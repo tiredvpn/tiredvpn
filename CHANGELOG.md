@@ -5,6 +5,18 @@ All notable changes to TiredVPN are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.0.1] - 2026-04-05
+
+### Fixed
+
+- Fixed `ktls.Enable()` return type on non-Linux platforms (was `bool`, now `*Conn`)
+- Applied `gofmt -s` formatting across all Go files
+
+### Changed
+
+- Refactored `server.Run()`, `handleHTTP2()`, `strategy.NewDefaultManager()`, `client.Run()`, `tun.RunTUNRelayWithCallbacks()` — extracted helpers to reduce cyclomatic complexity
+- Removed darwin/windows from release builds (TUN requires Linux kernel)
+
 ## [1.0.0] - 2026-04-03
 
 ### Added

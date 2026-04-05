@@ -1018,154 +1018,148 @@ func RunTUNRelayWithCallback(tunDev *TUNDevice, serverConn net.Conn, localIP, re
 func RunTUNRelayWithCallbacks(tunDev *TUNDevice, serverConn net.Conn, localIP, remoteIP net.IP, externalStopCh chan struct{}, callbacks *RelayCallbacks) {
 	log.Info("Starting TUN relay (local=%s, remote=%s)", localIP, remoteIP)
 
-	// Use sync.Once to safely close stopCh only once
-	var stopCh chan struct{}
-	if externalStopCh != nil {
-		stopCh = externalStopCh
-	} else {
-		stopCh = make(chan struct{})
-	}
-	var closeOnce sync.Once
-	safeClose := func() {
-		// Only close if we created it internally
-		if externalStopCh == nil {
-			closeOnce.Do(func() {
-				close(stopCh)
-			})
-		}
-	}
+	stopCh, safeClose := makeStopChannel(externalStopCh)
 
-	// Activity tracking for dead connection detection
 	lastActivity := time.Now().UnixNano()
-	updateActivity := func() {
-		atomic.StoreInt64(&lastActivity, time.Now().UnixNano())
-	}
+	updateActivity := func() { atomic.StoreInt64(&lastActivity, time.Now().UnixNano()) }
 	getIdleDuration := func() time.Duration {
-		last := atomic.LoadInt64(&lastActivity)
-		return time.Since(time.Unix(0, last))
+		return time.Since(time.Unix(0, atomic.LoadInt64(&lastActivity)))
 	}
 
-	// Dead connection monitor goroutine
-	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				idle := getIdleDuration()
-				if idle > deadConnectionTimeout {
-					log.Warn("Connection dead: no activity for %v", idle)
-					if callbacks != nil && callbacks.OnError != nil {
-						callbacks.OnError(fmt.Sprintf("no_activity: %v", idle))
-					}
-					safeClose()
-					return
-				}
-			case <-stopCh:
-				return
-			}
-		}
-	}()
+	go runDeadConnectionMonitor(stopCh, safeClose, getIdleDuration, callbacks)
+	go runKeepaliveSender(stopCh, serverConn)
+	go runTUNToServer(stopCh, safeClose, tunDev, serverConn, updateActivity)
 
-	// Start keepalive sender
-	go func() {
-		ticker := time.NewTicker(keepaliveInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				// Send keepalive: [length:4=0]
-				keepalive := make([]byte, 4)
-				serverConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-				if _, err := serverConn.Write(keepalive); err != nil {
-					log.Debug("Keepalive write error: %v", err)
-					return
-				}
-				log.Debug("Sent keepalive")
-			case <-stopCh:
-				return
-			}
-		}
-	}()
+	errorReason := runServerToTUN(stopCh, safeClose, tunDev, serverConn, remoteIP, updateActivity, callbacks)
 
-	// TUN -> Server goroutine
-	go func() {
-		buf := make([]byte, tunDev.mtu+4)
-		pktCount := 0
-		for {
-			// Check if we should stop
-			select {
-			case <-stopCh:
-				log.Debug("TUN->Server: stop signal received")
-				return
-			default:
-			}
+	safeClose()
+	serverConn.Close()
+	log.Info("TUN relay stopped (reason: %s)", errorReason)
 
-			n, err := tunDev.Read(buf[4:])
-			if err != nil {
-				// Check if it's EAGAIN/EWOULDBLOCK (non-blocking fd, common on Android)
-				if isTemporaryError(err) {
-					time.Sleep(10 * time.Millisecond) // Small delay to avoid busy loop
-					continue
+	if callbacks != nil && callbacks.OnError != nil && errorReason != "" {
+		callbacks.OnError(errorReason)
+	}
+}
+
+// makeStopChannel returns the stop channel and a safe-close function.
+// If externalStopCh is provided it is used directly; otherwise a new channel is created.
+func makeStopChannel(externalStopCh chan struct{}) (chan struct{}, func()) {
+	if externalStopCh != nil {
+		return externalStopCh, func() {}
+	}
+	stopCh := make(chan struct{})
+	var once sync.Once
+	return stopCh, func() { once.Do(func() { close(stopCh) }) }
+}
+
+// runDeadConnectionMonitor periodically checks for idle connections and triggers safeClose.
+func runDeadConnectionMonitor(stopCh chan struct{}, safeClose func(), getIdleDuration func() time.Duration, callbacks *RelayCallbacks) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			idle := getIdleDuration()
+			if idle > deadConnectionTimeout {
+				log.Warn("Connection dead: no activity for %v", idle)
+				if callbacks != nil && callbacks.OnError != nil {
+					callbacks.OnError(fmt.Sprintf("no_activity: %v", idle))
 				}
-				log.Debug("TUN read error: %v", err)
 				safeClose()
 				return
 			}
+		case <-stopCh:
+			return
+		}
+	}
+}
 
-			pktCount++
-			if pktCount <= 5 || pktCount%100 == 0 {
-				log.Debug("TUN->Server: read %d bytes from TUN (pkt #%d)", n, pktCount)
-			}
-
-			// Clamp TCP MSS on outgoing SYN/SYN-ACK packets
-			ClampTCPMSS(buf[4:4+n], tunDev.mtu)
-
-			// Frame: [length:4][data:n]
-			binary.BigEndian.PutUint32(buf[:4], uint32(n))
-
+// runKeepaliveSender periodically writes zero-length keepalive frames to serverConn.
+func runKeepaliveSender(stopCh chan struct{}, serverConn net.Conn) {
+	ticker := time.NewTicker(keepaliveInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			keepalive := make([]byte, 4)
 			serverConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			if _, err := serverConn.Write(buf[:n+4]); err != nil {
-				log.Debug("Server write error: %v", err)
-				safeClose()
+			if _, err := serverConn.Write(keepalive); err != nil {
+				log.Debug("Keepalive write error: %v", err)
 				return
 			}
-
-			// Update activity on successful send
-			updateActivity()
+			log.Debug("Sent keepalive")
+		case <-stopCh:
+			return
 		}
-	}()
+	}
+}
 
-	// Server -> TUN (main goroutine)
+// runTUNToServer reads IP packets from the TUN device and frames them to serverConn.
+func runTUNToServer(stopCh chan struct{}, safeClose func(), tunDev *TUNDevice, serverConn net.Conn, updateActivity func()) {
+	buf := make([]byte, tunDev.mtu+4)
+	pktCount := 0
+	for {
+		select {
+		case <-stopCh:
+			log.Debug("TUN->Server: stop signal received")
+			return
+		default:
+		}
+
+		n, err := tunDev.Read(buf[4:])
+		if err != nil {
+			if isTemporaryError(err) {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			log.Debug("TUN read error: %v", err)
+			safeClose()
+			return
+		}
+
+		pktCount++
+		if pktCount <= 5 || pktCount%100 == 0 {
+			log.Debug("TUN->Server: read %d bytes from TUN (pkt #%d)", n, pktCount)
+		}
+
+		ClampTCPMSS(buf[4:4+n], tunDev.mtu)
+		binary.BigEndian.PutUint32(buf[:4], uint32(n))
+
+		serverConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		if _, err := serverConn.Write(buf[:n+4]); err != nil {
+			log.Debug("Server write error: %v", err)
+			safeClose()
+			return
+		}
+		updateActivity()
+	}
+}
+
+// runServerToTUN reads framed packets from serverConn and writes them to the TUN device.
+// Returns an error reason string (empty if stopped intentionally).
+func runServerToTUN(stopCh chan struct{}, safeClose func(), tunDev *TUNDevice, serverConn net.Conn, remoteIP net.IP, updateActivity func(), callbacks *RelayCallbacks) string {
 	lenBuf := make([]byte, 4)
 	pktCount := 0
-	var errorReason string
 	for {
-		// Check if we should stop
 		select {
 		case <-stopCh:
 			log.Debug("Server->TUN: stop signal received")
 			safeClose()
 			// NOTE: serverConn is NOT closed here — callers manage its lifecycle.
-			// Closing here would break hot-swap (hotSwapTunFdLocked) which reuses the conn.
 			log.Info("TUN relay stopped (by stop signal)")
-			return
+			return ""
 		default:
 		}
 
 		serverConn.SetReadDeadline(time.Now().Add(readTimeout))
 		if _, err := io.ReadFull(serverConn, lenBuf); err != nil {
 			log.Debug("Server read error: %v", err)
-			errorReason = fmt.Sprintf("server_read: %v", err)
-			break
+			return fmt.Sprintf("server_read: %v", err)
 		}
 
-		// Update activity on any data from server
 		updateActivity()
-
 		pktLen := binary.BigEndian.Uint32(lenBuf)
 
-		// Keepalive received from server
 		if pktLen == 0 {
 			log.Debug("Received keepalive from server")
 			if callbacks != nil && callbacks.OnKeepalive != nil {
@@ -1174,32 +1168,19 @@ func RunTUNRelayWithCallbacks(tunDev *TUNDevice, serverConn net.Conn, localIP, r
 			continue
 		}
 
-		if pktLen > uint32(tunDev.mtu) {
-			// Read and discard oversized packet, inject ICMP Frag Needed
-			log.Debug("Packet too large (%d > MTU %d), dropping and sending ICMP", pktLen, tunDev.mtu)
-			oversized := make([]byte, pktLen)
-			if _, err := io.ReadFull(serverConn, oversized); err != nil {
-				log.Debug("Failed to read oversized packet: %v", err)
-				errorReason = fmt.Sprintf("server_read_oversized: %v", err)
-				break
+		if reason := handleOversizedPacket(tunDev, serverConn, remoteIP, pktLen); reason != "" {
+			if reason == "dropped" {
+				continue
 			}
-			icmpPkt := BuildICMPFragNeeded(remoteIP, oversized, uint16(tunDev.mtu))
-			if icmpPkt != nil {
-				if _, err := tunDev.Write(icmpPkt); err != nil {
-					log.Debug("Failed to inject ICMP frag needed: %v", err)
-				}
-			}
-			continue
+			return reason
 		}
 
 		buf := make([]byte, pktLen)
 		if _, err := io.ReadFull(serverConn, buf); err != nil {
 			log.Debug("Server read data error: %v", err)
-			errorReason = fmt.Sprintf("server_read_data: %v", err)
-			break
+			return fmt.Sprintf("server_read_data: %v", err)
 		}
 
-		// Clamp TCP MSS on incoming SYN/SYN-ACK before writing to TUN
 		ClampTCPMSS(buf, tunDev.mtu)
 
 		pktCount++
@@ -1209,17 +1190,27 @@ func RunTUNRelayWithCallbacks(tunDev *TUNDevice, serverConn net.Conn, localIP, r
 
 		if _, err := tunDev.Write(buf); err != nil {
 			log.Debug("TUN write error: %v", err)
-			continue
 		}
 	}
+}
 
-	safeClose()
-	// Don't close TUN device here - it may be reused for reconnect
-	serverConn.Close()
-	log.Info("TUN relay stopped (reason: %s)", errorReason)
-
-	// Notify callback about error (if not stopped intentionally)
-	if callbacks != nil && callbacks.OnError != nil && errorReason != "" {
-		callbacks.OnError(errorReason)
+// handleOversizedPacket discards an oversized packet and injects an ICMP Frag Needed.
+// Returns "dropped" if the packet was discarded, an error reason string on read failure, or "" if not oversized.
+func handleOversizedPacket(tunDev *TUNDevice, serverConn net.Conn, remoteIP net.IP, pktLen uint32) string {
+	if pktLen <= uint32(tunDev.mtu) {
+		return ""
 	}
+	log.Debug("Packet too large (%d > MTU %d), dropping and sending ICMP", pktLen, tunDev.mtu)
+	oversized := make([]byte, pktLen)
+	if _, err := io.ReadFull(serverConn, oversized); err != nil {
+		log.Debug("Failed to read oversized packet: %v", err)
+		return fmt.Sprintf("server_read_oversized: %v", err)
+	}
+	icmpPkt := BuildICMPFragNeeded(remoteIP, oversized, uint16(tunDev.mtu))
+	if icmpPkt != nil {
+		if _, err := tunDev.Write(icmpPkt); err != nil {
+			log.Debug("Failed to inject ICMP frag needed: %v", err)
+		}
+	}
+	return "dropped"
 }

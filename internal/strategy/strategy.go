@@ -932,7 +932,18 @@ type DefaultManagerConfig struct {
 func NewDefaultManager(cfg DefaultManagerConfig) *Manager {
 	m := NewManager()
 
-	// Initialize IPv6 Transport Layer
+	initManagerTransport(m, cfg)
+	initManagerPortHopping(m, cfg)
+	initManagerAndroidMode(m, cfg)
+	initManagerMux(m, cfg)
+	initManagerRTTMasking(m, cfg)
+	registerAllStrategies(m, cfg)
+
+	return m
+}
+
+// initManagerTransport sets the IPv4/IPv6 address fields on the manager.
+func initManagerTransport(m *Manager, cfg DefaultManagerConfig) {
 	m.serverAddrV4 = cfg.ServerAddr
 	m.serverAddrV6 = cfg.ServerAddrV6
 	m.preferIPv6 = cfg.PreferIPv6
@@ -941,79 +952,102 @@ func NewDefaultManager(cfg DefaultManagerConfig) *Manager {
 		log.Info("IPv6 transport enabled (IPv6=%s, IPv4=%s, fallback=%v)",
 			cfg.ServerAddrV6, cfg.ServerAddr, cfg.FallbackToV4)
 	}
+}
 
-	// Initialize port hopper if configured
-	if cfg.PortHopping != nil && cfg.PortHopping.Enabled {
-		hopper, err := porthopping.NewPortHopper(cfg.PortHopping)
-		if err != nil {
-			log.Warn("Port hopping disabled: %v", err)
+// initManagerPortHopping configures the port hopper if enabled.
+func initManagerPortHopping(m *Manager, cfg DefaultManagerConfig) {
+	if cfg.PortHopping == nil || !cfg.PortHopping.Enabled {
+		return
+	}
+	hopper, err := porthopping.NewPortHopper(cfg.PortHopping)
+	if err != nil {
+		log.Warn("Port hopping disabled: %v", err)
+		return
+	}
+	m.portHopper = hopper
+	hopper.OnHop(func(oldPort, newPort int) {
+		log.Info("Port hop: %d -> %d, triggering reconnect", oldPort, newPort)
+		m.triggerReconnect()
+	})
+	log.Info("Port hopping enabled (range=%d-%d, interval=%v, strategy=%s)",
+		cfg.PortHopping.PortRangeStart, cfg.PortHopping.PortRangeEnd,
+		cfg.PortHopping.HopInterval, cfg.PortHopping.Strategy)
+}
+
+// initManagerAndroidMode applies Android-specific timeout and retry optimizations.
+func initManagerAndroidMode(m *Manager, cfg DefaultManagerConfig) {
+	if !cfg.AndroidMode {
+		return
+	}
+	m.probeTimeout = 3 * time.Second
+	m.connectTimeout = 10 * time.Second
+	m.maxRetries = 1
+	m.androidMode = true
+	log.Info("Android mode: using optimized timeouts (probe=%v, connect=%v, retries=%d, TCP-first)",
+		m.probeTimeout, m.connectTimeout, m.maxRetries)
+}
+
+// initManagerMux enables mux multiplexing if configured.
+func initManagerMux(m *Manager, cfg DefaultManagerConfig) {
+	if !cfg.MuxEnabled {
+		return
+	}
+	muxConfig := cfg.MuxConfig
+	if muxConfig == nil {
+		if cfg.AndroidMode {
+			muxConfig = mux.MobileConfig()
 		} else {
-			m.portHopper = hopper
-			// Set callback for port change - triggers reconnect
-			hopper.OnHop(func(oldPort, newPort int) {
-				log.Info("Port hop: %d -> %d, triggering reconnect", oldPort, newPort)
-				m.triggerReconnect()
-			})
-			log.Info("Port hopping enabled (range=%d-%d, interval=%v, strategy=%s)",
-				cfg.PortHopping.PortRangeStart, cfg.PortHopping.PortRangeEnd,
-				cfg.PortHopping.HopInterval, cfg.PortHopping.Strategy)
+			muxConfig = mux.DefaultConfig()
 		}
 	}
+	m.EnableMux(muxConfig)
+}
 
-	// Android-specific optimizations: shorter timeouts, fewer retries, TCP-first
-	if cfg.AndroidMode {
-		m.probeTimeout = 3 * time.Second    // 10s -> 3s
-		m.connectTimeout = 10 * time.Second // 30s -> 10s
-		m.maxRetries = 1                    // 2 -> 1
-		m.androidMode = true                // Deprioritize QUIC/UDP strategies
-		log.Info("Android mode: using optimized timeouts (probe=%v, connect=%v, retries=%d, TCP-first)",
-			m.probeTimeout, m.connectTimeout, m.maxRetries)
+// initManagerRTTMasking enables RTT masking if configured.
+func initManagerRTTMasking(m *Manager, cfg DefaultManagerConfig) {
+	if !cfg.RTTMaskingEnabled {
+		return
 	}
-
-	// Configure Mux - ENABLED BY DEFAULT (99.5% success rate with VLESS+Reality+mux)
-	// Mux is critical for DPI evasion: interleaved frames confuse traffic analysis
-	if cfg.MuxEnabled {
-		muxConfig := cfg.MuxConfig
-		if muxConfig == nil {
-			// Use mobile config for Android, default otherwise
-			if cfg.AndroidMode {
-				muxConfig = mux.MobileConfig()
-			} else {
-				muxConfig = mux.DefaultConfig()
-			}
-		}
-		m.EnableMux(muxConfig)
+	profile := cfg.RTTProfile
+	if profile == nil {
+		profile = MoscowToYandexProfile
 	}
+	m.EnableRTTMasking(profile)
+}
 
-	// Configure RTT masking if enabled
-	if cfg.RTTMaskingEnabled {
-		profile := cfg.RTTProfile
-		if profile == nil {
-			profile = MoscowToYandexProfile // Default to Moscow-Yandex profile
-		}
-		m.EnableRTTMasking(profile)
+// registerAllStrategies registers all transport strategies onto the manager.
+func registerAllStrategies(m *Manager, cfg DefaultManagerConfig) {
+	hasServer := cfg.ServerAddr != ""
+	hasSecret := len(cfg.Secret) > 0
+
+	registerQUICStrategies(m, cfg, hasServer, hasSecret)
+	registerTLSStrategies(m, cfg, hasServer, hasSecret)
+	registerMorphStrategies(m, cfg, hasSecret)
+	registerMeshAndAntiProbe(m, cfg, hasServer, hasSecret)
+	registerConfusionAndExhaustion(m)
+	registerGenevaStrategies(m, cfg, hasServer, hasSecret)
+}
+
+// registerQUICStrategies registers QUIC and QUIC-Salamander strategies.
+func registerQUICStrategies(m *Manager, cfg DefaultManagerConfig, hasServer, hasSecret bool) {
+	if !hasServer || !hasSecret {
+		return
 	}
-
-	// 1. QUIC Strategy - hardest to block, new protocol
-	if cfg.QUICEnabled && cfg.ServerAddr != "" && len(cfg.Secret) > 0 {
+	if cfg.QUICEnabled {
 		port := cfg.QUICPort
 		if port == 0 {
 			port = 443
 		}
 		quicStrat := NewQUICStrategy(m, cfg.Secret, port)
-		// Enable SNI fragmentation for GFW bypass if configured
 		if cfg.QUICSNIFragEnabled {
 			quicStrat.SetSNIFragmentation(true, nil)
 		}
 		m.Register(quicStrat)
 	}
 
-	// 1.3. QUIC Salamander - QUIC with cryptographic obfuscation
-	// NOT registered when SNI fragmentation is enabled (they are mutually exclusive)
-	if cfg.ServerAddr != "" && len(cfg.Secret) > 0 && !cfg.QUICSNIFragEnabled {
+	if !cfg.QUICSNIFragEnabled {
 		port := cfg.QUICSalamanderPort
 		if port == 0 {
-			// Extract port from server address, default to 443 if not specified
 			if _, portStr, err := net.SplitHostPort(cfg.ServerAddr); err == nil {
 				if p, err := strconv.Atoi(portStr); err == nil {
 					port = p
@@ -1023,104 +1057,80 @@ func NewDefaultManager(cfg DefaultManagerConfig) *Manager {
 				port = 443
 			}
 		}
-		salamanderStrat := NewQUICSalamanderStrategy(m, cfg.Secret, port)
-		m.Register(salamanderStrat)
+		m.Register(NewQUICSalamanderStrategy(m, cfg.Secret, port))
+	}
+}
+
+// registerTLSStrategies registers REALITY, WebSocket, HTTP Polling and HTTP/2 Stego.
+func registerTLSStrategies(m *Manager, cfg DefaultManagerConfig, hasServer, hasSecret bool) {
+	if !hasServer || !hasSecret {
+		return
 	}
 
-	// 1.5. REALITY Protocol - 99.5% success rate (ALWAYS enabled if server present)
-	if cfg.ServerAddr != "" && len(cfg.Secret) > 0 {
-		reality := NewREALITYStrategy(m, cfg.Secret)
-		// Enable post-quantum crypto if configured
-		if cfg.PQEnabled && cfg.PQServerKemPubB64 != "" {
-			kemPub, err := base64.StdEncoding.DecodeString(cfg.PQServerKemPubB64)
-			if err == nil && len(kemPub) > 0 {
-				if err := reality.SetPostQuantum(kemPub); err != nil {
-					// Log but don't fail - fallback to classical
-					log.Warn("REALITY: PQ init failed, using classical: %v", err)
-				}
+	reality := NewREALITYStrategy(m, cfg.Secret)
+	if cfg.PQEnabled && cfg.PQServerKemPubB64 != "" {
+		kemPub, err := base64.StdEncoding.DecodeString(cfg.PQServerKemPubB64)
+		if err == nil && len(kemPub) > 0 {
+			if err := reality.SetPostQuantum(kemPub); err != nil {
+				log.Warn("REALITY: PQ init failed, using classical: %v", err)
 			}
 		}
-		m.Register(reality)
 	}
+	m.Register(reality)
 
-	// 1.7. WebSocket Salamander Padding - High priority (ALWAYS enabled if server present)
-	if cfg.ServerAddr != "" && len(cfg.Secret) > 0 {
-		m.Register(NewWebSocketPaddedStrategy(m, cfg.Secret))
+	m.Register(NewWebSocketPaddedStrategy(m, cfg.Secret))
+	m.Register(NewHTTPPollingStrategy(m, cfg.Secret))
+
+	stego := NewHTTP2StegoStrategy(m, cfg.Secret, cfg.CoverHost)
+	if cfg.ECHEnabled && len(cfg.ECHConfigList) > 0 {
+		stego.SetECH(cfg.ECHConfigList, cfg.ECHPublicName)
 	}
+	m.Register(stego)
+}
 
-	// 1.8. HTTP Polling (meek-style) - bypasses long-connection throttling
-	// Uses multiple short-lived HTTP/1.1 requests instead of persistent connections
-	// Effective against TSPU that blocks HTTP/2 but allows HTTP/1.1
-	if cfg.ServerAddr != "" && len(cfg.Secret) > 0 {
-		m.Register(NewHTTPPollingStrategy(m, cfg.Secret))
+// registerMorphStrategies registers Traffic Morphing strategies for multiple profiles.
+func registerMorphStrategies(m *Manager, cfg DefaultManagerConfig, hasSecret bool) {
+	if !hasSecret {
+		return
 	}
+	m.Register(NewTrafficMorphStrategy(m, YandexVideoProfile, nil, cfg.Secret))
+	m.Register(NewTrafficMorphStrategy(m, VKVideoProfile, nil, cfg.Secret))
+	m.Register(NewTrafficMorphStrategy(m, BaiduVideoProfile, nil, cfg.Secret))
+	m.Register(NewTrafficMorphStrategy(m, AparatVideoProfile, nil, cfg.Secret))
+}
 
-	// 2. HTTP/2 Steganography - highest priority, looks most legitimate
-	if cfg.ServerAddr != "" && len(cfg.Secret) > 0 {
-		stego := NewHTTP2StegoStrategy(m, cfg.Secret, cfg.CoverHost)
-		// Enable ECH if configured
-		if cfg.ECHEnabled && len(cfg.ECHConfigList) > 0 {
-			stego.SetECH(cfg.ECHConfigList, cfg.ECHPublicName)
-		}
-		m.Register(stego)
-	}
-
-	// 3. Traffic Morphing (Yandex profile) - Russian video service (primary)
-	if len(cfg.Secret) > 0 {
-		m.Register(NewTrafficMorphStrategy(m, YandexVideoProfile, nil, cfg.Secret))
-	}
-
-	// 4. Traffic Morphing (VK profile) - VK video streaming
-	if len(cfg.Secret) > 0 {
-		m.Register(NewTrafficMorphStrategy(m, VKVideoProfile, nil, cfg.Secret))
-
-		// 5. Traffic Morphing (Baidu profile) - Chinese video streaming
-		if len(cfg.Secret) > 0 {
-			m.Register(NewTrafficMorphStrategy(m, BaiduVideoProfile, nil, cfg.Secret))
-		}
-
-		// 6. Traffic Morphing (Aparat profile) - Iranian video streaming
-		if len(cfg.Secret) > 0 {
-			m.Register(NewTrafficMorphStrategy(m, AparatVideoProfile, nil, cfg.Secret))
-		}
-	}
-
-	// 5. Mesh Relay - route through Russian IPs
-	if cfg.ServerAddr != "" && len(cfg.RelayNodes) > 0 {
+// registerMeshAndAntiProbe registers Mesh Relay and Anti-Probe strategies.
+func registerMeshAndAntiProbe(m *Manager, cfg DefaultManagerConfig, hasServer, hasSecret bool) {
+	if hasServer && len(cfg.RelayNodes) > 0 {
 		mesh := NewMeshRelayStrategy(cfg.ServerAddr)
 		mesh.AddRelays(cfg.RelayNodes)
 		m.Register(mesh)
 	}
-
-	// 6. Anti-Probe Resistance
-	if cfg.ServerAddr != "" && len(cfg.Secret) > 0 {
+	if hasServer && hasSecret {
 		antiprobe := NewAntiProbeStrategy(m, cfg.Secret)
 		if cfg.ECHEnabled && len(cfg.ECHConfigList) > 0 {
 			antiprobe.SetECH(cfg.ECHConfigList, cfg.ECHPublicName)
 		}
 		m.Register(antiprobe)
 	}
+}
 
-	// 7. Protocol Confusion strategies
+// registerConfusionAndExhaustion registers Protocol Confusion and State Exhaustion.
+func registerConfusionAndExhaustion(m *Manager) {
 	for _, confStrat := range AllConfusionTypes(m) {
 		m.Register(confStrat)
 	}
-
-	// 8. State Table Exhaustion - more aggressive, lower priority
 	m.Register(NewStateExhaustionStrategy(m))
+}
 
-	// 9. Geneva strategies for different countries
-	// Now using Manager reference for IPv6/IPv4 transport layer support
-	if cfg.ServerAddr != "" && len(cfg.Secret) > 0 {
-		// Russia TSPU - most relevant for Russian users
-		m.Register(NewGenevaStrategy(m, cfg.Secret, "russia"))
-		// China GFW
-		m.Register(NewGenevaStrategy(m, cfg.Secret, "china"))
-		// Iran DPI
-		m.Register(NewGenevaStrategy(m, cfg.Secret, "iran"))
+// registerGenevaStrategies registers Geneva strategies for Russia, China, and Iran.
+func registerGenevaStrategies(m *Manager, cfg DefaultManagerConfig, hasServer, hasSecret bool) {
+	if !hasServer || !hasSecret {
+		return
 	}
-
-	return m
+	m.Register(NewGenevaStrategy(m, cfg.Secret, "russia"))
+	m.Register(NewGenevaStrategy(m, cfg.Secret, "china"))
+	m.Register(NewGenevaStrategy(m, cfg.Secret, "iran"))
 }
 
 // ConnectWithFallback is a convenience function for one-shot connection

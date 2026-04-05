@@ -73,10 +73,22 @@ jobs:
             tiredvpn-linux-arm64.tar.gz \
             > checksums.txt
 
+      - name: Extract changelog
+        id: changelog
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
+          NOTES=$(awk "/^## \[${VERSION}\]/{found=1; next} found && /^## \[/{exit} found{print}" CHANGELOG.md)
+          {
+            echo "notes<<CHANGELOG_EOF"
+            printf '%s\n' "$NOTES"
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          body: ${{ steps.changelog.outputs.notes }}
           files: |
             tiredvpn-linux-amd64.tar.gz
             tiredvpn-linux-arm64.tar.gz
