@@ -107,57 +107,24 @@ type Config struct {
 
 // Run starts the client with the given configuration
 func Run(cfg *Config) error {
-	// List strategies and exit (doesn't require server)
 	if cfg.ListStrategies {
-		mgrCfg := strategy.DefaultManagerConfig{
-			ServerAddr: "example.com:443",
-			Secret:     []byte("dummy"),
-			CoverHost:  cfg.CoverHost,
-		}
-		mgr := strategy.NewDefaultManager(mgrCfg)
-		fmt.Println(mgr.PrintStrategySummary())
-		fmt.Println("\nStrategy IDs for -strategy flag:")
-		fmt.Println("  http2_stego    - HTTP/2 Steganography")
-		fmt.Println("  morph          - Traffic Morphing (YouTube)")
-		fmt.Println("  confusion      - Protocol Confusion (DNS/TLS)")
-		fmt.Println("  antiprobe      - Anti-Probe Resistance")
-		return nil
+		return listStrategies(cfg)
 	}
 
 	if cfg.ServerAddr == "" {
 		return fmt.Errorf("-server is required")
 	}
 
-	// Try environment variable for secret
-	secret := cfg.Secret
-	if secret == "" {
-		secret = os.Getenv("TIREDVPN_SECRET")
-	}
-	if secret == "" {
-		log.Warn("No secret provided - using default (INSECURE!)")
-		secret = "default-secret-change-me"
-	}
+	secret := resolveSecret(cfg)
 
 	if cfg.Debug {
 		log.SetDebug(true)
 	}
-
-	// Android mode: disable strategies that require root (raw sockets, ICMP)
 	if cfg.AndroidMode {
 		strategy.SetAndroidMode(true)
 	}
 
-	// Apply defaults for adaptive config
-	if cfg.ReprobeInterval == 0 {
-		cfg.ReprobeInterval = 5 * time.Minute
-	}
-	if cfg.CircuitThreshold == 0 {
-		cfg.CircuitThreshold = 3
-	}
-	if cfg.CircuitResetTime == 0 {
-		cfg.CircuitResetTime = 5 * time.Minute
-	}
-	// EnableFallback defaults to true (need explicit false to disable)
+	applyAdaptiveDefaults(cfg)
 
 	log.Info("tiredvpn client %s starting...", Version)
 	log.Info("Server: %s, Cover: %s", cfg.ServerAddr, cfg.CoverHost)
@@ -168,46 +135,88 @@ func Run(cfg *Config) error {
 	log.Info("Adaptive config: reprobe=%v, circuitThreshold=%d, circuitReset=%v, fallback=%v",
 		cfg.ReprobeInterval, cfg.CircuitThreshold, cfg.CircuitResetTime, cfg.EnableFallback)
 
-	// Resolve RTT profile
-	var rttProfile *strategy.RTTProfile
-	if cfg.RTTMaskingEnabled && cfg.RTTProfile != "" {
-		rttProfile = strategy.GetRTTProfile(cfg.RTTProfile)
-		if rttProfile == nil {
-			log.Warn("Unknown RTT profile '%s', using default (moscow-yandex)", cfg.RTTProfile)
-			rttProfile = strategy.MoscowToYandexProfile
-		}
+	mgr, err := buildManager(cfg, secret)
+	if err != nil {
+		return err
 	}
 
-	// Decode ECH config if provided
-	var echConfigList []byte
-	if cfg.ECHEnabled && cfg.ECHConfigB64 != "" {
-		var err error
-		echConfigList, err = base64.StdEncoding.DecodeString(cfg.ECHConfigB64)
-		if err != nil {
-			log.Warn("Failed to decode ECH config: %v (ECH disabled)", err)
-			cfg.ECHEnabled = false
-		}
+	logEnabledFeatures(cfg, mgr)
+
+	if cfg.Debug {
+		fmt.Println(mgr.PrintStrategySummary())
 	}
 
-	// Create port hopping config if enabled
-	var portHoppingCfg *porthopping.Config
-	if cfg.PortHoppingEnabled {
-		portHoppingCfg = &porthopping.Config{
-			Enabled:        true,
-			PortRangeStart: cfg.PortHopRangeStart,
-			PortRangeEnd:   cfg.PortHopRangeEnd,
-			HopInterval:    cfg.PortHopInterval,
-			Strategy:       porthopping.Strategy(cfg.PortHopStrategy),
-			Seed:           []byte(cfg.PortHopSeed),
-		}
-		// Validate
-		if err := portHoppingCfg.Validate(); err != nil {
-			log.Warn("Invalid port hopping config: %v (disabled)", err)
-			portHoppingCfg = nil
-		}
+	if cfg.BenchmarkMode {
+		return runBenchmark(cfg, mgr)
+	}
+	if cfg.FullBenchmarkMode {
+		return runFullBenchmark(cfg, mgr)
+	}
+	if cfg.BenchmarkAllCombos {
+		return runAllCombosBenchmark(cfg, mgr)
 	}
 
-	// Create Strategy Manager
+	mgr.SetReprobeInterval(cfg.ReprobeInterval)
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	if cfg.ControlSocket != "" {
+		return runControlSocketMode(cfg, mgr, sigChan)
+	}
+
+	return runProbeAndServe(cfg, mgr, sigChan)
+}
+
+// listStrategies prints available strategy IDs and exits.
+func listStrategies(cfg *Config) error {
+	mgrCfg := strategy.DefaultManagerConfig{
+		ServerAddr: "example.com:443",
+		Secret:     []byte("dummy"),
+		CoverHost:  cfg.CoverHost,
+	}
+	mgr := strategy.NewDefaultManager(mgrCfg)
+	fmt.Println(mgr.PrintStrategySummary())
+	fmt.Println("\nStrategy IDs for -strategy flag:")
+	fmt.Println("  http2_stego    - HTTP/2 Steganography")
+	fmt.Println("  morph          - Traffic Morphing (YouTube)")
+	fmt.Println("  confusion      - Protocol Confusion (DNS/TLS)")
+	fmt.Println("  antiprobe      - Anti-Probe Resistance")
+	return nil
+}
+
+// resolveSecret returns the effective secret: from cfg, env, or insecure default.
+func resolveSecret(cfg *Config) string {
+	s := cfg.Secret
+	if s == "" {
+		s = os.Getenv("TIREDVPN_SECRET")
+	}
+	if s == "" {
+		log.Warn("No secret provided - using default (INSECURE!)")
+		s = "default-secret-change-me"
+	}
+	return s
+}
+
+// applyAdaptiveDefaults fills zero-value adaptive config fields with sensible defaults.
+func applyAdaptiveDefaults(cfg *Config) {
+	if cfg.ReprobeInterval == 0 {
+		cfg.ReprobeInterval = 5 * time.Minute
+	}
+	if cfg.CircuitThreshold == 0 {
+		cfg.CircuitThreshold = 3
+	}
+	if cfg.CircuitResetTime == 0 {
+		cfg.CircuitResetTime = 5 * time.Minute
+	}
+}
+
+// buildManager constructs and configures the strategy manager.
+func buildManager(cfg *Config, secret string) (*strategy.Manager, error) {
+	rttProfile := resolveRTTProfile(cfg)
+	echConfigList := decodeECHConfig(cfg)
+	portHoppingCfg := buildPortHoppingConfig(cfg)
+
 	mgrCfg := strategy.DefaultManagerConfig{
 		ServerAddr:         cfg.ServerAddr,
 		Secret:             []byte(secret),
@@ -230,11 +239,68 @@ func Run(cfg *Config) error {
 	}
 	mgr := strategy.NewDefaultManager(mgrCfg)
 
-	// Set up connectivity checker for pre-flight checks
 	connectivityChecker := strategy.NewConnectivityChecker(cfg.ServerAddr, 3*time.Second, cfg.AndroidMode)
 	mgr.SetConnectivityChecker(connectivityChecker)
 	log.Debug("Connectivity checker initialized for %s", cfg.ServerAddr)
 
+	if cfg.StrategyName != "" {
+		log.Info("Forcing strategy: %s", cfg.StrategyName)
+		if err := mgr.ForceStrategy(cfg.StrategyName); err != nil {
+			return nil, fmt.Errorf("unknown strategy: %s (available: %s)", cfg.StrategyName, mgr.ListStrategyIDs())
+		}
+	}
+	return mgr, nil
+}
+
+// resolveRTTProfile looks up the named RTT profile, returning nil if not found.
+func resolveRTTProfile(cfg *Config) *strategy.RTTProfile {
+	if !cfg.RTTMaskingEnabled || cfg.RTTProfile == "" {
+		return nil
+	}
+	p := strategy.GetRTTProfile(cfg.RTTProfile)
+	if p == nil {
+		log.Warn("Unknown RTT profile '%s', using default (moscow-yandex)", cfg.RTTProfile)
+		return strategy.MoscowToYandexProfile
+	}
+	return p
+}
+
+// decodeECHConfig base64-decodes the ECH config list, disabling ECH on failure.
+func decodeECHConfig(cfg *Config) []byte {
+	if !cfg.ECHEnabled || cfg.ECHConfigB64 == "" {
+		return nil
+	}
+	b, err := base64.StdEncoding.DecodeString(cfg.ECHConfigB64)
+	if err != nil {
+		log.Warn("Failed to decode ECH config: %v (ECH disabled)", err)
+		cfg.ECHEnabled = false
+		return nil
+	}
+	return b
+}
+
+// buildPortHoppingConfig creates a validated port-hopping config, or nil if disabled/invalid.
+func buildPortHoppingConfig(cfg *Config) *porthopping.Config {
+	if !cfg.PortHoppingEnabled {
+		return nil
+	}
+	phCfg := &porthopping.Config{
+		Enabled:        true,
+		PortRangeStart: cfg.PortHopRangeStart,
+		PortRangeEnd:   cfg.PortHopRangeEnd,
+		HopInterval:    cfg.PortHopInterval,
+		Strategy:       porthopping.Strategy(cfg.PortHopStrategy),
+		Seed:           []byte(cfg.PortHopSeed),
+	}
+	if err := phCfg.Validate(); err != nil {
+		log.Warn("Invalid port hopping config: %v (disabled)", err)
+		return nil
+	}
+	return phCfg
+}
+
+// logEnabledFeatures logs info lines for each optional feature that is active.
+func logEnabledFeatures(cfg *Config, mgr *strategy.Manager) {
 	if cfg.RTTMaskingEnabled {
 		log.Info("RTT masking enabled (profile=%s)", cfg.RTTProfile)
 	}
@@ -254,108 +320,62 @@ func Run(cfg *Config) error {
 		log.Info("IPv6 transport enabled (IPv6=%s, IPv4=%s, fallback=%v)",
 			cfg.ServerAddrV6, cfg.ServerAddr, cfg.FallbackToV4)
 	}
-	if cfg.PortHoppingEnabled && portHoppingCfg != nil {
-		log.Info("Port hopping enabled (range=%d-%d, interval=%v, strategy=%s)",
-			portHoppingCfg.PortRangeStart, portHoppingCfg.PortRangeEnd,
-			portHoppingCfg.HopInterval, portHoppingCfg.Strategy)
+	// log port hopping status if manager has a port hopper configured
+	_ = mgr // used for future per-strategy logging
+}
+
+// runBenchmark runs the parallel strategy probe benchmark and prints results.
+func runBenchmark(cfg *Config, mgr *strategy.Manager) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	log.Info("Running strategy benchmark...")
+	result := benchmark.ParallelProbe(ctx, mgr, cfg.ServerAddr)
+	fmt.Println(benchmark.FormatResults(result, false))
+	return nil
+}
+
+// runFullBenchmark runs the full HTTP/latency/speed/IP-change benchmark and prints results.
+func runFullBenchmark(cfg *Config, mgr *strategy.Manager) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	log.Info("Running FULL strategy benchmark (this may take several minutes)...")
+	log.Info("Testing %d strategies for: HTTP, latency, speed, IP change", len(mgr.GetOrderedStrategies()))
+	origIP, err := benchmark.GetOriginalIP(ctx)
+	if err != nil {
+		log.Warn("Could not get original IP: %v (IP change detection disabled)", err)
+		origIP = "unknown"
+	} else {
+		log.Info("Original IP: %s", origIP)
 	}
+	result := benchmark.RunFullBenchmarkDirect(ctx, mgr, cfg.ServerAddr, origIP)
+	fmt.Println(benchmark.FormatFullResults(result))
+	return nil
+}
 
-	// Force specific strategy if requested
-	if cfg.StrategyName != "" {
-		log.Info("Forcing strategy: %s", cfg.StrategyName)
-		if err := mgr.ForceStrategy(cfg.StrategyName); err != nil {
-			return fmt.Errorf("unknown strategy: %s (available: %s)", cfg.StrategyName, mgr.ListStrategyIDs())
-		}
+// runAllCombosBenchmark runs the exhaustive strategies × RTT profiles benchmark.
+func runAllCombosBenchmark(cfg *Config, mgr *strategy.Manager) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+	rttProfiles := strategy.AllRTTProfiles()
+	strategies := mgr.GetOrderedStrategies()
+	totalCombos := len(strategies) * (1 + len(rttProfiles))
+	log.Info("Running EXHAUSTIVE benchmark of ALL combinations...")
+	log.Info("Strategies: %d, RTT profiles: %d (+none), Total combinations: %d",
+		len(strategies), len(rttProfiles), totalCombos)
+	origIP, err := benchmark.GetOriginalIP(ctx)
+	if err != nil {
+		log.Warn("Could not get original IP: %v", err)
+		origIP = "unknown"
+	} else {
+		log.Info("Original IP: %s", origIP)
 	}
+	result := benchmark.RunAllCombinationsBenchmark(ctx, mgr, cfg.ServerAddr, origIP, rttProfiles)
+	fmt.Println(benchmark.FormatAllCombosResults(result))
+	return nil
+}
 
-	// Print strategies
-	if cfg.Debug {
-		fmt.Println(mgr.PrintStrategySummary())
-	}
-
-	// Benchmark mode - run tests and exit
-	if cfg.BenchmarkMode {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		defer cancel()
-
-		log.Info("Running strategy benchmark...")
-		result := benchmark.ParallelProbe(ctx, mgr, cfg.ServerAddr)
-		fmt.Println(benchmark.FormatResults(result, false))
-		return nil
-	}
-
-	// Full benchmark mode - tests HTTP, latency, speed, IP change via each strategy
-	if cfg.FullBenchmarkMode {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-		defer cancel()
-
-		log.Info("Running FULL strategy benchmark (this may take several minutes)...")
-		log.Info("Testing %d strategies for: HTTP, latency, speed, IP change", len(mgr.GetOrderedStrategies()))
-
-		// Get original IP first
-		origIP, err := benchmark.GetOriginalIP(ctx)
-		if err != nil {
-			log.Warn("Could not get original IP: %v (IP change detection disabled)", err)
-			origIP = "unknown"
-		} else {
-			log.Info("Original IP: %s", origIP)
-		}
-
-		// Get all strategy IDs from the manager
-		strategies := mgr.GetOrderedStrategies()
-		stratIDs := make([]string, len(strategies))
-		for i, s := range strategies {
-			stratIDs[i] = s.ID()
-		}
-
-		result := benchmark.RunFullBenchmarkDirect(ctx, mgr, cfg.ServerAddr, origIP)
-		fmt.Println(benchmark.FormatFullResults(result))
-		return nil
-	}
-
-	// Benchmark ALL combinations mode - strategies × RTT profiles
-	if cfg.BenchmarkAllCombos {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
-		defer cancel()
-
-		// Get RTT profiles
-		rttProfiles := strategy.AllRTTProfiles()
-		strategies := mgr.GetOrderedStrategies()
-		totalCombos := len(strategies) * (1 + len(rttProfiles)) // +1 for "no RTT masking"
-
-		log.Info("Running EXHAUSTIVE benchmark of ALL combinations...")
-		log.Info("Strategies: %d, RTT profiles: %d (+none), Total combinations: %d",
-			len(strategies), len(rttProfiles), totalCombos)
-
-		// Get original IP
-		origIP, err := benchmark.GetOriginalIP(ctx)
-		if err != nil {
-			log.Warn("Could not get original IP: %v", err)
-			origIP = "unknown"
-		} else {
-			log.Info("Original IP: %s", origIP)
-		}
-
-		result := benchmark.RunAllCombinationsBenchmark(ctx, mgr, cfg.ServerAddr, origIP, rttProfiles)
-		fmt.Println(benchmark.FormatAllCombosResults(result))
-		return nil
-	}
-
-	// Configure reprobe interval
-	mgr.SetReprobeInterval(cfg.ReprobeInterval)
-
-	// Handle signals
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	// Control socket mode for Android (starts control server, waits for commands)
-	// For Android: skip pre-probe, start control socket immediately
-	// Strategies will be probed lazily during Connect() with shorter timeouts
-	if cfg.ControlSocket != "" {
-		return runControlSocketMode(cfg, mgr, sigChan)
-	}
-
-	// For non-Android modes: probe strategies before starting
+// runProbeAndServe probes strategies then starts proxy/TUN serving.
+func runProbeAndServe(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	log.Info("Probing strategies...")
 	results := mgr.ProbeAll(ctx, cfg.ServerAddr)
@@ -370,11 +390,9 @@ func Run(cfg *Config) error {
 	}
 	log.Info("Available strategies: %d/%d", available, len(results))
 
-	// Start periodic reprobe in background
 	reprobeCtx, reprobeCancel := context.WithCancel(context.Background())
 	mgr.StartPeriodicReprobe(reprobeCtx, cfg.ServerAddr)
 
-	// Start port hop checker if enabled
 	if cfg.PortHoppingEnabled {
 		mgr.StartPortHopChecker(reprobeCtx)
 	}
@@ -385,7 +403,6 @@ func Run(cfg *Config) error {
 		mgr.StopPortHopChecker()
 	}()
 
-	// TUN mode or proxy mode
 	if cfg.TunMode {
 		return runTUNMode(cfg, mgr, sigChan)
 	}

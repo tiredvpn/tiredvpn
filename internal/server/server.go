@@ -232,320 +232,48 @@ type serverContext struct {
 
 // Run starts the server with the given configuration
 func Run(cfg *Config) error {
-	// Configure logging
 	if cfg.Debug {
 		log.SetDebug(true)
 	}
 
-	// Initialize REALITY protocol keys
 	if err := InitREALITYKeys(); err != nil {
 		return fmt.Errorf("reality initialization failed: %w", err)
 	}
 
-	// Create server context
 	srvCtx := &serverContext{cfg: cfg}
 
-	// Multi-client mode with Redis
-	if cfg.RedisAddr != "" {
-		store, err := NewRedisStore(cfg.RedisAddr)
-		if err != nil {
-			return fmt.Errorf("redis connection failed: %w", err)
-		}
-		srvCtx.store = store
-
-		registry := NewClientRegistry(store)
-		ctx := context.Background()
-		if err := registry.Start(ctx); err != nil {
-			return fmt.Errorf("registry start failed: %w", err)
-		}
-		srvCtx.registry = registry
-
-		log.Info("Multi-client mode enabled with Redis at %s", cfg.RedisAddr)
-
-		// Start API server
-		if cfg.APIAddr == "" {
-			cfg.APIAddr = "127.0.0.1:8080"
-		}
-		api := NewAPIServer(registry, store, cfg.APIAddr)
-		srvCtx.metrics = api.Metrics() // Store metrics in context
-		go func() {
-			if err := api.Start(ctx); err != nil {
-				log.Error("API server error: %v", err)
-			}
-		}()
-
-		// Periodic stats flush
-		go func() {
-			ticker := time.NewTicker(30 * time.Second)
-			defer ticker.Stop()
-			for range ticker.C {
-				registry.FlushStats(ctx)
-			}
-		}()
-	} else {
-		// Single secret mode (backward compatible)
-		if len(cfg.Secret) == 0 {
-			return fmt.Errorf("secret is required: set -secret flag or TIREDVPN_SECRET env variable")
-		}
-		secretHash := sha256.Sum256(cfg.Secret)
-		log.Debug("Single-client mode, secret hash: %x", secretHash[:8])
+	if err := initClientMode(cfg, srvCtx); err != nil {
+		return err
 	}
 
-	// Upstream (multi-hop) mode
-	if cfg.UpstreamAddr != "" {
-		if cfg.UpstreamSecret == "" {
-			return fmt.Errorf("upstream-secret required when using upstream mode")
-		}
-		srvCtx.upstreamDialer = NewUpstreamDialer(cfg.UpstreamAddr, []byte(cfg.UpstreamSecret))
-		log.Info("Upstream mode enabled: %s", cfg.UpstreamAddr)
+	if err := initUpstreamMode(cfg, srvCtx); err != nil {
+		return err
 	}
 
-	// Initialize IP Pool for TUN mode
-	if cfg.IPPoolNetwork != "" {
-		var redisClient *redis.Client
-		if srvCtx.store != nil {
-			redisClient = srvCtx.store.Client()
-		}
-
-		poolCfg := IPPoolConfig{
-			Network:   cfg.IPPoolNetwork,
-			ServerIP:  cfg.TunIP.String(),
-			LeaseTime: cfg.IPPoolLeaseTime,
-		}
-
-		pool, err := NewIPPool(poolCfg, redisClient)
-		if err != nil {
-			return fmt.Errorf("IP pool initialization failed: %w", err)
-		}
-		srvCtx.ipPool = pool
-
-		// Start cleanup routine for IP leases
-		pool.StartCleanupRoutine(context.Background(), 5*time.Minute)
-
-		log.Info("IP Pool enabled: %s (server=%s, lease=%v)", cfg.IPPoolNetwork, cfg.TunIP, cfg.IPPoolLeaseTime)
-
-		// Create shared TUN device for all clients
-		_, network, err := net.ParseCIDR(cfg.IPPoolNetwork)
-		if err != nil {
-			return fmt.Errorf("failed to parse IP pool network: %w", err)
-		}
-
-		tunName := cfg.TunName
-		if tunName == "" {
-			tunName = "tiredvpn0"
-		}
-		sharedTUN, err := NewSharedTUN(tunName, cfg.TunIP, network, tun.DefaultMTU, 0) // 0 = auto workers
-		if err != nil {
-			return fmt.Errorf("failed to create shared TUN: %w", err)
-		}
-		srvCtx.sharedTUN = sharedTUN
-
-		// Start cleanup for inactive clients (every 2 min, inactive for 5 min)
-		sharedTUN.StartCleanupRoutine(2*time.Minute, 5*time.Minute)
+	if err := initIPPool(cfg, srvCtx); err != nil {
+		return err
 	}
 
-	// Load TLS certificate
-	cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
+	if err := initTLSConfig(cfg, srvCtx); err != nil {
+		return err
+	}
+
+	listener, err := createTCPListener(cfg)
 	if err != nil {
-		return fmt.Errorf("failed to load certificate: %w", err)
-	}
-
-	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		NextProtos: []string{
-			"tired-stego",   // HTTP/2 Stego (explicit, enables kTLS) - FIRST for new clients
-			"tired-raw",     // Raw tunnel (enables kTLS)
-			"tired-morph",   // Traffic Morph (enables kTLS)
-			"tired-ws",      // WebSocket Salamander (enables kTLS)
-			"tired-polling", // HTTP Polling (meek-style, short-lived requests)
-			"h2",            // HTTP/2 (standard fallback for old clients)
-			"http/1.1",      // HTTP/1.1 fallback
-		},
-		MinVersion: tls.VersionTLS12,
-	}
-	srvCtx.tlsConfig = tlsConfig
-
-	// Start raw TCP listener (not TLS) to allow REALITY protocol detection
-	// REALITY sends custom ClientHello that won't pass standard TLS handshake
-	var listener net.Listener
-
-	// Check if port range is configured for multi-port listening
-	if cfg.PortRange != "" {
-		// Parse host and main port from ListenAddr
-		host, mainPortStr, err := net.SplitHostPort(cfg.ListenAddr)
-		if err != nil {
-			host = "0.0.0.0"
-			mainPortStr = ""
-		}
-
-		maxPorts := cfg.PortRangeMaxPorts
-		if maxPorts <= 0 {
-			maxPorts = 50 // default
-		}
-
-		// Parse port range
-		rangePorts, err := ParsePortRange(cfg.PortRange, maxPorts)
-		if err != nil {
-			return fmt.Errorf("failed to parse port range: %w", err)
-		}
-
-		// Include main port if specified and not already in range
-		var allPorts []int
-		if mainPortStr != "" {
-			mainPort, perr := strconv.Atoi(mainPortStr)
-			if perr == nil && mainPort > 0 && mainPort < 65536 {
-				// Check if main port is already in range
-				found := false
-				for _, p := range rangePorts {
-					if p == mainPort {
-						found = true
-						break
-					}
-				}
-				if !found {
-					allPorts = append(allPorts, mainPort)
-					log.Info("Including main port %d in addition to port hopping range", mainPort)
-				}
-			}
-		}
-		allPorts = append(allPorts, rangePorts...)
-
-		listener, err = NewMultiPortListener(host, allPorts)
-		if err != nil {
-			return fmt.Errorf("failed to create multi-port listener: %w", err)
-		}
-
-		if mpl, ok := listener.(*MultiPortListener); ok {
-			log.Info("tiredvpn server %s listening on %d TCP ports (main: %s, range: %s)", Version, mpl.NumPorts(), mainPortStr, cfg.PortRange)
-		} else {
-			log.Info("tiredvpn server %s listening on %s (single port mode)", Version, listener.Addr())
-		}
-	} else {
-		// Single port mode (default)
-		var err error
-		// Fix dual-stack conflict: explicitly bind IPv4 to 0.0.0.0 instead of ::
-		addr := cfg.ListenAddr
-		if strings.HasPrefix(addr, ":") {
-			addr = "0.0.0.0" + addr
-		}
-		listener, err = net.Listen("tcp4", addr)
-		if err != nil {
-			return fmt.Errorf("failed to listen: %w", err)
-		}
-		log.Info("tiredvpn server %s listening on %s", Version, cfg.ListenAddr)
+		return err
 	}
 
 	log.Info("Debug mode: %v", cfg.Debug)
 
-	// Start QUIC server if enabled
-	var quicServer *strategy.QUICServer
-	if cfg.QUICEnabled {
-		// Check UDP buffer sizes for optimal QUIC performance
-		checkUDPBufferSizes()
+	quicServer := startQUICServer(cfg, srvCtx)
 
-		quicAddr := cfg.QUICListenAddr
-		if quicAddr == "" {
-			// Default: same port as TLS but on UDP
-			quicAddr = cfg.ListenAddr
-		}
-
-		quicCfg := strategy.QUICServerConfig{
-			ListenAddr:            quicAddr,
-			CertFile:              cfg.CertFile,
-			KeyFile:               cfg.KeyFile,
-			Secret:                cfg.Secret,
-			SNIFragmentReassembly: cfg.QUICSNIFragReassembly,
-			GetClientSecrets: func() []strategy.SecretInfo {
-				if srvCtx.registry == nil {
-					return nil
-				}
-				clients := srvCtx.registry.ListClients()
-				secrets := make([]strategy.SecretInfo, 0, len(clients))
-				for _, c := range clients {
-					secrets = append(secrets, strategy.SecretInfo{
-						Secret:   []byte(c.Secret),
-						ClientID: c.ID,
-						Name:     c.Name,
-					})
-				}
-				return secrets
-			},
-		}
-
-		// Check if port range is configured for multi-port UDP listening
-		if cfg.PortRange != "" {
-			maxPorts := cfg.PortRangeMaxPorts
-			if maxPorts <= 0 {
-				maxPorts = 50
-			}
-			rangePorts, err := ParsePortRange(cfg.PortRange, maxPorts)
-			if err != nil {
-				log.Warn("QUIC: failed to parse port range: %v, using single port", err)
-			} else if len(rangePorts) > 0 {
-				// Include main QUIC port if not in range
-				var allPorts []int
-				_, mainPortStr, _ := net.SplitHostPort(quicAddr)
-				if mainPortStr != "" {
-					mainPort, perr := strconv.Atoi(mainPortStr)
-					if perr == nil && mainPort > 0 && mainPort < 65536 {
-						found := false
-						for _, p := range rangePorts {
-							if p == mainPort {
-								found = true
-								break
-							}
-						}
-						if !found {
-							allPorts = append(allPorts, mainPort)
-						}
-					}
-				}
-				allPorts = append(allPorts, rangePorts...)
-				quicCfg.Ports = allPorts
-				log.Info("QUIC multi-port mode: %d UDP ports configured", len(allPorts))
-			}
-		}
-
-		quicServer = strategy.NewQUICServer(quicCfg)
-
-		ctx := context.Background()
-		err := quicServer.Start(ctx, func(conn net.Conn) {
-			connID := atomic.AddUint64(&connCounter, 1)
-			handleQUICConnection(conn, srvCtx, connID)
-		})
-		if err != nil {
-			log.Error("Failed to start QUIC server: %v", err)
-		} else if len(quicCfg.Ports) > 0 {
-			log.Info("QUIC server listening on %d UDP ports (port hopping enabled)", len(quicCfg.Ports))
-		} else {
-			log.Info("QUIC server listening on %s (UDP)", quicAddr)
-		}
-	}
-
-	// Handle signals
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	go func() {
-		sig := <-sigChan
-		log.Info("Received signal %v, shutting down...", sig)
-		if srvCtx.registry != nil {
-			srvCtx.registry.Stop()
-		}
-		if srvCtx.store != nil {
-			srvCtx.store.Close()
-		}
-		if quicServer != nil {
-			quicServer.Stop()
-		}
-		listener.Close()
-		os.Exit(0)
-	}()
+	go handleShutdownSignal(sigChan, srvCtx, quicServer, listener)
 
-	// Start dual-stack listeners if IPv6 enabled
 	if cfg.EnableIPv6 && cfg.ListenAddrV6 != "" {
 		log.Info("Starting dual-stack mode: IPv4 and IPv6")
-		// Launch IPv6 listener as independent goroutine — it runs its own accept loop
 		go func() {
 			if err := startIPv6Listener(cfg.ListenAddrV6, srvCtx); err != nil {
 				log.Error("IPv6 listener failed: %v", err)
@@ -553,17 +281,305 @@ func Run(cfg *Config) error {
 		}()
 	}
 
-	// Accept connections (IPv4 only or fallback)
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
 			log.Debug("Accept error: %v", err)
 			continue
 		}
-
 		connID := atomic.AddUint64(&connCounter, 1)
 		go handleConnection(conn, srvCtx, connID)
 	}
+}
+
+// initClientMode sets up multi-client (Redis) or single-secret mode.
+func initClientMode(cfg *Config, srvCtx *serverContext) error {
+	if cfg.RedisAddr != "" {
+		return initRedisMode(cfg, srvCtx)
+	}
+	if len(cfg.Secret) == 0 {
+		return fmt.Errorf("secret is required: set -secret flag or TIREDVPN_SECRET env variable")
+	}
+	secretHash := sha256.Sum256(cfg.Secret)
+	log.Debug("Single-client mode, secret hash: %x", secretHash[:8])
+	return nil
+}
+
+// initRedisMode initialises Redis store, client registry, API server and stats flush.
+func initRedisMode(cfg *Config, srvCtx *serverContext) error {
+	store, err := NewRedisStore(cfg.RedisAddr)
+	if err != nil {
+		return fmt.Errorf("redis connection failed: %w", err)
+	}
+	srvCtx.store = store
+
+	registry := NewClientRegistry(store)
+	ctx := context.Background()
+	if err := registry.Start(ctx); err != nil {
+		return fmt.Errorf("registry start failed: %w", err)
+	}
+	srvCtx.registry = registry
+
+	log.Info("Multi-client mode enabled with Redis at %s", cfg.RedisAddr)
+
+	if cfg.APIAddr == "" {
+		cfg.APIAddr = "127.0.0.1:8080"
+	}
+	api := NewAPIServer(registry, store, cfg.APIAddr)
+	srvCtx.metrics = api.Metrics()
+	go func() {
+		if err := api.Start(ctx); err != nil {
+			log.Error("API server error: %v", err)
+		}
+	}()
+
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			registry.FlushStats(ctx)
+		}
+	}()
+	return nil
+}
+
+// initUpstreamMode configures multi-hop upstream dialer.
+func initUpstreamMode(cfg *Config, srvCtx *serverContext) error {
+	if cfg.UpstreamAddr == "" {
+		return nil
+	}
+	if cfg.UpstreamSecret == "" {
+		return fmt.Errorf("upstream-secret required when using upstream mode")
+	}
+	srvCtx.upstreamDialer = NewUpstreamDialer(cfg.UpstreamAddr, []byte(cfg.UpstreamSecret))
+	log.Info("Upstream mode enabled: %s", cfg.UpstreamAddr)
+	return nil
+}
+
+// initIPPool initialises the IP pool and shared TUN device for TUN mode.
+func initIPPool(cfg *Config, srvCtx *serverContext) error {
+	if cfg.IPPoolNetwork == "" {
+		return nil
+	}
+
+	var redisClient *redis.Client
+	if srvCtx.store != nil {
+		redisClient = srvCtx.store.Client()
+	}
+
+	pool, err := NewIPPool(IPPoolConfig{
+		Network:   cfg.IPPoolNetwork,
+		ServerIP:  cfg.TunIP.String(),
+		LeaseTime: cfg.IPPoolLeaseTime,
+	}, redisClient)
+	if err != nil {
+		return fmt.Errorf("IP pool initialization failed: %w", err)
+	}
+	srvCtx.ipPool = pool
+	pool.StartCleanupRoutine(context.Background(), 5*time.Minute)
+	log.Info("IP Pool enabled: %s (server=%s, lease=%v)", cfg.IPPoolNetwork, cfg.TunIP, cfg.IPPoolLeaseTime)
+
+	_, network, err := net.ParseCIDR(cfg.IPPoolNetwork)
+	if err != nil {
+		return fmt.Errorf("failed to parse IP pool network: %w", err)
+	}
+
+	tunName := cfg.TunName
+	if tunName == "" {
+		tunName = "tiredvpn0"
+	}
+	sharedTUN, err := NewSharedTUN(tunName, cfg.TunIP, network, tun.DefaultMTU, 0)
+	if err != nil {
+		return fmt.Errorf("failed to create shared TUN: %w", err)
+	}
+	srvCtx.sharedTUN = sharedTUN
+	sharedTUN.StartCleanupRoutine(2*time.Minute, 5*time.Minute)
+	return nil
+}
+
+// initTLSConfig loads the TLS certificate and builds the tls.Config.
+func initTLSConfig(cfg *Config, srvCtx *serverContext) error {
+	cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
+	if err != nil {
+		return fmt.Errorf("failed to load certificate: %w", err)
+	}
+	srvCtx.tlsConfig = &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos: []string{
+			"tired-stego",
+			"tired-raw",
+			"tired-morph",
+			"tired-ws",
+			"tired-polling",
+			"h2",
+			"http/1.1",
+		},
+		MinVersion: tls.VersionTLS12,
+	}
+	return nil
+}
+
+// createTCPListener creates the main TCP listener (multi-port or single-port).
+func createTCPListener(cfg *Config) (net.Listener, error) {
+	if cfg.PortRange != "" {
+		return createMultiPortTCPListener(cfg)
+	}
+	addr := cfg.ListenAddr
+	if strings.HasPrefix(addr, ":") {
+		addr = "0.0.0.0" + addr
+	}
+	l, err := net.Listen("tcp4", addr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to listen: %w", err)
+	}
+	log.Info("tiredvpn server %s listening on %s", Version, cfg.ListenAddr)
+	return l, nil
+}
+
+// createMultiPortTCPListener creates a MultiPortListener from the port-range config.
+func createMultiPortTCPListener(cfg *Config) (net.Listener, error) {
+	host, mainPortStr, err := net.SplitHostPort(cfg.ListenAddr)
+	if err != nil {
+		host = "0.0.0.0"
+		mainPortStr = ""
+	}
+
+	maxPorts := cfg.PortRangeMaxPorts
+	if maxPorts <= 0 {
+		maxPorts = 50
+	}
+
+	rangePorts, err := ParsePortRange(cfg.PortRange, maxPorts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse port range: %w", err)
+	}
+
+	allPorts := mergeMainPort(mainPortStr, rangePorts, true)
+	mpl, err := NewMultiPortListener(host, allPorts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create multi-port listener: %w", err)
+	}
+	log.Info("tiredvpn server %s listening on %d TCP ports (main: %s, range: %s)", Version, mpl.NumPorts(), mainPortStr, cfg.PortRange)
+	return mpl, nil
+}
+
+// mergeMainPort prepends mainPortStr to ports if not already present.
+// logIfAdded logs when the main port is added (used for TCP listener only).
+func mergeMainPort(mainPortStr string, rangePorts []int, logIfAdded bool) []int {
+	if mainPortStr == "" {
+		return rangePorts
+	}
+	mainPort, perr := strconv.Atoi(mainPortStr)
+	if perr != nil || mainPort <= 0 || mainPort >= 65536 {
+		return rangePorts
+	}
+	for _, p := range rangePorts {
+		if p == mainPort {
+			return rangePorts
+		}
+	}
+	if logIfAdded {
+		log.Info("Including main port %d in addition to port hopping range", mainPort)
+	}
+	return append([]int{mainPort}, rangePorts...)
+}
+
+// startQUICServer starts the QUIC UDP server if enabled; returns nil if disabled.
+func startQUICServer(cfg *Config, srvCtx *serverContext) *strategy.QUICServer {
+	if !cfg.QUICEnabled {
+		return nil
+	}
+	checkUDPBufferSizes()
+
+	quicAddr := cfg.QUICListenAddr
+	if quicAddr == "" {
+		quicAddr = cfg.ListenAddr
+	}
+
+	quicCfg := buildQUICServerConfig(cfg, srvCtx, quicAddr)
+	srv := strategy.NewQUICServer(quicCfg)
+
+	ctx := context.Background()
+	err := srv.Start(ctx, func(conn net.Conn) {
+		connID := atomic.AddUint64(&connCounter, 1)
+		handleQUICConnection(conn, srvCtx, connID)
+	})
+	if err != nil {
+		log.Error("Failed to start QUIC server: %v", err)
+		return nil
+	}
+	if len(quicCfg.Ports) > 0 {
+		log.Info("QUIC server listening on %d UDP ports (port hopping enabled)", len(quicCfg.Ports))
+	} else {
+		log.Info("QUIC server listening on %s (UDP)", quicAddr)
+	}
+	return srv
+}
+
+// buildQUICServerConfig constructs strategy.QUICServerConfig including multi-port UDP support.
+func buildQUICServerConfig(cfg *Config, srvCtx *serverContext, quicAddr string) strategy.QUICServerConfig {
+	qcfg := strategy.QUICServerConfig{
+		ListenAddr:            quicAddr,
+		CertFile:              cfg.CertFile,
+		KeyFile:               cfg.KeyFile,
+		Secret:                cfg.Secret,
+		SNIFragmentReassembly: cfg.QUICSNIFragReassembly,
+		GetClientSecrets: func() []strategy.SecretInfo {
+			if srvCtx.registry == nil {
+				return nil
+			}
+			clients := srvCtx.registry.ListClients()
+			secrets := make([]strategy.SecretInfo, 0, len(clients))
+			for _, c := range clients {
+				secrets = append(secrets, strategy.SecretInfo{
+					Secret:   []byte(c.Secret),
+					ClientID: c.ID,
+					Name:     c.Name,
+				})
+			}
+			return secrets
+		},
+	}
+
+	if cfg.PortRange == "" {
+		return qcfg
+	}
+
+	maxPorts := cfg.PortRangeMaxPorts
+	if maxPorts <= 0 {
+		maxPorts = 50
+	}
+	rangePorts, err := ParsePortRange(cfg.PortRange, maxPorts)
+	if err != nil {
+		log.Warn("QUIC: failed to parse port range: %v, using single port", err)
+		return qcfg
+	}
+	if len(rangePorts) == 0 {
+		return qcfg
+	}
+
+	_, mainPortStr, _ := net.SplitHostPort(quicAddr)
+	allPorts := mergeMainPort(mainPortStr, rangePorts, false)
+	qcfg.Ports = allPorts
+	log.Info("QUIC multi-port mode: %d UDP ports configured", len(allPorts))
+	return qcfg
+}
+
+// handleShutdownSignal waits for OS signal and performs graceful shutdown.
+func handleShutdownSignal(sigChan chan os.Signal, srvCtx *serverContext, quicServer *strategy.QUICServer, listener net.Listener) {
+	sig := <-sigChan
+	log.Info("Received signal %v, shutting down...", sig)
+	if srvCtx.registry != nil {
+		srvCtx.registry.Stop()
+	}
+	if srvCtx.store != nil {
+		srvCtx.store.Close()
+	}
+	if quicServer != nil {
+		quicServer.Stop()
+	}
+	listener.Close()
+	os.Exit(0)
 }
 
 // runDualStackListeners starts both IPv4 and IPv6 listeners in parallel
@@ -1075,48 +1091,56 @@ type h2TunnelState struct {
 
 // handleHTTP2 handles HTTP/2 connections (including steganography)
 func handleHTTP2(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
-	cfg := srvCtx.cfg
 	logger.Debug("Processing HTTP/2 connection")
 
-	// Read preface (already peeked, skip it)
+	framer, err := initH2Framer(conn, logger)
+	if err != nil {
+		return
+	}
+
+	hpackDec := hpack.NewDecoder(4096, nil)
+
+	authenticated := false
+	var authClientID string
+	var tunnel *h2TunnelState
+	var connTracked bool
+	defer cleanupH2Conn(conn, srvCtx, &tunnel, &connTracked, &authClientID)
+
+	runH2FrameLoop(conn, framer, hpackDec, srvCtx, logger, &authenticated, &authClientID, &connTracked, &tunnel)
+}
+
+// initH2Framer reads the HTTP/2 preface, creates a framer and sends server SETTINGS.
+func initH2Framer(conn net.Conn, logger *log.Logger) (*http2.Framer, error) {
 	preface := make([]byte, 24)
 	if _, err := io.ReadFull(conn, preface); err != nil {
 		logger.Debug("Failed to read HTTP/2 preface: %v", err)
-		return
+		return nil, err
 	}
-
-	// Create framer
 	framer := http2.NewFramer(conn, conn)
 	framer.AllowIllegalReads = true
 	framer.AllowIllegalWrites = true
-
-	// Send server SETTINGS
 	if err := framer.WriteSettings(); err != nil {
 		logger.Debug("Failed to write SETTINGS: %v", err)
-		return
+		return nil, err
 	}
+	return framer, nil
+}
 
-	// HPACK decoder
-	hpackDec := hpack.NewDecoder(4096, nil)
+// cleanupH2Conn closes tunnel target and removes per-client connection tracking on defer.
+func cleanupH2Conn(conn net.Conn, srvCtx *serverContext, tunnel **h2TunnelState, connTracked *bool, authClientID *string) {
+	if *tunnel != nil && (*tunnel).targetConn != nil {
+		(*tunnel).targetConn.Close()
+	}
+	if *connTracked && srvCtx.registry != nil && *authClientID != "" {
+		srvCtx.registry.RemoveConnection(*authClientID, conn)
+	}
+}
 
-	// Process frames
-	authenticated := false
-	var authClientID string // Client ID for IP pool allocation
-	var tunnel *h2TunnelState
-	var connTracked bool // Whether connection was added to registry
-	defer func() {
-		if tunnel != nil && tunnel.targetConn != nil {
-			tunnel.targetConn.Close()
-		}
-		// Remove per-client connection tracking
-		if connTracked && srvCtx.registry != nil && authClientID != "" {
-			srvCtx.registry.RemoveConnection(authClientID, conn)
-		}
-	}()
-
+// runH2FrameLoop reads and dispatches HTTP/2 frames until the connection closes.
+func runH2FrameLoop(conn net.Conn, framer *http2.Framer, hpackDec *hpack.Decoder, srvCtx *serverContext, logger *log.Logger, authenticated *bool, authClientID *string, connTracked *bool, tunnel **h2TunnelState) {
+	cfg := srvCtx.cfg
 	for {
 		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-
 		frame, err := framer.ReadFrame()
 		if err != nil {
 			if err != io.EOF {
@@ -1124,7 +1148,6 @@ func handleHTTP2(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
 			}
 			return
 		}
-
 		logger.Debug("Received frame: %T (stream=%d)", frame, frame.Header().StreamID)
 
 		switch f := frame.(type) {
@@ -1133,155 +1156,158 @@ func handleHTTP2(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
 				logger.Debug("Received SETTINGS, sending ACK")
 				framer.WriteSettingsAck()
 			}
-
 		case *http2.HeadersFrame:
-			// Extract headers for auth check
-			var apiKey, requestID string
-
-			hpackDec.SetEmitFunc(func(hf hpack.HeaderField) {
-				logger.Debug("  Header: %s = %s", hf.Name, truncate(hf.Value, 50))
-				switch hf.Name {
-				case "x-goog-api-key":
-					apiKey = hf.Value
-				case "x-goog-request-id":
-					requestID = hf.Value
-				}
-			})
-			hpackDec.Write(f.HeaderBlockFragment())
-
-			// Check for steganography auth
-			if apiKey != "" && requestID != "" {
-				authenticated = false
-				var usedSecret []byte
-
-				// 1. Try per-client secrets from Redis (if registry exists)
-				if srvCtx.registry != nil {
-					clients := srvCtx.registry.ListClients()
-					for _, client := range clients {
-						if verifyH2Auth(apiKey, requestID, []byte(client.Secret)) {
-							logger.Info("HTTP/2 steganography authenticated (client: %s, id: %s)", client.Name, client.ID)
-							authenticated = true
-							usedSecret = []byte(client.Secret)
-							authClientID = client.ID
-							break
-						}
-					}
-				}
-
-				// 2. Fallback to global secret (if not found in registry and global secret exists)
-				if !authenticated && len(cfg.Secret) > 0 {
-					if verifyH2Auth(apiKey, requestID, cfg.Secret) {
-						logger.Info("HTTP/2 steganography authenticated (global secret)")
-						authenticated = true
-						usedSecret = cfg.Secret
-						authClientID = "global"
-					}
-				}
-
-				if authenticated {
-					// Send auth acknowledgment
-					sendH2AuthAck(framer, f.StreamID, usedSecret)
-
-					// Track per-client connection (only once per connection)
-					if !connTracked && srvCtx.registry != nil && authClientID != "" {
-						if err := srvCtx.registry.AddConnection(authClientID, conn); err != nil {
-							logger.Warn("Failed to track H2 connection for client %s: %v", authClientID, err)
-						} else {
-							connTracked = true
-						}
-					}
-				} else {
-					logger.Warn("HTTP/2 steganography auth FAILED")
-				}
-			}
-
+			processH2HeadersFrame(conn, f, framer, hpackDec, srvCtx, logger, authenticated, authClientID, connTracked)
 		case *http2.DataFrame:
-			if !authenticated {
+			if !*authenticated {
 				logger.Debug("Received DATA before auth, ignoring")
 				continue
 			}
-
-			data := f.Data()
-			logger.Debug("Received DATA: %d bytes", len(data))
-
-			// Check for our steganography format
-			if len(data) >= 7 && bytes.Equal(data[0:4], []byte("TIRD")) {
-				flags := data[4]
-				length := binary.BigEndian.Uint16(data[5:7])
-
-				logger.Debug("Stego frame: flags=%02x, length=%d", flags, length)
-
-				if int(length) <= len(data)-7 {
-					payload := data[7 : 7+length]
-
-					// De-obfuscate if needed
-					if flags&0x01 != 0 {
-						paddingKey := deriveKey(cfg.Secret, "padding-key")
-						for i := range payload {
-							payload[i] ^= paddingKey[i%len(paddingKey)]
-						}
-					}
-
-					logger.Debug("Extracted payload: %d bytes", len(payload))
-
-					// If no tunnel yet, this is the connection request
-					if tunnel == nil {
-						tunnel = &h2TunnelState{streamID: f.StreamID, clientID: authClientID}
-						setupH2Tunnel(tunnel, framer, payload, srvCtx, logger)
-					} else if tunnel.targetConn != nil {
-						// Check if this is TUN mode (targetConn is h2TunConn)
-						if _, ok := tunnel.targetConn.(*h2TunConn); ok {
-							// Update stream ID for responses
-							tunnel.streamID = f.StreamID
-
-							// TUN mode - process IP packets via shared TUN
-							// Payload format: [len:4][packet:N]
-							if len(payload) >= 4 && tunnel.sharedTUN != nil {
-								pktLen := binary.BigEndian.Uint32(payload[0:4])
-								logger.Debug("H2 TUN: received payload len=%d, pktLen=%d", len(payload), pktLen)
-								if int(pktLen) <= len(payload)-4 && pktLen >= 20 {
-									ipPkt := payload[4 : 4+pktLen]
-									logger.Debug("H2 TUN: writing %d bytes to TUN, first 20: %x", len(ipPkt), ipPkt[:minInt(20, len(ipPkt))])
-									// Write to shared TUN device
-									if _, err := tunnel.sharedTUN.TUNDevice().Write(ipPkt); err != nil {
-										logger.Debug("H2 TUN write error: %v", err)
-									} else {
-										logger.Debug("H2 TUN: wrote %d bytes to TUN successfully", len(ipPkt))
-									}
-									// Update activity
-									if tunnel.sharedTUNWriter != nil {
-										tunnel.sharedTUNWriter.UpdateActivity()
-									}
-								} else {
-									logger.Debug("H2 TUN: invalid packet - pktLen=%d, payload=%d", pktLen, len(payload))
-								}
-							}
-						} else {
-							// Regular proxy mode - forward data to target
-							// Check for control message first
-							if control.IsControlMessage(payload) {
-								control.HandleServerMessage(conn, payload)
-								continue
-							}
-
-							tunnel.mu.Lock()
-							n, err := tunnel.targetConn.Write(payload)
-							tunnel.mu.Unlock()
-							if err != nil {
-								logger.Debug("Write to target failed: %v", err)
-							} else {
-								logger.Debug("Wrote %d bytes to target (first 20: %x)", n, payload[:minInt(20, len(payload))])
-							}
-						}
-					}
-				}
-			}
-
+			handleH2DataFrame(conn, f, framer, cfg, srvCtx, *tunnel, *authClientID, logger, tunnel)
 		case *http2.WindowUpdateFrame:
 			// Ignore
 		case *http2.PingFrame:
 			framer.WritePing(true, f.Data)
 		}
+	}
+}
+
+// processH2HeadersFrame extracts auth headers and, if valid, marks the connection authenticated.
+func processH2HeadersFrame(conn net.Conn, f *http2.HeadersFrame, framer *http2.Framer, hpackDec *hpack.Decoder, srvCtx *serverContext, logger *log.Logger, authenticated *bool, authClientID *string, connTracked *bool) {
+	var apiKey, requestID string
+	hpackDec.SetEmitFunc(func(hf hpack.HeaderField) {
+		logger.Debug("  Header: %s = %s", hf.Name, truncate(hf.Value, 50))
+		switch hf.Name {
+		case "x-goog-api-key":
+			apiKey = hf.Value
+		case "x-goog-request-id":
+			requestID = hf.Value
+		}
+	})
+	hpackDec.Write(f.HeaderBlockFragment())
+
+	if apiKey == "" || requestID == "" {
+		return
+	}
+
+	ok, clientID, secret := verifyH2AuthMulti(srvCtx, apiKey, requestID, logger)
+	if !ok {
+		logger.Warn("HTTP/2 steganography auth FAILED")
+		return
+	}
+
+	*authenticated = true
+	*authClientID = clientID
+	sendH2AuthAck(framer, f.StreamID, secret)
+
+	if !*connTracked && srvCtx.registry != nil && clientID != "" {
+		if err := srvCtx.registry.AddConnection(clientID, conn); err != nil {
+			logger.Warn("Failed to track H2 connection for client %s: %v", clientID, err)
+		} else {
+			*connTracked = true
+		}
+	}
+}
+
+// verifyH2AuthMulti checks per-client secrets then global secret for HTTP/2 stego auth.
+// Returns (ok, clientID, usedSecret).
+func verifyH2AuthMulti(srvCtx *serverContext, apiKey, requestID string, logger *log.Logger) (bool, string, []byte) {
+	if srvCtx.registry != nil {
+		for _, client := range srvCtx.registry.ListClients() {
+			if verifyH2Auth(apiKey, requestID, []byte(client.Secret)) {
+				logger.Info("HTTP/2 steganography authenticated (client: %s, id: %s)", client.Name, client.ID)
+				return true, client.ID, []byte(client.Secret)
+			}
+		}
+	}
+	if len(srvCtx.cfg.Secret) > 0 && verifyH2Auth(apiKey, requestID, srvCtx.cfg.Secret) {
+		logger.Info("HTTP/2 steganography authenticated (global secret)")
+		return true, "global", srvCtx.cfg.Secret
+	}
+	return false, "", nil
+}
+
+// handleH2DataFrame processes an authenticated HTTP/2 DATA frame.
+func handleH2DataFrame(conn net.Conn, f *http2.DataFrame, framer *http2.Framer, cfg *Config, srvCtx *serverContext, _ *h2TunnelState, authClientID string, logger *log.Logger, tunnelPtr **h2TunnelState) {
+	data := f.Data()
+	logger.Debug("Received DATA: %d bytes", len(data))
+
+	if len(data) < 7 || !bytes.Equal(data[0:4], []byte("TIRD")) {
+		return
+	}
+
+	flags := data[4]
+	length := binary.BigEndian.Uint16(data[5:7])
+	logger.Debug("Stego frame: flags=%02x, length=%d", flags, length)
+
+	if int(length) > len(data)-7 {
+		return
+	}
+
+	payload := data[7 : 7+length]
+	if flags&0x01 != 0 {
+		paddingKey := deriveKey(cfg.Secret, "padding-key")
+		for i := range payload {
+			payload[i] ^= paddingKey[i%len(paddingKey)]
+		}
+	}
+	logger.Debug("Extracted payload: %d bytes", len(payload))
+
+	tunnel := *tunnelPtr
+	if tunnel == nil {
+		t := &h2TunnelState{streamID: f.StreamID, clientID: authClientID}
+		setupH2Tunnel(t, framer, payload, srvCtx, logger)
+		*tunnelPtr = t
+		return
+	}
+	if tunnel.targetConn == nil {
+		return
+	}
+
+	if _, ok := tunnel.targetConn.(*h2TunConn); ok {
+		forwardH2TUNPacket(tunnel, f.StreamID, payload, logger)
+	} else {
+		forwardH2ProxyData(conn, tunnel, payload, logger)
+	}
+}
+
+// forwardH2TUNPacket writes an IP packet from the stego payload to the shared TUN device.
+func forwardH2TUNPacket(tunnel *h2TunnelState, streamID uint32, payload []byte, logger *log.Logger) {
+	tunnel.streamID = streamID
+	if len(payload) < 4 || tunnel.sharedTUN == nil {
+		return
+	}
+	pktLen := binary.BigEndian.Uint32(payload[0:4])
+	logger.Debug("H2 TUN: received payload len=%d, pktLen=%d", len(payload), pktLen)
+	if int(pktLen) > len(payload)-4 || pktLen < 20 {
+		logger.Debug("H2 TUN: invalid packet - pktLen=%d, payload=%d", pktLen, len(payload))
+		return
+	}
+	ipPkt := payload[4 : 4+pktLen]
+	logger.Debug("H2 TUN: writing %d bytes to TUN, first 20: %x", len(ipPkt), ipPkt[:minInt(20, len(ipPkt))])
+	if _, err := tunnel.sharedTUN.TUNDevice().Write(ipPkt); err != nil {
+		logger.Debug("H2 TUN write error: %v", err)
+	} else {
+		logger.Debug("H2 TUN: wrote %d bytes to TUN successfully", len(ipPkt))
+	}
+	if tunnel.sharedTUNWriter != nil {
+		tunnel.sharedTUNWriter.UpdateActivity()
+	}
+}
+
+// forwardH2ProxyData forwards stego payload to the proxy target connection.
+func forwardH2ProxyData(conn net.Conn, tunnel *h2TunnelState, payload []byte, logger *log.Logger) {
+	if control.IsControlMessage(payload) {
+		control.HandleServerMessage(conn, payload)
+		return
+	}
+	tunnel.mu.Lock()
+	n, err := tunnel.targetConn.Write(payload)
+	tunnel.mu.Unlock()
+	if err != nil {
+		logger.Debug("Write to target failed: %v", err)
+	} else {
+		logger.Debug("Wrote %d bytes to target (first 20: %x)", n, payload[:minInt(20, len(payload))])
 	}
 }
 
