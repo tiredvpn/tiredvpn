@@ -1,0 +1,47 @@
+{
+  "listen_addr": "127.0.0.1:1080",
+  "remote_addr": "your-server.com:443",
+  "mode": "ws",
+  "cover_sni": "yandex.ru",
+  "tls_fingerprint": "chrome",
+  "alpn": ["http/1.1"],
+
+  "sni_pool": [
+    "yandex.ru",
+    "ya.ru",
+    "yandex.net",
+    "vk.com",
+    "mail.ru",
+    "sberbank.ru",
+    "gosuslugi.ru"
+  ],
+
+  "fake_packet": {
+    "enabled": true,
+    "ttl": 2,
+    "bad_checksum": true,
+    "fake_sni": "gosuslugi.ru",
+    "count": 2
+  },
+
+  "fragment": {
+    "enabled": true,
+    "size": 3,
+    "split_position": 2,
+    "delay": "0ms",
+    "buffer_flood": false
+  },
+
+  "websocket": {
+    "path": "/portal/websocket",
+    "headers": {
+      "Origin": "https://yandex.ru",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    },
+    "binary_frames": true,
+    "ping_interval": "30s"
+  },
+
+  "connect_timeout": "10s",
+  "verbose": false
+}

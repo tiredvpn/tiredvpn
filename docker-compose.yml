@@ -1,0 +1,14 @@
+version: '3.8'
+services:
+  tiredvpn-server:
+    image: tiredvpn/tiredvpn:latest
+    ports:
+      - "${TIREDVPN_PORT:-443}:443/tcp"
+      - "${TIREDVPN_PORT:-443}:443/udp"
+      - "${TIREDVPN_PORT_V6:-995}:995/tcp"
+      - "${TIREDVPN_PORT_V6:-995}:995/udp"
+    volumes:
+      - ./certs:/certs:ro
+      - ./configs:/etc/tiredvpn
+    command: ["server", "-listen", ":443", "-cert", "/certs/server.crt", "-key", "/certs/server.key", "-secret", "${TIREDVPN_SECRET}"]
+    restart: unless-stopped

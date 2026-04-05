@@ -1,0 +1,37 @@
+# Binaries
+/tiredvpn
+*.exe
+*.test
+*.out
+
+# Test artifacts
+coverage.out
+*.prof
+*.test
+
+# Dependencies
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+*.env
+
+# AI tools
+.claude/
+.beads/
+.cursor/
+.aider/
+
+# Build
+dist/

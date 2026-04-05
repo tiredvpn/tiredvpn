@@ -1,0 +1,113 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: VERSION=${{ steps.version.outputs.version }}
+          tags: |
+            tiredvpn/tiredvpn:latest
+            tiredvpn/tiredvpn:${{ steps.version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Build linux/amd64
+        env:
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          go build -ldflags="-s -w" -o tiredvpn-linux-amd64 ./cmd/tiredvpn/
+          tar -czf tiredvpn-linux-amd64.tar.gz tiredvpn-linux-amd64
+
+      - name: Build linux/arm64
+        env:
+          GOOS: linux
+          GOARCH: arm64
+        run: |
+          go build -ldflags="-s -w" -o tiredvpn-linux-arm64 ./cmd/tiredvpn/
+          tar -czf tiredvpn-linux-arm64.tar.gz tiredvpn-linux-arm64
+
+      - name: Build darwin/amd64
+        env:
+          GOOS: darwin
+          GOARCH: amd64
+        run: |
+          go build -ldflags="-s -w" -o tiredvpn-darwin-amd64 ./cmd/tiredvpn/
+          tar -czf tiredvpn-darwin-amd64.tar.gz tiredvpn-darwin-amd64
+
+      - name: Build darwin/arm64
+        env:
+          GOOS: darwin
+          GOARCH: arm64
+        run: |
+          go build -ldflags="-s -w" -o tiredvpn-darwin-arm64 ./cmd/tiredvpn/
+          tar -czf tiredvpn-darwin-arm64.tar.gz tiredvpn-darwin-arm64
+
+      - name: Build windows/amd64
+        env:
+          GOOS: windows
+          GOARCH: amd64
+        run: |
+          go build -ldflags="-s -w" -o tiredvpn-windows-amd64.exe ./cmd/tiredvpn/
+          zip tiredvpn-windows-amd64.zip tiredvpn-windows-amd64.exe
+
+      - name: Generate checksums
+        run: |
+          sha256sum \
+            tiredvpn-linux-amd64.tar.gz \
+            tiredvpn-linux-arm64.tar.gz \
+            tiredvpn-darwin-amd64.tar.gz \
+            tiredvpn-darwin-arm64.tar.gz \
+            tiredvpn-windows-amd64.zip \
+            > checksums.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            tiredvpn-linux-amd64.tar.gz
+            tiredvpn-linux-arm64.tar.gz
+            tiredvpn-darwin-amd64.tar.gz
+            tiredvpn-darwin-arm64.tar.gz
+            tiredvpn-windows-amd64.zip
+            checksums.txt

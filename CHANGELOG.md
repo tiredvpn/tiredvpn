@@ -1,0 +1,43 @@
+# Changelog
+
+All notable changes to TiredVPN are documented in this file.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+Versions follow [Semantic Versioning](https://semver.org/).
+
+## [1.0.0] - 2026-04-03
+
+### Added
+
+- **Adaptive strategy engine** — probes available transports, ranks by latency/reliability, falls back seamlessly mid-session
+- **20+ DPI bypass strategies**:
+  - REALITY — impersonates real TLS handshakes of legitimate websites
+  - QUIC Salamander — UDP transport with packet padding to defeat traffic analysis
+  - HTTP/2 Steganography — tunnel data inside real HTTP/2 frames
+  - WebSocket Padded — WebSocket framing with random padding
+  - Traffic Morphing — statistically matches CDN/streaming traffic patterns
+  - Protocol Confusion — mixes protocol signatures to confuse DPI classifiers
+  - Geneva — country-specific packet manipulation (Russia, China, Iran, Turkey)
+  - HTTP Polling — covert data transfer over chunked HTTP responses
+  - Anti-Probe — active probe detection and response
+  - State Exhaustion — forces DPI state machine resets
+  - ECH (Encrypted Client Hello) — hides SNI from deep inspection
+  - TLS Mimicry — mirrors TLS fingerprints of popular browsers
+  - QUIC SNI Fragmentation — splits SNI across multiple QUIC packets
+  - Mux (smux) — multiplexed streams over a single connection
+  - RTT Masking — randomizes inter-packet timing
+  - ICMP Tunnel (stealth) — data transport over ICMP echo
+  - Port Hopping — random, sequential, and Fibonacci port rotation
+  - IPv6 Transport — dual-stack with automatic fallback
+  - Mesh — distributed relay network
+- **Post-quantum cryptography** — ML-KEM-768 (key encapsulation) + ML-DSA-65 (signatures)
+- **TUN mode** — full system traffic tunneling (Linux)
+- **SOCKS5 and HTTP proxy** modes
+- **Multiplexed connections** via smux for efficient stream management
+- **Client management** — Redis backend, REST API, QR code generation for mobile provisioning
+- **Docker support** — multi-stage builds for minimal images
+- **Prometheus-compatible metrics** endpoint
+- **Android JNI integration** — compiled as `c-shared` for embedding in the Android client
+- **Multi-hop routing** — chain multiple servers for additional anonymity
+- **ALPN-based routing** — single port serves multiple protocols transparently
+- **Fake website** — unauthenticated visitors see a real-looking HTTPS site; the server is indistinguishable from nginx

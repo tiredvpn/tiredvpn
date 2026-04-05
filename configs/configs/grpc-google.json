@@ -1,0 +1,50 @@
+{
+  "listen_addr": "127.0.0.1:1080",
+  "remote_addr": "your-server.com:443",
+  "mode": "grpc",
+  "cover_sni": "firestore.googleapis.com",
+  "tls_fingerprint": "chrome",
+  "alpn": ["h2", "http/1.1"],
+
+  "sni_pool": [
+    "firestore.googleapis.com",
+    "pubsub.googleapis.com",
+    "speech.googleapis.com",
+    "bigquerystorage.googleapis.com",
+    "cloudresourcemanager.googleapis.com"
+  ],
+
+  "fake_packet": {
+    "enabled": true,
+    "ttl": 2,
+    "bad_checksum": true,
+    "bad_seq": false,
+    "fake_sni": "yandex.ru",
+    "count": 3,
+    "position": "before"
+  },
+
+  "fragment": {
+    "enabled": false,
+    "size": 2,
+    "split_position": 1,
+    "buffer_flood": false
+  },
+
+  "grpc": {
+    "service_name": "google.firestore.v1.Firestore",
+    "method_name": "Listen",
+    "headers": {
+      "user-agent": "grpc-go/1.59.0",
+      "content-type": "application/grpc",
+      "grpc-encoding": "identity",
+      "grpc-accept-encoding": "identity,deflate,gzip"
+    },
+    "padding": true
+  },
+
+  "connect_timeout": "10s",
+  "read_timeout": "60s",
+  "write_timeout": "60s",
+  "verbose": false
+}
