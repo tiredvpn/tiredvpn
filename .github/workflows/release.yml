@@ -66,38 +66,11 @@ jobs:
           go build -ldflags="-s -w" -o tiredvpn-linux-arm64 ./cmd/tiredvpn/
           tar -czf tiredvpn-linux-arm64.tar.gz tiredvpn-linux-arm64
 
-      - name: Build darwin/amd64
-        env:
-          GOOS: darwin
-          GOARCH: amd64
-        run: |
-          go build -ldflags="-s -w" -o tiredvpn-darwin-amd64 ./cmd/tiredvpn/
-          tar -czf tiredvpn-darwin-amd64.tar.gz tiredvpn-darwin-amd64
-
-      - name: Build darwin/arm64
-        env:
-          GOOS: darwin
-          GOARCH: arm64
-        run: |
-          go build -ldflags="-s -w" -o tiredvpn-darwin-arm64 ./cmd/tiredvpn/
-          tar -czf tiredvpn-darwin-arm64.tar.gz tiredvpn-darwin-arm64
-
-      - name: Build windows/amd64
-        env:
-          GOOS: windows
-          GOARCH: amd64
-        run: |
-          go build -ldflags="-s -w" -o tiredvpn-windows-amd64.exe ./cmd/tiredvpn/
-          zip tiredvpn-windows-amd64.zip tiredvpn-windows-amd64.exe
-
       - name: Generate checksums
         run: |
           sha256sum \
             tiredvpn-linux-amd64.tar.gz \
             tiredvpn-linux-arm64.tar.gz \
-            tiredvpn-darwin-amd64.tar.gz \
-            tiredvpn-darwin-arm64.tar.gz \
-            tiredvpn-windows-amd64.zip \
             > checksums.txt
 
       - name: Create Release
@@ -107,7 +80,4 @@ jobs:
           files: |
             tiredvpn-linux-amd64.tar.gz
             tiredvpn-linux-arm64.tar.gz
-            tiredvpn-darwin-amd64.tar.gz
-            tiredvpn-darwin-arm64.tar.gz
-            tiredvpn-windows-amd64.zip
             checksums.txt
