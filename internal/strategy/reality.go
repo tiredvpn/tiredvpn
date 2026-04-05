@@ -32,10 +32,10 @@ type REALITYStrategy struct {
 	clientPubKey  [32]byte
 
 	// Post-Quantum crypto (optional)
-	pqEnabled       bool
-	pqKeyExchange   *customtls.HybridKeyExchange
-	pqSignature     *customtls.QuantumSignature
-	serverPQKemPub  []byte // Server's Kyber768 public key (for encapsulation)
+	pqEnabled      bool
+	pqKeyExchange  *customtls.HybridKeyExchange
+	pqSignature    *customtls.QuantumSignature
+	serverPQKemPub []byte // Server's Kyber768 public key (for encapsulation)
 }
 
 // NewREALITYStrategy creates a new REALITY strategy
@@ -235,10 +235,10 @@ func (r *REALITYStrategy) Connect(ctx context.Context, target string) (net.Conn,
 
 	// Return wrapped connection (could add additional framing here if needed)
 	return &realityConn{
-		Conn:       tcpConn,
-		target:     target,
-		dest:       dest,
-		isEstab:    true,
+		Conn:    tcpConn,
+		target:  target,
+		dest:    dest,
+		isEstab: true,
 	}, nil
 }
 
@@ -257,8 +257,8 @@ func (r *REALITYStrategy) selectDestination() (string, error) {
 
 	// Get Tier 1 SNIs (Russian services + banking)
 	tier1SNIs := r.getRussianSNIs()
-    tier1SNIs = append(tier1SNIs, r.getChineseSNIs()...)
-    tier1SNIs = append(tier1SNIs, r.getIranianSNIs()...)
+	tier1SNIs = append(tier1SNIs, r.getChineseSNIs()...)
+	tier1SNIs = append(tier1SNIs, r.getIranianSNIs()...)
 
 	// Try up to 10 times to find a non-recent destination
 	for attempt := 0; attempt < 10; attempt++ {

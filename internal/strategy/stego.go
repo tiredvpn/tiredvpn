@@ -270,10 +270,10 @@ type HTTP2StegoConn struct {
 	paddingKey    []byte
 
 	// Fast path optimization for TUN mode
-	tunMode       bool          // Enable optimized TUN mode
-	writeBuf      bytes.Buffer  // Buffer for batching small writes
-	lastWriteTime time.Time     // Last write timestamp for batch timeout
-	batchTimer    *time.Timer   // Timer for flushing batched writes
+	tunMode       bool         // Enable optimized TUN mode
+	writeBuf      bytes.Buffer // Buffer for batching small writes
+	lastWriteTime time.Time    // Last write timestamp for batch timeout
+	batchTimer    *time.Timer  // Timer for flushing batched writes
 
 	// Rate limiting for TSPU evasion (client-side only)
 	rateLimiter *rateLimiterWrapper
@@ -710,11 +710,11 @@ func (sc *HTTP2StegoConn) writeViaPaddedData(data []byte) (int, error) {
 	}
 	frame := make([]byte, 7+chunkSize+coverLen)
 
-	copy(frame[0:4], []byte("TIRD"))                             // Magic
-	frame[4] = 0x01                                              // Flag: obfuscated
-	binary.BigEndian.PutUint16(frame[5:7], uint16(chunkSize))    // Length
-	copy(frame[7:7+chunkSize], obfuscated)                       // Obfuscated data
-	rand.Read(frame[7+chunkSize:])                               // Cover data
+	copy(frame[0:4], []byte("TIRD"))                          // Magic
+	frame[4] = 0x01                                           // Flag: obfuscated
+	binary.BigEndian.PutUint16(frame[5:7], uint16(chunkSize)) // Length
+	copy(frame[7:7+chunkSize], obfuscated)                    // Obfuscated data
+	rand.Read(frame[7+chunkSize:])                            // Cover data
 
 	if err := sc.framer.WriteData(streamID, false, frame); err != nil {
 		return 0, err
@@ -1003,12 +1003,12 @@ func (sc *HTTP2StegoConn) calculateNaivePadding(dataLen int) int {
 		return overhead + variability
 	case NaivePaddingStandard:
 		// 15-25% padding (balanced)
-		overhead := dataLen / 6                    // ~16% base
+		overhead := dataLen / 6                     // ~16% base
 		variability := int(sc.methodCounter%10) - 5 // ±5% variation
 		return overhead + variability
 	case NaivePaddingParanoid:
 		// 30-50% padding (maximum security)
-		overhead := dataLen * 2 / 5                 // 40% base
+		overhead := dataLen * 2 / 5                  // 40% base
 		variability := int(sc.methodCounter%20) - 10 // ±10% variation
 		return overhead + variability
 	default:

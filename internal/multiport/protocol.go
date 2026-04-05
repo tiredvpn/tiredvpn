@@ -68,7 +68,7 @@ func (p *Packet) Marshal() ([]byte, error) {
 	copy(buf[HeaderSize:], p.Payload)
 
 	// Calculate checksum over entire packet (except checksum field itself)
-	checksum := crc32.ChecksumIEEE(buf[:12]) // Header before checksum
+	checksum := crc32.ChecksumIEEE(buf[:12])         // Header before checksum
 	checksum ^= crc32.ChecksumIEEE(buf[HeaderSize:]) // Payload
 	binary.BigEndian.PutUint16(buf[14:16], uint16(checksum&0xFFFF))
 
@@ -113,8 +113,8 @@ type AckPacket struct {
 	Version   uint8
 	Flags     uint8
 	SessionID uint16
-	AckBase   uint64  // Lowest unacknowledged sequence number
-	AckBitmap []byte  // Bitmap for selective ACK (256 bits = 32 bytes max)
+	AckBase   uint64 // Lowest unacknowledged sequence number
+	AckBitmap []byte // Bitmap for selective ACK (256 bits = 32 bytes max)
 }
 
 // Marshal serializes an ACK packet
@@ -181,7 +181,7 @@ func (a *AckPacket) SetAcked(seq uint64) {
 	offset := seq - a.AckBase
 	if offset >= uint64(len(a.AckBitmap)*8) {
 		// Need to extend bitmap
-		newSize := int((offset/8)+1)
+		newSize := int((offset / 8) + 1)
 		if newSize > 32 {
 			newSize = 32 // Cap at 256 bits
 		}
@@ -208,6 +208,6 @@ type HandshakeRequest struct {
 type HandshakeResponse struct {
 	StartPort int    `json:"start_port"`
 	Count     int    `json:"count"`
-	Secret    string `json:"secret"` // hex encoded
+	Secret    string `json:"secret"`     // hex encoded
 	SessionID string `json:"session_id"` // UUID
 }

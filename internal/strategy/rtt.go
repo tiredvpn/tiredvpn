@@ -53,14 +53,14 @@ type RTTMaskingConfig struct {
 
 // RTTProfile defines RTT characteristics for a typical connection
 type RTTProfile struct {
-	Name           string
-	MeanDelay      time.Duration
-	StdDev         time.Duration
-	MinDelay       time.Duration
-	MaxDelay       time.Duration
-	BurstSize      int
-	BurstInterval  time.Duration
-	Description    string
+	Name          string
+	MeanDelay     time.Duration
+	StdDev        time.Duration
+	MinDelay      time.Duration
+	MaxDelay      time.Duration
+	BurstSize     int
+	BurstInterval time.Duration
+	Description   string
 }
 
 // Predefined RTT profiles for different "cover" scenarios
@@ -90,29 +90,29 @@ var (
 	}
 
 	// RegionalRussiaProfile mimics RTT from regions to Moscow (~20-50ms)
-        // BeijingToBaiduProfile mimics RTT from Beijing to Baidu (~5-15ms)
-        BeijingToBaiduProfile = &RTTProfile{
-                Name:          "beijing-baidu",
-                MeanDelay:     10 * time.Millisecond,
-                StdDev:        3 * time.Millisecond,
-                MinDelay:      5 * time.Millisecond,
-                MaxDelay:      25 * time.Millisecond,
-                BurstSize:     8,
-                BurstInterval: 50 * time.Millisecond,
-                Description:   "Beijing to Baidu datacenter (domestic)",
-        }
+	// BeijingToBaiduProfile mimics RTT from Beijing to Baidu (~5-15ms)
+	BeijingToBaiduProfile = &RTTProfile{
+		Name:          "beijing-baidu",
+		MeanDelay:     10 * time.Millisecond,
+		StdDev:        3 * time.Millisecond,
+		MinDelay:      5 * time.Millisecond,
+		MaxDelay:      25 * time.Millisecond,
+		BurstSize:     8,
+		BurstInterval: 50 * time.Millisecond,
+		Description:   "Beijing to Baidu datacenter (domestic)",
+	}
 
-        // TehranToAparatProfile mimics RTT from Tehran to Aparat (~10-25ms)
-        TehranToAparatProfile = &RTTProfile{
-                Name:          "tehran-aparat",
-                MeanDelay:     15 * time.Millisecond,
-                StdDev:        5 * time.Millisecond,
-                MinDelay:      8 * time.Millisecond,
-                MaxDelay:      35 * time.Millisecond,
-                BurstSize:     6,
-                BurstInterval: 60 * time.Millisecond,
-                Description:   "Tehran to Aparat datacenter (domestic)",
-        }
+	// TehranToAparatProfile mimics RTT from Tehran to Aparat (~10-25ms)
+	TehranToAparatProfile = &RTTProfile{
+		Name:          "tehran-aparat",
+		MeanDelay:     15 * time.Millisecond,
+		StdDev:        5 * time.Millisecond,
+		MinDelay:      8 * time.Millisecond,
+		MaxDelay:      35 * time.Millisecond,
+		BurstSize:     6,
+		BurstInterval: 60 * time.Millisecond,
+		Description:   "Tehran to Aparat datacenter (domestic)",
+	}
 
 	RegionalRussiaProfile = &RTTProfile{
 		Name:          "regional-russia",
@@ -158,8 +158,8 @@ func AllRTTProfiles() []*RTTProfile {
 		RegionalRussiaProfile,
 		SiberiaProfile,
 		CDNProfile,
-                BeijingToBaiduProfile,
-                TehranToAparatProfile,
+		BeijingToBaiduProfile,
+		TehranToAparatProfile,
 	}
 }
 
@@ -198,7 +198,7 @@ type RTTMaskingConn struct {
 	lastBurstTime time.Time
 
 	// Adaptive stats
-	observedRTTs  []time.Duration
+	observedRTTs   []time.Duration
 	avgObservedRTT time.Duration
 }
 

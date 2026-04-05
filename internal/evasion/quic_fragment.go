@@ -432,7 +432,6 @@ func writeVarInt(buf *bytes.Buffer, v uint64) {
 	}
 }
 
-
 // ChromeChaosProtection implements Chrome's Chaos Protection mechanism
 // Disperses QUIC client Initial message into multiple QUIC frames shuffled across UDP datagrams
 type ChromeChaosProtection struct {

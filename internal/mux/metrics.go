@@ -9,10 +9,10 @@ import (
 // Metrics tracks mux layer statistics
 type Metrics struct {
 	// Stream statistics
-	StreamsOpened  uint64 // Total streams opened
-	StreamsClosed  uint64 // Total streams closed
-	StreamsActive  int64  // Currently active streams (can go negative temporarily during race)
-	StreamsFailed  uint64 // Failed stream open attempts
+	StreamsOpened uint64 // Total streams opened
+	StreamsClosed uint64 // Total streams closed
+	StreamsActive int64  // Currently active streams (can go negative temporarily during race)
+	StreamsFailed uint64 // Failed stream open attempts
 
 	// Data transfer statistics
 	BytesSent     uint64 // Total bytes sent across all streams

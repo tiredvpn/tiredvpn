@@ -19,10 +19,10 @@ import (
 // GenevaStrategy applies Geneva-style packet manipulation to evade DPI
 // It works by fragmenting the TLS ClientHello during connection establishment
 type GenevaStrategy struct {
-	manager    *Manager          // Reference to Manager for IPv6/IPv4 support
-	serverAddr string            // Deprecated: use manager.GetServerAddr() instead
+	manager    *Manager // Reference to Manager for IPv6/IPv4 support
+	serverAddr string   // Deprecated: use manager.GetServerAddr() instead
 	secret     []byte
-	country    string            // "russia", "china", "iran", "turkey"
+	country    string // "russia", "china", "iran", "turkey"
 	strategies []*geneva.Strategy
 	wsHost     string
 	wsPath     string
@@ -37,7 +37,7 @@ func NewGenevaStrategy(manager *Manager, secret []byte, country string) *GenevaS
 		secret:     secret,
 		country:    strings.ToLower(country),
 		strategies: geneva.GetStrategiesByCountry(country),
-		wsHost:     "cdn.jsdelivr.net", // Common CDN that's unlikely to be blocked
+		wsHost:     "cdn.jsdelivr.net",                     // Common CDN that's unlikely to be blocked
 		wsPath:     "/npm/jquery@3.7.1/dist/jquery.min.js", // Looks like CDN request
 	}
 }
@@ -297,7 +297,7 @@ func (g *GenevaConn) fragmentForTSPU(p []byte) [][]byte {
 	// TSPU key: split after TLS record header (5 bytes) + 1 byte
 	// This breaks the DPI's ability to parse handshake type
 	fragments := [][]byte{
-		p[:6],  // TLS header + 1 byte of handshake
+		p[:6], // TLS header + 1 byte of handshake
 	}
 
 	// Rest in 50-byte chunks

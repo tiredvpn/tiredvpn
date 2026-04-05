@@ -11,12 +11,12 @@ import (
 // Thread-safe for concurrent use
 type Histogram struct {
 	mu      sync.RWMutex
-	buckets []float64      // Bucket boundaries
-	counts  []uint64       // Counts per bucket
-	sum     float64        // Sum of all observed values
-	count   uint64         // Total number of observations
-	min     float64        // Minimum observed value
-	max     float64        // Maximum observed value
+	buckets []float64 // Bucket boundaries
+	counts  []uint64  // Counts per bucket
+	sum     float64   // Sum of all observed values
+	count   uint64    // Total number of observations
+	min     float64   // Minimum observed value
+	max     float64   // Maximum observed value
 }
 
 // NewHistogram creates a new histogram with predefined buckets

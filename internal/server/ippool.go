@@ -16,8 +16,8 @@ import (
 // IPLease represents an IP address lease
 type IPLease struct {
 	IP        string    `json:"ip"`
-	ClientID  string    `json:"client_id"`  // Client secret hash or identifier
-	Hostname  string    `json:"hostname"`   // Optional client hostname
+	ClientID  string    `json:"client_id"` // Client secret hash or identifier
+	Hostname  string    `json:"hostname"`  // Optional client hostname
 	LeasedAt  time.Time `json:"leased_at"`
 	ExpiresAt time.Time `json:"expires_at"` // Zero = permanent (static assignment)
 	Static    bool      `json:"static"`     // True if client requested specific IP
@@ -40,17 +40,17 @@ type IPPoolConfig struct {
 
 // IPPool manages IP address allocation for TUN clients
 type IPPool struct {
-	config     IPPoolConfig
-	network    *net.IPNet
-	serverIP   net.IP
-	startIP    uint32 // First allocatable IP
-	endIP      uint32 // Last allocatable IP
-	reserved   map[uint32]bool
-	mu         sync.RWMutex
+	config   IPPoolConfig
+	network  *net.IPNet
+	serverIP net.IP
+	startIP  uint32 // First allocatable IP
+	endIP    uint32 // Last allocatable IP
+	reserved map[uint32]bool
+	mu       sync.RWMutex
 
 	// Backend storage
-	redis   *redis.Client
-	leases  map[string]*IPLease // In-memory: IP -> Lease
+	redis    *redis.Client
+	leases   map[string]*IPLease // In-memory: IP -> Lease
 	byClient map[string]string   // In-memory: ClientID -> IP
 }
 
@@ -85,9 +85,9 @@ func NewIPPool(cfg IPPoolConfig, redisClient *redis.Client) (*IPPool, error) {
 
 	// Build reserved set
 	reserved := make(map[uint32]bool)
-	reserved[networkIP] = true                              // Network address
-	reserved[broadcastIP] = true                            // Broadcast
-	reserved[binary.BigEndian.Uint32(serverIP)] = true      // Server IP
+	reserved[networkIP] = true                         // Network address
+	reserved[broadcastIP] = true                       // Broadcast
+	reserved[binary.BigEndian.Uint32(serverIP)] = true // Server IP
 
 	for _, r := range cfg.ReservedIPs {
 		ip := net.ParseIP(r)
@@ -97,15 +97,15 @@ func NewIPPool(cfg IPPoolConfig, redisClient *redis.Client) (*IPPool, error) {
 	}
 
 	pool := &IPPool{
-		config:    cfg,
-		network:   network,
-		serverIP:  serverIP,
-		startIP:   startIP,
-		endIP:     endIP,
-		reserved:  reserved,
-		redis:     redisClient,
-		leases:    make(map[string]*IPLease),
-		byClient:  make(map[string]string),
+		config:   cfg,
+		network:  network,
+		serverIP: serverIP,
+		startIP:  startIP,
+		endIP:    endIP,
+		reserved: reserved,
+		redis:    redisClient,
+		leases:   make(map[string]*IPLease),
+		byClient: make(map[string]string),
 	}
 
 	// Load existing leases
@@ -113,7 +113,7 @@ func NewIPPool(cfg IPPoolConfig, redisClient *redis.Client) (*IPPool, error) {
 		log.Warn("Failed to load IP leases: %v", err)
 	}
 
-	poolSize := int(endIP - startIP + 1) - len(reserved)
+	poolSize := int(endIP-startIP+1) - len(reserved)
 	log.Info("IP Pool initialized: %s (size=%d, server=%s)", cfg.Network, poolSize, cfg.ServerIP)
 
 	return pool, nil
@@ -425,7 +425,7 @@ func (p *IPPool) Stats() (total, used, available int) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
-	total = int(p.endIP - p.startIP + 1) - len(p.reserved)
+	total = int(p.endIP-p.startIP+1) - len(p.reserved)
 	used = len(p.leases)
 	available = total - used
 	return

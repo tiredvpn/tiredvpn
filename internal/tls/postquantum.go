@@ -205,12 +205,12 @@ func VerifyQuantumSignature(publicKey, message, signature []byte) bool {
 // REALITYExtensionV2 is the post-quantum enhanced REALITY extension
 // Extension format: [Magic:"REAL"][Version:0x02][ClassicalPubKey:32][KemCiphertext:1088][Signature:3293][AuthToken:64]
 type REALITYExtensionV2 struct {
-	Magic              [4]byte
-	Version            uint8
-	ClassicalPubKey    [32]byte
-	KemCiphertext      []byte // 1088 bytes
-	QuantumSignature   []byte // 3293 bytes
-	AuthToken          [64]byte // SHA-512 for stronger auth
+	Magic            [4]byte
+	Version          uint8
+	ClassicalPubKey  [32]byte
+	KemCiphertext    []byte   // 1088 bytes
+	QuantumSignature []byte   // 3293 bytes
+	AuthToken        [64]byte // SHA-512 for stronger auth
 }
 
 // REALITYExtensionV2Length is the total length of the PQ extension
@@ -234,11 +234,11 @@ func NewClientREALITYExtensionV2(secret []byte, hybrid *HybridKeyExchange, signe
 	}
 
 	ext := &REALITYExtensionV2{
-		Version:            REALITYVersionPQ,
-		ClassicalPubKey:    hybrid.ClassicalPublicKey,
-		KemCiphertext:      kemCT,
-		QuantumSignature:   signature,
-		AuthToken:          authToken,
+		Version:          REALITYVersionPQ,
+		ClassicalPubKey:  hybrid.ClassicalPublicKey,
+		KemCiphertext:    kemCT,
+		QuantumSignature: signature,
+		AuthToken:        authToken,
 	}
 	copy(ext.Magic[:], REALITYMagic)
 
@@ -396,11 +396,11 @@ func IsPostQuantumExtension(data []byte) bool {
 
 // Benchmark helpers for performance testing
 type PQBenchmarkResult struct {
-	KeyGenTime     time.Duration
-	EncapsTime     time.Duration
-	DecapsTime     time.Duration
-	SignTime       time.Duration
-	VerifyTime     time.Duration
+	KeyGenTime time.Duration
+	EncapsTime time.Duration
+	DecapsTime time.Duration
+	SignTime   time.Duration
+	VerifyTime time.Duration
 }
 
 // BenchmarkPQ runs performance benchmarks for PQ operations

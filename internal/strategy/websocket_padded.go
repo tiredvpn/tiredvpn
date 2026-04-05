@@ -191,11 +191,11 @@ type SalamanderConn struct {
 	padder   *padding.SalamanderPadder
 	isClient bool
 
-	readBuf  []byte
-	readMu   sync.Mutex
-	writeMu  sync.Mutex
-	closeMu  sync.Mutex
-	closed   bool
+	readBuf []byte
+	readMu  sync.Mutex
+	writeMu sync.Mutex
+	closeMu sync.Mutex
+	closed  bool
 }
 
 // NewSalamanderConn creates a new Salamander-wrapped connection

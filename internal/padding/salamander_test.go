@@ -99,17 +99,17 @@ func TestSalamanderBucketNormalization(t *testing.T) {
 		plaintextLen int
 		wantBucket   int
 	}{
-		{Conservative, 10, 512},       // 10 + 8 = 18 → 512
-		{Conservative, 500, 512},      // 500 + 8 = 508 → 512
-		{Conservative, 510, 1024},     // 510 + 8 = 518 → 1024
-		{Conservative, 1000, 1024},    // 1000 + 8 = 1008 → 1024
-		{Conservative, 1440, 1452},    // 1440 + 8 = 1448 → 1452
-		{Balanced, 10, 400},           // 10 + 8 = 18 → 400
-		{Balanced, 390, 400},          // 390 + 8 = 398 → 400
-		{Balanced, 790, 800},          // 790 + 8 = 798 → 800
-		{Aggressive, 10, 300},         // 10 + 8 = 18 → 300
-		{Aggressive, 290, 300},        // 290 + 8 = 298 → 300
-		{Aggressive, 590, 600},        // 590 + 8 = 598 → 600
+		{Conservative, 10, 512},    // 10 + 8 = 18 → 512
+		{Conservative, 500, 512},   // 500 + 8 = 508 → 512
+		{Conservative, 510, 1024},  // 510 + 8 = 518 → 1024
+		{Conservative, 1000, 1024}, // 1000 + 8 = 1008 → 1024
+		{Conservative, 1440, 1452}, // 1440 + 8 = 1448 → 1452
+		{Balanced, 10, 400},        // 10 + 8 = 18 → 400
+		{Balanced, 390, 400},       // 390 + 8 = 398 → 400
+		{Balanced, 790, 800},       // 790 + 8 = 798 → 800
+		{Aggressive, 10, 300},      // 10 + 8 = 18 → 300
+		{Aggressive, 290, 300},     // 290 + 8 = 298 → 300
+		{Aggressive, 590, 600},     // 590 + 8 = 598 → 600
 	}
 
 	for _, tt := range tests {

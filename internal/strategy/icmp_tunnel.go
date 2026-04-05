@@ -50,10 +50,10 @@ const (
 	MaxPayloadSize = 1400 - ICMPHeaderSize - TunnelHeaderSize - AuthTagSize
 
 	// Stealth mode parameters (ONLY allowed mode)
-	StealthPacketRate  = 10  // packets per second
-	StealthPayloadSize = 56  // bytes, matches standard ping
-	StealthJitterMin   = 10  // milliseconds
-	StealthJitterMax   = 50  // milliseconds
+	StealthPacketRate  = 10 // packets per second
+	StealthPayloadSize = 56 // bytes, matches standard ping
+	StealthJitterMin   = 10 // milliseconds
+	StealthJitterMax   = 50 // milliseconds
 
 	// Timeouts
 	ICMPConnectTimeout = 10 * time.Second

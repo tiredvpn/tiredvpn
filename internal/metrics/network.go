@@ -11,15 +11,15 @@ type RTTTracker struct {
 	histogram *Histogram
 
 	// Recent window for jitter calculation
-	mu            sync.Mutex
-	recentRTTs    []float64
-	maxRecent     int
+	mu         sync.Mutex
+	recentRTTs []float64
+	maxRecent  int
 
 	// Running statistics
-	count         uint64
-	sum           uint64 // microseconds
-	min           uint64 // microseconds
-	max           uint64 // microseconds
+	count uint64
+	sum   uint64 // microseconds
+	min   uint64 // microseconds
+	max   uint64 // microseconds
 }
 
 // NewRTTTracker creates a new RTT tracker
@@ -142,8 +142,8 @@ type BandwidthTracker struct {
 	windowDuration time.Duration
 
 	// Peak tracking
-	peakBps       uint64
-	currentBps    uint64
+	peakBps    uint64
+	currentBps uint64
 }
 
 // NewBandwidthTracker creates a new bandwidth tracker
@@ -198,9 +198,9 @@ func (b *BandwidthTracker) GetCurrentMbps() float64 {
 
 // PacketLossEstimator estimates packet loss from retransmissions
 type PacketLossEstimator struct {
-	totalPackets  uint64
-	lostPackets   uint64
-	retransmits   uint64
+	totalPackets uint64
+	lostPackets  uint64
+	retransmits  uint64
 }
 
 // ObservePackets records packet counts

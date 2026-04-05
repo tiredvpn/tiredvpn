@@ -292,8 +292,8 @@ func (c *authSessionCache) Put(sessionKey string, cs *tls.ClientSessionState) {
 // ServerAntiProbeHandler handles incoming connections with probe resistance
 type ServerAntiProbeHandler struct {
 	knockSecret []byte
-	realHandler func(net.Conn)   // Handler for authenticated clients
-	fakeHandler func(net.Conn)   // Handler for probes (show fake site)
+	realHandler func(net.Conn) // Handler for authenticated clients
+	fakeHandler func(net.Conn) // Handler for probes (show fake site)
 }
 
 // NewServerAntiProbeHandler creates server-side handler

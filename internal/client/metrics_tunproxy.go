@@ -8,12 +8,12 @@ import (
 
 type TunProxyMetrics struct {
 	// TUN mode metrics
-	tunDNSQueries   uint64
-	tunMTUIssues    uint64
+	tunDNSQueries uint64
+	tunMTUIssues  uint64
 
 	// Proxy mode metrics
-	proxyProtocol   uint64 // 0=none, 1=socks5, 2=http
-	poolHitRate     uint64 // hit rate * 10000 for precision
+	proxyProtocol uint64 // 0=none, 1=socks5, 2=http
+	poolHitRate   uint64 // hit rate * 10000 for precision
 }
 
 func NewTunProxyMetrics() *TunProxyMetrics {

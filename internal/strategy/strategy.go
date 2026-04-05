@@ -69,11 +69,11 @@ type Manager struct {
 	mu         sync.RWMutex
 
 	// Config
-	probeTimeout    time.Duration
-	connectTimeout  time.Duration
-	maxRetries      int
-	parallelProbes  int
-	adaptiveOrder   bool // Reorder strategies based on success rate
+	probeTimeout   time.Duration
+	connectTimeout time.Duration
+	maxRetries     int
+	parallelProbes int
+	adaptiveOrder  bool // Reorder strategies based on success rate
 
 	// Circuit breaker
 	circuitBreakers *CircuitBreakerManager
@@ -122,20 +122,20 @@ type Manager struct {
 	lastConnectionStrategyID string
 
 	// Port hopping for DPI evasion
-	portHopper         *porthopping.PortHopper
-	portHopperStop     chan struct{}
-	portHopperMu       sync.Mutex
-	portHopCallback    func(oldPort, newPort int) // External callback for port hop events (e.g., VPN reconnect)
-	portHopCallbackMu  sync.Mutex
+	portHopper        *porthopping.PortHopper
+	portHopperStop    chan struct{}
+	portHopperMu      sync.Mutex
+	portHopCallback   func(oldPort, newPort int) // External callback for port hop events (e.g., VPN reconnect)
+	portHopCallbackMu sync.Mutex
 
 	// IPv6 Transport Layer
-	serverAddrV6     string // IPv6 server address
-	serverAddrV4     string // IPv4 server address
-	preferIPv6       bool   // Prefer IPv6 if available
-	fallbackToV4     bool   // Fallback to IPv4 if IPv6 fails
-	ipv6Available    bool   // Cached IPv6 availability
-	ipv6CheckedOnce  bool   // Whether we've checked IPv6 availability
-	ipv6Mu           sync.Mutex
+	serverAddrV6    string // IPv6 server address
+	serverAddrV4    string // IPv4 server address
+	preferIPv6      bool   // Prefer IPv6 if available
+	fallbackToV4    bool   // Fallback to IPv4 if IPv6 fails
+	ipv6Available   bool   // Cached IPv6 availability
+	ipv6CheckedOnce bool   // Whether we've checked IPv6 availability
+	ipv6Mu          sync.Mutex
 }
 
 // NewManager creates a new strategy manager
@@ -878,10 +878,10 @@ var _ io.ReadWriteCloser = (*StrategyConn)(nil)
 
 // DefaultManagerConfig contains configuration for default manager
 type DefaultManagerConfig struct {
-	ServerAddr   string // Server address for server-based strategies
-	Secret       []byte // Shared secret for authentication
-	RelayNodes   []*RelayNode // Mesh relay nodes (optional)
-	CoverHost    string // Host to impersonate for HTTP/2 stego
+	ServerAddr string       // Server address for server-based strategies
+	Secret     []byte       // Shared secret for authentication
+	RelayNodes []*RelayNode // Mesh relay nodes (optional)
+	CoverHost  string       // Host to impersonate for HTTP/2 stego
 
 	// IPv6 Transport Layer
 	ServerAddrV6 string // IPv6 server address (e.g., "[2001:db8::100]:995")
@@ -897,27 +897,27 @@ type DefaultManagerConfig struct {
 	MuxConfig  *mux.Config // Mux configuration (nil = use default)
 
 	// QUIC configuration
-	QUICEnabled          bool   // Enable QUIC strategy
-	QUICPort             int    // QUIC server port (default: 443)
-	QUICSalamanderEnabled bool  // Enable QUIC with Salamander obfuscation
-	QUICSalamanderPort   int    // QUIC Salamander port (default: 8443)
+	QUICEnabled           bool // Enable QUIC strategy
+	QUICPort              int  // QUIC server port (default: 443)
+	QUICSalamanderEnabled bool // Enable QUIC with Salamander obfuscation
+	QUICSalamanderPort    int  // QUIC Salamander port (default: 8443)
 
 	// REALITY configuration
-	REALITYEnabled    bool   // Enable REALITY protocol (99.5% success rate)
+	REALITYEnabled bool // Enable REALITY protocol (99.5% success rate)
 
 	// WebSocket Padded configuration
-	WebSocketPaddedEnabled bool   // Enable WebSocket with Salamander padding
+	WebSocketPaddedEnabled bool // Enable WebSocket with Salamander padding
 
 	// ECH (Encrypted Client Hello) configuration
-	ECHEnabled     bool   // Enable ECH to hide SNI from DPI
-	ECHConfigList  []byte // ECHConfigList from server (base64 decoded)
-	ECHPublicName  string // Outer SNI visible to network (e.g. "cloudflare-ech.com")
+	ECHEnabled    bool   // Enable ECH to hide SNI from DPI
+	ECHConfigList []byte // ECHConfigList from server (base64 decoded)
+	ECHPublicName string // Outer SNI visible to network (e.g. "cloudflare-ech.com")
 
 	// QUIC SNI fragmentation for GFW bypass
 	QUICSNIFragEnabled bool // Enable SNI fragmentation in QUIC CRYPTO frames
 
 	// Post-Quantum crypto for REALITY
-	PQEnabled        bool   // Enable post-quantum crypto (ML-KEM-768 + ML-DSA-65)
+	PQEnabled         bool   // Enable post-quantum crypto (ML-KEM-768 + ML-DSA-65)
 	PQServerKemPubB64 string // Server's Kyber768 public key in base64
 
 	// Android-specific optimizations
@@ -1073,16 +1073,16 @@ func NewDefaultManager(cfg DefaultManagerConfig) *Manager {
 	// 4. Traffic Morphing (VK profile) - VK video streaming
 	if len(cfg.Secret) > 0 {
 		m.Register(NewTrafficMorphStrategy(m, VKVideoProfile, nil, cfg.Secret))
-    
-    // 5. Traffic Morphing (Baidu profile) - Chinese video streaming
-    if len(cfg.Secret) > 0 {
-            m.Register(NewTrafficMorphStrategy(m, BaiduVideoProfile, nil, cfg.Secret))
-    }
 
-    // 6. Traffic Morphing (Aparat profile) - Iranian video streaming
-    if len(cfg.Secret) > 0 {
-            m.Register(NewTrafficMorphStrategy(m, AparatVideoProfile, nil, cfg.Secret))
-    }
+		// 5. Traffic Morphing (Baidu profile) - Chinese video streaming
+		if len(cfg.Secret) > 0 {
+			m.Register(NewTrafficMorphStrategy(m, BaiduVideoProfile, nil, cfg.Secret))
+		}
+
+		// 6. Traffic Morphing (Aparat profile) - Iranian video streaming
+		if len(cfg.Secret) > 0 {
+			m.Register(NewTrafficMorphStrategy(m, AparatVideoProfile, nil, cfg.Secret))
+		}
 	}
 
 	// 5. Mesh Relay - route through Russian IPs

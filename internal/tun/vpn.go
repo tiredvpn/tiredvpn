@@ -35,22 +35,22 @@ func isTemporaryError(err error) bool {
 
 // Keepalive packet marker (zero-length packet signals keepalive)
 const keepaliveInterval = 10 * time.Second
-const readTimeout = 30 * time.Second          // Must be > keepaliveInterval, detect dead connection faster
-const writeTimeout = 30 * time.Second         // Write timeout (was 5s, caused i/o timeouts with bufferbloat)
+const readTimeout = 30 * time.Second           // Must be > keepaliveInterval, detect dead connection faster
+const writeTimeout = 30 * time.Second          // Write timeout (was 5s, caused i/o timeouts with bufferbloat)
 const deadConnectionTimeout = 45 * time.Second // Proactive dead connection detection timeout
 
 // Reconnect configuration
 const (
-	reconnectInitialDelay = 1 * time.Second  // Start with 1 second
-	reconnectMaxDelay     = 2 * time.Minute  // Cap at 2 minutes
-	reconnectMultiplier   = 2.0              // Double each time
-	reconnectJitterFactor = 0.3              // +/- 30% jitter
+	reconnectInitialDelay = 1 * time.Second // Start with 1 second
+	reconnectMaxDelay     = 2 * time.Minute // Cap at 2 minutes
+	reconnectMultiplier   = 2.0             // Double each time
+	reconnectJitterFactor = 0.3             // +/- 30% jitter
 )
 
 // Port hop reconnect configuration (faster than regular reconnect)
 const (
-	portHopReconnectTimeout = 5 * time.Second  // Quick timeout for port hop
-	portHopMaxAttempts      = 3                // Max attempts before falling back to regular reconnect
+	portHopReconnectTimeout = 5 * time.Second // Quick timeout for port hop
+	portHopMaxAttempts      = 3               // Max attempts before falling back to regular reconnect
 )
 
 // VPNClient manages the TUN-based VPN connection
@@ -89,8 +89,8 @@ type VPNClient struct {
 	serverCaps ServerCapabilities
 
 	// Port hop state for seamless reconnect
-	portHopInProgress int32         // 1 if port hop reconnect in progress
-	pendingConn       net.Conn      // New connection being established during port hop
+	portHopInProgress int32    // 1 if port hop reconnect in progress
+	pendingConn       net.Conn // New connection being established during port hop
 	pendingStrategy   strategy.Strategy
 }
 
@@ -856,9 +856,9 @@ func (v *VPNClient) checkNetworkConnectivity() bool {
 
 	// Try common ports that are usually open
 	testAddrs := []string{
-		v.serverAddr,               // Original server address
-		net.JoinHostPort(host, "443"),  // HTTPS
-		net.JoinHostPort(host, "80"),   // HTTP
+		v.serverAddr,                  // Original server address
+		net.JoinHostPort(host, "443"), // HTTPS
+		net.JoinHostPort(host, "80"),  // HTTP
 	}
 
 	for _, addr := range testAddrs {

@@ -44,7 +44,7 @@ type StateExhaustionStrategy struct {
 func NewStateExhaustionStrategy(manager *Manager) *StateExhaustionStrategy {
 	return &StateExhaustionStrategy{
 		manager:       manager,
-		baseStrat:     nil, // No base strategy - works independently
+		baseStrat:     nil,  // No base strategy - works independently
 		decoyCount:    1000, // Number of decoy SYNs per batch
 		decoyInterval: 5 * time.Second,
 		decoyTimeout:  60 * time.Second, // TSPU SYN_SENT timeout is 60s
@@ -222,8 +222,8 @@ func (s *StateExhaustionStrategy) launchDecoyFlood(ctx context.Context, realTarg
 func (s *StateExhaustionStrategy) buildSYNPacket(srcIP, dstIP net.IP, srcPort, dstPort uint16) []byte {
 	// IP Header (20 bytes)
 	ipHeader := make([]byte, 20)
-	ipHeader[0] = 0x45 // Version 4, IHL 5
-	ipHeader[1] = 0x00 // DSCP/ECN
+	ipHeader[0] = 0x45     // Version 4, IHL 5
+	ipHeader[1] = 0x00     // DSCP/ECN
 	totalLen := uint16(40) // IP(20) + TCP(20)
 	binary.BigEndian.PutUint16(ipHeader[2:4], totalLen)
 
@@ -234,8 +234,8 @@ func (s *StateExhaustionStrategy) buildSYNPacket(srcIP, dstIP net.IP, srcPort, d
 
 	ipHeader[6] = 0x40 // Don't fragment
 	ipHeader[7] = 0x00
-	ipHeader[8] = 64   // TTL
-	ipHeader[9] = 6    // TCP
+	ipHeader[8] = 64 // TTL
+	ipHeader[9] = 6  // TCP
 
 	copy(ipHeader[12:16], srcIP.To4())
 	copy(ipHeader[16:20], dstIP.To4())

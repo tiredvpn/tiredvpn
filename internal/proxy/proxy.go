@@ -17,9 +17,9 @@ import (
 
 // Proxy is the main SOCKS5 proxy server with DPI evasion
 type Proxy struct {
-	config      *config.Config
-	listener    net.Listener
-	sniRotator  *evasion.SNIRotator
+	config     *config.Config
+	listener   net.Listener
+	sniRotator *evasion.SNIRotator
 
 	mu          sync.Mutex
 	connections map[string]net.Conn
@@ -230,10 +230,10 @@ func (p *Proxy) socks5Request(conn net.Conn) (string, error) {
 func (p *Proxy) socks5Reply(conn net.Conn, status byte) {
 	// Reply: VER(1) + REP(1) + RSV(1) + ATYP(1) + BND.ADDR(4) + BND.PORT(2)
 	reply := []byte{
-		0x05,   // VER
-		status, // REP
-		0x00,   // RSV
-		0x01,   // ATYP: IPv4
+		0x05,                   // VER
+		status,                 // REP
+		0x00,                   // RSV
+		0x01,                   // ATYP: IPv4
 		0x00, 0x00, 0x00, 0x00, // BND.ADDR
 		0x00, 0x00, // BND.PORT
 	}
@@ -301,12 +301,12 @@ func (p *Proxy) establishTunnel(targetAddr string) (net.Conn, error) {
 	switch p.config.Mode {
 	case config.ModeGRPC:
 		grpcConfig := &tunnel.GRPCConfig{
-			ServiceName:  p.config.GRPC.ServiceName,
-			MethodName:   p.config.GRPC.MethodName,
-			Authority:    coverSNI,
-			UserAgent:    p.config.GRPC.Headers["user-agent"],
-			ContentType:  p.config.GRPC.Headers["content-type"],
-			GRPCEncoding: p.config.GRPC.Headers["grpc-encoding"],
+			ServiceName:   p.config.GRPC.ServiceName,
+			MethodName:    p.config.GRPC.MethodName,
+			Authority:     coverSNI,
+			UserAgent:     p.config.GRPC.Headers["user-agent"],
+			ContentType:   p.config.GRPC.Headers["content-type"],
+			GRPCEncoding:  p.config.GRPC.Headers["grpc-encoding"],
 			EnablePadding: p.config.GRPC.Padding,
 		}
 		return tunnel.NewGRPCTunnel(tlsConn, grpcConfig)

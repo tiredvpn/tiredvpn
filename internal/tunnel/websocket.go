@@ -17,17 +17,17 @@ import (
 // WebSocketTunnel implements tunneling over WebSocket protocol
 // Masquerades as legitimate WebSocket connection (e.g., web.telegram.org, yandex.ru)
 type WebSocketTunnel struct {
-	conn     net.Conn
-	reader   *bufio.Reader
+	conn   net.Conn
+	reader *bufio.Reader
 
-	config   *WebSocketConfig
-	mu       sync.Mutex
+	config *WebSocketConfig
+	mu     sync.Mutex
 
-	readBuf  bytes.Buffer
-	readMu   sync.Mutex
+	readBuf bytes.Buffer
+	readMu  sync.Mutex
 
-	closed   bool
-	maskKey  [4]byte // WebSocket client mask key
+	closed  bool
+	maskKey [4]byte // WebSocket client mask key
 }
 
 // WebSocketConfig configures WebSocket tunnel
@@ -64,11 +64,11 @@ func DefaultWebSocketConfig(host string) *WebSocketConfig {
 		PingInterval:    30 * time.Second,
 		MaxFrameSize:    1 << 16, // 64KB
 		CustomHeaders: map[string]string{
-			"User-Agent":       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0",
-			"Accept-Language":  "en-US,en;q=0.9,ru;q=0.8",
-			"Accept-Encoding":  "gzip, deflate, br",
-			"Cache-Control":    "no-cache",
-			"Pragma":           "no-cache",
+			"User-Agent":               "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0",
+			"Accept-Language":          "en-US,en;q=0.9,ru;q=0.8",
+			"Accept-Encoding":          "gzip, deflate, br",
+			"Cache-Control":            "no-cache",
+			"Pragma":                   "no-cache",
 			"Sec-WebSocket-Extensions": "permessage-deflate",
 		},
 	}
@@ -384,7 +384,7 @@ func (t *WebSocketTunnel) sendPing() error {
 	rand.Read(payload)
 
 	frame := []byte{
-		0x80 | wsOpPing,        // FIN + PING
+		0x80 | wsOpPing,           // FIN + PING
 		0x80 | byte(len(payload)), // MASK + length
 	}
 	frame = append(frame, t.maskKey[:]...)

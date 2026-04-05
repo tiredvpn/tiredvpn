@@ -91,23 +91,23 @@ type TLSConn struct {
 
 // Config for TLS connection
 type Config struct {
-	ServerName      string   // SNI
-	Fingerprint     string   // Browser fingerprint name
-	ALPN            []string // Application-Layer Protocol Negotiation
-	InsecureSkipVerify bool  // Skip certificate verification (for testing)
+	ServerName         string   // SNI
+	Fingerprint        string   // Browser fingerprint name
+	ALPN               []string // Application-Layer Protocol Negotiation
+	InsecureSkipVerify bool     // Skip certificate verification (for testing)
 
 	// Advanced options
-	SessionTicket   []byte   // Session resumption ticket
-	UseECH          bool     // Use Encrypted Client Hello (if available)
-	PaddingLen      int      // Pad ClientHello to this length
+	SessionTicket []byte // Session resumption ticket
+	UseECH        bool   // Use Encrypted Client Hello (if available)
+	PaddingLen    int    // Pad ClientHello to this length
 }
 
 // DefaultConfig returns default TLS config
 func DefaultConfig(serverName string) *Config {
 	return &Config{
-		ServerName:  serverName,
-		Fingerprint: "chrome",
-		ALPN:        []string{"h2", "http/1.1"},
+		ServerName:         serverName,
+		Fingerprint:        "chrome",
+		ALPN:               []string{"h2", "http/1.1"},
 		InsecureSkipVerify: false,
 	}
 }
@@ -310,7 +310,7 @@ func looksLikeDomain(s string) bool {
 		if c == '.' {
 			hasDot = true
 		} else if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') &&
-				(c < '0' || c > '9') && c != '-' {
+			(c < '0' || c > '9') && c != '-' {
 			return false
 		}
 	}

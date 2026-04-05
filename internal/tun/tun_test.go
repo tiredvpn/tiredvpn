@@ -358,7 +358,7 @@ func TestIPFragmentation(t *testing.T) {
 		{
 			name:           "Middle fragment",
 			flags:          0x20, // More Fragments
-			fragmentOffset: 185, // 1480 bytes offset (185 * 8)
+			fragmentOffset: 185,  // 1480 bytes offset (185 * 8)
 			isFragment:     true,
 			moreFragments:  true,
 		},

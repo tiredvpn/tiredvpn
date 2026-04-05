@@ -9,13 +9,13 @@ import (
 
 // SNIRotator manages rotation through whitelisted SNI values
 type SNIRotator struct {
-	pool       []string
-	weights    []int      // Higher weight = higher priority
-	index      uint64     // Current index for round-robin
-	mu         sync.RWMutex
-	strategy   RotationStrategy
-	lastUsed   map[string]time.Time // Track usage for cooldown
-	cooldown   time.Duration        // Cooldown between same SNI uses
+	pool     []string
+	weights  []int  // Higher weight = higher priority
+	index    uint64 // Current index for round-robin
+	mu       sync.RWMutex
+	strategy RotationStrategy
+	lastUsed map[string]time.Time // Track usage for cooldown
+	cooldown time.Duration        // Cooldown between same SNI uses
 }
 
 // RotationStrategy defines how SNIs are selected

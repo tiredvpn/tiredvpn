@@ -724,7 +724,7 @@ func TestConfigValidation(t *testing.T) {
 				KeepAliveInterval: 10 * time.Second,
 				KeepAliveTimeout:  30 * time.Second,
 				MaxFrameSize:      32768,
-				MaxReceiveBuffer:  1024,  // < MaxStreamBuffer
+				MaxReceiveBuffer:  1024, // < MaxStreamBuffer
 				MaxStreamBuffer:   65536,
 			},
 			wantErr: true,

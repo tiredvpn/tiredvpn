@@ -63,9 +63,9 @@ func NewQUICEvasion(config *QUICEvasionConfig) *QUICEvasion {
 
 // QUICVersion constants
 const (
-	QUICVersion1      uint32 = 0x00000001 // BLOCKED by TSPU
-	QUICVersionDraft29 uint32 = 0xff00001d // Sometimes works
-	QUICVersionDraft32 uint32 = 0xff000020 // Sometimes works
+	QUICVersion1        uint32 = 0x00000001 // BLOCKED by TSPU
+	QUICVersionDraft29  uint32 = 0xff00001d // Sometimes works
+	QUICVersionDraft32  uint32 = 0xff000020 // Sometimes works
 	QUICVersionQuicPing uint32 = 0xbabababa // quicping - usually allowed
 	QUICVersionReserved uint32 = 0x00000000 // Version negotiation
 )
@@ -171,7 +171,7 @@ func buildMinimalClientHello(sni string) []byte {
 	hello := []byte{
 		0x01,             // HandshakeType: ClientHello
 		0x00, 0x00, 0x00, // Length placeholder
-		0x03, 0x03,       // Version: TLS 1.2
+		0x03, 0x03, // Version: TLS 1.2
 	}
 
 	// Random (32 bytes)

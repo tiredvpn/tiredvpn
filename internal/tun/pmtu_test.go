@@ -111,7 +111,7 @@ func TestBuildICMPFragNeeded(t *testing.T) {
 	origPkt := make([]byte, 40)
 	origPkt[0] = 0x45 // IPv4, IHL=5
 	binary.BigEndian.PutUint16(origPkt[2:4], 40)
-	origPkt[9] = 6 // TCP
+	origPkt[9] = 6                                    // TCP
 	copy(origPkt[12:16], net.IPv4(10, 9, 0, 2).To4()) // src
 	copy(origPkt[16:20], net.IPv4(8, 8, 8, 8).To4())  // dst
 
@@ -201,10 +201,10 @@ func buildTCPSYNWithMSS(mss uint16) []byte {
 	pkt := make([]byte, 44)
 
 	// IPv4 header
-	pkt[0] = 0x45 // Version 4, IHL 5
+	pkt[0] = 0x45                            // Version 4, IHL 5
 	binary.BigEndian.PutUint16(pkt[2:4], 44) // Total length
-	pkt[8] = 64                               // TTL
-	pkt[9] = 6                                // TCP
+	pkt[8] = 64                              // TTL
+	pkt[9] = 6                               // TCP
 	copy(pkt[12:16], net.IPv4(10, 9, 0, 2).To4())
 	copy(pkt[16:20], net.IPv4(8, 8, 8, 8).To4())
 
@@ -222,8 +222,8 @@ func buildTCPSYNWithMSS(mss uint16) []byte {
 	tcp := 20
 	binary.BigEndian.PutUint16(pkt[tcp:tcp+2], 12345) // src port
 	binary.BigEndian.PutUint16(pkt[tcp+2:tcp+4], 443) // dst port
-	pkt[tcp+12] = 0x60                                 // Data offset = 6 (24 bytes)
-	pkt[tcp+13] = 0x02                                 // SYN flag
+	pkt[tcp+12] = 0x60                                // Data offset = 6 (24 bytes)
+	pkt[tcp+13] = 0x02                                // SYN flag
 
 	// MSS option: kind=2, len=4, mss
 	pkt[tcp+20] = 2 // kind = MSS

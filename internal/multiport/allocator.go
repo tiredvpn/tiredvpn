@@ -20,13 +20,13 @@ type PortAllocator struct {
 	mu sync.Mutex
 
 	// Configuration
-	basePort  int // Starting port for allocations (e.g., 50000)
-	portCount int // Total ports available per client (e.g., 500)
+	basePort   int // Starting port for allocations (e.g., 50000)
+	portCount  int // Total ports available per client (e.g., 500)
 	maxClients int // Maximum concurrent clients
 
 	// State
 	allocated map[string]*Allocation // sessionID -> allocation
-	portUsage []bool                  // bitmap of used ports
+	portUsage []bool                 // bitmap of used ports
 }
 
 // Allocation represents an allocated port range for a client

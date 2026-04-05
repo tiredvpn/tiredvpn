@@ -63,9 +63,9 @@ type ClientWriter struct {
 
 // reconnectTracker tracks per-client reconnect frequency to prevent flapping
 type reconnectTracker struct {
-	mu         sync.Mutex
-	counts     map[string]*reconnectState // clientID -> state
-	maxPerMin  int                        // max reconnects per minute before backoff warning
+	mu        sync.Mutex
+	counts    map[string]*reconnectState // clientID -> state
+	maxPerMin int                        // max reconnects per minute before backoff warning
 }
 
 type reconnectState struct {

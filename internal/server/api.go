@@ -294,9 +294,9 @@ func (s *APIServer) deleteClient(w http.ResponseWriter, r *http.Request, clientI
 
 // StatsResponse is the response for GET /stats
 type StatsResponse struct {
-	TotalClients      int              `json:"total_clients"`
-	TotalConnections  int              `json:"total_connections"`
-	ClientStats       []ClientStats    `json:"client_stats"`
+	TotalClients     int           `json:"total_clients"`
+	TotalConnections int           `json:"total_connections"`
+	ClientStats      []ClientStats `json:"client_stats"`
 }
 
 // handleStats handles GET /stats

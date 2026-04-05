@@ -365,8 +365,8 @@ func sendTLSAlert(conn net.Conn, alertCode byte) {
 		0x15,       // Alert
 		0x03, 0x03, // TLS 1.2
 		0x00, 0x02, // Length: 2
-		0x02,       // Fatal
-		alertCode,  // Alert code
+		0x02,      // Fatal
+		alertCode, // Alert code
 	}
 	conn.Write(alert)
 }
