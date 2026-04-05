@@ -10,6 +10,8 @@
 [![Go Version](https://img.shields.io/github/go-mod/go-version/tiredvpn/tiredvpn)](go.mod)
 ![TiredVPN](img/github.png)
 
+**Related repositories:** [tiredvpn/tiredvpn-android](https://github.com/tiredvpn/tiredvpn-android) — Android client
+
 ---
 
 ## What is TiredVPN?
