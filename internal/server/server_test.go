@@ -17,15 +17,15 @@ func TestConfusionRelayPacketSizeLimit(t *testing.T) {
 
 	// Test packets at and around the 64KB limit
 	tests := []struct {
-		name      string
-		size      uint32
+		name       string
+		size       uint32
 		shouldFail bool
 	}{
 		{"1KB packet", 1024, false},
 		{"16KB packet", 16 * 1024, false},
 		{"32KB packet", 32 * 1024, false},
 		{"64KB packet", 64 * 1024, false},
-		{"65KB packet", 65 * 1024, true},  // Should fail - over limit
+		{"65KB packet", 65 * 1024, true},   // Should fail - over limit
 		{"128KB packet", 128 * 1024, true}, // Should fail - over limit
 		{"Zero length", 0, true},           // Should fail - zero length
 	}
@@ -296,11 +296,11 @@ func TestConfusionMagicDetection(t *testing.T) {
 	buf.Write([]byte{0x00, 0x01, 0x00, 0x01})                   // Type A, Class IN
 
 	// DNS answer
-	buf.Write([]byte{0xc0, 0x0c})                   // Name pointer
-	buf.Write([]byte{0x00, 0x01, 0x00, 0x01})       // Type A, Class IN
-	buf.Write([]byte{0x00, 0x00, 0x01, 0x2c})       // TTL
-	buf.Write([]byte{0x00, 0x04})                   // RDLENGTH
-	buf.Write([]byte{0x4d, 0x58, 0x67, 0x63})       // Fake IP
+	buf.Write([]byte{0xc0, 0x0c})             // Name pointer
+	buf.Write([]byte{0x00, 0x01, 0x00, 0x01}) // Type A, Class IN
+	buf.Write([]byte{0x00, 0x00, 0x01, 0x2c}) // TTL
+	buf.Write([]byte{0x00, 0x04})             // RDLENGTH
+	buf.Write([]byte{0x4d, 0x58, 0x67, 0x63}) // Fake IP
 
 	// Magic marker
 	magicPos := buf.Len()

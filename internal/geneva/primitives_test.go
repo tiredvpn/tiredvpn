@@ -11,9 +11,9 @@ func createTestPacket() []byte {
 	packet := make([]byte, 60)
 
 	// IP header
-	packet[0] = 0x45 // Version 4, header length 5 (20 bytes)
-	packet[1] = 0x00 // TOS
-	binary.BigEndian.PutUint16(packet[2:4], 60)  // Total length
+	packet[0] = 0x45                              // Version 4, header length 5 (20 bytes)
+	packet[1] = 0x00                              // TOS
+	binary.BigEndian.PutUint16(packet[2:4], 60)   // Total length
 	binary.BigEndian.PutUint16(packet[4:6], 1234) // ID
 	packet[6] = 0x40                              // Flags: DF
 	packet[7] = 0x00                              // Fragment offset
@@ -34,8 +34,8 @@ func createTestPacket() []byte {
 	binary.BigEndian.PutUint16(packet[22:24], 80)    // Dest port
 	binary.BigEndian.PutUint32(packet[24:28], 1000)  // Sequence number
 	binary.BigEndian.PutUint32(packet[28:32], 2000)  // Ack number
-	packet[32] = 0x50                                 // Data offset: 5 (20 bytes), reserved
-	packet[33] = TCPFlagSYN | TCPFlagACK              // Flags: SYN+ACK
+	packet[32] = 0x50                                // Data offset: 5 (20 bytes), reserved
+	packet[33] = TCPFlagSYN | TCPFlagACK             // Flags: SYN+ACK
 	binary.BigEndian.PutUint16(packet[34:36], 65535) // Window size
 	// Checksum at 36-37
 	binary.BigEndian.PutUint16(packet[38:40], 0) // Urgent pointer

@@ -19,7 +19,7 @@ import (
 // TrafficMorphStrategy morphs traffic to match target application patterns
 // Makes VPN traffic statistically indistinguishable from YouTube/Yandex.Video
 type TrafficMorphStrategy struct {
-	manager   *Manager        // Reference to Manager for IPv6/IPv4 support
+	manager   *Manager // Reference to Manager for IPv6/IPv4 support
 	profile   *TrafficProfile
 	baseStrat Strategy // Underlying strategy (e.g., gRPC tunnel)
 	secret    []byte   // Secret for authentication
@@ -66,33 +66,33 @@ var (
 	}
 
 	// VKVideoProfile mimics VK Video streaming
-        // BaiduVideoProfile mimics Baidu Video streaming (primary for China)
-        BaiduVideoProfile = &TrafficProfile{
-                Name:               "Baidu Video",
-                PacketSizes:        []int{250, 700, 1100, 1450},
-                PacketSizeProbs:    []float64{0.12, 0.18, 0.30, 0.40},
-                InterArrivalMean:   10.0,
-                InterArrivalStdDev: 25.0,
-                BurstSize:          25,
-                BurstInterval:      180 * time.Millisecond,
-                DownUpRatio:        12.0,
-                MinPadding:         60,
-                MaxPadding:         250,
-        }
+	// BaiduVideoProfile mimics Baidu Video streaming (primary for China)
+	BaiduVideoProfile = &TrafficProfile{
+		Name:               "Baidu Video",
+		PacketSizes:        []int{250, 700, 1100, 1450},
+		PacketSizeProbs:    []float64{0.12, 0.18, 0.30, 0.40},
+		InterArrivalMean:   10.0,
+		InterArrivalStdDev: 25.0,
+		BurstSize:          25,
+		BurstInterval:      180 * time.Millisecond,
+		DownUpRatio:        12.0,
+		MinPadding:         60,
+		MaxPadding:         250,
+	}
 
-        // AparatVideoProfile mimics Aparat Video streaming (primary for Iran)
-        AparatVideoProfile = &TrafficProfile{
-                Name:               "Aparat Video",
-                PacketSizes:        []int{180, 550, 950, 1350},
-                PacketSizeProbs:    []float64{0.15, 0.25, 0.30, 0.30},
-                InterArrivalMean:   12.0,
-                InterArrivalStdDev: 30.0,
-                BurstSize:          20,
-                BurstInterval:      200 * time.Millisecond,
-                DownUpRatio:        10.0,
-                MinPadding:         40,
-                MaxPadding:         180,
-        }
+	// AparatVideoProfile mimics Aparat Video streaming (primary for Iran)
+	AparatVideoProfile = &TrafficProfile{
+		Name:               "Aparat Video",
+		PacketSizes:        []int{180, 550, 950, 1350},
+		PacketSizeProbs:    []float64{0.15, 0.25, 0.30, 0.30},
+		InterArrivalMean:   12.0,
+		InterArrivalStdDev: 30.0,
+		BurstSize:          20,
+		BurstInterval:      200 * time.Millisecond,
+		DownUpRatio:        10.0,
+		MinPadding:         40,
+		MaxPadding:         180,
+	}
 
 	VKVideoProfile = &TrafficProfile{
 		Name:               "VK Video",
@@ -284,8 +284,8 @@ func (s *TrafficMorphStrategy) Connect(ctx context.Context, target string) (net.
 		// Wrap TCP connection with fragmentation to defeat DPI
 		// This splits TLS ClientHello across multiple TCP segments
 		fragConfig := &evasion.FragmentationConfig{
-			FragmentSize:  2,             // Very small fragments
-			SplitPosition: 1,             // Split SNI at first byte
+			FragmentSize:  2,                // Very small fragments
+			SplitPosition: 1,                // Split SNI at first byte
 			FragmentDelay: time.Millisecond, // Small delay between fragments
 		}
 		fragConn := evasion.NewFragmentedWriter(tcpConn, fragConfig)
@@ -322,10 +322,10 @@ type MorphedConn struct {
 	profile *TrafficProfile
 
 	// Write scheduling
-	writeMu      sync.Mutex
-	writeQueue   [][]byte
-	writeTicker  *time.Ticker
-	writeStop    chan struct{}
+	writeMu     sync.Mutex
+	writeQueue  [][]byte
+	writeTicker *time.Ticker
+	writeStop   chan struct{}
 
 	// Read buffer for partial reads
 	readBuf []byte
@@ -352,11 +352,11 @@ func (mc *MorphedConn) NetConn() net.Conn {
 // NewMorphedConn creates a morphed connection
 func NewMorphedConn(conn net.Conn, profile *TrafficProfile, secret []byte) *MorphedConn {
 	mc := &MorphedConn{
-		Conn:        conn,
-		profile:     profile,
-		writeQueue:  make([][]byte, 0),
-		writeStop:   make(chan struct{}),
-		lastBurst:   time.Now(),
+		Conn:       conn,
+		profile:    profile,
+		writeQueue: make([][]byte, 0),
+		writeStop:  make(chan struct{}),
+		lastBurst:  time.Now(),
 		// Rate limiter disabled - was causing 80 KB/s bottleneck
 		rateLimiter: nil,
 	}

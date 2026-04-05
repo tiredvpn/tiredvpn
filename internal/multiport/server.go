@@ -13,50 +13,50 @@ import (
 // Server manages the multiport UDP server
 type Server struct {
 	// Configuration
-	tcpPort       int
-	udpBasePort   int
-	udpPortCount  int
-	maxClients    int
+	tcpPort      int
+	udpBasePort  int
+	udpPortCount int
+	maxClients   int
 
 	// Components
-	allocator     *PortAllocator
-	tcpListener   net.Listener
-	udpSockets    map[int]*net.UDPConn // port -> UDP connection
-	udpSocketsMu  sync.RWMutex
+	allocator    *PortAllocator
+	tcpListener  net.Listener
+	udpSockets   map[int]*net.UDPConn // port -> UDP connection
+	udpSocketsMu sync.RWMutex
 
 	// Session management
-	sessions      map[string]*Session // sessionID -> session
+	sessions       map[string]*Session // sessionID -> session
 	sessionsByPort map[int]string      // UDP port -> sessionID (for fast lookup)
-	sessionsMu    sync.RWMutex
+	sessionsMu     sync.RWMutex
 
 	// Lifecycle
-	ctx           context.Context
-	cancel        context.CancelFunc
-	wg            sync.WaitGroup
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
 // Session represents a client session
 type Session struct {
 	// Identity
-	SessionID     string
-	ClientID      string
-	Allocation    *Allocation
+	SessionID  string
+	ClientID   string
+	Allocation *Allocation
 
 	// Buffers
-	RecvBuffer    *ReceiveBuffer
-	SendBuffer    *SendBuffer
+	RecvBuffer *ReceiveBuffer
+	SendBuffer *SendBuffer
 
 	// Target connection (for relay)
-	TargetConn    net.Conn
-	TargetMu      sync.Mutex
+	TargetConn net.Conn
+	TargetMu   sync.Mutex
 
 	// Stats
-	CreatedAt     time.Time
-	LastActivity  time.Time
+	CreatedAt    time.Time
+	LastActivity time.Time
 
 	// Lifecycle
-	ctx           context.Context
-	cancel        context.CancelFunc
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // NewServer creates a new multiport server

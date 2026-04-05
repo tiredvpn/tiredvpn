@@ -29,7 +29,7 @@ type ReceiveBuffer struct {
 
 // ReceiveStats tracks receive buffer statistics
 type ReceiveStats struct {
-	PacketsReceived uint64
+	PacketsReceived  uint64
 	PacketsDuplicate uint64
 	PacketsDropped   uint64
 	BytesReceived    uint64
@@ -234,21 +234,21 @@ type SendBuffer struct {
 }
 
 type sendPacketState struct {
-	packet      *Packet
-	sendTime    time.Time
-	retries     int
-	rto         time.Duration // Current RTO for this packet
-	timer       *time.Timer
+	packet       *Packet
+	sendTime     time.Time
+	retries      int
+	rto          time.Duration // Current RTO for this packet
+	timer        *time.Timer
 	acknowledged bool
 }
 
 // SendStats tracks send buffer statistics
 type SendStats struct {
-	PacketsSent      uint64
-	BytesSent        uint64
-	Retransmissions  uint64
-	Acknowledgments  uint64
-	PacketsLost      uint64
+	PacketsSent     uint64
+	BytesSent       uint64
+	Retransmissions uint64
+	Acknowledgments uint64
+	PacketsLost     uint64
 }
 
 // NewSendBuffer creates a new send buffer

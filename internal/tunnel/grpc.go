@@ -16,19 +16,19 @@ import (
 // GRPCTunnel implements tunneling over gRPC-like HTTP/2 connection
 // This mimics traffic to googleapis.com / firebaseio.com
 type GRPCTunnel struct {
-	conn          net.Conn
-	framer        *http2.Framer
-	encoder       *hpack.Encoder
-	encoderBuf    bytes.Buffer
+	conn       net.Conn
+	framer     *http2.Framer
+	encoder    *hpack.Encoder
+	encoderBuf bytes.Buffer
 
-	config        *GRPCConfig
-	streamID      uint32
-	mu            sync.Mutex
+	config   *GRPCConfig
+	streamID uint32
+	mu       sync.Mutex
 
-	readBuf       bytes.Buffer
-	readMu        sync.Mutex
+	readBuf bytes.Buffer
+	readMu  sync.Mutex
 
-	closed        bool
+	closed bool
 }
 
 // GRPCConfig configures gRPC tunnel
@@ -73,7 +73,7 @@ func DefaultGRPCConfig(authority string) *GRPCConfig {
 		ContentType:  "application/grpc",
 		GRPCEncoding: "identity",
 		CustomHeaders: map[string]string{
-			"te":               "trailers",
+			"te":                   "trailers",
 			"grpc-accept-encoding": "identity,deflate,gzip",
 		},
 		EnablePadding: true,

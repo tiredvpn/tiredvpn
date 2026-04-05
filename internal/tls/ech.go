@@ -70,12 +70,12 @@ func DialWithECH(ctx context.Context, network, addr string, serverName string, e
 
 	// Build TLS config with ECH
 	tlsConfig := &tls.Config{
-		ServerName:         serverName,
-// InsecureSkipVerify is intentional: the VPN server presents a certificate for
+		ServerName: serverName,
+		// InsecureSkipVerify is intentional: the VPN server presents a certificate for
 		// the cover domain which it does not own (required for DPI evasion via ECH).
 		// Server identity is authenticated at the VPN protocol layer via shared secret.
 		// TODO: implement certificate pinning for the actual server certificate.
-		InsecureSkipVerify: true, //nolint:gosec
+		InsecureSkipVerify: true,             //nolint:gosec
 		MinVersion:         tls.VersionTLS13, // ECH requires TLS 1.3
 		NextProtos:         []string{"h2", "http/1.1"},
 	}

@@ -42,21 +42,21 @@ func TestSOCKS5HandshakeResponse(t *testing.T) {
 // TestSOCKS5ConnectRequestFormat tests CONNECT request formatting
 func TestSOCKS5ConnectRequestFormat(t *testing.T) {
 	tests := []struct {
-		name       string
-		domain     string
-		port       uint16
+		name         string
+		domain       string
+		port         uint16
 		wantAddrType byte
 	}{
 		{
-			name:       "example.com:443",
-			domain:     "example.com",
-			port:       443,
+			name:         "example.com:443",
+			domain:       "example.com",
+			port:         443,
 			wantAddrType: 0x03, // Domain name
 		},
 		{
-			name:       "google.com:80",
-			domain:     "google.com",
-			port:       80,
+			name:         "google.com:80",
+			domain:       "google.com",
+			port:         80,
 			wantAddrType: 0x03,
 		},
 	}
@@ -66,9 +66,9 @@ func TestSOCKS5ConnectRequestFormat(t *testing.T) {
 			var req bytes.Buffer
 
 			// Build CONNECT request
-			req.WriteByte(0x05) // Version
-			req.WriteByte(0x01) // CONNECT
-			req.WriteByte(0x00) // Reserved
+			req.WriteByte(0x05)            // Version
+			req.WriteByte(0x01)            // CONNECT
+			req.WriteByte(0x00)            // Reserved
 			req.WriteByte(tt.wantAddrType) // Domain name type
 			req.WriteByte(byte(len(tt.domain)))
 			req.WriteString(tt.domain)
@@ -116,9 +116,9 @@ func TestSOCKS5ConnectRequestFormat(t *testing.T) {
 // TestSOCKS5ResponseFormat tests SOCKS5 response parsing
 func TestSOCKS5ResponseFormat(t *testing.T) {
 	tests := []struct {
-		name     string
-		code     byte
-		wantErr  bool
+		name    string
+		code    byte
+		wantErr bool
 	}{
 		{"Success", 0x00, false},
 		{"General failure", 0x01, true},
@@ -135,10 +135,10 @@ func TestSOCKS5ResponseFormat(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Build response packet
 			var resp bytes.Buffer
-			resp.WriteByte(0x05) // Version
-			resp.WriteByte(tt.code) // Status code
-			resp.WriteByte(0x00) // Reserved
-			resp.WriteByte(0x01) // IPv4
+			resp.WriteByte(0x05)           // Version
+			resp.WriteByte(tt.code)        // Status code
+			resp.WriteByte(0x00)           // Reserved
+			resp.WriteByte(0x01)           // IPv4
 			resp.Write([]byte{0, 0, 0, 0}) // Bind addr
 			resp.Write([]byte{0, 0})       // Bind port
 
@@ -249,12 +249,12 @@ func TestSOCKS5IPv4Format(t *testing.T) {
 	var req bytes.Buffer
 
 	// Build CONNECT with IPv4
-	req.WriteByte(0x05) // Version
-	req.WriteByte(0x01) // CONNECT
-	req.WriteByte(0x00) // Reserved
-	req.WriteByte(0x01) // IPv4
+	req.WriteByte(0x05)                 // Version
+	req.WriteByte(0x01)                 // CONNECT
+	req.WriteByte(0x00)                 // Reserved
+	req.WriteByte(0x01)                 // IPv4
 	req.Write([]byte{93, 184, 216, 34}) // 93.184.216.34 (example.com)
-	req.Write([]byte{0x01, 0xBB}) // Port 443
+	req.Write([]byte{0x01, 0xBB})       // Port 443
 
 	packet := req.Bytes()
 

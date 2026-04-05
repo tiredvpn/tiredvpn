@@ -21,7 +21,7 @@ import (
 type ControlCommand struct {
 	Command string `json:"command"` // "connect", "disconnect", "status", "set_fd", "reconnect", "network_changed"
 	TunFd   int    `json:"tun_fd,omitempty"`
-	Pid     int    `json:"pid,omitempty"` // Parent process PID for /proc/PID/fd/N access
+	Pid     int    `json:"pid,omitempty"`    // Parent process PID for /proc/PID/fd/N access
 	Reason  string `json:"reason,omitempty"` // For network_changed: "wifi_to_lte", "lte_to_wifi", "cell_handoff"
 }
 
@@ -43,9 +43,9 @@ type ControlResponse struct {
 // EventMessage represents asynchronous events from Go to Android
 // Android distinguishes events from responses by presence of "event" field vs "status" field
 type EventMessage struct {
-	Event     string `json:"event"`               // "keepalive", "connection_dead", "reconnecting", "connected"
-	Timestamp int64  `json:"timestamp"`           // unix milliseconds
-	Data      string `json:"data,omitempty"`      // optional: latency, strategy name, error reason
+	Event     string `json:"event"`          // "keepalive", "connection_dead", "reconnecting", "connected"
+	Timestamp int64  `json:"timestamp"`      // unix milliseconds
+	Data      string `json:"data,omitempty"` // optional: latency, strategy name, error reason
 }
 
 // ControlServer handles control socket for Android VpnService
@@ -55,25 +55,25 @@ type ControlServer struct {
 	vpnClient  *VPNClient
 
 	// Connection state
-	mu           sync.Mutex
-	serverConn   net.Conn           // Connection to VPN server
-	assignedIP   net.IP             // IP assigned by server
-	serverIP     net.IP             // Server's TUN IP
-	mtu          int
-	waitingForFd bool
-	tunFdCh      chan int           // Channel to receive TUN fd
-	tunFd        int                // Current TUN fd (for reconnect)
-	tunDev       *TUNDevice         // Current TUN device (for reconnect)
-	relayStopCh      chan struct{}  // Channel to stop current TUN relay
-	relayGeneration  int           // Incremented on each relay start/hot-swap; stale OnError callbacks are ignored
-	reconnecting     bool          // True when intentionally reconnecting (suppress dead event)
+	mu              sync.Mutex
+	serverConn      net.Conn // Connection to VPN server
+	assignedIP      net.IP   // IP assigned by server
+	serverIP        net.IP   // Server's TUN IP
+	mtu             int
+	waitingForFd    bool
+	tunFdCh         chan int      // Channel to receive TUN fd
+	tunFd           int           // Current TUN fd (for reconnect)
+	tunDev          *TUNDevice    // Current TUN device (for reconnect)
+	relayStopCh     chan struct{} // Channel to stop current TUN relay
+	relayGeneration int           // Incremented on each relay start/hot-swap; stale OnError callbacks are ignored
+	reconnecting    bool          // True when intentionally reconnecting (suppress dead event)
 
 	// Auto-reconnect state
-	autoReconnect     bool              // Enable automatic reconnect on connection loss
-	autoReconnectStop chan struct{}     // Stop channel for auto-reconnect goroutine
+	autoReconnect     bool          // Enable automatic reconnect on connection loss
+	autoReconnectStop chan struct{} // Stop channel for auto-reconnect goroutine
 
 	// Network signal channel - Android notifies us when network is restored
-	networkAvailableChan chan struct{}  // Buffered channel for network_available signals
+	networkAvailableChan chan struct{} // Buffered channel for network_available signals
 
 	// Control connection for sending events back to Android
 	controlConn net.Conn
@@ -122,11 +122,11 @@ func NewControlServer(socketPath string, cfg *ControlConfig) (*ControlServer, er
 	os.Chmod(socketPath, 0666)
 
 	return &ControlServer{
-		socketPath: socketPath,
-		listener:   listener,
-		config:     cfg,
-		mtu:        cfg.MTU,
-		tunFdCh:    make(chan int, 1),
+		socketPath:           socketPath,
+		listener:             listener,
+		config:               cfg,
+		mtu:                  cfg.MTU,
+		tunFdCh:              make(chan int, 1),
 		networkAvailableChan: make(chan struct{}, 1), // Buffered to avoid blocking Android
 	}, nil
 }

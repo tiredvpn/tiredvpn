@@ -927,17 +927,17 @@ func testHTTPThroughTunnel(conn net.Conn, serverAddr string) (exitIP string, lat
 
 // ComboResult holds result for a strategy + RTT profile combination
 type ComboResult struct {
-	StrategyID   string
-	StrategyName string
-	RTTProfile   string // "none" or profile name
-	Available    bool
-	Latency      time.Duration
-	HTTPLatency  time.Duration
-	ExitIP       string
-	IPChanged    bool
+	StrategyID    string
+	StrategyName  string
+	RTTProfile    string // "none" or profile name
+	Available     bool
+	Latency       time.Duration
+	HTTPLatency   time.Duration
+	ExitIP        string
+	IPChanged     bool
 	DownloadSpeed float64
-	Score        int
-	Error        string
+	Score         int
+	Error         string
 }
 
 // AllCombosResult holds results for all combinations

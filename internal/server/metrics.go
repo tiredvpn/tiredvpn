@@ -12,12 +12,12 @@ type Metrics struct {
 	registry *ClientRegistry
 
 	// Server-wide counters (atomic)
-	totalConnections   int64
-	activeConnections  int64
-	totalBytesUp       int64
-	totalBytesDown     int64
-	authFailures       int64
-	connectionErrors   int64
+	totalConnections  int64
+	activeConnections int64
+	totalBytesUp      int64
+	totalBytesDown    int64
+	authFailures      int64
+	connectionErrors  int64
 
 	// Timestamps
 	startTime time.Time

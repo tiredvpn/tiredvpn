@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 package tun
@@ -14,10 +15,10 @@ import (
 )
 
 const (
-	tunDevice  = "/dev/net/tun"
-	ifnamsiz   = 16
-	iffTun     = 0x0001
-	iffNoPi    = 0x1000
+	tunDevice = "/dev/net/tun"
+	ifnamsiz  = 16
+	iffTun    = 0x0001
+	iffNoPi   = 0x1000
 )
 
 // ifReq is the Linux interface request structure

@@ -41,13 +41,13 @@ type ResilientConnection struct {
 	serverAddr string
 	config     ResilientConfig
 
-	mu              sync.Mutex
-	conn            net.Conn
-	strategy        Strategy
-	excludeIDs      []string // strategies that have failed in this session
-	reconnectCount  int
-	closed          int32
-	lastActivity    time.Time
+	mu             sync.Mutex
+	conn           net.Conn
+	strategy       Strategy
+	excludeIDs     []string // strategies that have failed in this session
+	reconnectCount int
+	closed         int32
+	lastActivity   time.Time
 
 	// Callbacks
 	onReconnect func(oldStrategy, newStrategy Strategy)

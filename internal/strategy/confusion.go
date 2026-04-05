@@ -2,13 +2,13 @@ package strategy
 
 import (
 	"bytes"
-        "fmt"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
+	"fmt"
 	"io"
-        mathrand "math/rand"
+	mathrand "math/rand"
 	"net"
 	"time"
 
@@ -142,11 +142,11 @@ func getRandomConfusionDomain() string {
 
 type ConfusedConn struct {
 	net.Conn
-	confType      ConfusionType
-	headerSent    bool
-	headerRead    bool
-	serverMagic   []byte
-	rawMode       bool // When true, Read() passes data through without deframing (for VPN mode)
+	confType    ConfusionType
+	headerSent  bool
+	headerRead  bool
+	serverMagic []byte
+	rawMode     bool // When true, Read() passes data through without deframing (for VPN mode)
 }
 
 // NewConfusedConn creates a confused connection
@@ -237,11 +237,11 @@ func (c *ConfusedConn) buildDNSConfusion(realData []byte) []byte {
 	buf.Write([]byte{0x00, 0x01})
 
 	// Answer section (fake)
-	buf.Write([]byte{0xc0, 0x0c}) // Pointer to name
-	buf.Write([]byte{0x00, 0x01}) // Type A
-	buf.Write([]byte{0x00, 0x01}) // Class IN
+	buf.Write([]byte{0xc0, 0x0c})             // Pointer to name
+	buf.Write([]byte{0x00, 0x01})             // Type A
+	buf.Write([]byte{0x00, 0x01})             // Class IN
 	buf.Write([]byte{0x00, 0x00, 0x01, 0x2c}) // TTL: 300
-	buf.Write([]byte{0x00, 0x04}) // RDLENGTH: 4
+	buf.Write([]byte{0x00, 0x04})             // RDLENGTH: 4
 	buf.Write([]byte{0x4d, 0x58, 0x67, 0x63}) // IP (fake)
 
 	// Magic marker - server looks for this
@@ -351,14 +351,14 @@ func (c *ConfusedConn) buildMultiLayerConfusion(realData []byte) []byte {
 	buf.WriteString("\r\n")
 
 	// Layer 2: gRPC frame header
-	buf.Write([]byte{0x00}) // No compression
+	buf.Write([]byte{0x00})                   // No compression
 	buf.Write([]byte{0x00, 0x00, 0x00, 0x00}) // Placeholder length
 
 	// Layer 3: Protocol buffers-like structure
 	buf.Write([]byte{0x0a}) // Field 1, wire type 2 (length-delimited)
 
 	// Magic in "field value"
-	buf.Write([]byte{0x05}) // Length 5
+	buf.Write([]byte{0x05})                         // Length 5
 	buf.Write([]byte{0x54, 0x49, 0x52, 0x45, 0x44}) // TIRED
 
 	// Real data length

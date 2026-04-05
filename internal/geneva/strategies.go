@@ -13,8 +13,8 @@ func ChinaGFWStrategy1() *Strategy {
 		Value:    uint8(TCPFlagSYN),
 		Operator: "&",
 		Metadata: map[string]string{
-			"name":        "China GFW Strategy 1",
-			"description": "Duplicate SYN with low TTL",
+			"name":         "China GFW Strategy 1",
+			"description":  "Duplicate SYN with low TTL",
 			"success_rate": "75%",
 		},
 	}
@@ -36,8 +36,8 @@ func ChinaGFWStrategy2() *Strategy {
 		Value:    uint8(TCPFlagSYN),
 		Operator: "&",
 		Metadata: map[string]string{
-			"name":        "China GFW Strategy 2",
-			"description": "Fake SYN-ACK confusion",
+			"name":         "China GFW Strategy 2",
+			"description":  "Fake SYN-ACK confusion",
 			"success_rate": "70%",
 		},
 	}
@@ -60,8 +60,8 @@ func ChinaGFWStrategy3() *Strategy {
 		Value:    uint8(TCPFlagPSH | TCPFlagACK),
 		Operator: "&",
 		Metadata: map[string]string{
-			"name":        "China GFW Strategy 3",
-			"description": "Fragment PSH-ACK packets",
+			"name":         "China GFW Strategy 3",
+			"description":  "Fragment PSH-ACK packets",
 			"success_rate": "80%",
 		},
 	}
@@ -83,8 +83,8 @@ func IranDPIStrategy1() *Strategy {
 		Value:    uint8(TCPFlagSYN),
 		Operator: "&",
 		Metadata: map[string]string{
-			"name":        "Iran DPI Strategy 1",
-			"description": "Sequence number tampering",
+			"name":         "Iran DPI Strategy 1",
+			"description":  "Sequence number tampering",
 			"success_rate": "65%",
 		},
 	}
@@ -107,8 +107,8 @@ func IranDPIStrategy2() *Strategy {
 		Value:    uint8(TCPFlagPSH | TCPFlagACK),
 		Operator: "&",
 		Metadata: map[string]string{
-			"name":        "Iran DPI Strategy 2",
-			"description": "Fragment HTTP requests",
+			"name":         "Iran DPI Strategy 2",
+			"description":  "Fragment HTTP requests",
 			"success_rate": "70%",
 		},
 	}
@@ -130,8 +130,8 @@ func RussiaTSPUStrategy1() *Strategy {
 		Value:    uint8(TCPFlagSYN),
 		Operator: "&",
 		Metadata: map[string]string{
-			"name":        "Russia TSPU Strategy 1",
-			"description": "Low TTL SYN duplicate",
+			"name":         "Russia TSPU Strategy 1",
+			"description":  "Low TTL SYN duplicate",
 			"success_rate": "85%",
 		},
 	}
@@ -154,8 +154,8 @@ func RussiaTSPUStrategy2() *Strategy {
 		Value:    uint8(TCPFlagPSH | TCPFlagACK),
 		Operator: "&",
 		Metadata: map[string]string{
-			"name":        "Russia TSPU Strategy 2",
-			"description": "Single-byte fragment for SNI evasion",
+			"name":         "Russia TSPU Strategy 2",
+			"description":  "Single-byte fragment for SNI evasion",
 			"success_rate": "90%",
 		},
 	}
@@ -177,8 +177,8 @@ func RussiaTSPUStrategy3() *Strategy {
 		Value:    uint8(TCPFlagPSH | TCPFlagACK),
 		Operator: "&",
 		Metadata: map[string]string{
-			"name":        "Russia TSPU Strategy 3",
-			"description": "RST poisoning",
+			"name":         "Russia TSPU Strategy 3",
+			"description":  "RST poisoning",
 			"success_rate": "80%",
 		},
 	}
@@ -201,8 +201,8 @@ func TurkeyDPIStrategy1() *Strategy {
 		Value:    uint8(TCPFlagSYN),
 		Operator: "&",
 		Metadata: map[string]string{
-			"name":        "Turkey DPI Strategy 1",
-			"description": "Zero sequence number confusion",
+			"name":         "Turkey DPI Strategy 1",
+			"description":  "Zero sequence number confusion",
 			"success_rate": "60%",
 		},
 	}
@@ -225,8 +225,8 @@ func GenericFragmentStrategy() *Strategy {
 		Value:    uint8(TCPFlagPSH | TCPFlagACK),
 		Operator: "&",
 		Metadata: map[string]string{
-			"name":        "Generic Fragment Strategy",
-			"description": "Basic payload fragmentation",
+			"name":         "Generic Fragment Strategy",
+			"description":  "Basic payload fragmentation",
 			"success_rate": "50%",
 		},
 	}
@@ -248,8 +248,8 @@ func GenericDuplicateStrategy() *Strategy {
 		Value:    uint8(TCPFlagSYN),
 		Operator: "&",
 		Metadata: map[string]string{
-			"name":        "Generic Duplicate Strategy",
-			"description": "Simple SYN duplication",
+			"name":         "Generic Duplicate Strategy",
+			"description":  "Simple SYN duplication",
 			"success_rate": "40%",
 		},
 	}
@@ -264,17 +264,17 @@ func GenericDuplicateStrategy() *Strategy {
 // GetAllStrategies returns all pre-discovered Geneva strategies
 func GetAllStrategies() map[string]*Strategy {
 	return map[string]*Strategy{
-		"china_gfw_1":     ChinaGFWStrategy1(),
-		"china_gfw_2":     ChinaGFWStrategy2(),
-		"china_gfw_3":     ChinaGFWStrategy3(),
-		"iran_dpi_1":      IranDPIStrategy1(),
-		"iran_dpi_2":      IranDPIStrategy2(),
-		"russia_tspu_1":   RussiaTSPUStrategy1(),
-		"russia_tspu_2":   RussiaTSPUStrategy2(),
-		"russia_tspu_3":   RussiaTSPUStrategy3(),
-		"turkey_dpi_1":    TurkeyDPIStrategy1(),
+		"china_gfw_1":      ChinaGFWStrategy1(),
+		"china_gfw_2":      ChinaGFWStrategy2(),
+		"china_gfw_3":      ChinaGFWStrategy3(),
+		"iran_dpi_1":       IranDPIStrategy1(),
+		"iran_dpi_2":       IranDPIStrategy2(),
+		"russia_tspu_1":    RussiaTSPUStrategy1(),
+		"russia_tspu_2":    RussiaTSPUStrategy2(),
+		"russia_tspu_3":    RussiaTSPUStrategy3(),
+		"turkey_dpi_1":     TurkeyDPIStrategy1(),
 		"generic_fragment": GenericFragmentStrategy(),
-		"generic_dup":     GenericDuplicateStrategy(),
+		"generic_dup":      GenericDuplicateStrategy(),
 	}
 }
 

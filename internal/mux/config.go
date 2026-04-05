@@ -35,13 +35,13 @@ type Config struct {
 // - DPI confusion (reasonable frame sizes)
 func DefaultConfig() *Config {
 	return &Config{
-		Version:           2,                  // smux v2 for better performance
-		KeepAliveInterval: 10 * time.Second,   // Fast detection of dead connections
-		KeepAliveTimeout:  30 * time.Second,   // Allow for network jitter
-		MaxFrameSize:      32768,              // 32KB frames - good balance
-		MaxReceiveBuffer:  4194304,            // 4MB total receive buffer
-		MaxStreamBuffer:   65536,              // 64KB per stream
-		MaxStreams:        0,                  // Unlimited streams
+		Version:           2,                // smux v2 for better performance
+		KeepAliveInterval: 10 * time.Second, // Fast detection of dead connections
+		KeepAliveTimeout:  30 * time.Second, // Allow for network jitter
+		MaxFrameSize:      32768,            // 32KB frames - good balance
+		MaxReceiveBuffer:  4194304,          // 4MB total receive buffer
+		MaxStreamBuffer:   65536,            // 64KB per stream
+		MaxStreams:        0,                // Unlimited streams
 	}
 }
 
@@ -52,9 +52,9 @@ func HighThroughputConfig() *Config {
 		Version:           2,
 		KeepAliveInterval: 15 * time.Second,
 		KeepAliveTimeout:  45 * time.Second,
-		MaxFrameSize:      65535,             // Maximum frame size
-		MaxReceiveBuffer:  16777216,          // 16MB total buffer
-		MaxStreamBuffer:   262144,            // 256KB per stream
+		MaxFrameSize:      65535,    // Maximum frame size
+		MaxReceiveBuffer:  16777216, // 16MB total buffer
+		MaxStreamBuffer:   262144,   // 256KB per stream
 		MaxStreams:        0,
 	}
 }
@@ -64,11 +64,11 @@ func HighThroughputConfig() *Config {
 func LowLatencyConfig() *Config {
 	return &Config{
 		Version:           2,
-		KeepAliveInterval: 5 * time.Second,   // Very fast keepalive
+		KeepAliveInterval: 5 * time.Second, // Very fast keepalive
 		KeepAliveTimeout:  15 * time.Second,
-		MaxFrameSize:      16384,             // Smaller frames for lower latency
-		MaxReceiveBuffer:  2097152,           // 2MB total buffer
-		MaxStreamBuffer:   32768,             // 32KB per stream
+		MaxFrameSize:      16384,   // Smaller frames for lower latency
+		MaxReceiveBuffer:  2097152, // 2MB total buffer
+		MaxStreamBuffer:   32768,   // 32KB per stream
 		MaxStreams:        0,
 	}
 }
@@ -78,12 +78,12 @@ func LowLatencyConfig() *Config {
 func MobileConfig() *Config {
 	return &Config{
 		Version:           2,
-		KeepAliveInterval: 20 * time.Second,  // Less aggressive keepalive for battery
-		KeepAliveTimeout:  60 * time.Second,  // More tolerance for mobile latency
-		MaxFrameSize:      32768,             // Standard frames
-		MaxReceiveBuffer:  2097152,           // 2MB - conserve memory
-		MaxStreamBuffer:   65536,             // 64KB per stream
-		MaxStreams:        100,               // Limit streams on mobile
+		KeepAliveInterval: 20 * time.Second, // Less aggressive keepalive for battery
+		KeepAliveTimeout:  60 * time.Second, // More tolerance for mobile latency
+		MaxFrameSize:      32768,            // Standard frames
+		MaxReceiveBuffer:  2097152,          // 2MB - conserve memory
+		MaxStreamBuffer:   65536,            // 64KB per stream
+		MaxStreams:        100,              // Limit streams on mobile
 	}
 }
 

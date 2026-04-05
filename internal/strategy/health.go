@@ -14,12 +14,12 @@ import (
 
 // HealthConfig configures health monitoring
 type HealthConfig struct {
-	ReadTimeout      time.Duration       // Max time to wait for any read (default 5s)
-	WriteTimeout     time.Duration       // Max time for write (default 5s)
-	IdleTimeout      time.Duration       // Max idle time before health check (default 30s)
-	HealthCheckFreq  time.Duration       // How often to check health (default 10s)
-	OnUnhealthy      func(reason string) // Callback when unhealthy
-	NoPenaltyOnIdle  bool                // Don't reduce confidence on idle timeout
+	ReadTimeout     time.Duration       // Max time to wait for any read (default 5s)
+	WriteTimeout    time.Duration       // Max time for write (default 5s)
+	IdleTimeout     time.Duration       // Max idle time before health check (default 30s)
+	HealthCheckFreq time.Duration       // How often to check health (default 10s)
+	OnUnhealthy     func(reason string) // Callback when unhealthy
+	NoPenaltyOnIdle bool                // Don't reduce confidence on idle timeout
 }
 
 // DefaultHealthConfig returns default health configuration
@@ -35,23 +35,23 @@ func DefaultHealthConfig() HealthConfig {
 // HealthMonitoredConn wraps a connection with health monitoring
 type HealthMonitoredConn struct {
 	net.Conn
-	config       HealthConfig
-	strategy     Strategy
-	manager      *Manager
-	serverAddr   string
+	config     HealthConfig
+	strategy   Strategy
+	manager    *Manager
+	serverAddr string
 
 	// State
-	lastActivity  int64 // unix nano
-	unhealthy     int32 // atomic bool
-	closed        int32 // atomic bool
-	mu            sync.Mutex
+	lastActivity int64 // unix nano
+	unhealthy    int32 // atomic bool
+	closed       int32 // atomic bool
+	mu           sync.Mutex
 
 	// For reconnection
-	targetAddr    string // The target we're proxying to
+	targetAddr string // The target we're proxying to
 
 	// Control channel
-	controller   *control.Controller
-	ctrlBuf      []byte // Buffer for partial control messages
+	controller *control.Controller
+	ctrlBuf    []byte // Buffer for partial control messages
 }
 
 // NewHealthMonitoredConn wraps a connection with health monitoring
@@ -219,12 +219,12 @@ func (hc *HealthMonitoredConn) Controller() *control.Controller {
 
 // ConnWithHealthCheck is a connection manager that auto-reconnects
 type ConnWithHealthCheck struct {
-	mu           sync.Mutex
-	conn         *HealthMonitoredConn
-	manager      *Manager
-	serverAddr   string
-	targetAddr   string
-	config       HealthConfig
+	mu         sync.Mutex
+	conn       *HealthMonitoredConn
+	manager    *Manager
+	serverAddr string
+	targetAddr string
+	config     HealthConfig
 
 	// Reconnection state
 	reconnecting int32

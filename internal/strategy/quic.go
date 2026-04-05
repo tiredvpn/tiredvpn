@@ -356,9 +356,9 @@ func (s *QUICStrategy) Connect(ctx context.Context, target string) (net.Conn, er
 
 	// Perform authentication handshake
 	quicConn := &QUICConn{
-		Conn: conn,
-		stream:     stream,
-		secret:     s.secret,
+		Conn:   conn,
+		stream: stream,
+		secret: s.secret,
 	}
 
 	if err := quicConn.Handshake(); err != nil {

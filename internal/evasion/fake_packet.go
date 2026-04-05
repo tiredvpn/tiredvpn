@@ -12,11 +12,11 @@ import (
 // FakePacketInjector injects fake packets to confuse DPI
 // Based on research.md: DPI doesn't verify checksums and ignores low TTL packets
 type FakePacketInjector struct {
-	ttl           int
-	badChecksum   bool
-	badSeq        bool
-	fakeSNI       string
-	count         int
+	ttl         int
+	badChecksum bool
+	badSeq      bool
+	fakeSNI     string
+	count       int
 }
 
 // FakePacketConfig configures the injector
@@ -128,17 +128,17 @@ func (f *FakePacketInjector) buildPacket(
 ) ([]byte, error) {
 	// IP header (20 bytes)
 	ipHeader := make([]byte, 20)
-	ipHeader[0] = 0x45                                        // Version (4) + IHL (5)
-	ipHeader[1] = 0x00                                        // DSCP/ECN
-	totalLen := uint16(20 + 20 + len(payload))                // IP + TCP + Payload
-	binary.BigEndian.PutUint16(ipHeader[2:4], totalLen)       // Total length
-	binary.BigEndian.PutUint16(ipHeader[4:6], 0x0000)         // ID (set to 0 - detectable but ok)
-	binary.BigEndian.PutUint16(ipHeader[6:8], 0x4000)         // Flags (Don't Fragment)
-	ipHeader[8] = byte(f.ttl)                                 // TTL - KEY: low TTL
-	ipHeader[9] = 0x06                                        // Protocol: TCP
+	ipHeader[0] = 0x45                                  // Version (4) + IHL (5)
+	ipHeader[1] = 0x00                                  // DSCP/ECN
+	totalLen := uint16(20 + 20 + len(payload))          // IP + TCP + Payload
+	binary.BigEndian.PutUint16(ipHeader[2:4], totalLen) // Total length
+	binary.BigEndian.PutUint16(ipHeader[4:6], 0x0000)   // ID (set to 0 - detectable but ok)
+	binary.BigEndian.PutUint16(ipHeader[6:8], 0x4000)   // Flags (Don't Fragment)
+	ipHeader[8] = byte(f.ttl)                           // TTL - KEY: low TTL
+	ipHeader[9] = 0x06                                  // Protocol: TCP
 	// Checksum at [10:12] - calculated later
-	copy(ipHeader[12:16], srcIP.To4())                        // Source IP
-	copy(ipHeader[16:20], dstIP.To4())                        // Destination IP
+	copy(ipHeader[12:16], srcIP.To4()) // Source IP
+	copy(ipHeader[16:20], dstIP.To4()) // Destination IP
 
 	// Calculate IP checksum
 	ipChecksum := calculateChecksum(ipHeader)
@@ -146,19 +146,19 @@ func (f *FakePacketInjector) buildPacket(
 
 	// TCP header (20 bytes minimum)
 	tcpHeader := make([]byte, 20)
-	binary.BigEndian.PutUint16(tcpHeader[0:2], srcPort)       // Source port
-	binary.BigEndian.PutUint16(tcpHeader[2:4], dstPort)       // Destination port
+	binary.BigEndian.PutUint16(tcpHeader[0:2], srcPort) // Source port
+	binary.BigEndian.PutUint16(tcpHeader[2:4], dstPort) // Destination port
 
 	// Sequence number
 	if f.badSeq {
 		seqNum = seqNum - 10000 // Wrong sequence - server will ignore
 	}
-	binary.BigEndian.PutUint32(tcpHeader[4:8], seqNum)        // Sequence number
-	binary.BigEndian.PutUint32(tcpHeader[8:12], ackNum)       // ACK number
+	binary.BigEndian.PutUint32(tcpHeader[4:8], seqNum)  // Sequence number
+	binary.BigEndian.PutUint32(tcpHeader[8:12], ackNum) // ACK number
 
-	tcpHeader[12] = 0x50                                       // Data offset (5 words = 20 bytes)
-	tcpHeader[13] = 0x18                                       // Flags: PSH + ACK
-	binary.BigEndian.PutUint16(tcpHeader[14:16], 65535)        // Window size
+	tcpHeader[12] = 0x50                                // Data offset (5 words = 20 bytes)
+	tcpHeader[13] = 0x18                                // Flags: PSH + ACK
+	binary.BigEndian.PutUint16(tcpHeader[14:16], 65535) // Window size
 	// Checksum at [16:18] - calculated later
 	// Urgent pointer at [18:20] - zero
 
@@ -243,7 +243,7 @@ func buildFakeClientHello(sni string) []byte {
 	hello := []byte{
 		0x01,             // Handshake Type: ClientHello
 		0x00, 0x00, 0x00, // Length: to be filled
-		0x03, 0x03,       // Version: TLS 1.2
+		0x03, 0x03, // Version: TLS 1.2
 	}
 
 	// Random (32 bytes)

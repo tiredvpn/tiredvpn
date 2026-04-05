@@ -30,8 +30,8 @@ type RelayNode struct {
 	Latency   time.Duration `json:"latency"`   // measured latency
 	Available bool          `json:"available"` // is node up
 	LastCheck time.Time     `json:"last_check"`
-	Load      float64       `json:"load"`      // current load 0-1
-	Secret    string        `json:"secret"`    // shared secret for auth
+	Load      float64       `json:"load"`   // current load 0-1
+	Secret    string        `json:"secret"` // shared secret for auth
 }
 
 // RelayType defines the type of relay node

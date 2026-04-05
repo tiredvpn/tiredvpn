@@ -77,11 +77,11 @@ func checkUDPBufferSizes() bool {
 // setTCPOptions applies performance optimizations to TCP connections
 func setTCPOptions(conn net.Conn) {
 	if tc, ok := conn.(*net.TCPConn); ok {
-		tc.SetNoDelay(true)           // Disable Nagle's algorithm for low latency
-		tc.SetKeepAlive(true)         // Enable TCP keepalive
+		tc.SetNoDelay(true)   // Disable Nagle's algorithm for low latency
+		tc.SetKeepAlive(true) // Enable TCP keepalive
 		tc.SetKeepAlivePeriod(30 * time.Second)
-		tc.SetReadBuffer(64 * 1024)   // 64KB read buffer
-		tc.SetWriteBuffer(64 * 1024)  // 64KB write buffer
+		tc.SetReadBuffer(64 * 1024)  // 64KB read buffer
+		tc.SetWriteBuffer(64 * 1024) // 64KB write buffer
 	}
 }
 
@@ -545,12 +545,12 @@ func Run(cfg *Config) error {
 	// Start dual-stack listeners if IPv6 enabled
 	if cfg.EnableIPv6 && cfg.ListenAddrV6 != "" {
 		log.Info("Starting dual-stack mode: IPv4 and IPv6")
-                // Launch IPv6 listener as independent goroutine — it runs its own accept loop
-                go func() {
-                        if err := startIPv6Listener(cfg.ListenAddrV6, srvCtx); err != nil {
-                                log.Error("IPv6 listener failed: %v", err)
-                        }
-                }()
+		// Launch IPv6 listener as independent goroutine — it runs its own accept loop
+		go func() {
+			if err := startIPv6Listener(cfg.ListenAddrV6, srvCtx); err != nil {
+				log.Error("IPv6 listener failed: %v", err)
+			}
+		}()
 	}
 
 	// Accept connections (IPv4 only or fallback)
@@ -2210,9 +2210,9 @@ func handleConfusionTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverC
 	// Send success response with length prefix: [length:4][status:1][serverIP:4][clientIP:4]
 	// Confusion protocol uses length-prefixed frames for all data after "TIRED" magic
 	serverIP := cfg.TunIP
-	resp := make([]byte, 13) // 4 bytes length + 9 bytes data
+	resp := make([]byte, 13)                 // 4 bytes length + 9 bytes data
 	binary.BigEndian.PutUint32(resp[0:4], 9) // length = 9
-	resp[4] = 0x00 // Success
+	resp[4] = 0x00                           // Success
 	copy(resp[5:9], serverIP.To4())
 	copy(resp[9:13], clientIP.To4())
 	conn.Write(resp)

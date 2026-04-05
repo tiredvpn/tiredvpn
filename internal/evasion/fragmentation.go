@@ -55,9 +55,9 @@ func DefaultFragmentationConfig() *FragmentationConfig {
 
 // FragmentedWriter wraps a connection and fragments writes
 type FragmentedWriter struct {
-	conn          net.Conn
-	config        *FragmentationConfig
-	mu            sync.Mutex
+	conn           net.Conn
+	config         *FragmentationConfig
+	mu             sync.Mutex
 	firstWriteDone bool
 }
 
@@ -253,7 +253,7 @@ func isTLSClientHello(data []byte) bool {
 	// Handshake type 0x01 = ClientHello
 	return data[0] == 0x16 && // Handshake
 		data[1] == 0x03 && // TLS major version
-		data[5] == 0x01    // ClientHello handshake type
+		data[5] == 0x01 // ClientHello handshake type
 }
 
 // Read passes through to underlying connection

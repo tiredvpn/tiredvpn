@@ -8,9 +8,9 @@ import (
 
 // RuntimeStats collects Go runtime performance metrics
 type RuntimeStats struct {
-	lastCPUTime   int64 // nanoseconds
+	lastCPUTime    int64 // nanoseconds
 	lastSampleTime int64 // unix nano
-	cpuPercent    int64 // scaled by 100 (e.g., 1523 = 15.23%)
+	cpuPercent     int64 // scaled by 100 (e.g., 1523 = 15.23%)
 }
 
 // NewRuntimeStats creates a new runtime stats collector
@@ -72,10 +72,10 @@ func GetGoroutineCount() int {
 
 // GetGCStats returns GC statistics
 type GCStats struct {
-	NumGC          uint32
-	PauseTotal     time.Duration
-	LastPause      time.Duration
-	GCCPUFraction  float64
+	NumGC         uint32
+	PauseTotal    time.Duration
+	LastPause     time.Duration
+	GCCPUFraction float64
 }
 
 // GetGCStats returns current GC statistics

@@ -338,7 +338,7 @@ func (c *HTTPPollingConn) doRequest(ctx context.Context, authToken string, data 
 		InsecureSkipVerify: true,
 		MinVersion:         tls.VersionTLS12,
 		NextProtos:         []string{"tired-polling"}, // Custom ALPN for HTTP Polling
-		ClientSessionCache: c.tlsSessionCache,   // TLS session resumption
+		ClientSessionCache: c.tlsSessionCache,         // TLS session resumption
 	}
 
 	tlsConn := tls.Client(tcpConn, tlsConfig)

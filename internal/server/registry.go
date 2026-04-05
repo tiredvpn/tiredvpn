@@ -21,8 +21,8 @@ type ClientRegistry struct {
 
 	// Active connections tracking
 	connMu      sync.RWMutex
-	activeConns map[string]int            // clientID → count
-	connsByID   map[string][]net.Conn     // clientID → connections (for forced disconnect)
+	activeConns map[string]int        // clientID → count
+	connsByID   map[string][]net.Conn // clientID → connections (for forced disconnect)
 
 	// Stats (atomic for performance)
 	totalConns map[string]*int64 // clientID → total connections counter

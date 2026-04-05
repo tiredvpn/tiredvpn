@@ -117,17 +117,17 @@ func TestHTTP2SettingsFrame(t *testing.T) {
 	var buf bytes.Buffer
 
 	// Frame header (9 bytes)
-	buf.Write([]byte{0x00, 0x00, 0x0c}) // Length: 12 (2 settings * 6 bytes)
-	buf.WriteByte(0x04)                 // Type: SETTINGS
-	buf.WriteByte(0x00)                 // Flags: none
+	buf.Write([]byte{0x00, 0x00, 0x0c})       // Length: 12 (2 settings * 6 bytes)
+	buf.WriteByte(0x04)                       // Type: SETTINGS
+	buf.WriteByte(0x00)                       // Flags: none
 	buf.Write([]byte{0x00, 0x00, 0x00, 0x00}) // Stream ID: 0
 
 	// Setting 1: HEADER_TABLE_SIZE = 4096
-	binary.Write(&buf, binary.BigEndian, uint16(0x1)) // ID
+	binary.Write(&buf, binary.BigEndian, uint16(0x1))  // ID
 	binary.Write(&buf, binary.BigEndian, uint32(4096)) // Value
 
 	// Setting 2: MAX_FRAME_SIZE = 16384
-	binary.Write(&buf, binary.BigEndian, uint16(0x5)) // ID
+	binary.Write(&buf, binary.BigEndian, uint16(0x5))   // ID
 	binary.Write(&buf, binary.BigEndian, uint32(16384)) // Value
 
 	frame := buf.Bytes()
@@ -155,9 +155,9 @@ func TestHTTP2WindowUpdateFrame(t *testing.T) {
 	var buf bytes.Buffer
 
 	// Frame header
-	buf.Write([]byte{0x00, 0x00, 0x04}) // Length: 4
-	buf.WriteByte(0x08)                 // Type: WINDOW_UPDATE
-	buf.WriteByte(0x00)                 // Flags: none
+	buf.Write([]byte{0x00, 0x00, 0x04})       // Length: 4
+	buf.WriteByte(0x08)                       // Type: WINDOW_UPDATE
+	buf.WriteByte(0x00)                       // Flags: none
 	buf.Write([]byte{0x00, 0x00, 0x00, 0x01}) // Stream ID: 1
 
 	// Window size increment: 65535
@@ -179,9 +179,9 @@ func TestHTTP2PingFrame(t *testing.T) {
 	var buf bytes.Buffer
 
 	// Frame header
-	buf.Write([]byte{0x00, 0x00, 0x08}) // Length: 8 (opaque data)
-	buf.WriteByte(0x06)                 // Type: PING
-	buf.WriteByte(0x00)                 // Flags: none (not ACK)
+	buf.Write([]byte{0x00, 0x00, 0x08})       // Length: 8 (opaque data)
+	buf.WriteByte(0x06)                       // Type: PING
+	buf.WriteByte(0x00)                       // Flags: none (not ACK)
 	buf.Write([]byte{0x00, 0x00, 0x00, 0x00}) // Stream ID: 0
 
 	// Opaque data (8 bytes)
@@ -258,13 +258,13 @@ func TestHTTP2DataFramePadding(t *testing.T) {
 	buf.WriteByte(byte(totalLen >> 16))
 	buf.WriteByte(byte(totalLen >> 8))
 	buf.WriteByte(byte(totalLen))
-	buf.WriteByte(0x0)  // Type: DATA
-	buf.WriteByte(0x8)  // Flags: PADDED
+	buf.WriteByte(0x0)                        // Type: DATA
+	buf.WriteByte(0x8)                        // Flags: PADDED
 	buf.Write([]byte{0x00, 0x00, 0x00, 0x01}) // Stream ID: 1
 
 	// Payload
-	buf.WriteByte(paddingLen) // Padding length
-	buf.Write(payload)        // Data
+	buf.WriteByte(paddingLen)           // Padding length
+	buf.Write(payload)                  // Data
 	buf.Write(make([]byte, paddingLen)) // Padding
 
 	frame := buf.Bytes()

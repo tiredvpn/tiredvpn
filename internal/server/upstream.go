@@ -36,7 +36,7 @@ func NewUpstreamDialer(addr string, secret []byte) *UpstreamDialer {
 		coverHost:      "api.googleapis.com",
 		sessionCache:   sessionCache,
 		tlsConfig: &tls.Config{
-	// InsecureSkipVerify is intentional: the upstream TiredVPN server presents a
+			// InsecureSkipVerify is intentional: the upstream TiredVPN server presents a
 			// certificate for the cover domain (e.g. api.googleapis.com) which it does
 			// not actually own — this is required for DPI evasion. Server identity is
 			// verified at the application layer via HMAC-based HTTP/2 stego handshake.

@@ -137,9 +137,9 @@ func TestTunnelHeaderMagic(t *testing.T) {
 // TestDeriveICMPKey tests key derivation
 func TestDeriveICMPKey(t *testing.T) {
 	tests := []struct {
-		name      string
-		secret    []byte
-		wantLen   int
+		name    string
+		secret  []byte
+		wantLen int
 	}{
 		{
 			name:    "short secret",
@@ -362,11 +362,11 @@ func BenchmarkDeriveICMPKey(b *testing.B) {
 
 // MockICMPConn is a mock for testing without root
 type MockICMPConn struct {
-	sendBuf   []byte
-	recvBuf   []byte
-	closed    bool
-	readErr   error
-	writeErr  error
+	sendBuf  []byte
+	recvBuf  []byte
+	closed   bool
+	readErr  error
+	writeErr error
 }
 
 // TestMockICMPTunnel tests ICMP tunnel with mock connection

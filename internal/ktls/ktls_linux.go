@@ -26,29 +26,29 @@ import (
 
 // Linux kTLS constants
 const (
-	SOL_TLS   = 282
-	TLS_TX    = 1
-	TLS_RX    = 2
+	SOL_TLS = 282
+	TLS_TX  = 1
+	TLS_RX  = 2
 
 	TLS_1_2_VERSION = 0x0303
 	TLS_1_3_VERSION = 0x0304
 
 	// Cipher types
-	TLS_CIPHER_AES_GCM_128        = 51
-	TLS_CIPHER_AES_GCM_256        = 52
-	TLS_CIPHER_CHACHA20_POLY1305  = 54
+	TLS_CIPHER_AES_GCM_128       = 51
+	TLS_CIPHER_AES_GCM_256       = 52
+	TLS_CIPHER_CHACHA20_POLY1305 = 54
 
 	// Sizes
-	TLS_CIPHER_AES_GCM_128_KEY_SIZE      = 16
-	TLS_CIPHER_AES_GCM_256_KEY_SIZE      = 32
-	TLS_CIPHER_AES_GCM_128_IV_SIZE       = 8
-	TLS_CIPHER_AES_GCM_256_IV_SIZE       = 8
-	TLS_CIPHER_AES_GCM_128_SALT_SIZE     = 4
-	TLS_CIPHER_AES_GCM_256_SALT_SIZE     = 4
-	TLS_CIPHER_AES_GCM_128_TAG_SIZE      = 16
-	TLS_CIPHER_AES_GCM_256_TAG_SIZE      = 16
-	TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE  = 8
-	TLS_CIPHER_AES_GCM_256_REC_SEQ_SIZE  = 8
+	TLS_CIPHER_AES_GCM_128_KEY_SIZE       = 16
+	TLS_CIPHER_AES_GCM_256_KEY_SIZE       = 32
+	TLS_CIPHER_AES_GCM_128_IV_SIZE        = 8
+	TLS_CIPHER_AES_GCM_256_IV_SIZE        = 8
+	TLS_CIPHER_AES_GCM_128_SALT_SIZE      = 4
+	TLS_CIPHER_AES_GCM_256_SALT_SIZE      = 4
+	TLS_CIPHER_AES_GCM_128_TAG_SIZE       = 16
+	TLS_CIPHER_AES_GCM_256_TAG_SIZE       = 16
+	TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE   = 8
+	TLS_CIPHER_AES_GCM_256_REC_SEQ_SIZE   = 8
 	TLS_CIPHER_CHACHA20_POLY1305_KEY_SIZE = 32
 	TLS_CIPHER_CHACHA20_POLY1305_IV_SIZE  = 12
 	TLS_CIPHER_CHACHA20_POLY1305_TAG_SIZE = 16
@@ -65,10 +65,10 @@ const (
 type tlsCryptoInfoAESGCM128 struct {
 	Version    uint16
 	CipherType uint16
-	IV         [8]byte   // implicit IV (last 8 bytes of 12-byte nonce)
+	IV         [8]byte // implicit IV (last 8 bytes of 12-byte nonce)
 	Key        [16]byte
-	Salt       [4]byte   // first 4 bytes of 12-byte IV
-	RecSeq     [8]byte   // record sequence number
+	Salt       [4]byte // first 4 bytes of 12-byte IV
+	RecSeq     [8]byte // record sequence number
 }
 
 // tlsCryptoInfoAESGCM256 for TLS 1.3 AES-256-GCM
@@ -147,12 +147,12 @@ func Stats() (enabled, fallback int64) {
 
 // tlsConnState extracts internal state from tls.Conn using reflection
 type tlsConnState struct {
-	Version         uint16
-	CipherSuite     uint16
-	InTrafficSecret []byte
+	Version          uint16
+	CipherSuite      uint16
+	InTrafficSecret  []byte
 	OutTrafficSecret []byte
-	InSeq           [8]byte
-	OutSeq          [8]byte
+	InSeq            [8]byte
+	OutSeq           [8]byte
 }
 
 // extractTLSState extracts TLS keys and IVs from tls.Conn using reflection
@@ -363,10 +363,10 @@ func Enable(tlsConn *tls.Conn) *Conn {
 	enabledConns.Add(1)
 	log.Debug("kTLS: enabled for connection (cipher: 0x%04x, inSeq: %d, outSeq: %d)",
 		state.CipherSuite,
-		uint64(state.InSeq[0])<<56 | uint64(state.InSeq[1])<<48 | uint64(state.InSeq[2])<<40 | uint64(state.InSeq[3])<<32 |
-		uint64(state.InSeq[4])<<24 | uint64(state.InSeq[5])<<16 | uint64(state.InSeq[6])<<8 | uint64(state.InSeq[7]),
-		uint64(state.OutSeq[0])<<56 | uint64(state.OutSeq[1])<<48 | uint64(state.OutSeq[2])<<40 | uint64(state.OutSeq[3])<<32 |
-		uint64(state.OutSeq[4])<<24 | uint64(state.OutSeq[5])<<16 | uint64(state.OutSeq[6])<<8 | uint64(state.OutSeq[7]))
+		uint64(state.InSeq[0])<<56|uint64(state.InSeq[1])<<48|uint64(state.InSeq[2])<<40|uint64(state.InSeq[3])<<32|
+			uint64(state.InSeq[4])<<24|uint64(state.InSeq[5])<<16|uint64(state.InSeq[6])<<8|uint64(state.InSeq[7]),
+		uint64(state.OutSeq[0])<<56|uint64(state.OutSeq[1])<<48|uint64(state.OutSeq[2])<<40|uint64(state.OutSeq[3])<<32|
+			uint64(state.OutSeq[4])<<24|uint64(state.OutSeq[5])<<16|uint64(state.OutSeq[6])<<8|uint64(state.OutSeq[7]))
 
 	// Create wrapped connection - uses tcpConn directly for I/O
 	// After kTLS is enabled, the kernel handles encryption/decryption transparently

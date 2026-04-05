@@ -203,7 +203,7 @@ func BuildICMPFragNeeded(srcIP net.IP, origPkt []byte, nextHopMTU uint16) []byte
 
 	// --- ICMP Header ---
 	icmpStart := 20
-	pkt[icmpStart] = 3 // Type: Destination Unreachable
+	pkt[icmpStart] = 3   // Type: Destination Unreachable
 	pkt[icmpStart+1] = 4 // Code: Fragmentation Needed
 	// Checksum at [icmpStart+2:icmpStart+4] - computed below
 	// Unused (2 bytes) = 0

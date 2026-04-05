@@ -101,8 +101,8 @@ type CircuitBreaker struct {
 	lastStateChange    time.Time
 
 	// Half-open graduated recovery
-	halfOpenCount      int // requests attempted in half-open
-	halfOpenSuccess    int // successes in half-open
+	halfOpenCount   int // requests attempted in half-open
+	halfOpenSuccess int // successes in half-open
 
 	// Exponential backoff
 	currentResetTimeout time.Duration // grows with each re-open

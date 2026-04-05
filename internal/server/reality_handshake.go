@@ -11,7 +11,7 @@ import (
 
 // TLS record and handshake type constants
 const (
-	recordTypeHandshake = 0x16
+	recordTypeHandshake      = 0x16
 	handshakeTypeClientHello = 0x01
 	handshakeTypeServerHello = 0x02
 )
@@ -58,7 +58,7 @@ func ParseHandshakeMessage(data []byte) (*HandshakeMessage, error) {
 	}
 
 	msg := &HandshakeMessage{
-		Type: data[0],
+		Type:   data[0],
 		Length: uint32(data[1])<<16 | uint32(data[2])<<8 | uint32(data[3]),
 	}
 
@@ -341,7 +341,7 @@ func InjectREALITYExtension(serverHello []byte, realityExt *customtls.REALITYExt
 	newPayload := make([]byte, 0, len(payload)+len(paddingExtension))
 	newPayload = append(newPayload, payload[:offset]...)                     // Before extensions
 	newPayload = append(newPayload, payload[offset:offset+extensionsLen]...) // Original extensions
-	newPayload = append(newPayload, paddingExtension...)                      // Padding with REALITY
+	newPayload = append(newPayload, paddingExtension...)                     // Padding with REALITY
 
 	// Update extensions length
 	newExtensionsLen := extensionsLen + len(paddingExtension)
