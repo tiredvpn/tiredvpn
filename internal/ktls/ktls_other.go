@@ -17,9 +17,9 @@ func Supported() bool {
 	return false
 }
 
-// Enable always returns false on non-Linux platforms
-func Enable(tlsConn *tls.Conn) bool {
-	return false
+// Enable always returns nil on non-Linux platforms (kTLS not supported)
+func Enable(tlsConn *tls.Conn) *Conn {
+	return nil
 }
 
 // Stats returns zeros on non-Linux platforms
