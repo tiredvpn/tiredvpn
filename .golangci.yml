@@ -1,0 +1,14 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    - govet
+    - staticcheck
+  exclusions:
+    rules:
+      - linters: [staticcheck]
+        text: "SA1019|SA6002|S1000|S1009"
