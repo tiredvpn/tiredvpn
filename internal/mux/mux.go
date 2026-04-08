@@ -49,12 +49,10 @@ func NewClient(conn net.Conn, config *Config) (*Client, error) {
 	}
 
 	smuxConfig := smux.DefaultConfig()
-	smuxConfig.Version = config.Version
 	smuxConfig.KeepAliveInterval = config.KeepAliveInterval
 	smuxConfig.KeepAliveTimeout = config.KeepAliveTimeout
 	smuxConfig.MaxFrameSize = config.MaxFrameSize
 	smuxConfig.MaxReceiveBuffer = config.MaxReceiveBuffer
-	smuxConfig.MaxStreamBuffer = config.MaxStreamBuffer
 
 	session, err := smux.Client(conn, smuxConfig)
 	if err != nil {
@@ -63,7 +61,7 @@ func NewClient(conn net.Conn, config *Config) (*Client, error) {
 	}
 
 	globalMetrics.RecordSessionCreate()
-	log.Debug("Mux client created (version=%d, keepalive=%v)", config.Version, config.KeepAliveInterval)
+	log.Debug("Mux client created (keepalive=%v)", config.KeepAliveInterval)
 
 	return &Client{
 		config:  config,
@@ -155,12 +153,10 @@ func (c *Client) reconnect() error {
 
 	// Create new smux session
 	smuxConfig := smux.DefaultConfig()
-	smuxConfig.Version = c.config.Version
 	smuxConfig.KeepAliveInterval = c.config.KeepAliveInterval
 	smuxConfig.KeepAliveTimeout = c.config.KeepAliveTimeout
 	smuxConfig.MaxFrameSize = c.config.MaxFrameSize
 	smuxConfig.MaxReceiveBuffer = c.config.MaxReceiveBuffer
-	smuxConfig.MaxStreamBuffer = c.config.MaxStreamBuffer
 
 	session, err := smux.Client(newConn, smuxConfig)
 	if err != nil {
@@ -239,12 +235,10 @@ func NewServer(conn net.Conn, config *Config) (*Server, error) {
 	}
 
 	smuxConfig := smux.DefaultConfig()
-	smuxConfig.Version = config.Version
 	smuxConfig.KeepAliveInterval = config.KeepAliveInterval
 	smuxConfig.KeepAliveTimeout = config.KeepAliveTimeout
 	smuxConfig.MaxFrameSize = config.MaxFrameSize
 	smuxConfig.MaxReceiveBuffer = config.MaxReceiveBuffer
-	smuxConfig.MaxStreamBuffer = config.MaxStreamBuffer
 
 	session, err := smux.Server(conn, smuxConfig)
 	if err != nil {
@@ -253,7 +247,7 @@ func NewServer(conn net.Conn, config *Config) (*Server, error) {
 	}
 
 	globalMetrics.RecordSessionCreate()
-	log.Debug("Mux server created (version=%d)", config.Version)
+	log.Debug("Mux server created")
 
 	return &Server{
 		config:  config,
