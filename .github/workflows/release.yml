@@ -9,8 +9,35 @@ permissions:
   contents: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Build
+        run: go build ./cmd/tiredvpn/
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Unit Tests
+        run: |
+          go test -race -timeout 5m -short \
+            -skip "TestWebSocket|TestQUICSalamander|TestDefaultPadding|TestConfusedConnWrite" \
+            ./internal/...
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: latest
+
   docker:
     runs-on: ubuntu-latest
+    needs: [test]
     steps:
       - uses: actions/checkout@v6
 
@@ -42,6 +69,7 @@ jobs:
 
   release:
     runs-on: ubuntu-latest
+    needs: [test]
     steps:
       - uses: actions/checkout@v6
 

@@ -5,6 +5,15 @@ All notable changes to TiredVPN are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.0.2] - 2026-04-08
+
+### Changed
+
+- Upgraded smux from v1.5.57 to v2.0.1 — improved multiplexing performance
+- Upgraded Docker CI actions: setup-buildx v4, build-push v7, login v4
+- Added test coverage reporting to CI pipeline
+- Release workflow now gates on passing tests and lint before building artifacts
+
 ## [1.0.1] - 2026-04-05
 
 ### Fixed
