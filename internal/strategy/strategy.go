@@ -1294,7 +1294,7 @@ func (m *Manager) EnableMux(config *mux.Config) {
 	m.muxEnabled = true
 	if config != nil {
 		m.muxConfig = config
-		log.Info("Mux enabled (version=%d, keepalive=%v)", config.Version, config.KeepAliveInterval)
+		log.Info("Mux enabled (keepalive=%v)", config.KeepAliveInterval)
 	} else {
 		m.muxConfig = mux.DefaultConfig()
 		log.Info("Mux enabled (default config)")
@@ -1373,7 +1373,7 @@ func (m *Manager) wrapWithMux(conn net.Conn, config *mux.Config) (net.Conn, erro
 		return nil, fmt.Errorf("mux stream open failed: %w", err)
 	}
 
-	log.Debug("Mux client created and stream opened (version=%d)", config.Version)
+	log.Debug("Mux client created and stream opened")
 	return stream, nil
 }
 
