@@ -48,12 +48,10 @@ func TestNewClientWithConfig(t *testing.T) {
 	}()
 
 	config := &Config{
-		Version:           2,
 		KeepAliveInterval: 5 * time.Second,
 		KeepAliveTimeout:  15 * time.Second,
 		MaxFrameSize:      16384,
 		MaxReceiveBuffer:  2097152,
-		MaxStreamBuffer:   32768,
 		MaxStreams:        10,
 	}
 
@@ -74,14 +72,12 @@ func TestNewClientInvalidConfig(t *testing.T) {
 	defer clientConn.Close()
 	defer serverConn.Close()
 
-	// Invalid version
+	// Invalid keepalive (timeout <= interval)
 	invalidConfig := &Config{
-		Version:           3, // Invalid
-		KeepAliveInterval: 5 * time.Second,
+		KeepAliveInterval: 30 * time.Second,
 		KeepAliveTimeout:  15 * time.Second,
 		MaxFrameSize:      16384,
 		MaxReceiveBuffer:  2097152,
-		MaxStreamBuffer:   32768,
 	}
 
 	_, err := NewClient(clientConn, invalidConfig)
@@ -311,12 +307,10 @@ func TestMaxStreamsLimit(t *testing.T) {
 	}()
 
 	config := &Config{
-		Version:           2,
 		KeepAliveInterval: 10 * time.Second,
 		KeepAliveTimeout:  30 * time.Second,
 		MaxFrameSize:      32768,
 		MaxReceiveBuffer:  4194304,
-		MaxStreamBuffer:   65536,
 		MaxStreams:        3, // Limit to 3 streams
 	}
 
@@ -670,74 +664,42 @@ func TestConfigValidation(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "invalid version",
-			config: &Config{
-				Version:           0,
-				KeepAliveInterval: 10 * time.Second,
-				KeepAliveTimeout:  30 * time.Second,
-				MaxFrameSize:      32768,
-				MaxReceiveBuffer:  4194304,
-				MaxStreamBuffer:   65536,
-			},
-			wantErr: true,
-		},
-		{
 			name: "invalid keepalive (timeout <= interval)",
 			config: &Config{
-				Version:           2,
 				KeepAliveInterval: 30 * time.Second,
 				KeepAliveTimeout:  30 * time.Second, // Should be > interval
 				MaxFrameSize:      32768,
 				MaxReceiveBuffer:  4194304,
-				MaxStreamBuffer:   65536,
 			},
 			wantErr: true,
 		},
 		{
 			name: "invalid frame size (too small)",
 			config: &Config{
-				Version:           2,
 				KeepAliveInterval: 10 * time.Second,
 				KeepAliveTimeout:  30 * time.Second,
 				MaxFrameSize:      100, // < 1024
 				MaxReceiveBuffer:  4194304,
-				MaxStreamBuffer:   65536,
 			},
 			wantErr: true,
 		},
 		{
 			name: "invalid frame size (too large)",
 			config: &Config{
-				Version:           2,
 				KeepAliveInterval: 10 * time.Second,
 				KeepAliveTimeout:  30 * time.Second,
 				MaxFrameSize:      100000, // > 65535
 				MaxReceiveBuffer:  4194304,
-				MaxStreamBuffer:   65536,
 			},
 			wantErr: true,
 		},
 		{
-			name: "invalid buffer (receive < stream)",
+			name: "invalid buffer (receive < frame)",
 			config: &Config{
-				Version:           2,
 				KeepAliveInterval: 10 * time.Second,
 				KeepAliveTimeout:  30 * time.Second,
 				MaxFrameSize:      32768,
-				MaxReceiveBuffer:  1024, // < MaxStreamBuffer
-				MaxStreamBuffer:   65536,
-			},
-			wantErr: true,
-		},
-		{
-			name: "invalid buffer (stream < frame)",
-			config: &Config{
-				Version:           2,
-				KeepAliveInterval: 10 * time.Second,
-				KeepAliveTimeout:  30 * time.Second,
-				MaxFrameSize:      32768,
-				MaxReceiveBuffer:  4194304,
-				MaxStreamBuffer:   1024, // < MaxFrameSize
+				MaxReceiveBuffer:  1024, // < MaxFrameSize
 			},
 			wantErr: true,
 		},
@@ -762,14 +724,10 @@ func TestConfigClone(t *testing.T) {
 
 	// Modify original
 	original.MaxStreams = 200
-	original.Version = 1
 
 	// Clone should be unchanged
 	if cloned.MaxStreams != 100 {
 		t.Errorf("Clone was modified: MaxStreams = %d, want 100", cloned.MaxStreams)
-	}
-	if cloned.Version != 2 {
-		t.Errorf("Clone was modified: Version = %d, want 2", cloned.Version)
 	}
 }
 
