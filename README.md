@@ -398,8 +398,6 @@ Before submitting a pull request:
 
 ## Community
 
-- [Telegram Channel](https://t.me/tiredvpn) — announcements, TSPU reports, how-to guides
-- [Telegram Chat](https://t.me/tiredvpn_chat) — questions and discussion
 - [GitHub Discussions](https://github.com/tiredvpn/tiredvpn/discussions) — feature ideas, Q&A
 
 ---
