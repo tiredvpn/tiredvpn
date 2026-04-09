@@ -62,6 +62,23 @@ Key design goals:
 
 ---
 
+## How TiredVPN Compares
+
+| Feature | TiredVPN | Xray/VLESS | sing-box | Outline |
+|---------|----------|------------|----------|---------|
+| Bypass strategies | 20+ | 3–5 | 5–8 | 1–2 |
+| Adaptive fallback | ✅ Mid-session | ❌ | Partial | ❌ |
+| TSPU research | Monthly reports | ❌ | ❌ | ❌ |
+| Post-quantum crypto | ✅ ML-KEM-768 | ❌ | ❌ | ❌ |
+| Geneva engine | ✅ | ❌ | ❌ | ❌ |
+| RTT masking | ✅ | ❌ | ❌ | ❌ |
+| ICMP fallback | ✅ | ❌ | ❌ | ❌ |
+| Traffic morphing | ✅ | ❌ | ❌ | ❌ |
+| Android app | ✅ Native | Third-party | Third-party | ✅ |
+| License | AGPL-3.0 | MPL-2.0 | GPL-3.0 | Apache-2.0 |
+
+---
+
 ## Quick Start
 
 ### Generate a shared secret
@@ -379,6 +396,20 @@ Before submitting a pull request:
 
 ---
 
+## Community
+
+- [Telegram Channel](https://t.me/tiredvpn) — announcements, TSPU reports, how-to guides
+- [Telegram Chat](https://t.me/tiredvpn_chat) — questions and discussion
+- [GitHub Discussions](https://github.com/tiredvpn/tiredvpn/discussions) — feature ideas, Q&A
+
+---
+
 ## License
 
 TiredVPN is licensed under the [GNU Affero General Public License v3.0](LICENSE).
+
+---
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=tiredvpn/tiredvpn&type=Date)](https://star-history.com/#tiredvpn/tiredvpn&Date)
