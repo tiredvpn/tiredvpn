@@ -5,6 +5,23 @@ All notable changes to TiredVPN are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.0.3] - 2026-04-09
+
+### Added
+
+- **E2E integration testing in CI** — server starts on localhost, client connects via SOCKS5, real HTTP requests verified through the tunnel
+- **Strategy benchmark in CI** — 19 strategies probed against localhost server on every push
+- **Integration test job** — runs porthopping, QUIC Salamander, mux, and server tests without `-short` flag
+- README: comparison table with other VPN tools, community links, star history badge
+
+### Fixed
+
+- Fixed WebSocket Padded integration tests — server address was discarded (`_ = addr`), now passed via Manager
+- Fixed `TestDefaultPaddingMode` — assertion updated to match actual default (Minimal)
+- Fixed `TestConfusedConnWrite` data race — replaced shared variable with channel synchronization
+- Pinned `trivy-action` from `@master` to `@v0.35.0` (supply chain hardening)
+- Removed Telegram links from README community section
+
 ## [1.0.2] - 2026-04-08
 
 ### Changed
