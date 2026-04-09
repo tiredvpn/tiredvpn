@@ -138,7 +138,7 @@ func TestWebSocketPaddedIntegration(t *testing.T) {
 	}
 	defer listener.Close()
 
-	_ = listener.Addr().String()
+	addr := listener.Addr().String()
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -147,8 +147,10 @@ func TestWebSocketPaddedIntegration(t *testing.T) {
 	// Give server time to start
 	time.Sleep(100 * time.Millisecond)
 
-	// Create client strategy
-	strategy := NewWebSocketPaddedStrategy(NewManager(), secret)
+	// Create client strategy with manager pointing to our test server
+	mgr := NewManager()
+	mgr.serverAddrV4 = addr
+	strategy := NewWebSocketPaddedStrategy(mgr, secret)
 
 	// Test connection
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -282,7 +284,7 @@ func TestWebSocketPaddedMultipleMessages(t *testing.T) {
 	}
 	defer listener.Close()
 
-	_ = listener.Addr().String()
+	addr := listener.Addr().String()
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -290,7 +292,9 @@ func TestWebSocketPaddedMultipleMessages(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	strategy := NewWebSocketPaddedStrategy(NewManager(), secret)
+	mgr := NewManager()
+	mgr.serverAddrV4 = addr
+	strategy := NewWebSocketPaddedStrategy(mgr, secret)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -428,7 +432,7 @@ func TestWebSocketPaddedLargePayload(t *testing.T) {
 	}
 	defer listener.Close()
 
-	_ = listener.Addr().String()
+	addr := listener.Addr().String()
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -436,7 +440,9 @@ func TestWebSocketPaddedLargePayload(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	strategy := NewWebSocketPaddedStrategy(NewManager(), secret)
+	mgr := NewManager()
+	mgr.serverAddrV4 = addr
+	strategy := NewWebSocketPaddedStrategy(mgr, secret)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
