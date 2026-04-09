@@ -179,9 +179,10 @@ func TestConfusedConnWrite(t *testing.T) {
 	testData := []byte("hello world")
 
 	// Write in goroutine
-	var writeErr error
+	writeErrCh := make(chan error, 1)
 	go func() {
-		_, writeErr = cc.Write(testData)
+		_, err := cc.Write(testData)
+		writeErrCh <- err
 	}()
 
 	// Read from server side
@@ -191,7 +192,7 @@ func TestConfusedConnWrite(t *testing.T) {
 		t.Fatalf("Read failed: %v", err)
 	}
 
-	if writeErr != nil {
+	if writeErr := <-writeErrCh; writeErr != nil {
 		t.Fatalf("Write failed: %v", writeErr)
 	}
 
