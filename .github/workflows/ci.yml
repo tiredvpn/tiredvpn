@@ -37,7 +37,7 @@ jobs:
       - name: Unit Tests with Coverage
         run: |
           go test -race -timeout 5m -short \
-            -skip "TestWebSocket|TestQUICSalamander|TestDefaultPadding|TestConfusedConnWrite" \
+            -skip "TestWebSocketPadded|TestQUICSalamander" \
             -coverprofile=coverage.out \
             -covermode=atomic \
             ./internal/...
@@ -74,7 +74,6 @@ jobs:
       - name: Integration Tests
         run: |
           go test -race -timeout 10m -count=1 -v \
-            -skip "TestWebSocketPaddedIntegration|TestWebSocketPaddedMultipleMessages|TestWebSocketPaddedLargePayload|TestDefaultPaddingMode|TestConfusedConnWrite" \
             ./internal/strategy/ \
             ./internal/porthopping/ \
             ./internal/server/ \
