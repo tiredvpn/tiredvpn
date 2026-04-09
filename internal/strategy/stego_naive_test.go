@@ -356,7 +356,7 @@ func TestDefaultPaddingMode(t *testing.T) {
 
 	strategy := NewHTTP2StegoStrategy(NewManager(), secret, "")
 
-	if strategy.paddingMode != NaivePaddingStandard {
-		t.Errorf("Default padding mode = %v, want %v", strategy.paddingMode, NaivePaddingStandard)
+	if strategy.paddingMode != NaivePaddingMinimal {
+		t.Errorf("Default padding mode = %v, want %v", strategy.paddingMode, NaivePaddingMinimal)
 	}
 }
