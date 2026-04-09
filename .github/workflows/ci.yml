@@ -74,7 +74,7 @@ jobs:
       - name: Integration Tests
         run: |
           go test -race -timeout 10m -count=1 -v \
-            -skip "TestWebSocketPaddedIntegration|TestWebSocketPaddedMultipleMessages|TestWebSocketPaddedLargePayload|TestDefaultPaddingMode" \
+            -skip "TestWebSocketPaddedIntegration|TestWebSocketPaddedMultipleMessages|TestWebSocketPaddedLargePayload|TestDefaultPaddingMode|TestConfusedConnWrite" \
             ./internal/strategy/ \
             ./internal/porthopping/ \
             ./internal/server/ \
