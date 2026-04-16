@@ -101,6 +101,25 @@ and [Building from Source](#building-from-source) sections below.
 openssl rand -hex 32
 ```
 
+### Generate TLS certificates
+
+For testing, create a self-signed certificate:
+
+```bash
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+  -days 365 -nodes -keyout server.key -out server.crt \
+  -subj "/CN=your-server.com"
+```
+
+For production, use [Let's Encrypt](https://letsencrypt.org/) with certbot:
+
+```bash
+sudo certbot certonly --standalone -d your-server.com
+# Certificates will be at:
+#   /etc/letsencrypt/live/your-server.com/fullchain.pem
+#   /etc/letsencrypt/live/your-server.com/privkey.pem
+```
+
 ### Server
 
 ```bash
