@@ -91,9 +91,9 @@ tar xzf tiredvpn-linux-amd64.tar.gz
 sudo mv tiredvpn-linux-amd64 /usr/local/bin/tiredvpn
 ```
 
-Other platforms and installation methods are described in the
-[Docker](#docker), [Download Pre-built Binaries](#download-pre-built-binaries),
-and [Building from Source](#building-from-source) sections below.
+Available platforms: `linux-amd64`, `linux-arm64`. Other installation
+methods are described in the [Docker](#docker) and
+[Building from Source](#building-from-source) sections below.
 
 ### Generate a shared secret
 
@@ -296,22 +296,6 @@ volumes:
 ```bash
 docker build -t tiredvpn .
 ```
-
----
-
-## Download Pre-built Binaries
-
-Pre-built binaries for Linux, macOS, and Windows are available on the
-[Releases](https://github.com/tiredvpn/tiredvpn/releases/latest) page.
-
-```bash
-# Example: download latest release for Linux amd64
-curl -LO https://github.com/tiredvpn/tiredvpn/releases/latest/download/tiredvpn-linux-amd64.tar.gz
-tar xzf tiredvpn-linux-amd64.tar.gz
-sudo mv tiredvpn /usr/local/bin/
-```
-
-Available platforms: `linux-amd64`, `linux-arm64`, `darwin-amd64`, `darwin-arm64`, `windows-amd64`.
 
 ---
 
