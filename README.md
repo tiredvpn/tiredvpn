@@ -127,47 +127,6 @@ This creates a TUN interface and routes all traffic through the VPN.
 
 ---
 
-## Building from Source
-
-### Requirements
-
-- Go 1.26 or later
-- Linux, macOS, or Windows (TUN mode requires Linux)
-
-### Build
-
-```bash
-git clone https://github.com/tiredvpn/tiredvpn.git
-cd tiredvpn
-make build
-```
-
-Or directly with Go:
-
-```bash
-go build -o tiredvpn ./cmd/tiredvpn/
-```
-
-### Cross-compile for Linux (amd64)
-
-```bash
-make build-linux
-```
-
-### Cross-compile for Android (arm64)
-
-```bash
-make build-android
-```
-
-### Run tests
-
-```bash
-make test
-```
-
----
-
 ## Configuration
 
 TiredVPN is configured entirely via CLI flags. Run `tiredvpn server -help` or
@@ -303,6 +262,63 @@ volumes:
 
 ```bash
 docker build -t tiredvpn .
+```
+
+---
+
+## Download Pre-built Binaries
+
+Pre-built binaries for Linux, macOS, and Windows are available on the
+[Releases](https://github.com/tiredvpn/tiredvpn/releases/latest) page.
+
+```bash
+# Example: download latest release for Linux amd64
+curl -LO https://github.com/tiredvpn/tiredvpn/releases/latest/download/tiredvpn-linux-amd64.tar.gz
+tar xzf tiredvpn-linux-amd64.tar.gz
+sudo mv tiredvpn /usr/local/bin/
+```
+
+Available platforms: `linux-amd64`, `linux-arm64`, `darwin-amd64`, `darwin-arm64`, `windows-amd64`.
+
+---
+
+## Building from Source
+
+### Requirements
+
+- Go 1.26 or later
+- Linux, macOS, or Windows (TUN mode requires Linux)
+
+### Build
+
+```bash
+git clone https://github.com/tiredvpn/tiredvpn.git
+cd tiredvpn
+make build
+```
+
+Or directly with Go:
+
+```bash
+go build -o tiredvpn ./cmd/tiredvpn/
+```
+
+### Cross-compile for Linux (amd64)
+
+```bash
+make build-linux
+```
+
+### Cross-compile for Android (arm64)
+
+```bash
+make build-android
+```
+
+### Run tests
+
+```bash
+make test
 ```
 
 ---
