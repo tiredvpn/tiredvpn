@@ -81,6 +81,20 @@ Key design goals:
 
 ## Quick Start
 
+### Install
+
+Download the latest binary for your platform:
+
+```bash
+curl -LO https://github.com/tiredvpn/tiredvpn/releases/latest/download/tiredvpn-linux-amd64.tar.gz
+tar xzf tiredvpn-linux-amd64.tar.gz
+sudo mv tiredvpn-linux-amd64 /usr/local/bin/tiredvpn
+```
+
+Other platforms and installation methods are described in the
+[Docker](#docker), [Download Pre-built Binaries](#download-pre-built-binaries),
+and [Building from Source](#building-from-source) sections below.
+
 ### Generate a shared secret
 
 ```bash
