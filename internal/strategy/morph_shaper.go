@@ -6,6 +6,7 @@ import (
 
 	"github.com/tiredvpn/tiredvpn/internal/config/toml"
 	"github.com/tiredvpn/tiredvpn/internal/shaper"
+	"github.com/tiredvpn/tiredvpn/internal/shaper/presets"
 )
 
 // isNoopShaper reports whether sh is the passthrough shaper. The legacy Write
@@ -116,11 +117,8 @@ func (mc *MorphedConn) readShaped(p []byte) (int, error) {
 
 // ShaperFromConfig builds a Shaper for MorphedConn from the parsed TOML
 // [shaper] section. A nil cfg or one with neither preset nor custom returns
-// NoopShaper so callers can always safely pass through.
-//
-// Preset resolution and custom-distribution wiring live in a follow-up task
-// (see internal/shaper/presets, beads y37). For now we return NoopShaper for
-// any non-empty config so the call site is stable and tests are deterministic.
+// NoopShaper so callers can always safely pass through; otherwise the
+// construction is delegated to internal/shaper/presets.FromConfig.
 func ShaperFromConfig(cfg *toml.ShaperConfig) (shaper.Shaper, error) {
 	if cfg == nil {
 		return shaper.NoopShaper{}, nil
@@ -128,6 +126,5 @@ func ShaperFromConfig(cfg *toml.ShaperConfig) (shaper.Shaper, error) {
 	if cfg.Preset == "" && cfg.Custom == nil {
 		return shaper.NoopShaper{}, nil
 	}
-	// TODO(y37): wire to internal/shaper/presets and dist registry.
-	return shaper.NoopShaper{}, nil
+	return presets.FromConfig(*cfg)
 }
