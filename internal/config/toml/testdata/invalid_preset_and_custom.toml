@@ -1,0 +1,20 @@
+[server]
+address = "vpn.example.org"
+port = 443
+
+[strategy]
+mode = "reality"
+
+[shaper]
+preset = "chrome_browsing"
+
+[shaper.custom.packet_size]
+type = "lognormal"
+
+[shaper.custom.packet_size.lognormal]
+mu = 0
+sigma = 1
+
+[tls]
+
+[logging]

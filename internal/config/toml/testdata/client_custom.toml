@@ -1,0 +1,41 @@
+[server]
+address = "vpn.example.org"
+port = 443
+
+[strategy]
+mode = "grpc"
+
+[strategy.options]
+service = "google.firestore.v1.Firestore"
+
+[shaper]
+randomization_range = 0.05
+
+[shaper.custom.packet_size]
+type = "histogram"
+
+[[shaper.custom.packet_size.histogram.bins]]
+value = 64
+weight = 0.2
+
+[[shaper.custom.packet_size.histogram.bins]]
+value = 1280
+weight = 0.5
+
+[[shaper.custom.packet_size.histogram.bins]]
+value = 1500
+weight = 0.3
+
+[shaper.custom.inter_arrival]
+type = "lognormal"
+
+[shaper.custom.inter_arrival.lognormal]
+mu = -4.0
+sigma = 1.2
+
+[tls]
+server_name = "googleapis.com"
+fingerprint = "chrome_120"
+
+[logging]
+level = "debug"
