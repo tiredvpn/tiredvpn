@@ -249,6 +249,7 @@ func (s *TrafficMorphStrategy) Connect(ctx context.Context, target string) (net.
 	if s.baseStrat != nil {
 		baseConn, err = s.baseStrat.Connect(ctx, target)
 	} else {
+		// --- TLS / handshake (do not touch in shaper migration) ---
 		// Get server address (IPv6/IPv4 with automatic fallback)
 		serverAddr := s.manager.GetServerAddr(ctx)
 		log.Debug("Traffic Morph: Using server address: %s", serverAddr)
@@ -363,14 +364,122 @@ func NewMorphedConn(conn net.Conn, profile *TrafficProfile, secret []byte) *Morp
 	return mc
 }
 
-// Write sends data immediately with morph framing (for TUN mode compatibility)
-// Note: This bypasses the async queue for immediate delivery
-// OPTIMIZED: Uses buffer pool, fast RNG, single write syscall
+// --- Behavioral shaping (replaceable by internal/shaper) ---
+//
+// Everything in this section is the "shaping layer" that decides packet
+// sizes, padding amounts and dummy/cover frames. Task I2 will replace this
+// with a generic shaper.Shaper while keeping the wire format below stable.
+
+// morphHeaderLen is the size of the 6-byte morph framing header
+// laid out as [dataLen:4 BE][paddingLen:2 BE].
+const morphHeaderLen = 6
+
+// pickPaddingLen returns a random padding length within the profile's
+// configured [MinPadding, MaxPadding] range. Non-cryptographic by design —
+// padding only obscures size, it does not need to be unpredictable to an
+// attacker who already sees ciphertext sizes.
+func (mc *MorphedConn) pickPaddingLen() int {
+	return fastRandInt(mc.profile.MinPadding, mc.profile.MaxPadding)
+}
+
+// selectPacketSize returns a packet size drawn from the profile's discrete
+// size distribution (CDF lookup over PacketSizeProbs).
+func (mc *MorphedConn) selectPacketSize() int {
+	r := mc.randomFloat()
+	cumulative := 0.0
+
+	for i, prob := range mc.profile.PacketSizeProbs {
+		cumulative += prob
+		if r < cumulative {
+			return mc.profile.PacketSizes[i]
+		}
+	}
+
+	return mc.profile.PacketSizes[len(mc.profile.PacketSizes)-1]
+}
+
+// randomFloat returns a random float64 in [0, 1).
+// Uses fast math/rand (non-cryptographic) — only feeds shaping decisions.
+func (mc *MorphedConn) randomFloat() float64 {
+	fastRandMu.Lock()
+	f := fastRand.Float64()
+	fastRandMu.Unlock()
+	return f
+}
+
+// --- Wire format helpers (do not change without bumping protocol) ---
+//
+// These helpers encode/decode the 6-byte Morph framing header. The wire
+// format is shared with already-deployed servers and must stay byte-stable
+// across the shaper migration.
+
+// writeFrameHeader serialises [dataLen:4 BE][paddingLen:2 BE] into dst[:6].
+// dst must have length >= morphHeaderLen.
+func writeFrameHeader(dst []byte, dataLen, paddingLen int) {
+	dst[0] = byte(dataLen >> 24)
+	dst[1] = byte(dataLen >> 16)
+	dst[2] = byte(dataLen >> 8)
+	dst[3] = byte(dataLen)
+	dst[4] = byte(paddingLen >> 8)
+	dst[5] = byte(paddingLen)
+}
+
+// readFrameHeader parses the 6-byte header from src[:6].
+func readFrameHeader(src []byte) (dataLen, paddingLen int) {
+	dataLen = int(src[0])<<24 | int(src[1])<<16 | int(src[2])<<8 | int(src[3])
+	paddingLen = int(src[4])<<8 | int(src[5])
+	return dataLen, paddingLen
+}
+
+// buildFrame allocates (or borrows from packetPool) a buffer holding a fully
+// framed packet: [header:6][data:N][padding:M] with random padding bytes.
+// fromPool indicates whether the returned slice must be released via
+// packetPool.Put after use.
+func buildFrame(data []byte, padLen int) (packet []byte, fromPool bool) {
+	totalLen := morphHeaderLen + len(data) + padLen
+	if totalLen <= 2048 {
+		packet = packetPool.Get().([]byte)
+		packet = packet[:totalLen]
+		fromPool = true
+	} else {
+		packet = make([]byte, totalLen)
+	}
+
+	writeFrameHeader(packet, len(data), padLen)
+	copy(packet[morphHeaderLen:morphHeaderLen+len(data)], data)
+	if padLen > 0 {
+		fastRandBytes(packet[morphHeaderLen+len(data):])
+	}
+	return packet, fromPool
+}
+
+// buildDummyFrame produces a [header:6][padding:M] frame with dataLen=0.
+// Used both as a keepalive response and (historically) as cover traffic.
+func (mc *MorphedConn) buildDummyFrame() []byte {
+	size := mc.selectPacketSize()
+	paddingLen := size - morphHeaderLen
+	if paddingLen < 0 {
+		paddingLen = 0
+	}
+
+	packet := make([]byte, morphHeaderLen+paddingLen)
+	writeFrameHeader(packet, 0, paddingLen)
+	if paddingLen > 0 {
+		// Crypto-quality randomness for dummies — they go on the wire
+		// without surrounding plaintext, so any bias would be observable.
+		_, _ = rand.Read(packet[morphHeaderLen:])
+	}
+	return packet
+}
+
+// Write sends data immediately with morph framing (for TUN mode compatibility).
+// Behaviour: one Write call -> one framed packet on the wire. The 4-zero-byte
+// keepalive sentinel from the TUN layer is converted into a Morph dummy frame.
 func (mc *MorphedConn) Write(p []byte) (int, error) {
 	// Handle keepalive packet (4 zero bytes = length prefix for zero-length packet)
 	// Send as Morph dummy packet which server echoes back
 	if len(p) == 4 && p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 0 {
-		dummy := mc.generateDummy()
+		dummy := mc.buildDummyFrame()
 		_, err := mc.Conn.Write(dummy)
 		if err != nil {
 			return 0, err
@@ -382,42 +491,9 @@ func (mc *MorphedConn) Write(p []byte) (int, error) {
 		return 0, nil
 	}
 
-	// Send immediately with morph framing (don't fragment for TUN mode)
-	// Format: [dataLen:4][paddingLen:2][data:N][padding:M]
-
-	// OPTIMIZATION 1: Use fast math/rand instead of crypto/rand (10× faster)
-	padLen := fastRandInt(mc.profile.MinPadding, mc.profile.MaxPadding)
-
-	totalLen := 6 + len(p) + padLen
-
-	// OPTIMIZATION 2: Use buffer pool to reduce GC pressure
-	var packet []byte
-	var fromPool bool
-	if totalLen <= 2048 {
-		packet = packetPool.Get().([]byte)
-		packet = packet[:totalLen]
-		fromPool = true
-	} else {
-		packet = make([]byte, totalLen)
-	}
-
-	// Data length header
-	packet[0] = byte(len(p) >> 24)
-	packet[1] = byte(len(p) >> 16)
-	packet[2] = byte(len(p) >> 8)
-	packet[3] = byte(len(p))
-
-	// Padding length header
-	packet[4] = byte(padLen >> 8)
-	packet[5] = byte(padLen)
-
-	// Data
-	copy(packet[6:6+len(p)], p)
-
-	// OPTIMIZATION 3: Fast random padding (non-cryptographic is fine for padding)
-	if padLen > 0 {
-		fastRandBytes(packet[6+len(p):])
-	}
+	// Build framed packet [header:6][data:N][padding:M]
+	padLen := mc.pickPaddingLen()
+	packet, fromPool := buildFrame(p, padLen)
 
 	// Apply rate limiting to evade TSPU bulk transfer detection
 	// This adds jitter and micro-pauses to mimic legitimate streaming
@@ -451,24 +527,9 @@ func (mc *MorphedConn) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// selectPacketSize returns a packet size based on profile distribution
-func (mc *MorphedConn) selectPacketSize() int {
-	r := mc.randomFloat()
-	cumulative := 0.0
-
-	for i, prob := range mc.profile.PacketSizeProbs {
-		cumulative += prob
-		if r < cumulative {
-			return mc.profile.PacketSizes[i]
-		}
-	}
-
-	return mc.profile.PacketSizes[len(mc.profile.PacketSizes)-1]
-}
-
-// Read reads and unpacks morphed data with buffering support
-// OPTIMIZED: Reads header+data+padding in fewer syscalls
-// NOTE: Rate limiting on Read creates TCP backpressure to slow down server
+// Read reads and unpacks morphed data with buffering support.
+// Reads header+data+padding in fewer syscalls; padding is silently dropped.
+// NOTE: Rate limiting on Read creates TCP backpressure to slow down server.
 func (mc *MorphedConn) Read(p []byte) (int, error) {
 	// If we have buffered data, return from buffer first
 	if len(mc.readBuf) > 0 {
@@ -482,16 +543,13 @@ func (mc *MorphedConn) Read(p []byte) (int, error) {
 		return n, nil
 	}
 
-	// OPTIMIZATION: Read packet header: [dataLen:4][paddingLen:2]
-	header := make([]byte, 6)
+	// Read packet header: [dataLen:4][paddingLen:2]
+	header := make([]byte, morphHeaderLen)
 	_, err := io.ReadFull(mc.Conn, header)
 	if err != nil {
 		return 0, err
 	}
-
-	// Parse lengths
-	dataLen := int(header[0])<<24 | int(header[1])<<16 | int(header[2])<<8 | int(header[3])
-	paddingLen := int(header[4])<<8 | int(header[5])
+	dataLen, paddingLen := readFrameHeader(header)
 
 	// Handle dummy packets (dataLen = 0) - these are keepalive responses
 	if dataLen == 0 {
@@ -508,7 +566,7 @@ func (mc *MorphedConn) Read(p []byte) (int, error) {
 		return mc.Read(p) // Buffer too small, read next packet
 	}
 
-	// OPTIMIZATION 4: Read data+padding in single syscall to reduce latency
+	// Read data+padding in single syscall to reduce latency
 	totalPayload := dataLen + paddingLen
 	var payload []byte
 	var fromPool bool
@@ -553,37 +611,6 @@ func (mc *MorphedConn) Read(p []byte) (int, error) {
 	}
 
 	return copied, nil
-}
-
-// generateDummy creates a dummy packet
-func (mc *MorphedConn) generateDummy() []byte {
-	size := mc.selectPacketSize()
-	paddingLen := size - 6 // Header is 6 bytes
-	if paddingLen < 0 {
-		paddingLen = 0
-	}
-
-	packet := make([]byte, 6+paddingLen)
-
-	// Data length = 0 (dummy)
-	packet[0], packet[1], packet[2], packet[3] = 0, 0, 0, 0
-
-	// Padding length
-	packet[4] = byte(paddingLen >> 8)
-	packet[5] = byte(paddingLen)
-
-	// Random padding
-	rand.Read(packet[6:])
-	return packet
-}
-
-// randomFloat returns a random float64 in [0, 1).
-// Uses fast math/rand (non-cryptographic) — only feeds shaping decisions.
-func (mc *MorphedConn) randomFloat() float64 {
-	fastRandMu.Lock()
-	f := fastRand.Float64()
-	fastRandMu.Unlock()
-	return f
 }
 
 // Close closes the underlying connection.
