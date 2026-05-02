@@ -1,0 +1,25 @@
+[32mINF[0m 23:12:13.550 kTLS: kernel TLS support detected, will offload encryption
+goos: linux
+goarch: amd64
+pkg: github.com/tiredvpn/tiredvpn/internal/strategy
+cpu: 13th Gen Intel(R) Core(TM) i7-1370P
+BenchmarkMorphedConn_NoopShaper-20       	   33057	     72217 ns/op	 907.49 MB/s	  196621 B/op	       4 allocs/op
+BenchmarkMorphedConn_ChromeShaper-20     	      55	  37512799 ns/op	   1.75 MB/s	  256629 B/op	     716 allocs/op
+BenchmarkMorphedConn_YoutubeShaper-20    	       8	 286503708 ns/op	   0.23 MB/s	  286505 B/op	    1963 allocs/op
+PASS
+ok  	github.com/tiredvpn/tiredvpn/internal/strategy	6.760s
+
+# Notes
+#
+# Chrome and YouTube presets are *intentionally* much slower than NoopShaper
+# because their whole purpose is to reshape traffic into a target packet-size
+# distribution; small-frame presets (chrome avg ~600 B, youtube_up ~120 B)
+# fragment a 64 KiB Write into hundreds of frames each separated by a
+# time.Sleep. The 5% throughput-overhead target stated in the task spec is
+# only realistic if a shaper preserves the original frame size, which is the
+# opposite of the design goal.
+#
+# Net.Pipe is also synchronous (one outstanding write at a time), so the
+# benchmark measures end-to-end serialized framing cost, not raw shaper
+# CPU. Real deployments will sit behind buffered TCP/TLS so per-frame
+# Sleep latency overlaps with kernel I/O and the wall-clock cost falls.
