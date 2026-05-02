@@ -5,6 +5,7 @@ go 1.26
 require (
 	github.com/cloudflare/circl v1.6.3
 	github.com/google/uuid v1.6.0
+	github.com/pelletier/go-toml/v2 v2.3.1
 	github.com/quic-go/quic-go v0.59.0
 	github.com/redis/go-redis/v9 v9.19.0
 	github.com/refraction-networking/utls v1.8.2
