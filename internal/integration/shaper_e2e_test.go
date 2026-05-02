@@ -117,13 +117,19 @@ func TestShaperE2E_DifferentPresetsCantTalk_DocumentBehavior(t *testing.T) {
 		want[i] = byte(rng.UintN(256))
 	}
 
-	var writeErr error
+	var (
+		writeErr error
+		wg       sync.WaitGroup
+	)
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		_, writeErr = client.Write(want)
 		_ = client.Close()
 	}()
 
 	got, readErr := readAll(server, N, 10*time.Second)
+	wg.Wait()
 	if writeErr != nil {
 		t.Fatalf("client write: %v", writeErr)
 	}
