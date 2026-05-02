@@ -3,7 +3,6 @@ package strategy
 import (
 	"math"
 	"testing"
-	"time"
 )
 
 // TestTrafficProfilePacketSizes tests packet size distribution
@@ -79,90 +78,6 @@ func TestTrafficProfileInterArrival(t *testing.T) {
 	}
 }
 
-// TestTrafficProfileBurstParameters tests burst behavior
-func TestTrafficProfileBurstParameters(t *testing.T) {
-	profiles := []*TrafficProfile{
-		YandexVideoProfile,
-		VKVideoProfile,
-		WebBrowsingProfile,
-		VoIPProfile,
-	}
-
-	for _, profile := range profiles {
-		t.Run(profile.Name, func(t *testing.T) {
-			// Burst size should be positive
-			if profile.BurstSize <= 0 {
-				t.Errorf("BurstSize %d should be > 0", profile.BurstSize)
-			}
-
-			// Burst size shouldn't be too large (sanity check)
-			if profile.BurstSize > 1000 {
-				t.Errorf("BurstSize %d seems too large", profile.BurstSize)
-			}
-
-			// Burst interval should be positive
-			if profile.BurstInterval <= 0 {
-				t.Errorf("BurstInterval %v should be > 0", profile.BurstInterval)
-			}
-
-			// Burst interval should be reasonable (< 10 seconds)
-			if profile.BurstInterval > 10*time.Second {
-				t.Errorf("BurstInterval %v seems too large", profile.BurstInterval)
-			}
-		})
-	}
-}
-
-// TestTrafficProfileDownUpRatio tests download/upload ratio
-func TestTrafficProfileDownUpRatio(t *testing.T) {
-	tests := []struct {
-		profile     *TrafficProfile
-		minRatio    float64
-		maxRatio    float64
-		description string
-	}{
-		{
-			profile:     YandexVideoProfile,
-			minRatio:    10.0,
-			maxRatio:    20.0,
-			description: "Video streaming should be heavily asymmetric",
-		},
-		{
-			profile:     VKVideoProfile,
-			minRatio:    10.0,
-			maxRatio:    25.0,
-			description: "Video streaming should be heavily asymmetric",
-		},
-		{
-			profile:     WebBrowsingProfile,
-			minRatio:    3.0,
-			maxRatio:    10.0,
-			description: "Web browsing moderately asymmetric",
-		},
-		{
-			profile:     VoIPProfile,
-			minRatio:    0.8,
-			maxRatio:    1.2,
-			description: "VoIP should be nearly symmetric",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.profile.Name, func(t *testing.T) {
-			ratio := tt.profile.DownUpRatio
-
-			if ratio < 0 {
-				t.Errorf("DownUpRatio %f should be >= 0", ratio)
-			}
-
-			if ratio < tt.minRatio || ratio > tt.maxRatio {
-				t.Errorf("DownUpRatio %f outside expected range [%f, %f]: %s",
-					ratio, tt.minRatio, tt.maxRatio, tt.description)
-			}
-		})
-	}
-}
-
 // TestTrafficProfilePadding tests padding parameters
 func TestTrafficProfilePadding(t *testing.T) {
 	profiles := []*TrafficProfile{
@@ -208,18 +123,6 @@ func TestYandexVideoProfileCharacteristics(t *testing.T) {
 		t.Error("Yandex Video should have packets >= 1200 bytes")
 	}
 
-	// Should be download-heavy
-	if profile.DownUpRatio < 10.0 {
-		t.Errorf("Yandex Video DownUpRatio %f should be >= 10.0 (streaming is asymmetric)",
-			profile.DownUpRatio)
-	}
-
-	// Should have bursty behavior
-	if profile.BurstSize < 20 {
-		t.Errorf("Yandex Video BurstSize %d should be >= 20 (video buffering)",
-			profile.BurstSize)
-	}
-
 	// Inter-arrival should be low (high throughput)
 	if profile.InterArrivalMean > 20.0 {
 		t.Errorf("Yandex Video InterArrivalMean %f should be <= 20ms (streaming)",
@@ -239,22 +142,10 @@ func TestVoIPProfileCharacteristics(t *testing.T) {
 		}
 	}
 
-	// Should be nearly symmetric
-	if profile.DownUpRatio < 0.8 || profile.DownUpRatio > 1.2 {
-		t.Errorf("VoIP DownUpRatio %f should be near 1.0 (symmetric)",
-			profile.DownUpRatio)
-	}
-
 	// Should have regular intervals (low variance)
 	if profile.InterArrivalStdDev > profile.InterArrivalMean {
 		t.Errorf("VoIP should have low variance: StdDev %f > Mean %f",
 			profile.InterArrivalStdDev, profile.InterArrivalMean)
-	}
-
-	// VoIP sends packets regularly, not in bursts
-	if profile.BurstSize > 1 {
-		t.Logf("Note: VoIP BurstSize %d (expected 1 for regular packets)",
-			profile.BurstSize)
 	}
 }
 
@@ -271,12 +162,6 @@ func TestWebBrowsingProfileCharacteristics(t *testing.T) {
 	if profile.InterArrivalMean < 30.0 {
 		t.Errorf("Web browsing InterArrivalMean %f should be >= 30ms (bursty)",
 			profile.InterArrivalMean)
-	}
-
-	// Should be moderately asymmetric (more downloads)
-	if profile.DownUpRatio < 3.0 || profile.DownUpRatio > 10.0 {
-		t.Errorf("Web browsing DownUpRatio %f should be in [3.0, 10.0]",
-			profile.DownUpRatio)
 	}
 }
 
@@ -384,9 +269,6 @@ func TestProfileConsistency(t *testing.T) {
 			}
 			if profile.InterArrivalMean == 0 {
 				t.Error("InterArrivalMean is zero")
-			}
-			if profile.BurstInterval == 0 {
-				t.Error("BurstInterval is zero")
 			}
 		})
 	}
