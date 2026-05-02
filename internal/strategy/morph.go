@@ -25,7 +25,17 @@ type TrafficMorphStrategy struct {
 	secret    []byte   // Secret for authentication
 }
 
-// TrafficProfile defines statistical properties of traffic to mimic
+// TrafficProfile defines statistical properties of traffic to mimic.
+//
+// Fields BurstSize, BurstInterval and DownUpRatio that previously lived here
+// were declared but never read by the runtime (writeScheduler was disabled,
+// fragmentToProfile was unused). They are intentionally absent so the profile
+// only exposes parameters that actually drive behaviour today: packet size
+// distribution (used by dummy generation) and padding ranges (used by Write).
+//
+// Inter-arrival parameters remain because they are part of the documented
+// shape of each profile and will become inputs to the future shaper layer
+// (see internal/shaper, task I2). They have no runtime effect right now.
 type TrafficProfile struct {
 	Name string
 
@@ -33,18 +43,12 @@ type TrafficProfile struct {
 	PacketSizes     []int     // Bucket centers
 	PacketSizeProbs []float64 // Probability for each bucket
 
-	// Inter-arrival time distribution (milliseconds)
+	// Inter-arrival time distribution (milliseconds).
+	// Currently informational; will drive timing once shaper is wired in.
 	InterArrivalMean   float64
 	InterArrivalStdDev float64
 
-	// Burst patterns
-	BurstSize     int           // Packets per burst
-	BurstInterval time.Duration // Time between bursts
-
-	// Direction ratio (download/upload)
-	DownUpRatio float64
-
-	// Padding behavior
+	// Padding behavior (applied per Write)
 	MinPadding int
 	MaxPadding int
 }
@@ -58,9 +62,6 @@ var (
 		PacketSizeProbs:    []float64{0.10, 0.20, 0.35, 0.35},
 		InterArrivalMean:   8.0,
 		InterArrivalStdDev: 20.0,
-		BurstSize:          30,
-		BurstInterval:      150 * time.Millisecond,
-		DownUpRatio:        15.0,
 		MinPadding:         50,
 		MaxPadding:         200,
 	}
@@ -73,9 +74,6 @@ var (
 		PacketSizeProbs:    []float64{0.12, 0.18, 0.30, 0.40},
 		InterArrivalMean:   10.0,
 		InterArrivalStdDev: 25.0,
-		BurstSize:          25,
-		BurstInterval:      180 * time.Millisecond,
-		DownUpRatio:        12.0,
 		MinPadding:         60,
 		MaxPadding:         250,
 	}
@@ -87,9 +85,6 @@ var (
 		PacketSizeProbs:    []float64{0.15, 0.25, 0.30, 0.30},
 		InterArrivalMean:   12.0,
 		InterArrivalStdDev: 30.0,
-		BurstSize:          20,
-		BurstInterval:      200 * time.Millisecond,
-		DownUpRatio:        10.0,
 		MinPadding:         40,
 		MaxPadding:         180,
 	}
@@ -100,9 +95,6 @@ var (
 		PacketSizeProbs:    []float64{0.08, 0.15, 0.32, 0.45},
 		InterArrivalMean:   6.0,
 		InterArrivalStdDev: 18.0,
-		BurstSize:          40,
-		BurstInterval:      120 * time.Millisecond,
-		DownUpRatio:        18.0,
 		MinPadding:         20,
 		MaxPadding:         150,
 	}
@@ -114,9 +106,6 @@ var (
 		PacketSizeProbs:    []float64{0.30, 0.25, 0.25, 0.20},
 		InterArrivalMean:   50.0,
 		InterArrivalStdDev: 100.0,
-		BurstSize:          10,
-		BurstInterval:      500 * time.Millisecond,
-		DownUpRatio:        5.0,
 		MinPadding:         0,
 		MaxPadding:         50,
 	}
@@ -128,9 +117,6 @@ var (
 		PacketSizeProbs:    []float64{0.40, 0.40, 0.20},
 		InterArrivalMean:   20.0, // Regular intervals
 		InterArrivalStdDev: 5.0,  // Low variance
-		BurstSize:          1,
-		BurstInterval:      20 * time.Millisecond,
-		DownUpRatio:        1.0, // Symmetric
 		MinPadding:         0,
 		MaxPadding:         20,
 	}
