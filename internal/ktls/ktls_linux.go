@@ -325,7 +325,7 @@ func Enable(tlsConn *tls.Conn) *Conn {
 
 		// Check if it's a wrapper with embedded net.Conn
 		v := reflect.ValueOf(netConn)
-		if v.Kind() == reflect.Ptr {
+		if v.Kind() == reflect.Pointer {
 			v = v.Elem()
 		}
 
