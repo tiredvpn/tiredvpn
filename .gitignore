@@ -34,4 +34,4 @@ Thumbs.db
 .aider/
 
 # Build
-dist/
+/dist/
