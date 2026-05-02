@@ -232,3 +232,25 @@ func TestShaperFromConfig(t *testing.T) {
 		}
 	})
 }
+
+// TestShaperFromConfig_PresetReturnsNonNoop locks in that wiring the preset
+// registry actually produces a behavioral shaper, not the legacy passthrough.
+func TestShaperFromConfig_PresetReturnsNonNoop(t *testing.T) {
+	seed := int64(42)
+	sh, err := ShaperFromConfig(&toml.ShaperConfig{
+		Preset: "chrome_browsing",
+		Seed:   &seed,
+	})
+	if err != nil {
+		t.Fatalf("ShaperFromConfig: %v", err)
+	}
+	if isNoopShaper(sh) {
+		t.Fatalf("expected non-noop shaper for preset, got %T", sh)
+	}
+}
+
+func TestShaperFromConfig_UnknownPreset(t *testing.T) {
+	if _, err := ShaperFromConfig(&toml.ShaperConfig{Preset: "no_such_preset"}); err == nil {
+		t.Fatal("expected error for unknown preset")
+	}
+}
