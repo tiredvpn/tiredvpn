@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"io"
-	"math"
 	mathrand "math/rand"
 	"net"
 	"sync"
@@ -302,16 +301,17 @@ func (s *TrafficMorphStrategy) Connect(ctx context.Context, target string) (net.
 	return NewMorphedConn(baseConn, s.profile, s.secret), nil
 }
 
-// MorphedConn wraps a connection with traffic morphing
+// MorphedConn wraps a connection with traffic morphing.
+//
+// Behavioural shaping is intentionally minimal here: per-Write padding plus
+// a 6-byte length/padding framing header. Burst scheduling, dummy cover
+// traffic and Gaussian inter-arrival jitter previously lived in a
+// writeScheduler goroutine that conflicted with TLS framing and is removed.
+// Those behaviours are planned for re-introduction via internal/shaper
+// (task I2).
 type MorphedConn struct {
 	net.Conn
 	profile *TrafficProfile
-
-	// Write scheduling
-	writeMu     sync.Mutex
-	writeQueue  [][]byte
-	writeTicker *time.Ticker
-	writeStop   chan struct{}
 
 	// Read buffer for partial reads
 	readBuf []byte
@@ -322,10 +322,6 @@ type MorphedConn struct {
 	packetsSent int64
 	packetsRecv int64
 
-	// Burst control
-	burstCounter int
-	lastBurst    time.Time
-
 	// Rate limiting for TSPU evasion
 	rateLimiter *evasion.AdaptiveRateLimiter
 }
@@ -335,18 +331,18 @@ func (mc *MorphedConn) NetConn() net.Conn {
 	return mc.Conn
 }
 
-// NewMorphedConn creates a morphed connection
+// NewMorphedConn creates a morphed connection.
+// It performs the application-layer Morph handshake over the underlying
+// (typically TLS) conn before returning.
 func NewMorphedConn(conn net.Conn, profile *TrafficProfile, secret []byte) *MorphedConn {
 	mc := &MorphedConn{
-		Conn:       conn,
-		profile:    profile,
-		writeQueue: make([][]byte, 0),
-		writeStop:  make(chan struct{}),
-		lastBurst:  time.Now(),
+		Conn:    conn,
+		profile: profile,
 		// Rate limiter disabled - was causing 80 KB/s bottleneck
 		rateLimiter: nil,
 	}
 
+	// --- TLS / handshake (do not touch in shaper migration) ---
 	// Send magic handshake so server recognizes Morph protocol
 	// Format: "MRPH" + profile name length (1 byte) + profile name + auth token (32 bytes)
 	magic := []byte("MRPH")
@@ -364,50 +360,7 @@ func NewMorphedConn(conn net.Conn, profile *TrafficProfile, secret []byte) *Morp
 	log.Debug("Morph: sending handshake, secret_prefix=%x..., token=%x...", secret[:min(8, len(secret))], authToken[:8])
 	conn.Write(handshake)
 
-	// NOTE: writeScheduler disabled for TUN mode compatibility
-	// TUN mode uses synchronous Write() directly without queue/scheduler
-	// The scheduler's dummy packets interfere with TLS causing "bad record MAC" errors
-
 	return mc
-}
-
-// writeScheduler sends packets according to profile timing
-func (mc *MorphedConn) writeScheduler() {
-	for {
-		select {
-		case <-mc.writeStop:
-			return
-		case <-mc.writeTicker.C:
-			mc.writeMu.Lock()
-			if len(mc.writeQueue) > 0 {
-				// Send next packet
-				packet := mc.writeQueue[0]
-				mc.writeQueue = mc.writeQueue[1:]
-				mc.writeMu.Unlock()
-
-				mc.Conn.Write(packet)
-				mc.packetsSent++
-				mc.bytesSent += int64(len(packet))
-			} else {
-				mc.writeMu.Unlock()
-
-				// Send dummy packet to maintain pattern
-				if mc.shouldSendDummy() {
-					dummy := mc.generateDummy()
-					mc.Conn.Write(dummy)
-					mc.packetsSent++
-				}
-			}
-
-			// Adjust timing with jitter
-			jitter := mc.gaussianRandom(0, mc.profile.InterArrivalStdDev)
-			nextInterval := mc.profile.InterArrivalMean + jitter
-			if nextInterval < 1 {
-				nextInterval = 1
-			}
-			mc.writeTicker.Reset(time.Duration(nextInterval) * time.Millisecond)
-		}
-	}
 }
 
 // Write sends data immediately with morph framing (for TUN mode compatibility)
@@ -496,54 +449,6 @@ func (mc *MorphedConn) Write(p []byte) (int, error) {
 	mc.bytesSent += int64(len(packet))
 
 	return len(p), nil
-}
-
-// fragmentToProfile splits data into packets matching size distribution
-func (mc *MorphedConn) fragmentToProfile(data []byte) [][]byte {
-	var packets [][]byte
-	offset := 0
-
-	for offset < len(data) {
-		// Select packet size based on profile distribution
-		targetSize := mc.selectPacketSize()
-
-		// Add padding
-		padding := mc.randomInt(mc.profile.MinPadding, mc.profile.MaxPadding)
-
-		// Calculate actual data size
-		// Header is 6 bytes: [dataLen:4][paddingLen:2]
-		dataSize := targetSize - padding - 6
-		if dataSize < 1 {
-			dataSize = 1
-		}
-		if offset+dataSize > len(data) {
-			dataSize = len(data) - offset
-		}
-
-		// Build packet: [dataLen:4][paddingLen:2][data:N][padding:M]
-		packet := make([]byte, 6+dataSize+padding)
-
-		// Data length header
-		packet[0] = byte(dataSize >> 24)
-		packet[1] = byte(dataSize >> 16)
-		packet[2] = byte(dataSize >> 8)
-		packet[3] = byte(dataSize)
-
-		// Padding length header
-		packet[4] = byte(padding >> 8)
-		packet[5] = byte(padding)
-
-		// Data
-		copy(packet[6:6+dataSize], data[offset:offset+dataSize])
-
-		// Random padding
-		rand.Read(packet[6+dataSize:])
-
-		packets = append(packets, packet)
-		offset += dataSize
-	}
-
-	return packets
 }
 
 // selectPacketSize returns a packet size based on profile distribution
@@ -650,12 +555,6 @@ func (mc *MorphedConn) Read(p []byte) (int, error) {
 	return copied, nil
 }
 
-// shouldSendDummy decides if a dummy packet should be sent
-func (mc *MorphedConn) shouldSendDummy() bool {
-	// Maintain minimum packet rate
-	return mc.randomFloat() < 0.1 // 10% chance
-}
-
 // generateDummy creates a dummy packet
 func (mc *MorphedConn) generateDummy() []byte {
 	size := mc.selectPacketSize()
@@ -678,22 +577,8 @@ func (mc *MorphedConn) generateDummy() []byte {
 	return packet
 }
 
-// gaussianRandom generates a random number with Gaussian distribution
-func (mc *MorphedConn) gaussianRandom(mean, stddev float64) float64 {
-	// Box-Muller transform
-	u1 := mc.randomFloat()
-	u2 := mc.randomFloat()
-
-	if u1 == 0 {
-		u1 = 0.0001
-	}
-
-	z := math.Sqrt(-2*math.Log(u1)) * math.Cos(2*math.Pi*u2)
-	return mean + z*stddev
-}
-
-// randomFloat returns a random float64 in [0, 1)
-// OPTIMIZED: Uses fast math/rand instead of crypto/rand
+// randomFloat returns a random float64 in [0, 1).
+// Uses fast math/rand (non-cryptographic) — only feeds shaping decisions.
 func (mc *MorphedConn) randomFloat() float64 {
 	fastRandMu.Lock()
 	f := fastRand.Float64()
@@ -701,26 +586,8 @@ func (mc *MorphedConn) randomFloat() float64 {
 	return f
 }
 
-// randomInt returns a random int in [min, max]
-// OPTIMIZED: Uses fast math/rand instead of crypto/rand
-func (mc *MorphedConn) randomInt(min, max int) int {
-	if max <= min {
-		return min
-	}
-	return fastRandInt(min, max)
-}
-
-// Close stops the scheduler and closes connection
+// Close closes the underlying connection.
 func (mc *MorphedConn) Close() error {
-	select {
-	case <-mc.writeStop:
-		// Already closed
-	default:
-		close(mc.writeStop)
-	}
-	if mc.writeTicker != nil {
-		mc.writeTicker.Stop()
-	}
 	return mc.Conn.Close()
 }
 
