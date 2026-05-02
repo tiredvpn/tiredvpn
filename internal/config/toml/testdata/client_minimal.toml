@@ -1,0 +1,10 @@
+[server]
+address = "vpn.example.org"
+port = 443
+
+[strategy]
+mode = "reality"
+
+[tls]
+
+[logging]

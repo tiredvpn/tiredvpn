@@ -1,0 +1,48 @@
+[listen]
+address = "0.0.0.0"
+port = 443
+
+[strategy]
+mode = "reality"
+
+[shaper]
+randomization_range = 0.15
+
+[shaper.custom.burst]
+type = "markov"
+
+[[shaper.custom.burst.markov.states]]
+name = "idle"
+value = 0
+
+[[shaper.custom.burst.markov.states]]
+name = "burst"
+value = 1
+
+[shaper.custom.burst.markov]
+transitions = [
+  [0.9, 0.1],
+  [0.4, 0.6],
+]
+
+[shaper.custom.packet_size]
+type = "pareto"
+
+[shaper.custom.packet_size.pareto]
+xm = 64
+alpha = 2.5
+
+[tls]
+cert_file = "/etc/tiredvpn/server.crt"
+key_file = "/etc/tiredvpn/server.key"
+alpn = ["h2", "http/1.1"]
+client_ca_file = "/etc/tiredvpn/clients.pem"
+
+[auth]
+mode = "token"
+tokens_file = "/etc/tiredvpn/tokens.txt"
+
+[logging]
+level = "info"
+format = "json"
+output = "/var/log/tiredvpn.log"

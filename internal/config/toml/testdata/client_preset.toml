@@ -1,0 +1,21 @@
+[server]
+address = "vpn.example.org"
+port = 443
+
+[strategy]
+mode = "reality"
+
+[shaper]
+preset = "chrome_browsing"
+randomization_range = 0.1
+seed = 1234567890
+
+[tls]
+server_name = "www.cloudflare.com"
+fingerprint = "chrome_120"
+alpn = ["h2", "http/1.1"]
+
+[logging]
+level = "info"
+format = "json"
+output = "stderr"

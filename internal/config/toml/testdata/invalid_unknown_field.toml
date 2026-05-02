@@ -1,0 +1,11 @@
+[server]
+address = "vpn.example.org"
+port = 443
+typo_field = "boom"
+
+[strategy]
+mode = "reality"
+
+[tls]
+
+[logging]

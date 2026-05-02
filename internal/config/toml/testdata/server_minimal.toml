@@ -1,0 +1,16 @@
+[listen]
+address = "0.0.0.0"
+port = 443
+
+[strategy]
+mode = "reality"
+
+[tls]
+cert_file = "/etc/tiredvpn/server.crt"
+key_file = "/etc/tiredvpn/server.key"
+
+[auth]
+mode = "token"
+tokens = ["alpha", "beta"]
+
+[logging]
