@@ -13,6 +13,7 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/evasion"
 	"github.com/tiredvpn/tiredvpn/internal/ktls"
 	"github.com/tiredvpn/tiredvpn/internal/log"
+	"github.com/tiredvpn/tiredvpn/internal/shaper"
 )
 
 // TrafficMorphStrategy morphs traffic to match target application patterns
@@ -314,6 +315,11 @@ type MorphedConn struct {
 	net.Conn
 	profile *TrafficProfile
 
+	// shaper drives sizing, delay and fragmentation. NoopShaper means
+	// "use the legacy per-Write padding pipeline" — we keep wire bytes
+	// byte-identical to pre-shaper builds in that mode (backward compat).
+	shaper shaper.Shaper
+
 	// Read buffer for partial reads
 	readBuf []byte
 
@@ -332,13 +338,24 @@ func (mc *MorphedConn) NetConn() net.Conn {
 	return mc.Conn
 }
 
-// NewMorphedConn creates a morphed connection.
-// It performs the application-layer Morph handshake over the underlying
-// (typically TLS) conn before returning.
+// NewMorphedConn creates a morphed connection with the legacy passthrough
+// shaper. It performs the application-layer Morph handshake over the
+// underlying (typically TLS) conn before returning.
 func NewMorphedConn(conn net.Conn, profile *TrafficProfile, secret []byte) *MorphedConn {
+	return NewMorphedConnWithShaper(conn, profile, secret, nil)
+}
+
+// NewMorphedConnWithShaper is like NewMorphedConn but lets callers inject a
+// behavioral shaper. A nil sh defaults to shaper.NoopShaper, which keeps the
+// wire format and Write/Read pipeline byte-identical to the pre-shaper code.
+func NewMorphedConnWithShaper(conn net.Conn, profile *TrafficProfile, secret []byte, sh shaper.Shaper) *MorphedConn {
+	if sh == nil {
+		sh = shaper.NoopShaper{}
+	}
 	mc := &MorphedConn{
 		Conn:    conn,
 		profile: profile,
+		shaper:  sh,
 		// Rate limiter disabled - was causing 80 KB/s bottleneck
 		rateLimiter: nil,
 	}
@@ -491,6 +508,12 @@ func (mc *MorphedConn) Write(p []byte) (int, error) {
 		return 0, nil
 	}
 
+	// Non-Noop shapers fragment + delay; Noop preserves the legacy wire layout
+	// exactly (one Write -> one frame, padding from profile).
+	if !isNoopShaper(mc.shaper) {
+		return mc.writeShaped(p)
+	}
+
 	// Build framed packet [header:6][data:N][padding:M]
 	padLen := mc.pickPaddingLen()
 	packet, fromPool := buildFrame(p, padLen)
@@ -531,7 +554,8 @@ func (mc *MorphedConn) Write(p []byte) (int, error) {
 // Reads header+data+padding in fewer syscalls; padding is silently dropped.
 // NOTE: Rate limiting on Read creates TCP backpressure to slow down server.
 func (mc *MorphedConn) Read(p []byte) (int, error) {
-	// If we have buffered data, return from buffer first
+	// Drain anything already buffered by either path before pulling new bytes;
+	// the shaper path may yield a payload larger than p in one go.
 	if len(mc.readBuf) > 0 {
 		n := copy(p, mc.readBuf)
 		mc.readBuf = mc.readBuf[n:]
@@ -541,6 +565,10 @@ func (mc *MorphedConn) Read(p []byte) (int, error) {
 			mc.rateLimiter.Wait(n)
 		}
 		return n, nil
+	}
+
+	if !isNoopShaper(mc.shaper) {
+		return mc.readShaped(p)
 	}
 
 	// Read packet header: [dataLen:4][paddingLen:2]
