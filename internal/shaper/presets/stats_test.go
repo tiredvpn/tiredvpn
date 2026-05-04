@@ -112,7 +112,7 @@ func TestPreset_BitTorrent_StatisticalSignature(t *testing.T) {
 		600:  0.10,
 		1200: 0.05,
 	}
-	s, err := ByName(PresetBitTorrentIdle, 12345)
+	s, err := ByNameAllowAny(PresetBitTorrentIdle, 12345)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,10 +188,11 @@ func TestPreset_RandomPerSession_VariesAcrossSeeds(t *testing.T) {
 			}
 		}
 	}
-	// Require >= 60% of pairs to be distinguishable. With 3 base presets and
-	// 15% jitter, same-base pairs may still look similar — that's fine.
-	if float64(distinct)/float64(pairs) < 0.6 {
-		t.Fatalf("random_per_session: only %d/%d pairs distinguishable (want ≥ 60%%)", distinct, pairs)
+	// Require >= 40% of pairs to be distinguishable. With 2 data-plane-safe
+	// base presets and 15% jitter, ~half the pairs share a base preset and
+	// are inherently similar — only cross-base pairs are reliably distinct.
+	if float64(distinct)/float64(pairs) < 0.4 {
+		t.Fatalf("random_per_session: only %d/%d pairs distinguishable (want ≥ 40%%)", distinct, pairs)
 	}
 	t.Logf("random_per_session: %d/%d distinct pairs", distinct, pairs)
 }

@@ -6,6 +6,30 @@ implementation; concrete distribution-driven shapers live in
 `internal/shaper/dist`, ready-made profiles in `internal/shaper/presets`,
 and the wiring point for `MorphedConn` is `internal/strategy.ShaperFromConfig`.
 
+## Data-plane vs cover-traffic presets
+
+Each preset carries a `DataPlaneSafe` metadata flag that splits profiles
+into two categories:
+
+| Preset               | DataPlaneSafe | Median delay | Intended use                  |
+|----------------------|---------------|--------------|-------------------------------|
+| `chrome_browsing`    | yes           | ~0.9 ms      | data plane (HTTPS browsing)   |
+| `youtube_streaming`  | yes           | sub-second   | data plane (HD video)         |
+| `random_per_session` | yes           | sub-second   | data plane (rotates basis)    |
+| `bittorrent_idle`    | no            | ~7 s         | cover traffic only            |
+
+The data-plane entry points — `presets.FromConfig` (used by TOML config) and
+`presets.ByName` — refuse non-safe presets and return
+`ErrPresetNotDataPlaneSafe`. Putting `bittorrent_idle` into a tunnel would
+collapse throughput, since its inter-arrival distribution is built around
+multi-second gaps that are realistic for a stalled BT swarm participant but
+catastrophic for user payload.
+
+Cover-traffic emitters that intentionally need long idle gaps must call
+`presets.ByNameAllowAny` and assume responsibility for the schedule. Custom
+TOML shapers (`shaper.custom = ...`) are not gated — operators take
+responsibility for parameters they author.
+
 ## Verification & Testing
 
 The shaping pipeline is verified at four layers; rerun any of them locally
