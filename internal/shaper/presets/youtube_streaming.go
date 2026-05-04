@@ -31,7 +31,7 @@ const PresetYouTubeStreaming = "youtube_streaming"
 // Inter-arrival: Pareto(xm=0.05 ms, alpha=1.5) on download (heavy tail for
 // rebuffering); LogNormal(mu=-3, sigma=1.5) on upload (sparse GETs).
 func init() {
-	register(PresetYouTubeStreaming, buildYouTubeStreaming)
+	register(PresetYouTubeStreaming, true, buildYouTubeStreaming)
 }
 
 func buildYouTubeStreaming(seed int64) (shaper.Shaper, error) {
