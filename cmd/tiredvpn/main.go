@@ -21,8 +21,10 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/server"
 )
 
+// version is overridden at link time via -ldflags="-X main.version=$VERSION".
+// "dev" indicates an untagged local build.
 var (
-	version   = "1.0.1"
+	version   = "dev"
 	buildTime = "unknown"
 )
 
@@ -304,6 +306,8 @@ func runServer(args []string) {
 
 	cfg := &server.Config{}
 
+	configPath := fs.String("config", "", "Path to TOML config (overrides defaults; CLI flags override TOML)")
+
 	fs.StringVar(&cfg.ListenAddr, "listen", ":443", "Listen address")
 	fs.StringVar(&cfg.CertFile, "cert", "server.crt", "TLS certificate file")
 	fs.StringVar(&cfg.KeyFile, "key", "server.key", "TLS key file")
@@ -361,6 +365,11 @@ func runServer(args []string) {
 	cfg.IPPoolLeaseTime = *ipPoolLease
 	cfg.PortHopInterval = *portHopInterval
 
+	if err := applyServerTOMLConfig(cfg, *configPath, fs); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
 	// Start pprof server if enabled
 	if *pprofAddr != "" {
 		go func() {
@@ -382,6 +391,8 @@ func runClient(args []string) {
 	fs.Usage = printClientHelp
 
 	cfg := &client.Config{}
+
+	configPath := fs.String("config", "", "Path to TOML config (overrides defaults; CLI flags override TOML)")
 
 	fs.StringVar(&cfg.ListenAddr, "listen", "127.0.0.1:1080", "Local proxy address (SOCKS5/HTTP auto-detect)")
 	fs.StringVar(&cfg.HTTPListenAddr, "http-listen", "", "Separate HTTP proxy address (optional)")
@@ -464,6 +475,11 @@ func runClient(args []string) {
 	cfg.CircuitResetTime = *circuitResetTime
 	cfg.APIAddr = *apiAddr
 	cfg.PortHopInterval = *portHopInterval
+
+	if err := applyClientTOMLConfig(cfg, *configPath, fs); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
 
 	if *showVersion {
 		fmt.Printf("tiredvpn client %s (built %s)\n", version, buildTime)
