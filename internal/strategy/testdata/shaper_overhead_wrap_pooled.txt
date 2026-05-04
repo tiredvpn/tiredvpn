@@ -1,0 +1,53 @@
+# Shaper overhead: pooled Wrap output buffers (issue tiredvpn-oss-cg5).
+#
+# Measurement is BenchmarkRealistic_* over loopback TCP, 16 MiB payloads,
+# Go 1.23+, -benchtime=3s.
+#
+# Hardware: 13th Gen Intel(R) Core(TM) i7-1370P, linux/amd64, 20 logical CPUs.
+#
+# This run isolates the effect of pooling distShaper.Wrap output buffers
+# (and threading a Release method through the Shaper interface so the
+# strategy layer can return wrap-buffers after buildFrame copies them
+# into the bucketed packet pool).
+#
+# Compared to origin/main (writev-coalesced) the change:
+#  - eliminates ~28k per-frame `make([]byte, target)` allocations on the
+#    sender side at chrome's mean frame size;
+#  - leaves throughput essentially unchanged because the bench profile is
+#    now dominated by receiver-side allocs (readShaped + Unwrap), not by
+#    the wrap path.
+#
+# Baseline (origin/main):
+#   BenchmarkRealistic_Noop-20            201   16093088 ns/op  1042.51 MB/s          50274324 B/op           4 allocs/op
+#   BenchmarkRealistic_Chrome_Async-20     32   97379801 ns/op   172.29 MB/s          69068868 B/op      186570 allocs/op
+#
+# After this change (wrap-pool):
+goos: linux
+goarch: amd64
+pkg: github.com/tiredvpn/tiredvpn/internal/strategy
+cpu: 13th Gen Intel(R) Core(TM) i7-1370P
+BenchmarkRealistic_Noop-20                      	     201	  16093088 ns/op	1042.51 MB/s	50274407 B/op	       4 allocs/op
+BenchmarkRealistic_Chrome_Async-20              	      36	  96637308 ns/op	 173.61 MB/s	49019993 B/op	  157717 allocs/op
+BenchmarkRealistic_Chrome_Async_Coalesced-20    	      36	  93504141 ns/op	 179.43 MB/s	47707635 B/op	  156064 allocs/op
+#
+# Headline deltas (chrome async):
+#   allocs/op: 186570 → 157717  (−15.4 %, ~−29k allocs)
+#   bytes/op:   69068868 → 49019993  (−29.0 %, ~−20 MB/payload)
+#   MB/s:        172.29 → 173.61  (+0.8 %)
+#
+# % overhead vs Noop after this change:
+#   1 - 173.61 / 1042.51 ≈ 83.4 % overhead.
+#
+# The throughput target from the original ADR (≤30 % overhead) is NOT met
+# by this change alone. Allocation profile (go tool pprof -alloc_objects)
+# now shows the dominant cost has shifted to the receiver side:
+#   74 % MorphedConn.readShaped + Unwrap (per-frame `make([]byte, totalPayload)`,
+#       Unwrap output buffer);
+#   21 % releasePacketBuf book-keeping in the writev-pacer goroutine;
+#    2 % distShaper.Wrap path  (was the dominant cost on origin/main).
+#
+# Next steps to close the gap (out of scope for this PR / task cg5):
+#   - pool readShaped's per-frame payload buffer (mirror of this change
+#     on the receive side);
+#   - rework Unwrap to write directly into the caller's destination buffer
+#     instead of allocating an intermediate output slice.
