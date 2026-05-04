@@ -115,6 +115,63 @@ Client → Server A (relay) → Server B (upstream/exit) → Internet
 
 The fake website (`-fake-root`) is what any DPI probe or direct browser sees when connecting without a valid auth token. Put static HTML files there to mimic a real web service.
 
+## Configuration via TOML (preferred)
+
+Since v1.1.0 the server accepts `--config <path>` to load all options from a
+TOML file. Any CLI flag passed alongside overrides the file value
+(precedence: CLI > TOML > defaults), so existing systemd units keep working.
+
+```bash
+tiredvpn server --config /etc/tiredvpn/server.toml
+```
+
+A copy-paste-ready template lives in [`configs/server.example.toml`](../configs/server.example.toml).
+
+Minimal example:
+
+```toml
+[listen]
+address = "0.0.0.0"
+port    = 443
+
+[strategy]
+mode = "reality"
+
+[tls]
+cert_file = "/etc/tiredvpn/server.crt"
+key_file  = "/etc/tiredvpn/server.key"
+
+[auth]
+mode         = "token"
+tokens_file  = "/etc/tiredvpn/secrets.txt"
+
+[logging]
+level = "info"
+```
+
+Most CLI-only flags (Redis multi-tenancy, port-hopping range, monitoring
+endpoints, post-quantum) are not yet mapped to TOML and stay command-line
+only — see the
+[migration guide](../internal/config/toml/MIGRATION.md) for the field-by-field
+table and roadmap.
+
+## Traffic Shaper (server side)
+
+Server-side shaping is **opt-in**. By default the server is shaper-agnostic:
+each `MorphedConn` runs `NoopShaper` so server-to-client throughput is native.
+Enable `[shaper]` only when your threat model requires the server to also
+emit a specific statistical signature on its egress traffic.
+
+```toml
+[shaper]
+preset = "chrome_browsing"
+```
+
+Available presets and trade-offs are identical to the client side —
+see [client.md → Traffic Shaper](client.md#traffic-shaper). The
+`bittorrent_idle` preset is rejected in the data plane (≈7 s median
+inter-arrival is incompatible with tunnelling user payload).
+
 ## Configuration Examples
 
 ### Minimal single-client

@@ -87,3 +87,30 @@ go run ./cmd/shaper-dump --preset chrome_browsing --samples 10000 --seed 42 --ou
 
 Emits `idx,direction,size,delay_ms` and prints a per-direction mean/median/p95
 summary on stderr. CSVs are not committed.
+
+## Performance characteristics
+
+Final numbers from `internal/strategy/testdata/shaper_overhead_receiver.txt`,
+loopback TCP, 16 MiB payload, async pacer + writev coalescing + bucketed pool +
+pooled Wrap/Unwrap buffers:
+
+| Preset               | Throughput   | bytes/op | allocs/op | Notes                                    |
+|----------------------|--------------|---------:|----------:|------------------------------------------|
+| Noop (baseline)      | ~1040 MB/s   |   ~50 MB |       ~4  | Direct passthrough, no shaping           |
+| `chrome_browsing`    | **~191 MB/s**|   5.8 MB |    127 k  | Recommended for HTTPS-mimicry data plane |
+| `youtube_streaming`  | sleep-bound  |       —  |        —  | Pareto tail dominates wallclock          |
+| `random_per_session` | sleep-bound  |       —  |        —  | Same family as basis preset              |
+
+Honest trade-off: `chrome_browsing` is **109×** faster than the original
+synchronous shaper (1.75 → 191 MB/s) with **12×** less heap traffic, but still
+sits at ~80% throughput overhead vs. unshaped Noop. Headroom remains in the
+pacer goroutine handoff / channel ops — pursued only when a real workload
+needs it. Operators who need raw bandwidth can run with no shaper (`omit
+[shaper]` in TOML); the rest of the anti-DPI stack (REALITY, port-hop, RTT
+masking) stays effective on its own.
+
+Sleep-bound presets (`youtube_streaming`, `random_per_session`) spend most of
+their wallclock honoring inter-arrival distributions clamped to a 50 ms cap;
+on bulk transfer this caps throughput in single-digit MB/s. They are designed
+for workloads where the shape matters more than throughput (interactive,
+chat-like, browsing-like). For bulk transfer prefer `chrome_browsing`.

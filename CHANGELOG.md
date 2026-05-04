@@ -7,14 +7,31 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-05-04
+
+### Added
+
+- **Traffic Shaper** — new behavioural masking layer (`internal/shaper`) that decouples DPI shape from TLS transport. Distribution engines (Histogram, LogNormal, Pareto, MarkovBurst), four ready-made presets (`chrome_browsing`, `youtube_streaming`, `random_per_session`, `bittorrent_idle`) and a `cmd/shaper-dump` utility for χ² / Jupyter visualization.
+- **TOML configuration** — `tiredvpn client|server --config <path>` (`internal/config/toml`). Strict validation via `pelletier/go-toml/v2 DisallowUnknownFields`, precedence CLI > TOML > defaults, full field reference in [`internal/config/toml/MIGRATION.md`](internal/config/toml/MIGRATION.md).
+- Example configs: [`configs/client.example.toml`](configs/client.example.toml), [`configs/server.example.toml`](configs/server.example.toml). Regression-tested by `TestExampleConfigs_LoadCleanly`.
+- `presets.IsDataPlaneSafe(name)` accessor and `DataPlaneSafe` flag on every registered preset.
+- `presets.ByNameAllowAny` entry point for cover-traffic callers that need access to non-data-plane presets.
+- Real-tunnel TCP e2e test (`internal/integration/tunnel_e2e_test.go`, build tag `integration_e2e`) that loads both sides from TOML and verifies byte-perfect 1 MiB roundtrip.
+- Documentation: [`docs/client.md`](docs/client.md) and [`docs/server.md`](docs/server.md) gained "Configuration via TOML" and "Traffic Shaper" sections; [`internal/shaper/README.md`](internal/shaper/README.md) carries the final performance table.
+
+### Performance
+
+- Shaped-write throughput on `chrome_browsing` improved **109×** (1.75 → ~191 MB/s on loopback TCP, 16 MiB workload). Heap traffic dropped **12×** (~70 MB → ~5.8 MB per transfer), allocations −24%.
+- The pipeline now runs an async pacer goroutine with sleep coalescing, adaptive throttling on queue overflow, a 50 ms inter-frame delay cap, and `writev` (`net.Buffers`) coalescing. Frame buffers are pulled from a 4-bucket `sync.Pool`; `Wrap` and `Unwrap` reuse output slices via a new `Shaper.Release` method.
+- Honest trade-off: ~80% throughput overhead vs. unshaped Noop remains in the pacer goroutine handoff. Operators who do not need DPI shape masking should omit `[shaper]` from their TOML — the rest of the anti-DPI stack (REALITY, port-hop, RTT masking) is fully effective on its own.
+
 ### Breaking
 
 - Shaper preset `bittorrent_idle` is no longer accepted in data-plane configs (`shaper.preset = "bittorrent_idle"` returns `ErrPresetNotDataPlaneSafe`). Its ~7 s median inter-arrival is suitable for cover-traffic generation only; cover-traffic emitters must call `presets.ByNameAllowAny`. `random_per_session` now picks only from data-plane-safe basis presets.
 
-### Added
+### Changed
 
-- `presets.IsDataPlaneSafe(name)` accessor and `DataPlaneSafe` flag on every registered preset.
-- `presets.ByNameAllowAny` entry point for cover-traffic callers that need access to non-data-plane presets.
+- `version` is now passed through `-ldflags` from `git describe` at release build time. Local development builds report `dev`.
 
 ## [1.0.3] - 2026-04-09
 

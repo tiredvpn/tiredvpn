@@ -219,6 +219,68 @@ Benchmark results show per-strategy latency, success rate, and throughput. Use t
 
 See [monitoring.md](monitoring.md) for Prometheus metrics details.
 
+## Configuration via TOML (preferred)
+
+Since v1.1.0 the client accepts `--config <path>` to load all options from a
+TOML file. Any CLI flag passed alongside overrides the file value
+(precedence: CLI > TOML > defaults), so existing scripts keep working.
+
+```bash
+tiredvpn client --config /etc/tiredvpn/client.toml
+```
+
+A copy-paste-ready template lives in [`configs/client.example.toml`](../configs/client.example.toml).
+
+Minimal example:
+
+```toml
+[server]
+address = "vpn.example.com"
+port    = 443
+
+[strategy]
+mode = "morph"
+
+[shaper]
+preset = "chrome_browsing"
+
+[logging]
+level = "info"
+```
+
+CLI-only flags (TUN, port-hopping, ECH, post-quantum, benchmarking) are not
+yet mapped to TOML and stay command-line only — see the
+[migration guide](../internal/config/toml/MIGRATION.md) for the field-by-field
+table and roadmap.
+
+## Traffic Shaper
+
+The shaper is a behavioural masking layer that sits between strategy and
+transport. Strategies (REALITY, morph, etc.) hide *what* you send; the shaper
+hides *the timing and sizes of how you send it*, so DPI cannot kluster
+multiple users by their packet-distribution histogram.
+
+Enable via `[shaper]` in TOML. Available presets:
+
+| Preset                 | Use case                            | Throughput    | Trade-off                                |
+|------------------------|-------------------------------------|---------------|------------------------------------------|
+| `chrome_browsing`      | HTTPS browsing mimicry              | ~191 MB/s     | ~80% overhead vs. unshaped, recommended  |
+| `youtube_streaming`    | HD video streaming mimicry          | sleep-bound   | bulk transfer caps in single-digit MB/s  |
+| `random_per_session`   | rotates basis preset per connection | sleep-bound   | hardest to fingerprint, same caveat      |
+| `bittorrent_idle`      | cover traffic only                  | n/a           | rejected in data plane (median ~7 s)     |
+
+Recommendation: start with `chrome_browsing`. Switch to
+`random_per_session` when you specifically need the rotation property
+(adversary collects long traces). Use `youtube_streaming` only on
+interactive / non-bulk workloads.
+
+Custom distributions are supported via `[shaper.custom]` — see the example
+config and the [shaper README](../internal/shaper/README.md) for histogram /
+log-normal / Pareto / Markov-burst parameter shapes.
+
+If you do not need DPI shape masking, omit `[shaper]` entirely; throughput
+defaults to native (>1 GB/s on loopback).
+
 ## Configuration Examples
 
 ### Russia (TSPU bypass)
