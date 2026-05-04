@@ -6,6 +6,7 @@ package integration_test
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"math/rand/v2"
 	"sync"
@@ -140,6 +141,82 @@ func TestShaperE2E_DifferentPresetsCantTalk_DocumentBehavior(t *testing.T) {
 		t.Fatalf("cross-preset roundtrip mismatch: got %d bytes, want %d", len(got), N)
 	}
 	t.Log("cross-preset roundtrip succeeded; shaper changes affect on-wire shape, not application semantics")
+}
+
+// TestShaperE2E_LargePayload_Async exercises the async pacer end-to-end on a
+// 1 MiB payload through the chrome_browsing preset. The point is to verify
+// byte-for-byte recovery on a payload large enough to drive several queue
+// fills + adaptive-throttle cycles, not just a one-shot Wrap/Unwrap.
+func TestShaperE2E_LargePayload_Async(t *testing.T) {
+	t.Parallel()
+	clientShaper := newPresetShaper(t, presets.PresetChromeBrowsing, 11)
+	serverShaper := newPresetShaper(t, presets.PresetChromeBrowsing, 22)
+	client, server, cleanup := pairedMorphedConns(t, clientShaper, serverShaper)
+	defer cleanup()
+
+	const N = 1 << 20 // 1 MiB
+	rng := rand.New(rand.NewPCG(0xA1B2C3D4, 0x55555555))
+	want := make([]byte, N)
+	for i := range want {
+		want[i] = byte(rng.UintN(256))
+	}
+
+	var (
+		writeErr error
+		wg       sync.WaitGroup
+	)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, writeErr = client.Write(want)
+		_ = client.Close()
+	}()
+
+	got, readErr := readAll(server, N, 60*time.Second)
+	wg.Wait()
+	if writeErr != nil {
+		t.Fatalf("client write: %v", writeErr)
+	}
+	if readErr != nil && readErr != io.EOF {
+		t.Fatalf("server read: %v", readErr)
+	}
+	if !bytes.Equal(got[:N], want) {
+		t.Fatalf("large-payload roundtrip mismatch at %d bytes", len(got))
+	}
+}
+
+// TestShaperE2E_OverflowGraceful checks the overflow contract end-to-end:
+// when the server stops reading (simulated by never starting a reader and
+// letting net.Pipe block the pacer's Conn.Write), the client's Write must
+// eventually return ErrShaperOverflow rather than hanging. This is the
+// behavioural guarantee that lets the upper TUN layer fail fast instead of
+// piling up forever.
+func TestShaperE2E_OverflowGraceful(t *testing.T) {
+	t.Parallel()
+	if testing.Short() {
+		t.Skip("uses 1s+ wallclock for the overflow timer")
+	}
+	clientShaper := newPresetShaper(t, presets.PresetChromeBrowsing, 33)
+	serverShaper := newPresetShaper(t, presets.PresetChromeBrowsing, 44)
+	client, _, cleanup := pairedMorphedConns(t, clientShaper, serverShaper)
+	defer cleanup()
+
+	// Server side intentionally never reads. net.Pipe is unbuffered, so the
+	// pacer's first Conn.Write blocks forever; producer Writes fill the
+	// queue and eventually trip the 1s enqueue timeout.
+	payload := make([]byte, 4*1024*1024) // 4 MiB — far more than queue cap
+
+	start := time.Now()
+	_, err := client.Write(payload)
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, strategy.ErrShaperOverflow) {
+		t.Fatalf("got err=%v, want ErrShaperOverflow (after %v)", err, elapsed)
+	}
+	// Sanity: must surface within ~enqueueTimeout + a little, not minutes.
+	if elapsed > 5*time.Second {
+		t.Fatalf("Write took %v to return overflow; expected ~1s", elapsed)
+	}
 }
 
 func readAll(r io.Reader, n int, timeout time.Duration) ([]byte, error) {

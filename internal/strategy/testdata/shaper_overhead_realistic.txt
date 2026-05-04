@@ -1,0 +1,44 @@
+goos: linux
+goarch: amd64
+pkg: github.com/tiredvpn/tiredvpn/internal/strategy
+cpu: 13th Gen Intel(R) Core(TM) i7-1370P
+# Workload: 16 MiB single payload, server-side TCP loopback drainer, kernel
+# default send/recv buffers, async pacer enabled. Producer waits for the
+# server to drain its committed bytes each iteration so timed work covers
+# the full enqueue → wire → kernel-buffer → application path, not just the
+# enqueue handoff.
+BenchmarkRealistic_Noop-20                	       5	  31307741 ns/op	 535.88 MB/s	50274403 B/op	       6 allocs/op
+BenchmarkRealistic_Chrome_Async-20        	       5	 309922432 ns/op	  54.13 MB/s	72812126 B/op	  247071 allocs/op
+BenchmarkRealistic_Youtube_Async-20       	       5	1296364971 ns/op	  12.94 MB/s	94019756 B/op	  679751 allocs/op
+BenchmarkRealistic_RandomPerSession-20    	       5	1256263303 ns/op	  13.35 MB/s	93574827 B/op	  675503 allocs/op
+PASS
+ok  	github.com/tiredvpn/tiredvpn/internal/strategy	14.565s
+
+# Notes
+#
+# Acceptance bar from issue #18 / ADR-shaper-perf §2: ≤ 30 % overhead vs
+# Noop on bulk transfers. Computed against the Noop loopback baseline of
+# 535.88 MB/s above:
+#
+#   chrome_browsing : 54.13 MB/s → overhead = 1 - 54.13/535.88 = 89.9 %
+#   youtube_streaming: 12.94 MB/s → overhead = 97.6 %
+#   random_per_session: 13.35 MB/s → overhead = 97.5 %
+#
+# The async pacer fix (PR #20) lifted chrome from 1.75 MB/s (sync, net.Pipe)
+# to 74 MB/s (async, net.Pipe) and now 54 MB/s (async, real TCP) — a 31×
+# improvement in the deployment regime. But the 30 % overhead target is
+# not met on any preset.
+#
+# Why the headline target is missed: per-frame allocations dominate. At
+# chrome_browsing's mean ~600 B frame size a 16 MiB payload generates
+# ~28 000 frames, each going through buildFrame + Wrap + len-prefix +
+# rate-limit checks (~250 k allocs / 70 MB allocated, see allocs above).
+# That is independent of how clever the pacer is — it's structural cost in
+# the framing layer. youtube_streaming makes it worse: ~120 B avg frame, so
+# ~140 k frames per 16 MiB.
+#
+# Conclusion: this verification establishes that PR #19 + PR #20 fixed the
+# producer-side time.Sleep stall (the root cause of issue #18 as filed), but
+# bulk throughput remains framing-bound. A separate follow-up — reducing
+# per-frame allocs and/or coalescing multiple frames into a single Conn.Write
+# — would be needed to reach 30 %. See shaper_perf_summary.md.
