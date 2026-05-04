@@ -1,0 +1,78 @@
+# Shaper overhead: receiver-side allocations eliminated (issue tiredvpn-oss-8nl).
+#
+# Measurement is BenchmarkRealistic_* over loopback TCP, 16 MiB payloads,
+# Go 1.23+, -benchtime=3s.
+#
+# Hardware: 13th Gen Intel(R) Core(TM) i7-1370P, linux/amd64, 20 logical CPUs.
+#
+# This run isolates the effect of removing per-frame allocations on the
+# receiver side:
+#  - readShaped header buffer is now a 6-byte stack array (was make([]byte, 6)).
+#  - readShaped padding-discard buffer is a per-MorphedConn scratch slice,
+#    lazily MTU-sized, reused across frames (was make([]byte, paddingLen)).
+#  - readShaped payload buffer is acquired from the bucketed packet pool used
+#    by the legacy noop path (was make([]byte, totalPayload)).
+#  - distShaper exposes a new UnwrapInto(out, frames) fast path that decodes
+#    directly into a caller-provided buffer; readShaped uses it via type
+#    assertion, falling back to allocating Unwrap for shapers that don't
+#    implement it (NoopShaper still works since the noop branch never enters
+#    readShaped — isNoopShaper short-circuits in MorphedConn.Read).
+#
+# Baseline (post-PR #25, wrap-pooled):
+#   BenchmarkRealistic_Noop-20            201   16093088 ns/op  1042.51 MB/s    50274407 B/op       4 allocs/op
+#   BenchmarkRealistic_Chrome_Async-20     36   96637308 ns/op   173.61 MB/s    49019993 B/op  157717 allocs/op
+#   BenchmarkRealistic_Chrome_Async_Coal.- 36   93504141 ns/op   179.43 MB/s    47707635 B/op  156064 allocs/op
+#
+# After this change (receiver-no-alloc):
+goos: linux
+goarch: amd64
+pkg: github.com/tiredvpn/tiredvpn/internal/strategy
+cpu: 13th Gen Intel(R) Core(TM) i7-1370P
+BenchmarkRealistic_Noop-20                      	     210	  16397710 ns/op	1023.14 MB/s	50274405 B/op	       4 allocs/op
+BenchmarkRealistic_Chrome_Async-20              	      39	  87547584 ns/op	 191.64 MB/s	 5819041 B/op	  127059 allocs/op
+BenchmarkRealistic_Chrome_Async_Coalesced-20    	      45	  87676801 ns/op	 191.35 MB/s	 4542666 B/op	  125576 allocs/op
+#
+# Headline deltas (chrome async):
+#   bytes/op:  49019993 → 5819041   (−88.1 %, ~8.4× reduction)
+#   allocs/op:    157717 → 127059   (−19.4 %, ~−30k allocs)
+#   MB/s:         173.61 → 191.64   (+10.4 %)
+#   ns/op:      96637308 → 87547584 (−9.4 %)
+#
+# % overhead vs Noop after this change:
+#   1 - 191.64 / 1023.14 ≈ 81.3 % overhead (was 83.4 %).
+#
+# Targets vs achieved (issue 8nl acceptance bar):
+#   chrome throughput ≥ 350 MB/s          → NOT met (191 MB/s).
+#   allocs/op ≤ 80k                       → NOT met (127k).
+#   bytes/op reduction                    → vastly exceeded (8.4× reduction).
+#
+# Where remaining allocations live (go tool pprof -alloc_objects after change):
+#   - 4× allocs/frame (≈ 28k frames × 4.5 = 127k) live in:
+#     1. writePacer enqueue path: pacedFrame{packet, bucket} struct heap-
+#        escapes via channel send (~28k allocs/run).
+#     2. distShaper.Wrap on the sender: even with the wrap-pool, each frame
+#        produces one *[]byte handle slot in the wrapHandles slice when it
+#        grows past the previous high-water mark (~28k allocs first run,
+#        amortised after).
+#     3. mc.readBuf = append(mc.readBuf, ...) when the destination Read
+#        buffer is smaller than the frame payload — this is rare with the
+#        64KiB drain buffer in the bench but still measurable.
+#     4. sync.Pool internal per-P bookkeeping under -race adds a small
+#        constant per acquire/release pair.
+#
+# Why throughput didn't reach the 350 MB/s target despite the alloc cleanup:
+#   The receiver allocation profile is no longer the dominant cost. CPU is
+#   now spent on:
+#     - pacer goroutine scheduling + channel ops (~30 % of receiver-side time);
+#     - writev syscall + io.ReadFull on the loopback socket;
+#     - per-frame distribution sampling (NextPacketSize) on the sender.
+#   The next throughput lever is reducing the goroutine handoff cost (e.g.
+#   merging the pacer into the writer goroutine when burst budget is empty).
+#   That is out of scope for this task and tracked separately.
+#
+# Test plan executed:
+#   - go build ./... — clean.
+#   - go test -race ./... — 634 tests pass.
+#   - golangci-lint run ./internal/shaper/... — no issues found.
+#   - golangci-lint run ./internal/strategy/... — no NEW issues from this
+#     change (pre-existing errcheck/unused warnings on unrelated files).
