@@ -1,0 +1,12 @@
+[32mINF[0m 11:23:19.365 kTLS: kernel TLS support detected, will offload encryption
+goos: linux
+goarch: amd64
+pkg: github.com/tiredvpn/tiredvpn/internal/strategy
+cpu: 13th Gen Intel(R) Core(TM) i7-1370P
+BenchmarkMorphedConn_NoopShaper-20             	   50427	     72192 ns/op	 907.80 MB/s	  196620 B/op	       4 allocs/op
+BenchmarkMorphedConn_ChromeShaper-20           	    3976	    882786 ns/op	  74.24 MB/s	  270565 B/op	     879 allocs/op
+BenchmarkMorphedConn_YoutubeShaper-20          	     543	   6611748 ns/op	   9.91 MB/s	  321975 B/op	    2358 allocs/op
+BenchmarkMorphedConn_ChromeShaper_Async-20     	    4038	    885892 ns/op	  73.98 MB/s	  271029 B/op	     886 allocs/op
+BenchmarkMorphedConn_YoutubeShaper_Async-20    	     534	   6693739 ns/op	   9.79 MB/s	  320659 B/op	    2342 allocs/op
+PASS
+ok  	github.com/tiredvpn/tiredvpn/internal/strategy	17.911s

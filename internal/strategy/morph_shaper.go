@@ -2,7 +2,6 @@ package strategy
 
 import (
 	"io"
-	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/config/toml"
 	"github.com/tiredvpn/tiredvpn/internal/shaper"
@@ -23,16 +22,27 @@ func isNoopShaper(sh shaper.Shaper) bool {
 	return false
 }
 
+// ensurePacer lazily starts the async write pacer for this connection.
+// Idempotent and safe to call from any goroutine.
+func (mc *MorphedConn) ensurePacer() {
+	mc.pacerOnce.Do(func() {
+		mc.pacer = newWritePacer(mc.Conn, mc.shaper)
+	})
+}
+
 // writeShaped emits one or more frames per Write according to the shaper's
-// Wrap/NextPacketSize/NextDelay decisions. Inter-frame spacing is enforced
-// with time.Sleep — simpler than a ticker and good enough for the typical
-// sub-millisecond budgets the shaper produces.
+// Wrap/NextPacketSize decisions. Inter-frame spacing and Conn.Write are
+// delegated to a per-connection pacer goroutine so the producer never
+// blocks on time.Sleep at sub-tick granularity (see adr-shaper-perf.md).
 func (mc *MorphedConn) writeShaped(p []byte) (int, error) {
+	mc.ensurePacer()
+
 	frames := mc.shaper.Wrap(p)
 	if len(frames) == 0 {
 		return len(p), nil
 	}
-	for i, frame := range frames {
+
+	for _, frame := range frames {
 		target := mc.shaper.NextPacketSize(shaper.DirectionUp)
 		padLen := target - len(frame) - morphHeaderLen
 		if padLen < 0 {
@@ -43,11 +53,7 @@ func (mc *MorphedConn) writeShaped(p []byte) (int, error) {
 		if mc.rateLimiter != nil {
 			mc.rateLimiter.Wait(len(packet))
 		}
-		_, err := mc.Conn.Write(packet)
-		if fromPool {
-			packetPool.Put(packet[:cap(packet)])
-		}
-		if err != nil {
+		if err := mc.pacer.enqueue(pacedFrame{packet: packet, fromPool: fromPool}); err != nil {
 			if mc.rateLimiter != nil {
 				mc.rateLimiter.RecordFailure()
 			}
@@ -58,10 +64,6 @@ func (mc *MorphedConn) writeShaped(p []byte) (int, error) {
 		}
 		mc.packetsSent++
 		mc.bytesSent += int64(len(packet))
-
-		if d := mc.shaper.NextDelay(shaper.DirectionUp); d > 0 && i < len(frames)-1 {
-			time.Sleep(d)
-		}
 	}
 	return len(p), nil
 }
