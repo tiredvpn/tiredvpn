@@ -99,9 +99,10 @@ func TestPacer_OverflowReturnsError(t *testing.T) {
 	p := newWritePacer(c, &constShaper{delay: 0, size: 1})
 
 	frame := []byte{0}
-	// Fill: one frame is in-flight (pacer goroutine blocked on Write) plus
-	// pacerQueueCap in the channel.
-	for range pacerQueueCap + 1 {
+	// Fill: pacerQueueCap in the channel plus up to maxCoalesceFrames the
+	// pacer goroutine has pulled into its local writev vector while blocked
+	// on the gated Conn.Write.
+	for range pacerQueueCap + maxCoalesceFrames {
 		if err := p.enqueue(pacedFrame{packet: frame, bucket: -1}); err != nil {
 			t.Fatalf("fill: %v", err)
 		}
