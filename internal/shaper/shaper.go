@@ -36,6 +36,13 @@ type Shaper interface {
 	// original payload.
 	Wrap(payload []byte) [][]byte
 
+	// Release hands the slice headers and underlying buffers returned by Wrap
+	// back to the implementation for reuse. Callers MUST stop touching the
+	// frames before calling Release. Implementations that do not pool buffers
+	// (e.g. NoopShaper) treat Release as a no-op. Calling Release on a nil or
+	// empty slice is always safe.
+	Release(frames [][]byte)
+
 	// Unwrap reassembles frames produced by Wrap (possibly across calls) into
 	// the original payload bytes.
 	Unwrap(frames [][]byte) []byte

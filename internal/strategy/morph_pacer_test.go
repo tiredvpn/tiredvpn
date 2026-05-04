@@ -72,6 +72,7 @@ type constShaper struct {
 func (s *constShaper) NextPacketSize(_ shaper.Direction) int      { return s.size }
 func (s *constShaper) NextDelay(_ shaper.Direction) time.Duration { return s.delay }
 func (s *constShaper) Wrap(p []byte) [][]byte                     { return [][]byte{p} }
+func (s *constShaper) Release(_ [][]byte)                          {}
 func (s *constShaper) Unwrap(f [][]byte) []byte {
 	out := []byte{}
 	for _, x := range f {
@@ -368,6 +369,7 @@ func (s *fragShaper) Wrap(p []byte) [][]byte {
 	}
 	return out
 }
+func (s *fragShaper) Release(_ [][]byte) {}
 func (s *fragShaper) Unwrap(f [][]byte) []byte {
 	out := []byte{}
 	for _, x := range f {
