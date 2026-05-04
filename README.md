@@ -29,11 +29,11 @@ This makes it effective against sophisticated filtering systems like TSPU
 
 Key design goals:
 
-- **Resilience** -- no single point of failure; if one strategy is blocked,
+- **Resilience** - no single point of failure; if one strategy is blocked,
   the client seamlessly switches to another.
-- **Stealth** -- traffic patterns are morphed to resemble legitimate services
+- **Stealth** - traffic patterns are morphed to resemble legitimate services
   (video streaming, CDN traffic, HTTPS browsing).
-- **Performance** -- multiplexed connections via smux, QUIC transport, and
+- **Performance** - multiplexed connections via smux, QUIC transport, and
   adaptive RTT masking minimize overhead.
 
 ---
@@ -42,10 +42,10 @@ Key design goals:
 
 - **20+ DPI bypass strategies** with automatic selection and mid-session fallback
 - **QUIC and TLS transports** with Salamander padding and SNI fragmentation
-- **REALITY protocol** -- impersonates legitimate websites with near-perfect TLS fingerprints
-- **HTTP/2 steganography** -- hides tunnel data inside real HTTP/2 frames
-- **Traffic morphing** -- statistically matches traffic patterns of popular services
-- **Geneva engine** -- country-specific packet manipulation rules (Russia, China, Iran, Turkey)
+- **REALITY protocol** - impersonates legitimate websites with near-perfect TLS fingerprints
+- **HTTP/2 steganography** - hides tunnel data inside real HTTP/2 frames
+- **Traffic morphing** - statistically matches traffic patterns of popular services
+- **Geneva engine** - country-specific packet manipulation rules (Russia, China, Iran, Turkey)
 - **Multiplexed connections** via smux for efficient stream management
 - **TUN mode** for full system traffic tunneling
 - **SOCKS5 and HTTP proxy** modes
@@ -363,11 +363,11 @@ best transport. Each strategy targets a different aspect of DPI evasion.
 
 The strategy engine supports:
 
-- **Automatic probing** -- tests all available strategies and ranks by latency
-- **Circuit breakers** -- disables failing strategies after configurable threshold
-- **Mid-session fallback** -- switches strategy without dropping the connection
-- **Periodic re-probing** -- re-evaluates blocked strategies on a timer
-- **Benchmarking** -- `tiredvpn client -benchmark` to test all strategies
+- **Automatic probing** - tests all available strategies and ranks by latency
+- **Circuit breakers** - disables failing strategies after configurable threshold
+- **Mid-session fallback** - switches strategy without dropping the connection
+- **Periodic re-probing** - re-evaluates blocked strategies on a timer
+- **Benchmarking** - `tiredvpn client -benchmark` to test all strategies
 
 ---
 
