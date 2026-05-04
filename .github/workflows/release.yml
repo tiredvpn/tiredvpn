@@ -86,7 +86,7 @@ jobs:
           GOOS: linux
           GOARCH: amd64
         run: |
-          go build -ldflags="-s -w" -o tiredvpn-linux-amd64 ./cmd/tiredvpn/
+          go build -ldflags="-s -w -X main.version=${GITHUB_REF_NAME#v}" -o tiredvpn-linux-amd64 ./cmd/tiredvpn/
           tar -czf tiredvpn-linux-amd64.tar.gz tiredvpn-linux-amd64
 
       - name: Build linux/arm64
@@ -94,7 +94,7 @@ jobs:
           GOOS: linux
           GOARCH: arm64
         run: |
-          go build -ldflags="-s -w" -o tiredvpn-linux-arm64 ./cmd/tiredvpn/
+          go build -ldflags="-s -w -X main.version=${GITHUB_REF_NAME#v}" -o tiredvpn-linux-arm64 ./cmd/tiredvpn/
           tar -czf tiredvpn-linux-arm64.tar.gz tiredvpn-linux-arm64
 
       - name: Generate checksums

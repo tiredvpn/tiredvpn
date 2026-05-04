@@ -216,6 +216,12 @@ type Config struct {
 	ListenAddrV6 string // "[::]:995"
 	EnableIPv6   bool   // default: true
 	DualStack    bool   // default: true
+
+	// Shaper, when non-nil, is built from TOML [shaper]. The server-side
+	// pipeline does not yet consume it — server morph processing lives
+	// outside internal/strategy.MorphedConn — so this field is reserved for
+	// future wiring. Stored to keep the TOML round-trip honest.
+	Shaper any
 }
 
 // serverContext holds runtime context for multi-client mode

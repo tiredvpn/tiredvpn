@@ -20,6 +20,7 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/pool"
 	"github.com/tiredvpn/tiredvpn/internal/porthopping"
+	"github.com/tiredvpn/tiredvpn/internal/shaper"
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
 	"github.com/tiredvpn/tiredvpn/internal/tun"
 )
@@ -103,6 +104,10 @@ type Config struct {
 	PortHopInterval    time.Duration // Hop interval (default: 60s)
 	PortHopStrategy    string        // Strategy: random, sequential, fibonacci
 	PortHopSeed        string        // Seed for deterministic hopping (optional)
+
+	// Shaper, when non-nil, is forwarded to the strategy manager and drives
+	// MorphedConn behaviour. Built from TOML [shaper] in cmd/tiredvpn.
+	Shaper shaper.Shaper
 }
 
 // Run starts the client with the given configuration
@@ -236,6 +241,7 @@ func buildManager(cfg *Config, secret string) (*strategy.Manager, error) {
 		PQServerKemPubB64:  cfg.PQServerKemPubB64,
 		AndroidMode:        cfg.AndroidMode,
 		PortHopping:        portHoppingCfg,
+		Shaper:             cfg.Shaper,
 	}
 	mgr := strategy.NewDefaultManager(mgrCfg)
 
