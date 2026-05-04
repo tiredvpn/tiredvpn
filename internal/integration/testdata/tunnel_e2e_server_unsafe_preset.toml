@@ -1,0 +1,23 @@
+# Server config that requests a cover-traffic preset (bittorrent_idle).
+# Used by TestTunnelE2E_ConfigDrivenShaperGate to verify that
+# presets.FromConfig refuses non-DataPlaneSafe profiles loaded from TOML.
+[listen]
+address = "127.0.0.1"
+port = 1
+
+[strategy]
+mode = "morph"
+
+[shaper]
+preset = "bittorrent_idle"
+seed = 42
+
+[tls]
+cert_file = "unused.pem"
+key_file = "unused.key"
+
+[auth]
+mode = "none"
+
+[logging]
+level = "error"

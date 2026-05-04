@@ -1,0 +1,17 @@
+# Client config used by TestTunnelE2E. Port is a placeholder; the test
+# overwrites Server.Port with the ephemeral port chosen by net.Listen.
+[server]
+address = "127.0.0.1"
+port = 1
+
+[strategy]
+mode = "morph"
+
+[shaper]
+preset = "chrome_browsing"
+seed = 42
+
+[tls]
+
+[logging]
+level = "error"
