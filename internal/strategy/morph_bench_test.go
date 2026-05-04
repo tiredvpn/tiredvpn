@@ -89,3 +89,16 @@ func BenchmarkMorphedConn_ChromeShaper(b *testing.B) {
 func BenchmarkMorphedConn_YoutubeShaper(b *testing.B) {
 	runShaperBench(b, mustPresetShaper(b, presets.PresetYouTubeStreaming), mustPresetShaper(b, presets.PresetYouTubeStreaming))
 }
+
+// The *_Async variants exercise the same shaper presets but exist as
+// distinct entries so before/after comparisons via benchstat read cleanly
+// after the async pacer landed. The shaper code path is identical to the
+// non-async benchmarks above; the suffix only marks the post-pacer baseline
+// recorded in testdata/shaper_overhead_async.txt.
+func BenchmarkMorphedConn_ChromeShaper_Async(b *testing.B) {
+	runShaperBench(b, mustPresetShaper(b, presets.PresetChromeBrowsing), mustPresetShaper(b, presets.PresetChromeBrowsing))
+}
+
+func BenchmarkMorphedConn_YoutubeShaper_Async(b *testing.B) {
+	runShaperBench(b, mustPresetShaper(b, presets.PresetYouTubeStreaming), mustPresetShaper(b, presets.PresetYouTubeStreaming))
+}

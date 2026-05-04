@@ -331,6 +331,13 @@ type MorphedConn struct {
 
 	// Rate limiting for TSPU evasion
 	rateLimiter *evasion.AdaptiveRateLimiter
+
+	// pacer drains shaped frames asynchronously so the producer Write
+	// never blocks on per-frame time.Sleep. Lazy-initialised via pacerOnce
+	// on the first shaped Write; nil while the connection only sees
+	// NoopShaper traffic.
+	pacer     *writePacer
+	pacerOnce sync.Once
 }
 
 // NetConn returns the underlying net.Conn for TCP optimization
@@ -641,8 +648,13 @@ func (mc *MorphedConn) Read(p []byte) (int, error) {
 	return copied, nil
 }
 
-// Close closes the underlying connection.
+// Close closes the underlying connection. If the async shaped-write pacer
+// has been started, it is stopped first so its drain timeout has a chance
+// to flush queued frames before the socket goes away.
 func (mc *MorphedConn) Close() error {
+	if mc.pacer != nil {
+		mc.pacer.close()
+	}
 	return mc.Conn.Close()
 }
 
