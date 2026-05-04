@@ -87,7 +87,7 @@ func TestPacer_BasicFlow(t *testing.T) {
 	const N = 100
 	for i := range N {
 		buf := []byte{byte(i)}
-		if err := p.enqueue(pacedFrame{packet: buf}); err != nil {
+		if err := p.enqueue(pacedFrame{packet: buf, bucket: -1}); err != nil {
 			t.Fatalf("enqueue %d: %v", i, err)
 		}
 	}
@@ -112,7 +112,7 @@ func TestPacer_SleepCoalescing(t *testing.T) {
 	const N = 100
 	start := time.Now()
 	for range N {
-		if err := p.enqueue(pacedFrame{packet: []byte{0}}); err != nil {
+		if err := p.enqueue(pacedFrame{packet: []byte{0}, bucket: -1}); err != nil {
 			t.Fatalf("enqueue: %v", err)
 		}
 	}
@@ -144,7 +144,7 @@ func TestPacer_AdaptiveThrottle(t *testing.T) {
 	const N = 200
 	start := time.Now()
 	for range N {
-		if err := p.enqueue(pacedFrame{packet: []byte{0}}); err != nil {
+		if err := p.enqueue(pacedFrame{packet: []byte{0}, bucket: -1}); err != nil {
 			t.Fatalf("enqueue: %v", err)
 		}
 	}
@@ -166,7 +166,7 @@ func TestPacer_AdaptiveThrottle(t *testing.T) {
 func TestPacer_MaxDelayCap(t *testing.T) {
 	c := &countingConn{}
 	p := newWritePacer(c, &constShaper{delay: 1 * time.Second})
-	if err := p.enqueue(pacedFrame{packet: []byte{1}}); err != nil {
+	if err := p.enqueue(pacedFrame{packet: []byte{1}, bucket: -1}); err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
 	// Wait for the first write to land, then enqueue a second; the pacer
@@ -179,7 +179,7 @@ func TestPacer_MaxDelayCap(t *testing.T) {
 		t.Fatalf("first write never observed")
 	}
 	start := time.Now()
-	if err := p.enqueue(pacedFrame{packet: []byte{2}}); err != nil {
+	if err := p.enqueue(pacedFrame{packet: []byte{2}, bucket: -1}); err != nil {
 		t.Fatalf("enqueue 2: %v", err)
 	}
 	for c.Writes() < 2 && time.Since(start) < 200*time.Millisecond {
@@ -201,14 +201,14 @@ func TestPacer_BackpressureBlocking(t *testing.T) {
 	p := newWritePacer(c, &constShaper{delay: 0})
 	// Fill the queue. One frame is in-flight (blocked on Write), 256 in queue.
 	for range pacerQueueCap + 1 {
-		if err := p.enqueue(pacedFrame{packet: []byte{0}}); err != nil {
+		if err := p.enqueue(pacedFrame{packet: []byte{0}, bucket: -1}); err != nil {
 			t.Fatalf("initial enqueue: %v", err)
 		}
 	}
 	// Next enqueue must block; do it from a goroutine.
 	done := make(chan error, 1)
 	go func() {
-		done <- p.enqueue(pacedFrame{packet: []byte{0}})
+		done <- p.enqueue(pacedFrame{packet: []byte{0}, bucket: -1})
 	}()
 	select {
 	case err := <-done:
@@ -238,12 +238,12 @@ func TestPacer_OverflowError(t *testing.T) {
 	p := newWritePacer(c, &constShaper{delay: 0})
 	// Fill in-flight + queue.
 	for range pacerQueueCap + 1 {
-		if err := p.enqueue(pacedFrame{packet: []byte{0}}); err != nil {
+		if err := p.enqueue(pacedFrame{packet: []byte{0}, bucket: -1}); err != nil {
 			t.Fatalf("fill: %v", err)
 		}
 	}
 	start := time.Now()
-	err := p.enqueue(pacedFrame{packet: []byte{0}})
+	err := p.enqueue(pacedFrame{packet: []byte{0}, bucket: -1})
 	elapsed := time.Since(start)
 	if !errors.Is(err, ErrShaperOverflow) {
 		t.Fatalf("got %v, want ErrShaperOverflow", err)
@@ -261,7 +261,7 @@ func TestPacer_Close(t *testing.T) {
 	c := &countingConn{}
 	p := newWritePacer(c, &constShaper{delay: 0})
 	for range 50 {
-		if err := p.enqueue(pacedFrame{packet: []byte{0}}); err != nil {
+		if err := p.enqueue(pacedFrame{packet: []byte{0}, bucket: -1}); err != nil {
 			t.Fatalf("enqueue: %v", err)
 		}
 	}
@@ -278,7 +278,7 @@ func TestPacer_WriteErrorPropagation(t *testing.T) {
 	c := &countingConn{}
 	c.failNext.Store(true)
 	p := newWritePacer(c, &constShaper{delay: 0})
-	if err := p.enqueue(pacedFrame{packet: []byte{0}}); err != nil {
+	if err := p.enqueue(pacedFrame{packet: []byte{0}, bucket: -1}); err != nil {
 		t.Fatalf("first enqueue: %v", err)
 	}
 	// Wait for goroutine to observe the failure.
@@ -286,7 +286,7 @@ func TestPacer_WriteErrorPropagation(t *testing.T) {
 	for p.errSeen.Load() == nil && time.Now().Before(deadline) {
 		time.Sleep(2 * time.Millisecond)
 	}
-	err := p.enqueue(pacedFrame{packet: []byte{0}})
+	err := p.enqueue(pacedFrame{packet: []byte{0}, bucket: -1})
 	if !errors.Is(err, errFakeWrite) {
 		t.Fatalf("got %v, want errFakeWrite", err)
 	}

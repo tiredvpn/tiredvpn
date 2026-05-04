@@ -48,12 +48,12 @@ func (mc *MorphedConn) writeShaped(p []byte) (int, error) {
 		if padLen < 0 {
 			padLen = 0
 		}
-		packet, fromPool := buildFrame(frame, padLen)
+		packet, bucket, _ := buildFrame(frame, padLen)
 
 		if mc.rateLimiter != nil {
 			mc.rateLimiter.Wait(len(packet))
 		}
-		if err := mc.pacer.enqueue(pacedFrame{packet: packet, fromPool: fromPool}); err != nil {
+		if err := mc.pacer.enqueue(pacedFrame{packet: packet, bucket: bucket}); err != nil {
 			if mc.rateLimiter != nil {
 				mc.rateLimiter.RecordFailure()
 			}
