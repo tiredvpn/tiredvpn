@@ -1,0 +1,48 @@
+# tiredvpn server configuration
+# Run: tiredvpn-server --config /etc/tiredvpn/server.toml
+#
+# Unknown fields are rejected (strict TOML) — typos surface immediately.
+
+[listen]
+# Public-facing listen socket. 0.0.0.0 = all IPv4 interfaces.
+address = "0.0.0.0"
+port = 443
+
+[strategy]
+# TLS-mimicry transport. Must match what clients are configured to use.
+mode = "reality"
+
+# [strategy.options]
+# free-form strategy-specific options
+
+# Server-side shaping is opt-in; by default the server is shaper-agnostic
+# and follows whatever the client negotiates.
+#
+# [shaper]
+# preset = "chrome_browsing"
+# randomization_range = 0.1
+
+[tls]
+# PEM-encoded server certificate and private key.
+cert_file = "/etc/tiredvpn/server.crt"
+key_file  = "/etc/tiredvpn/server.key"
+
+# ALPN advertised by the listener.
+alpn = ["h2", "http/1.1"]
+
+# Optional mTLS — require clients to present a cert signed by this CA.
+# client_ca_file = "/etc/tiredvpn/clients.pem"
+
+[auth]
+# Authentication mode. Typical: "token".
+mode = "token"
+
+# Either inline `tokens` or `tokens_file` (one per line). Use the file form
+# in production so secrets aren't baked into the config.
+tokens_file = "/etc/tiredvpn/tokens.txt"
+# tokens = ["replace-me-with-a-real-token"]
+
+[logging]
+level = "info"
+format = "json"
+output = "/var/log/tiredvpn.log"
