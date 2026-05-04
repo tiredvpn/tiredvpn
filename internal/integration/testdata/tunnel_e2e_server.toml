@@ -1,0 +1,24 @@
+# Server config used by TestTunnelE2E. The test ignores Listen.Address/Port and
+# builds its own net.Listen("tcp", "127.0.0.1:0") because Validate() forbids
+# port=0. cert_file/key_file/auth.mode are required by Validate(); the actual
+# values are unused — TLS handshake is intentionally skipped in this test.
+[listen]
+address = "127.0.0.1"
+port = 1
+
+[strategy]
+mode = "morph"
+
+[shaper]
+preset = "chrome_browsing"
+seed = 42
+
+[tls]
+cert_file = "unused.pem"
+key_file = "unused.key"
+
+[auth]
+mode = "none"
+
+[logging]
+level = "error"
