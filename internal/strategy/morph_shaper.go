@@ -39,6 +39,7 @@ func (mc *MorphedConn) writeShaped(p []byte) (int, error) {
 
 	frames := mc.shaper.Wrap(p)
 	if len(frames) == 0 {
+		mc.shaper.Release(frames)
 		return len(p), nil
 	}
 
@@ -57,6 +58,7 @@ func (mc *MorphedConn) writeShaped(p []byte) (int, error) {
 			if mc.rateLimiter != nil {
 				mc.rateLimiter.RecordFailure()
 			}
+			mc.shaper.Release(frames)
 			return 0, err
 		}
 		if mc.rateLimiter != nil {
@@ -65,6 +67,7 @@ func (mc *MorphedConn) writeShaped(p []byte) (int, error) {
 		mc.packetsSent++
 		mc.bytesSent += int64(len(packet))
 	}
+	mc.shaper.Release(frames)
 	return len(p), nil
 }
 

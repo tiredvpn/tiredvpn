@@ -96,6 +96,7 @@ func TestMorphedConn_NoopShaper_BackwardCompat(t *testing.T) {
 type mockShaper struct {
 	wrapCalls    [][]byte
 	unwrapCalls  [][][]byte
+	releaseCalls int
 	nextSize     int
 	nextDelay    time.Duration
 	fragmentInto int // split payload into N equal-ish chunks; 0 => single frame
@@ -119,6 +120,7 @@ func (m *mockShaper) Wrap(p []byte) [][]byte {
 	}
 	return out
 }
+func (m *mockShaper) Release(_ [][]byte) { m.releaseCalls++ }
 func (m *mockShaper) Unwrap(frames [][]byte) []byte {
 	m.unwrapCalls = append(m.unwrapCalls, frames)
 	total := 0
@@ -169,6 +171,31 @@ func TestMorphedConn_WithShaper_Wrap(t *testing.T) {
 	}
 	if frameCount != 3 {
 		t.Fatalf("on wire frame count = %d, want 3", frameCount)
+	}
+}
+
+// TestMorphedConn_WithShaper_ReleasesWrapBuffers checks that writeShaped
+// hands the Wrap-output back to the shaper exactly once per Write, regardless
+// of how many frames Wrap produced. This is what lets a pooled distShaper
+// reclaim its buffers after buildFrame copies them into the pacer queue.
+func TestMorphedConn_WithShaper_ReleasesWrapBuffers(t *testing.T) {
+	profile := &TrafficProfile{Name: "T", PacketSizes: []int{100}, PacketSizeProbs: []float64{1}}
+	fc := &fakeConn{}
+	ms := &mockShaper{nextSize: 64, fragmentInto: 4}
+	mc := NewMorphedConnWithShaper(fc, profile, []byte("secretsecretsecretsecretsecretse"), ms)
+
+	for range 5 {
+		if _, err := mc.Write(bytes.Repeat([]byte("Z"), 30)); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+	if err := mc.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// One Release per Write — buffers come back as soon as the for-loop
+	// inside writeShaped finishes copying frames into pacer queue entries.
+	if ms.releaseCalls != 5 {
+		t.Fatalf("Release called %d times, want 5", ms.releaseCalls)
 	}
 }
 
