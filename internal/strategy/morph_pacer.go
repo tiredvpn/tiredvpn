@@ -29,11 +29,12 @@ const (
 )
 
 // pacedFrame is a fully built [header][data][padding] packet ready for
-// Conn.Write. fromPool indicates whether the underlying buffer must be
-// returned to packetPool after the write.
+// Conn.Write. bucket is the bucketed-pool index returned by buildFrame
+// and must be passed to releasePacketBuf after the write; bucket=-1 means
+// the buffer was heap-allocated and release is a no-op.
 type pacedFrame struct {
-	packet   []byte
-	fromPool bool
+	packet []byte
+	bucket int
 }
 
 // writePacer serialises shaped writes off the producer goroutine. The
@@ -103,9 +104,7 @@ func (p *writePacer) run() {
 	var pendingDelay time.Duration
 
 	releaseFrame := func(f pacedFrame) {
-		if f.fromPool {
-			packetPool.Put(f.packet[:cap(f.packet)])
-		}
+		releasePacketBuf(f.packet, f.bucket)
 	}
 
 	for {
@@ -185,16 +184,12 @@ func (p *writePacer) drain(deadline time.Time, release func(pacedFrame)) {
 // successful handoff.
 func (p *writePacer) enqueue(frame pacedFrame) error {
 	if errp := p.errSeen.Load(); errp != nil {
-		if frame.fromPool {
-			packetPool.Put(frame.packet[:cap(frame.packet)])
-		}
+		releasePacketBuf(frame.packet, frame.bucket)
 		return *errp
 	}
 	select {
 	case <-p.done:
-		if frame.fromPool {
-			packetPool.Put(frame.packet[:cap(frame.packet)])
-		}
+		releasePacketBuf(frame.packet, frame.bucket)
 		return net.ErrClosed
 	case p.queue <- frame:
 		return nil
@@ -206,14 +201,10 @@ func (p *writePacer) enqueue(frame pacedFrame) error {
 	case p.queue <- frame:
 		return nil
 	case <-p.done:
-		if frame.fromPool {
-			packetPool.Put(frame.packet[:cap(frame.packet)])
-		}
+		releasePacketBuf(frame.packet, frame.bucket)
 		return net.ErrClosed
 	case <-timer.C:
-		if frame.fromPool {
-			packetPool.Put(frame.packet[:cap(frame.packet)])
-		}
+		releasePacketBuf(frame.packet, frame.bucket)
 		return ErrShaperOverflow
 	}
 }
