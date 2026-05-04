@@ -44,11 +44,11 @@ func TestByName_Unknown(t *testing.T) {
 func TestByName_AllPresets_Determinism(t *testing.T) {
 	for _, name := range List() {
 		t.Run(name, func(t *testing.T) {
-			a, err := ByName(name, 42)
+			a, err := ByNameAllowAny(name, 42)
 			if err != nil {
 				t.Fatal(err)
 			}
-			b, err := ByName(name, 42)
+			b, err := ByNameAllowAny(name, 42)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -241,7 +241,7 @@ func TestDistShaper_NextPacketSize_RespectsMTU(t *testing.T) {
 		PresetChromeBrowsing, PresetYouTubeStreaming,
 		PresetBitTorrentIdle, PresetRandomPerSession,
 	} {
-		s, err := ByName(name, 5)
+		s, err := ByNameAllowAny(name, 5)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -256,7 +256,7 @@ func TestDistShaper_NextPacketSize_RespectsMTU(t *testing.T) {
 
 func TestDistShaper_NextDelay_NonNegative(t *testing.T) {
 	for _, name := range List() {
-		s, err := ByName(name, 11)
+		s, err := ByNameAllowAny(name, 11)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -411,7 +411,98 @@ func TestRegister_DuplicatePanics(t *testing.T) {
 			t.Fatal("expected panic on duplicate register")
 		}
 	}()
-	register(PresetChromeBrowsing, buildChromeBrowsing)
+	register(PresetChromeBrowsing, true, buildChromeBrowsing)
+}
+
+func TestIsDataPlaneSafe_Known(t *testing.T) {
+	cases := []struct {
+		name string
+		want bool
+	}{
+		{PresetChromeBrowsing, true},
+		{PresetYouTubeStreaming, true},
+		{PresetRandomPerSession, true},
+		{PresetBitTorrentIdle, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := IsDataPlaneSafe(tc.name)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("IsDataPlaneSafe(%q) = %v, want %v", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIsDataPlaneSafe_Unknown(t *testing.T) {
+	_, err := IsDataPlaneSafe("does_not_exist")
+	if !errors.Is(err, ErrUnknownPreset) {
+		t.Fatalf("want ErrUnknownPreset, got %v", err)
+	}
+}
+
+func TestByName_RejectsUnsafePresetForDataPlane(t *testing.T) {
+	_, err := ByName(PresetBitTorrentIdle, 1)
+	if !errors.Is(err, ErrPresetNotDataPlaneSafe) {
+		t.Fatalf("want ErrPresetNotDataPlaneSafe, got %v", err)
+	}
+}
+
+func TestByNameAllowAny_AcceptsAll(t *testing.T) {
+	for _, name := range List() {
+		t.Run(name, func(t *testing.T) {
+			s, err := ByNameAllowAny(name, 3)
+			if err != nil {
+				t.Fatalf("ByNameAllowAny(%q): %v", name, err)
+			}
+			if s == nil {
+				t.Fatalf("ByNameAllowAny(%q): nil shaper", name)
+			}
+		})
+	}
+}
+
+func TestByNameAllowAny_Unknown(t *testing.T) {
+	_, err := ByNameAllowAny("does_not_exist", 1)
+	if !errors.Is(err, ErrUnknownPreset) {
+		t.Fatalf("want ErrUnknownPreset, got %v", err)
+	}
+}
+
+func TestFromConfig_RejectsUnsafePreset(t *testing.T) {
+	cfg := toml.ShaperConfig{
+		Preset: PresetBitTorrentIdle,
+		Seed:   int64Ptr(1),
+	}
+	_, err := FromConfig(cfg)
+	if !errors.Is(err, ErrPresetNotDataPlaneSafe) {
+		t.Fatalf("want ErrPresetNotDataPlaneSafe, got %v", err)
+	}
+}
+
+// TestFromConfig_AcceptsCustomEvenIfRiskyParams verifies that user-defined
+// custom configs bypass the DataPlaneSafe gate — operators take responsibility
+// for their own parameters.
+func TestFromConfig_AcceptsCustomEvenIfRiskyParams(t *testing.T) {
+	cfg := toml.ShaperConfig{
+		Custom: &toml.ShaperCustom{
+			InterArrival: &toml.DistConfig{
+				Type:      toml.DistLogNormal,
+				LogNormal: &toml.LogNormalDist{Mu: 8.9, Sigma: 2.5},
+			},
+		},
+		Seed: int64Ptr(1),
+	}
+	s, err := FromConfig(cfg)
+	if err != nil {
+		t.Fatalf("custom must be accepted regardless of params: %v", err)
+	}
+	if s == nil {
+		t.Fatal("nil shaper")
+	}
 }
 
 func BenchmarkChromeBrowsing_Next(b *testing.B) {

@@ -8,10 +8,13 @@ import (
 )
 
 // PresetRandomPerSession is the registry name for a per-session randomized
-// preset: it picks one of {chrome_browsing, youtube_streaming, bittorrent_idle}
-// using `seed` and applies a ±randomizationFraction jitter to histogram bins
-// so that even repeated picks of the same base preset produce subtly different
-// signatures.
+// preset: it picks one of the data-plane-safe basis presets using `seed` and
+// applies a ±randomizationFraction jitter to histogram bins so that even
+// repeated picks of the same base preset produce subtly different signatures.
+//
+// Cover-traffic-only presets (e.g. bittorrent_idle) are intentionally excluded
+// from the candidate set so that random_per_session itself stays
+// data-plane-safe.
 const PresetRandomPerSession = "random_per_session"
 
 // randomizationFraction is the default ±jitter applied to histogram bins
@@ -20,7 +23,7 @@ const PresetRandomPerSession = "random_per_session"
 const randomizationFraction = 0.15
 
 func init() {
-	register(PresetRandomPerSession, buildRandomPerSession)
+	register(PresetRandomPerSession, true, buildRandomPerSession)
 }
 
 // buildRandomPerSession derives the basis preset name from `seed`, builds
@@ -31,7 +34,6 @@ func buildRandomPerSession(seed int64) (shaper.Shaper, error) {
 	candidates := []string{
 		PresetChromeBrowsing,
 		PresetYouTubeStreaming,
-		PresetBitTorrentIdle,
 	}
 	// Use a dedicated PCG stream to choose the basis preset so that the choice
 	// is independent of the underlying preset's RNG sequence.

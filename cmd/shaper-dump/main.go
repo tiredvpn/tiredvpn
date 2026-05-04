@@ -27,7 +27,9 @@ func main() {
 	out := flag.String("out", "", "output CSV path; empty = stdout")
 	flag.Parse()
 
-	sh, err := presets.ByName(*preset, *seed)
+	// Inspection tool — allow any preset so cover-traffic profiles can be
+	// dumped for analysis, not just data-plane-safe ones.
+	sh, err := presets.ByNameAllowAny(*preset, *seed)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "unknown preset %q: %v\n", *preset, err)
 		fmt.Fprintf(os.Stderr, "available: %v\n", presets.List())
