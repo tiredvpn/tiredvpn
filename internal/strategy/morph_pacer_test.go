@@ -199,8 +199,11 @@ func TestPacer_BackpressureBlocking(t *testing.T) {
 	gate := make(chan struct{})
 	c.blockWrite = gate
 	p := newWritePacer(c, &constShaper{delay: 0})
-	// Fill the queue. One frame is in-flight (blocked on Write), 256 in queue.
-	for range pacerQueueCap + 1 {
+	// Saturate: queue cap + pacer's local writev pending vector. The pacer
+	// goroutine may have pulled up to maxCoalesceFrames frames into its
+	// local net.Buffers slice while blocked on the gated Conn.Write, so the
+	// producer-visible saturation point is queue cap + maxCoalesceFrames.
+	for range pacerQueueCap + maxCoalesceFrames {
 		if err := p.enqueue(pacedFrame{packet: []byte{0}, bucket: -1}); err != nil {
 			t.Fatalf("initial enqueue: %v", err)
 		}
@@ -215,8 +218,10 @@ func TestPacer_BackpressureBlocking(t *testing.T) {
 		t.Fatalf("enqueue returned %v immediately, expected to block", err)
 	case <-time.After(50 * time.Millisecond):
 	}
-	// Release one slot; enqueue should now succeed.
-	gate <- struct{}{}
+	// Drain the gate continuously so the pacer can flush its current writev
+	// batch (up to maxCoalesceFrames buffers) and pull more from the queue,
+	// which is what unblocks the producer.
+	close(gate)
 	select {
 	case err := <-done:
 		if err != nil {
@@ -225,7 +230,6 @@ func TestPacer_BackpressureBlocking(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("enqueue did not unblock after consumer progress")
 	}
-	close(gate)
 	p.close()
 }
 
@@ -237,7 +241,7 @@ func TestPacer_OverflowError(t *testing.T) {
 	c.blockWrite = gate
 	p := newWritePacer(c, &constShaper{delay: 0})
 	// Fill in-flight + queue.
-	for range pacerQueueCap + 1 {
+	for range pacerQueueCap + maxCoalesceFrames {
 		if err := p.enqueue(pacedFrame{packet: []byte{0}, bucket: -1}); err != nil {
 			t.Fatalf("fill: %v", err)
 		}
