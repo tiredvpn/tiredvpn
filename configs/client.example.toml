@@ -1,0 +1,73 @@
+# tiredvpn client configuration
+# Run: tiredvpn --config /etc/tiredvpn/client.toml
+#
+# CLI flags override these values. Unknown fields are rejected (strict TOML).
+
+[server]
+# Upstream tiredvpn endpoint to connect to.
+address = "vpn.example.org"
+port = 443
+
+[strategy]
+# TLS-mimicry transport. Options: reality, grpc, morph, ...
+mode = "reality"
+
+# Optional strategy-specific options (free-form key/value).
+# [strategy.options]
+# service = "google.firestore.v1.Firestore"
+
+[shaper]
+# Behavioural traffic shaper. Use a named preset OR a [shaper.custom] block,
+# but not both. Presets are resolved by the shaper registry.
+preset = "chrome_browsing"
+
+# Optional ±N% jitter applied to distribution samples; range [0.0, 1.0).
+randomization_range = 0.1
+
+# Optional fixed seed for reproducible shaping. Omit for per-session entropy.
+# seed = 1234567890
+
+# --- Advanced: custom distributions (mutually exclusive with `preset`) ---
+# Comment out `preset` above before enabling [shaper.custom].
+#
+# [shaper.custom.packet_size]
+# type = "histogram"
+# [[shaper.custom.packet_size.histogram.bins]]
+# value = 64
+# weight = 0.2
+# [[shaper.custom.packet_size.histogram.bins]]
+# value = 1280
+# weight = 0.5
+# [[shaper.custom.packet_size.histogram.bins]]
+# value = 1500
+# weight = 0.3
+#
+# [shaper.custom.inter_arrival]
+# type = "lognormal"
+# [shaper.custom.inter_arrival.lognormal]
+# mu = -4.0
+# sigma = 1.2
+
+[tls]
+# SNI presented to the upstream — should match the cover hostname.
+server_name = "www.cloudflare.com"
+
+# uTLS fingerprint label. See strategy docs for supported values.
+fingerprint = "chrome_120"
+
+# ALPN protocols, in preference order.
+alpn = ["h2", "http/1.1"]
+
+# Pin a custom CA bundle (PEM). Omit to use system roots.
+# ca_cert = "/etc/tiredvpn/ca.pem"
+
+# Disable cert verification — for local testing only. NEVER set in production.
+# insecure_skip_verify = false
+
+[logging]
+# trace, debug, info, warn, error
+level = "info"
+# Output format: text or json.
+format = "json"
+# Destination: stderr, stdout, or a file path.
+output = "stderr"
