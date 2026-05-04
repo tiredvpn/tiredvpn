@@ -78,6 +78,30 @@ func runShaperBench(b *testing.B, clientShaper, serverShaper shaper.Shaper) {
 	<-done
 }
 
+// BenchmarkBuildFrame_BucketedPool measures the per-frame allocation cost of
+// the bucketed packet pool path. Mean frame size (~600 B) targets the chrome
+// preset distribution from shaper_overhead_realistic.txt.
+func BenchmarkBuildFrame_BucketedPool(b *testing.B) {
+	data := make([]byte, 600)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		packet, bucket, _ := strategy.ExportBuildFrame(data, 64)
+		strategy.ExportReleasePacketBuf(packet, bucket)
+	}
+}
+
+// BenchmarkBuildFrame_DirectAlloc is the no-pool baseline: every frame is a
+// fresh make([]byte, total). Used to quantify the bucketed-pool savings.
+func BenchmarkBuildFrame_DirectAlloc(b *testing.B) {
+	data := make([]byte, 600)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		_ = strategy.ExportBuildFrameDirect(data, 64)
+	}
+}
+
 func BenchmarkMorphedConn_NoopShaper(b *testing.B) {
 	runShaperBench(b, shaper.NoopShaper{}, shaper.NoopShaper{})
 }

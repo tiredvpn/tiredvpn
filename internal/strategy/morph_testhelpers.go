@@ -55,6 +55,32 @@ func NewTestMorphedConnPairTCP(profile *TrafficProfile, clientShaper, serverShap
 	return client, server, cleanup, nil
 }
 
+// ExportBuildFrame exposes buildFrame for cross-package benchmarks. It
+// allocates from the bucketed packet pool when the total frame fits a bucket,
+// otherwise falls back to make([]byte, total). Callers must release the
+// returned buffer via ExportReleasePacketBuf.
+func ExportBuildFrame(data []byte, padLen int) ([]byte, int, bool) {
+	return buildFrame(data, padLen)
+}
+
+// ExportBuildFrameDirect builds the same wire-format frame as buildFrame but
+// always allocates a fresh buffer (no pool). Used as the bench baseline.
+func ExportBuildFrameDirect(data []byte, padLen int) []byte {
+	totalLen := morphHeaderLen + len(data) + padLen
+	packet := make([]byte, totalLen)
+	writeFrameHeader(packet, len(data), padLen)
+	copy(packet[morphHeaderLen:morphHeaderLen+len(data)], data)
+	if padLen > 0 {
+		fastRandBytes(packet[morphHeaderLen+len(data):])
+	}
+	return packet
+}
+
+// ExportReleasePacketBuf wraps releasePacketBuf for cross-package benchmarks.
+func ExportReleasePacketBuf(buf []byte, bucket int) {
+	releasePacketBuf(buf, bucket)
+}
+
 // NewTestMorphedConnPair returns two MorphedConn endpoints connected via
 // net.Pipe with shapers pre-installed and the application-layer Morph
 // handshake skipped. It exists for cross-package integration tests that

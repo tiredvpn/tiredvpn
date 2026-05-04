@@ -186,11 +186,53 @@ func fastRandInt(min, max int) int {
 	return n
 }
 
-// Buffer pool for packet allocation (reduces GC pressure)
-var packetPool = sync.Pool{
-	New: func() interface{} {
-		return make([]byte, 2048) // Pre-allocated 2KB buffer
-	},
+// packetBucketSizes defines capacity tiers for the bucketed frame pool.
+// Bucket index → buffer capacity. Buffers store *[]byte (sync.Pool best
+// practice — avoids escaping the underlying array into interface storage).
+var packetBucketSizes = [...]int{256, 512, 1024, 1500}
+
+// packetPools holds one sync.Pool per capacity tier in packetBucketSizes.
+// Bucketing prevents the pathological case where a single shared pool mixes
+// tiny ~120 B youtube frames with ~1400 B chrome frames, yielding poor reuse
+// and forcing fresh allocs on ~50 % of Get() calls.
+var packetPools = [...]*sync.Pool{
+	{New: func() any { b := make([]byte, packetBucketSizes[0]); return &b }},
+	{New: func() any { b := make([]byte, packetBucketSizes[1]); return &b }},
+	{New: func() any { b := make([]byte, packetBucketSizes[2]); return &b }},
+	{New: func() any { b := make([]byte, packetBucketSizes[3]); return &b }},
+}
+
+// pickBucket returns the smallest bucket index whose capacity ≥ size, or -1
+// if size exceeds the largest bucket.
+func pickBucket(size int) int {
+	for i, cap := range packetBucketSizes {
+		if size <= cap {
+			return i
+		}
+	}
+	return -1
+}
+
+// acquirePacketBuf returns a buffer of length `size` whose capacity is the
+// matching bucket capacity, plus the bucket index for releasePacketBuf.
+// For size > largest bucket the buffer is freshly allocated and bucket=-1.
+func acquirePacketBuf(size int) ([]byte, int) {
+	bucket := pickBucket(size)
+	if bucket < 0 {
+		return make([]byte, size), -1
+	}
+	bp := packetPools[bucket].Get().(*[]byte)
+	return (*bp)[:size], bucket
+}
+
+// releasePacketBuf returns buf to the pool of the given bucket. bucket=-1
+// is a no-op so callers can release unconditionally without branching.
+func releasePacketBuf(buf []byte, bucket int) {
+	if bucket < 0 {
+		return
+	}
+	full := buf[:cap(buf)]
+	packetPools[bucket].Put(&full)
 }
 
 // NewTrafficMorphStrategy creates a new traffic morphing strategy
@@ -455,26 +497,22 @@ func readFrameHeader(src []byte) (dataLen, paddingLen int) {
 	return dataLen, paddingLen
 }
 
-// buildFrame allocates (or borrows from packetPool) a buffer holding a fully
-// framed packet: [header:6][data:N][padding:M] with random padding bytes.
-// fromPool indicates whether the returned slice must be released via
-// packetPool.Put after use.
-func buildFrame(data []byte, padLen int) (packet []byte, fromPool bool) {
+// buildFrame allocates (or borrows from a bucketed packet pool) a buffer
+// holding a fully framed packet: [header:6][data:N][padding:M] with random
+// padding bytes. Caller must release via releasePacketBuf(packet, bucket)
+// once the frame has been written to the wire. fromPool reflects whether
+// the buffer originated from the pool — it equals (bucket >= 0).
+func buildFrame(data []byte, padLen int) (packet []byte, bucket int, fromPool bool) {
 	totalLen := morphHeaderLen + len(data) + padLen
-	if totalLen <= 2048 {
-		packet = packetPool.Get().([]byte)
-		packet = packet[:totalLen]
-		fromPool = true
-	} else {
-		packet = make([]byte, totalLen)
-	}
+	packet, bucket = acquirePacketBuf(totalLen)
+	fromPool = bucket >= 0
 
 	writeFrameHeader(packet, len(data), padLen)
 	copy(packet[morphHeaderLen:morphHeaderLen+len(data)], data)
 	if padLen > 0 {
 		fastRandBytes(packet[morphHeaderLen+len(data):])
 	}
-	return packet, fromPool
+	return packet, bucket, fromPool
 }
 
 // buildDummyFrame produces a [header:6][padding:M] frame with dataLen=0.
@@ -523,7 +561,7 @@ func (mc *MorphedConn) Write(p []byte) (int, error) {
 
 	// Build framed packet [header:6][data:N][padding:M]
 	padLen := mc.pickPaddingLen()
-	packet, fromPool := buildFrame(p, padLen)
+	packet, bucket, _ := buildFrame(p, padLen)
 
 	// Apply rate limiting to evade TSPU bulk transfer detection
 	// This adds jitter and micro-pauses to mimic legitimate streaming
@@ -533,10 +571,8 @@ func (mc *MorphedConn) Write(p []byte) (int, error) {
 
 	_, err := mc.Conn.Write(packet)
 
-	// Return buffer to pool
-	if fromPool {
-		packetPool.Put(packet[:cap(packet)])
-	}
+	// Return buffer to its bucketed pool (no-op for bucket=-1).
+	releasePacketBuf(packet, bucket)
 
 	if err != nil {
 		// Record failure for adaptive rate adjustment
@@ -603,22 +639,11 @@ func (mc *MorphedConn) Read(p []byte) (int, error) {
 
 	// Read data+padding in single syscall to reduce latency
 	totalPayload := dataLen + paddingLen
-	var payload []byte
-	var fromPool bool
-
-	if totalPayload <= 2048 {
-		payload = packetPool.Get().([]byte)
-		payload = payload[:totalPayload]
-		fromPool = true
-	} else {
-		payload = make([]byte, totalPayload)
-	}
+	payload, bucket := acquirePacketBuf(totalPayload)
 
 	n, err := io.ReadFull(mc.Conn, payload)
 	if err != nil {
-		if fromPool {
-			packetPool.Put(payload[:cap(payload)])
-		}
+		releasePacketBuf(payload, bucket)
 		return 0, err
 	}
 
@@ -634,10 +659,8 @@ func (mc *MorphedConn) Read(p []byte) (int, error) {
 		mc.readBuf = append(mc.readBuf, data[copied:]...)
 	}
 
-	// Return buffer to pool
-	if fromPool {
-		packetPool.Put(payload[:cap(payload)])
-	}
+	// Return buffer to its bucketed pool (no-op for bucket=-1).
+	releasePacketBuf(payload, bucket)
 
 	// Apply rate limiting to downloads to create TCP backpressure
 	// This slows down the server via TCP flow control

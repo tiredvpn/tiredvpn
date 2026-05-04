@@ -1,0 +1,65 @@
+goos: linux
+goarch: amd64
+pkg: github.com/tiredvpn/tiredvpn/internal/strategy
+cpu: 13th Gen Intel(R) Core(TM) i7-1370P
+# Workload: identical to shaper_overhead_realistic.txt (16 MiB single payload,
+# loopback TCP, async pacer). Diff vs the previous baseline is the morph
+# packetPool migrating from a single shared 2048-byte pool to a 4-bucket
+# size-classed pool (256 / 512 / 1024 / 1500 B) holding *[]byte.
+#
+# Synthetic per-frame buildFrame:
+BenchmarkBuildFrame_BucketedPool-20       5384976  214.4 ns/op    24 B/op  1 allocs/op
+BenchmarkBuildFrame_BucketedPool-20       5931406  204.5 ns/op    24 B/op  1 allocs/op
+BenchmarkBuildFrame_BucketedPool-20       5970819  203.5 ns/op    24 B/op  1 allocs/op
+BenchmarkBuildFrame_DirectAlloc-20        2827263  404.8 ns/op   704 B/op  1 allocs/op
+BenchmarkBuildFrame_DirectAlloc-20        2926234  412.0 ns/op   704 B/op  1 allocs/op
+BenchmarkBuildFrame_DirectAlloc-20        2922726  411.9 ns/op   704 B/op  1 allocs/op
+#
+# Realistic 16 MiB transfer:
+BenchmarkRealistic_Noop-20                       61   17451280 ns/op   961.37 MB/s   50274326 B/op       4 allocs/op
+BenchmarkRealistic_Noop-20                       81   16307937 ns/op  1028.78 MB/s   50274322 B/op       4 allocs/op
+BenchmarkRealistic_Noop-20                       68   16010661 ns/op  1047.88 MB/s   50274324 B/op       4 allocs/op
+BenchmarkRealistic_Chrome_Async-20                4  301643843 ns/op    55.62 MB/s   72752578 B/op  246010 allocs/op
+BenchmarkRealistic_Chrome_Async-20                4  302136582 ns/op    55.53 MB/s   72771448 B/op  246267 allocs/op
+BenchmarkRealistic_Chrome_Async-20                4  320647734 ns/op    52.32 MB/s   72699832 B/op  245420 allocs/op
+BenchmarkRealistic_Youtube_Async-20               1 1339425554 ns/op    12.53 MB/s   93876992 B/op  677952 allocs/op
+BenchmarkRealistic_Youtube_Async-20               1 1307169021 ns/op    12.83 MB/s   93807920 B/op  677100 allocs/op
+BenchmarkRealistic_Youtube_Async-20               1 1191974846 ns/op    14.08 MB/s   94061256 B/op  680187 allocs/op
+BenchmarkRealistic_RandomPerSession-20            1 1307533152 ns/op    12.83 MB/s   93441136 B/op  674955 allocs/op
+BenchmarkRealistic_RandomPerSession-20            1 1283745357 ns/op    13.07 MB/s   93756024 B/op  678726 allocs/op
+BenchmarkRealistic_RandomPerSession-20            1 1305027506 ns/op    12.86 MB/s   93672440 B/op  677774 allocs/op
+PASS
+
+# Findings vs shaper_overhead_realistic.txt baseline
+#
+# buildFrame synthetic (chrome-mean 600 B payload, 64 B padding):
+#   bucketed     : 24  B/op,  1 alloc/op,  ~210 ns/op
+#   direct alloc : 704 B/op,  1 alloc/op,  ~410 ns/op
+#   → 96.6 % bytes/op reduction, ~2× faster per frame.
+#
+# Realistic 16 MiB chrome:
+#   baseline   : 247071 allocs/op, 72812126 B/op,  54.13 MB/s
+#   bucketed   : ~245900 allocs/op, ~72741000 B/op, ~54.5 MB/s
+#
+# Allocs/op count is essentially unchanged on the realistic bench. Reason: the
+# allocs measured here are dominated by internal/shaper/presets.distShaper.Wrap,
+# which does `make([]byte, target)` + `append(frames, ...)` per produced frame
+# (~28 k frames per 16 MiB at chrome's mean ~600 B). buildFrame contributes a
+# single `*[]byte` header per frame (24 B) with the bucketed pool — the pool
+# already had near-100 % reuse before, the win is in *bytes-allocated* (every
+# eviction now releases a 256/512/1024/1500 B buffer instead of 2048 B) and
+# in GC pressure under concurrent load, not in alloc *count*.
+#
+# Bringing realistic allocs/op down towards the 30 % target requires changing
+# the shaper Wrap path itself (e.g. caller-provided frame buffer, scratch
+# arena reused across Wrap calls). That is explicitly out of scope here —
+# Shaper.Wrap is the contract for a separate task.
+#
+# Net effect of this PR:
+#   + buildFrame allocates 96 % fewer bytes per call (synthetic).
+#   + Right-sizes pooled buffers so an evicted 120-B youtube frame buffer no
+#     longer occupies 2 KiB of resident pool memory.
+#   + No regression on realistic bulk throughput; minor (~+0.5 MB/s) gain
+#     within run-to-run noise.
+#   - Realistic allocs/op headline number unchanged: the next lever is the
+#     shaper Wrap path, not the morph packet pool.
