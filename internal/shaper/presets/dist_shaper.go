@@ -2,12 +2,17 @@ package presets
 
 import (
 	"encoding/binary"
+	"errors"
 	"sync"
 	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/shaper"
 	"github.com/tiredvpn/tiredvpn/internal/shaper/dist"
 )
+
+// errUnwrapBufferTooSmall is returned by UnwrapInto when the destination
+// buffer cannot fit the unwrapped payload.
+var errUnwrapBufferTooSmall = errors.New("dist_shaper: UnwrapInto destination too small")
 
 // wrapBufPool reuses per-frame byte slices produced by distShaper.Wrap.
 // Buffers are sized at MTU (1500) so any frame up to MTU shares a single
@@ -258,4 +263,31 @@ func (d *distShaper) Unwrap(frames [][]byte) []byte {
 		out = append(out, f[frameHeaderLen:frameHeaderLen+n]...)
 	}
 	return out
+}
+
+// UnwrapInto writes the unwrapped payload from frames into out and returns the
+// number of bytes written. Callers may pass an out slice with capacity ≥ the
+// expected payload length (an MTU-sized scratch buffer is sufficient for the
+// single-frame case used by the receiver hot path). Returns an error only if
+// the destination buffer is too small.
+func (d *distShaper) UnwrapInto(out []byte, frames [][]byte) (int, error) {
+	if len(frames) == 0 {
+		return 0, nil
+	}
+	pos := 0
+	for _, f := range frames {
+		if len(f) < frameHeaderLen {
+			continue
+		}
+		n := int(binary.LittleEndian.Uint32(f[:frameHeaderLen]))
+		if n > len(f)-frameHeaderLen {
+			n = len(f) - frameHeaderLen
+		}
+		if pos+n > len(out) {
+			return pos, errUnwrapBufferTooSmall
+		}
+		copy(out[pos:pos+n], f[frameHeaderLen:frameHeaderLen+n])
+		pos += n
+	}
+	return pos, nil
 }

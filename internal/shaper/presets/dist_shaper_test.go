@@ -88,6 +88,60 @@ func TestDistShaper_Wrap_ReusesPooledBuffers(t *testing.T) {
 	}
 }
 
+// TestDistShaper_UnwrapInto_Roundtrip verifies the in-place fast path produces
+// the same bytes as the allocating Unwrap and reports the correct length.
+func TestDistShaper_UnwrapInto_Roundtrip(t *testing.T) {
+	d := newTestDistShaper(300)
+	payload := bytes.Repeat([]byte("UVW-"), 256)
+
+	frames := d.Wrap(payload)
+	defer d.Release(frames)
+
+	out := make([]byte, len(payload))
+	n, err := d.UnwrapInto(out, frames)
+	if err != nil {
+		t.Fatalf("UnwrapInto: %v", err)
+	}
+	if n != len(payload) {
+		t.Fatalf("UnwrapInto n=%d, want %d", n, len(payload))
+	}
+	if !bytes.Equal(out[:n], payload) {
+		t.Fatalf("UnwrapInto bytes mismatch")
+	}
+}
+
+// TestDistShaper_UnwrapInto_BufferTooSmall: returns an error rather than
+// silently truncating; the bytes that did fit are still written.
+func TestDistShaper_UnwrapInto_BufferTooSmall(t *testing.T) {
+	d := newTestDistShaper(300)
+	payload := bytes.Repeat([]byte{0x55}, 1024)
+	frames := d.Wrap(payload)
+	defer d.Release(frames)
+
+	tiny := make([]byte, 100)
+	n, err := d.UnwrapInto(tiny, frames)
+	if err == nil {
+		t.Fatalf("UnwrapInto with tiny buffer: expected error, got n=%d", n)
+	}
+}
+
+// TestDistShaper_UnwrapInto_NoAllocs verifies the fast path is allocation-free
+// once the destination buffer is owned by the caller.
+func TestDistShaper_UnwrapInto_NoAllocs(t *testing.T) {
+	d := newTestDistShaper(300)
+	payload := bytes.Repeat([]byte("Z"), 600)
+	frames := d.Wrap(payload)
+	defer d.Release(frames)
+
+	out := make([]byte, 1500)
+	allocs := testing.AllocsPerRun(50, func() {
+		_, _ = d.UnwrapInto(out, frames)
+	})
+	if allocs > 0 {
+		t.Fatalf("UnwrapInto allocs/op = %.1f, want 0", allocs)
+	}
+}
+
 // TestDistShaper_EmptyPayload_Roundtrip: empty payload still produces a
 // header-only frame that Unwrap turns back into nothing.
 func TestDistShaper_EmptyPayload_Roundtrip(t *testing.T) {
