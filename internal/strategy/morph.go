@@ -365,6 +365,17 @@ type MorphedConn struct {
 	// Read buffer for partial reads
 	readBuf []byte
 
+	// readScratchBuf is a single-goroutine scratch buffer used by readShaped
+	// to absorb padding bytes from dummy frames without per-frame allocation.
+	// Lazy-initialised; sized at MTU. readShaped is invoked from a single
+	// reader goroutine per connection, so this is race-free by construction.
+	readScratchBuf []byte
+
+	// readUnwrapBuf backs the in-place UnwrapInto fast path; reused per
+	// frame so Unwrap on the receiver side does not allocate. Same single-
+	// goroutine invariant as readScratchBuf.
+	readUnwrapBuf []byte
+
 	// Statistics tracking
 	bytesSent   int64
 	bytesRecv   int64
