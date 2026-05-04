@@ -31,6 +31,10 @@ func (NoopShaper) Wrap(payload []byte) [][]byte {
 	return [][]byte{payload}
 }
 
+// Release is a no-op for the passthrough shaper because Wrap returns the
+// caller's payload slice directly without any pooled allocation.
+func (NoopShaper) Release(_ [][]byte) {}
+
 // Unwrap concatenates frames in order. A nil/empty input yields nil to keep
 // roundtrip semantics with Wrap(nil).
 func (NoopShaper) Unwrap(frames [][]byte) []byte {
