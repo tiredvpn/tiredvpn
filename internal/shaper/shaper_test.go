@@ -75,6 +75,15 @@ func TestNoopShaper_Unwrap_ConcatenatesInOrder(t *testing.T) {
 	}
 }
 
+func TestNoopShaper_Release_NoPanic(t *testing.T) {
+	s := NewNoopShaper()
+	// Nil, empty, single, multi — all must be no-ops without panicking.
+	s.Release(nil)
+	s.Release([][]byte{})
+	s.Release([][]byte{[]byte("a")})
+	s.Release([][]byte{[]byte("a"), []byte("bc")})
+}
+
 func TestNoopShaper_Unwrap_EmptyInput(t *testing.T) {
 	s := NewNoopShaper()
 	if got := s.Unwrap(nil); got != nil {

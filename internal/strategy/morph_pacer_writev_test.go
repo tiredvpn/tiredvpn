@@ -81,6 +81,7 @@ func (s *scriptedShaper) NextDelay(_ shaper.Direction) time.Duration {
 	return s.script[len(s.script)-1]
 }
 func (s *scriptedShaper) Wrap(p []byte) [][]byte { return [][]byte{p} }
+func (s *scriptedShaper) Release(_ [][]byte)     {}
 func (s *scriptedShaper) Unwrap(f [][]byte) []byte {
 	out := []byte{}
 	for _, x := range f {
