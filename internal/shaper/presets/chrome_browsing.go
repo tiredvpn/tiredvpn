@@ -29,7 +29,7 @@ const PresetChromeBrowsing = "chrome_browsing"
 //
 // No burst engine — browsing is request/response, not steady-state.
 func init() {
-	register(PresetChromeBrowsing, buildChromeBrowsing)
+	register(PresetChromeBrowsing, true, buildChromeBrowsing)
 }
 
 func buildChromeBrowsing(seed int64) (shaper.Shaper, error) {

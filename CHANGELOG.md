@@ -5,6 +5,17 @@ All notable changes to TiredVPN are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Breaking
+
+- Shaper preset `bittorrent_idle` is no longer accepted in data-plane configs (`shaper.preset = "bittorrent_idle"` returns `ErrPresetNotDataPlaneSafe`). Its ~7 s median inter-arrival is suitable for cover-traffic generation only; cover-traffic emitters must call `presets.ByNameAllowAny`. `random_per_session` now picks only from data-plane-safe basis presets.
+
+### Added
+
+- `presets.IsDataPlaneSafe(name)` accessor and `DataPlaneSafe` flag on every registered preset.
+- `presets.ByNameAllowAny` entry point for cover-traffic callers that need access to non-data-plane presets.
+
 ## [1.0.3] - 2026-04-09
 
 ### Added

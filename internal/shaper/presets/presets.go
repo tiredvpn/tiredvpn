@@ -6,6 +6,12 @@
 // driven by a single seed, so that two Shapers built with the same name and
 // seed reproduce the same packet/delay sequence — a property exercised by
 // tests and required by the Hybrid handshake design (see ADR shaper-handshake).
+//
+// Presets carry a DataPlaneSafe flag distinguishing profiles fit for the VPN
+// data plane (sub-second delays, bounded fragmentation) from cover-traffic
+// generators that intentionally idle for seconds. Data-plane entry points
+// (FromConfig, ByName) reject unsafe presets; cover-traffic callers must use
+// ByNameAllowAny explicitly.
 package presets
 
 import (
@@ -20,32 +26,72 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/shaper/dist"
 )
 
-// ErrUnknownPreset is returned by ByName when the requested preset is not
-// registered.
+// ErrUnknownPreset is returned when the requested preset is not registered.
 var ErrUnknownPreset = errors.New("presets: unknown preset")
+
+// ErrPresetNotDataPlaneSafe is returned by FromConfig and ByName when the
+// requested preset is a cover-traffic profile (e.g. multi-second idle gaps)
+// and therefore unsuitable for tunneling user payload. Cover-traffic emitters
+// must call ByNameAllowAny explicitly.
+var ErrPresetNotDataPlaneSafe = errors.New("presets: preset is not safe for data plane")
 
 // presetBuilder is the constructor signature every preset file registers.
 type presetBuilder func(seed int64) (shaper.Shaper, error)
 
-// registry holds all built-in presets. It is populated by init() in each
-// preset file so that adding a new preset is a single-file change.
-var registry = map[string]presetBuilder{}
+// presetMeta carries both the constructor and metadata used by gating logic.
+// DataPlaneSafe == true means delays are bounded enough (sub-second median)
+// that the preset can carry user traffic without throughput collapse.
+type presetMeta struct {
+	Name          string
+	DataPlaneSafe bool
+	Build         presetBuilder
+}
 
-func register(name string, b presetBuilder) {
+// registry holds all built-in presets. Populated by init() in each preset
+// file so that adding a new preset is a single-file change.
+var registry = map[string]presetMeta{}
+
+func register(name string, dataPlaneSafe bool, b presetBuilder) {
 	if _, exists := registry[name]; exists {
 		panic(fmt.Sprintf("presets: duplicate registration for %q", name))
 	}
-	registry[name] = b
+	registry[name] = presetMeta{Name: name, DataPlaneSafe: dataPlaneSafe, Build: b}
 }
 
-// ByName returns a Shaper configured for the named preset.
-// Returns ErrUnknownPreset if name is not registered.
+// IsDataPlaneSafe reports whether the named preset is suitable for the VPN
+// data plane (sub-second delays, bounded fragmentation). Returns
+// ErrUnknownPreset for unknown names.
+func IsDataPlaneSafe(name string) (bool, error) {
+	m, ok := registry[name]
+	if !ok {
+		return false, fmt.Errorf("%w: %q", ErrUnknownPreset, name)
+	}
+	return m.DataPlaneSafe, nil
+}
+
+// ByName returns a Shaper configured for the named preset. It rejects presets
+// flagged as not data-plane-safe with ErrPresetNotDataPlaneSafe — use
+// ByNameAllowAny for cover-traffic generation.
 func ByName(name string, seed int64) (shaper.Shaper, error) {
-	b, ok := registry[name]
+	m, ok := registry[name]
 	if !ok {
 		return nil, fmt.Errorf("%w: %q", ErrUnknownPreset, name)
 	}
-	return b(seed)
+	if !m.DataPlaneSafe {
+		return nil, fmt.Errorf("%w: %q", ErrPresetNotDataPlaneSafe, name)
+	}
+	return m.Build(seed)
+}
+
+// ByNameAllowAny is like ByName but does not enforce DataPlaneSafe. Use only
+// for cover-traffic generation, never for data tunneling. Returns
+// ErrUnknownPreset for unknown names.
+func ByNameAllowAny(name string, seed int64) (shaper.Shaper, error) {
+	m, ok := registry[name]
+	if !ok {
+		return nil, fmt.Errorf("%w: %q", ErrUnknownPreset, name)
+	}
+	return m.Build(seed)
 }
 
 // List returns all available preset names in deterministic (sorted) order.
@@ -61,7 +107,8 @@ func List() []string {
 // FromConfig builds a Shaper from a parsed TOML [shaper] section. Either
 // cfg.Preset or cfg.Custom must be set, not both. cfg.RandomizationRange is
 // applied to histogram bins where supported. cfg.Seed, when nil, is replaced
-// by a freshly drawn cryptographic seed.
+// by a freshly drawn cryptographic seed. Non-data-plane-safe presets are
+// rejected here so that misconfiguration cannot collapse tunnel throughput.
 func FromConfig(cfg toml.ShaperConfig) (shaper.Shaper, error) {
 	if cfg.Preset != "" && cfg.Custom != nil {
 		return nil, errors.New("presets: preset and custom are mutually exclusive")
@@ -73,6 +120,8 @@ func FromConfig(cfg toml.ShaperConfig) (shaper.Shaper, error) {
 	seed := resolveSeed(cfg.Seed)
 
 	if cfg.Preset != "" {
+		// ByName already enforces DataPlaneSafe; relying on it keeps the gate
+		// in a single place.
 		s, err := ByName(cfg.Preset, seed)
 		if err != nil {
 			return nil, err

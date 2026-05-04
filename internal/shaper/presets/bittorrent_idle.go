@@ -26,7 +26,10 @@ const PresetBitTorrentIdle = "bittorrent_idle"
 // Inter-arrival: LogNormal(mu=2, sigma=2.5) → median ~7 s, with tail to
 // minutes — matching observed idle-swarm telemetry.
 func init() {
-	register(PresetBitTorrentIdle, buildBitTorrentIdle)
+	// DataPlaneSafe=false: median delay ~7 s — cover-traffic only. Building
+	// for the data plane would collapse throughput; callers that need this
+	// preset for cover-traffic must use ByNameAllowAny.
+	register(PresetBitTorrentIdle, false, buildBitTorrentIdle)
 }
 
 func buildBitTorrentIdle(seed int64) (shaper.Shaper, error) {
