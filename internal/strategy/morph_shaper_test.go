@@ -142,6 +142,10 @@ func TestMorphedConn_WithShaper_Wrap(t *testing.T) {
 	if _, err := mc.Write(payload); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
+	// Close drains the async pacer so the captured write buffer is stable.
+	if err := mc.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
 	if len(ms.wrapCalls) != 1 {
 		t.Fatalf("Wrap called %d times, want 1", len(ms.wrapCalls))
 	}
