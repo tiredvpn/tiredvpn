@@ -76,7 +76,8 @@ func (mc *MorphedConn) writeShaped(p []byte) (int, error) {
 // frame matches the documented streaming contract: NoopShaper is identity,
 // distribution-driven shapers strip per-frame padding/markers as needed.
 func (mc *MorphedConn) readShaped(p []byte) (int, error) {
-	header := make([]byte, morphHeaderLen)
+	var headerArr [morphHeaderLen]byte
+	header := headerArr[:]
 	if _, err := io.ReadFull(mc.Conn, header); err != nil {
 		return 0, err
 	}
@@ -86,7 +87,7 @@ func (mc *MorphedConn) readShaped(p []byte) (int, error) {
 	// signal the TUN layer with the 4-zero-byte sentinel.
 	if dataLen == 0 {
 		if paddingLen > 0 {
-			discard := make([]byte, paddingLen)
+			discard := mc.acquireScratch(paddingLen)
 			if _, err := io.ReadFull(mc.Conn, discard); err != nil {
 				return 0, err
 			}
@@ -99,25 +100,74 @@ func (mc *MorphedConn) readShaped(p []byte) (int, error) {
 	}
 
 	totalPayload := dataLen + paddingLen
-	payload := make([]byte, totalPayload)
+	payload, bucket := acquirePacketBuf(totalPayload)
 	n, err := io.ReadFull(mc.Conn, payload)
 	if err != nil {
+		releasePacketBuf(payload, bucket)
 		return 0, err
 	}
 	frame := payload[:dataLen]
-	data := mc.shaper.Unwrap([][]byte{frame})
 
 	mc.packetsRecv++
 	mc.bytesRecv += int64(n)
 
-	copied := copy(p, data)
-	if copied < len(data) {
-		mc.readBuf = append(mc.readBuf, data[copied:]...)
+	// Fast path for shapers that support in-place unwrap into a caller-
+	// provided buffer; falls back to allocating Unwrap otherwise.
+	var copied int
+	if u, ok := mc.shaper.(unwrapInto); ok {
+		// distShaper.UnwrapInto: writes payload into mc's readUnwrapBuf
+		// (lazy MTU-sized scratch) so we don't pay per-frame Unwrap allocs.
+		if mc.readUnwrapBuf == nil {
+			mc.readUnwrapBuf = make([]byte, defaultReadScratchSize)
+		}
+		nn, uerr := u.UnwrapInto(mc.readUnwrapBuf[:cap(mc.readUnwrapBuf)], [][]byte{frame})
+		if uerr != nil {
+			releasePacketBuf(payload, bucket)
+			return 0, uerr
+		}
+		data := mc.readUnwrapBuf[:nn]
+		copied = copy(p, data)
+		if copied < len(data) {
+			mc.readBuf = append(mc.readBuf, data[copied:]...)
+		}
+	} else {
+		data := mc.shaper.Unwrap([][]byte{frame})
+		copied = copy(p, data)
+		if copied < len(data) {
+			mc.readBuf = append(mc.readBuf, data[copied:]...)
+		}
 	}
+	releasePacketBuf(payload, bucket)
 	if mc.rateLimiter != nil {
 		mc.rateLimiter.Wait(copied)
 	}
 	return copied, nil
+}
+
+// defaultReadScratchSize is the lazy-allocated per-conn scratch buffer for
+// padding discard and Unwrap output. Sized at MTU; readShaped is single-
+// goroutine on the read side, so no synchronisation is needed.
+const defaultReadScratchSize = 1500
+
+// acquireScratch returns a slice of length n backed by mc.readScratchBuf.
+// If n exceeds the existing capacity, the buffer is grown (rare: only when
+// paddingLen > MTU, which the wire format does not normally produce).
+func (mc *MorphedConn) acquireScratch(n int) []byte {
+	want := n
+	if want < defaultReadScratchSize {
+		want = defaultReadScratchSize
+	}
+	if cap(mc.readScratchBuf) < want {
+		mc.readScratchBuf = make([]byte, want)
+	}
+	return mc.readScratchBuf[:n]
+}
+
+// unwrapInto is an optional fast-path interface implemented by shapers that
+// can decode frames directly into a caller-provided buffer, avoiding the
+// per-frame allocation of the standard Unwrap method.
+type unwrapInto interface {
+	UnwrapInto(out []byte, frames [][]byte) (int, error)
 }
 
 // ShaperFromConfig builds a Shaper for MorphedConn from the parsed TOML
