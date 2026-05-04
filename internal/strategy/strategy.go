@@ -15,6 +15,7 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/mux"
 	"github.com/tiredvpn/tiredvpn/internal/porthopping"
+	"github.com/tiredvpn/tiredvpn/internal/shaper"
 )
 
 // Strategy defines interface for DPI evasion techniques
@@ -926,6 +927,11 @@ type DefaultManagerConfig struct {
 	// Port hopping for DPI evasion
 	// High ports (47000+) are less analyzed by DPI, periodic port changes complicate blocking
 	PortHopping *porthopping.Config
+
+	// Shaper, when non-nil, is injected into Traffic-Morph strategies and
+	// drives sizing/inter-arrival in MorphedConn. nil keeps the legacy
+	// NoopShaper behaviour (wire-format unchanged).
+	Shaper shaper.Shaper
 }
 
 // NewDefaultManager creates a manager with all strategies pre-registered
@@ -1093,10 +1099,18 @@ func registerMorphStrategies(m *Manager, cfg DefaultManagerConfig, hasSecret boo
 	if !hasSecret {
 		return
 	}
-	m.Register(NewTrafficMorphStrategy(m, YandexVideoProfile, nil, cfg.Secret))
-	m.Register(NewTrafficMorphStrategy(m, VKVideoProfile, nil, cfg.Secret))
-	m.Register(NewTrafficMorphStrategy(m, BaiduVideoProfile, nil, cfg.Secret))
-	m.Register(NewTrafficMorphStrategy(m, AparatVideoProfile, nil, cfg.Secret))
+	for _, profile := range []*TrafficProfile{
+		YandexVideoProfile,
+		VKVideoProfile,
+		BaiduVideoProfile,
+		AparatVideoProfile,
+	} {
+		strat := NewTrafficMorphStrategy(m, profile, nil, cfg.Secret)
+		if cfg.Shaper != nil {
+			strat.SetShaper(cfg.Shaper)
+		}
+		m.Register(strat)
+	}
 }
 
 // registerMeshAndAntiProbe registers Mesh Relay and Anti-Probe strategies.

@@ -23,6 +23,10 @@ type TrafficMorphStrategy struct {
 	profile   *TrafficProfile
 	baseStrat Strategy // Underlying strategy (e.g., gRPC tunnel)
 	secret    []byte   // Secret for authentication
+
+	// customShaper, when non-nil, is injected into MorphedConn instead of the
+	// legacy NoopShaper. Wired from TOML [shaper] via the manager config.
+	customShaper shaper.Shaper
 }
 
 // TrafficProfile defines statistical properties of traffic to mimic.
@@ -342,7 +346,13 @@ func (s *TrafficMorphStrategy) Connect(ctx context.Context, target string) (net.
 	}
 
 	// Wrap with morphing layer
-	return NewMorphedConn(baseConn, s.profile, s.secret), nil
+	return NewMorphedConnWithShaper(baseConn, s.profile, s.secret, s.customShaper), nil
+}
+
+// SetShaper injects a custom Shaper into all subsequent MorphedConn instances
+// produced by this strategy. nil reverts to the legacy passthrough shaper.
+func (s *TrafficMorphStrategy) SetShaper(sh shaper.Shaper) {
+	s.customShaper = sh
 }
 
 // MorphedConn wraps a connection with traffic morphing.
