@@ -132,6 +132,17 @@ func BenchmarkRealistic_Chrome_Async(b *testing.B) {
 	)
 }
 
+// BenchmarkRealistic_Chrome_Async_Coalesced is the writev-coalesced variant
+// of BenchmarkRealistic_Chrome_Async. Same workload; the headline change is
+// that the pacer batches sub-tick frames into a single net.Buffers.WriteTo
+// (vectored / writev syscall on TCP), reducing per-frame syscall overhead.
+func BenchmarkRealistic_Chrome_Async_Coalesced(b *testing.B) {
+	runRealisticBench(b,
+		mustRealisticPresetShaper(b, presets.PresetChromeBrowsing),
+		mustRealisticPresetShaper(b, presets.PresetChromeBrowsing),
+	)
+}
+
 // BenchmarkRealistic_Youtube_Async is the youtube_streaming counterpart.
 // Pareto-tail delays are clamped to 50 ms in the pacer (ADR §7) and the
 // up-direction packet sizes are tiny (~120 B), so this is the worst-case
