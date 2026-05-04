@@ -24,7 +24,7 @@ func TestPacer_SaturationDoesNotDeadlock(t *testing.T) {
 	doneCh := make(chan error, 1)
 	go func() {
 		for range totalFrames {
-			if err := p.enqueue(pacedFrame{packet: frame}); err != nil {
+			if err := p.enqueue(pacedFrame{packet: frame, bucket: -1}); err != nil {
 				doneCh <- err
 				return
 			}
@@ -65,7 +65,7 @@ func TestPacer_AdaptiveThrottle_Effective(t *testing.T) {
 	frame := make([]byte, 1500)
 	start := time.Now()
 	for range N {
-		if err := p.enqueue(pacedFrame{packet: frame}); err != nil {
+		if err := p.enqueue(pacedFrame{packet: frame, bucket: -1}); err != nil {
 			t.Fatalf("enqueue: %v", err)
 		}
 	}
@@ -102,12 +102,12 @@ func TestPacer_OverflowReturnsError(t *testing.T) {
 	// Fill: one frame is in-flight (pacer goroutine blocked on Write) plus
 	// pacerQueueCap in the channel.
 	for range pacerQueueCap + 1 {
-		if err := p.enqueue(pacedFrame{packet: frame}); err != nil {
+		if err := p.enqueue(pacedFrame{packet: frame, bucket: -1}); err != nil {
 			t.Fatalf("fill: %v", err)
 		}
 	}
 	start := time.Now()
-	err := p.enqueue(pacedFrame{packet: frame})
+	err := p.enqueue(pacedFrame{packet: frame, bucket: -1})
 	elapsed := time.Since(start)
 	if !errors.Is(err, ErrShaperOverflow) {
 		t.Fatalf("got %v, want ErrShaperOverflow", err)
