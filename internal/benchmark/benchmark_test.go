@@ -563,6 +563,34 @@ func BenchmarkGetAllStrategyIDs(b *testing.B) {
 	}
 }
 
+func TestToJSONReportNilFastest(t *testing.T) {
+	r := &BenchmarkResult{
+		TestedAt:   time.Now(),
+		Strategies: []StrategyResult{},
+		Fastest:    nil,
+	}
+	report := ToJSONReport(r, "host:8444", "1.0.0")
+	if report.Fastest != "" {
+		t.Errorf("Fastest should be empty when r.Fastest is nil, got %q", report.Fastest)
+	}
+	if report.Summary.Total != 0 {
+		t.Errorf("Summary.Total: got %d, want 0", report.Summary.Total)
+	}
+}
+
+func TestToJSONReportContextCanceled(t *testing.T) {
+	r := &BenchmarkResult{
+		TestedAt: time.Now(),
+		Strategies: []StrategyResult{
+			{ID: "quic", Name: "QUIC", Available: false, Error: "context canceled"},
+		},
+	}
+	report := ToJSONReport(r, "host:8444", "1.0.0")
+	if report.Strategies[0].Status != "timeout" {
+		t.Errorf("context canceled should map to timeout, got %q", report.Strategies[0].Status)
+	}
+}
+
 func TestToJSONReport(t *testing.T) {
 	latency := 42 * time.Millisecond
 	r := &BenchmarkResult{

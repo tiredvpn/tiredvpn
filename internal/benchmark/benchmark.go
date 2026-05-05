@@ -84,7 +84,9 @@ func strategyStatus(sr StrategyResult) string {
 	if sr.Available {
 		return "ok"
 	}
-	if strings.Contains(sr.Error, "timeout") || strings.Contains(sr.Error, "deadline exceeded") {
+	if strings.Contains(sr.Error, "timeout") ||
+		strings.Contains(sr.Error, "deadline exceeded") ||
+		strings.Contains(sr.Error, "context canceled") {
 		return "timeout"
 	}
 	return "blocked"
@@ -109,7 +111,7 @@ func ToJSONReport(r *BenchmarkResult, serverAddr, version string) JSONReport {
 			Status: status,
 			Error:  sr.Error,
 		}
-		if sr.Available && sr.Latency > 0 {
+		if sr.Available {
 			ms := sr.Latency.Milliseconds()
 			jsr.LatencyMS = &ms
 		}
