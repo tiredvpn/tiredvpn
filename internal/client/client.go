@@ -150,7 +150,7 @@ func Run(cfg *Config) error {
 	logEnabledFeatures(cfg, mgr)
 
 	if cfg.Debug {
-		fmt.Println(mgr.PrintStrategySummary())
+		fmt.Fprintln(os.Stderr, mgr.PrintStrategySummary())
 	}
 
 	if cfg.BenchmarkMode {
