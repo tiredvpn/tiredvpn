@@ -52,6 +52,87 @@ type BenchmarkResult struct {
 	TestedAt   time.Time
 }
 
+// JSONStrategyResult is the JSON-serializable form of a single strategy probe result.
+type JSONStrategyResult struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Status    string `json:"status"` // "ok", "blocked", "timeout"
+	LatencyMS *int64 `json:"latency_ms"`
+	Error     string `json:"error,omitempty"`
+}
+
+// JSONSummary aggregates counts across all strategies.
+type JSONSummary struct {
+	Total     int `json:"total"`
+	Available int `json:"available"`
+	Failed    int `json:"failed"`
+	Timeout   int `json:"timeout"`
+}
+
+// JSONReport is the top-level structure written to stdout by -benchmark-json.
+type JSONReport struct {
+	GeneratedAt string               `json:"generated_at"`
+	Server      string               `json:"server"`
+	Version     string               `json:"version"`
+	Strategies  []JSONStrategyResult `json:"strategies"`
+	Summary     JSONSummary          `json:"summary"`
+	Fastest     string               `json:"fastest,omitempty"`
+}
+
+// strategyStatus converts an internal StrategyResult to the string status used in reports.
+func strategyStatus(sr StrategyResult) string {
+	if sr.Available {
+		return "ok"
+	}
+	if strings.Contains(sr.Error, "timeout") || strings.Contains(sr.Error, "deadline exceeded") {
+		return "timeout"
+	}
+	return "blocked"
+}
+
+// ToJSONReport converts a BenchmarkResult into a JSON-serializable report.
+func ToJSONReport(r *BenchmarkResult, serverAddr, version string) JSONReport {
+	report := JSONReport{
+		GeneratedAt: r.TestedAt.UTC().Format(time.RFC3339),
+		Server:      serverAddr,
+		Version:     version,
+	}
+
+	var summary JSONSummary
+	summary.Total = len(r.Strategies)
+
+	for _, sr := range r.Strategies {
+		status := strategyStatus(sr)
+		jsr := JSONStrategyResult{
+			ID:     sr.ID,
+			Name:   sr.Name,
+			Status: status,
+			Error:  sr.Error,
+		}
+		if sr.Available && sr.Latency > 0 {
+			ms := sr.Latency.Milliseconds()
+			jsr.LatencyMS = &ms
+		}
+		report.Strategies = append(report.Strategies, jsr)
+
+		switch status {
+		case "ok":
+			summary.Available++
+		case "timeout":
+			summary.Failed++
+			summary.Timeout++
+		default:
+			summary.Failed++
+		}
+	}
+
+	if r.Fastest != nil {
+		report.Fastest = r.Fastest.ID
+	}
+	report.Summary = summary
+	return report
+}
+
 // RunBenchmark tests all strategies for latency and speed
 func RunBenchmark(ctx context.Context, mgr *strategy.Manager, serverAddr string, testSpeed bool) *BenchmarkResult {
 	result := &BenchmarkResult{

@@ -562,3 +562,68 @@ func BenchmarkGetAllStrategyIDs(b *testing.B) {
 		_ = GetAllStrategyIDs()
 	}
 }
+
+func TestToJSONReport(t *testing.T) {
+	latency := 42 * time.Millisecond
+	r := &BenchmarkResult{
+		TestedAt: time.Date(2026, 5, 5, 3, 0, 0, 0, time.UTC),
+		Strategies: []StrategyResult{
+			{ID: "quic_salamander", Name: "QUIC Salamander", Available: true, Latency: latency},
+			{ID: "reality", Name: "REALITY Protocol", Available: false, Error: "connection refused"},
+			{ID: "http_polling", Name: "HTTP Polling", Available: false, Error: "context deadline exceeded"},
+		},
+	}
+	r.Fastest = &r.Strategies[0]
+
+	report := ToJSONReport(r, "31.44.3.165:8444", "1.1.0")
+
+	if report.GeneratedAt != "2026-05-05T03:00:00Z" {
+		t.Errorf("GeneratedAt: got %s, want 2026-05-05T03:00:00Z", report.GeneratedAt)
+	}
+	if report.Server != "31.44.3.165:8444" {
+		t.Errorf("Server: got %s, want 31.44.3.165:8444", report.Server)
+	}
+	if report.Version != "1.1.0" {
+		t.Errorf("Version: got %s, want 1.1.0", report.Version)
+	}
+	if len(report.Strategies) != 3 {
+		t.Fatalf("Strategies: got %d, want 3", len(report.Strategies))
+	}
+
+	ok := report.Strategies[0]
+	if ok.Status != "ok" {
+		t.Errorf("Strategies[0].Status: got %s, want ok", ok.Status)
+	}
+	if ok.LatencyMS == nil || *ok.LatencyMS != 42 {
+		t.Errorf("Strategies[0].LatencyMS: got %v, want 42", ok.LatencyMS)
+	}
+
+	blocked := report.Strategies[1]
+	if blocked.Status != "blocked" {
+		t.Errorf("Strategies[1].Status: got %s, want blocked", blocked.Status)
+	}
+	if blocked.LatencyMS != nil {
+		t.Errorf("Strategies[1].LatencyMS: should be nil for blocked")
+	}
+
+	timeout := report.Strategies[2]
+	if timeout.Status != "timeout" {
+		t.Errorf("Strategies[2].Status: got %s, want timeout", timeout.Status)
+	}
+
+	if report.Summary.Total != 3 {
+		t.Errorf("Summary.Total: got %d, want 3", report.Summary.Total)
+	}
+	if report.Summary.Available != 1 {
+		t.Errorf("Summary.Available: got %d, want 1", report.Summary.Available)
+	}
+	if report.Summary.Failed != 2 {
+		t.Errorf("Summary.Failed: got %d, want 2", report.Summary.Failed)
+	}
+	if report.Summary.Timeout != 1 {
+		t.Errorf("Summary.Timeout: got %d, want 1", report.Summary.Timeout)
+	}
+	if report.Fastest != "quic_salamander" {
+		t.Errorf("Fastest: got %s, want quic_salamander", report.Fastest)
+	}
+}
