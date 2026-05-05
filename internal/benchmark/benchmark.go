@@ -188,7 +188,7 @@ func testStrategy(ctx context.Context, mgr *strategy.Manager, strat strategy.Str
 
 	// Test latency with probe
 	start := time.Now()
-	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	conn, err := strat.Connect(probeCtx, serverAddr)
 	cancel()
 

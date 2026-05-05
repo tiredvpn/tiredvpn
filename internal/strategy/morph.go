@@ -317,7 +317,7 @@ func (s *TrafficMorphStrategy) Connect(ctx context.Context, target string) (net.
 		// Wrap TCP connection with fragmentation to defeat DPI
 		// This splits TLS ClientHello across multiple TCP segments
 		fragConfig := &evasion.FragmentationConfig{
-			FragmentSize:  2,                // Very small fragments
+			FragmentSize:  64,               // ~24 segments for typical ClientHello
 			SplitPosition: 1,                // Split SNI at first byte
 			FragmentDelay: time.Millisecond, // Small delay between fragments
 		}

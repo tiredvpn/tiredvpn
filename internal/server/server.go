@@ -790,50 +790,30 @@ func handleConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 		peekBuf = make([]byte, 5+recordLen)
 		copy(peekBuf, header)
 
-		// Read TLS record in chunks to support fragmented ClientHello (Geneva strategies)
-		// Geneva sends TLS ClientHello in 32 small TCP fragments
-		// io.ReadFull() would block waiting for all bytes, causing timeout
-		// Instead, read in chunks with per-chunk timeout
+		// Read TLS record in chunks to support heavily fragmented ClientHello.
+		// Morph strategy sends ~750 fragments of 2 bytes each (1ms delay between).
+		// Per-chunk timeouts cause false failures under congestion (parallel probing).
+		// Use a single overall deadline instead.
 		totalRead := 0
-		remaining := recordLen
 		startTime := time.Now()
-		maxTotalTime := 30 * time.Second // Total time allowed for full record
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 
 		for totalRead < recordLen {
-			// Set per-chunk deadline (5 seconds per chunk)
-			// This allows slow fragmented delivery but prevents indefinite blocking
-			conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-
-			// Read at least 1 byte, up to remaining bytes
-			chunkSize := remaining
-			if chunkSize > 4096 { // Read in reasonable chunks
+			chunkSize := recordLen - totalRead
+			if chunkSize > 4096 {
 				chunkSize = 4096
 			}
 
 			n, err := io.ReadAtLeast(conn, peekBuf[5+totalRead:5+totalRead+chunkSize], 1)
 			if err != nil {
-				if time.Since(startTime) > maxTotalTime {
-					logger.Debug("Timeout reading TLS record after %v (read %d/%d bytes)",
-						time.Since(startTime), totalRead, recordLen)
-				} else {
-					logger.Debug("Failed to read TLS record chunk: %v (read %d/%d bytes)",
-						err, totalRead, recordLen)
-				}
+				logger.Debug("Failed to read TLS record: %v (read %d/%d bytes)",
+					err, totalRead, recordLen)
 				serveFakeWebsite(conn, cfg, logger)
 				return
 			}
 
 			totalRead += n
-			remaining -= n
 			logger.Debug("Read chunk: %d bytes (total: %d/%d)", n, totalRead, recordLen)
-
-			// Safety check: don't exceed max total time
-			if time.Since(startTime) > maxTotalTime {
-				logger.Debug("Max time exceeded reading TLS record (read %d/%d bytes)",
-					totalRead, recordLen)
-				serveFakeWebsite(conn, cfg, logger)
-				return
-			}
 		}
 
 		logger.Debug("Completed reading TLS payload: %d bytes in %v", totalRead, time.Since(startTime))

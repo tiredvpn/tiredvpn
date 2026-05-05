@@ -7,6 +7,14 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-05-06
+
+### Fixed
+
+- **Traffic Morph strategies** (Yandex, VK, Baidu, Aparat Video) — increased TLS ClientHello fragment size from 2 bytes to 64 bytes, reducing TCP segment count from ~750 to ~24. The extreme fragmentation caused reliable timeouts on high-latency paths where the last segments of a 1500-byte ClientHello were dropped.
+- **Server TLS reassembly timeout** — replaced per-chunk 5-second deadline with a single 30-second connection deadline, preventing premature timeout on fragmented TLS records.
+- **Benchmark probe timeout** — increased per-strategy probe timeout from 10 s to 30 s to accommodate slow paths.
+
 ## [1.1.1] - 2026-05-05
 
 ### Added
