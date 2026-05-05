@@ -7,6 +7,19 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-05-05
+
+### Added
+
+- **`-benchmark-json` flag** — machine-readable JSON output for all bypass strategies (`available`, `blocked`, `timeout`, `latency_ms`, `fastest`). Powers the daily availability reports published to `reports/`.
+
+### Fixed
+
+- `context canceled` errors now correctly classified as `timeout` (not `blocked`) in benchmark output.
+- Zero-latency strategies (`latency_ms = 0`) now included in JSON output.
+- Debug strategy summary redirected to stderr to avoid corrupting JSON stdout.
+- `ldflags` version correctly propagated into client package before `Run()`.
+
 ## [1.1.0] - 2026-05-04
 
 ### Added
