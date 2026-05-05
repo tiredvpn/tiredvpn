@@ -286,6 +286,8 @@ ADAPTIVE STRATEGY:
 BENCHMARKING:
   -benchmark
         Run strategy benchmark (latency test)
+  -benchmark-json
+        Run strategy benchmark, output results as JSON (for automation)
   -benchmark-full
         Run FULL strategy benchmark (HTTP, latency, speed, IP change)
   -benchmark-all
@@ -424,6 +426,7 @@ func runClient(args []string) {
 
 	// Benchmark flags
 	fs.BoolVar(&cfg.BenchmarkMode, "benchmark", false, "Run strategy benchmark (latency test)")
+	fs.BoolVar(&cfg.BenchmarkJSONMode, "benchmark-json", false, "Run strategy benchmark, output results as JSON (for automation)")
 	fs.BoolVar(&cfg.FullBenchmarkMode, "benchmark-full", false, "Run FULL strategy benchmark (HTTP, latency, speed, IP change)")
 	fs.BoolVar(&cfg.BenchmarkAllCombos, "benchmark-all", false, "Run EXHAUSTIVE benchmark: all strategies × all RTT profiles (78 combinations)")
 

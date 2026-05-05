@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -65,6 +66,7 @@ type Config struct {
 	// Modes
 	ListStrategies     bool
 	BenchmarkMode      bool
+	BenchmarkJSONMode  bool // Output benchmark results as JSON (for automation)
 	FullBenchmarkMode  bool
 	BenchmarkAllCombos bool // Test all strategy + RTT profile combinations
 
@@ -153,6 +155,9 @@ func Run(cfg *Config) error {
 
 	if cfg.BenchmarkMode {
 		return runBenchmark(cfg, mgr)
+	}
+	if cfg.BenchmarkJSONMode {
+		return runBenchmarkJSON(cfg, mgr)
 	}
 	if cfg.FullBenchmarkMode {
 		return runFullBenchmark(cfg, mgr)
@@ -338,6 +343,17 @@ func runBenchmark(cfg *Config, mgr *strategy.Manager) error {
 	result := benchmark.ParallelProbe(ctx, mgr, cfg.ServerAddr)
 	fmt.Println(benchmark.FormatResults(result, false))
 	return nil
+}
+
+// runBenchmarkJSON runs the parallel strategy probe and writes results as JSON to stdout.
+func runBenchmarkJSON(cfg *Config, mgr *strategy.Manager) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	result := benchmark.ParallelProbe(ctx, mgr, cfg.ServerAddr)
+	report := benchmark.ToJSONReport(result, cfg.ServerAddr, Version)
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(report)
 }
 
 // runFullBenchmark runs the full HTTP/latency/speed/IP-change benchmark and prints results.
