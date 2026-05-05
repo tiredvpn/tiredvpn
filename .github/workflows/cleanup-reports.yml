@@ -1,0 +1,39 @@
+name: Cleanup old reports
+
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Delete reports older than 14 days
+        run: |
+          cutoff=$(date -d '14 days ago' +%Y-%m-%d)
+          deleted=0
+          for dir in reports/*/; do
+            name=$(basename "$dir")
+            if [[ "$name" < "$cutoff" ]]; then
+              echo "Removing $name"
+              rm -rf "$dir"
+              deleted=$((deleted + 1))
+            fi
+          done
+          echo "Removed $deleted report(s)"
+          echo "deleted=$deleted" >> $GITHUB_OUTPUT
+        id: cleanup
+
+      - name: Commit deletions
+        if: steps.cleanup.outputs.deleted != '0'
+        run: |
+          git config user.name 'tiredvpn'
+          git config user.email 'noreply@users.noreply.github.com'
+          git add -A reports/
+          git commit -m "chore: remove reports older than 14 days"
+          git push
