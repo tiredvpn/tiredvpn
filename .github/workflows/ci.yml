@@ -3,8 +3,12 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'reports/**'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - 'reports/**'
   schedule:
     - cron: '0 0 * * 1' # Weekly security scan
 
