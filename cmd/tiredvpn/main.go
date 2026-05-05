@@ -499,6 +499,8 @@ func runClient(args []string) {
 		}()
 	}
 
+	client.Version = version
+	client.BuildTime = buildTime
 	if err := client.Run(cfg); err != nil {
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
