@@ -872,9 +872,8 @@ func handleConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 
 		// kTLS is enabled per-handler in the relay phase, after each protocol's
 		// auth/header bytes are fully drained from the TLS stack. See
-		// internal/ktls.TryEnable and the handlers below.
-		alpn := tlsConn.ConnectionState().NegotiatedProtocol
-		_ = alpn // alpn used for logging in handleTLSConnection
+		// internal/ktls.TryEnable; per-protocol handlers (tired-raw, tired-confusion)
+		// call it after their auth phase completes.
 
 		// Clear deadline after successful handshake
 		tlsConn.SetReadDeadline(time.Time{})
@@ -896,10 +895,11 @@ func handleConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 	serveFakeWebsite(buffConn, cfg, logger)
 }
 
-// handleTLSConnection handles protocols over TLS (after TLS handshake completed)
-// Uses ALPN-based routing when available. Each handler is responsible for
-// calling ktls.TryEnable at the relay-phase boundary.
-// Falls back to legacy magic-byte detection for backwards compatibility.
+// handleTLSConnection handles protocols over TLS (after TLS handshake completed).
+// conn must be a fully-handshaked *tls.Conn — kTLS upgrade is deferred to each
+// per-protocol handler at the relay-phase boundary via ktls.TryEnable.
+// Uses ALPN-based routing when available; falls back to legacy magic-byte
+// detection for backwards compatibility.
 func handleTLSConnection(conn *tls.Conn, srvCtx *serverContext, connID uint64) {
 	_ = srvCtx.cfg // Used in legacy path
 	logger := log.WithPrefix(fmt.Sprintf("conn:%d", connID))
