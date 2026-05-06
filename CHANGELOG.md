@@ -7,6 +7,10 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **kTLS upgrade is now performed per-handler at the relay-phase boundary** instead of unconditionally after the TLS handshake. `tired-raw` and `tired-confusion` handlers now call `ktls.TryEnable` after their auth-complete ack write, before the relay goroutines spin up. `tired-morph`, `tired-stego`, `tired-ws`, and `tired-polling` continue to run without kTLS pending Phase 2 (handler-level framer/upgrade rework). Behaviour-equivalent for end users; eliminates the EBADMSG race that the static `kTLSUnsafe` exclusion list was a workaround for. Also adds `ClientRegistry.SwapConn` so registry-tracked handlers can update the stored connection pointer after the kTLS swap, keeping forced-disconnect `Close()` targeting the live socket wrapper instead of the stale `*tls.Conn`. Includes an in-process e2e regression test (`TestRawTunnelKTLSHandover`) that catches future regressions where a TLS-stack read is reintroduced after `TryEnable`.
+
 ## [1.1.3] - 2026-05-06
 
 ### Fixed
