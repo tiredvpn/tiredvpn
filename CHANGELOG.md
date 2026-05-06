@@ -7,6 +7,12 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.3] - 2026-05-06
+
+### Fixed
+
+- **HTTP/2 Steganography and WebSocket Salamander on kTLS-capable hosts** — disabled kTLS for `tired-stego` and `tired-ws` ALPN connections. Both protocols send application data immediately after the TLS handshake; the Go TLS stack may buffer the first record before `ktls.Enable()` is called, causing the kernel's AEAD sequence counter to be out of sync and failing decryption with `EBADMSG`. Consistent with the existing exclusion of `tired-morph` and `tired-polling`.
+
 ## [1.1.2] - 2026-05-06
 
 ### Fixed
