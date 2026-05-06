@@ -1029,10 +1029,33 @@ func handleTLSConnectionLegacy(conn *tls.Conn, srvCtx *serverContext, connID uin
 // handleHTTP2WithALPN handles HTTP/2 Stego when ALPN was used
 // Since kTLS is already enabled, we just need to read the preface and delegate to handleHTTP2
 func handleHTTP2WithALPN(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
-	logger.Debug("HTTP/2 via ALPN (kTLS enabled)")
-	// handleHTTP2 expects to read the preface first, so we pass conn directly
-	// The client still sends preface after ALPN negotiation
-	handleHTTP2(conn, srvCtx, logger)
+	logger.Debug("HTTP/2 via ALPN — kTLS upgrade after preface read")
+
+	// Read the preface through the TLS stack. This drains any decrypted
+	// preface bytes from tls.Conn's buffer so the subsequent kTLS Enable
+	// gives the kernel a record-sequence counter that matches the next
+	// byte on the wire.
+	if err := readH2Preface(conn, logger); err != nil {
+		return
+	}
+
+	// Auth phase complete: hand the socket over to kTLS for the byte-relay
+	// phase. Subsequent frame I/O (HEADERS / DATA) goes through the kernel.
+	conn = ktls.TryEnable(conn, "tired-stego")
+
+	framer, err := newH2Framer(conn, logger)
+	if err != nil {
+		return
+	}
+
+	hpackDec := hpack.NewDecoder(4096, nil)
+	authenticated := false
+	var authClientID string
+	var tunnel *h2TunnelState
+	var connTracked bool
+	defer cleanupH2Conn(conn, srvCtx, &tunnel, &connTracked, &authClientID)
+
+	runH2FrameLoop(conn, framer, hpackDec, srvCtx, logger, &authenticated, &authClientID, &connTracked, &tunnel)
 }
 
 // handleMorphConnectionWithALPN handles Morph protocol when ALPN was used
