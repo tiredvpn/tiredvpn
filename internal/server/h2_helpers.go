@@ -26,3 +26,23 @@ func readH2Preface(conn net.Conn, logger *log.Logger) error {
 	}
 	return nil
 }
+
+// newH2Framer constructs an HTTP/2 framer over conn and writes the initial
+// server SETTINGS frame. Safe to call after kTLS Enable — the framer holds
+// a permanent reference to conn for subsequent frame I/O, so the conn
+// passed in must be the final post-Enable wrapper.
+//
+// AllowIllegalReads / AllowIllegalWrites are set true to mirror
+// initH2Framer's tolerance for client variants that occasionally emit
+// non-spec-compliant frames; we have observed this in the wild and the
+// stego layer takes care of validating frame contents itself.
+func newH2Framer(conn net.Conn, logger *log.Logger) (*http2.Framer, error) {
+	framer := http2.NewFramer(conn, conn)
+	framer.AllowIllegalReads = true
+	framer.AllowIllegalWrites = true
+	if err := framer.WriteSettings(); err != nil {
+		logger.Debug("Failed to write SETTINGS: %v", err)
+		return nil, err
+	}
+	return framer, nil
+}

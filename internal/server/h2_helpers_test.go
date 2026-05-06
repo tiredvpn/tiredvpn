@@ -47,3 +47,34 @@ func TestReadH2Preface_Garbage(t *testing.T) {
 		t.Fatalf("expected error on garbage preface, got nil")
 	}
 }
+
+func TestNewH2Framer_WritesSettings(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+
+	settingsCh := make(chan []byte, 1)
+	go func() {
+		buf := make([]byte, 64)
+		n, _ := b.Read(buf)
+		settingsCh <- buf[:n]
+	}()
+
+	framer, err := newH2Framer(a, testLogger(t))
+	if err != nil {
+		t.Fatalf("newH2Framer: %v", err)
+	}
+	if framer == nil {
+		t.Fatalf("framer is nil")
+	}
+
+	select {
+	case got := <-settingsCh:
+		// HTTP/2 SETTINGS frame: 9-byte header, type=4 at offset 3
+		if len(got) < 9 || got[3] != 0x04 {
+			t.Fatalf("expected SETTINGS frame (type 0x04 at offset 3), got % x", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("newH2Framer did not write SETTINGS within 1s")
+	}
+}
