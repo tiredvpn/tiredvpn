@@ -26,6 +26,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"github.com/tiredvpn/tiredvpn/internal/control"
+	"github.com/tiredvpn/tiredvpn/internal/ktls"
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/padding"
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
@@ -2361,9 +2362,17 @@ func handleRawTunnel(conn net.Conn, srvCtx *serverContext, logger *log.Logger, c
 	}
 	defer targetConn.Close()
 
-	// Send success
-	conn.Write([]byte{0x00})
+	// Send success ack
+	if _, err := conn.Write([]byte{0x00}); err != nil {
+		logger.Debug("Failed to write success ack: %v", err)
+		return
+	}
 	logger.Debug("Connected to target, starting relay")
+
+	// Auth phase complete: hand the socket over to kTLS for the byte-relay phase.
+	// At this point the TLS stack's read buffer is empty (we read mode + addr
+	// to completion) and the write buffer has been flushed by the ack write.
+	conn = ktls.TryEnable(conn, "tired-raw")
 
 	// Relay data
 	var wg sync.WaitGroup
