@@ -1369,18 +1369,44 @@ func handleMorphConnection(conn net.Conn, srvCtx *serverContext, logger *log.Log
 
 	if !authenticated {
 		logger.Warn("Traffic Morph authentication FAILED")
+		conn.Write([]byte{0x01}) // best-effort fail ack; client treats as fail and closes
 		return
 	}
 
 	_ = usedSecret // Mark as used
 
-	// Track per-client connection for metrics
+	// Track per-client connection for metrics. Use a closure on the conn
+	// variable so the defer picks up the kTLS-wrapped value if we hand
+	// the socket over later via ktls.TryEnable + registry.SwapConn.
 	if srvCtx.registry != nil && clientID != "" {
 		if err := srvCtx.registry.AddConnection(clientID, conn); err != nil {
 			logger.Warn("Failed to track connection for client %s: %v", clientID, err)
 		} else {
-			defer srvCtx.registry.RemoveConnection(clientID, conn)
+			defer func() {
+				srvCtx.registry.RemoveConnection(clientID, conn)
+			}()
 		}
+	}
+
+	// Auth complete — write 1-byte ack to client (Phase 2 wire protocol).
+	// 0x00 = auth ok, dialing target next. The client must read this byte
+	// before sending the first morph frame, so it can ktls.TryEnable on
+	// the matching boundary.
+	if _, err := conn.Write([]byte{0x00}); err != nil {
+		logger.Warn("Failed to write morph auth ack: %v", err)
+		return
+	}
+
+	// Auth phase complete: hand the socket over to kTLS for the relay
+	// phase. We have read MRPH+name+auth to completion and the ack write
+	// flushed synchronously to the kernel send buffer. Subsequent morph
+	// frame reads (target addr) and writes (relay data) go through kTLS.
+	preSwap := conn
+	conn = ktls.TryEnable(conn, "tired-morph")
+	if conn != preSwap && srvCtx.registry != nil && clientID != "" {
+		// Replace the stored *tls.Conn with the live *ktls.Conn so
+		// forced-disconnect Close() targets the right socket wrapper.
+		srvCtx.registry.SwapConn(clientID, preSwap, conn)
 	}
 
 	// Read first morph packet containing target address
