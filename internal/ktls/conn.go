@@ -5,6 +5,8 @@ import (
 	"io"
 	"net"
 	"time"
+
+	"github.com/tiredvpn/tiredvpn/internal/log"
 )
 
 // Conn wraps a TLS connection after kTLS is enabled.
@@ -87,4 +89,34 @@ func (c *Conn) SetWriteDeadline(t time.Time) error {
 // This is safe because it only returns immutable state information.
 func (c *Conn) ConnectionState() tls.ConnectionState {
 	return c.tlsConn.ConnectionState()
+}
+
+// TryEnable attempts to upgrade the connection to kTLS for the kernel-offloaded
+// data phase. It is safe to call with any net.Conn:
+//
+//   - if conn is already a *ktls.Conn, it is returned unchanged.
+//   - if conn is a *tls.Conn whose TLS records have been fully drained from
+//     the TLS-stack buffer (i.e. the next read will hit raw socket), Enable is
+//     called and the *Conn wrapper is returned.
+//   - otherwise (non-TLS, fallback failed) the original conn is returned.
+//
+// label identifies the call site for log output ("tired-raw", "tired-confusion", ...).
+//
+// Callers must invoke this AFTER all protocol-level auth/header bytes have been
+// read or written through the *tls.Conn — otherwise residual decrypted bytes
+// in the TLS stack's buffer are lost when the kernel takes over the socket.
+func TryEnable(conn net.Conn, label string) net.Conn {
+	if _, ok := conn.(*Conn); ok {
+		return conn
+	}
+	tlsConn, ok := conn.(*tls.Conn)
+	if !ok {
+		return conn
+	}
+	if k := Enable(tlsConn); k != nil {
+		log.Info("kTLS enabled for %s (relay phase)", label)
+		return k
+	}
+	log.Debug("kTLS unavailable for %s, using TLS stack", label)
+	return conn
 }
