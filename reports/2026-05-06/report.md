@@ -1,15 +1,15 @@
 # TiredVPN Availability Report — 2026-05-06
 
-**Date:** 2026-05-06  |  **Version:** 1.1.2
+**Date:** 2026-05-06  |  **Version:** 1.1.3
 
 ## Summary
 
 | Client ISP → Server | OK | Blocked | Best strategy | Best latency |
 |---------------------|----|---------|--------------:|-------------|
-| Rostelecom → Hetzner Amsterdam | 17 | 2 | confusion_1 | 102ms |
-| Rostelecom → Hetzner Nuremberg | 19 | 0 | confusion_1 | 82ms |
-| MegaFon → Hetzner Amsterdam | 17 | 2 | confusion_3 | 145ms |
-| MegaFon → Hetzner Nuremberg | 19 | 0 | confusion_2 | 103ms |
+| Rostelecom → Hetzner Amsterdam | 19 | 0 | confusion_3 | 90ms |
+| Rostelecom → Hetzner Nuremberg | 19 | 0 | confusion_3 | 80ms |
+| MegaFon → Hetzner Amsterdam | 19 | 0 | confusion_0 | 105ms |
+| MegaFon → Hetzner Nuremberg | 19 | 0 | confusion_2 | 104ms |
 
 ## Strategy Results
 
@@ -17,49 +17,49 @@
 
 | Strategy | Rostelecom | MegaFon |
 |----------|------------|---------|
-| QUIC Salamander | ✅ 111ms | ✅ 165ms |
-| REALITY Protocol | ✅ 191ms | ✅ 245ms |
-| HTTP Polling (meek-style) | ✅ 159ms | ✅ 209ms |
-| HTTP/2 Steganography | ❌ — | ❌ — |
-| WebSocket Salamander | ❌ — | ❌ — |
-| Traffic Morph (Yandex Video) | ✅ 133ms | ✅ 184ms |
-| Traffic Morph (VK Video) | ✅ 137ms | ✅ 188ms |
-| Traffic Morph (Baidu Video) | ✅ 140ms | ✅ 183ms |
-| Traffic Morph (Aparat Video) | ✅ 178ms | ✅ 187ms |
-| Geneva (Russia TSPU) | ✅ 194ms | ✅ 202ms |
-| Geneva (China GFW) | ✅ 178ms | ✅ 196ms |
-| Geneva (Iran DPI) | ✅ 156ms | ✅ 216ms |
-| Anti-Probe Resistance | ✅ 947ms | ✅ 953ms |
-| Protocol Confusion (DNS/TLS) | ✅ 115ms | ✅ 149ms |
-| Protocol Confusion (HTTP/TLS) | ✅ 102ms | ✅ 156ms |
-| Protocol Confusion (SSH/TLS) | ✅ 108ms | ✅ 160ms |
-| Protocol Confusion (SMTP/TLS) | ✅ 114ms | ✅ 145ms |
-| Protocol Confusion (Multi-Layer) | ✅ 107ms | ✅ 156ms |
-| State Table Exhaustion | ✅ 2102ms | ✅ 2116ms |
+| QUIC Salamander | ✅ 140ms | ✅ 132ms |
+| REALITY Protocol | ✅ 231ms | ✅ 217ms |
+| HTTP Polling (meek-style) | ✅ 175ms | ✅ 172ms |
+| HTTP/2 Steganography | ✅ 139ms | ✅ 179ms |
+| WebSocket Salamander | ✅ 140ms | ✅ 177ms |
+| Traffic Morph (Yandex Video) | ✅ 135ms | ✅ 172ms |
+| Traffic Morph (VK Video) | ✅ 137ms | ✅ 172ms |
+| Traffic Morph (Baidu Video) | ✅ 177ms | ✅ 171ms |
+| Traffic Morph (Aparat Video) | ✅ 137ms | ✅ 179ms |
+| Geneva (Russia TSPU) | ✅ 185ms | ✅ 166ms |
+| Geneva (China GFW) | ✅ 170ms | ✅ 182ms |
+| Geneva (Iran DPI) | ✅ 189ms | ✅ 182ms |
+| Anti-Probe Resistance | ✅ 888ms | ✅ 906ms |
+| Protocol Confusion (DNS/TLS) | ✅ 121ms | ✅ 105ms |
+| Protocol Confusion (HTTP/TLS) | ✅ 123ms | ✅ 120ms |
+| Protocol Confusion (SSH/TLS) | ✅ 134ms | ✅ 119ms |
+| Protocol Confusion (SMTP/TLS) | ✅ 90ms | ✅ 126ms |
+| Protocol Confusion (Multi-Layer) | ✅ 92ms | ✅ 130ms |
+| State Table Exhaustion | ✅ 2083ms | ✅ 2102ms |
 
 ### → Hetzner Nuremberg
 
 | Strategy | Rostelecom | MegaFon |
 |----------|------------|---------|
-| QUIC Salamander | ✅ 93ms | ✅ 110ms |
-| REALITY Protocol | ✅ 166ms | ✅ 194ms |
-| HTTP Polling (meek-style) | ✅ 131ms | ✅ 171ms |
-| HTTP/2 Steganography | ✅ 127ms | ✅ 168ms |
-| WebSocket Salamander | ✅ 126ms | ✅ 139ms |
-| Traffic Morph (Yandex Video) | ✅ 125ms | ✅ 137ms |
-| Traffic Morph (VK Video) | ✅ 133ms | ✅ 144ms |
-| Traffic Morph (Baidu Video) | ✅ 128ms | ✅ 170ms |
-| Traffic Morph (Aparat Video) | ✅ 123ms | ✅ 170ms |
-| Geneva (Russia TSPU) | ✅ 165ms | ✅ 166ms |
-| Geneva (China GFW) | ✅ 123ms | ✅ 166ms |
-| Geneva (Iran DPI) | ✅ 134ms | ✅ 168ms |
-| Anti-Probe Resistance | ✅ 879ms | ✅ 917ms |
-| Protocol Confusion (DNS/TLS) | ✅ 83ms | ✅ 112ms |
-| Protocol Confusion (HTTP/TLS) | ✅ 82ms | ✅ 112ms |
-| Protocol Confusion (SSH/TLS) | ✅ 84ms | ✅ 103ms |
-| Protocol Confusion (SMTP/TLS) | ✅ 84ms | ✅ 114ms |
-| Protocol Confusion (Multi-Layer) | ✅ 90ms | ✅ 119ms |
-| State Table Exhaustion | ✅ 2083ms | ✅ 2081ms |
+| QUIC Salamander | ✅ 89ms | ✅ 121ms |
+| REALITY Protocol | ✅ 162ms | ✅ 193ms |
+| HTTP Polling (meek-style) | ✅ 115ms | ✅ 168ms |
+| HTTP/2 Steganography | ✅ 135ms | ✅ 171ms |
+| WebSocket Salamander | ✅ 119ms | ✅ 170ms |
+| Traffic Morph (Yandex Video) | ✅ 122ms | ✅ 146ms |
+| Traffic Morph (VK Video) | ✅ 123ms | ✅ 171ms |
+| Traffic Morph (Baidu Video) | ✅ 122ms | ✅ 169ms |
+| Traffic Morph (Aparat Video) | ✅ 113ms | ✅ 145ms |
+| Geneva (Russia TSPU) | ✅ 162ms | ✅ 145ms |
+| Geneva (China GFW) | ✅ 131ms | ✅ 168ms |
+| Geneva (Iran DPI) | ✅ 122ms | ✅ 170ms |
+| Anti-Probe Resistance | ✅ 881ms | ✅ 911ms |
+| Protocol Confusion (DNS/TLS) | ✅ 88ms | ✅ 120ms |
+| Protocol Confusion (HTTP/TLS) | ✅ 81ms | ✅ 107ms |
+| Protocol Confusion (SSH/TLS) | ✅ 87ms | ✅ 104ms |
+| Protocol Confusion (SMTP/TLS) | ✅ 80ms | ✅ 106ms |
+| Protocol Confusion (Multi-Layer) | ✅ 90ms | ✅ 112ms |
+| State Table Exhaustion | ✅ 2083ms | ✅ 2099ms |
 
 ---
 *Generated automatically.*
