@@ -2292,12 +2292,16 @@ func handleConfusionTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverC
 func handleRawTunnel(conn net.Conn, srvCtx *serverContext, logger *log.Logger, clientID string) {
 	logger.Debug("Starting raw tunnel mode")
 
-	// Track per-client connection for metrics
+	// Track per-client connection for metrics. Use a closure on the conn
+	// variable so the defer picks up the kTLS-wrapped value if we hand
+	// the socket over later via ktls.TryEnable + registry.SwapConn.
 	if srvCtx.registry != nil && clientID != "" {
 		if err := srvCtx.registry.AddConnection(clientID, conn); err != nil {
 			logger.Warn("Failed to track connection for client %s: %v", clientID, err)
 		} else {
-			defer srvCtx.registry.RemoveConnection(clientID, conn)
+			defer func() {
+				srvCtx.registry.RemoveConnection(clientID, conn)
+			}()
 		}
 	}
 
@@ -2364,15 +2368,22 @@ func handleRawTunnel(conn net.Conn, srvCtx *serverContext, logger *log.Logger, c
 
 	// Send success ack
 	if _, err := conn.Write([]byte{0x00}); err != nil {
-		logger.Debug("Failed to write success ack: %v", err)
+		logger.Warn("Failed to write success ack: %v", err)
 		return
 	}
 	logger.Debug("Connected to target, starting relay")
 
 	// Auth phase complete: hand the socket over to kTLS for the byte-relay phase.
 	// At this point the TLS stack's read buffer is empty (we read mode + addr
-	// to completion) and the write buffer has been flushed by the ack write.
+	// to completion) and tls.Conn.Write has written the ack synchronously to
+	// the kernel send buffer.
+	preSwap := conn
 	conn = ktls.TryEnable(conn, "tired-raw")
+	if conn != preSwap && srvCtx.registry != nil && clientID != "" {
+		// Replace the stored *tls.Conn pointer so forced-disconnect Close()
+		// targets the live ktls.Conn wrapper rather than the stale *tls.Conn.
+		srvCtx.registry.SwapConn(clientID, preSwap, conn)
+	}
 
 	// Relay data
 	var wg sync.WaitGroup
