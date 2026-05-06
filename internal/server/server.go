@@ -876,10 +876,19 @@ func handleConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 		alpn := tlsConn.ConnectionState().NegotiatedProtocol
 		var finalConn net.Conn = tlsConn
 
-		// NOTE: Don't enable kTLS for "tired-morph" - it sends application data
-		// immediately after TLS handshake, which may be buffered in tlsConn.
-		// kTLS reads directly from TCP socket and would miss buffered data.
-		if strings.HasPrefix(alpn, "tired-") && alpn != "tired-morph" && alpn != "tired-polling" {
+		// NOTE: Don't enable kTLS for protocols that send application data
+		// immediately after TLS handshake — the data may already be buffered
+		// in the Go TLS stack. kTLS reads directly from the TCP socket, so it
+		// would either miss that data (EOF) or fail AEAD verification (EBADMSG)
+		// because the kernel's sequence number starts at 0 while the socket is
+		// already past the first record.
+		kTLSUnsafe := map[string]bool{
+			"tired-morph":   true, // sends data immediately after handshake
+			"tired-polling": true, // same
+			"tired-stego":   true, // H2 preface sent immediately → EBADMSG on kTLS
+			"tired-ws":      true, // WebSocket upgrade sent immediately → EBADMSG on kTLS
+		}
+		if strings.HasPrefix(alpn, "tired-") && !kTLSUnsafe[alpn] {
 			// Modern client with "tired-*" ALPN - enable kTLS
 			if ktlsConn := ktls.Enable(tlsConn); ktlsConn != nil {
 				finalConn = ktlsConn
