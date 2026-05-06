@@ -4,10 +4,13 @@ import (
 	"crypto/tls"
 	"io"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/log"
 )
+
+var firstEnableLog sync.Once
 
 // Conn wraps a TLS connection after kTLS is enabled.
 // After kTLS is enabled, we can use the underlying TCP connection directly
@@ -98,7 +101,10 @@ func (c *Conn) ConnectionState() tls.ConnectionState {
 //   - if conn is a *tls.Conn whose TLS records have been fully drained from
 //     the TLS-stack buffer (i.e. the next read will hit raw socket), Enable is
 //     called and the *Conn wrapper is returned.
-//   - otherwise (non-TLS, fallback failed) the original conn is returned.
+//   - otherwise the original conn is returned unchanged. This covers both
+//     non-TLS conns and *tls.Conn values for which Enable returns nil (kernel
+//     TLS unsupported or cipher not offloadable); in the latter case the
+//     original *tls.Conn remains valid for continued TLS-stack I/O.
 //
 // label identifies the call site for log output ("tired-raw", "tired-confusion", ...).
 //
@@ -114,7 +120,10 @@ func TryEnable(conn net.Conn, label string) net.Conn {
 		return conn
 	}
 	if k := Enable(tlsConn); k != nil {
-		log.Info("kTLS enabled for %s (relay phase)", label)
+		firstEnableLog.Do(func() {
+			log.Info("kTLS enabled (first activation, label=%s); subsequent activations at debug level", label)
+		})
+		log.Debug("kTLS enabled for %s (relay phase)", label)
 		return k
 	}
 	log.Debug("kTLS unavailable for %s, using TLS stack", label)

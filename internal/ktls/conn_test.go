@@ -5,9 +5,6 @@ import (
 	"testing"
 )
 
-// fakeConn is a minimal net.Conn for testing the TryEnable type-assert path.
-type fakeConn struct{ net.Conn }
-
 func TestTryEnable_NotTLSReturnsOriginal(t *testing.T) {
 	a, b := net.Pipe()
 	defer a.Close()
