@@ -902,7 +902,6 @@ func handleConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 // Uses ALPN-based routing when available; falls back to legacy magic-byte
 // detection for backwards compatibility.
 func handleTLSConnection(conn *tls.Conn, srvCtx *serverContext, connID uint64) {
-	_ = srvCtx.cfg // Used in legacy path
 	logger := log.WithPrefix(fmt.Sprintf("conn:%d", connID))
 
 	// Get negotiated ALPN protocol from TLS handshake
