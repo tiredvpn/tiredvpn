@@ -26,7 +26,6 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"github.com/tiredvpn/tiredvpn/internal/control"
-	"github.com/tiredvpn/tiredvpn/internal/ktls"
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/padding"
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
@@ -871,35 +870,17 @@ func handleConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 			return
 		}
 
-		// Check ALPN before enabling kTLS - only enable for "tired-*" protocols
-		// Legacy protocols (http/1.1, h2) need *tls.Conn for magic-byte detection
+		// kTLS is enabled per-handler in the relay phase, after each protocol's
+		// auth/header bytes are fully drained from the TLS stack. See
+		// internal/ktls.TryEnable and the handlers below.
 		alpn := tlsConn.ConnectionState().NegotiatedProtocol
-		var finalConn net.Conn = tlsConn
-
-		// NOTE: Don't enable kTLS for protocols that send application data
-		// immediately after TLS handshake — the data may already be buffered
-		// in the Go TLS stack. kTLS reads directly from the TCP socket, so it
-		// would either miss that data (EOF) or fail AEAD verification (EBADMSG)
-		// because the kernel's sequence number starts at 0 while the socket is
-		// already past the first record.
-		kTLSUnsafe := map[string]bool{
-			"tired-morph":   true, // sends data immediately after handshake
-			"tired-polling": true, // same
-			"tired-stego":   true, // H2 preface sent immediately → EBADMSG on kTLS
-			"tired-ws":      true, // WebSocket upgrade sent immediately → EBADMSG on kTLS
-		}
-		if strings.HasPrefix(alpn, "tired-") && !kTLSUnsafe[alpn] {
-			// Modern client with "tired-*" ALPN - enable kTLS
-			if ktlsConn := ktls.Enable(tlsConn); ktlsConn != nil {
-				finalConn = ktlsConn
-			}
-		}
+		_ = alpn // alpn used for logging in handleTLSConnection
 
 		// Clear deadline after successful handshake
 		tlsConn.SetReadDeadline(time.Time{})
 
 		// Now detect protocol over TLS
-		handleTLSConnection(finalConn, srvCtx, connID)
+		handleTLSConnection(tlsConn, srvCtx, connID)
 		return
 	}
 
@@ -916,20 +897,15 @@ func handleConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 }
 
 // handleTLSConnection handles protocols over TLS (after TLS handshake completed)
-// Uses ALPN-based routing when available, enabling kTLS before any read/write.
+// Uses ALPN-based routing when available. Each handler is responsible for
+// calling ktls.TryEnable at the relay-phase boundary.
 // Falls back to legacy magic-byte detection for backwards compatibility.
-func handleTLSConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
+func handleTLSConnection(conn *tls.Conn, srvCtx *serverContext, connID uint64) {
 	_ = srvCtx.cfg // Used in legacy path
 	logger := log.WithPrefix(fmt.Sprintf("conn:%d", connID))
 
 	// Get negotiated ALPN protocol from TLS handshake
-	// Both *tls.Conn and *ktls.Conn have ConnectionState() method
-	var alpn string
-	if tc, ok := conn.(*tls.Conn); ok {
-		alpn = tc.ConnectionState().NegotiatedProtocol
-	} else if kc, ok := conn.(*ktls.Conn); ok {
-		alpn = kc.ConnectionState().NegotiatedProtocol
-	}
+	alpn := conn.ConnectionState().NegotiatedProtocol
 	logger.Debug("TLS ALPN negotiated: %q", alpn)
 
 	// ALPN-based routing (new clients with kTLS support)
@@ -967,15 +943,8 @@ func handleTLSConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 	}
 
 	// Fallback: legacy protocol detection (for old clients without custom ALPN)
-	// This reads bytes and disables kTLS benefits, but maintains compatibility
 	logger.Debug("ALPN fallback: using legacy magic-byte detection")
-	// For legacy path, we need *tls.Conn, so cast it
-	if tc, ok := conn.(*tls.Conn); ok {
-		handleTLSConnectionLegacy(tc, srvCtx, connID)
-	} else {
-		logger.Warn("Legacy fallback not supported for kTLS connections")
-		conn.Close()
-	}
+	handleTLSConnectionLegacy(conn, srvCtx, connID)
 }
 
 // handleTLSConnectionLegacy handles TLS connections using magic-byte detection
