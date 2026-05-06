@@ -2034,7 +2034,15 @@ func handleProtocolConfusion(conn net.Conn, srvCtx *serverContext, logger *log.L
 	if buf[embeddedStart] == 0x02 {
 		logger.Info("Confusion TUN mode detected")
 		// Confirm understanding
-		conn.Write([]byte("TIRED"))
+		if _, err := conn.Write([]byte("TIRED")); err != nil {
+			logger.Warn("Failed to write confusion TUN ack: %v", err)
+			return
+		}
+		// Auth phase complete: hand the socket over to kTLS for the byte-relay phase.
+		// At this point the TLS stack's read buffer is empty (we read the magic
+		// + embedded data block to completion) and tls.Conn.Write has written
+		// the ack synchronously to the kernel send buffer.
+		conn = ktls.TryEnable(conn, "tired-confusion")
 		handleConfusionTUNMode(conn, buf[embeddedStart+1:totalRead], srvCtx, logger)
 		return
 	}
@@ -2068,8 +2076,17 @@ func handleProtocolConfusion(conn net.Conn, srvCtx *serverContext, logger *log.L
 	defer targetConn.Close()
 
 	// Send success (length-prefixed as client expects)
-	conn.Write([]byte{0x00, 0x00, 0x00, 0x01, 0x00})
+	if _, err := conn.Write([]byte{0x00, 0x00, 0x00, 0x01, 0x00}); err != nil {
+		logger.Warn("Failed to write confusion tunnel ack: %v", err)
+		return
+	}
 	logger.Debug("Connected to target, starting confusion relay")
+
+	// Auth phase complete: hand the socket over to kTLS for the byte-relay phase.
+	// At this point the TLS stack's read buffer is empty (we read the magic
+	// + embedded data block to completion) and tls.Conn.Write has written
+	// the ack synchronously to the kernel send buffer.
+	conn = ktls.TryEnable(conn, "tired-confusion")
 
 	// Relay data
 	var wg sync.WaitGroup
