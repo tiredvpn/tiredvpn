@@ -3285,37 +3285,13 @@ func handleWebSocketPadded(conn net.Conn, srvCtx *serverContext, logger *log.Log
 
 	logger.Debug("WebSocket Padded: Processing connection from %s", conn.RemoteAddr())
 
-	// Read upgrade request (already peeked, but read full headers)
-	reader := bufio.NewReader(conn)
-
-	// Read request line
-	_, err := reader.ReadString('\n')
+	// Read upgrade request byte-exactly so no bytes past \r\n\r\n are
+	// consumed into an internal buffer. bufio.NewReader would pre-fetch
+	// past the empty line and lose those bytes when kTLS takes over.
+	_, headers, err := readHTTPRequestExact(conn, 8192)
 	if err != nil {
-		logger.Error("WebSocket Padded: Failed to read request line: %v", err)
+		logger.Error("WebSocket Padded: Failed to read upgrade request: %v", err)
 		return
-	}
-
-	// Read headers
-	headers := make(map[string]string)
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			logger.Error("WebSocket Padded: Failed to read headers: %v", err)
-			return
-		}
-
-		lineTrimmed := bytes.TrimSpace([]byte(line))
-		if len(lineTrimmed) == 0 {
-			break // End of headers
-		}
-
-		// Parse header
-		parts := bytes.SplitN(lineTrimmed, []byte(":"), 2)
-		if len(parts) == 2 {
-			key := string(bytes.TrimSpace(parts[0]))
-			value := string(bytes.TrimSpace(parts[1]))
-			headers[key] = value
-		}
 	}
 
 	// Verify required headers
@@ -3400,6 +3376,16 @@ func handleWebSocketPadded(conn net.Conn, srvCtx *serverContext, logger *log.Log
 	}
 
 	logger.Info("WebSocket Padded: Upgrade complete for %s (client: %s)", conn.RemoteAddr(), clientID)
+
+	// Auth + upgrade complete: hand the socket over to kTLS for the
+	// frame-relay phase. readHTTPRequestExact stopped at \r\n\r\n with no
+	// over-read, and the upgrade response was written synchronously to
+	// the kernel send buffer.
+	preSwap := conn
+	conn = ktls.TryEnable(conn, "tired-ws")
+	if conn != preSwap && srvCtx.registry != nil && clientID != "" {
+		srvCtx.registry.SwapConn(clientID, preSwap, conn)
+	}
 
 	// Wrap with SalamanderConn using the authenticated secret
 	padder := padding.NewSalamanderPadder(usedSecret, padding.Balanced)
