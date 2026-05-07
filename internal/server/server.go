@@ -871,35 +871,16 @@ func handleConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 			return
 		}
 
-		// Check ALPN before enabling kTLS - only enable for "tired-*" protocols
-		// Legacy protocols (http/1.1, h2) need *tls.Conn for magic-byte detection
-		alpn := tlsConn.ConnectionState().NegotiatedProtocol
-		var finalConn net.Conn = tlsConn
-
-		// NOTE: Don't enable kTLS for protocols that send application data
-		// immediately after TLS handshake — the data may already be buffered
-		// in the Go TLS stack. kTLS reads directly from the TCP socket, so it
-		// would either miss that data (EOF) or fail AEAD verification (EBADMSG)
-		// because the kernel's sequence number starts at 0 while the socket is
-		// already past the first record.
-		kTLSUnsafe := map[string]bool{
-			"tired-morph":   true, // sends data immediately after handshake
-			"tired-polling": true, // same
-			"tired-stego":   true, // H2 preface sent immediately → EBADMSG on kTLS
-			"tired-ws":      true, // WebSocket upgrade sent immediately → EBADMSG on kTLS
-		}
-		if strings.HasPrefix(alpn, "tired-") && !kTLSUnsafe[alpn] {
-			// Modern client with "tired-*" ALPN - enable kTLS
-			if ktlsConn := ktls.Enable(tlsConn); ktlsConn != nil {
-				finalConn = ktlsConn
-			}
-		}
+		// kTLS is enabled per-handler in the relay phase, after each protocol's
+		// auth/header bytes are fully drained from the TLS stack. See
+		// internal/ktls.TryEnable; per-protocol handlers (tired-raw, tired-confusion)
+		// call it after their auth phase completes.
 
 		// Clear deadline after successful handshake
 		tlsConn.SetReadDeadline(time.Time{})
 
 		// Now detect protocol over TLS
-		handleTLSConnection(finalConn, srvCtx, connID)
+		handleTLSConnection(tlsConn, srvCtx, connID)
 		return
 	}
 
@@ -915,21 +896,16 @@ func handleConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 	serveFakeWebsite(buffConn, cfg, logger)
 }
 
-// handleTLSConnection handles protocols over TLS (after TLS handshake completed)
-// Uses ALPN-based routing when available, enabling kTLS before any read/write.
-// Falls back to legacy magic-byte detection for backwards compatibility.
-func handleTLSConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
-	_ = srvCtx.cfg // Used in legacy path
+// handleTLSConnection handles protocols over TLS (after TLS handshake completed).
+// conn must be a fully-handshaked *tls.Conn — kTLS upgrade is deferred to each
+// per-protocol handler at the relay-phase boundary via ktls.TryEnable.
+// Uses ALPN-based routing when available; falls back to legacy magic-byte
+// detection for backwards compatibility.
+func handleTLSConnection(conn *tls.Conn, srvCtx *serverContext, connID uint64) {
 	logger := log.WithPrefix(fmt.Sprintf("conn:%d", connID))
 
 	// Get negotiated ALPN protocol from TLS handshake
-	// Both *tls.Conn and *ktls.Conn have ConnectionState() method
-	var alpn string
-	if tc, ok := conn.(*tls.Conn); ok {
-		alpn = tc.ConnectionState().NegotiatedProtocol
-	} else if kc, ok := conn.(*ktls.Conn); ok {
-		alpn = kc.ConnectionState().NegotiatedProtocol
-	}
+	alpn := conn.ConnectionState().NegotiatedProtocol
 	logger.Debug("TLS ALPN negotiated: %q", alpn)
 
 	// ALPN-based routing (new clients with kTLS support)
@@ -967,15 +943,8 @@ func handleTLSConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 	}
 
 	// Fallback: legacy protocol detection (for old clients without custom ALPN)
-	// This reads bytes and disables kTLS benefits, but maintains compatibility
 	logger.Debug("ALPN fallback: using legacy magic-byte detection")
-	// For legacy path, we need *tls.Conn, so cast it
-	if tc, ok := conn.(*tls.Conn); ok {
-		handleTLSConnectionLegacy(tc, srvCtx, connID)
-	} else {
-		logger.Warn("Legacy fallback not supported for kTLS connections")
-		conn.Close()
-	}
+	handleTLSConnectionLegacy(conn, srvCtx, connID)
 }
 
 // handleTLSConnectionLegacy handles TLS connections using magic-byte detection
@@ -2064,7 +2033,15 @@ func handleProtocolConfusion(conn net.Conn, srvCtx *serverContext, logger *log.L
 	if buf[embeddedStart] == 0x02 {
 		logger.Info("Confusion TUN mode detected")
 		// Confirm understanding
-		conn.Write([]byte("TIRED"))
+		if _, err := conn.Write([]byte("TIRED")); err != nil {
+			logger.Warn("Failed to write confusion TUN ack: %v", err)
+			return
+		}
+		// Auth phase complete: hand the socket over to kTLS for the byte-relay phase.
+		// At this point the TLS stack's read buffer is empty (we read the magic
+		// + embedded data block to completion) and tls.Conn.Write has written
+		// the ack synchronously to the kernel send buffer.
+		conn = ktls.TryEnable(conn, "tired-confusion")
 		handleConfusionTUNMode(conn, buf[embeddedStart+1:totalRead], srvCtx, logger)
 		return
 	}
@@ -2098,8 +2075,17 @@ func handleProtocolConfusion(conn net.Conn, srvCtx *serverContext, logger *log.L
 	defer targetConn.Close()
 
 	// Send success (length-prefixed as client expects)
-	conn.Write([]byte{0x00, 0x00, 0x00, 0x01, 0x00})
+	if _, err := conn.Write([]byte{0x00, 0x00, 0x00, 0x01, 0x00}); err != nil {
+		logger.Warn("Failed to write confusion tunnel ack: %v", err)
+		return
+	}
 	logger.Debug("Connected to target, starting confusion relay")
+
+	// Auth phase complete: hand the socket over to kTLS for the byte-relay phase.
+	// At this point the TLS stack's read buffer is empty (we read the magic
+	// + embedded data block to completion) and tls.Conn.Write has written
+	// the ack synchronously to the kernel send buffer.
+	conn = ktls.TryEnable(conn, "tired-confusion")
 
 	// Relay data
 	var wg sync.WaitGroup
@@ -2322,12 +2308,16 @@ func handleConfusionTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverC
 func handleRawTunnel(conn net.Conn, srvCtx *serverContext, logger *log.Logger, clientID string) {
 	logger.Debug("Starting raw tunnel mode")
 
-	// Track per-client connection for metrics
+	// Track per-client connection for metrics. Use a closure on the conn
+	// variable so the defer picks up the kTLS-wrapped value if we hand
+	// the socket over later via ktls.TryEnable + registry.SwapConn.
 	if srvCtx.registry != nil && clientID != "" {
 		if err := srvCtx.registry.AddConnection(clientID, conn); err != nil {
 			logger.Warn("Failed to track connection for client %s: %v", clientID, err)
 		} else {
-			defer srvCtx.registry.RemoveConnection(clientID, conn)
+			defer func() {
+				srvCtx.registry.RemoveConnection(clientID, conn)
+			}()
 		}
 	}
 
@@ -2392,9 +2382,24 @@ func handleRawTunnel(conn net.Conn, srvCtx *serverContext, logger *log.Logger, c
 	}
 	defer targetConn.Close()
 
-	// Send success
-	conn.Write([]byte{0x00})
+	// Send success ack
+	if _, err := conn.Write([]byte{0x00}); err != nil {
+		logger.Warn("Failed to write success ack: %v", err)
+		return
+	}
 	logger.Debug("Connected to target, starting relay")
+
+	// Auth phase complete: hand the socket over to kTLS for the byte-relay phase.
+	// At this point the TLS stack's read buffer is empty (we read mode + addr
+	// to completion) and tls.Conn.Write has written the ack synchronously to
+	// the kernel send buffer.
+	preSwap := conn
+	conn = ktls.TryEnable(conn, "tired-raw")
+	if conn != preSwap && srvCtx.registry != nil && clientID != "" {
+		// Replace the stored *tls.Conn pointer so forced-disconnect Close()
+		// targets the live ktls.Conn wrapper rather than the stale *tls.Conn.
+		srvCtx.registry.SwapConn(clientID, preSwap, conn)
+	}
 
 	// Relay data
 	var wg sync.WaitGroup

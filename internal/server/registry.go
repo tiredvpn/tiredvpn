@@ -275,6 +275,28 @@ func (r *ClientRegistry) RemoveConnection(clientID string, conn net.Conn) {
 	}
 }
 
+// SwapConn replaces oldConn with newConn in the connection list for clientID
+// without changing the active-connections counter. Used by handlers that hand
+// the socket over to kTLS after AddConnection has already registered the
+// original *tls.Conn — so that subsequent forced-disconnect (Close) and
+// voluntary RemoveConnection target the live socket wrapper, not the stale
+// *tls.Conn.
+//
+// If oldConn is not currently registered for clientID, SwapConn is a no-op.
+func (r *ClientRegistry) SwapConn(clientID string, oldConn, newConn net.Conn) {
+	r.connMu.Lock()
+	defer r.connMu.Unlock()
+
+	conns := r.connsByID[clientID]
+	for i, c := range conns {
+		if c == oldConn {
+			conns[i] = newConn
+			r.connsByID[clientID] = conns
+			return
+		}
+	}
+}
+
 // GetActiveConns returns number of active connections for a client
 func (r *ClientRegistry) GetActiveConns(clientID string) int {
 	r.connMu.RLock()
