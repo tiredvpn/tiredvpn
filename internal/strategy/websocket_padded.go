@@ -1,7 +1,6 @@
 package strategy
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -13,9 +12,11 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/tiredvpn/tiredvpn/internal/ktls"
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/padding"
 )
@@ -137,38 +138,32 @@ func (s *WebSocketPaddedStrategy) Connect(ctx context.Context, target string) (n
 
 	log.Debug("WebSocket Padded: Sent upgrade request")
 
-	// 3. Read upgrade response
-	reader := bufio.NewReader(tlsConn)
+	// 3. Read upgrade response — byte-exact, no over-read past \r\n\r\n,
+	// so the subsequent ktls.TryEnable can take a clean socket.
 	if deadline, ok := ctx.Deadline(); ok {
 		tlsConn.SetReadDeadline(deadline)
 	} else {
 		tlsConn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	}
 
-	statusLine, err := reader.ReadString('\n')
+	statusLine, _, err := readWSUpgradeResponseExact(tlsConn, 8192)
 	if err != nil {
 		tlsConn.Close()
-		return nil, fmt.Errorf("websocket_padded: failed to read status: %w", err)
+		return nil, fmt.Errorf("websocket_padded: failed to read upgrade response: %w", err)
 	}
+	tlsConn.SetReadDeadline(time.Time{})
 
-	if !bytes.Contains([]byte(statusLine), []byte("101")) {
+	if !strings.Contains(statusLine, "101") {
 		tlsConn.Close()
 		return nil, fmt.Errorf("websocket_padded: upgrade failed: %s", statusLine)
 	}
 
-	// Read headers until empty line
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			tlsConn.Close()
-			return nil, fmt.Errorf("websocket_padded: failed to read headers: %w", err)
-		}
-		if line == "\r\n" || line == "\n" {
-			break // End of headers
-		}
+	// Auth + upgrade complete: kernel offload for the WebSocket-frame phase.
+	// On non-Linux / no-kTLS platforms this is a no-op (returns tlsConn).
+	var baseConn net.Conn = tlsConn
+	if k := ktls.TryEnable(tlsConn, "tired-ws"); k != nil {
+		baseConn = k
 	}
-
-	tlsConn.SetReadDeadline(time.Time{})
 
 	log.Info("WebSocket Padded: Upgrade successful")
 
@@ -178,11 +173,56 @@ func (s *WebSocketPaddedStrategy) Connect(ctx context.Context, target string) (n
 
 	// 5. Wrap with SalamanderConn
 	padder := padding.NewSalamanderPadder(s.secret, paddingLevel)
-	salamanderConn := NewSalamanderConn(tlsConn, padder, true) // true = client side
+	salamanderConn := NewSalamanderConn(baseConn, padder, true) // true = client side
 
 	log.Info("WebSocket Padded: Connection established to %s", target)
 
 	return salamanderConn, nil
+}
+
+// readWSUpgradeResponseExact reads HTTP/1.1 status line + headers from conn
+// strictly up to and including \r\n\r\n, byte-by-byte, with no over-read.
+// A subsequent conn.Read() (potentially through ktls.Conn) will start on
+// the first byte of the WebSocket frame stream.
+//
+// Mirrors internal/server/http_request_reader.go:readHTTPRequestExact.
+// The duplication is intentional — moving both into a shared package is
+// a future cleanup.
+func readWSUpgradeResponseExact(conn net.Conn, maxHeaderBytes int) (string, map[string]string, error) {
+	if maxHeaderBytes <= 0 {
+		maxHeaderBytes = 8192
+	}
+	buf := make([]byte, 0, 1024)
+	one := make([]byte, 1)
+	for len(buf) < maxHeaderBytes {
+		if _, err := io.ReadFull(conn, one); err != nil {
+			return "", nil, fmt.Errorf("read response byte: %w", err)
+		}
+		buf = append(buf, one[0])
+		n := len(buf)
+		if n >= 4 &&
+			buf[n-4] == '\r' && buf[n-3] == '\n' &&
+			buf[n-2] == '\r' && buf[n-1] == '\n' {
+			lines := strings.Split(string(buf[:n-4]), "\r\n")
+			if len(lines) == 0 {
+				return "", nil, errors.New("empty response")
+			}
+			statusLine := lines[0]
+			headers := make(map[string]string, len(lines)-1)
+			for _, line := range lines[1:] {
+				if line == "" {
+					continue
+				}
+				i := strings.IndexByte(line, ':')
+				if i <= 0 {
+					return "", nil, fmt.Errorf("malformed header: %q", line)
+				}
+				headers[strings.TrimSpace(line[:i])] = strings.TrimSpace(line[i+1:])
+			}
+			return statusLine, headers, nil
+		}
+	}
+	return "", nil, errors.New("response too large")
 }
 
 // SalamanderConn wraps a WebSocket connection with Salamander padding
