@@ -1029,10 +1029,33 @@ func handleTLSConnectionLegacy(conn *tls.Conn, srvCtx *serverContext, connID uin
 // handleHTTP2WithALPN handles HTTP/2 Stego when ALPN was used
 // Since kTLS is already enabled, we just need to read the preface and delegate to handleHTTP2
 func handleHTTP2WithALPN(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
-	logger.Debug("HTTP/2 via ALPN (kTLS enabled)")
-	// handleHTTP2 expects to read the preface first, so we pass conn directly
-	// The client still sends preface after ALPN negotiation
-	handleHTTP2(conn, srvCtx, logger)
+	logger.Debug("HTTP/2 via ALPN — kTLS upgrade after preface read")
+
+	// Read the preface through the TLS stack. This drains any decrypted
+	// preface bytes from tls.Conn's buffer so the subsequent kTLS Enable
+	// gives the kernel a record-sequence counter that matches the next
+	// byte on the wire.
+	if err := readH2Preface(conn, logger); err != nil {
+		return
+	}
+
+	// Auth phase complete: hand the socket over to kTLS for the byte-relay
+	// phase. Subsequent frame I/O (HEADERS / DATA) goes through the kernel.
+	conn = ktls.TryEnable(conn, "tired-stego")
+
+	framer, err := newH2Framer(conn, logger)
+	if err != nil {
+		return
+	}
+
+	hpackDec := hpack.NewDecoder(4096, nil)
+	authenticated := false
+	var authClientID string
+	var tunnel *h2TunnelState
+	var connTracked bool
+	defer cleanupH2Conn(conn, srvCtx, &tunnel, &connTracked, &authClientID)
+
+	runH2FrameLoop(conn, framer, hpackDec, srvCtx, logger, &authenticated, &authClientID, &connTracked, &tunnel)
 }
 
 // handleMorphConnectionWithALPN handles Morph protocol when ALPN was used
@@ -1346,18 +1369,44 @@ func handleMorphConnection(conn net.Conn, srvCtx *serverContext, logger *log.Log
 
 	if !authenticated {
 		logger.Warn("Traffic Morph authentication FAILED")
+		conn.Write([]byte{0x01}) // best-effort fail ack; client treats as fail and closes
 		return
 	}
 
 	_ = usedSecret // Mark as used
 
-	// Track per-client connection for metrics
+	// Track per-client connection for metrics. Use a closure on the conn
+	// variable so the defer picks up the kTLS-wrapped value if we hand
+	// the socket over later via ktls.TryEnable + registry.SwapConn.
 	if srvCtx.registry != nil && clientID != "" {
 		if err := srvCtx.registry.AddConnection(clientID, conn); err != nil {
 			logger.Warn("Failed to track connection for client %s: %v", clientID, err)
 		} else {
-			defer srvCtx.registry.RemoveConnection(clientID, conn)
+			defer func() {
+				srvCtx.registry.RemoveConnection(clientID, conn)
+			}()
 		}
+	}
+
+	// Auth complete — write 1-byte ack to client (Phase 2 wire protocol).
+	// 0x00 = auth ok, dialing target next. The client must read this byte
+	// before sending the first morph frame, so it can ktls.TryEnable on
+	// the matching boundary.
+	if _, err := conn.Write([]byte{0x00}); err != nil {
+		logger.Warn("Failed to write morph auth ack: %v", err)
+		return
+	}
+
+	// Auth phase complete: hand the socket over to kTLS for the relay
+	// phase. We have read MRPH+name+auth to completion and the ack write
+	// flushed synchronously to the kernel send buffer. Subsequent morph
+	// frame reads (target addr) and writes (relay data) go through kTLS.
+	preSwap := conn
+	conn = ktls.TryEnable(conn, "tired-morph")
+	if conn != preSwap && srvCtx.registry != nil && clientID != "" {
+		// Replace the stored *tls.Conn with the live *ktls.Conn so
+		// forced-disconnect Close() targets the right socket wrapper.
+		srvCtx.registry.SwapConn(clientID, preSwap, conn)
 	}
 
 	// Read first morph packet containing target address
@@ -3236,37 +3285,13 @@ func handleWebSocketPadded(conn net.Conn, srvCtx *serverContext, logger *log.Log
 
 	logger.Debug("WebSocket Padded: Processing connection from %s", conn.RemoteAddr())
 
-	// Read upgrade request (already peeked, but read full headers)
-	reader := bufio.NewReader(conn)
-
-	// Read request line
-	_, err := reader.ReadString('\n')
+	// Read upgrade request byte-exactly so no bytes past \r\n\r\n are
+	// consumed into an internal buffer. bufio.NewReader would pre-fetch
+	// past the empty line and lose those bytes when kTLS takes over.
+	_, headers, err := readHTTPRequestExact(conn, 8192)
 	if err != nil {
-		logger.Error("WebSocket Padded: Failed to read request line: %v", err)
+		logger.Error("WebSocket Padded: Failed to read upgrade request: %v", err)
 		return
-	}
-
-	// Read headers
-	headers := make(map[string]string)
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			logger.Error("WebSocket Padded: Failed to read headers: %v", err)
-			return
-		}
-
-		lineTrimmed := bytes.TrimSpace([]byte(line))
-		if len(lineTrimmed) == 0 {
-			break // End of headers
-		}
-
-		// Parse header
-		parts := bytes.SplitN(lineTrimmed, []byte(":"), 2)
-		if len(parts) == 2 {
-			key := string(bytes.TrimSpace(parts[0]))
-			value := string(bytes.TrimSpace(parts[1]))
-			headers[key] = value
-		}
 	}
 
 	// Verify required headers
@@ -3351,6 +3376,16 @@ func handleWebSocketPadded(conn net.Conn, srvCtx *serverContext, logger *log.Log
 	}
 
 	logger.Info("WebSocket Padded: Upgrade complete for %s (client: %s)", conn.RemoteAddr(), clientID)
+
+	// Auth + upgrade complete: hand the socket over to kTLS for the
+	// frame-relay phase. readHTTPRequestExact stopped at \r\n\r\n with no
+	// over-read, and the upgrade response was written synchronously to
+	// the kernel send buffer.
+	preSwap := conn
+	conn = ktls.TryEnable(conn, "tired-ws")
+	if conn != preSwap && srvCtx.registry != nil && clientID != "" {
+		srvCtx.registry.SwapConn(clientID, preSwap, conn)
+	}
 
 	// Wrap with SalamanderConn using the authenticated secret
 	padder := padding.NewSalamanderPadder(usedSecret, padding.Balanced)

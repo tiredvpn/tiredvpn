@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"fmt"
 	"io"
 	mathrand "math/rand"
 	"net"
@@ -330,13 +331,40 @@ func (s *TrafficMorphStrategy) Connect(ctx context.Context, target string) (net.
 			return nil, err
 		}
 
-		// Try to enable kTLS for kernel TLS offload
-		// This returns a wrapped connection that uses raw socket I/O
-		if ktlsConn := ktls.Enable(tlsConn); ktlsConn != nil {
+		// Pre-Enable handshake: write MRPH+nameLen+name+auth through the TLS
+		// stack so the server can verify auth and reply with a 1-byte ack.
+		// We must read that ack BEFORE ktls.TryEnable so the kernel takes
+		// over a socket whose TLS receive buffer is empty and whose record
+		// sequence counter matches the next byte on the wire.
+		profileName := []byte(s.profile.Name)
+		authToken := generateAuthToken(s.secret)
+		hs := make([]byte, 5+len(profileName)+32)
+		copy(hs[0:4], []byte("MRPH"))
+		hs[4] = byte(len(profileName))
+		copy(hs[5:], profileName)
+		copy(hs[5+len(profileName):], authToken)
+		if _, err := tlsConn.Write(hs); err != nil {
+			tcpConn.Close()
+			return nil, fmt.Errorf("morph handshake write: %w", err)
+		}
+
+		ack := make([]byte, 1)
+		tlsConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if _, err := io.ReadFull(tlsConn, ack); err != nil {
+			tcpConn.Close()
+			return nil, fmt.Errorf("morph read ack: %w", err)
+		}
+		tlsConn.SetReadDeadline(time.Time{})
+		if ack[0] != 0x00 {
+			tcpConn.Close()
+			return nil, fmt.Errorf("morph server ack=0x%02x (failure)", ack[0])
+		}
+
+		// Auth + ack done — kernel offload for the byte-relay phase.
+		baseConn = tlsConn
+		if k := ktls.TryEnable(tlsConn, "tired-morph"); k != nil {
 			log.Debug("kTLS enabled for Morph connection")
-			baseConn = ktlsConn
-		} else {
-			baseConn = tlsConn
+			baseConn = k
 		}
 		err = nil
 	}
@@ -345,8 +373,25 @@ func (s *TrafficMorphStrategy) Connect(ctx context.Context, target string) (net.
 		return nil, err
 	}
 
-	// Wrap with morphing layer
-	return NewMorphedConnWithShaper(baseConn, s.profile, s.secret, s.customShaper), nil
+	// Wrap with morphing layer.
+	// For the direct-TLS path (s.baseStrat == nil) the MRPH handshake was
+	// already written above, so we build the struct literal directly to avoid
+	// NewMorphedConnWithShaper re-sending the handshake bytes.
+	// For the baseStrat path the handshake goes through the underlying strategy
+	// transport via NewMorphedConnWithShaper as before.
+	if s.baseStrat != nil {
+		return NewMorphedConnWithShaper(baseConn, s.profile, s.secret, s.customShaper), nil
+	}
+	sh := s.customShaper
+	if sh == nil {
+		sh = shaper.NoopShaper{}
+	}
+	return &MorphedConn{
+		Conn:        baseConn,
+		profile:     s.profile,
+		shaper:      sh,
+		rateLimiter: nil,
+	}, nil
 }
 
 // SetShaper injects a custom Shaper into all subsequent MorphedConn instances
