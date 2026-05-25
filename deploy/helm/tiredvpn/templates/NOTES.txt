@@ -1,0 +1,82 @@
+tiredvpn {{ .Chart.AppVersion }} установлен как release «{{ .Release.Name }}» в namespace «{{ .Release.Namespace }}».
+
+{{- if .Values.server.enabled }}
+
+SERVER
+======
+Workload:  Deployment/{{ include "tiredvpn.server.fullname" . }}
+Main Service ({{ .Values.server.service.main.type }}):  {{ include "tiredvpn.server.fullname" . }}
+  TCP: {{ .Values.server.config.listen }}
+{{- if .Values.server.config.quic.enabled }}
+  UDP (QUIC): {{ default .Values.server.config.listen .Values.server.config.quic.listen }}
+{{- end }}
+{{- if .Values.server.config.ipv6.enabled }}
+  IPv6 TCP: {{ .Values.server.config.listenV6 }}
+{{- end }}
+
+{{- if eq .Values.server.service.main.type "LoadBalancer" }}
+
+Узнать внешний адрес LoadBalancer:
+  kubectl -n {{ .Release.Namespace }} get svc {{ include "tiredvpn.server.fullname" . }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}{.status.loadBalancer.ingress[0].hostname}'
+
+{{- else if eq .Values.server.service.main.type "NodePort" }}
+
+Получить NodePort'ы:
+  kubectl -n {{ .Release.Namespace }} get svc {{ include "tiredvpn.server.fullname" . }} -o jsonpath='{.spec.ports}'
+
+{{- end }}
+
+{{- if .Values.server.config.api.enabled }}
+
+API / Health / Metrics ({{ include "tiredvpn.server.fullname" . }}-api):
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "tiredvpn.server.fullname" . }}-api 8080:{{ .Values.server.service.api.port }}
+  curl http://localhost:8080/health
+  curl http://localhost:8080/metrics
+{{- end }}
+
+{{- if eq .Values.server.auth.mode "secret" }}
+
+Auth (single-client). Чтобы получить shared secret:
+  kubectl -n {{ .Release.Namespace }} get secret {{ include "tiredvpn.server.authSecretName" . }} -o jsonpath='{.data.{{ include "tiredvpn.server.authSecretKey" . }}}' | base64 -d
+{{- end }}
+
+{{- if and .Values.server.redis.addr (not .Values.redis.enabled) }}
+
+Redis: используется внешний {{ .Values.server.redis.addr }}.
+{{- else if .Values.redis.enabled }}
+
+Redis subchart (bitnami) поднят как {{ .Release.Name }}-redis-master:6379.
+{{- end }}
+{{- end }}
+
+{{- if .Values.client.enabled }}
+
+CLIENT (mode={{ .Values.client.mode }})
+=================================
+
+{{- if include "tiredvpn.client.socks.enabled" . }}
+
+SOCKS5 proxy:
+  Service: {{ include "tiredvpn.client.socks.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.client.socks.service.port }}
+  Из других подов: socks5://{{ include "tiredvpn.client.socks.fullname" . }}:{{ .Values.client.socks.service.port }}
+  Локальный port-forward для теста:
+    kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "tiredvpn.client.socks.fullname" . }} 1080:{{ .Values.client.socks.service.port }}
+    curl -x socks5h://localhost:1080 https://ifconfig.me
+{{- end }}
+
+{{- if include "tiredvpn.client.tun.enabled" . }}
+
+TUN tunnel (DaemonSet на каждом linux-узле):
+  ⚠️  Дефолтный образ tiredvpn/tiredvpn собран FROM scratch и НЕ содержит `ip`/`iptables`,
+      которые клиент использует для настройки TUN. Перед использованием TUN-режима соберите
+      собственный образ на базе alpine с iproute2+iptables и задайте его в
+      client.tun.image.repository (или global.image.repository).
+  Routes: {{ .Values.client.tun.routes }}
+  Логи:
+    kubectl -n {{ .Release.Namespace }} logs -l app.kubernetes.io/component=client-tun -f
+{{- end }}
+{{- end }}
+
+Документация по флагам бинаря:
+  https://github.com/tiredvpn/tiredvpn-oss/blob/main/docs/server.md
+  https://github.com/tiredvpn/tiredvpn-oss/blob/main/docs/client.md

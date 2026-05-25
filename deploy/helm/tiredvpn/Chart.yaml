@@ -1,0 +1,31 @@
+apiVersion: v2
+name: tiredvpn
+description: DPI-resistant VPN — server (exit node) and/or client (SOCKS5 proxy or TUN tunnel).
+type: application
+version: 0.1.0
+appVersion: "1.1.3"
+kubeVersion: ">=1.25.0-0"
+home: https://github.com/tiredvpn/tiredvpn-oss
+sources:
+  - https://github.com/tiredvpn/tiredvpn-oss
+keywords:
+  - vpn
+  - proxy
+  - socks5
+  - tun
+  - dpi-evasion
+  - censorship-resistance
+  - quic
+  - tls
+maintainers:
+  - name: tiredvpn
+dependencies:
+  - name: redis
+    version: "~20.6.0"
+    repository: https://charts.bitnami.com/bitnami
+    condition: redis.enabled
+    tags:
+      - server-storage
+annotations:
+  category: Networking
+  licenses: AGPL-3.0

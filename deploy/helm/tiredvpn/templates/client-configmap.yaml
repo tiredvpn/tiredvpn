@@ -1,0 +1,13 @@
+{{- if and .Values.client.enabled .Values.client.tomlConfig -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "tiredvpn.client.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tiredvpn.labels" . | nindent 4 }}
+    app.kubernetes.io/component: client
+data:
+  client.toml: |
+    {{- .Values.client.tomlConfig | nindent 4 }}
+{{- end }}

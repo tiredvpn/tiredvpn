@@ -1,0 +1,69 @@
+{{- if and .Values.server.enabled .Values.server.networkPolicy.enabled -}}
+{{- $mainPort := regexReplaceAll ".*:([0-9]+).*" .Values.server.config.listen "${1}" | int -}}
+{{- $quicPort := regexReplaceAll ".*:([0-9]+).*" (default .Values.server.config.listen .Values.server.config.quic.listen) "${1}" | int -}}
+{{- $v6Port := regexReplaceAll ".*:([0-9]+).*" .Values.server.config.listenV6 "${1}" | int -}}
+{{- $apiPort := regexReplaceAll ".*:([0-9]+).*" .Values.server.config.api.listen "${1}" | int -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "tiredvpn.server.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tiredvpn.server.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "tiredvpn.server.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Main listener — публичный.
+    - ports:
+        - port: {{ $mainPort }}
+          protocol: TCP
+        {{- if .Values.server.config.quic.enabled }}
+        - port: {{ $quicPort }}
+          protocol: UDP
+        {{- end }}
+        {{- if .Values.server.config.ipv6.enabled }}
+        - port: {{ $v6Port }}
+          protocol: TCP
+        {{- if .Values.server.config.quic.enabled }}
+        - port: {{ $v6Port }}
+          protocol: UDP
+        {{- end }}
+        {{- end }}
+      {{- if not .Values.server.networkPolicy.allowAllExternal }}
+      from:
+        {{- with .Values.server.networkPolicy.allowedFromMain }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
+    {{- if .Values.server.config.api.enabled }}
+    # API/metrics — только из мониторинг-namespace.
+    - ports:
+        - port: {{ $apiPort }}
+          protocol: TCP
+      from:
+        - podSelector:
+            matchLabels:
+              {{- include "tiredvpn.server.selectorLabels" . | nindent 14 }}
+        {{- range .Values.server.networkPolicy.allowedMonitoringNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+        {{- end }}
+    {{- end }}
+  egress:
+    # DNS.
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Redis / upstream / весь мир (для multi-hop клиента).
+    - {}
+{{- end }}

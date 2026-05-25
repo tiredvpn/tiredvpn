@@ -1,0 +1,12 @@
+{{- if and .Values.server.enabled .Values.server.config.fakeRoot.inline -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "tiredvpn.server.fullname" . }}-fakeroot
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tiredvpn.server.labels" . | nindent 4 }}
+data:
+  index.html: |
+    {{- .Values.server.config.fakeRoot.inline | nindent 4 }}
+{{- end }}

@@ -1,0 +1,34 @@
+{{- if include "tiredvpn.client.socks.enabled" . -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "tiredvpn.client.socks.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tiredvpn.client.socks.labels" . | nindent 4 }}
+  {{- with .Values.client.socks.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.client.socks.service.type }}
+  selector:
+    {{- include "tiredvpn.client.socks.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: socks
+      port: {{ .Values.client.socks.service.port }}
+      targetPort: socks
+      protocol: TCP
+    {{- if .Values.client.socks.httpListen }}
+    - name: http
+      port: {{ .Values.client.socks.service.httpPort }}
+      targetPort: http
+      protocol: TCP
+    {{- end }}
+    {{- if .Values.client.config.api.enabled }}
+    - name: api
+      port: {{ regexReplaceAll ".*:([0-9]+).*" .Values.client.config.api.listen "${1}" | int }}
+      targetPort: api
+      protocol: TCP
+    {{- end }}
+{{- end }}

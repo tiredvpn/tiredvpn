@@ -1,0 +1,21 @@
+# Минимальный single-client сервер с inline TLS и secret.
+server:
+  enabled: true
+  service:
+    main:
+      type: ClusterIP   # для lint без LB
+  tls:
+    create: true
+    cert: |
+      -----BEGIN CERTIFICATE-----
+      TESTCERT
+      -----END CERTIFICATE-----
+    key: |
+      -----BEGIN PRIVATE KEY-----
+      TESTKEY
+      -----END PRIVATE KEY-----
+  auth:
+    mode: secret
+    secret: test-shared-secret
+client:
+  enabled: false

@@ -1,0 +1,24 @@
+{{- if and .Values.server.enabled .Values.server.config.api.enabled -}}
+{{- $apiPort := regexReplaceAll ".*:([0-9]+).*" .Values.server.config.api.listen "${1}" | int -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "tiredvpn.server.fullname" . }}-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tiredvpn.server.labels" . | nindent 4 }}
+    app.kubernetes.io/role: api
+  {{- with .Values.server.service.api.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.server.service.api.type }}
+  selector:
+    {{- include "tiredvpn.server.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: api
+      port: {{ .Values.server.service.api.port }}
+      targetPort: api
+      protocol: TCP
+{{- end }}

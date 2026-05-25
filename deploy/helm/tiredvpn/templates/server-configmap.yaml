@@ -1,0 +1,12 @@
+{{- if and .Values.server.enabled .Values.server.tomlConfig -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "tiredvpn.server.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tiredvpn.server.labels" . | nindent 4 }}
+data:
+  server.toml: |
+    {{- .Values.server.tomlConfig | nindent 4 }}
+{{- end }}

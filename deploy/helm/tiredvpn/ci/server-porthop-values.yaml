@@ -1,0 +1,29 @@
+# Сервер с port-hopping + IPv6 dual-stack + NetworkPolicy.
+server:
+  enabled: true
+  service:
+    main:
+      type: ClusterIP
+  tls:
+    create: true
+    cert: "-----BEGIN CERTIFICATE-----\nT\n-----END CERTIFICATE-----"
+    key: "-----BEGIN PRIVATE KEY-----\nT\n-----END PRIVATE KEY-----"
+  auth:
+    mode: secret
+    secret: hop-secret
+  config:
+    portHopping:
+      enabled: true
+      range: "47000-47100"
+      maxPorts: 50
+      interval: 60s
+      strategy: random
+    quic:
+      enabled: true
+      sniReassembly: true
+  networkPolicy:
+    enabled: true
+    allowedMonitoringNamespaces: [monitoring]
+
+client:
+  enabled: false

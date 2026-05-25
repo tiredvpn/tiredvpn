@@ -1,0 +1,29 @@
+# Multi-client сервер с bitnami/redis subchart + ServiceMonitor + PDB.
+server:
+  enabled: true
+  replicaCount: 2
+  service:
+    main:
+      type: ClusterIP
+  tls:
+    create: true
+    cert: "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----"
+    key: "-----BEGIN PRIVATE KEY-----\nTEST\n-----END PRIVATE KEY-----"
+  auth:
+    mode: external      # multi-client: клиенты добавляются через admin API → Redis
+  pdb:
+    enabled: true
+    minAvailable: 1
+  metrics:
+    serviceMonitor:
+      enabled: true
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 8
+
+client:
+  enabled: false
+
+redis:
+  enabled: true

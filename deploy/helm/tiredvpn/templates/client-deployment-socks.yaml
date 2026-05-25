@@ -1,0 +1,133 @@
+{{- if include "tiredvpn.client.socks.enabled" . -}}
+{{- include "tiredvpn.validate" . -}}
+{{- $socksPort := regexReplaceAll ".*:([0-9]+).*" .Values.client.socks.listen "${1}" | int -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "tiredvpn.client.socks.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tiredvpn.client.socks.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.client.socks.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "tiredvpn.client.socks.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "tiredvpn.client.socks.selectorLabels" . | nindent 8 }}
+        {{- with .Values.client.socks.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- if .Values.client.tomlConfig }}
+        checksum/config: {{ .Values.client.tomlConfig | sha256sum }}
+        {{- end }}
+        {{- if and (not .Values.client.server.existingSecret) .Values.client.server.secret }}
+        checksum/credentials: {{ printf "%s%s" .Values.client.server.address .Values.client.server.secret | sha256sum }}
+        {{- end }}
+        {{- with .Values.client.socks.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- include "tiredvpn.imagePullSecrets" . | nindent 6 }}
+      serviceAccountName: {{ include "tiredvpn.serviceAccountName" . }}
+      {{- with .Values.client.socks.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: tiredvpn
+          image: {{ include "tiredvpn.image" . }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          args:
+            {{- include "tiredvpn.client.socks.args" . | nindent 12 }}
+          ports:
+            - name: socks
+              containerPort: {{ $socksPort }}
+              protocol: TCP
+            {{- with .Values.client.socks.httpListen }}
+            - name: http
+              containerPort: {{ regexReplaceAll ".*:([0-9]+).*" . "${1}" | int }}
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.client.config.api.enabled }}
+            - name: api
+              containerPort: {{ regexReplaceAll ".*:([0-9]+).*" .Values.client.config.api.listen "${1}" | int }}
+              protocol: TCP
+            {{- end }}
+          env:
+            {{- if not .Values.client.tomlConfig }}
+            - name: TIREDVPN_SERVER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "tiredvpn.client.secretName" . }}
+                  key: {{ include "tiredvpn.client.secretAddressKey" . }}
+            - name: TIREDVPN_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "tiredvpn.client.secretName" . }}
+                  key: {{ include "tiredvpn.client.secretSecretKey" . }}
+            {{- end }}
+            {{- with .Values.client.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.client.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            {{- if .Values.client.tomlConfig }}
+            - name: config
+              mountPath: /etc/tiredvpn/client.toml
+              subPath: client.toml
+              readOnly: true
+            {{- end }}
+            - name: tmp
+              mountPath: /tmp
+            {{- with .Values.client.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.client.socks.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          livenessProbe:
+            tcpSocket:
+              port: socks
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          readinessProbe:
+            tcpSocket:
+              port: socks
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          {{- with .Values.client.socks.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        {{- if .Values.client.tomlConfig }}
+        - name: config
+          configMap:
+            name: {{ include "tiredvpn.client.fullname" . }}-config
+        {{- end }}
+        - name: tmp
+          emptyDir: {}
+        {{- with .Values.client.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.client.socks.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.client.socks.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.client.socks.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
