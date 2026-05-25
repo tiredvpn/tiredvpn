@@ -1,0 +1,24 @@
+# Только клиент в TUN-режиме (DaemonSet, privileged).
+# Внимание: использует override образа на alpine-base с iproute2/iptables.
+server:
+  enabled: false
+
+client:
+  enabled: true
+  mode: tun
+  server:
+    address: "vpn.example.com:443"
+    secret: "tun-shared-secret"
+  config:
+    api:
+      enabled: true
+  tun:
+    name: tiredvpn0
+    ip: 10.8.0.2
+    peerIp: 10.8.0.1
+    mtu: 1280
+    routes: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+    usePrivileged: false   # NET_ADMIN+NET_RAW caps
+    image:
+      repository: "myorg/tiredvpn-tun"  # override: образ с iproute2+iptables
+      tag: "1.1.3"

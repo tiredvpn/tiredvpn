@@ -1,0 +1,50 @@
+{{- if and (include "tiredvpn.client.socks.enabled" .) .Values.client.networkPolicy.enabled -}}
+{{- $socksPort := regexReplaceAll ".*:([0-9]+).*" .Values.client.socks.listen "${1}" | int -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "tiredvpn.client.socks.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tiredvpn.client.socks.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "tiredvpn.client.socks.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - ports:
+        - port: {{ $socksPort }}
+          protocol: TCP
+        {{- with .Values.client.socks.httpListen }}
+        - port: {{ regexReplaceAll ".*:([0-9]+).*" . "${1}" | int }}
+          protocol: TCP
+        {{- end }}
+      from:
+        {{- range .Values.client.networkPolicy.allowedClientNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+        {{- end }}
+        {{- range .Values.client.networkPolicy.allowedClientPodSelectors }}
+        - podSelector:
+            matchLabels:
+              {{- toYaml . | nindent 14 }}
+        {{- end }}
+        {{- if and (empty .Values.client.networkPolicy.allowedClientNamespaces) (empty .Values.client.networkPolicy.allowedClientPodSelectors) }}
+        - podSelector: {}
+        {{- end }}
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    {{- if .Values.client.networkPolicy.allowAllEgress }}
+    - {}
+    {{- end }}
+{{- end }}
