@@ -1,0 +1,19 @@
+{{- if and .Values.server.enabled .Values.server.pdb.enabled -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "tiredvpn.server.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tiredvpn.server.labels" . | nindent 4 }}
+spec:
+  {{- with .Values.server.pdb.minAvailable }}
+  minAvailable: {{ . }}
+  {{- end }}
+  {{- with .Values.server.pdb.maxUnavailable }}
+  maxUnavailable: {{ . }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "tiredvpn.server.selectorLabels" . | nindent 6 }}
+{{- end }}

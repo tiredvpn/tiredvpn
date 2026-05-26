@@ -1,0 +1,20 @@
+# Server + Client (SOCKS) в одном release — для split-test.
+server:
+  enabled: true
+  service:
+    main:
+      type: ClusterIP
+  tls:
+    create: true
+    cert: "-----BEGIN CERTIFICATE-----\nT\n-----END CERTIFICATE-----"
+    key: "-----BEGIN PRIVATE KEY-----\nT\n-----END PRIVATE KEY-----"
+  auth:
+    mode: secret
+    secret: shared-test-secret
+
+client:
+  enabled: true
+  mode: socks
+  server:
+    address: "127.0.0.1:443"
+    secret: "shared-test-secret"

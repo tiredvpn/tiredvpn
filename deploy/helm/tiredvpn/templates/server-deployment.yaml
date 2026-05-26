@@ -1,0 +1,212 @@
+{{- if .Values.server.enabled -}}
+{{- include "tiredvpn.validate" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "tiredvpn.server.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tiredvpn.server.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if not .Values.server.autoscaling.enabled }}
+  replicas: {{ .Values.server.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "tiredvpn.server.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "tiredvpn.server.selectorLabels" . | nindent 8 }}
+        {{- with .Values.server.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- if .Values.server.tomlConfig }}
+        checksum/config: {{ .Values.server.tomlConfig | sha256sum }}
+        {{- end }}
+        {{- if and (not .Values.server.tomlConfig) (eq .Values.server.auth.mode "secret") (not .Values.server.auth.existingSecret) }}
+        checksum/auth: {{ .Values.server.auth.secret | sha256sum }}
+        {{- end }}
+        {{- if .Values.server.tls.create }}
+        checksum/tls: {{ printf "%s%s" .Values.server.tls.cert .Values.server.tls.key | sha256sum }}
+        {{- end }}
+        {{- with .Values.server.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- include "tiredvpn.imagePullSecrets" . | nindent 6 }}
+      serviceAccountName: {{ include "tiredvpn.serviceAccountName" . }}
+      {{- with .Values.server.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.server.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: tiredvpn
+          image: {{ include "tiredvpn.image" . }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          args:
+            {{- include "tiredvpn.server.args" . | nindent 12 }}
+          ports:
+            - name: main-tcp
+              containerPort: {{ regexReplaceAll ".*:([0-9]+).*" .Values.server.config.listen "${1}" | int }}
+              protocol: TCP
+            {{- if .Values.server.config.quic.enabled }}
+            - name: main-udp
+              containerPort: {{ regexReplaceAll ".*:([0-9]+).*" (default .Values.server.config.listen .Values.server.config.quic.listen) "${1}" | int }}
+              protocol: UDP
+            {{- end }}
+            {{- if .Values.server.config.ipv6.enabled }}
+            - name: v6-tcp
+              containerPort: {{ regexReplaceAll ".*:([0-9]+).*" .Values.server.config.listenV6 "${1}" | int }}
+              protocol: TCP
+            {{- if .Values.server.config.quic.enabled }}
+            - name: v6-udp
+              containerPort: {{ regexReplaceAll ".*:([0-9]+).*" .Values.server.config.listenV6 "${1}" | int }}
+              protocol: UDP
+            {{- end }}
+            {{- end }}
+            {{- if .Values.server.config.api.enabled }}
+            - name: api
+              containerPort: {{ regexReplaceAll ".*:([0-9]+).*" .Values.server.config.api.listen "${1}" | int }}
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.server.config.pprof.enabled }}
+            - name: pprof
+              containerPort: {{ regexReplaceAll ".*:([0-9]+).*" .Values.server.config.pprof.listen "${1}" | int }}
+              protocol: TCP
+            {{- end }}
+          env:
+            {{- if and (not .Values.server.tomlConfig) (eq .Values.server.auth.mode "secret") }}
+            - name: TIREDVPN_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "tiredvpn.server.authSecretName" . }}
+                  key: {{ include "tiredvpn.server.authSecretKey" . }}
+            {{- end }}
+            {{- if and (not .Values.server.tomlConfig) .Values.server.config.upstream.addr }}
+            - name: TIREDVPN_UPSTREAM_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "tiredvpn.server.upstreamSecretName" . }}
+                  key: {{ default "upstream-secret" .Values.server.config.upstream.existingSecretKey }}
+            {{- end }}
+            {{- with .Values.server.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.server.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: tls
+              mountPath: /etc/tiredvpn/tls
+              readOnly: true
+            {{- if .Values.server.tomlConfig }}
+            - name: config
+              mountPath: /etc/tiredvpn/server.toml
+              subPath: server.toml
+              readOnly: true
+            {{- end }}
+            {{- if and (not .Values.server.tomlConfig) (eq .Values.server.auth.mode "tokens") }}
+            - name: tokens
+              mountPath: /etc/tiredvpn/tokens.txt
+              subPath: tokens
+              readOnly: true
+            {{- end }}
+            {{- if .Values.server.config.fakeRoot.inline }}
+            - name: fakeroot
+              mountPath: {{ .Values.server.config.fakeRoot.path }}
+              readOnly: true
+            {{- end }}
+            - name: tmp
+              mountPath: /tmp
+            {{- with .Values.server.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if .Values.server.securityContext }}
+          securityContext:
+            {{- toYaml .Values.server.securityContext | nindent 12 }}
+          {{- end }}
+          {{- if .Values.server.config.api.enabled }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: api
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: api
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+          {{- else }}
+          livenessProbe:
+            tcpSocket:
+              port: main-tcp
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          readinessProbe:
+            tcpSocket:
+              port: main-tcp
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          {{- end }}
+          {{- with .Values.server.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: tls
+          secret:
+            secretName: {{ include "tiredvpn.server.tlsSecretName" . }}
+            defaultMode: 0400
+        {{- if .Values.server.tomlConfig }}
+        - name: config
+          configMap:
+            name: {{ include "tiredvpn.server.fullname" . }}-config
+        {{- end }}
+        {{- if and (not .Values.server.tomlConfig) (eq .Values.server.auth.mode "tokens") }}
+        - name: tokens
+          secret:
+            secretName: {{ include "tiredvpn.server.authSecretName" . }}
+            defaultMode: 0400
+        {{- end }}
+        {{- if .Values.server.config.fakeRoot.inline }}
+        - name: fakeroot
+          configMap:
+            name: {{ include "tiredvpn.server.fullname" . }}-fakeroot
+        {{- end }}
+        - name: tmp
+          emptyDir: {}
+        {{- with .Values.server.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.server.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.server.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.server.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.server.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

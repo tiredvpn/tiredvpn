@@ -1,0 +1,26 @@
+# Только клиент в SOCKS5-режиме (Deployment + ClusterIP).
+server:
+  enabled: false
+
+client:
+  enabled: true
+  mode: socks
+  server:
+    address: "vpn.example.com:443"
+    secret: "client-shared-secret"
+  config:
+    strategy: ""        # auto
+    quic:
+      enabled: true
+    api:
+      enabled: true
+  socks:
+    replicaCount: 2
+    pdb:
+      enabled: true
+  metrics:
+    serviceMonitor:
+      enabled: true
+  networkPolicy:
+    enabled: true
+    allowedClientNamespaces: [default]

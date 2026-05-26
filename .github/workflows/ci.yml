@@ -111,6 +111,33 @@ jobs:
         with:
           version: latest
 
+  helm_chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+      - name: Update dependencies
+        run: helm dependency update deploy/helm/tiredvpn
+      - name: Lint chart (all ci fixtures)
+        run: |
+          cd deploy/helm/tiredvpn
+          for f in ci/*.yaml; do
+            echo "::group::lint $f"
+            helm lint . -f "$f"
+            echo "::endgroup::"
+          done
+      - name: Template dry-run (all ci fixtures)
+        run: |
+          cd deploy/helm/tiredvpn
+          for f in ci/*.yaml; do
+            echo "::group::template $f"
+            helm template release . -f "$f" > /dev/null
+            echo "::endgroup::"
+          done
+
   vuln_check:
     runs-on: ubuntu-latest
     steps:

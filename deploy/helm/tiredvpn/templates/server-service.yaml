@@ -1,0 +1,61 @@
+{{- if .Values.server.enabled -}}
+{{- $mainPort := regexReplaceAll ".*:([0-9]+).*" .Values.server.config.listen "${1}" | int -}}
+{{- $quicPort := regexReplaceAll ".*:([0-9]+).*" (default .Values.server.config.listen .Values.server.config.quic.listen) "${1}" | int -}}
+{{- $v6Port := regexReplaceAll ".*:([0-9]+).*" .Values.server.config.listenV6 "${1}" | int -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "tiredvpn.server.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tiredvpn.server.labels" . | nindent 4 }}
+  {{- with .Values.server.service.main.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.server.service.main.type }}
+  {{- if eq .Values.server.service.main.type "LoadBalancer" }}
+  {{- with .Values.server.service.main.externalTrafficPolicy }}
+  externalTrafficPolicy: {{ . }}
+  {{- end }}
+  {{- with .Values.server.service.main.loadBalancerIP }}
+  loadBalancerIP: {{ . }}
+  {{- end }}
+  {{- with .Values.server.service.main.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- end }}
+  selector:
+    {{- include "tiredvpn.server.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: main-tcp
+      port: {{ $mainPort }}
+      targetPort: main-tcp
+      protocol: TCP
+      {{- if and (eq .Values.server.service.main.type "NodePort") .Values.server.service.main.tcpNodePort }}
+      nodePort: {{ .Values.server.service.main.tcpNodePort }}
+      {{- end }}
+    {{- if .Values.server.config.quic.enabled }}
+    - name: main-udp
+      port: {{ $quicPort }}
+      targetPort: main-udp
+      protocol: UDP
+      {{- if and (eq .Values.server.service.main.type "NodePort") .Values.server.service.main.udpNodePort }}
+      nodePort: {{ .Values.server.service.main.udpNodePort }}
+      {{- end }}
+    {{- end }}
+    {{- if .Values.server.config.ipv6.enabled }}
+    - name: v6-tcp
+      port: {{ $v6Port }}
+      targetPort: v6-tcp
+      protocol: TCP
+    {{- if .Values.server.config.quic.enabled }}
+    - name: v6-udp
+      port: {{ $v6Port }}
+      targetPort: v6-udp
+      protocol: UDP
+    {{- end }}
+    {{- end }}
+{{- end }}

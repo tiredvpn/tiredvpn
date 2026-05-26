@@ -1,0 +1,19 @@
+{{- if and (include "tiredvpn.client.socks.enabled" .) .Values.client.socks.pdb.enabled -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "tiredvpn.client.socks.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tiredvpn.client.socks.labels" . | nindent 4 }}
+spec:
+  {{- with .Values.client.socks.pdb.minAvailable }}
+  minAvailable: {{ . }}
+  {{- end }}
+  {{- with .Values.client.socks.pdb.maxUnavailable }}
+  maxUnavailable: {{ . }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "tiredvpn.client.socks.selectorLabels" . | nindent 6 }}
+{{- end }}
