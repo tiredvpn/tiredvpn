@@ -1,0 +1,105 @@
+name: Helm chart release
+
+on:
+  push:
+    tags:
+      - "chart-v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Chart version (без префикса chart-v). Если пусто — берётся из Chart.yaml."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  CHART_DIR: deploy/helm/tiredvpn
+  REGISTRY: ghcr.io
+  REGISTRY_NAMESPACE: ${{ github.repository_owner }}/charts
+
+jobs:
+  release-chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+
+      - name: Resolve chart version
+        id: version
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            TAG="${GITHUB_REF_NAME}"
+            VERSION="${TAG#chart-v}"
+          elif [[ -n "${{ inputs.version }}" ]]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="$(grep -E '^version:' "${CHART_DIR}/Chart.yaml" | awk '{print $2}' | tr -d '\"')"
+          fi
+          CHART_VERSION="$(grep -E '^version:' "${CHART_DIR}/Chart.yaml" | awk '{print $2}' | tr -d '\"')"
+          if [[ "${VERSION}" != "${CHART_VERSION}" ]]; then
+            echo "::error::Tag/input version (${VERSION}) does not match Chart.yaml version (${CHART_VERSION}). Bump Chart.yaml first."
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Releasing chart version: ${VERSION}"
+
+      - name: Update dependencies
+        run: |
+          cd "${CHART_DIR}"
+          helm dependency update
+
+      - name: Lint chart (all ci fixtures)
+        run: |
+          cd "${CHART_DIR}"
+          for f in ci/*.yaml; do
+            echo "::group::lint $f"
+            helm lint . -f "$f"
+            echo "::endgroup::"
+          done
+
+      - name: Template dry-run (all ci fixtures)
+        run: |
+          cd "${CHART_DIR}"
+          for f in ci/*.yaml; do
+            echo "::group::template $f"
+            helm template release . -f "$f" > /dev/null
+            echo "::endgroup::"
+          done
+
+      - name: Package chart
+        id: package
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          helm package "${CHART_DIR}" --destination dist
+          PKG="$(ls dist/*.tgz | head -n1)"
+          echo "package=${PKG}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            helm registry login "${REGISTRY}" \
+              --username "${{ github.actor }}" --password-stdin
+
+      - name: Push chart to OCI registry
+        run: |
+          set -euo pipefail
+          DEST="oci://${REGISTRY}/${REGISTRY_NAMESPACE,,}"
+          echo "Pushing $(basename ${{ steps.package.outputs.package }}) to ${DEST}"
+          helm push "${{ steps.package.outputs.package }}" "${DEST}"
+
+      - name: Show install hint
+        run: |
+          DEST="oci://${REGISTRY}/${REGISTRY_NAMESPACE,,}/tiredvpn"
+          cat <<EOF
+          Chart published. To install:
+            helm install my-release ${DEST} --version ${{ steps.version.outputs.version }}
+          EOF
