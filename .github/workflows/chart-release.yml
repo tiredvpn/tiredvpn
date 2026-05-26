@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Chart version (без префикса chart-v). Если пусто — берётся из Chart.yaml."
+        description: "Chart version (without the chart-v prefix). If empty, taken from Chart.yaml."
         required: false
         type: string
 

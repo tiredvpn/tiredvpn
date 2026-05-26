@@ -1,5 +1,5 @@
-# Только клиент в TUN-режиме (DaemonSet, privileged).
-# Внимание: использует override образа на alpine-base с iproute2/iptables.
+# Client in TUN mode only (DaemonSet, privileged).
+# NOTE: uses an image override based on alpine with iproute2/iptables.
 server:
   enabled: false
 
@@ -20,5 +20,5 @@ client:
     routes: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
     usePrivileged: false   # NET_ADMIN+NET_RAW caps
     image:
-      repository: "myorg/tiredvpn-tun"  # override: образ с iproute2+iptables
+      repository: "myorg/tiredvpn-tun"  # override: image with iproute2+iptables
       tag: "1.1.3"

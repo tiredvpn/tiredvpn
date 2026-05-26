@@ -1,4 +1,4 @@
-# Multi-client сервер с bitnami/redis subchart + ServiceMonitor + PDB.
+# Multi-client server with the bitnami/redis subchart + ServiceMonitor + PDB.
 server:
   enabled: true
   replicaCount: 2
@@ -10,7 +10,7 @@ server:
     cert: "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----"
     key: "-----BEGIN PRIVATE KEY-----\nTEST\n-----END PRIVATE KEY-----"
   auth:
-    mode: external      # multi-client: клиенты добавляются через admin API → Redis
+    mode: external      # multi-client: clients are added via the admin API → Redis
   pdb:
     enabled: true
     minAvailable: 1

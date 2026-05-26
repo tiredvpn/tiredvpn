@@ -1,9 +1,9 @@
-# Минимальный single-client сервер с inline TLS и secret.
+# Minimal single-client server with inline TLS and shared secret.
 server:
   enabled: true
   service:
     main:
-      type: ClusterIP   # для lint без LB
+      type: ClusterIP   # avoid LB for lint
   tls:
     create: true
     cert: |

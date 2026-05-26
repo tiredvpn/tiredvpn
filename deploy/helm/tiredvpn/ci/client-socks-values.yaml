@@ -1,4 +1,4 @@
-# Только клиент в SOCKS5-режиме (Deployment + ClusterIP).
+# Client in SOCKS5 mode only (Deployment + ClusterIP).
 server:
   enabled: false
 

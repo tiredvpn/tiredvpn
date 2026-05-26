@@ -1,4 +1,4 @@
-# Server + Client (SOCKS) в одном release — для split-test.
+# Server + Client (SOCKS) in the same release — for split-test setups.
 server:
   enabled: true
   service:
