@@ -95,6 +95,15 @@ Available platforms: `linux-amd64`, `linux-arm64`. Other installation
 methods are described in the [Docker](#docker) and
 [Building from Source](#building-from-source) sections below.
 
+Kubernetes via Helm (server and/or client from a single release):
+
+```bash
+helm install my-tiredvpn oci://ghcr.io/tiredvpn/charts/tiredvpn --version 0.1.0 \
+  -f my-values.yaml
+```
+
+See [deploy/helm/tiredvpn/README.md](deploy/helm/tiredvpn/README.md) for values, examples, and TLS/auth/Redis/HPA options.
+
 ### Generate a shared secret
 
 ```bash
