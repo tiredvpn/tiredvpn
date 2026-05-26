@@ -18,7 +18,7 @@ spec:
     - Ingress
     - Egress
   ingress:
-    # Main listener — публичный.
+    # Main listener — public.
     - ports:
         - port: {{ $mainPort }}
           protocol: TCP
@@ -41,7 +41,7 @@ spec:
         {{- end }}
       {{- end }}
     {{- if .Values.server.config.api.enabled }}
-    # API/metrics — только из мониторинг-namespace.
+    # API/metrics — monitoring namespaces only.
     - ports:
         - port: {{ $apiPort }}
           protocol: TCP
@@ -64,6 +64,6 @@ spec:
           protocol: UDP
         - port: 53
           protocol: TCP
-    # Redis / upstream / весь мир (для multi-hop клиента).
+    # Redis / upstream / the world (for the multi-hop client).
     - {}
 {{- end }}

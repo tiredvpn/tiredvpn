@@ -1,4 +1,4 @@
-# Сервер с port-hopping + IPv6 dual-stack + NetworkPolicy.
+# Server with port-hopping + IPv6 dual-stack + NetworkPolicy.
 server:
   enabled: true
   service:

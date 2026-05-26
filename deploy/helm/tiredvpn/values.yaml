@@ -1,31 +1,31 @@
-# Default values for tiredvpn Helm chart.
-# Сервер и/или клиент включаются независимыми toggle:
-#   server.enabled — поднимает exit-node (Deployment + Service main TCP/UDP + API ClusterIP).
-#   client.enabled + client.mode (socks|tun|both) — поднимает SOCKS5-proxy и/или TUN-DaemonSet.
+# Default values for the tiredvpn Helm chart.
+# Server and/or client are turned on by independent toggles:
+#   server.enabled — runs the exit node (Deployment + main TCP/UDP Service + api ClusterIP).
+#   client.enabled + client.mode (socks|tun|both) — runs SOCKS5 proxy and/or TUN DaemonSet.
 
 # ---------------- global ----------------
 global:
   image:
     repository: tiredvpn/tiredvpn
-    # tag по умолчанию = .Chart.AppVersion; override здесь.
+    # Defaults to .Chart.AppVersion; override here.
     tag: ""
     pullPolicy: IfNotPresent
-  # Список ссылок на kubernetes.io/dockerconfigjson Secret-ы.
+  # List of references to kubernetes.io/dockerconfigjson Secrets.
   imagePullSecrets: []
   # [{ name: ghcr-pull }]
 
-# Переопределить имя release; по умолчанию = release name.
+# Override resource name; defaults to the release name.
 nameOverride: ""
 fullnameOverride: ""
 
-# Один ServiceAccount шарится server-ом и client-ом.
+# A single ServiceAccount is shared by server and client.
 serviceAccount:
   create: true
   name: ""
   annotations: {}
   automount: true
 
-# Метки/аннотации применяемые ко всем подам.
+# Labels / annotations applied to all pods.
 commonLabels: {}
 commonAnnotations: {}
 
@@ -36,8 +36,8 @@ server:
   enabled: true
   replicaCount: 1
 
-  # Конфиг через CLI-флаги (рекомендуется). Если задан server.tomlConfig — этот блок игнорируется.
-  # Поля соответствуют флагам `tiredvpn server` (см. cmd/tiredvpn/main.go).
+  # CLI-flag configuration (recommended). If server.tomlConfig is set, this block is ignored.
+  # Fields map to `tiredvpn server` flags (see cmd/tiredvpn/main.go).
   config:
     # -listen :443
     listen: ":443"
@@ -47,12 +47,12 @@ server:
       enabled: true   # -enable-v6
       dualStack: true # -dual-stack
     quic:
-      enabled: true             # инвертируется в -no-quic если false
-      listen: ""                # -quic-listen (пусто = по умолчанию)
+      enabled: true             # mapped to -no-quic if false
+      listen: ""                # -quic-listen (empty = default, same port as main)
       sniReassembly: false      # -quic-sni-reassembly
     portHopping:
       enabled: false
-      range: ""                 # -port-range "47000-47100" или "995"
+      range: ""                 # -port-range "47000-47100" or "995"
       maxPorts: 50              # -port-range-max
       interval: 60s             # -port-hop-interval
       strategy: random          # -port-hop-strategy: random|sequential|fibonacci
@@ -60,65 +60,65 @@ server:
     tun:
       ip: 10.8.0.1              # -tun-ip
       name: tiredvpn0           # -tun-name
-      ipPool: ""                # -ip-pool "10.8.0.0/24" (включает выдачу IP клиентам)
+      ipPool: ""                # -ip-pool "10.8.0.0/24" (enables IP issuance to clients)
       ipPoolLease: 24h          # -ip-pool-lease
     upstream:
       addr: ""                  # -upstream
-      secret: ""                # -upstream-secret (можно через server.upstream.existingSecret)
+      secret: ""                # -upstream-secret (can be sourced via existingSecret)
       existingSecret: ""
       existingSecretKey: upstream-secret
     fakeRoot:
-      # Путь в контейнере; в образе уже есть /var/www/html/index.html.
-      path: "./www"             # -fake-root (default образа — ./www)
-      # Inline-HTML, который смонтируется как ConfigMap. Если пусто — используется уже встроенный.
+      # Path inside the container; the image already ships /var/www/html/index.html.
+      path: "./www"             # -fake-root (binary default — ./www)
+      # Inline HTML mounted as a ConfigMap. Empty = use the image's built-in.
       inline: ""
     api:
-      enabled: true             # без api нет /health, /metrics, и admin API
-      listen: ":8080"           # -api-addr (0.0.0.0 чтобы быть доступным в кластере)
+      enabled: true             # without api there's no /health, /metrics, or admin API
+      listen: ":8080"           # -api-addr (use 0.0.0.0 so it's reachable in-cluster)
     pprof:
       enabled: false
       listen: ":6060"           # -pprof
     debug: false                # -debug
 
-  # Альтернатива config.* — сырое содержимое TOML (см. configs/server.example.toml).
-  # Если задано, монтируется в /etc/tiredvpn/server.toml и запускается: `tiredvpn server -config /etc/tiredvpn/server.toml`.
+  # Alternative to config.* — raw TOML content (see configs/server.example.toml).
+  # When set, mounted at /etc/tiredvpn/server.toml and started as `tiredvpn server -config /etc/tiredvpn/server.toml`.
   tomlConfig: ""
 
   tls:
-    # Готовый Secret типа kubernetes.io/tls с ключами tls.crt / tls.key (например, от cert-manager).
+    # Existing kubernetes.io/tls Secret with tls.crt / tls.key (e.g., issued by cert-manager).
     existingSecret: ""
-    # Альтернатива: создать Secret из inline-значений.
+    # Alternative: create a Secret from inline values.
     create: false
     cert: ""                    # PEM
     key: ""                     # PEM
 
   auth:
-    # secret  → single-client mode (-secret), значение из values.secret или existingSecret.
-    # tokens  → multi-client tokens (без Redis нужен либо tokens-file через TOML, либо API).
-    # external→ ни secret ни tokens не добавляются в args (используется внешний Redis/API).
+    # secret  → single-client mode (-secret), value from values.secret or existingSecret.
+    # tokens  → multi-client tokens (without Redis you need either tokens-file via TOML or admin API).
+    # external→ neither secret nor tokens are passed in args (use external Redis/API).
     mode: secret                # secret | tokens | external
-    # Готовый Secret с ключом `secret` (для mode=secret).
+    # Existing Secret with the `secret` key (for mode=secret).
     existingSecret: ""
     existingSecretKey: secret
-    # Inline-секрет.
+    # Inline secret.
     secret: ""
-    # tokens — список строк (для mode=tokens), монтируется как файл /etc/tiredvpn/tokens.txt.
+    # tokens — list of strings (for mode=tokens), mounted as /etc/tiredvpn/tokens.txt.
     tokens: []
 
   redis:
-    # Адрес Redis. Если пусто и .Values.redis.enabled=true — подставляется {release}-redis-master:6379.
-    # Если задано — используется как-есть; subchart-redis отключаем.
+    # Redis address. If empty and .Values.redis.enabled=true — defaulted to {release}-redis-master:6379.
+    # If set — used as-is; the redis subchart should be disabled.
     addr: ""
 
   service:
     main:
-      # Основной listener — обычно LoadBalancer/NodePort для внешнего доступа.
+      # Main listener — usually LoadBalancer/NodePort for external access.
       type: LoadBalancer
       annotations: {}
       externalTrafficPolicy: Local
       loadBalancerIP: ""
       loadBalancerSourceRanges: []
-      # Если указан tcpNodePort/udpNodePort, и type=NodePort — биндится этот порт.
+      # When type=NodePort and tcpNodePort/udpNodePort are set, bind those node ports.
       tcpNodePort: ""
       udpNodePort: ""
     api:
@@ -157,14 +157,14 @@ server:
 
   priorityClassName: ""
 
-  # Дополнительные env переменные.
+  # Extra environment variables.
   extraEnv: []
   extraEnvFrom: []
-  # Дополнительные volume / volumeMounts (например для логов).
+  # Extra volumes / volumeMounts (e.g., for logs).
   extraVolumes: []
   extraVolumeMounts: []
 
-  # Дополнительные CLI args. Полезно для флагов, явно не покрытых config.*.
+  # Extra CLI args. Useful for flags not exposed through config.*.
   extraArgs: []
 
   pdb:
@@ -174,13 +174,13 @@ server:
 
   networkPolicy:
     enabled: false
-    # Доп. namespace, откуда разрешён trafic в API (например, для Prometheus).
+    # Extra namespaces allowed to scrape the api port (e.g., for Prometheus).
     allowedMonitoringNamespaces: []
-    # Доп. peers для main listener (по умолчанию — мир).
+    # Extra peers for the main listener (default — world).
     allowedFromMain:
       - podSelector: {}
       - namespaceSelector: {}
-    # ipBlock для main listener (по умолчанию — 0.0.0.0/0).
+    # ipBlock for the main listener (default — 0.0.0.0/0).
     allowAllExternal: true
 
   metrics:
@@ -195,7 +195,7 @@ server:
       honorLabels: false
 
   autoscaling:
-    # Имеет смысл только при server.redis.addr / .Values.redis.enabled (общий state).
+    # Only meaningful when server.redis.addr or .Values.redis.enabled (shared state).
     enabled: false
     minReplicas: 2
     maxReplicas: 10
@@ -207,12 +207,12 @@ server:
 # =========================================================
 client:
   enabled: false
-  # socks → Deployment с SOCKS5 на 0.0.0.0:1080 + ClusterIP Service (доступно другим подам).
-  # tun   → DaemonSet с TUN-туннелем (требует privileged или NET_ADMIN/NET_RAW).
-  # both  → и то, и другое.
+  # socks → Deployment with SOCKS5 on 0.0.0.0:1080 + ClusterIP Service (reachable by other pods).
+  # tun   → DaemonSet with a TUN tunnel (requires privileged or NET_ADMIN/NET_RAW).
+  # both  → both workloads.
   mode: socks
 
-  # Адрес и секрет VPN-сервера. Можно через existingSecret (ключи: address, secret).
+  # VPN server address and secret. Can come from existingSecret (keys: address, secret).
   server:
     address: ""                 # vpn.example.com:443  (-server)
     secret: ""                  # (-secret)
@@ -220,31 +220,31 @@ client:
     existingSecretAddressKey: address
     existingSecretSecretKey: secret
 
-  # Конфиг через CLI-флаги (рекомендуется). Если задан client.tomlConfig — этот блок игнорируется.
-  # Поля соответствуют флагам `tiredvpn client` (см. cmd/tiredvpn/main.go).
+  # CLI-flag configuration (recommended). If client.tomlConfig is set, this block is ignored.
+  # Fields map to `tiredvpn client` flags (see cmd/tiredvpn/main.go).
   config:
     debug: false                # -debug
-    strategy: ""                # -strategy (пусто = автовыбор)
-    cover: ""                   # -cover (пусто = api.googleapis.com по умолчанию бинаря)
-    fallback: true              # -fallback (по умолчанию true)
+    strategy: ""                # -strategy (empty = auto)
+    cover: ""                   # -cover (empty = binary default api.googleapis.com)
+    fallback: true              # -fallback (default true)
     quic:
       enabled: false            # -quic
-      port: 0                   # -quic-port (0 = не передавать, оставить дефолт 443)
+      port: 0                   # -quic-port (0 = don't pass, leave default 443)
       sniFrag: false            # -quic-sni-frag
     ech:
       enabled: false            # -ech
       config: ""                # -ech-config (base64)
-      publicName: ""            # -ech-public-name (пусто = дефолт бинаря)
+      publicName: ""            # -ech-public-name (empty = binary default)
     pq:
       enabled: false            # -pq
       serverKey: ""             # -pq-server-key (base64)
     rttMasking:
       enabled: false            # -rtt-masking
-      profile: ""               # -rtt-profile (пусто = дефолт moscow-yandex)
+      profile: ""               # -rtt-profile (empty = default moscow-yandex)
     ipv6:
       serverV6: ""              # -server-v6 [2001:db8::1]:995
-      preferV6: true            # -prefer-ipv6 (дефолт true)
-      fallbackV4: true          # -fallback-v4 (дефолт true)
+      preferV6: true            # -prefer-ipv6 (default true)
+      fallbackV4: true          # -fallback-v4 (default true)
     portHop:
       enabled: false            # -port-hop
       start: 47000              # -port-hop-start
@@ -253,24 +253,24 @@ client:
       strategy: random          # -port-hop-strategy
       seed: ""                  # -port-hop-seed
     adaptive:
-      reprobeInterval: ""       # -reprobe-interval (пусто = дефолт 5m)
-      circuitThreshold: 0       # -circuit-threshold (0 = не передавать)
+      reprobeInterval: ""       # -reprobe-interval (empty = default 5m)
+      circuitThreshold: 0       # -circuit-threshold (0 = don't pass)
       circuitReset: ""          # -circuit-reset
     api:
-      enabled: false            # включить /metrics, /health
+      enabled: false            # exposes /metrics, /health
       listen: ":8080"           # -api-addr
     pprof:
       enabled: false
       listen: ":6060"           # -pprof
 
-  # Альтернатива config.* — сырое содержимое TOML (см. configs/client.example.toml).
+  # Alternative to config.* — raw TOML content (see configs/client.example.toml).
   tomlConfig: ""
 
   # -------- SOCKS5 mode (Deployment) --------
   socks:
     replicaCount: 1
-    listen: "0.0.0.0:1080"      # -listen (нужно 0.0.0.0 для доступа из других подов)
-    httpListen: ""              # -http-listen (опц. отдельный HTTP proxy порт)
+    listen: "0.0.0.0:1080"      # -listen (must be 0.0.0.0 for in-cluster access)
+    httpListen: ""              # -http-listen (optional separate HTTP proxy port)
     service:
       type: ClusterIP
       port: 1080
@@ -304,10 +304,10 @@ client:
       minAvailable: 1
 
   # -------- TUN mode (DaemonSet) --------
-  # ВНИМАНИЕ: дефолтный образ tiredvpn собран FROM scratch и НЕ содержит `ip`/`iptables`,
-  # которые требуются клиенту для настройки TUN. Перед использованием TUN-режима соберите
-  # собственный образ на базе alpine/debian с iproute2+iptables или используйте global.image
-  # для указания такого образа.
+  # NOTE: the default tiredvpn image is FROM scratch and does NOT contain `ip`/`iptables`,
+  # which the client needs to configure the TUN device. Before using TUN mode, build your
+  # own image based on alpine/debian with iproute2+iptables, or override global.image
+  # to point at such an image.
   tun:
     name: tiredvpn0             # -tun-name
     ip: 10.8.0.2                # -tun-ip
@@ -317,7 +317,7 @@ client:
     hostNetwork: true
     # true → privileged: true; false → drop ALL + add NET_ADMIN,NET_RAW.
     usePrivileged: false
-    # Образ override (рекомендуется собрать свой с iproute2). Пусто = global.image.
+    # Image override (recommended — build your own with iproute2). Empty = global.image.
     image:
       repository: ""
       tag: ""
@@ -340,7 +340,7 @@ client:
     podAnnotations: {}
     podLabels: {}
 
-  # Доп. env / volumes для обоих режимов.
+  # Extra env / volumes shared by both modes.
   extraEnv: []
   extraEnvFrom: []
   extraVolumes: []
@@ -360,22 +360,22 @@ client:
 
   networkPolicy:
     enabled: false
-    # Откуда разрешено коннектиться к SOCKS-порту.
+    # Where SOCKS port traffic is allowed from.
     allowedClientNamespaces: []
     allowedClientPodSelectors: []
-    # Куда разрешён egress (по умолчанию весь мир — VPN-сервер обычно публичный).
+    # Where egress is allowed to (default — world; the VPN server is usually public).
     allowAllEgress: true
 
 # =========================================================
 # REDIS subchart (bitnami)
 # =========================================================
-# Включается только для multi-client сервера. Когда redis.enabled=true и
-# server.redis.addr пусто — server подключается к <release>-redis-master:6379.
+# Enable for the multi-client server. When redis.enabled=true and
+# server.redis.addr is empty, the server connects to <release>-redis-master:6379.
 redis:
   enabled: false
   architecture: standalone
   auth:
-    # tiredvpn server (текущая версия) не передаёт пароль в Redis — оставляем без auth.
+    # The current tiredvpn server doesn't pass a password to Redis — leave auth off.
     enabled: false
   master:
     persistence:

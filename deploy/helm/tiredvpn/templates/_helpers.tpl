@@ -45,7 +45,7 @@ Chart label string.
 {{- end -}}
 
 {{/*
-Base labels (применяются ко всем ресурсам).
+Base labels (applied to every resource).
 */}}
 {{- define "tiredvpn.labels" -}}
 helm.sh/chart: {{ include "tiredvpn.chart" . }}
@@ -108,7 +108,7 @@ ServiceAccount name.
 {{- end -}}
 
 {{/*
-Image reference (с возможностью override через workload-specific image).
+Image reference (with optional override via a workload-specific image).
 */}}
 {{- define "tiredvpn.image" -}}
 {{- $repo := .Values.global.image.repository -}}
@@ -131,7 +131,7 @@ Image reference (с возможностью override через workload-specif
 {{- end -}}
 
 {{/*
-ImagePullSecrets list (для шаблонизации в pod spec).
+ImagePullSecrets list (rendered into the pod spec).
 */}}
 {{- define "tiredvpn.imagePullSecrets" -}}
 {{- with .Values.global.imagePullSecrets }}
@@ -141,7 +141,7 @@ imagePullSecrets:
 {{- end -}}
 
 {{/*
-Имя Secret-а с TLS для сервера.
+Name of the server's TLS Secret.
 */}}
 {{- define "tiredvpn.server.tlsSecretName" -}}
 {{- if .Values.server.tls.existingSecret -}}
@@ -152,7 +152,7 @@ imagePullSecrets:
 {{- end -}}
 
 {{/*
-Имя Secret-а с auth для сервера (когда mode=secret или mode=tokens).
+Name of the server's auth Secret (when mode=secret or mode=tokens).
 */}}
 {{- define "tiredvpn.server.authSecretName" -}}
 {{- if .Values.server.auth.existingSecret -}}
@@ -163,14 +163,14 @@ imagePullSecrets:
 {{- end -}}
 
 {{/*
-Ключ secret-а с авторизацией.
+Key inside the auth Secret.
 */}}
 {{- define "tiredvpn.server.authSecretKey" -}}
 {{- default "secret" .Values.server.auth.existingSecretKey -}}
 {{- end -}}
 
 {{/*
-Имя Secret-а с upstream secret-ом.
+Name of the Secret holding the upstream secret.
 */}}
 {{- define "tiredvpn.server.upstreamSecretName" -}}
 {{- if .Values.server.config.upstream.existingSecret -}}
@@ -181,7 +181,7 @@ imagePullSecrets:
 {{- end -}}
 
 {{/*
-Имя Secret-а клиента (server addr + secret).
+Name of the client credentials Secret (server addr + secret).
 */}}
 {{- define "tiredvpn.client.secretName" -}}
 {{- if .Values.client.server.existingSecret -}}
@@ -200,10 +200,10 @@ imagePullSecrets:
 {{- end -}}
 
 {{/*
-Эффективный Redis-адрес для сервера.
-Если server.redis.addr задан — используется как есть.
-Иначе если bitnami/redis subchart enabled — {release}-redis-master:6379.
-Иначе пусто (single-client mode).
+Effective Redis address for the server.
+If server.redis.addr is set — used as-is.
+Otherwise, if the bitnami/redis subchart is enabled — {release}-redis-master:6379.
+Otherwise empty (single-client mode).
 */}}
 {{- define "tiredvpn.server.redisAddr" -}}
 {{- if .Values.server.redis.addr -}}
@@ -214,11 +214,11 @@ imagePullSecrets:
 {{- end -}}
 
 {{/*
-Проверка инвариантов перед рендером.
+Pre-render invariant checks.
 */}}
 {{- define "tiredvpn.validate" -}}
 {{- if and .Values.server.enabled .Values.server.tomlConfig .Values.server.config -}}
-{{/* TOML и config взаимоисключающи де-факто, но мы не падаем — TOML просто переопределит. */}}
+{{/* TOML and config are de-facto mutually exclusive, but we don't fail — TOML simply overrides. */}}
 {{- end -}}
 {{- if and .Values.server.enabled (eq .Values.server.auth.mode "secret") (not .Values.server.tomlConfig) -}}
 {{- if and (not .Values.server.auth.secret) (not .Values.server.auth.existingSecret) -}}
@@ -246,7 +246,7 @@ imagePullSecrets:
 {{- end -}}
 
 {{/*
-Хелпер: shouldRenderClientSocks
+Helper: shouldRenderClientSocks.
 */}}
 {{- define "tiredvpn.client.socks.enabled" -}}
 {{- if and .Values.client.enabled (or (eq .Values.client.mode "socks") (eq .Values.client.mode "both")) -}}
@@ -262,8 +262,8 @@ true
 
 {{/*
 =================== ARGS RENDER ===================
-Рендер CLI args для server и client из values.*.config.
-Если задан tomlConfig — используется -config /etc/tiredvpn/{server,client}.toml.
+Render CLI args for server and client from values.*.config.
+If tomlConfig is set, use -config /etc/tiredvpn/{server,client}.toml instead.
 */}}
 
 {{- define "tiredvpn.server.args" -}}
