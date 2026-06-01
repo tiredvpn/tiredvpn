@@ -7,6 +7,16 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.4] - 2026-06-02
+
+### Added
+
+- **macOS client (NEPacketTunnelProvider)** — the Go core can now run inside a host-managed macOS Network Extension. Adds a `MacOSMode` that, like `AndroidMode`, disables raw-socket/ICMP strategies and host-side route/DNS setup (the host owns the TUN fd, routes, and firewall); a CGo c-archive bridge (`cmd/tiredvpn/cgo_darwin.go`) exposing start/stop with state and log callbacks for the Swift app; a Darwin `utun` device (`internal/tun/tun_darwin.go`); and Makefile targets `build-macos-cli` and `build-macos-lib` (universal arm64+amd64 `libtiredvpn.a`). The `jni_context.go` host-context entrypoint now builds for `darwin` as well as `android`.
+
+### Fixed
+
+- **`admin add` / `admin list` / `admin delete` targeted a non-existent API** — the admin subcommands talked to `/api/clients`, which the server does not route, so every call returned 404. `admin add` also posted `{id, secret}`, but the create endpoint takes `{name}` and generates the id (UUID) and secret server-side. Repointed all three commands to `/clients` and `/clients/{id}`; `add` now sends `name` (plus optional `tun_ip`, `max_conns`, `expires_in`) and reads the server-issued id and secret from the response to build the connection string; `list` decodes the `{clients:[...]}` envelope instead of a bare array. The `-id`/`-secret` flags on `add` are replaced by a required `-name`.
+
 ### Changed
 
 - **kTLS upgrade is now performed per-handler at the relay-phase boundary** instead of unconditionally after the TLS handshake. `tired-raw` and `tired-confusion` handlers now call `ktls.TryEnable` after their auth-complete ack write, before the relay goroutines spin up. `tired-morph`, `tired-stego`, `tired-ws`, and `tired-polling` continue to run without kTLS pending Phase 2 (handler-level framer/upgrade rework). Behaviour-equivalent for end users; eliminates the EBADMSG race that the static `kTLSUnsafe` exclusion list was a workaround for. Also adds `ClientRegistry.SwapConn` so registry-tracked handlers can update the stored connection pointer after the kTLS swap, keeping forced-disconnect `Close()` targeting the live socket wrapper instead of the stale `*tls.Conn`. Includes an in-process e2e regression test (`TestRawTunnelKTLSHandover`) that catches future regressions where a TLS-stack read is reintroduced after `TryEnable`.
