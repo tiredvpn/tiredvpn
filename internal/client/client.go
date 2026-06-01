@@ -57,11 +57,14 @@ type Config struct {
 	TunMTU    int
 	TunRoutes string
 
-	// Android VpnService support
-	TunFd         int    // Use existing TUN file descriptor (from Android VpnService)
-	ProtectPath   string // Unix socket path for protect() calls
-	ControlSocket string // Control socket path for Android integration
+	// Host-supplied TUN integration (Android VpnService / macOS NetworkExtension).
+	// In both modes the TUN fd is created by the host and passed in via TunFd;
+	// the host (not Go) also owns route/DNS/firewall setup.
+	TunFd         int    // Use existing TUN file descriptor
+	ProtectPath   string // Unix socket path for protect() calls (Android only)
+	ControlSocket string // Control socket path for host<->Go command channel
 	AndroidMode   bool   // Running on Android (disables os/exec, ICMP checks, etc.)
+	MacOSMode     bool   // Running on macOS inside NEPacketTunnelProvider (same shape as AndroidMode minus protect)
 
 	// Modes
 	ListStrategies     bool
@@ -127,7 +130,9 @@ func Run(cfg *Config) error {
 	if cfg.Debug {
 		log.SetDebug(true)
 	}
-	if cfg.AndroidMode {
+	if cfg.AndroidMode || cfg.MacOSMode {
+		// Both modes run inside a host-managed sandbox: no raw sockets, no ICMP,
+		// no os/exec for routes. The strategy package gates these behind one flag.
 		strategy.SetAndroidMode(true)
 	}
 
@@ -244,13 +249,13 @@ func buildManager(cfg *Config, secret string) (*strategy.Manager, error) {
 		QUICSNIFragEnabled: cfg.QUICSNIFragEnabled,
 		PQEnabled:          cfg.PQEnabled,
 		PQServerKemPubB64:  cfg.PQServerKemPubB64,
-		AndroidMode:        cfg.AndroidMode,
+		AndroidMode:        cfg.AndroidMode || cfg.MacOSMode,
 		PortHopping:        portHoppingCfg,
 		Shaper:             cfg.Shaper,
 	}
 	mgr := strategy.NewDefaultManager(mgrCfg)
 
-	connectivityChecker := strategy.NewConnectivityChecker(cfg.ServerAddr, 3*time.Second, cfg.AndroidMode)
+	connectivityChecker := strategy.NewConnectivityChecker(cfg.ServerAddr, 3*time.Second, cfg.AndroidMode || cfg.MacOSMode)
 	mgr.SetConnectivityChecker(connectivityChecker)
 	log.Debug("Connectivity checker initialized for %s", cfg.ServerAddr)
 

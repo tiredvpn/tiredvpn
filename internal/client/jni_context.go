@@ -1,5 +1,5 @@
-//go:build android
-// +build android
+//go:build android || darwin
+// +build android darwin
 
 package client
 
@@ -36,8 +36,8 @@ func RunWithContext(ctx context.Context, cfg *Config) error {
 		log.SetDebug(true)
 	}
 
-	// Android mode: disable strategies that require root (raw sockets, ICMP)
-	if cfg.AndroidMode {
+	// Host-managed sandbox modes: disable strategies that require root (raw sockets, ICMP).
+	if cfg.AndroidMode || cfg.MacOSMode {
 		strategy.SetAndroidMode(true)
 	}
 
