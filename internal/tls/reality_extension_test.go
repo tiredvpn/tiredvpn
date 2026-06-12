@@ -78,12 +78,6 @@ func TestREALITYExtensionMarshalUnmarshal(t *testing.T) {
 	}
 
 	// Verify fields
-	if string(ext2.Magic[:]) != REALITYMagic {
-		t.Errorf("Magic = %s, want %s", ext2.Magic[:], REALITYMagic)
-	}
-	if ext2.Version != REALITYVersion {
-		t.Errorf("Version = %d, want %d", ext2.Version, REALITYVersion)
-	}
 	if !bytes.Equal(ext2.PubKey[:], ext.PubKey[:]) {
 		t.Error("PubKey mismatch")
 	}
@@ -93,39 +87,10 @@ func TestREALITYExtensionMarshalUnmarshal(t *testing.T) {
 }
 
 func TestREALITYExtensionUnmarshalInvalid(t *testing.T) {
-	tests := []struct {
-		name string
-		data []byte
-		want string
-	}{
-		{
-			name: "too short",
-			data: []byte{1, 2, 3},
-			want: "too short",
-		},
-		{
-			name: "invalid magic",
-			data: append([]byte("FAKE"), make([]byte, 65)...),
-			want: "invalid reality magic",
-		},
-		{
-			name: "invalid version",
-			data: append(append([]byte("REAL"), byte(0xFF)), make([]byte, 64)...),
-			want: "unsupported reality version",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var ext REALITYExtension
-			err := ext.Unmarshal(tt.data)
-			if err == nil {
-				t.Error("Expected error, got nil")
-			}
-			if err != nil && !bytes.Contains([]byte(err.Error()), []byte(tt.want)) {
-				t.Errorf("Error = %v, want substring %q", err, tt.want)
-			}
-		})
+	var ext REALITYExtension
+	err := ext.Unmarshal([]byte{1, 2, 3})
+	if err == nil {
+		t.Error("Expected error for too-short input, got nil")
 	}
 }
 
@@ -136,20 +101,20 @@ func TestVerifyClientAuth(t *testing.T) {
 	ext, _ := NewClientREALITYExtension(secret, clientPriv)
 
 	// Valid auth
-	if !VerifyClientAuth(secret, ext.AuthToken) {
+	if !VerifyClientAuth(secret, ext.PubKey, ext.AuthToken) {
 		t.Error("Valid auth token rejected")
 	}
 
 	// Invalid secret
 	wrongSecret := []byte("wrong-secret")
-	if VerifyClientAuth(wrongSecret, ext.AuthToken) {
+	if VerifyClientAuth(wrongSecret, ext.PubKey, ext.AuthToken) {
 		t.Error("Invalid secret accepted")
 	}
 
 	// Invalid token
 	var wrongToken [32]byte
 	copy(wrongToken[:], "totally-wrong-token-data-here")
-	if VerifyClientAuth(secret, wrongToken) {
+	if VerifyClientAuth(secret, ext.PubKey, wrongToken) {
 		t.Error("Invalid token accepted")
 	}
 }
@@ -181,17 +146,15 @@ func TestVerifyServerAuth(t *testing.T) {
 
 func TestAuthTokenTimestampWindow(t *testing.T) {
 	secret := []byte("test-secret")
+	var pubKey [32]byte
+	copy(pubKey[:], "test-pubkey-32-bytes-fixed-value")
 
-	// Generate token
-	token1 := generateAuthToken(secret, "test-context")
+	token1 := generateAuthToken(secret, pubKey)
 
-	// Wait a bit (but stay within same 5-minute bucket)
 	time.Sleep(100 * time.Millisecond)
 
-	// Generate again
-	token2 := generateAuthToken(secret, "test-context")
+	token2 := generateAuthToken(secret, pubKey)
 
-	// Should match within same time window
 	if !bytes.Equal(token1[:], token2[:]) {
 		t.Error("Tokens in same time window do not match")
 	}
@@ -205,7 +168,7 @@ func TestClientServerAuthFlow(t *testing.T) {
 	clientExt, _ := NewClientREALITYExtension(secret, clientPriv)
 
 	// Server receives and verifies client auth
-	if !VerifyClientAuth(secret, clientExt.AuthToken) {
+	if !VerifyClientAuth(secret, clientExt.PubKey, clientExt.AuthToken) {
 		t.Fatal("Server rejected client auth")
 	}
 
@@ -240,7 +203,7 @@ func TestREALITYExtensionConstants(t *testing.T) {
 		t.Errorf("REALITYVersion = 0x%02X, want 0x01", REALITYVersion)
 	}
 
-	expectedLen := 4 + 1 + 32 + 32 // magic + version + pubkey + token
+	expectedLen := 32 + 32 // pubkey + auth token (no magic, no version)
 	if REALITYExtensionLength != expectedLen {
 		t.Errorf("REALITYExtensionLength = %d, want %d", REALITYExtensionLength, expectedLen)
 	}
@@ -248,15 +211,14 @@ func TestREALITYExtensionConstants(t *testing.T) {
 
 func TestHMACAuthTokenConsistency(t *testing.T) {
 	secret := []byte("test-secret")
-	context := "reality-auth"
+	var pubKey [32]byte
+	copy(pubKey[:], "test-pubkey-32-bytes-fixed-value")
 
-	// Generate multiple tokens in quick succession
 	tokens := make([][32]byte, 5)
 	for i := range tokens {
-		tokens[i] = generateAuthToken(secret, context)
+		tokens[i] = generateAuthToken(secret, pubKey)
 	}
 
-	// All should be identical (within same 5-minute window)
 	for i := 1; i < len(tokens); i++ {
 		if !hmac.Equal(tokens[0][:], tokens[i][:]) {
 			t.Errorf("Token %d differs from token 0", i)
@@ -311,6 +273,6 @@ func BenchmarkVerifyClientAuth(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		VerifyClientAuth(secret, ext.AuthToken)
+		VerifyClientAuth(secret, ext.PubKey, ext.AuthToken)
 	}
 }

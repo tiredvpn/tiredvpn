@@ -19,6 +19,7 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/ktls"
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/padding"
+	"github.com/tiredvpn/tiredvpn/internal/protocol"
 )
 
 // WebSocketPaddedStrategy implements WebSocket transport with Salamander padding
@@ -94,7 +95,7 @@ func (s *WebSocketPaddedStrategy) Connect(ctx context.Context, target string) (n
 		ServerName:         s.wsHost,
 		InsecureSkipVerify: true,
 		MinVersion:         tls.VersionTLS12,
-		NextProtos:         []string{"tired-ws", "http/1.1"}, // kTLS-enabled ALPN
+		NextProtos:         []string{"h2", "http/1.1"},
 	}
 
 	tcpConn, err := dialer.DialContext(ctx, "tcp", serverAddr)
@@ -106,6 +107,12 @@ func (s *WebSocketPaddedStrategy) Connect(ctx context.Context, target string) (n
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		tcpConn.Close()
 		return nil, fmt.Errorf("websocket_padded: tls handshake failed: %w", err)
+	}
+
+	// Send protocol discriminator (encrypted, not visible to DPI)
+	if err := protocol.WriteDispatch(tlsConn, protocol.TypeWS); err != nil {
+		tcpConn.Close()
+		return nil, fmt.Errorf("websocket_padded: dispatch failed: %w", err)
 	}
 
 	// Set optimizations
@@ -161,7 +168,7 @@ func (s *WebSocketPaddedStrategy) Connect(ctx context.Context, target string) (n
 	// Auth + upgrade complete: kernel offload for the WebSocket-frame phase.
 	// On non-Linux / no-kTLS platforms this is a no-op (returns tlsConn).
 	var baseConn net.Conn = tlsConn
-	if k := ktls.TryEnable(tlsConn, "tired-ws"); k != nil {
+	if k := ktls.TryEnable(tlsConn, "websocket-padded"); k != nil {
 		baseConn = k
 	}
 

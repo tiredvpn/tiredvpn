@@ -118,19 +118,13 @@ func DetectREALITYExtension(data []byte) bool {
 			break
 		}
 
-		// Padding extension type: 0x0015
+		// Padding extension type: 0x0015 with enough data for PubKey+AuthToken
 		if extType == customtls.PaddingExtensionType {
 			log.Debug("DetectREALITY: found padding ext at offset %d, len=%d (need %d)", offset, extLen, customtls.REALITYExtensionLength)
 
-			if extLen >= customtls.REALITYExtensionLength && extDataStart+4 <= extEnd {
-				log.Debug("DetectREALITY: padding data starts with: %x %x %x %x",
-					data[extDataStart], data[extDataStart+1], data[extDataStart+2], data[extDataStart+3])
-
-				if data[extDataStart] == 'R' && data[extDataStart+1] == 'E' &&
-					data[extDataStart+2] == 'A' && data[extDataStart+3] == 'L' {
-					log.Debug("DetectREALITY: FOUND REALITY magic!")
-					return true
-				}
+			if extLen >= customtls.REALITYExtensionLength {
+				log.Debug("DetectREALITY: candidate REALITY padding found (auth verified per-connection in handler)")
+				return true
 			}
 		}
 
@@ -173,7 +167,7 @@ func HandleREALITYConnection(conn net.Conn, srvCtx *serverContext, logger *log.L
 		clients := srvCtx.registry.ListClients()
 		for _, client := range clients {
 			secretBytes := []byte(client.Secret)
-			if customtls.VerifyClientAuth(secretBytes, realityExt.AuthToken) {
+			if customtls.VerifyClientAuth(secretBytes, realityExt.PubKey, realityExt.AuthToken) {
 				logger.Info("REALITY: Auth successful (client: %s, id: %s)", client.Name, client.ID)
 				authenticated = true
 				usedSecret = secretBytes
@@ -185,7 +179,7 @@ func HandleREALITYConnection(conn net.Conn, srvCtx *serverContext, logger *log.L
 
 	// 2. Fallback to global secret (if not found in registry and global secret exists)
 	if !authenticated && len(srvCtx.cfg.Secret) > 0 {
-		if customtls.VerifyClientAuth(srvCtx.cfg.Secret, realityExt.AuthToken) {
+		if customtls.VerifyClientAuth(srvCtx.cfg.Secret, realityExt.PubKey, realityExt.AuthToken) {
 			logger.Info("REALITY: Auth successful (global secret)")
 			authenticated = true
 			usedSecret = srvCtx.cfg.Secret

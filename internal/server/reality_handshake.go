@@ -161,22 +161,14 @@ func findREALITYExtension(extensions []byte) (*customtls.REALITYExtension, error
 			return nil, errors.New("invalid extension length")
 		}
 
-		// Search for REALITY in padding extension (0x0015)
+		// Search for REALITY in padding extension (0x0015) - no magic, just size check
 		if extType == customtls.PaddingExtensionType && extLen >= customtls.REALITYExtensionLength {
 			extData := extensions[offset : offset+extLen]
-
-			// Check for REALITY magic at start of padding
-			if len(extData) >= 4 &&
-				extData[0] == 'R' && extData[1] == 'E' &&
-				extData[2] == 'A' && extData[3] == 'L' {
-
-				// Extract REALITY extension from padding
-				ext, err := customtls.ExtractREALITYFromPadding(extData)
-				if err != nil {
-					return nil, err
-				}
-				return ext, nil
+			ext, err := customtls.ExtractREALITYFromPadding(extData)
+			if err != nil {
+				return nil, err
 			}
+			return ext, nil
 		}
 
 		offset += extLen

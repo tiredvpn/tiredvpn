@@ -18,6 +18,7 @@ import (
 
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/protect"
+	"github.com/tiredvpn/tiredvpn/internal/protocol"
 )
 
 // HTTPPollingStrategy implements meek-style HTTP polling transport
@@ -337,8 +338,8 @@ func (c *HTTPPollingConn) doRequest(ctx context.Context, authToken string, data 
 		ServerName:         c.host,
 		InsecureSkipVerify: true,
 		MinVersion:         tls.VersionTLS12,
-		NextProtos:         []string{"tired-polling"}, // Custom ALPN for HTTP Polling
-		ClientSessionCache: c.tlsSessionCache,         // TLS session resumption
+		NextProtos:         []string{"http/1.1"},
+		ClientSessionCache: c.tlsSessionCache, // TLS session resumption
 	}
 
 	tlsConn := tls.Client(tcpConn, tlsConfig)
@@ -346,6 +347,11 @@ func (c *HTTPPollingConn) doRequest(ctx context.Context, authToken string, data 
 		return nil, err
 	}
 	defer tlsConn.Close()
+
+	// Send protocol discriminator (encrypted, not visible to DPI)
+	if err := protocol.WriteDispatch(tlsConn, protocol.TypePolling); err != nil {
+		return nil, fmt.Errorf("http_polling: dispatch failed: %w", err)
+	}
 
 	// Build HTTP request
 	var body []byte

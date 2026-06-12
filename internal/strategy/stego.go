@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -18,6 +19,7 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/ktls"
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/protect"
+	"github.com/tiredvpn/tiredvpn/internal/protocol"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 )
@@ -157,12 +159,13 @@ func (s *HTTP2StegoStrategy) Connect(ctx context.Context, target string) (net.Co
 	serverAddr := s.manager.GetServerAddr(ctx)
 	log.Debug("HTTP/2 Stego: Using server address: %s", serverAddr)
 
-	// Establish TLS connection with ALPN for HTTP/2
-	// "tired-stego" enables kTLS on server, "h2" is fallback for old servers
+	// Establish TLS connection with standard ALPN.
+	// Protocol type is sent as the first encrypted byte after handshake,
+	// so DPI sees no "tired-*" fingerprint in the ClientHello.
 	tlsConfig := &tls.Config{
 		InsecureSkipVerify: true,
 		ServerName:         s.coverHost,
-		NextProtos:         []string{"tired-stego", "h2"}, // kTLS-enabled ALPN with fallback
+		NextProtos:         []string{"h2", "http/1.1"},
 	}
 
 	var conn *tls.Conn
@@ -210,15 +213,20 @@ func (s *HTTP2StegoStrategy) Connect(ctx context.Context, target string) (net.Co
 		}
 	}
 
-	// Verify HTTP/2 was negotiated (either tired-stego or h2)
+	// Verify HTTP/2 was negotiated
 	alpn := conn.ConnectionState().NegotiatedProtocol
-	if alpn != "h2" && alpn != "tired-stego" {
+	if alpn != "h2" && alpn != "http/1.1" {
 		conn.Close()
 		return nil, errors.New("HTTP/2 not negotiated")
 	}
 
+	// Send protocol discriminator so server can route without ALPN fingerprints
+	if err := protocol.WriteDispatch(conn, protocol.TypeStego); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("stego dispatch: %w", err)
+	}
+
 	// Try to enable kTLS for kernel TLS offload (reduces CPU usage)
-	// This returns a wrapped connection that uses raw socket I/O
 	var finalConn net.Conn = conn
 	if ktlsConn := ktls.Enable(conn); ktlsConn != nil {
 		log.Debug("kTLS enabled for HTTP/2 Stego connection")

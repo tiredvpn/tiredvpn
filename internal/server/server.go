@@ -29,6 +29,7 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/ktls"
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/padding"
+	"github.com/tiredvpn/tiredvpn/internal/protocol"
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
 	"github.com/tiredvpn/tiredvpn/internal/tun"
 	"golang.org/x/net/http2"
@@ -412,11 +413,6 @@ func initTLSConfig(cfg *Config, srvCtx *serverContext) error {
 	srvCtx.tlsConfig = &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		NextProtos: []string{
-			"tired-stego",
-			"tired-raw",
-			"tired-morph",
-			"tired-ws",
-			"tired-polling",
 			"h2",
 			"http/1.1",
 		},
@@ -899,52 +895,37 @@ func handleConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 // handleTLSConnection handles protocols over TLS (after TLS handshake completed).
 // conn must be a fully-handshaked *tls.Conn — kTLS upgrade is deferred to each
 // per-protocol handler at the relay-phase boundary via ktls.TryEnable.
-// Uses ALPN-based routing when available; falls back to legacy magic-byte
-// detection for backwards compatibility.
+// Routes by the first encrypted byte (protocol discriminator) sent by the client.
 func handleTLSConnection(conn *tls.Conn, srvCtx *serverContext, connID uint64) {
 	logger := log.WithPrefix(fmt.Sprintf("conn:%d", connID))
 
-	// Get negotiated ALPN protocol from TLS handshake
-	alpn := conn.ConnectionState().NegotiatedProtocol
-	logger.Debug("TLS ALPN negotiated: %q", alpn)
-
-	// ALPN-based routing (new clients with kTLS support)
-	switch alpn {
-	case "tired-stego":
-		// HTTP/2 Stego with explicit ALPN - skip preface detection
-		logger.Debug("ALPN routing: tired-stego -> HTTP/2 Stego")
-		handleHTTP2WithALPN(conn, srvCtx, logger)
-		return
-	case "tired-raw":
-		// Raw tunnel with explicit ALPN
-		logger.Debug("ALPN routing: tired-raw -> Raw Tunnel")
-		handleRawTunnel(conn, srvCtx, logger, "")
-		return
-	case "tired-confusion":
-		// Protocol Confusion with explicit ALPN
-		logger.Debug("ALPN routing: tired-confusion -> Protocol Confusion")
-		handleProtocolConfusion(conn, srvCtx, logger)
-		return
-	case "tired-morph":
-		// Traffic Morph with explicit ALPN
-		logger.Debug("ALPN routing: tired-morph -> Traffic Morph")
-		handleMorphConnectionWithALPN(conn, srvCtx, logger)
-		return
-	case "tired-ws":
-		// WebSocket Padded with explicit ALPN
-		logger.Debug("ALPN routing: tired-ws -> WebSocket Padded")
-		handleWebSocketConnection(conn, srvCtx, logger)
-		return
-	case "tired-polling":
-		// HTTP Polling (meek-style) with explicit ALPN
-		logger.Debug("ALPN routing: tired-polling -> HTTP Polling")
-		handleHTTPPollingWithALPN(conn, srvCtx, logger)
+	// Read 1-byte protocol discriminator (encrypted; invisible in ClientHello)
+	protoType, err := protocol.ReadDispatch(conn)
+	if err != nil {
+		logger.Debug("dispatch read failed: %v; falling back to legacy detection", err)
+		handleTLSConnectionLegacy(conn, srvCtx, connID)
 		return
 	}
 
-	// Fallback: legacy protocol detection (for old clients without custom ALPN)
-	logger.Debug("ALPN fallback: using legacy magic-byte detection")
-	handleTLSConnectionLegacy(conn, srvCtx, connID)
+	logger.Debug("dispatch routing: type=0x%02x", protoType)
+
+	switch protoType {
+	case protocol.TypeStego:
+		handleHTTP2WithALPN(conn, srvCtx, logger)
+	case protocol.TypeRaw:
+		handleRawTunnel(conn, srvCtx, logger, "")
+	case protocol.TypeConfusion:
+		handleProtocolConfusion(conn, srvCtx, logger)
+	case protocol.TypeMorph:
+		handleMorphConnectionWithALPN(conn, srvCtx, logger)
+	case protocol.TypeWS:
+		handleWebSocketConnection(conn, srvCtx, logger)
+	case protocol.TypePolling:
+		handleHTTPPollingWithALPN(conn, srvCtx, logger)
+	default:
+		logger.Debug("unknown dispatch type 0x%02x; falling back to legacy detection", protoType)
+		handleTLSConnectionLegacy(conn, srvCtx, connID)
+	}
 }
 
 // handleTLSConnectionLegacy handles TLS connections using magic-byte detection

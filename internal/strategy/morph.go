@@ -14,6 +14,7 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/evasion"
 	"github.com/tiredvpn/tiredvpn/internal/ktls"
 	"github.com/tiredvpn/tiredvpn/internal/log"
+	"github.com/tiredvpn/tiredvpn/internal/protocol"
 	"github.com/tiredvpn/tiredvpn/internal/shaper"
 	"github.com/tiredvpn/tiredvpn/internal/shaper/presets"
 )
@@ -313,11 +314,10 @@ func (s *TrafficMorphStrategy) Connect(ctx context.Context, target string) (net.
 		serverAddr := s.manager.GetServerAddr(ctx)
 		log.Debug("Traffic Morph: Using server address: %s", serverAddr)
 
-		// Use TLS connection (server requires TLS)
-		// "tired-morph" enables kTLS on server, "http/1.1" is fallback
+		// Use TLS connection with standard ALPN (no fingerprint in ClientHello)
 		tlsConfig := &tls.Config{
 			InsecureSkipVerify: true,
-			NextProtos:         []string{"tired-morph", "http/1.1"},
+			NextProtos:         []string{"http/1.1"},
 		}
 		// Use context-aware dialing (respects Android optimized timeouts)
 		dialer := &net.Dialer{}
@@ -340,6 +340,12 @@ func (s *TrafficMorphStrategy) Connect(ctx context.Context, target string) (net.
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			tcpConn.Close()
 			return nil, err
+		}
+
+		// Send protocol discriminator first (encrypted, not visible to DPI)
+		if err := protocol.WriteDispatch(tlsConn, protocol.TypeMorph); err != nil {
+			tcpConn.Close()
+			return nil, fmt.Errorf("morph dispatch: %w", err)
 		}
 
 		// Pre-Enable handshake: write MRPH+nameLen+name+auth through the TLS

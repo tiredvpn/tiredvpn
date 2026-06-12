@@ -23,53 +23,47 @@ const (
 	// Padding extension type (RFC 7685) - used to hide REALITY data
 	PaddingExtensionType = 0x0015
 
-	// Legacy extension type (deprecated, detected by DPI)
+	// Legacy extension type (for postquantum V2 path)
 	REALITYExtensionType = 0xFF01
 
+	// REALITYMagic and REALITYVersion are used only by the postquantum V2 path.
+	// V1 format contains no magic markers - just PubKey+AuthToken at a fixed offset.
 	REALITYMagic   = "REAL"
 	REALITYVersion = 0x01
 
-	REALITYExtensionLength = 4 + 1 + 32 + 32 // magic + version + pubkey + auth token
-	MinPaddingSize         = 256             // minimum padding size for REALITY data + random
+	REALITYExtensionLength = 32 + 32 // pubkey + auth token (no magic, no version)
+	MinPaddingSize         = 256     // minimum padding size for REALITY data + random
 )
 
-// REALITYExtension represents the custom TLS extension for REALITY protocol
-// Extension format: [Magic:"REAL"][Version:0x01][PubKey:32][AuthToken:32]
+// REALITYExtension carries client credentials hidden inside TLS padding extension.
+// Wire format: [PubKey:32][AuthToken:32] — looks like random bytes to an observer.
 type REALITYExtension struct {
-	Magic     [4]byte
-	Version   uint8
 	PubKey    [32]byte
 	AuthToken [32]byte
 }
 
-// NewClientREALITYExtension creates a client-side REALITY extension with auth token
+// NewClientREALITYExtension creates a client-side REALITY extension with auth token.
+// AuthToken is bound to the ephemeral clientPubKey, making it unique per connection.
 func NewClientREALITYExtension(secret []byte, clientPrivKey [32]byte) (*REALITYExtension, error) {
-	// Compute client public key from private key
 	var clientPubKey [32]byte
 	curve25519.ScalarBaseMult(&clientPubKey, &clientPrivKey)
 
-	// Generate auth token: HMAC-SHA256(secret || timestamp || "reality-auth")
-	authToken := generateAuthToken(secret, "reality-auth")
+	// Bind token to per-connection pubkey to prevent replay across connections
+	authToken := generateAuthToken(secret, clientPubKey)
 
 	log.Debug("REALITY-AUTH-CLIENT: auth token generated")
 
-	ext := &REALITYExtension{
-		Version:   REALITYVersion,
+	return &REALITYExtension{
 		PubKey:    clientPubKey,
 		AuthToken: authToken,
-	}
-	copy(ext.Magic[:], REALITYMagic)
-
-	return ext, nil
+	}, nil
 }
 
 // NewServerREALITYExtension creates a server-side REALITY extension response
 func NewServerREALITYExtension(secret []byte, serverPrivKey, clientPubKey [32]byte) (*REALITYExtension, error) {
-	// Compute server public key
 	var serverPubKey [32]byte
 	curve25519.ScalarBaseMult(&serverPubKey, &serverPrivKey)
 
-	// Generate server auth token: HMAC-SHA256(secret || clientPubKey || "reality-server-ack")
 	h := hmac.New(sha256.New, secret)
 	h.Write(clientPubKey[:])
 	h.Write([]byte("reality-server-ack"))
@@ -78,53 +72,34 @@ func NewServerREALITYExtension(secret []byte, serverPrivKey, clientPubKey [32]by
 	var authToken [32]byte
 	copy(authToken[:], authSum)
 
-	ext := &REALITYExtension{
-		Version:   REALITYVersion,
+	return &REALITYExtension{
 		PubKey:    serverPubKey,
 		AuthToken: authToken,
-	}
-	copy(ext.Magic[:], REALITYMagic)
-
-	return ext, nil
+	}, nil
 }
 
-// Marshal serializes the extension to bytes
+// Marshal serializes the extension to bytes: [PubKey:32][AuthToken:32].
+// No magic or version bytes — indistinguishable from random padding to an observer.
 func (e *REALITYExtension) Marshal() []byte {
 	buf := make([]byte, REALITYExtensionLength)
-
-	copy(buf[0:4], e.Magic[:])
-	buf[4] = e.Version
-	copy(buf[5:37], e.PubKey[:])
-	copy(buf[37:69], e.AuthToken[:])
-
+	copy(buf[0:32], e.PubKey[:])
+	copy(buf[32:64], e.AuthToken[:])
 	return buf
 }
 
-// Unmarshal parses the extension from bytes
+// Unmarshal parses [PubKey:32][AuthToken:32] from the start of data.
 func (e *REALITYExtension) Unmarshal(data []byte) error {
 	if len(data) < REALITYExtensionLength {
 		return errors.New("reality extension too short")
 	}
-
-	copy(e.Magic[:], data[0:4])
-	if string(e.Magic[:]) != REALITYMagic {
-		return errors.New("invalid reality magic")
-	}
-
-	e.Version = data[4]
-	if e.Version != REALITYVersion {
-		return errors.New("unsupported reality version")
-	}
-
-	copy(e.PubKey[:], data[5:37])
-	copy(e.AuthToken[:], data[37:69])
-
+	copy(e.PubKey[:], data[0:32])
+	copy(e.AuthToken[:], data[32:64])
 	return nil
 }
 
-// VerifyClientAuth validates a client's auth token
-func VerifyClientAuth(secret []byte, authToken [32]byte) bool {
-	expected := generateAuthToken(secret, "reality-auth")
+// VerifyClientAuth validates a client's auth token bound to its ephemeral pubKey.
+func VerifyClientAuth(secret []byte, clientPubKey [32]byte, authToken [32]byte) bool {
+	expected := generateAuthToken(secret, clientPubKey)
 	match := hmac.Equal(expected[:], authToken[:])
 	if !match {
 		log.Debug("REALITY-AUTH: token mismatch")
@@ -142,17 +117,18 @@ func VerifyServerAuth(secret, clientPubKey []byte, authToken [32]byte) bool {
 	return hmac.Equal(expected, authToken[:])
 }
 
-// generateAuthToken creates an HMAC-based auth token with timestamp
-func generateAuthToken(secret []byte, context string) [32]byte {
-	// Include timestamp (5-minute window) to prevent replay attacks
+// generateAuthToken creates HMAC-SHA256(secret, pubKey || timestamp_bucket).
+// Binding to pubKey makes the token unique per connection and unreplayable.
+func generateAuthToken(secret []byte, clientPubKey [32]byte) [32]byte {
 	timestamp := time.Now().Unix() / 300 // 5-minute buckets
 
 	h := hmac.New(sha256.New, secret)
+	h.Write(clientPubKey[:])
 
 	var tsBuf [8]byte
 	binary.BigEndian.PutUint64(tsBuf[:], uint64(timestamp))
 	h.Write(tsBuf[:])
-	h.Write([]byte(context))
+	h.Write([]byte("reality-auth"))
 
 	var token [32]byte
 	copy(token[:], h.Sum(nil))
@@ -225,15 +201,11 @@ func InjectREALITYIntoPadding(clientHello []byte, ext *REALITYExtension) ([]byte
 	return result, nil
 }
 
-// ExtractREALITYFromPadding extracts REALITY extension from padding extension data
+// ExtractREALITYFromPadding extracts REALITY extension from the start of padding data.
+// No magic check — caller must verify AuthToken to confirm this is a real REALITY client.
 func ExtractREALITYFromPadding(paddingData []byte) (*REALITYExtension, error) {
 	if len(paddingData) < REALITYExtensionLength {
 		return nil, errors.New("padding too short for REALITY data")
-	}
-
-	// Check magic
-	if string(paddingData[0:4]) != REALITYMagic {
-		return nil, errors.New("REALITY magic not found in padding")
 	}
 
 	ext := &REALITYExtension{}

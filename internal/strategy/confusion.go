@@ -14,6 +14,7 @@ import (
 
 	"github.com/tiredvpn/tiredvpn/internal/ktls"
 	"github.com/tiredvpn/tiredvpn/internal/log"
+	"github.com/tiredvpn/tiredvpn/internal/protocol"
 )
 
 // ProtocolConfusionStrategy crafts packets that look like different protocols
@@ -96,11 +97,10 @@ func (s *ProtocolConfusionStrategy) Connect(ctx context.Context, target string) 
 	serverAddr := s.manager.GetServerAddr(ctx)
 	log.Debug("Protocol Confusion: Using server address: %s", serverAddr)
 
-	// Use TLS connection (server requires TLS)
-	// "tired-confusion" enables confusion protocol path on server
+	// Use TLS connection with standard ALPN (no fingerprint in ClientHello)
 	tlsConfig := &tls.Config{
 		InsecureSkipVerify: true,
-		NextProtos:         []string{"tired-confusion", "http/1.1"},
+		NextProtos:         []string{"http/1.1"},
 	}
 	// Use context-aware dialing (respects Android optimized timeouts)
 	dialer := &net.Dialer{}
@@ -112,6 +112,12 @@ func (s *ProtocolConfusionStrategy) Connect(ctx context.Context, target string) 
 	if err := conn.HandshakeContext(ctx); err != nil {
 		tcpConn.Close()
 		return nil, err
+	}
+
+	// Send protocol discriminator (encrypted, not visible to DPI)
+	if err := protocol.WriteDispatch(conn, protocol.TypeConfusion); err != nil {
+		tcpConn.Close()
+		return nil, fmt.Errorf("confusion dispatch: %w", err)
 	}
 
 	// Try to enable kTLS for kernel TLS offload

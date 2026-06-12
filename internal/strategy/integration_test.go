@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/padding"
+	"github.com/tiredvpn/tiredvpn/internal/protocol"
 )
 
 // generateTestCert creates a self-signed certificate for testing
@@ -75,6 +76,11 @@ func mockWebSocketPaddedServer(listener net.Listener, secret []byte, tlsCert tls
 
 		go func(c net.Conn) {
 			defer c.Close()
+
+			// Read protocol dispatch byte (TypeWS)
+			if _, err := protocol.ReadDispatch(c); err != nil {
+				return
+			}
 
 			// Read WebSocket upgrade request
 			buf := make([]byte, 4096)
