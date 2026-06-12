@@ -13,13 +13,20 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/log"
 )
 
+// InjectorPacketMark is set via SO_MARK on the raw socket used to inject
+// additional packets (fragments/duplicates). Exclude it from the NFQUEUE rule
+// so injected packets don't re-enter the queue and loop:
+//
+//	iptables -I OUTPUT -p tcp -d <server-ip> -m mark ! --mark 0x54495245 -j NFQUEUE --queue-num <N>
+const InjectorPacketMark = 0x54495245 // "TIRE"
+
 // Injector intercepts outgoing TCP packets via Linux NFQUEUE and applies
 // Geneva strategies before releasing them to the kernel.
 //
 // Prerequisites:
 //   - CAP_NET_ADMIN
-//   - iptables rule scoped to the target server, e.g.:
-//     iptables -I OUTPUT -p tcp -d <server-ip> -j NFQUEUE --queue-num <N>
+//   - iptables rule with mark exclusion (see InjectorPacketMark):
+//     iptables -I OUTPUT -p tcp -d <server-ip> -m mark ! --mark 0x54495245 -j NFQUEUE --queue-num <N>
 type Injector struct {
 	strategies []*Strategy
 	queueNum   uint16
@@ -49,6 +56,13 @@ func (inj *Injector) Start(ctx context.Context) error {
 	if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1); err != nil {
 		syscall.Close(fd)
 		return fmt.Errorf("geneva injector: IP_HDRINCL: %w", err)
+	}
+	// Mark injected packets so the iptables NFQUEUE rule (which must use
+	// ! --mark InjectorPacketMark) does not re-queue them, preventing an
+	// infinite re-injection loop.
+	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_MARK, InjectorPacketMark); err != nil {
+		syscall.Close(fd)
+		return fmt.Errorf("geneva injector: SO_MARK: %w", err)
 	}
 	inj.rawFd = fd
 

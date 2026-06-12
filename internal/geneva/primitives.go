@@ -202,9 +202,10 @@ func (f *FragmentPrimitive) Apply(packet []byte) ([][]byte, error) {
 	copy(frag1, header)
 	copy(frag1[payloadStart:], payload[:fragmentOffset])
 
-	// Update IP total length
+	// Update IP total length and recompute both IP and TCP checksums.
 	binary.BigEndian.PutUint16(frag1[2:4], uint16(len(frag1)))
 	recalculateIPChecksum(frag1)
+	recalculateTCPChecksum(frag1)
 
 	// Second fragment: header + payload[offset:]
 	frag2 := make([]byte, len(header)+len(payload)-fragmentOffset)
@@ -216,9 +217,10 @@ func (f *FragmentPrimitive) Apply(packet []byte) ([][]byte, error) {
 	seqNum += uint32(fragmentOffset)
 	binary.BigEndian.PutUint32(frag2[tcpStart+4:], seqNum)
 
-	// Update IP total length
+	// Update IP total length and recompute both checksums.
 	binary.BigEndian.PutUint16(frag2[2:4], uint16(len(frag2)))
 	recalculateIPChecksum(frag2)
+	recalculateTCPChecksum(frag2)
 
 	return [][]byte{frag1, frag2}, nil
 }

@@ -98,13 +98,31 @@ func (e *REALITYExtension) Unmarshal(data []byte) error {
 }
 
 // VerifyClientAuth validates a client's auth token bound to its ephemeral pubKey.
+// Accepts tokens from the current 5-minute bucket and the adjacent ones to
+// tolerate clock skew between client and server.
 func VerifyClientAuth(secret []byte, clientPubKey [32]byte, authToken [32]byte) bool {
-	expected := generateAuthToken(secret, clientPubKey)
-	match := hmac.Equal(expected[:], authToken[:])
-	if !match {
-		log.Debug("REALITY-AUTH: token mismatch")
+	now := time.Now().Unix() / 300
+	for _, delta := range []int64{0, -1, 1} {
+		expected := authTokenAtBucket(secret, clientPubKey, now+delta)
+		if hmac.Equal(authToken[:], expected[:]) {
+			return true
+		}
 	}
-	return match
+	log.Debug("REALITY-AUTH: token mismatch (checked buckets %d..%d)", now-1, now+1)
+	return false
+}
+
+// authTokenAtBucket computes the token for an explicit time bucket.
+func authTokenAtBucket(secret []byte, clientPubKey [32]byte, bucket int64) [32]byte {
+	h := hmac.New(sha256.New, secret)
+	h.Write(clientPubKey[:])
+	var tsBuf [8]byte
+	binary.BigEndian.PutUint64(tsBuf[:], uint64(bucket))
+	h.Write(tsBuf[:])
+	h.Write([]byte("reality-auth"))
+	var token [32]byte
+	copy(token[:], h.Sum(nil))
+	return token
 }
 
 // VerifyServerAuth validates a server's auth token
@@ -120,19 +138,7 @@ func VerifyServerAuth(secret, clientPubKey []byte, authToken [32]byte) bool {
 // generateAuthToken creates HMAC-SHA256(secret, pubKey || timestamp_bucket).
 // Binding to pubKey makes the token unique per connection and unreplayable.
 func generateAuthToken(secret []byte, clientPubKey [32]byte) [32]byte {
-	timestamp := time.Now().Unix() / 300 // 5-minute buckets
-
-	h := hmac.New(sha256.New, secret)
-	h.Write(clientPubKey[:])
-
-	var tsBuf [8]byte
-	binary.BigEndian.PutUint64(tsBuf[:], uint64(timestamp))
-	h.Write(tsBuf[:])
-	h.Write([]byte("reality-auth"))
-
-	var token [32]byte
-	copy(token[:], h.Sum(nil))
-	return token
+	return authTokenAtBucket(secret, clientPubKey, time.Now().Unix()/300)
 }
 
 // GenerateX25519KeyPair generates a new X25519 key pair
