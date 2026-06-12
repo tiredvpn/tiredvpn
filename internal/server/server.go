@@ -218,6 +218,10 @@ type Config struct {
 	EnableIPv6   bool   // default: true
 	DualStack    bool   // default: true
 
+	// EnableICMP enables the ICMP tunnel server (requires CAP_NET_RAW).
+	// If the process lacks the capability, the listener is silently skipped.
+	EnableICMP bool
+
 	// Shaper, when non-nil, is built from TOML [shaper]. The server-side
 	// pipeline does not yet consume it — server morph processing lives
 	// outside internal/strategy.MorphedConn — so this field is reserved for
@@ -286,6 +290,10 @@ func Run(cfg *Config) error {
 				log.Error("IPv6 listener failed: %v", err)
 			}
 		}()
+	}
+
+	if cfg.EnableICMP {
+		go startICMPServer(srvCtx)
 	}
 
 	for {
