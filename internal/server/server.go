@@ -222,6 +222,12 @@ type Config struct {
 	// If the process lacks the capability, the listener is silently skipped.
 	EnableICMP bool
 
+	// REALITYCoverDomain is the domain to proxy unauthorized REALITY connections
+	// to, making the server look like a legitimate HTTPS endpoint when probed.
+	// Must be a hostname without port (port 443 is used).
+	// If empty, unauthorized REALITY connections are silently dropped.
+	REALITYCoverDomain string
+
 	// Shaper, when non-nil, is built from TOML [shaper]. The server-side
 	// pipeline does not yet consume it — server morph processing lives
 	// outside internal/strategy.MorphedConn — so this field is reserved for
@@ -939,13 +945,18 @@ func handleTLSConnection(conn *tls.Conn, srvCtx *serverContext, connID uint64) {
 		handleHTTPPollingWithALPN(conn, srvCtx, logger)
 	default:
 		logger.Debug("unknown dispatch type 0x%02x; falling back to legacy detection", protoType)
-		handleTLSConnectionLegacy(conn, srvCtx, connID)
+		// Prepend the consumed dispatch byte so legacy detectors see the full stream.
+		prefixed := &bufferedConn{
+			Conn:   conn,
+			reader: io.MultiReader(bytes.NewReader([]byte{protoType}), conn),
+		}
+		handleTLSConnectionLegacy(prefixed, srvCtx, connID)
 	}
 }
 
-// handleTLSConnectionLegacy handles TLS connections using magic-byte detection
-// Used for backwards compatibility with clients that don't send custom ALPN
-func handleTLSConnectionLegacy(conn *tls.Conn, srvCtx *serverContext, connID uint64) {
+// handleTLSConnectionLegacy handles TLS connections using magic-byte detection.
+// conn is net.Conn (not *tls.Conn) so callers can prepend unread bytes via bufferedConn.
+func handleTLSConnectionLegacy(conn net.Conn, srvCtx *serverContext, connID uint64) {
 	cfg := srvCtx.cfg
 	logger := log.WithPrefix(fmt.Sprintf("conn:%d", connID))
 

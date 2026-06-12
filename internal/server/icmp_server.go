@@ -24,44 +24,44 @@ const (
 
 // icmpSession tracks an active ICMP tunnel session.
 type icmpSession struct {
-	sessionID uint32
-	cipher    interface {
-		Open(dst, nonce, ciphertext, additionalData []byte) ([]byte, error)
-		Seal(dst, nonce, plaintext, additionalData []byte) []byte
-		NonceSize() int
-		Overhead() int
-	}
+	sessionID  uint32
+	// c2sCipher decrypts client-to-server packets (matches client's sendCipher).
+	// s2cCipher encrypts server-to-client packets (matches client's recvCipher).
+	c2sCipher  cipherAEAD
+	s2cCipher  cipherAEAD
 	clientAddr *net.IPAddr
 	tunnelID   int
 	recvCh     chan []byte
-	sendCh     chan icmpSendRequest
 	lastActive time.Time
 	mu         sync.Mutex
+	done       chan struct{}
+	once       sync.Once // guards close(done)
 }
 
-type icmpSendRequest struct {
-	data      []byte
-	seq       uint32
-	sessionID uint32
+// cipherAEAD is the minimal AEAD interface used by the server.
+type cipherAEAD interface {
+	Open(dst, nonce, ciphertext, additionalData []byte) ([]byte, error)
+	Seal(dst, nonce, plaintext, additionalData []byte) []byte
 }
 
 // ICMPServer receives ICMP Echo Request packets, decrypts tunnel data, and
 // relays it through a virtual net.Conn handed to the standard tunnel handler.
 // Requires CAP_NET_RAW.
 type ICMPServer struct {
-	conn    *icmp.PacketConn
-	srvCtx  *serverContext
-	secret  []byte
-	mu      sync.Mutex
-	sessions map[uint32]*icmpSession
+	conn      *icmp.PacketConn
+	srvCtx    *serverContext
+	masterKey []byte // DeriveICMPKey(cfg.Secret), stable for the process lifetime
+	mu        sync.Mutex
+	sessions  map[uint32]*icmpSession
 }
 
-// startICMPServer starts the ICMP listener if EnableICMP is set and CAP_NET_RAW is available.
+// startICMPServer starts the ICMP listener if EnableICMP is set and
+// CAP_NET_RAW is available. Logs a warning and returns silently if not.
 func startICMPServer(srvCtx *serverContext) {
 	srv := &ICMPServer{
-		srvCtx:   srvCtx,
-		secret:   srvCtx.cfg.Secret,
-		sessions: make(map[uint32]*icmpSession),
+		srvCtx:    srvCtx,
+		masterKey: strategy.DeriveICMPKey(srvCtx.cfg.Secret),
+		sessions:  make(map[uint32]*icmpSession),
 	}
 
 	conn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
@@ -102,7 +102,6 @@ func (s *ICMPServer) run() {
 		if !ok || len(echo.Data) < strategy.TunnelHeaderSize {
 			continue
 		}
-
 		if binary.BigEndian.Uint16(echo.Data[0:2]) != strategy.ICMPTunnelMagic {
 			continue
 		}
@@ -119,27 +118,40 @@ func (s *ICMPServer) run() {
 
 func (s *ICMPServer) handlePacket(echo *icmp.Echo, clientAddr *net.IPAddr) {
 	data := echo.Data
-	header := strategy.ParseTunnelHeader(data[:strategy.TunnelHeaderSize])
-
-	session := s.getOrCreateSession(header.SessionID, clientAddr, echo.ID)
-	if session == nil {
+	if len(data) < strategy.TunnelHeaderSize {
 		return
 	}
+	header := strategy.ParseTunnelHeader(data[:strategy.TunnelHeaderSize])
 
-	// Decrypt payload
+	// --- Authenticate before touching session state ---
+	// Derive the c2s key for this sessionID and try to decrypt.
+	// An unauthenticated attacker cannot forge a valid ciphertext, so no
+	// session is created until this passes.
 	encrypted := data[strategy.TunnelHeaderSize:]
 	if len(encrypted) == 0 {
 		return
 	}
 	headerBytes := data[:strategy.TunnelHeaderSize]
 
+	c2sKey := strategy.DeriveICMPDirectionalKey(s.masterKey, header.SessionID, "c2s")
+	c2sCipher, err := chacha20poly1305.NewX(c2sKey)
+	if err != nil {
+		return
+	}
+
 	nonce := make([]byte, 24)
 	binary.BigEndian.PutUint32(nonce[0:], header.SessionID)
 	binary.BigEndian.PutUint64(nonce[16:], uint64(header.PacketSeq))
 
-	plaintext, err := session.cipher.Open(nil, nonce, encrypted, headerBytes)
+	plaintext, err := c2sCipher.Open(nil, nonce, encrypted, headerBytes)
 	if err != nil {
-		log.Debug("ICMP server: decrypt error session=%08x: %v", header.SessionID, err)
+		// Wrong secret or corrupted packet - silently discard, no session created.
+		return
+	}
+
+	// Auth passed - now get or create the session.
+	session := s.getOrCreateSession(header.SessionID, clientAddr, echo.ID, c2sCipher)
+	if session == nil {
 		return
 	}
 
@@ -147,20 +159,26 @@ func (s *ICMPServer) handlePacket(echo *icmp.Echo, clientAddr *net.IPAddr) {
 	session.lastActive = time.Now()
 	session.mu.Unlock()
 
-	// Control packet (handshake)
+	// Control packet (handshake) — reply and done.
 	if header.Flags&strategy.FlagControl != 0 {
 		s.sendEchoReply(session, plaintext, strategy.FlagControl, header.PacketSeq+1)
 		return
 	}
 
 	select {
+	case <-session.done:
 	case session.recvCh <- plaintext:
 	default:
 		log.Debug("ICMP server: session=%08x recv buffer full, dropping", header.SessionID)
 	}
 }
 
-func (s *ICMPServer) getOrCreateSession(sessionID uint32, clientAddr *net.IPAddr, tunnelID int) *icmpSession {
+func (s *ICMPServer) getOrCreateSession(
+	sessionID uint32,
+	clientAddr *net.IPAddr,
+	tunnelID int,
+	c2sCipher cipherAEAD,
+) *icmpSession {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -173,27 +191,28 @@ func (s *ICMPServer) getOrCreateSession(sessionID uint32, clientAddr *net.IPAddr
 		return nil
 	}
 
-	cipher, err := chacha20poly1305.NewX(strategy.DeriveICMPKey(s.secret))
+	s2cKey := strategy.DeriveICMPDirectionalKey(s.masterKey, sessionID, "s2c")
+	s2cCipher, err := chacha20poly1305.NewX(s2cKey)
 	if err != nil {
-		log.Warn("ICMP server: cipher init failed: %v", err)
+		log.Warn("ICMP server: s2c cipher init failed: %v", err)
 		return nil
 	}
 
 	sess := &icmpSession{
 		sessionID:  sessionID,
-		cipher:     cipher,
+		c2sCipher:  c2sCipher,
+		s2cCipher:  s2cCipher,
 		clientAddr: clientAddr,
 		tunnelID:   tunnelID,
 		recvCh:     make(chan []byte, 256),
-		sendCh:     make(chan icmpSendRequest, 256),
 		lastActive: time.Now(),
+		done:       make(chan struct{}),
 	}
 	s.sessions[sessionID] = sess
 
-	// Spin up a virtual connection and hand it to the raw tunnel handler.
+	// Spin up a virtual connection and hand it to the standard tunnel handler.
 	clientConn, serverConn := net.Pipe()
 
-	go s.sessionSendLoop(sess, clientAddr, tunnelID)
 	go s.pipeRecvToConn(sess, serverConn)
 	go s.pipeConnToSend(sess, serverConn)
 
@@ -206,24 +225,30 @@ func (s *ICMPServer) getOrCreateSession(sessionID uint32, clientAddr *net.IPAddr
 	return sess
 }
 
-// pipeRecvToConn writes decrypted ICMP data into the pipe that handleRawTunnel reads from.
+// pipeRecvToConn writes decrypted ICMP data into the server end of the pipe
+// that handleRawTunnel reads from. Exits when the session is evicted (done closed).
 func (s *ICMPServer) pipeRecvToConn(sess *icmpSession, conn net.Conn) {
 	defer conn.Close()
 	for {
 		select {
-		case data, ok := <-sess.recvCh:
-			if !ok {
+		case <-sess.done:
+			return
+		case data := <-sess.recvCh:
+			if data == nil {
 				return
 			}
 			if _, err := conn.Write(data); err != nil {
 				log.Debug("ICMP server: pipe write error session=%08x: %v", sess.sessionID, err)
+				s.removeSession(sess.sessionID)
 				return
 			}
 		}
 	}
 }
 
-// pipeConnToSend reads from the pipe (data that handleRawTunnel wants to send) and queues it.
+// pipeConnToSend reads from the server end of the pipe (data that
+// handleRawTunnel wants to send back to the client) and transmits it as
+// ICMP Echo Replies.
 func (s *ICMPServer) pipeConnToSend(sess *icmpSession, conn net.Conn) {
 	var seq uint32 = 1000
 	buf := make([]byte, 4096)
@@ -237,13 +262,12 @@ func (s *ICMPServer) pipeConnToSend(sess *icmpSession, conn net.Conn) {
 
 		payload := make([]byte, n)
 		copy(payload, buf[:n])
-
 		seq++
 		s.sendEchoReply(sess, payload, 0, seq)
 	}
 }
 
-// sendEchoReply encrypts payload and sends an ICMP Echo Reply to the client.
+// sendEchoReply encrypts payload with the s2c key and sends an ICMP Echo Reply.
 func (s *ICMPServer) sendEchoReply(sess *icmpSession, data []byte, flags uint8, seq uint32) {
 	header := strategy.TunnelHeader{
 		Magic:      strategy.ICMPTunnelMagic,
@@ -259,7 +283,7 @@ func (s *ICMPServer) sendEchoReply(sess *icmpSession, data []byte, flags uint8, 
 	binary.BigEndian.PutUint32(nonce[0:], sess.sessionID)
 	binary.BigEndian.PutUint64(nonce[16:], uint64(seq))
 
-	encrypted := sess.cipher.Seal(nil, nonce, data, headerBytes)
+	encrypted := sess.s2cCipher.Seal(nil, nonce, data, headerBytes)
 
 	payload := make([]byte, strategy.TunnelHeaderSize+len(encrypted))
 	copy(payload[0:strategy.TunnelHeaderSize], headerBytes)
@@ -287,14 +311,16 @@ func (s *ICMPServer) sendEchoReply(sess *icmpSession, data []byte, flags uint8, 
 	}
 }
 
-// sessionSendLoop is a no-op stub; actual sending happens directly in sendEchoReply.
-func (s *ICMPServer) sessionSendLoop(sess *icmpSession, _ *net.IPAddr, _ int) {}
-
 func (s *ICMPServer) removeSession(sessionID uint32) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	sess, ok := s.sessions[sessionID]
 	delete(s.sessions, sessionID)
-	log.Debug("ICMP server: removed session=%08x", sessionID)
+	s.mu.Unlock()
+	if ok {
+		// Close done once; pipeRecvToConn and pipeConnToSend select on it.
+		sess.once.Do(func() { close(sess.done) })
+		log.Debug("ICMP server: removed session=%08x", sessionID)
+	}
 }
 
 func (s *ICMPServer) cleanupLoop() {
@@ -302,16 +328,21 @@ func (s *ICMPServer) cleanupLoop() {
 	defer ticker.Stop()
 	for range ticker.C {
 		now := time.Now()
+		var expired []*icmpSession
 		s.mu.Lock()
 		for id, sess := range s.sessions {
 			sess.mu.Lock()
 			inactive := now.Sub(sess.lastActive) > icmpSessionTTL
 			sess.mu.Unlock()
 			if inactive {
+				expired = append(expired, sess)
 				delete(s.sessions, id)
-				log.Debug("ICMP server: expired session=%08x", id)
 			}
 		}
 		s.mu.Unlock()
+		for _, sess := range expired {
+			sess.once.Do(func() { close(sess.done) })
+			log.Debug("ICMP server: expired session=%08x", sess.sessionID)
+		}
 	}
 }

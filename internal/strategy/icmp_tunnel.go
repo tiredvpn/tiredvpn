@@ -3,7 +3,9 @@ package strategy
 import (
 	"context"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -214,23 +216,31 @@ func (s *ICMPTunnelStrategy) Connect(ctx context.Context, target string) (net.Co
 		return nil, fmt.Errorf("icmp tunnel: listen failed (need root/CAP_NET_RAW): %w", err)
 	}
 
-	// Derive session key from secret
-	cipher, err := chacha20poly1305.NewX(DeriveICMPKey(s.secret))
-	if err != nil {
-		icmpConn.Close()
-		return nil, fmt.Errorf("icmp tunnel: cipher init failed: %w", err)
-	}
-
 	// Generate session ID
 	var sessionID uint32
 	binary.Read(rand.Reader, binary.BigEndian, &sessionID)
+
+	// Derive per-direction keys so client-to-server and server-to-client packets
+	// use independent keystreams, preventing bidirectional nonce reuse.
+	masterKey := DeriveICMPKey(s.secret)
+	sendCipher, err := chacha20poly1305.NewX(DeriveICMPDirectionalKey(masterKey, sessionID, "c2s"))
+	if err != nil {
+		icmpConn.Close()
+		return nil, fmt.Errorf("icmp tunnel: send cipher: %w", err)
+	}
+	recvCipher, err := chacha20poly1305.NewX(DeriveICMPDirectionalKey(masterKey, sessionID, "s2c"))
+	if err != nil {
+		icmpConn.Close()
+		return nil, fmt.Errorf("icmp tunnel: recv cipher: %w", err)
+	}
 
 	// Create tunnel connection wrapper
 	tunnel := &icmpTunnelConn{
 		icmpConn:   icmpConn,
 		serverIP:   serverIP,
 		serverAddr: s.serverAddr,
-		cipher:     cipher,
+		sendCipher: sendCipher,
+		recvCipher: recvCipher,
 		sessionID:  sessionID,
 		tunnelID:   uint16(os.Getpid() & 0xffff),
 		sendQueue:  make(chan []byte, 256),
@@ -262,7 +272,10 @@ type icmpTunnelConn struct {
 	icmpConn   *icmp.PacketConn
 	serverIP   *net.IPAddr
 	serverAddr string
-	cipher     cipher.AEAD
+	// sendCipher encrypts client-to-server packets (c2s direction).
+	// recvCipher decrypts server-to-client packets (s2c direction).
+	sendCipher cipher.AEAD
+	recvCipher cipher.AEAD
 	sessionID  uint32
 	tunnelID   uint16
 
@@ -390,8 +403,8 @@ func (c *icmpTunnelConn) buildPacket(data []byte, flags uint8) ([]byte, error) {
 	binary.BigEndian.PutUint32(nonce[0:], c.sessionID)
 	binary.BigEndian.PutUint64(nonce[16:], seq)
 
-	// Encrypt payload with header as additional data
-	encrypted := c.cipher.Seal(nil, nonce, data, headerBytes)
+	// Encrypt with c2s direction key.
+	encrypted := c.sendCipher.Seal(nil, nonce, data, headerBytes)
 
 	// Build ICMP payload: tunnel header + encrypted data
 	payload := make([]byte, TunnelHeaderSize+len(encrypted))
@@ -541,7 +554,7 @@ func (c *icmpTunnelConn) recvLoop() {
 		binary.BigEndian.PutUint32(nonce[0:], header.SessionID)
 		binary.BigEndian.PutUint64(nonce[16:], uint64(header.PacketSeq))
 
-		plaintext, err := c.cipher.Open(nil, nonce, encrypted, headerBytes)
+		plaintext, err := c.recvCipher.Open(nil, nonce, encrypted, headerBytes)
 		if err != nil {
 			log.Debug("ICMP Tunnel: decrypt error: %v", err)
 			continue
@@ -669,6 +682,19 @@ func DeriveICMPKey(secret []byte) []byte {
 		}
 	}
 	return h
+}
+
+// DeriveICMPDirectionalKey derives a 32-byte key for a specific traffic direction.
+// direction is "c2s" (client-to-server) or "s2c" (server-to-client).
+// Both sides derive the same key pair from the shared masterKey + sessionID,
+// ensuring client.sendCipher == server.c2sCipher and client.recvCipher == server.s2cCipher.
+func DeriveICMPDirectionalKey(masterKey []byte, sessionID uint32, direction string) []byte {
+	h := hmac.New(sha256.New, masterKey)
+	var sidBuf [4]byte
+	binary.BigEndian.PutUint32(sidBuf[:], sessionID)
+	h.Write(sidBuf[:])
+	h.Write([]byte("icmp-" + direction))
+	return h.Sum(nil) // sha256 → 32 bytes, exactly what NewX needs
 }
 
 // Ensure interface compliance

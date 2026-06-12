@@ -188,8 +188,11 @@ func HandleREALITYConnection(conn net.Conn, srvCtx *serverContext, logger *log.L
 	}
 
 	if !authenticated {
-		logger.Info("REALITY: Auth failed, proxying to real destination")
-		handleREALITYUnauthorized(conn, clientHello, logger)
+		logger.Info("REALITY: Auth failed")
+		if srvCtx.cfg.REALITYCoverDomain != "" {
+			handleREALITYUnauthorized(conn, clientHello, srvCtx.cfg.REALITYCoverDomain, logger)
+		}
+		// No cover domain configured: silently drop to avoid SSRF via client-controlled SNI.
 		return
 	}
 
@@ -292,20 +295,11 @@ func HandleREALITYConnection(conn net.Conn, srvCtx *serverContext, logger *log.L
 	handleRawTunnel(conn, srvCtx, logger, clientID)
 }
 
-// handleREALITYUnauthorized proxies unauthorized clients to the real destination
-func handleREALITYUnauthorized(conn net.Conn, clientHello []byte, logger *log.Logger) {
-	// Extract SNI
-	sni, err := ExtractSNI(clientHello)
-	if err != nil {
-		logger.Error("REALITY-UNAUTH: Failed to extract SNI: %v", err)
-		return
-	}
-
-	// Default to port 443
-	dest := sni
-	if _, _, err := net.SplitHostPort(dest); err != nil {
-		dest = net.JoinHostPort(sni, "443")
-	}
+// handleREALITYUnauthorized proxies unauthorized REALITY clients to the configured
+// cover domain. coverDomain is admin-controlled (Config.REALITYCoverDomain), not
+// client-provided SNI, so there is no SSRF via attacker-controlled hostname.
+func handleREALITYUnauthorized(conn net.Conn, clientHello []byte, coverDomain string, logger *log.Logger) {
+	dest := net.JoinHostPort(coverDomain, "443")
 
 	logger.Info("REALITY-UNAUTH: Proxying to %s", dest)
 
