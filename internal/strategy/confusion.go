@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/tls"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -12,9 +11,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/tiredvpn/tiredvpn/internal/ktls"
 	"github.com/tiredvpn/tiredvpn/internal/log"
-	"github.com/tiredvpn/tiredvpn/internal/protocol"
 )
 
 // ProtocolConfusionStrategy crafts packets that look like different protocols
@@ -57,10 +54,10 @@ func NewProtocolConfusionStrategy(manager *Manager, confType ConfusionType, base
 
 func (s *ProtocolConfusionStrategy) Name() string {
 	names := map[ConfusionType]string{
-		ConfusionDNSoverTLS:  "Protocol Confusion (DNS/TLS)",
-		ConfusionHTTPoverTLS: "Protocol Confusion (HTTP/TLS)",
-		ConfusionSSHoverTLS:  "Protocol Confusion (SSH/TLS)",
-		ConfusionSMTPoverTLS: "Protocol Confusion (SMTP/TLS)",
+		ConfusionDNSoverTLS:  "Protocol Confusion (DNS)",
+		ConfusionHTTPoverTLS: "Protocol Confusion (HTTP)",
+		ConfusionSSHoverTLS:  "Protocol Confusion (SSH)",
+		ConfusionSMTPoverTLS: "Protocol Confusion (SMTP)",
 		ConfusionMultiLayer:  "Protocol Confusion (Multi-Layer)",
 	}
 	return names[s.confusionType]
@@ -93,43 +90,18 @@ func (s *ProtocolConfusionStrategy) Probe(ctx context.Context, target string) er
 }
 
 func (s *ProtocolConfusionStrategy) Connect(ctx context.Context, target string) (net.Conn, error) {
-	// Get server address (IPv6/IPv4 with automatic fallback)
 	serverAddr := s.manager.GetServerAddr(ctx)
-	log.Debug("Protocol Confusion: Using server address: %s", serverAddr)
+	log.Debug("Protocol Confusion: Connecting to %s (raw TCP, no TLS)", serverAddr)
 
-	// Use TLS connection with standard ALPN (no fingerprint in ClientHello)
-	tlsConfig := &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"http/1.1"},
-	}
-	// Use context-aware dialing (respects Android optimized timeouts)
+	// Confusion operates on raw TCP — the confused preamble IS the transport layer.
+	// No TLS wrapper; DPI sees DNS/HTTP/SSH/SMTP, server detects TIRED marker.
 	dialer := &net.Dialer{}
-	tcpConn, err := dialer.DialContext(ctx, "tcp", serverAddr)
+	conn, err := dialer.DialContext(ctx, "tcp", serverAddr)
 	if err != nil {
 		return nil, err
 	}
-	conn := tls.Client(tcpConn, tlsConfig)
-	if err := conn.HandshakeContext(ctx); err != nil {
-		tcpConn.Close()
-		return nil, err
-	}
 
-	// Send protocol discriminator (encrypted, not visible to DPI)
-	if err := protocol.WriteDispatch(conn, protocol.TypeConfusion); err != nil {
-		tcpConn.Close()
-		return nil, fmt.Errorf("confusion dispatch: %w", err)
-	}
-
-	// Try to enable kTLS for kernel TLS offload
-	// This returns a wrapped connection that uses raw socket I/O
-	var finalConn net.Conn = conn
-	if ktlsConn := ktls.Enable(conn); ktlsConn != nil {
-		log.Debug("kTLS enabled for Protocol Confusion connection")
-		finalConn = ktlsConn
-	}
-
-	// Wrap with confusion layer
-	return NewConfusedConn(finalConn, s.confusionType), nil
+	return NewConfusedConn(conn, s.confusionType), nil
 }
 
 // ConfusedConn wraps connection with protocol confusion
@@ -213,55 +185,58 @@ func (c *ConfusedConn) buildConfusedPacket(realData []byte) []byte {
 	}
 }
 
-// buildDNSConfusion makes packet look like DNS response to DPI
-// Structure: [DNS Header (fake)][Magic][Real TLS data]
-// DPI sees DNS and may skip deep inspection
-// Server skips to magic marker and processes TLS
+// buildDNSConfusion makes packet look like a DNS-over-TCP query.
+// DNS-over-TCP format: [length:2][dns-message], flags=0x0100 (standard query, RD set).
 func (c *ConfusedConn) buildDNSConfusion(realData []byte) []byte {
-	var buf bytes.Buffer
+	var dns bytes.Buffer
 
-	// Fake DNS response header (12 bytes)
-	// Transaction ID
-	buf.Write([]byte{0x12, 0x34})
-	// Flags: Standard response, no error
-	buf.Write([]byte{0x81, 0x80})
-	// Questions: 1
-	buf.Write([]byte{0x00, 0x01})
-	// Answers: 1
-	buf.Write([]byte{0x00, 0x01})
-	// Authority: 0
-	buf.Write([]byte{0x00, 0x00})
-	// Additional: 0
-	buf.Write([]byte{0x00, 0x00})
+	// Random transaction ID
+	txid := make([]byte, 2)
+	rand.Read(txid)
+	dns.Write(txid)
+	// Flags: standard query (0x0100) - not a response
+	dns.Write([]byte{0x01, 0x00})
+	// Questions: 1, Answers: 0, Authority: 0, Additional: 0
+	dns.Write([]byte{0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
 
-	// Fake question (for " + getRandomConfusionDomain() + ")
-	// Name: %s
-	buf.Write([]byte{0x06, 'y', 'a', 'n', 'd', 'e', 'x', 0x02, 'r', 'u', 0x00})
-	// Type: A
-	buf.Write([]byte{0x00, 0x01})
-	// Class: IN
-	buf.Write([]byte{0x00, 0x01})
+	// Question: encode getRandomConfusionDomain() as DNS labels
+	domain := getRandomConfusionDomain()
+	labels := encodeDNSName(domain)
+	dns.Write(labels)
+	// Type: A (0x0001), Class: IN (0x0001)
+	dns.Write([]byte{0x00, 0x01, 0x00, 0x01})
 
-	// Answer section (fake)
-	buf.Write([]byte{0xc0, 0x0c})             // Pointer to name
-	buf.Write([]byte{0x00, 0x01})             // Type A
-	buf.Write([]byte{0x00, 0x01})             // Class IN
-	buf.Write([]byte{0x00, 0x00, 0x01, 0x2c}) // TTL: 300
-	buf.Write([]byte{0x00, 0x04})             // RDLENGTH: 4
-	buf.Write([]byte{0x4d, 0x58, 0x67, 0x63}) // IP (fake)
-
-	// Magic marker - server looks for this
-	buf.Write([]byte{0x00, 0x00, 0x54, 0x49, 0x52, 0x45, 0x44}) // \0\0TIRED
-
-	// Length of real data
+	// Magic marker + length + real data embedded after question
+	dns.Write([]byte{0x00, 0x00, 0x54, 0x49, 0x52, 0x45, 0x44}) // \0\0TIRED
 	lenBytes := make([]byte, 4)
 	binary.BigEndian.PutUint32(lenBytes, uint32(len(realData)))
-	buf.Write(lenBytes)
+	dns.Write(lenBytes)
+	dns.Write(realData)
 
-	// Real data
-	buf.Write(realData)
-
+	// DNS-over-TCP 2-byte length prefix
+	msg := dns.Bytes()
+	var buf bytes.Buffer
+	buf.Write([]byte{byte(len(msg) >> 8), byte(len(msg))})
+	buf.Write(msg)
 	return buf.Bytes()
+}
+
+// encodeDNSName encodes a dotted domain into DNS label format.
+func encodeDNSName(domain string) []byte {
+	var out []byte
+	start := 0
+	for i := 0; i <= len(domain); i++ {
+		if i == len(domain) || domain[i] == '.' {
+			label := domain[start:i]
+			if len(label) > 0 {
+				out = append(out, byte(len(label)))
+				out = append(out, []byte(label)...)
+			}
+			start = i + 1
+		}
+	}
+	out = append(out, 0x00) // root label
+	return out
 }
 
 // buildHTTPConfusion makes packet look like HTTP request
@@ -321,26 +296,20 @@ func (c *ConfusedConn) buildSSHConfusion(realData []byte) []byte {
 	return buf.Bytes()
 }
 
-// buildSMTPConfusion starts with SMTP EHLO
+// buildSMTPConfusion opens with SMTP client role (EHLO only, no server 220 greeting).
 func (c *ConfusedConn) buildSMTPConfusion(realData []byte) []byte {
 	var buf bytes.Buffer
 
-	// SMTP greeting (as if from server)
-	fmt.Fprintf(&buf, "220 mail.%s ESMTP\r\n", getRandomConfusionDomain())
+	// Client starts the conversation: EHLO followed by the magic marker
+	fmt.Fprintf(&buf, "EHLO %s\r\n", getRandomConfusionDomain())
 
-	// Client EHLO
-	buf.WriteString("EHLO client\r\n")
-
-	// Magic marker - server looks for TIRED followed by length + data
-	buf.Write([]byte{0x00, 0x00}) // Padding for alignment
+	// Magic marker + length + real data
+	buf.Write([]byte{0x00, 0x00})
 	buf.Write([]byte("TIRED"))
 
-	// Length of real data (4 bytes big-endian)
 	lenBytes := make([]byte, 4)
 	binary.BigEndian.PutUint32(lenBytes, uint32(len(realData)))
 	buf.Write(lenBytes)
-
-	// Real data immediately after length
 	buf.Write(realData)
 
 	return buf.Bytes()

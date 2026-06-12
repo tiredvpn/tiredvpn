@@ -887,6 +887,13 @@ func handleConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 		return
 	}
 
+	// Raw TCP protocol confusion: DNS-over-TCP / HTTP / SSH / SMTP preamble + TIRED marker
+	if detectConfusionMagic(peekBuf) {
+		logger.Debug("Detected raw TCP protocol confusion")
+		handleProtocolConfusion(buffConn, srvCtx, logger)
+		return
+	}
+
 	// Unknown protocol - serve fake website
 	logger.Debug("Unknown protocol (not TLS, not timing knock), serving fake website")
 	serveFakeWebsite(buffConn, cfg, logger)
@@ -3094,32 +3101,27 @@ func verifyFullKnockSequence(conn net.Conn, secret []byte, logger *log.Logger) b
 }
 
 func detectConfusionMagic(data []byte) bool {
-	// Check for DNS response pattern (confusion_0)
-	// DNS header: [txid:2][flags:2] where flags = 0x8180 for response
-	if len(data) >= 12 && data[2] == 0x81 && data[3] == 0x80 {
-		return true
-	}
-
-	// Check for TIRED magic anywhere in peeked data
-	// This catches HTTP/SSH/SMTP/Multi-layer confusion if we peeked enough data
+	// TIRED magic anywhere in peeked data — catches all confusion types once enough
+	// bytes are buffered
 	if bytes.Contains(data, []byte("TIRED")) {
 		return true
 	}
 
-	// Check for SSH banner pattern (confusion_2) without TIRED visible yet
-	// SSH-2.0-* - will need to read more to find TIRED
+	// DNS-over-TCP confusion: [len:2][txid:2][flags:0x0100...] — query with RD bit
+	// len(data) >= 6 covers the 2-byte TCP length prefix + 4 bytes of DNS header
+	if len(data) >= 6 && data[4] == 0x01 && data[5] == 0x00 {
+		return true
+	}
+
+	// SSH banner — will need to read more to find TIRED marker
 	if bytes.HasPrefix(data, []byte("SSH-2.0-")) {
 		return true
 	}
 
-	// Check for SMTP pattern (confusion_3) without TIRED visible yet
-	// "220 " SMTP greeting - will need to read more to find TIRED
-	if bytes.HasPrefix(data, []byte("220 ")) {
+	// SMTP client EHLO — will need to read more to find TIRED marker
+	if bytes.HasPrefix(data, []byte("EHLO ")) {
 		return true
 	}
-
-	// Note: HTTP confusion (GET/POST) is detected by presence of TIRED in data
-	// If TIRED is not visible in peeked data, it's treated as regular HTTP
 
 	return false
 }
