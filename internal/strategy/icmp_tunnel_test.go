@@ -89,13 +89,13 @@ func TestTunnelHeaderSerialization(t *testing.T) {
 	}
 
 	// Serialize
-	data := serializeTunnelHeader(original)
+	data := SerializeTunnelHeader(original)
 	if len(data) != TunnelHeaderSize {
 		t.Errorf("serialized length = %d, want %d", len(data), TunnelHeaderSize)
 	}
 
 	// Deserialize
-	parsed := parseTunnelHeader(data)
+	parsed := ParseTunnelHeader(data)
 
 	// Verify fields
 	if parsed.Magic != original.Magic {
@@ -167,23 +167,23 @@ func TestDeriveICMPKey(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			key := deriveICMPKey(tt.secret)
+			key := DeriveICMPKey(tt.secret)
 			if len(key) != tt.wantLen {
-				t.Errorf("deriveICMPKey() length = %d, want %d", len(key), tt.wantLen)
+				t.Errorf("DeriveICMPKey() length = %d, want %d", len(key), tt.wantLen)
 			}
 		})
 	}
 
 	// Verify determinism
 	secret := []byte("test-secret")
-	key1 := deriveICMPKey(secret)
-	key2 := deriveICMPKey(secret)
+	key1 := DeriveICMPKey(secret)
+	key2 := DeriveICMPKey(secret)
 	if !bytes.Equal(key1, key2) {
-		t.Error("deriveICMPKey() should be deterministic")
+		t.Error("DeriveICMPKey() should be deterministic")
 	}
 
 	// Verify different secrets produce different keys
-	key3 := deriveICMPKey([]byte("different-secret"))
+	key3 := DeriveICMPKey([]byte("different-secret"))
 	if bytes.Equal(key1, key3) {
 		t.Error("different secrets should produce different keys")
 	}
@@ -330,7 +330,7 @@ func BenchmarkTunnelHeaderSerialization(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = serializeTunnelHeader(header)
+		_ = SerializeTunnelHeader(header)
 	}
 }
 
@@ -344,11 +344,11 @@ func BenchmarkTunnelHeaderParsing(b *testing.B) {
 		PacketSeq:  0xABCDEF00,
 		PayloadLen: 56,
 	}
-	data := serializeTunnelHeader(header)
+	data := SerializeTunnelHeader(header)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = parseTunnelHeader(data)
+		_ = ParseTunnelHeader(data)
 	}
 }
 
@@ -358,7 +358,7 @@ func BenchmarkDeriveICMPKey(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = deriveICMPKey(secret)
+		_ = DeriveICMPKey(secret)
 	}
 }
 
@@ -387,8 +387,8 @@ func TestMockICMPTunnel(t *testing.T) {
 			PayloadLen: 100,
 		}
 
-		serialized := serializeTunnelHeader(original)
-		parsed := parseTunnelHeader(serialized)
+		serialized := SerializeTunnelHeader(original)
+		parsed := ParseTunnelHeader(serialized)
 
 		if parsed.Magic != original.Magic ||
 			parsed.Version != original.Version ||
@@ -408,8 +408,8 @@ func TestMockICMPTunnel(t *testing.T) {
 		}
 
 		for _, secret := range secrets {
-			key1 := deriveICMPKey(secret)
-			key2 := deriveICMPKey(secret)
+			key1 := DeriveICMPKey(secret)
+			key2 := DeriveICMPKey(secret)
 
 			if !bytes.Equal(key1, key2) {
 				t.Errorf("Key derivation not consistent for secret %q", secret)
@@ -454,7 +454,7 @@ func TestICMPTunnelStrategyDescription(t *testing.T) {
 // Regression test for: chacha20poly1305.New (12-byte nonce) was used instead of NewX,
 // causing panic in Seal/Open on the first data packet.
 func TestICMPCipherNonceSize(t *testing.T) {
-	key := deriveICMPKey([]byte("test-secret"))
+	key := DeriveICMPKey([]byte("test-secret"))
 
 	// This is what Connect() uses after the fix
 	aead, err := chacha20poly1305.NewX(key)
@@ -479,7 +479,7 @@ func TestICMPCipherNonceSize(t *testing.T) {
 // Currently this would panic in Seal (wrong nonce size).
 // After fix it should complete without panic and recover the original plaintext.
 func TestICMPSealOpenRoundTrip(t *testing.T) {
-	key := deriveICMPKey([]byte("round-trip-secret"))
+	key := DeriveICMPKey([]byte("round-trip-secret"))
 
 	// After fix this becomes chacha20poly1305.NewX
 	// For now test what should work after fix by using NewX directly

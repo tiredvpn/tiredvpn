@@ -215,7 +215,7 @@ func (s *ICMPTunnelStrategy) Connect(ctx context.Context, target string) (net.Co
 	}
 
 	// Derive session key from secret
-	cipher, err := chacha20poly1305.NewX(deriveICMPKey(s.secret))
+	cipher, err := chacha20poly1305.NewX(DeriveICMPKey(s.secret))
 	if err != nil {
 		icmpConn.Close()
 		return nil, fmt.Errorf("icmp tunnel: cipher init failed: %w", err)
@@ -383,10 +383,11 @@ func (c *icmpTunnelConn) buildPacket(data []byte, flags uint8) ([]byte, error) {
 	}
 
 	// Serialize header
-	headerBytes := serializeTunnelHeader(header)
+	headerBytes := SerializeTunnelHeader(header)
 
-	// Create nonce from sequence
+	// Nonce: [sessionID:4][zeros:12][seq:8] - sessionID prevents nonce reuse across sessions
 	nonce := make([]byte, 24) // XChaCha20 uses 24-byte nonce
+	binary.BigEndian.PutUint32(nonce[0:], c.sessionID)
 	binary.BigEndian.PutUint64(nonce[16:], seq)
 
 	// Encrypt payload with header as additional data
@@ -411,8 +412,8 @@ func (c *icmpTunnelConn) buildPacket(data []byte, flags uint8) ([]byte, error) {
 	return msg.Marshal(nil)
 }
 
-// serializeTunnelHeader converts header to bytes
-func serializeTunnelHeader(h TunnelHeader) []byte {
+// SerializeTunnelHeader converts header to bytes
+func SerializeTunnelHeader(h TunnelHeader) []byte {
 	buf := make([]byte, TunnelHeaderSize)
 	binary.BigEndian.PutUint16(buf[0:2], h.Magic)
 	buf[2] = h.Version
@@ -424,8 +425,8 @@ func serializeTunnelHeader(h TunnelHeader) []byte {
 	return buf
 }
 
-// parseTunnelHeader extracts header from bytes
-func parseTunnelHeader(data []byte) TunnelHeader {
+// ParseTunnelHeader extracts header from bytes
+func ParseTunnelHeader(data []byte) TunnelHeader {
 	return TunnelHeader{
 		Magic:      binary.BigEndian.Uint16(data[0:2]),
 		Version:    data[2],
@@ -525,7 +526,7 @@ func (c *icmpTunnelConn) recvLoop() {
 		}
 
 		// Parse header
-		header := parseTunnelHeader(echo.Data[:TunnelHeaderSize])
+		header := ParseTunnelHeader(echo.Data[:TunnelHeaderSize])
 
 		// Verify session
 		if header.SessionID != c.sessionID {
@@ -537,6 +538,7 @@ func (c *icmpTunnelConn) recvLoop() {
 		headerBytes := echo.Data[:TunnelHeaderSize]
 
 		nonce := make([]byte, 24)
+		binary.BigEndian.PutUint32(nonce[0:], header.SessionID)
 		binary.BigEndian.PutUint64(nonce[16:], uint64(header.PacketSeq))
 
 		plaintext, err := c.cipher.Open(nil, nonce, encrypted, headerBytes)
@@ -647,8 +649,8 @@ func (c *icmpTunnelConn) SetWriteDeadline(t time.Time) error {
 	return c.icmpConn.SetWriteDeadline(t)
 }
 
-// deriveICMPKey derives a 32-byte key for ChaCha20-Poly1305 from secret
-func deriveICMPKey(secret []byte) []byte {
+// DeriveICMPKey derives a 32-byte key for ChaCha20-Poly1305 from secret
+func DeriveICMPKey(secret []byte) []byte {
 	// Simple key derivation
 	// In production, use HKDF or similar
 	h := make([]byte, 32)
