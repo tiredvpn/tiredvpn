@@ -304,6 +304,10 @@ func (sc *SalamanderConn) Write(p []byte) (int, error) {
 		return 0, errors.New("connection closed")
 	}
 
+	if len(p) > 65535 {
+		return 0, fmt.Errorf("salamander: payload too large (%d > 65535)", len(p))
+	}
+
 	// Prepend 2-byte length prefix
 	dataWithLen := make([]byte, 2+len(p))
 	binary.BigEndian.PutUint16(dataWithLen[0:2], uint16(len(p)))

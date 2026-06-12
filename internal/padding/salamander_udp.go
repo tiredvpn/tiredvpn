@@ -1,6 +1,7 @@
 package padding
 
 import (
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -66,6 +67,10 @@ func (s *SalamanderPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err err
 
 // WriteTo encrypts a packet with Salamander and writes it
 func (s *SalamanderPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	if len(p) > 65535 {
+		return 0, fmt.Errorf("salamander: payload too large (%d > 65535)", len(p))
+	}
+
 	// Prepend 2-byte length prefix
 	dataWithLen := make([]byte, 2+len(p))
 	dataWithLen[0] = byte(len(p) >> 8)

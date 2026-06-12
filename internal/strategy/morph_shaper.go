@@ -51,18 +51,9 @@ func (mc *MorphedConn) writeShaped(p []byte) (int, error) {
 		}
 		packet, bucket, _ := buildFrame(frame, padLen)
 
-		if mc.rateLimiter != nil {
-			mc.rateLimiter.Wait(len(packet))
-		}
 		if err := mc.pacer.enqueue(pacedFrame{packet: packet, bucket: bucket}); err != nil {
-			if mc.rateLimiter != nil {
-				mc.rateLimiter.RecordFailure()
-			}
-			mc.shaper.Release(frames)
+				mc.shaper.Release(frames)
 			return 0, err
-		}
-		if mc.rateLimiter != nil {
-			mc.rateLimiter.RecordSuccess()
 		}
 		mc.packetsSent++
 		mc.bytesSent += int64(len(packet))
@@ -138,9 +129,6 @@ func (mc *MorphedConn) readShaped(p []byte) (int, error) {
 		}
 	}
 	releasePacketBuf(payload, bucket)
-	if mc.rateLimiter != nil {
-		mc.rateLimiter.Wait(copied)
-	}
 	return copied, nil
 }
 

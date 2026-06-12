@@ -215,7 +215,7 @@ func (s *ICMPTunnelStrategy) Connect(ctx context.Context, target string) (net.Co
 	}
 
 	// Derive session key from secret
-	cipher, err := chacha20poly1305.New(deriveICMPKey(s.secret))
+	cipher, err := chacha20poly1305.NewX(deriveICMPKey(s.secret))
 	if err != nil {
 		icmpConn.Close()
 		return nil, fmt.Errorf("icmp tunnel: cipher init failed: %w", err)

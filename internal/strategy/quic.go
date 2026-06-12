@@ -34,7 +34,6 @@ type QUICStrategy struct {
 	secret     []byte
 	port       int
 
-	evasionConfig *evasion.QUICEvasionConfig
 
 	// Salamander obfuscation (optional)
 	useSalamander  bool
@@ -53,7 +52,6 @@ func NewQUICStrategy(manager *Manager, secret []byte, port int) *QUICStrategy {
 		serverAddr:     "", // Deprecated: use manager.GetServerAddr() instead
 		secret:         secret,
 		port:           port,
-		evasionConfig:  evasion.DefaultQUICEvasionConfig(),
 		useSalamander:  false,
 		salamanderPort: 8443,
 	}
@@ -67,7 +65,6 @@ func NewQUICSalamanderStrategy(manager *Manager, secret []byte, port int) *QUICS
 		serverAddr:     "", // Deprecated: use manager.GetServerAddr() instead
 		secret:         secret,
 		port:           port,
-		evasionConfig:  evasion.DefaultQUICEvasionConfig(),
 		useSalamander:  true,
 		salamanderPort: port, // Use provided port
 	}
@@ -162,7 +159,7 @@ func (s *QUICStrategy) buildProbePacket() []byte {
 
 	// Use draft-29 version (less likely to be blocked)
 	packet[0] = 0xc0 // Long header, Initial
-	binary.BigEndian.PutUint32(packet[1:5], evasion.QUICVersionDraft29)
+	binary.BigEndian.PutUint32(packet[1:5], 0xff00001d) // QUIC draft-29
 
 	// Random connection IDs
 	rand.Read(packet[5:])

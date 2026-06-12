@@ -3155,16 +3155,22 @@ func verifyH2Auth(apiKey, requestID string, secret []byte) bool {
 	// Reconstruct token
 	receivedToken := append(apiKeyBytes[:16], requestIDBytes[:16]...)
 
-	// Generate expected token
-	timestamp := make([]byte, 8)
-	binary.BigEndian.PutUint64(timestamp, uint64(time.Now().Unix()/60))
+	// Check timestamps in range [-1, 0, +1] minutes to handle clock skew
+	currentMinute := time.Now().Unix() / 60
+	for offset := int64(-1); offset <= 1; offset++ {
+		timestamp := make([]byte, 8)
+		binary.BigEndian.PutUint64(timestamp, uint64(currentMinute+offset))
 
-	h := hmac.New(sha256.New, secret)
-	h.Write(timestamp)
-	h.Write([]byte("http2-stego-auth"))
-	expectedToken := h.Sum(nil)[:32]
+		h := hmac.New(sha256.New, secret)
+		h.Write(timestamp)
+		h.Write([]byte("http2-stego-auth"))
+		expectedToken := h.Sum(nil)[:32]
 
-	return hmac.Equal(receivedToken, expectedToken)
+		if hmac.Equal(receivedToken, expectedToken) {
+			return true
+		}
+	}
+	return false
 }
 
 func verifyMorphAuth(receivedToken, secret []byte) bool {

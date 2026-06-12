@@ -17,6 +17,7 @@ type QUICReassemblyPacketConn struct {
 	mu             sync.Mutex
 	sessions       map[string]*reassemblySession // key: fragID (4 bytes as string)
 	sessionTimeout time.Duration
+	maxSessions    int
 }
 
 // reassemblySession tracks fragments for reassembly
@@ -53,6 +54,7 @@ func NewQUICReassemblyPacketConn(conn net.PacketConn, config *ReassemblyConfig) 
 		PacketConn:     conn,
 		sessions:       make(map[string]*reassemblySession),
 		sessionTimeout: config.SessionTimeout,
+		maxSessions:    config.MaxSessions,
 	}
 
 	// Start cleanup goroutine
@@ -88,6 +90,12 @@ func (c *QUICReassemblyPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 			sessionKey := string(fragID[:])
 			session, exists := c.sessions[sessionKey]
 			if !exists {
+				if c.maxSessions > 0 && len(c.sessions) >= c.maxSessions {
+					// Drop fragment: too many open sessions (DoS protection)
+					c.mu.Unlock()
+					log.Debug("Dropping fragment: MaxSessions=%d reached, possible DoS", c.maxSessions)
+					continue
+				}
 				session = &reassemblySession{
 					fragID:       fragID,
 					fragments:    make(map[int][]byte),

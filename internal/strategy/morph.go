@@ -387,10 +387,9 @@ func (s *TrafficMorphStrategy) Connect(ctx context.Context, target string) (net.
 		sh = shaper.NoopShaper{}
 	}
 	return &MorphedConn{
-		Conn:        baseConn,
-		profile:     s.profile,
-		shaper:      sh,
-		rateLimiter: nil,
+		Conn:    baseConn,
+		profile: s.profile,
+		shaper:  sh,
 	}, nil
 }
 
@@ -437,9 +436,6 @@ type MorphedConn struct {
 	packetsSent int64
 	packetsRecv int64
 
-	// Rate limiting for TSPU evasion
-	rateLimiter *evasion.AdaptiveRateLimiter
-
 	// pacer drains shaped frames asynchronously so the producer Write
 	// never blocks on per-frame time.Sleep. Lazy-initialised via pacerOnce
 	// on the first shaped Write; nil while the connection only sees
@@ -471,8 +467,6 @@ func NewMorphedConnWithShaper(conn net.Conn, profile *TrafficProfile, secret []b
 		Conn:    conn,
 		profile: profile,
 		shaper:  sh,
-		// Rate limiter disabled - was causing 80 KB/s bottleneck
-		rateLimiter: nil,
 	}
 
 	// --- TLS / handshake (do not touch in shaper migration) ---
@@ -630,10 +624,6 @@ func (mc *MorphedConn) Write(p []byte) (int, error) {
 	packet, bucket, _ := buildFrame(p, padLen)
 
 	// Apply rate limiting to evade TSPU bulk transfer detection
-	// This adds jitter and micro-pauses to mimic legitimate streaming
-	if mc.rateLimiter != nil {
-		mc.rateLimiter.Wait(len(packet))
-	}
 
 	_, err := mc.Conn.Write(packet)
 
@@ -642,16 +632,9 @@ func (mc *MorphedConn) Write(p []byte) (int, error) {
 
 	if err != nil {
 		// Record failure for adaptive rate adjustment
-		if mc.rateLimiter != nil {
-			mc.rateLimiter.RecordFailure()
-		}
 		return 0, err
 	}
 
-	// Record success for adaptive rate adjustment
-	if mc.rateLimiter != nil {
-		mc.rateLimiter.RecordSuccess()
-	}
 
 	mc.packetsSent++
 	mc.bytesSent += int64(len(packet))
@@ -670,9 +653,6 @@ func (mc *MorphedConn) Read(p []byte) (int, error) {
 		mc.readBuf = mc.readBuf[n:]
 		// Apply rate limiting to downloads to create TCP backpressure
 		// This slows down the server via TCP flow control
-		if mc.rateLimiter != nil {
-			mc.rateLimiter.Wait(n)
-		}
 		return n, nil
 	}
 
@@ -728,11 +708,6 @@ func (mc *MorphedConn) Read(p []byte) (int, error) {
 	// Return buffer to its bucketed pool (no-op for bucket=-1).
 	releasePacketBuf(payload, bucket)
 
-	// Apply rate limiting to downloads to create TCP backpressure
-	// This slows down the server via TCP flow control
-	if mc.rateLimiter != nil {
-		mc.rateLimiter.Wait(copied)
-	}
 
 	return copied, nil
 }

@@ -14,7 +14,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tiredvpn/tiredvpn/internal/evasion"
 	"github.com/tiredvpn/tiredvpn/internal/ktls"
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/protect"
@@ -22,10 +21,6 @@ import (
 	"golang.org/x/net/http2/hpack"
 )
 
-// rateLimiterWrapper wraps evasion.AdaptiveRateLimiter for optional use
-type rateLimiterWrapper struct {
-	limiter *evasion.AdaptiveRateLimiter
-}
 
 // NaivePaddingMode defines the padding strategy (inspired by NaiveProxy)
 type NaivePaddingMode int
@@ -276,7 +271,6 @@ type HTTP2StegoConn struct {
 	batchTimer    *time.Timer  // Timer for flushing batched writes
 
 	// Rate limiting for TSPU evasion (client-side only)
-	rateLimiter *rateLimiterWrapper
 }
 
 // NewHTTP2StegoConn creates a new steganographic HTTP/2 connection
@@ -301,8 +295,7 @@ func NewHTTP2StegoConn(conn net.Conn, secret []byte, isClient bool, paddingMode 
 	if isClient {
 		sc.nextStreamID = 1
 		// Rate limiter disabled - was causing 80 KB/s bottleneck
-		sc.rateLimiter = nil
-	} else {
+		} else {
 		sc.nextStreamID = 2
 	}
 
@@ -546,9 +539,6 @@ func (sc *HTTP2StegoConn) sendServerAck(streamID uint32) error {
 // Write sends data using various steganographic channels
 func (sc *HTTP2StegoConn) Write(p []byte) (int, error) {
 	// Apply rate limiting to evade TSPU bulk transfer detection
-	if sc.rateLimiter != nil && sc.rateLimiter.limiter != nil {
-		sc.rateLimiter.limiter.Wait(len(p))
-	}
 
 	// Fast path for TUN mode - optimized for low latency
 	if sc.tunMode {
@@ -824,10 +814,7 @@ func (sc *HTTP2StegoConn) Read(p []byte) (int, error) {
 		n, err := sc.readBuf.Read(p)
 		sc.mu.Unlock()
 		// Apply rate limiting to downloads to create TCP backpressure
-		if sc.rateLimiter != nil && sc.rateLimiter.limiter != nil && n > 0 {
-			sc.rateLimiter.limiter.Wait(n)
-		}
-		return n, err
+			return n, err
 	}
 	sc.mu.Unlock()
 
@@ -845,10 +832,7 @@ func (sc *HTTP2StegoConn) Read(p []byte) (int, error) {
 			n, err := sc.readBuf.Read(p)
 			sc.mu.Unlock()
 			// Apply rate limiting to downloads to create TCP backpressure
-			if sc.rateLimiter != nil && sc.rateLimiter.limiter != nil && n > 0 {
-				sc.rateLimiter.limiter.Wait(n)
-			}
-			return n, err
+					return n, err
 		}
 		sc.mu.Unlock()
 	}

@@ -155,6 +155,10 @@ func (r *SNIRotator) nextWeighted() string {
 		totalWeight += w
 	}
 
+	if totalWeight == 0 {
+		return r.pool[0]
+	}
+
 	// Pick random point
 	point := rand.Intn(totalWeight)
 
@@ -176,12 +180,12 @@ func (r *SNIRotator) nextWithCooldown() string {
 
 	now := time.Now()
 
-	// Find SNI not in cooldown, preferring higher weights
-	for _, entry := range WhitelistedSNIs {
-		lastUsed, exists := r.lastUsed[entry.SNI]
+	// Find SNI not in cooldown from the rotator's own pool
+	for _, sni := range r.pool {
+		lastUsed, exists := r.lastUsed[sni]
 		if !exists || now.Sub(lastUsed) > r.cooldown {
-			r.lastUsed[entry.SNI] = now
-			return entry.SNI
+			r.lastUsed[sni] = now
+			return sni
 		}
 	}
 

@@ -509,7 +509,9 @@ func randomInt(max int) int {
 	if max <= 0 {
 		return 0
 	}
-	return int(time.Now().UnixNano()) % max
+	var b [8]byte
+	cryptorand.Read(b[:]) //nolint:errcheck // crypto/rand.Read never fails on Linux
+	return int(b[0]|b[1]<<8|b[2]<<16|b[3]<<24) % max
 }
 
 func randRead(b []byte) {

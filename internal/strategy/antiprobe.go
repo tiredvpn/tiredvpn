@@ -1,12 +1,10 @@
 package strategy
 
 import (
-	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/tls"
-	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -223,42 +221,6 @@ func (s *AntiProbeStrategy) fillPacketData(packet []byte, seqNum int) {
 	}
 }
 
-// authenticateViaTLS hides auth data in TLS handshake
-func (s *AntiProbeStrategy) authenticateViaTLS(conn net.Conn) (*tls.Conn, error) {
-	// Generate auth token to hide in session ticket
-	authToken := s.generateAuthToken()
-
-	tlsConfig := &tls.Config{
-		InsecureSkipVerify: true,
-		ServerName:         "www.google.com", // Mimic Google
-
-		// Hide auth in session ticket hint
-		ClientSessionCache: &authSessionCache{
-			token: authToken,
-		},
-	}
-
-	tlsConn := tls.Client(conn, tlsConfig)
-	if err := tlsConn.Handshake(); err != nil {
-		return nil, err
-	}
-
-	return tlsConn, nil
-}
-
-// generateAuthToken creates authentication token
-func (s *AntiProbeStrategy) generateAuthToken() []byte {
-	timestamp := time.Now().Unix()
-	timestampBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(timestampBytes, uint64(timestamp))
-
-	h := hmac.New(sha256.New, s.knockSecret)
-	h.Write(timestampBytes)
-	h.Write([]byte("auth-token"))
-
-	return h.Sum(timestampBytes)
-}
-
 // verifyServerAuth verifies server recognized us
 // After timing knock ACK, server is ready for tunnel - just return success
 func (s *AntiProbeStrategy) verifyServerAuth(conn *tls.Conn) error {
@@ -266,111 +228,3 @@ func (s *AntiProbeStrategy) verifyServerAuth(conn *tls.Conn) error {
 	return nil
 }
 
-// generateServerMagic creates expected server response
-func (s *AntiProbeStrategy) generateServerMagic() []byte {
-	h := hmac.New(sha256.New, s.knockSecret)
-	h.Write([]byte("server-magic"))
-	hash := h.Sum(nil)
-	return hash[:8]
-}
-
-// authSessionCache implements tls.ClientSessionCache to inject auth
-type authSessionCache struct {
-	token []byte
-}
-
-func (c *authSessionCache) Get(sessionKey string) (session *tls.ClientSessionState, ok bool) {
-	// Return nil - we don't actually have a session
-	// But this method being called means TLS is initiating
-	return nil, false
-}
-
-func (c *authSessionCache) Put(sessionKey string, cs *tls.ClientSessionState) {
-	// Store session (not used for auth, but completes interface)
-}
-
-// ServerAntiProbeHandler handles incoming connections with probe resistance
-type ServerAntiProbeHandler struct {
-	knockSecret []byte
-	realHandler func(net.Conn) // Handler for authenticated clients
-	fakeHandler func(net.Conn) // Handler for probes (show fake site)
-}
-
-// NewServerAntiProbeHandler creates server-side handler
-func NewServerAntiProbeHandler(secret []byte, real, fake func(net.Conn)) *ServerAntiProbeHandler {
-	return &ServerAntiProbeHandler{
-		knockSecret: secret,
-		realHandler: real,
-		fakeHandler: fake,
-	}
-}
-
-// Handle processes incoming connection
-func (h *ServerAntiProbeHandler) Handle(conn net.Conn) {
-	// Try to verify knock sequence
-	if h.verifyKnock(conn) {
-		// Authenticated - handle as tunnel
-		h.realHandler(conn)
-	} else {
-		// Unknown - show fake website
-		h.fakeHandler(conn)
-	}
-}
-
-// verifyKnock verifies client knock sequence
-func (h *ServerAntiProbeHandler) verifyKnock(conn net.Conn) bool {
-	sequence := h.generateKnockSequence()
-
-	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-	defer conn.SetReadDeadline(time.Time{})
-
-	lastTime := time.Now()
-
-	for i, expectedDelay := range sequence.Delays {
-		// Read packet
-		packet := make([]byte, sequence.Sizes[i])
-		if _, err := io.ReadFull(conn, packet); err != nil {
-			return false
-		}
-
-		// Verify timing (with tolerance)
-		elapsed := time.Since(lastTime)
-		tolerance := 50 * time.Millisecond
-
-		if elapsed < expectedDelay-tolerance || elapsed > expectedDelay+tolerance {
-			return false
-		}
-
-		// Verify packet contents
-		expectedPacket := make([]byte, sequence.Sizes[i])
-		expectedPacket[0] = byte(i)
-		h.fillPacketData(expectedPacket, i)
-
-		if !bytes.Equal(packet, expectedPacket) {
-			return false
-		}
-
-		lastTime = time.Now()
-	}
-
-	// Send ACK
-	conn.Write([]byte{0x01})
-	return true
-}
-
-func (h *ServerAntiProbeHandler) generateKnockSequence() *KnockSequence {
-	strategy := &AntiProbeStrategy{knockSecret: h.knockSecret}
-	return strategy.generateKnockSequence()
-}
-
-func (h *ServerAntiProbeHandler) fillPacketData(packet []byte, seqNum int) {
-	// Generate expected packet content (same as client's fillPacketData)
-	hash := hmac.New(sha256.New, h.knockSecret)
-	hash.Write([]byte{byte(seqNum)})
-	hashSum := hash.Sum(nil)
-
-	// Use (i-1) to match server's verification
-	for i := 1; i < len(packet); i++ {
-		packet[i] = hashSum[(i-1)%len(hashSum)]
-	}
-}

@@ -1,6 +1,7 @@
 package padding
 
 import (
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -10,6 +11,12 @@ import (
 
 // SecretProvider returns a list of secrets to try for decryption
 type SecretProvider func() [][]byte
+
+const (
+	addrTTL        = 10 * time.Minute
+	addrCleanupInt = 2 * time.Minute
+	maxAddrEntries = 10000
+)
 
 // MultiSecretSalamanderPacketConn wraps a UDP PacketConn with Salamander padding
 // that supports multiple secrets for decryption (for per-client secrets support)
@@ -26,13 +33,16 @@ type MultiSecretSalamanderPacketConn struct {
 
 	// Track which secret was used per remote address
 	// Key: remote addr string, Value: secret bytes
-	addrSecrets map[string][]byte
+	addrSecrets  map[string][]byte
+	addrLastSeen map[string]time.Time // TTL tracking
+
+	done chan struct{}
 }
 
 // NewMultiSecretSalamanderPacketConn creates a Salamander-wrapped PacketConn
 // that supports multiple secrets for decryption
 func NewMultiSecretSalamanderPacketConn(conn net.PacketConn, globalSecret []byte, level PaddingLevel, provider SecretProvider) *MultiSecretSalamanderPacketConn {
-	return &MultiSecretSalamanderPacketConn{
+	s := &MultiSecretSalamanderPacketConn{
 		PacketConn:     conn,
 		globalPadder:   NewSalamanderPadder(globalSecret, level),
 		globalSecret:   globalSecret,
@@ -40,6 +50,32 @@ func NewMultiSecretSalamanderPacketConn(conn net.PacketConn, globalSecret []byte
 		level:          level,
 		padderCache:    make(map[string]*SalamanderPadder),
 		addrSecrets:    make(map[string][]byte),
+		addrLastSeen:   make(map[string]time.Time),
+		done:           make(chan struct{}),
+	}
+	go s.cleanupLoop()
+	return s
+}
+
+// cleanupLoop prunes stale address entries to prevent memory growth via UDP spoofing.
+func (s *MultiSecretSalamanderPacketConn) cleanupLoop() {
+	ticker := time.NewTicker(addrCleanupInt)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			s.mu.Lock()
+			now := time.Now()
+			for addr, ts := range s.addrLastSeen {
+				if now.Sub(ts) > addrTTL {
+					delete(s.addrSecrets, addr)
+					delete(s.addrLastSeen, addr)
+				}
+			}
+			s.mu.Unlock()
+		case <-s.done:
+			return
+		}
 	}
 }
 
@@ -104,14 +140,17 @@ func (s *MultiSecretSalamanderPacketConn) ReadFrom(p []byte) (n int, addr net.Ad
 	if knownSecret, ok := s.addrSecrets[addrStr]; ok {
 		padder := s.getPadder(knownSecret)
 		if decrypted, ok := s.tryDecrypt(padder, encrypted); ok {
+			s.addrLastSeen[addrStr] = time.Now()
 			return s.extractData(decrypted, p), addr, nil
 		}
 		// Secret didn't work - client might have changed, continue trying others
+		delete(s.addrSecrets, addrStr)
+		delete(s.addrLastSeen, addrStr)
 	}
 
 	// 1. Try global secret first (most common case)
 	if decrypted, ok := s.tryDecrypt(s.globalPadder, encrypted); ok {
-		s.addrSecrets[addrStr] = s.globalSecret
+		s.recordAddr(addrStr, s.globalSecret)
 		return s.extractData(decrypted, p), addr, nil
 	}
 
@@ -122,21 +161,36 @@ func (s *MultiSecretSalamanderPacketConn) ReadFrom(p []byte) (n int, addr net.Ad
 			padder := s.getPadder(secret)
 			if decrypted, ok := s.tryDecrypt(padder, encrypted); ok {
 				log.Debug("QUIC Salamander: decrypted with client secret for %s", addrStr)
-				s.addrSecrets[addrStr] = secret // Remember for responses
+				s.recordAddr(addrStr, secret)
 				return s.extractData(decrypted, p), addr, nil
 			}
 		}
 	}
 
-	// 3. Fallback: try global decryption without validation
-	// This handles edge cases and backwards compatibility
-	decrypted, err := s.globalPadder.Decrypt(encrypted)
-	if err != nil {
-		return 0, addr, err
-	}
+	// No matching secret found - drop packet to prevent misdecryption
+	log.Debug("QUIC Salamander: no matching secret for %s, dropping packet", addrStr)
+	return 0, addr, fmt.Errorf("salamander: no matching secret for %s", addrStr)
+}
 
-	s.addrSecrets[addrStr] = s.globalSecret
-	return s.extractData(decrypted, p), addr, nil
+// recordAddr stores the secret association for an address, enforcing maxAddrEntries.
+func (s *MultiSecretSalamanderPacketConn) recordAddr(addrStr string, secret []byte) {
+	if len(s.addrSecrets) >= maxAddrEntries {
+		// Evict oldest entry
+		var oldest string
+		var oldestTime time.Time
+		for a, ts := range s.addrLastSeen {
+			if oldest == "" || ts.Before(oldestTime) {
+				oldest = a
+				oldestTime = ts
+			}
+		}
+		if oldest != "" {
+			delete(s.addrSecrets, oldest)
+			delete(s.addrLastSeen, oldest)
+		}
+	}
+	s.addrSecrets[addrStr] = secret
+	s.addrLastSeen[addrStr] = time.Now()
 }
 
 // extractData extracts actual data from decrypted packet (handles length prefix)
@@ -159,6 +213,10 @@ func (s *MultiSecretSalamanderPacketConn) extractData(decrypted []byte, p []byte
 // WriteTo encrypts a packet with Salamander and writes it
 // Uses the same secret that was used to decrypt packets from this address
 func (s *MultiSecretSalamanderPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	if len(p) > 65535 {
+		return 0, fmt.Errorf("salamander: payload too large (%d > 65535)", len(p))
+	}
+
 	// Prepend 2-byte length prefix
 	dataWithLen := make([]byte, 2+len(p))
 	dataWithLen[0] = byte(len(p) >> 8)
@@ -189,8 +247,13 @@ func (s *MultiSecretSalamanderPacketConn) WriteTo(p []byte, addr net.Addr) (n in
 	return len(p), nil
 }
 
-// Close closes the underlying connection
+// Close closes the underlying connection and stops the cleanup goroutine.
 func (s *MultiSecretSalamanderPacketConn) Close() error {
+	select {
+	case <-s.done:
+	default:
+		close(s.done)
+	}
 	return s.PacketConn.Close()
 }
 

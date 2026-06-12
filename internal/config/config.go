@@ -69,12 +69,10 @@ type FakePacketConfig struct {
 
 // FragmentConfig configures TCP fragmentation
 type FragmentConfig struct {
-	Enabled         bool          `json:"enabled"`
-	Size            int           `json:"size"`              // Fragment size (bytes)
-	Delay           time.Duration `json:"delay"`             // Delay between fragments
-	SplitPosition   int           `json:"split_position"`    // Where to split SNI
-	BufferFlood     bool          `json:"buffer_flood"`      // Flood DPI buffer
-	BufferFloodSize int           `json:"buffer_flood_size"` // Number of fake fragments (max 44)
+	Enabled       bool          `json:"enabled"`
+	Size          int           `json:"size"`           // Fragment size (bytes)
+	Delay         time.Duration `json:"delay"`          // Delay between fragments
+	SplitPosition int           `json:"split_position"` // Where to split SNI
 }
 
 // GRPCConfig configures gRPC tunnel
@@ -130,12 +128,10 @@ func DefaultConfig() *Config {
 			Position:    "before",
 		},
 		Fragment: FragmentConfig{
-			Enabled:         false,
-			Size:            2,
-			Delay:           0,
-			SplitPosition:   1, // Split after first byte of SNI
-			BufferFlood:     false,
-			BufferFloodSize: 40,
+			Enabled:       false,
+			Size:          2,
+			Delay:         0,
+			SplitPosition: 1,
 		},
 		GRPC: GRPCConfig{
 			ServiceName: "google.firestore.v1.Firestore",
@@ -206,12 +202,6 @@ func (c *Config) Validate() error {
 	if c.FakePacket.Enabled {
 		if c.FakePacket.TTL < 1 || c.FakePacket.TTL > 10 {
 			return errors.New("fake packet TTL must be 1-10")
-		}
-	}
-
-	if c.Fragment.Enabled {
-		if c.Fragment.BufferFloodSize > 44 {
-			return errors.New("buffer flood size must be <= 44 (TSPU limit is 45)")
 		}
 	}
 

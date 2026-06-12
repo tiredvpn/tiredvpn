@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"net"
 	"syscall"
-
-	"golang.org/x/sys/unix"
 )
 
 // FakePacketInjector injects fake packets to confuse DPI
@@ -314,25 +312,3 @@ func buildSNIExtension(sni string) []byte {
 	return ext
 }
 
-// SetSocketTTL sets TTL on an existing socket using setsockopt
-func SetSocketTTL(conn net.Conn, ttl int) error {
-	tcpConn, ok := conn.(*net.TCPConn)
-	if !ok {
-		return fmt.Errorf("not a TCP connection")
-	}
-
-	rawConn, err := tcpConn.SyscallConn()
-	if err != nil {
-		return err
-	}
-
-	var setErr error
-	err = rawConn.Control(func(fd uintptr) {
-		setErr = unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_TTL, ttl)
-	})
-
-	if err != nil {
-		return err
-	}
-	return setErr
-}

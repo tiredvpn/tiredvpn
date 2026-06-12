@@ -258,13 +258,9 @@ func (p *Proxy) establishTunnel(targetAddr string) (net.Conn, error) {
 	conn := tcpConn
 	if p.config.Fragment.Enabled {
 		fragConfig := &evasion.FragmentationConfig{
-			FragmentSize:       p.config.Fragment.Size,
-			SplitPosition:      p.config.Fragment.SplitPosition,
-			FragmentDelay:      p.config.Fragment.Delay,
-			BufferFlood:        p.config.Fragment.BufferFlood,
-			BufferFloodCount:   p.config.Fragment.BufferFloodSize,
-			BufferFloodTTL:     2,
-			BufferFloodTimeout: 6 * time.Second,
+			FragmentSize:  p.config.Fragment.Size,
+			SplitPosition: p.config.Fragment.SplitPosition,
+			FragmentDelay: p.config.Fragment.Delay,
 		}
 		conn = evasion.NewFragmentedWriter(tcpConn, fragConfig)
 	}

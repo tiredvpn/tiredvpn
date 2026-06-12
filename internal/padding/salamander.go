@@ -60,6 +60,9 @@ func (sp *SalamanderPadder) Encrypt(plaintext []byte) ([]byte, error) {
 	if len(plaintext) == 0 {
 		return nil, errors.New("salamander: empty plaintext")
 	}
+	if len(sp.secret) > 64 {
+		return nil, errors.New("salamander: secret too long (max 64 bytes for BLAKE2b)")
+	}
 
 	// 1. Generate random salt (8 bytes)
 	salt := make([]byte, 8)
