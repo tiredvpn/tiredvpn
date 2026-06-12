@@ -15,6 +15,7 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/ktls"
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/shaper"
+	"github.com/tiredvpn/tiredvpn/internal/shaper/presets"
 )
 
 // TrafficMorphStrategy morphs traffic to match target application patterns
@@ -252,11 +253,21 @@ func NewTrafficMorphStrategy(manager *Manager, profile *TrafficProfile, base Str
 	profileCopy := *profile
 	profileCopy.ApplyPaddingPreset(GlobalPaddingPreset)
 
+	// Enable a real traffic shaper by default.
+	// youtube_streaming is data-plane-safe and matches the most common heavy-traffic cover story.
+	// SetShaper can override this after construction (e.g. from TOML [shaper] config).
+	defaultShaper, err := presets.ByName(presets.PresetYouTubeStreaming, time.Now().UnixNano())
+	if err != nil {
+		log.Debug("morph: failed to load default shaper preset: %v, falling back to noop", err)
+		defaultShaper = shaper.NoopShaper{}
+	}
+
 	return &TrafficMorphStrategy{
-		manager:   manager,
-		profile:   &profileCopy,
-		baseStrat: base,
-		secret:    secret,
+		manager:      manager,
+		profile:      &profileCopy,
+		baseStrat:    base,
+		secret:       secret,
+		customShaper: defaultShaper,
 	}
 }
 
