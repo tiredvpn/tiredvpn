@@ -3,6 +3,7 @@ package geneva
 import (
 	"encoding/binary"
 	"errors"
+	"strconv"
 )
 
 // Primitive represents a Geneva packet manipulation primitive
@@ -103,24 +104,28 @@ func (t *TamperPrimitive) Apply(packet []byte) ([][]byte, error) {
 		// TCP flags are at offset 13 in TCP header
 		if val, ok := t.Value.(uint8); ok {
 			modified[tcpStart+13] = val
+			recalculateTCPChecksum(modified)
 		}
 	case "seq":
 		// TCP sequence number at offset 4
 		if val, ok := t.Value.(uint32); ok {
 			binary.BigEndian.PutUint32(modified[tcpStart+4:], val)
+			recalculateTCPChecksum(modified)
 		}
 	case "ack":
 		// TCP acknowledgment number at offset 8
 		if val, ok := t.Value.(uint32); ok {
 			binary.BigEndian.PutUint32(modified[tcpStart+8:], val)
+			recalculateTCPChecksum(modified)
 		}
 	case "win":
 		// TCP window size at offset 14
 		if val, ok := t.Value.(uint16); ok {
 			binary.BigEndian.PutUint16(modified[tcpStart+14:], val)
+			recalculateTCPChecksum(modified)
 		}
 	case "chksum":
-		// TCP checksum at offset 16
+		// Explicit checksum override — caller knows what they're doing (desync)
 		if val, ok := t.Value.(uint16); ok {
 			binary.BigEndian.PutUint16(modified[tcpStart+16:], val)
 		}
@@ -128,7 +133,6 @@ func (t *TamperPrimitive) Apply(packet []byte) ([][]byte, error) {
 		// IP TTL at offset 8
 		if val, ok := t.Value.(uint8); ok {
 			modified[8] = val
-			// Recalculate IP checksum
 			recalculateIPChecksum(modified)
 		}
 	default:
@@ -222,9 +226,9 @@ func (f *FragmentPrimitive) Apply(packet []byte) ([][]byte, error) {
 // String returns description
 func (f *FragmentPrimitive) String() string {
 	if f.Offset > 0 {
-		return "fragment{offset=" + string(rune(f.Offset)) + "}"
+		return "fragment{offset=" + strconv.Itoa(f.Offset) + "}"
 	}
-	return "fragment{size=" + string(rune(f.Size)) + "}"
+	return "fragment{size=" + strconv.Itoa(f.Size) + "}"
 }
 
 // DuplicatePrimitive sends a duplicate packet
@@ -264,7 +268,7 @@ func (d *DuplicatePrimitive) String() string {
 	if d.Count == 1 {
 		return "duplicate"
 	}
-	return "duplicate{count=" + string(rune(d.Count)) + "}"
+	return "duplicate{count=" + strconv.Itoa(d.Count) + "}"
 }
 
 // SendPrimitive sends a packet as-is (no-op)
@@ -316,6 +320,47 @@ func recalculateIPChecksum(packet []byte) {
 
 	packet[10] = byte(checksum >> 8)
 	packet[11] = byte(checksum)
+}
+
+// recalculateTCPChecksum recalculates the TCP checksum over the IPv4 pseudo-header.
+// Must be called after any TCP header field modification (flags, seq, ack, win).
+func recalculateTCPChecksum(packet []byte) {
+	if len(packet) < 20 {
+		return
+	}
+	ipHeaderLen := int((packet[0] & 0x0F) * 4)
+	if ipHeaderLen+20 > len(packet) {
+		return
+	}
+	tcpStart := ipHeaderLen
+	tcpLen := len(packet) - tcpStart
+
+	// Zero out TCP checksum field
+	packet[tcpStart+16] = 0
+	packet[tcpStart+17] = 0
+
+	// Pseudo-header: src IP(4) + dst IP(4) + zero(1) + proto(1) + tcp length(2)
+	var sum uint32
+	for i := 12; i < 20; i += 2 {
+		sum += uint32(packet[i])<<8 | uint32(packet[i+1])
+	}
+	sum += uint32(6) // TCP protocol number
+	sum += uint32(tcpLen)
+
+	// TCP header + data
+	for i := tcpStart; i+1 < len(packet); i += 2 {
+		sum += uint32(packet[i])<<8 | uint32(packet[i+1])
+	}
+	if len(packet)%2 != 0 {
+		sum += uint32(packet[len(packet)-1]) << 8
+	}
+
+	for sum > 0xFFFF {
+		sum = (sum & 0xFFFF) + (sum >> 16)
+	}
+	checksum := uint16(^sum)
+	packet[tcpStart+16] = byte(checksum >> 8)
+	packet[tcpStart+17] = byte(checksum)
 }
 
 // TCPFlags represents TCP header flags
