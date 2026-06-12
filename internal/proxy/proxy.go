@@ -265,16 +265,6 @@ func (p *Proxy) establishTunnel(targetAddr string) (net.Conn, error) {
 		conn = evasion.NewFragmentedWriter(tcpConn, fragConfig)
 	}
 
-	// Inject fake packets if enabled
-	if p.config.FakePacket.Enabled {
-		if err := p.injectFakePackets(tcpConn, coverSNI); err != nil {
-			// Log but continue - fake injection is best effort
-			if p.config.Verbose {
-				log.Printf("Fake packet injection warning: %v", err)
-			}
-		}
-	}
-
 	// Establish TLS with browser fingerprint
 	tlsConfig := &tlsutil.Config{
 		ServerName:  coverSNI,
@@ -337,38 +327,6 @@ func (p *Proxy) establishTunnel(targetAddr string) (net.Conn, error) {
 		// Raw TLS tunnel
 		return tlsConn, nil
 	}
-}
-
-// injectFakePackets injects fake ClientHello packets to confuse DPI
-func (p *Proxy) injectFakePackets(conn net.Conn, coverSNI string) error {
-	rawSocket, err := evasion.NewRawSocket()
-	if err != nil {
-		return err // Requires root - best effort
-	}
-	defer rawSocket.Close()
-
-	localAddr := conn.LocalAddr().(*net.TCPAddr)
-	remoteAddr := conn.RemoteAddr().(*net.TCPAddr)
-
-	injector := evasion.NewFakePacketInjector(evasion.FakePacketConfig{
-		TTL:         p.config.FakePacket.TTL,
-		BadChecksum: p.config.FakePacket.BadChecksum,
-		BadSeq:      p.config.FakePacket.BadSeq,
-		FakeSNI:     p.config.FakePacket.FakeSNI,
-		Count:       p.config.FakePacket.Count,
-	})
-
-	// We need to get TCP sequence numbers - simplified version
-	// In production, this would require packet sniffing or kernel integration
-	seqNum := uint32(0) // Placeholder - real impl needs actual seq
-	ackNum := uint32(0)
-
-	return injector.InjectFakeClientHello(
-		rawSocket,
-		localAddr.IP, remoteAddr.IP,
-		uint16(localAddr.Port), uint16(remoteAddr.Port),
-		seqNum, ackNum,
-	)
 }
 
 // relay proxies data between two connections
