@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/ktls"
@@ -255,7 +256,6 @@ type HTTP2StegoConn struct {
 	nextStreamID     uint32
 	persistentStream uint32 // For TUN mode - reuse same stream
 	mu               sync.Mutex
-	readMu           sync.Mutex
 
 	// Read buffer for reassembling data
 	readBuf bytes.Buffer
@@ -270,7 +270,10 @@ type HTTP2StegoConn struct {
 	lastWriteTime time.Time    // Last write timestamp for batch timeout
 	batchTimer    *time.Timer  // Timer for flushing batched writes
 
-	// Rate limiting for TSPU evasion (client-side only)
+	// HTTP/2 flow-control (atomic, no mutex needed)
+	// recvConsumed: DATA bytes consumed by Read but not yet acknowledged via WINDOW_UPDATE.
+	// Flushed lazily at the start of each Write to prevent peer stalling after 64 KB.
+	recvConsumed int64
 }
 
 // NewHTTP2StegoConn creates a new steganographic HTTP/2 connection
@@ -536,10 +539,22 @@ func (sc *HTTP2StegoConn) sendServerAck(streamID uint32) error {
 	})
 }
 
+// flushWindowUpdate sends accumulated WINDOW_UPDATE credits back to the peer.
+// Must be called while sc.mu is held (framer is not concurrent-safe for writes).
+func (sc *HTTP2StegoConn) flushWindowUpdate() {
+	consumed := atomic.SwapInt64(&sc.recvConsumed, 0)
+	if consumed <= 0 {
+		return
+	}
+	inc := uint32(consumed)
+	sc.framer.WriteWindowUpdate(0, inc) // connection-level
+	if sc.persistentStream != 0 {
+		sc.framer.WriteWindowUpdate(sc.persistentStream, inc) // stream-level
+	}
+}
+
 // Write sends data using various steganographic channels
 func (sc *HTTP2StegoConn) Write(p []byte) (int, error) {
-	// Apply rate limiting to evade TSPU bulk transfer detection
-
 	// Fast path for TUN mode - optimized for low latency
 	if sc.tunMode {
 		return sc.writeFast(p)
@@ -548,6 +563,8 @@ func (sc *HTTP2StegoConn) Write(p []byte) (int, error) {
 	// Standard path with full steganography
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
+
+	sc.flushWindowUpdate()
 
 	written := 0
 
@@ -588,8 +605,7 @@ func (sc *HTTP2StegoConn) writeFast(p []byte) (int, error) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 
-	// Always write immediately for now - batching causes latency issues
-	// TODO: implement proper async flush with goroutine
+	sc.flushWindowUpdate()
 	return sc.writeViaDataFast(p)
 }
 
@@ -825,14 +841,19 @@ func (sc *HTTP2StegoConn) Read(p []byte) (int, error) {
 			return 0, err
 		}
 
+		// Accumulate flow-control credit for DATA frames outside the lock
+		// so we don't block Write goroutine while counting bytes.
+		if df, ok := frame.(*http2.DataFrame); ok {
+			atomic.AddInt64(&sc.recvConsumed, int64(len(df.Data())))
+		}
+
 		sc.mu.Lock()
 		data := sc.extractCovertData(frame)
 		if len(data) > 0 {
 			sc.readBuf.Write(data)
 			n, err := sc.readBuf.Read(p)
 			sc.mu.Unlock()
-			// Apply rate limiting to downloads to create TCP backpressure
-					return n, err
+			return n, err
 		}
 		sc.mu.Unlock()
 	}
@@ -845,6 +866,15 @@ func (sc *HTTP2StegoConn) extractCovertData(frame http2.Frame) []byte {
 		return sc.extractFromData(f)
 	case *http2.HeadersFrame:
 		return sc.extractFromHeaders(f)
+	case *http2.WindowUpdateFrame:
+		// Peer extended our send window; no data to return but handled.
+		_ = f
+		return nil
+	case *http2.SettingsFrame:
+		if !f.IsAck() {
+			sc.framer.WriteSettingsAck()
+		}
+		return nil
 	default:
 		return nil
 	}

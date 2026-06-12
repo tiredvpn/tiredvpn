@@ -511,7 +511,7 @@ func randomInt(max int) int {
 	}
 	var b [8]byte
 	cryptorand.Read(b[:]) //nolint:errcheck // crypto/rand.Read never fails on Linux
-	return int(b[0]|b[1]<<8|b[2]<<16|b[3]<<24) % max
+	return int(uint32(b[0])|uint32(b[1])<<8|uint32(b[2])<<16|uint32(b[3])<<24) % max
 }
 
 func randRead(b []byte) {

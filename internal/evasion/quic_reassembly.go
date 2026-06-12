@@ -1,6 +1,7 @@
 package evasion
 
 import (
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -18,6 +19,7 @@ type QUICReassemblyPacketConn struct {
 	sessions       map[string]*reassemblySession // key: fragID (4 bytes as string)
 	sessionTimeout time.Duration
 	maxSessions    int
+	done           chan struct{}
 }
 
 // reassemblySession tracks fragments for reassembly
@@ -55,9 +57,9 @@ func NewQUICReassemblyPacketConn(conn net.PacketConn, config *ReassemblyConfig) 
 		sessions:       make(map[string]*reassemblySession),
 		sessionTimeout: config.SessionTimeout,
 		maxSessions:    config.MaxSessions,
+		done:           make(chan struct{}),
 	}
 
-	// Start cleanup goroutine
 	go rc.cleanupLoop()
 
 	return rc
@@ -83,6 +85,12 @@ func (c *QUICReassemblyPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 			copy(fragID[:], buf[6:10])
 			data := buf[fragHeaderSize:]
 
+			// Validate seq is within declared range to prevent out-of-bounds fragment injection
+			if total == 0 || seq >= total {
+				log.Debug("Dropping fragment: invalid seq=%d total=%d", seq, total)
+				continue
+			}
+
 			log.Debug("Received fragment %d/%d for fragID %x, size=%d", seq+1, total, fragID, len(data))
 
 			// Get or create session
@@ -91,7 +99,6 @@ func (c *QUICReassemblyPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 			session, exists := c.sessions[sessionKey]
 			if !exists {
 				if c.maxSessions > 0 && len(c.sessions) >= c.maxSessions {
-					// Drop fragment: too many open sessions (DoS protection)
 					c.mu.Unlock()
 					log.Debug("Dropping fragment: MaxSessions=%d reached, possible DoS", c.maxSessions)
 					continue
@@ -106,7 +113,7 @@ func (c *QUICReassemblyPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 				c.sessions[sessionKey] = session
 			}
 
-			// Add fragment
+			// Add fragment (dedup by seq)
 			if _, dup := session.fragments[seq]; !dup {
 				session.fragments[seq] = make([]byte, len(data))
 				copy(session.fragments[seq], data)
@@ -116,15 +123,19 @@ func (c *QUICReassemblyPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 
 			// Check if complete
 			if session.received >= session.totalFrags {
-				// Reassemble
-				assembled := c.assembleFragments(session)
+				assembled, gapErr := c.assembleFragments(session)
 				delete(c.sessions, sessionKey)
 				c.mu.Unlock()
+
+				if gapErr != nil {
+					log.Debug("Reassembly gap detected for fragID %x: %v", fragID, gapErr)
+					continue
+				}
 
 				log.Debug("Reassembled %d fragments into %d byte packet", session.totalFrags, len(assembled))
 
 				if len(assembled) > len(p) {
-					assembled = assembled[:len(p)]
+					return 0, session.srcAddr, fmt.Errorf("quic_reassembly: assembled packet (%d bytes) exceeds buffer (%d bytes)", len(assembled), len(p))
 				}
 				copy(p, assembled)
 				return len(assembled), session.srcAddr, nil
@@ -141,23 +152,23 @@ func (c *QUICReassemblyPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	}
 }
 
-// assembleFragments combines all fragments in order
-func (c *QUICReassemblyPacketConn) assembleFragments(session *reassemblySession) []byte {
-	// Calculate total size
+// assembleFragments combines all fragments in order, returning an error if any fragment is missing.
+func (c *QUICReassemblyPacketConn) assembleFragments(session *reassemblySession) ([]byte, error) {
 	totalSize := 0
 	for _, data := range session.fragments {
 		totalSize += len(data)
 	}
 
-	// Assemble in order
 	result := make([]byte, 0, totalSize)
 	for i := 0; i < session.totalFrags; i++ {
-		if data, ok := session.fragments[i]; ok {
-			result = append(result, data...)
+		data, ok := session.fragments[i]
+		if !ok {
+			return nil, fmt.Errorf("missing fragment seq=%d of total=%d", i, session.totalFrags)
 		}
+		result = append(result, data...)
 	}
 
-	return result
+	return result, nil
 }
 
 // WriteTo passes through to underlying connection (no fragmentation on server side)
@@ -170,17 +181,22 @@ func (c *QUICReassemblyPacketConn) cleanupLoop() {
 	ticker := time.NewTicker(c.sessionTimeout / 2)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		c.mu.Lock()
-		now := time.Now()
-		for key, session := range c.sessions {
-			if now.Sub(session.lastActivity) > c.sessionTimeout {
-				log.Debug("Reassembly session timeout for fragID %x (received %d/%d)",
-					session.fragID, session.received, session.totalFrags)
-				delete(c.sessions, key)
+	for {
+		select {
+		case <-ticker.C:
+			c.mu.Lock()
+			now := time.Now()
+			for key, session := range c.sessions {
+				if now.Sub(session.lastActivity) > c.sessionTimeout {
+					log.Debug("Reassembly session timeout for fragID %x (received %d/%d)",
+						session.fragID, session.received, session.totalFrags)
+					delete(c.sessions, key)
+				}
 			}
+			c.mu.Unlock()
+		case <-c.done:
+			return
 		}
-		c.mu.Unlock()
 	}
 }
 
@@ -189,8 +205,13 @@ func (c *QUICReassemblyPacketConn) LocalAddr() net.Addr {
 	return c.PacketConn.LocalAddr()
 }
 
-// Close closes the connection
+// Close stops the cleanup goroutine and closes the connection
 func (c *QUICReassemblyPacketConn) Close() error {
+	select {
+	case <-c.done:
+	default:
+		close(c.done)
+	}
 	return c.PacketConn.Close()
 }
 

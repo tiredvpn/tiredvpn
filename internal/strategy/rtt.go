@@ -1,9 +1,8 @@
 package strategy
 
 import (
-	"crypto/rand"
 	"math"
-	"math/big"
+	mrand "math/rand"
 	"net"
 	"sync"
 	"time"
@@ -196,6 +195,7 @@ type RTTMaskingConn struct {
 	mu            sync.Mutex
 	burstBuffer   [][]byte
 	lastBurstTime time.Time
+	done          chan struct{}
 
 	// Adaptive stats
 	observedRTTs   []time.Duration
@@ -204,12 +204,31 @@ type RTTMaskingConn struct {
 
 // NewRTTMaskingConn wraps a connection with RTT masking
 func NewRTTMaskingConn(conn net.Conn, config RTTMaskingConfig) *RTTMaskingConn {
-	return &RTTMaskingConn{
+	c := &RTTMaskingConn{
 		Conn:          conn,
 		config:        config,
 		burstBuffer:   make([][]byte, 0, config.BurstSize),
 		lastBurstTime: time.Now(),
 		observedRTTs:  make([]time.Duration, 0, 100),
+	}
+	if config.BurstMode && config.BurstInterval > 0 {
+		c.done = make(chan struct{})
+		go c.flushLoop()
+	}
+	return c
+}
+
+// flushLoop fires Flush every BurstInterval so buffered packets don't stall.
+func (c *RTTMaskingConn) flushLoop() {
+	ticker := time.NewTicker(c.config.BurstInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			c.Flush()
+		case <-c.done:
+			return
+		}
 	}
 }
 
@@ -323,23 +342,13 @@ func (c *RTTMaskingConn) randomDuration(min, max time.Duration) time.Duration {
 	if max <= min {
 		return min
 	}
-
 	rangeNs := int64(max - min)
-	n, err := rand.Int(rand.Reader, big.NewInt(rangeNs))
-	if err != nil {
-		return min
-	}
-
-	return min + time.Duration(n.Int64())
+	return min + time.Duration(mrand.Int63n(rangeNs))
 }
 
 // randomFloat returns random float in [0, 1)
 func (c *RTTMaskingConn) randomFloat() float64 {
-	n, err := rand.Int(rand.Reader, big.NewInt(1<<53))
-	if err != nil {
-		return 0.5
-	}
-	return float64(n.Int64()) / float64(1<<53)
+	return float64(mrand.Int63n(1<<53)) / float64(1<<53)
 }
 
 // Read implements net.Conn (no masking on read, just pass through)
@@ -363,9 +372,15 @@ func (c *RTTMaskingConn) Flush() error {
 	return nil
 }
 
-// Close flushes any pending burst and closes connection
+// Close stops the flush goroutine, flushes any pending burst, and closes connection
 func (c *RTTMaskingConn) Close() error {
-	// Flush remaining burst buffer
+	if c.done != nil {
+		select {
+		case <-c.done:
+		default:
+			close(c.done)
+		}
+	}
 	c.Flush()
 	return c.Conn.Close()
 }
