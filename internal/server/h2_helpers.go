@@ -28,9 +28,10 @@ func readH2Preface(conn net.Conn, logger *log.Logger) error {
 }
 
 // newH2Framer constructs an HTTP/2 framer over conn and writes the initial
-// server SETTINGS frame. Safe to call after kTLS Enable — the framer holds
-// a permanent reference to conn for subsequent frame I/O, so the conn
-// passed in must be the final post-Enable wrapper.
+// server SETTINGS frame. For the stego ALPN path this runs over the TLS
+// stack during the auth phase; the framer is rebuilt on the kTLS wrapper
+// only after auth succeeds (see handleHTTP2WithALPN), because the framer
+// holds a permanent reference to conn for subsequent frame I/O.
 //
 // AllowIllegalReads / AllowIllegalWrites are set true to mirror
 // initH2Framer's tolerance for client variants that occasionally emit

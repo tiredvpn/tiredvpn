@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"github.com/tiredvpn/tiredvpn/internal/capabilities"
 	"github.com/tiredvpn/tiredvpn/internal/control"
 	"github.com/tiredvpn/tiredvpn/internal/ktls"
 	"github.com/tiredvpn/tiredvpn/internal/log"
@@ -255,6 +256,22 @@ func Run(cfg *Config) error {
 
 	if err := InitREALITYKeys(); err != nil {
 		return fmt.Errorf("reality initialization failed: %w", err)
+	}
+
+	caps := capabilities.Probe()
+	log.Info("capabilities: %s", caps)
+	if cfg.EnableICMP && !caps.HasNetRaw {
+		log.Warn("ICMP tunnel disabled: CAP_NET_RAW required")
+		cfg.EnableICMP = false
+	}
+	if !caps.HasIPCmd {
+		log.Warn("ip command not found: TUN mode will fail; install iproute2")
+	}
+	if !caps.HasIPTablesCmd {
+		log.Warn("iptables not found: MSS clamping disabled")
+	}
+	if !caps.HasTUNDevice {
+		log.Warn("TUN device /dev/net/tun not available")
 	}
 
 	srvCtx := &serverContext{cfg: cfg}
@@ -816,6 +833,13 @@ func handleConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 
 			n, err := io.ReadAtLeast(conn, peekBuf[5+totalRead:5+totalRead+chunkSize], 1)
 			if err != nil {
+				// DPI may drop trailing bytes of a REALITY ClientHello (random padding).
+				// peekBuf is zero-initialized so missing bytes are already zeroed.
+				// If REALITY is detectable in what we received, proceed with zero-padded record.
+				if totalRead > 0 && DetectREALITYExtension(peekBuf[:5+totalRead]) {
+					logger.Debug("Partial REALITY ClientHello: %d/%d bytes, zero-padding remainder", totalRead, recordLen)
+					break
+				}
 				logger.Debug("Failed to read TLS record: %v (read %d/%d bytes)",
 					err, totalRead, recordLen)
 				serveFakeWebsite(conn, cfg, logger)
@@ -901,6 +925,25 @@ func handleConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 		return
 	}
 
+	// SSH camouflage: plaintext SSH-2.0 banner with no TIRED marker. Must be
+	// checked before protocol confusion (which also matches "SSH-2.0-") and
+	// before TLS, since the SSH handshake is plaintext.
+	if DetectSSHCamouflage(peekBuf) {
+		logger.Debug("Detected SSH camouflage")
+		handleSSHCamouflage(buffConn, srvCtx, logger)
+		return
+	}
+
+	// IMAP camouflage: plaintext Dovecot greeting ("* OK ... Dovecot ... ready")
+	// emitted by the client so this peek-based dispatch can class it. Checked
+	// alongside SSH camouflage, before protocol confusion and the fake website
+	// fallback. The "* OK" prefix never collides with TLS (0x16) or SSH.
+	if DetectIMAPCamouflage(peekBuf) {
+		logger.Debug("Detected IMAP camouflage")
+		handleIMAPCamouflage(buffConn, srvCtx, logger)
+		return
+	}
+
 	// Raw TCP protocol confusion: DNS-over-TCP / HTTP / SSH / SMTP preamble + TIRED marker
 	if detectConfusionMagic(peekBuf) {
 		logger.Debug("Detected raw TCP protocol confusion")
@@ -937,6 +980,8 @@ func handleTLSConnection(conn *tls.Conn, srvCtx *serverContext, connID uint64) {
 		handleRawTunnel(conn, srvCtx, logger, "")
 	case protocol.TypeConfusion:
 		handleProtocolConfusion(conn, srvCtx, logger)
+	case protocol.TypeAntiProbe:
+		handleAntiProbeDispatch(conn, srvCtx, logger)
 	case protocol.TypeMorph:
 		handleMorphConnectionWithALPN(conn, srvCtx, logger)
 	case protocol.TypeWS:
@@ -1033,23 +1078,33 @@ func handleTLSConnectionLegacy(conn net.Conn, srvCtx *serverContext, connID uint
 	serveFakeWebsite(buffConn, cfg, logger)
 }
 
-// handleHTTP2WithALPN handles HTTP/2 Stego when ALPN was used
-// Since kTLS is already enabled, we just need to read the preface and delegate to handleHTTP2
+// handleHTTP2WithALPN handles HTTP/2 Stego when ALPN was used.
+//
+// kTLS handover boundary: unlike tired-raw / tired-confusion, the HTTP/2
+// stego client streams its whole opening burst — preface + SETTINGS + auth
+// HEADERS — back-to-back without waiting for a server signal. If we enable
+// kTLS right after reading the 24-byte preface, the TLS stack has already
+// decrypted the SETTINGS/HEADERS that trailed the preface in the same TCP
+// segment into tls.Conn's internal buffer; the kernel then takes over the
+// raw socket and those decrypted bytes are lost forever. The server waits
+// for HEADERS that never arrive, the client waits for an auth ack that never
+// comes, and the handshake hangs until timeout.
+//
+// Fix: run the entire auth handshake (SETTINGS exchange + auth HEADERS +
+// auth ack) through the TLS stack, and only hand the socket to kTLS once the
+// client is authenticated. At that point the client is blocked in
+// waitForServerAck and has not sent any DATA, so tls.Conn's buffer is empty
+// and the handover is lossless. The framer is rebuilt on the kTLS wrapper
+// for the relay phase; the HPACK decoder state is carried over unchanged.
 func handleHTTP2WithALPN(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
-	logger.Debug("HTTP/2 via ALPN — kTLS upgrade after preface read")
+	logger.Debug("HTTP/2 via ALPN — kTLS upgrade deferred until after auth")
 
-	// Read the preface through the TLS stack. This drains any decrypted
-	// preface bytes from tls.Conn's buffer so the subsequent kTLS Enable
-	// gives the kernel a record-sequence counter that matches the next
-	// byte on the wire.
+	// Read the preface through the TLS stack.
 	if err := readH2Preface(conn, logger); err != nil {
 		return
 	}
 
-	// Auth phase complete: hand the socket over to kTLS for the byte-relay
-	// phase. Subsequent frame I/O (HEADERS / DATA) goes through the kernel.
-	conn = ktls.TryEnable(conn, "tired-stego")
-
+	// Auth phase still runs over the TLS stack (no kTLS yet).
 	framer, err := newH2Framer(conn, logger)
 	if err != nil {
 		return
@@ -1060,9 +1115,32 @@ func handleHTTP2WithALPN(conn net.Conn, srvCtx *serverContext, logger *log.Logge
 	var authClientID string
 	var tunnel *h2TunnelState
 	var connTracked bool
-	defer cleanupH2Conn(conn, srvCtx, &tunnel, &connTracked, &authClientID)
 
-	runH2FrameLoop(conn, framer, hpackDec, srvCtx, logger, &authenticated, &authClientID, &connTracked, &tunnel)
+	// kTLS handover fires exactly once, the moment auth succeeds: the socket
+	// moves to the kernel and the framer is rebuilt on the new wrapper. Any
+	// connection tracking registered against the pre-swap conn is repointed.
+	handover := func(authedConn net.Conn) (net.Conn, *http2.Framer) {
+		preSwap := authedConn
+		swapped := ktls.TryEnable(authedConn, "tired-stego")
+		if swapped != preSwap {
+			if connTracked && srvCtx.registry != nil && authClientID != "" {
+				srvCtx.registry.SwapConn(authClientID, preSwap, swapped)
+			}
+			// Rebuild the framer on the kTLS wrapper. ReadFrame never reads
+			// past a single frame, so no client bytes are buffered inside the
+			// old framer; the client is parked in waitForServerAck so the TLS
+			// stack buffer is empty too.
+			newFramer := http2.NewFramer(swapped, swapped)
+			newFramer.AllowIllegalReads = true
+			newFramer.AllowIllegalWrites = true
+			return swapped, newFramer
+		}
+		return authedConn, framer
+	}
+
+	defer func() { cleanupH2Conn(conn, srvCtx, &tunnel, &connTracked, &authClientID) }()
+
+	runH2FrameLoop(&conn, &framer, hpackDec, srvCtx, logger, &authenticated, &authClientID, &connTracked, &tunnel, handover)
 }
 
 // handleMorphConnectionWithALPN handles Morph protocol when ALPN was used
@@ -1100,7 +1178,7 @@ func handleHTTP2(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
 	var connTracked bool
 	defer cleanupH2Conn(conn, srvCtx, &tunnel, &connTracked, &authClientID)
 
-	runH2FrameLoop(conn, framer, hpackDec, srvCtx, logger, &authenticated, &authClientID, &connTracked, &tunnel)
+	runH2FrameLoop(&conn, &framer, hpackDec, srvCtx, logger, &authenticated, &authClientID, &connTracked, &tunnel, nil)
 }
 
 // initH2Framer reads the HTTP/2 preface, creates a framer and sends server SETTINGS.
@@ -1131,9 +1209,17 @@ func cleanupH2Conn(conn net.Conn, srvCtx *serverContext, tunnel **h2TunnelState,
 }
 
 // runH2FrameLoop reads and dispatches HTTP/2 frames until the connection closes.
-func runH2FrameLoop(conn net.Conn, framer *http2.Framer, hpackDec *hpack.Decoder, srvCtx *serverContext, logger *log.Logger, authenticated *bool, authClientID *string, connTracked *bool, tunnel **h2TunnelState) {
+//
+// connPtr / framerPtr are pointers so the loop can swap the connection and
+// framer in place after a kTLS handover (see handover). handover may be nil
+// (legacy non-ALPN path), in which case no kTLS upgrade happens. When set, it
+// is invoked exactly once — immediately after auth succeeds — and returns the
+// connection and framer to use for the subsequent relay phase.
+func runH2FrameLoop(connPtr *net.Conn, framerPtr **http2.Framer, hpackDec *hpack.Decoder, srvCtx *serverContext, logger *log.Logger, authenticated *bool, authClientID *string, connTracked *bool, tunnel **h2TunnelState, handover func(net.Conn) (net.Conn, *http2.Framer)) {
 	cfg := srvCtx.cfg
 	for {
+		conn := *connPtr
+		framer := *framerPtr
 		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 		frame, err := framer.ReadFrame()
 		if err != nil {
@@ -1151,7 +1237,17 @@ func runH2FrameLoop(conn net.Conn, framer *http2.Framer, hpackDec *hpack.Decoder
 				framer.WriteSettingsAck()
 			}
 		case *http2.HeadersFrame:
+			wasAuthed := *authenticated
 			processH2HeadersFrame(conn, f, framer, hpackDec, srvCtx, logger, authenticated, authClientID, connTracked)
+			// Auth just succeeded on this frame: perform the kTLS handover
+			// now, before reading any further frames. The auth ack has been
+			// written through the TLS stack and flushed; the client is parked
+			// in waitForServerAck, so no client bytes are in flight.
+			if !wasAuthed && *authenticated && handover != nil {
+				newConn, newFramer := handover(conn)
+				*connPtr = newConn
+				*framerPtr = newFramer
+			}
 		case *http2.DataFrame:
 			if !*authenticated {
 				logger.Debug("Received DATA before auth, ignoring")
@@ -1991,6 +2087,44 @@ func handleWebSocket(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
 			return
 		}
 	}
+}
+
+// handleAntiProbeDispatch handles anti-probe connections that arrive over the
+// 1-byte protocol dispatch (TypeAntiProbe), after the TLS handshake. The
+// dispatch byte has already been consumed by handleTLSConnection, so the next
+// bytes are the timing-knock packets. Peek the first packet to resolve which
+// per-client (or global) secret the knock was built from, then hand off to the
+// shared knock verifier.
+func handleAntiProbeDispatch(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
+	cfg := srvCtx.cfg
+
+	// Peek the first knock packet so detectTimingKnockWithRegistry can match a
+	// secret. The first packet is at most 99 bytes (10 + hash%90); reading 99
+	// bytes covers it without blocking on the inter-packet client sleeps.
+	peekBuf := make([]byte, 99)
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	n, err := io.ReadAtLeast(conn, peekBuf, 10)
+	if err != nil {
+		logger.Debug("Anti-probe dispatch: failed to peek knock: %v (read %d)", err, n)
+		serveFakeWebsite(conn, cfg, logger)
+		return
+	}
+	conn.SetReadDeadline(time.Time{})
+	peekBuf = peekBuf[:n]
+
+	matched, secret, clientID := detectTimingKnockWithRegistry(peekBuf, srvCtx)
+	if !matched {
+		logger.Debug("Anti-probe dispatch: knock did not match any secret")
+		serveFakeWebsite(conn, cfg, logger)
+		return
+	}
+
+	// Replay the peeked bytes so verifyFullKnockSequence sees the full knock.
+	buffConn := &bufferedConn{
+		Conn:   conn,
+		reader: io.MultiReader(bytes.NewReader(peekBuf), conn),
+	}
+	handleAntiProbeAuth(buffConn, srvCtx, secret, clientID, logger)
 }
 
 // handleAntiProbeAuth handles anti-probe authenticated connections

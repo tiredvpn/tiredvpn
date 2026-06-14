@@ -34,6 +34,7 @@ type icmpSession struct {
 	recvCh     chan []byte
 	lastActive time.Time
 	mu         sync.Mutex
+	s2cSeq     uint32     // monotonic counter for all s2c replies; protected by mu
 	done       chan struct{}
 	once       sync.Once // guards close(done)
 }
@@ -161,7 +162,7 @@ func (s *ICMPServer) handlePacket(echo *icmp.Echo, clientAddr *net.IPAddr) {
 
 	// Control packet (handshake) — reply and done.
 	if header.Flags&strategy.FlagControl != 0 {
-		s.sendEchoReply(session, plaintext, strategy.FlagControl, header.PacketSeq+1)
+		s.sendEchoReply(session, plaintext, strategy.FlagControl, session.nextS2CSeq())
 		return
 	}
 
@@ -206,12 +207,22 @@ func (s *ICMPServer) getOrCreateSession(
 		tunnelID:   tunnelID,
 		recvCh:     make(chan []byte, 256),
 		lastActive: time.Now(),
+		s2cSeq:     0,
 		done:       make(chan struct{}),
 	}
 	s.sessions[sessionID] = sess
 
 	// Spin up a virtual connection and hand it to the standard tunnel handler.
 	clientConn, serverConn := net.Pipe()
+
+	// BUG 1 fix: close both pipe ends when the session is torn down so that
+	// pipeRecvToConn (blocked in conn.Write) and pipeConnToSend (blocked in
+	// conn.Read) both unblock immediately and exit.
+	go func() {
+		<-sess.done
+		serverConn.Close()
+		clientConn.Close()
+	}()
 
 	go s.pipeRecvToConn(sess, serverConn)
 	go s.pipeConnToSend(sess, serverConn)
@@ -220,7 +231,13 @@ func (s *ICMPServer) getOrCreateSession(
 
 	connID := atomic.AddUint64(&connCounter, 1)
 	logger := log.WithPrefix(fmt.Sprintf("icmp:%d", connID))
-	go handleRawTunnel(clientConn, s.srvCtx, logger, "")
+	// BUG 2 fix: remove the session when handleRawTunnel returns so that
+	// pipeConnToSend is not left blocking on serverConn.Read until TTL eviction.
+	// removeSession uses sync.Once internally so duplicate calls are harmless.
+	go func() {
+		handleRawTunnel(clientConn, s.srvCtx, logger, "")
+		s.removeSession(sess.sessionID)
+	}()
 
 	return sess
 }
@@ -250,7 +267,6 @@ func (s *ICMPServer) pipeRecvToConn(sess *icmpSession, conn net.Conn) {
 // handleRawTunnel wants to send back to the client) and transmits it as
 // ICMP Echo Replies.
 func (s *ICMPServer) pipeConnToSend(sess *icmpSession, conn net.Conn) {
-	var seq uint32 = 1000
 	buf := make([]byte, 4096)
 	for {
 		n, err := conn.Read(buf)
@@ -262,9 +278,18 @@ func (s *ICMPServer) pipeConnToSend(sess *icmpSession, conn net.Conn) {
 
 		payload := make([]byte, n)
 		copy(payload, buf[:n])
-		seq++
-		s.sendEchoReply(sess, payload, 0, seq)
+		s.sendEchoReply(sess, payload, 0, sess.nextS2CSeq())
 	}
+}
+
+// nextS2CSeq returns the next monotonic sequence number for s2c replies.
+// All reply paths (control and data) share this counter so nonces never collide.
+func (sess *icmpSession) nextS2CSeq() uint32 {
+	sess.mu.Lock()
+	sess.s2cSeq++
+	seq := sess.s2cSeq
+	sess.mu.Unlock()
+	return seq
 }
 
 // sendEchoReply encrypts payload with the s2c key and sends an ICMP Echo Reply.

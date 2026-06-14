@@ -19,7 +19,6 @@ import (
 type ProtocolConfusionStrategy struct {
 	manager       *Manager // Reference to Manager for IPv6/IPv4 support
 	confusionType ConfusionType
-	baseStrat     Strategy
 }
 
 // ConfusionType defines which protocol confusion to use
@@ -44,11 +43,10 @@ const (
 
 // NewProtocolConfusionStrategy creates a new confusion strategy
 // manager is required for IPv6/IPv4 transport layer support
-func NewProtocolConfusionStrategy(manager *Manager, confType ConfusionType, base Strategy) *ProtocolConfusionStrategy {
+func NewProtocolConfusionStrategy(manager *Manager, confType ConfusionType) *ProtocolConfusionStrategy {
 	return &ProtocolConfusionStrategy{
 		manager:       manager,
 		confusionType: confType,
-		baseStrat:     base,
 	}
 }
 
@@ -264,33 +262,74 @@ func (c *ConfusedConn) buildHTTPConfusion(realData []byte) []byte {
 	return buf.Bytes()
 }
 
-// buildSSHConfusion starts with SSH banner
+// buildSSHConfusion starts with SSH banner followed by a well-formed KEXINIT packet.
+// SSH-2.0 binary packet format: [uint32 packet_length][uint8 padding_length][payload][random padding]
+// where packet_length = 1 (padding_length) + len(payload) + padding_length.
 func (c *ConfusedConn) buildSSHConfusion(realData []byte) []byte {
 	var buf bytes.Buffer
 
 	// SSH banner
 	buf.WriteString("SSH-2.0-OpenSSH_8.9\r\n")
 
-	// Key exchange init (fake, truncated)
-	buf.Write([]byte{
-		0x00, 0x00, 0x00, 0x00, // Packet length (placeholder)
-		0x14, // SSH_MSG_KEXINIT
-	})
+	// Build KEXINIT payload:
+	//   0x14 (SSH_MSG_KEXINIT) + 16-byte cookie + kex name-lists + reserved uint32
+	// We use empty name-lists (each is a uint32-length-prefixed string with length 0).
+	// There are 10 name-list fields in KEXINIT plus 1 boolean (first_kex_packet_follows).
+	// Minimal payload: 1 + 16 + 10*4 + 1 + 4 = 62 bytes
+	var payload bytes.Buffer
+	payload.WriteByte(0x14) // SSH_MSG_KEXINIT
 
-	// Cookie (random)
+	// 16-byte random cookie - must not contain the TIRED marker (\x00\x00TIRED)
+	// because the server scans the stream for that sequence to detect our traffic.
+	tiredMarker := []byte{0x00, 0x00, 0x54, 0x49, 0x52, 0x45, 0x44} // \0\0TIRED
 	cookie := make([]byte, 16)
-	rand.Read(cookie)
-	buf.Write(cookie)
+	for {
+		rand.Read(cookie)
+		if !bytes.Contains(cookie, tiredMarker) {
+			break
+		}
+	}
+	payload.Write(cookie)
 
-	// Magic marker
+	// 10 empty name-list fields (each: uint32 length = 0, no data)
+	emptyList := []byte{0x00, 0x00, 0x00, 0x00}
+	for i := 0; i < 10; i++ {
+		payload.Write(emptyList)
+	}
+	payload.WriteByte(0x00)             // first_kex_packet_follows = false
+	payload.Write(emptyList)            // reserved uint32 = 0
+
+	payloadBytes := payload.Bytes()
+
+	// Compute padding: total (1 + len(payload) + padding) must be multiple of 8, min padding 4
+	blockSize := 8
+	// packetLen field covers: 1 byte padding_length + len(payload) + padding_length bytes
+	baseLen := 1 + len(payloadBytes)
+	paddingLen := blockSize - (baseLen % blockSize)
+	if paddingLen < 4 {
+		paddingLen += blockSize
+	}
+
+	// packet_length = 1 (padding_length field) + len(payload) + paddingLen
+	packetLength := uint32(1 + len(payloadBytes) + paddingLen)
+
+	pktLenBytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(pktLenBytes, packetLength)
+	buf.Write(pktLenBytes)
+	buf.WriteByte(byte(paddingLen))
+	buf.Write(payloadBytes)
+
+	padding := make([]byte, paddingLen)
+	rand.Read(padding)
+	buf.Write(padding)
+
+	// Magic marker + length + real data (appended after the SSH packet)
 	buf.Write([]byte{0x54, 0x49, 0x52, 0x45, 0x44}) // TIRED
 
-	// Length
 	lenBytes := make([]byte, 4)
 	binary.BigEndian.PutUint32(lenBytes, uint32(len(realData)))
 	buf.Write(lenBytes)
 
-	// Real data
 	buf.Write(realData)
 
 	return buf.Bytes()
@@ -345,14 +384,6 @@ func (c *ConfusedConn) buildMultiLayerConfusion(realData []byte) []byte {
 	buf.Write(realData)
 
 	return buf.Bytes()
-}
-
-// frameData adds length framing for subsequent data
-func (c *ConfusedConn) frameData(data []byte) []byte {
-	frame := make([]byte, 4+len(data))
-	binary.BigEndian.PutUint32(frame[:4], uint32(len(data)))
-	copy(frame[4:], data)
-	return frame
 }
 
 // Read handles server response, stripping confusion headers
@@ -432,7 +463,7 @@ func AllConfusionTypes(manager *Manager) []*ProtocolConfusionStrategy {
 
 	strategies := make([]*ProtocolConfusionStrategy, len(types))
 	for i, t := range types {
-		strategies[i] = NewProtocolConfusionStrategy(manager, t, nil)
+		strategies[i] = NewProtocolConfusionStrategy(manager, t)
 	}
 	return strategies
 }

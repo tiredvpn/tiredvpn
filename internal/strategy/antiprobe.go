@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/log"
+	"github.com/tiredvpn/tiredvpn/internal/protocol"
 )
 
 // AntiProbeStrategy implements resistance to active probing
@@ -137,13 +138,22 @@ func (s *AntiProbeStrategy) Connect(ctx context.Context, target string) (net.Con
 		}
 	}
 
-	// Phase 2: Perform timing-based authentication over TLS
+	// Phase 2: Announce the protocol via the 1-byte dispatch discriminator,
+	// mirroring every other TLS strategy. Without this the server's
+	// protocol.ReadDispatch consumes the first knock byte (0x00) as the
+	// discriminator, desyncing knock verification and hanging the auth.
+	if err := protocol.WriteDispatch(tlsConn, protocol.TypeAntiProbe); err != nil {
+		tlsConn.Close()
+		return nil, err
+	}
+
+	// Phase 3: Perform timing-based authentication over TLS
 	if err := s.timingKnock(tlsConn); err != nil {
 		tlsConn.Close()
 		return nil, err
 	}
 
-	// Phase 3: Verify server response
+	// Phase 4: Verify server response
 	if err := s.verifyServerAuth(tlsConn); err != nil {
 		tlsConn.Close()
 		return nil, err

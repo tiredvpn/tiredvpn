@@ -16,6 +16,8 @@ const (
 	TypeWS       = byte(0x04)
 	TypePolling  = byte(0x05)
 	TypeConfusion = byte(0x06)
+	TypeAntiProbe = byte(0x07)
+	TypeMux       = byte(0x08) // smux stream multiplexing (REALITY)
 
 	dispReadTimeout = 10 * time.Second
 )
