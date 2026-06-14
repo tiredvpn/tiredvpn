@@ -2,16 +2,25 @@ package strategy
 
 import (
 	"context"
+	"crypto/hmac"
 	cryptorand "crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"sort"
 	"sync"
 	"time"
+
+	"github.com/xtaci/smux"
+	"golang.org/x/crypto/hkdf"
 
 	"github.com/tiredvpn/tiredvpn/internal/evasion"
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/protect"
+	"github.com/tiredvpn/tiredvpn/internal/protocol"
 	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 )
 
@@ -36,13 +45,36 @@ type REALITYStrategy struct {
 	pqKeyExchange  *customtls.HybridKeyExchange
 	pqSignature    *customtls.QuantumSignature
 	serverPQKemPub []byte // Server's Kyber768 public key (for encapsulation)
+
+	// smux session reuse: one TCP connection per server, N streams per session.
+	// Avoids the DPI-drop-second-segment problem by eliminating new TCP connections.
+	muxMu   sync.Mutex
+	muxSess *smux.Session
+	muxConn net.Conn // underlying TCP for muxSess
 }
 
 // NewREALITYStrategy creates a new REALITY strategy
 // manager is required for IPv6/IPv4 transport layer support
 func NewREALITYStrategy(manager *Manager, secret []byte) *REALITYStrategy {
-	// Use cooldown strategy for destination selection
-	sniRotator := evasion.NewSNIRotator(evasion.StrategyCooldown)
+	// Use "developer" category (github.com, hetzner.com) as the primary cover pool.
+	// Empirically, TSPU (Russia) does NOT validate these domains' IPs against the
+	// real server address — so TLS ClientHello with github.com SNI reaches a
+	// Hetzner VPN server without being RST'd. Microsoft/Azure domains are blocked
+	// because TSPU whitelists their IP ranges and rejects mismatches.
+	developerPool := make([]string, 0, 8)
+	for _, entry := range evasion.WhitelistedSNIs {
+		if entry.Category == "developer" {
+			developerPool = append(developerPool, entry.SNI)
+		}
+	}
+	subPool := derivePool(developerPool, secret, len(developerPool))
+	if len(subPool) == 0 {
+		// Fallback to the legacy Tier 1 list if derivation yields nothing.
+		subPool = getRussianSNIsStatic()
+	}
+
+	// Use cooldown strategy for destination selection over the derived subpool
+	sniRotator := evasion.NewSNIRotatorWithPool(subPool, evasion.StrategyCooldown)
 
 	// Generate client key pair
 	privKey, pubKey, _ := customtls.GenerateX25519KeyPair()
@@ -150,13 +182,29 @@ func (r *REALITYStrategy) Probe(ctx context.Context, target string) error {
 	return nil
 }
 
-// Connect establishes a REALITY connection to the target
+// Connect establishes a REALITY connection to the target.
+// Connect dials a new REALITY connection for each request.
+// Smux session reuse is intentionally disabled: TSPU (Russian DPI) throttles
+// the underlying TCP after the first stream finishes, so any subsequent stream
+// on the same TCP arrives after an idle gap and gets dropped. A fresh TCP per
+// request avoids this — at the cost of one REALITY handshake (~200ms) each time.
 func (r *REALITYStrategy) Connect(ctx context.Context, target string) (net.Conn, error) {
-	// Get server address (IPv6/IPv4 with automatic fallback)
+	// Clean up any stale session from a prior connection.
+	r.muxMu.Lock()
+	if r.muxSess != nil {
+		r.muxSess.Close()
+		r.muxSess = nil
+	}
+	if r.muxConn != nil {
+		r.muxConn.Close()
+		r.muxConn = nil
+	}
+	r.muxMu.Unlock()
+
+	// Slow path: new TCP connection + REALITY handshake + smux negotiation.
 	serverAddr := r.manager.GetServerAddr(ctx)
 	log.Debug("REALITY: Connecting to %s via %s", target, serverAddr)
 
-	// Select legitimate destination for impersonation
 	dest, err := r.selectDestination()
 	if err != nil {
 		return nil, fmt.Errorf("reality: destination selection failed: %w", err)
@@ -164,14 +212,12 @@ func (r *REALITYStrategy) Connect(ctx context.Context, target string) (net.Conn,
 
 	log.Debug("REALITY: Using destination %s for cover", dest)
 
-	// Get timeout from context
 	deadline, hasDeadline := ctx.Deadline()
 	timeout := 30 * time.Second
 	if hasDeadline {
 		timeout = time.Until(deadline)
 	}
 
-	// Connect to TiredVPN server with protected socket (Android)
 	protectedDialer := &protect.ProtectDialer{
 		Dialer: &net.Dialer{
 			Timeout:   timeout,
@@ -184,38 +230,65 @@ func (r *REALITYStrategy) Connect(ctx context.Context, target string) (net.Conn,
 		return nil, fmt.Errorf("reality: server connection failed: %w", err)
 	}
 
-	// CRITICAL: Set TCP_NODELAY BEFORE TLS handshake to prevent ClientHello segmentation
-	// Without this, Nagle's algorithm may split ClientHello into 2 segments -> DPI detects REALITY
+	// CRITICAL: Set TCP_NODELAY BEFORE TLS handshake to prevent ClientHello segmentation.
+	// Without this, Nagle's algorithm may split ClientHello into 2 segments → DPI detects REALITY.
 	if tc, ok := tcpConn.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
 		tc.SetKeepAlive(true)
 		tc.SetKeepAlivePeriod(30 * time.Second)
 	}
 
-	// Build ClientHello with REALITY extension
 	clientHello, err := r.buildClientHello(dest)
 	if err != nil {
 		tcpConn.Close()
 		return nil, fmt.Errorf("reality: clienthello build failed: %w", err)
 	}
 
-	// CRITICAL: Verify record length before sending
 	if len(clientHello) >= 5 {
 		recordLen := int(clientHello[3])<<8 | int(clientHello[4])
 		log.Debug("REALITY: PRE-WRITE len=%d, record_len=%d (bytes[3:5]=%02x%02x)", len(clientHello), recordLen, clientHello[3], clientHello[4])
 	}
 
-	// Send ClientHello
-	n, err := tcpConn.Write(clientHello)
-	if err != nil {
+	// Send ClientHello with SNI-aware fragmentation to bypass stateless DPI.
+	// TCP_NODELAY ensures each Write() becomes its own TCP segment.
+	//
+	// Strategy: split the first fragment so it ends in the MIDDLE of the SNI
+	// hostname. No single segment contains the complete SNI string, so DPI
+	// doing per-segment SNI matching (Russia's TSPU style) cannot identify it.
+	const chelloFragmentSize = 200
+	sniHost, _, _ := net.SplitHostPort(dest)
+	firstFragEnd := sniFragmentSplitPoint(clientHello, sniHost, chelloFragmentSize)
+
+	totalWritten := 0
+	fragments := 0
+
+	sendFrag := func(b []byte) error {
+		nw, werr := tcpConn.Write(b)
+		totalWritten += nw
+		fragments++
+		return werr
+	}
+
+	// First fragment: ends mid-SNI (or before extensions if SNI not found)
+	if err := sendFrag(clientHello[:firstFragEnd]); err != nil {
 		tcpConn.Close()
 		return nil, fmt.Errorf("reality: clienthello send failed: %w", err)
 	}
+	// Remaining fragments: 200-byte chunks
+	for start := firstFragEnd; start < len(clientHello); start += chelloFragmentSize {
+		end := start + chelloFragmentSize
+		if end > len(clientHello) {
+			end = len(clientHello)
+		}
+		if err := sendFrag(clientHello[start:end]); err != nil {
+			tcpConn.Close()
+			return nil, fmt.Errorf("reality: clienthello send failed: %w", err)
+		}
+	}
 
-	log.Debug("REALITY: ClientHello written=%d bytes (requested=%d)", n, len(clientHello))
+	log.Debug("REALITY: ClientHello written=%d bytes (requested=%d, fragments=%d, firstFrag=%d)", totalWritten, len(clientHello), fragments, firstFragEnd)
 	log.Debug("REALITY: ClientHello hex: %s", log.HexDump(clientHello, 256))
 
-	// Read ServerHello
 	serverHello, err := r.readServerHello(tcpConn, timeout)
 	if err != nil {
 		tcpConn.Close()
@@ -225,21 +298,47 @@ func (r *REALITYStrategy) Connect(ctx context.Context, target string) (net.Conn,
 	log.Debug("REALITY: ServerHello received (%d bytes)", len(serverHello))
 	log.Debug("REALITY: ServerHello hex: %s", log.HexDump(serverHello, 128))
 
-	// Validate ServerHello
 	if err := r.validateServerHello(serverHello, dest); err != nil {
 		tcpConn.Close()
 		return nil, fmt.Errorf("reality: validation failed: %w", err)
 	}
 
-	log.Info("REALITY: Tunnel established to %s", target)
+	// Negotiate smux mode with the server.
+	if err := protocol.WriteDispatch(tcpConn, protocol.TypeMux); err != nil {
+		tcpConn.Close()
+		return nil, fmt.Errorf("reality: mux negotiate: %w", err)
+	}
 
-	// Return wrapped connection (could add additional framing here if needed)
-	return &realityConn{
-		Conn:    tcpConn,
-		target:  target,
-		dest:    dest,
-		isEstab: true,
-	}, nil
+	// Wrap TCP in a chacha20-over-TLS-record framing layer so TSPU sees
+	// a normal TLS Application Data stream instead of raw smux bytes.
+	// Without this, TSPU throttles the connection after ~600 bytes.
+	dataConn, err := NewRealityDataConn(tcpConn, r.secret, r.clientPubKey[:], true)
+	if err != nil {
+		tcpConn.Close()
+		return nil, fmt.Errorf("reality: data conn init: %w", err)
+	}
+
+	smuxCfg := smux.DefaultConfig()
+	newSess, err := smux.Client(dataConn, smuxCfg)
+	if err != nil {
+		tcpConn.Close()
+		return nil, fmt.Errorf("reality: smux client: %w", err)
+	}
+
+	stream, err := newSess.OpenStream()
+	if err != nil {
+		newSess.Close()
+		tcpConn.Close()
+		return nil, fmt.Errorf("reality: first mux stream: %w", err)
+	}
+
+	r.muxMu.Lock()
+	r.muxSess = newSess
+	r.muxConn = tcpConn
+	r.muxMu.Unlock()
+
+	log.Info("REALITY: Mux session established to %s via %s", target, dest)
+	return stream, nil
 }
 
 // selectDestination chooses a legitimate destination from the SNI whitelist
@@ -255,24 +354,15 @@ func (r *REALITYStrategy) selectDestination() (string, error) {
 		}
 	}
 
-	// Get Tier 1 SNIs (Russian services + banking)
-	tier1SNIs := r.getRussianSNIs()
-	tier1SNIs = append(tier1SNIs, r.getChineseSNIs()...)
-	tier1SNIs = append(tier1SNIs, r.getIranianSNIs()...)
+	// The rotator is already seeded from the per-user derived subpool
+	// (see NewREALITYStrategy / derivePool), so no Tier 1 forcing is needed here.
+	// Fallback list used only if the rotator's pool is somehow empty.
+	fallbackSNIs := getRussianSNIsStatic()
 
 	// Try up to 10 times to find a non-recent destination
 	for attempt := 0; attempt < 10; attempt++ {
-		// Use SNI rotator with weighted selection
+		// Use SNI rotator over the derived subpool
 		sni := r.sniRotator.Next()
-
-		// Prefer Tier 1, but allow fallback
-		if attempt < 5 {
-			// Force Tier 1 selection
-			if !containsString(tier1SNIs, sni) {
-				// Pick random from Tier 1
-				sni = tier1SNIs[randomInt(len(tier1SNIs))]
-			}
-		}
 
 		// Check cooldown (30 seconds)
 		if lastUse, used := r.recentDests[sni]; used {
@@ -294,9 +384,67 @@ func (r *REALITYStrategy) selectDestination() (string, error) {
 	}
 
 	// Fallback: use any destination
-	sni := tier1SNIs[0]
+	sni := fallbackSNIs[0]
 	r.recentDests[sni] = time.Now()
 	return net.JoinHostPort(sni, "443"), nil
+}
+
+// derivePool derives a deterministic per-user subpool of size n from globalPool.
+//
+// Blast-radius-min T2: a sub-key is derived from the user's secret via
+// HKDF-SHA256 (salt="tiredvpn-rotation-v1", info="subpool"). The global pool is
+// then sorted by HMAC-SHA256(K_sub, domain) and the top-n entries are returned.
+// This gives each user a stable, secret-specific donor set: domains used by one
+// user reveal nothing about another user's set.
+func derivePool(globalPool []string, secret []byte, n int) []string {
+	if len(globalPool) == 0 {
+		return nil
+	}
+
+	// K_sub = HKDF-SHA256(secret, salt, info)
+	kSub := make([]byte, 32)
+	kdf := hkdf.New(sha256.New, secret, []byte("tiredvpn-rotation-v1"), []byte("subpool"))
+	if _, err := io.ReadFull(kdf, kSub); err != nil {
+		// HKDF over SHA-256 never fails for a 32-byte read, but stay safe.
+		return globalPool
+	}
+
+	// Copy so we don't mutate the caller's slice ordering.
+	pool := make([]string, len(globalPool))
+	copy(pool, globalPool)
+
+	sort.SliceStable(pool, func(i, j int) bool {
+		return hmacScore(kSub, pool[i]) < hmacScore(kSub, pool[j])
+	})
+
+	if n > len(pool) {
+		n = len(pool)
+	}
+	return pool[:n]
+}
+
+// hmacScore returns the first 8 bytes of HMAC-SHA256(key, domain) as a uint64.
+func hmacScore(key []byte, domain string) uint64 {
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(domain))
+	sum := mac.Sum(nil)
+	return binary.BigEndian.Uint64(sum[:8])
+}
+
+// getRussianSNIsStatic is the package-level fallback Tier 1 list, used during
+// construction (before a receiver exists) and as a last-resort destination.
+func getRussianSNIsStatic() []string {
+	return []string{
+		"yandex.ru",
+		"ya.ru",
+		"vk.com",
+		"mail.ru",
+		"sberbank.ru",
+		"gosuslugi.ru",
+		"tinkoff.ru",
+		"alfabank.ru",
+		"vtb.ru",
+	}
 }
 
 // getRussianSNIs returns Tier 1 SNIs (Russian services + banking)
@@ -437,7 +585,9 @@ func (r *REALITYStrategy) validateServerHello(serverHello []byte, expectedDest s
 	// Search for REALITY in padding extension (0x0015)
 	var serverExt *customtls.REALITYExtension
 
-	// Scan for padding extension (0x00 0x15)
+	// Scan for padding extension (0x00 0x15). The V1 wire format has no magic
+	// marker — the padding starts directly with [PubKey:32][AuthToken:32], so we
+	// extract any candidate and let VerifyServerAuth below confirm it.
 	for i := 0; i < len(serverHello)-10; i++ {
 		if serverHello[i] == 0x00 && serverHello[i+1] == 0x15 {
 			// Found padding extension
@@ -451,18 +601,12 @@ func (r *REALITYStrategy) validateServerHello(serverHello []byte, expectedDest s
 				continue
 			}
 
-			// Check for REALITY magic at start of padding
+			// Extract REALITY extension from start of padding (no magic check).
 			paddingData := serverHello[extDataStart : extDataStart+extLen]
-			if len(paddingData) >= 4 &&
-				paddingData[0] == 'R' && paddingData[1] == 'E' &&
-				paddingData[2] == 'A' && paddingData[3] == 'L' {
-
-				// Extract REALITY extension
-				ext, err := customtls.ExtractREALITYFromPadding(paddingData)
-				if err == nil {
-					serverExt = ext
-					break
-				}
+			ext, err := customtls.ExtractREALITYFromPadding(paddingData)
+			if err == nil && customtls.VerifyServerAuth(r.secret, r.clientPubKey[:], ext.AuthToken) {
+				serverExt = ext
+				break
 			}
 		}
 	}
@@ -528,4 +672,90 @@ func readFull(conn net.Conn, buf []byte) (int, error) {
 		total += n
 	}
 	return total, nil
+}
+
+// sniFragmentSplitPoint returns the byte offset where the first ClientHello
+// fragment should end, chosen to fall in the middle of the SNI hostname.
+// Searching only within the TLS extensions section avoids false positives in
+// random bytes (ClientHello.Random, session ID, key share values).
+// If the SNI is not found, returns defaultSize as a safe fallback.
+//
+// Uses proper TLS extension-type walking (finds ext type 0x0000) rather than raw
+// byte search to avoid false positives inside key_share data (kyber768, ~1152 bytes
+// of semi-random bytes that can contain any short hostname as a substring).
+func sniFragmentSplitPoint(clientHello []byte, sniHost string, defaultSize int) int {
+	if len(sniHost) < 2 || len(clientHello) < 47 {
+		return defaultSize
+	}
+
+	// TLS Record header (5) + Handshake header (4) + CH version (2) + CH random (32) = 43
+	offset := 43
+	if offset >= len(clientHello) {
+		return defaultSize
+	}
+
+	// Skip session ID
+	sessionIDLen := int(clientHello[offset])
+	offset += 1 + sessionIDLen
+	if offset+2 > len(clientHello) {
+		return defaultSize
+	}
+
+	// Skip cipher suites
+	cipherLen := int(clientHello[offset])<<8 | int(clientHello[offset+1])
+	offset += 2 + cipherLen
+	if offset+1 > len(clientHello) {
+		return defaultSize
+	}
+
+	// Skip compression methods
+	compLen := int(clientHello[offset])
+	offset += 1 + compLen
+	if offset+2 > len(clientHello) {
+		return defaultSize
+	}
+
+	// Extensions: 2-byte total length, then each ext is type(2)+len(2)+data(len)
+	extTotalLen := int(clientHello[offset])<<8 | int(clientHello[offset+1])
+	offset += 2
+	extEnd := offset + extTotalLen
+	if extEnd > len(clientHello) {
+		extEnd = len(clientHello)
+	}
+
+	for offset+4 <= extEnd {
+		extType := int(clientHello[offset])<<8 | int(clientHello[offset+1])
+		extLen := int(clientHello[offset+2])<<8 | int(clientHello[offset+3])
+		extDataStart := offset + 4
+
+		if extType == 0x0000 { // SNI extension
+			// SNI body: server_name_list_len(2) + name_type(1) + name_len(2) + name(name_len)
+			if extDataStart+5 > extEnd {
+				log.Debug("REALITY: SNI ext too short at offset %d", extDataStart)
+				return defaultSize
+			}
+			nameType := clientHello[extDataStart+2]
+			if nameType != 0x00 {
+				log.Debug("REALITY: SNI ext name_type=%d (not hostname)", nameType)
+				return defaultSize
+			}
+			nameLen := int(clientHello[extDataStart+3])<<8 | int(clientHello[extDataStart+4])
+			nameStart := extDataStart + 5
+			if nameStart+nameLen > extEnd {
+				log.Debug("REALITY: SNI name extends past buffer")
+				return defaultSize
+			}
+			mid := nameStart + nameLen/2
+			log.Debug("REALITY: SNI ext at offset %d, name at %d len=%d, splitting at mid=%d", offset, nameStart, nameLen, mid)
+			return mid
+		}
+
+		if extDataStart+extLen > extEnd {
+			break
+		}
+		offset = extDataStart + extLen
+	}
+
+	log.Debug("REALITY: SNI ext not found, using default fragment size %d", defaultSize)
+	return defaultSize
 }

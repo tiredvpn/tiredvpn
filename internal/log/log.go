@@ -36,6 +36,14 @@ var levelColors = map[Level]string{
 
 const colorReset = "\033[0m"
 
+// dedupState tracks the current run of identical log messages.
+type dedupState struct {
+	msg   string
+	level Level
+	count int // suppressed occurrences (not counting the first emitted one)
+	last  time.Time
+}
+
 // Logger provides structured logging with debug support
 type Logger struct {
 	mu       sync.Mutex
@@ -44,13 +52,22 @@ type Logger struct {
 	prefix   string
 	color    bool
 	showFile bool
+
+	// Dedup: suppress runs of identical messages.
+	// A "run" ends when a different message arrives or dedupWindow elapses
+	// since the last occurrence. Default window: 5 s. Enabled by default.
+	dedup        dedupState
+	dedupEnabled bool
+	dedupWindow  time.Duration
 }
 
 var defaultLogger = &Logger{
-	out:      os.Stderr,
-	level:    LevelInfo,
-	color:    true,
-	showFile: true,
+	out:          os.Stderr,
+	level:        LevelInfo,
+	color:        true,
+	showFile:     true,
+	dedupEnabled: true,
+	dedupWindow:  5 * time.Second,
 }
 
 // SetLevel sets global log level
@@ -69,10 +86,11 @@ func SetDebug(enabled bool) {
 	}
 }
 
-// SetOutput sets log output
+// SetOutput sets log output. Resets dedup state (new output = new context).
 func SetOutput(w io.Writer) {
 	defaultLogger.mu.Lock()
 	defaultLogger.out = w
+	defaultLogger.dedup = dedupState{}
 	defaultLogger.mu.Unlock()
 }
 
@@ -80,6 +98,19 @@ func SetOutput(w io.Writer) {
 func SetColor(enabled bool) {
 	defaultLogger.mu.Lock()
 	defaultLogger.color = enabled
+	defaultLogger.mu.Unlock()
+}
+
+// SetDedupWindow configures repeated-message suppression.
+// window=0 disables dedup entirely. Default is 5s (enabled).
+func SetDedupWindow(window time.Duration) {
+	defaultLogger.mu.Lock()
+	if window <= 0 {
+		defaultLogger.dedupEnabled = false
+	} else {
+		defaultLogger.dedupEnabled = true
+		defaultLogger.dedupWindow = window
+	}
 	defaultLogger.mu.Unlock()
 }
 
@@ -102,15 +133,41 @@ func (l *Logger) log(level Level, format string, args ...interface{}) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	now := time.Now().Format("15:04:05.000")
+	now := time.Now()
 	msg := fmt.Sprintf(format, args...)
 
-	// Get caller info
+	// Dedup: suppress identical consecutive messages within the window.
+	// When a different message arrives (or window expires), flush the suppressed count.
+	if l.dedupEnabled {
+		sameMsg := msg == l.dedup.msg
+		withinWindow := now.Sub(l.dedup.last) < l.dedupWindow
+
+		if sameMsg && withinWindow {
+			l.dedup.count++
+			l.dedup.last = now
+			return
+		}
+
+		// Flush pending count before emitting a new message.
+		if l.dedup.count > 0 {
+			l.emit(l.dedup.level, l.dedup.last,
+				fmt.Sprintf("... last message repeated %d more time(s)", l.dedup.count))
+		}
+
+		l.dedup = dedupState{msg: msg, level: level, count: 0, last: now}
+	}
+
+	l.emit(level, now, msg)
+}
+
+// emit writes a single line; caller must hold l.mu.
+func (l *Logger) emit(level Level, t time.Time, msg string) {
+	ts := t.Format("15:04:05.000")
+
 	var fileInfo string
 	if l.showFile && level == LevelDebug {
-		_, file, line, ok := runtime.Caller(2)
+		_, file, line, ok := runtime.Caller(3)
 		if ok {
-			// Shorten path
 			parts := strings.Split(file, "/")
 			if len(parts) > 2 {
 				file = strings.Join(parts[len(parts)-2:], "/")
@@ -126,13 +183,12 @@ func (l *Logger) log(level Level, format string, args ...interface{}) {
 
 	var output string
 	if l.color {
-		output = fmt.Sprintf("%s%s%s %s%s%s\n",
+		output = fmt.Sprintf("%s%s%s %s%s %s%s\n",
 			levelColors[level], levelNames[level], colorReset,
-			now, fileInfo,
-			fmt.Sprintf(" %s%s", prefix, msg))
+			ts, fileInfo, prefix, msg)
 	} else {
 		output = fmt.Sprintf("%s %s%s %s%s\n",
-			levelNames[level], now, fileInfo, prefix, msg)
+			levelNames[level], ts, fileInfo, prefix, msg)
 	}
 
 	l.out.Write([]byte(output))

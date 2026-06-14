@@ -1,15 +1,19 @@
 package server
 
 import (
-	"crypto/tls"
-	"errors"
+	"crypto/hmac"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"net"
 	"sync"
 	"time"
 
+	"github.com/xtaci/smux"
+
 	"github.com/tiredvpn/tiredvpn/internal/log"
+	"github.com/tiredvpn/tiredvpn/internal/protocol"
+	"github.com/tiredvpn/tiredvpn/internal/strategy"
 	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 )
 
@@ -35,13 +39,6 @@ func InitREALITYKeys() error {
 
 	log.Info("REALITY server keys initialized")
 	return nil
-}
-
-// GetREALITYPublicKey returns the server's public key
-func GetREALITYPublicKey() [32]byte {
-	realityKeyMu.RLock()
-	defer realityKeyMu.RUnlock()
-	return serverREALITYPubKey
 }
 
 // DetectREALITYExtension checks if the data contains a REALITY extension
@@ -113,19 +110,24 @@ func DetectREALITYExtension(data []byte) bool {
 		extLen := int(data[offset+2])<<8 | int(data[offset+3])
 		extDataStart := offset + 4
 
-		if extDataStart+extLen > extEnd {
-			log.Debug("DetectREALITY: extension 0x%04x at %d truncated (len=%d)", extType, offset, extLen)
-			break
-		}
-
-		// Padding extension type: 0x0015 with enough data for PubKey+AuthToken
+		// Padding extension type: 0x0015 with enough data for PubKey+AuthToken.
+		// Handle truncated extension body: DPI may drop the trailing random padding
+		// while the REALITY auth bytes (first 64 bytes of extension body) are still present.
 		if extType == customtls.PaddingExtensionType {
-			log.Debug("DetectREALITY: found padding ext at offset %d, len=%d (need %d)", offset, extLen, customtls.REALITYExtensionLength)
-
-			if extLen >= customtls.REALITYExtensionLength {
+			availableBody := extEnd - extDataStart
+			if availableBody > extLen {
+				availableBody = extLen
+			}
+			log.Debug("DetectREALITY: found padding ext at offset %d, declared_len=%d, available=%d (need %d)", offset, extLen, availableBody, customtls.REALITYExtensionLength)
+			if extLen >= customtls.REALITYExtensionLength && availableBody >= customtls.REALITYExtensionLength {
 				log.Debug("DetectREALITY: candidate REALITY padding found (auth verified per-connection in handler)")
 				return true
 			}
+		}
+
+		if extDataStart+extLen > extEnd {
+			log.Debug("DetectREALITY: extension 0x%04x at %d truncated (len=%d), stopping walk", extType, offset, extLen)
+			break
 		}
 
 		offset = extDataStart + extLen
@@ -286,13 +288,81 @@ func HandleREALITYConnection(conn net.Conn, srvCtx *serverContext, logger *log.L
 	// Close connection to real destination (we only needed the certificate)
 	destConn.Close()
 
-	// Generate stable clientID from REALITY public key for TUN IP tracking
-	clientID := fmt.Sprintf("reality:%x", realityExt.PubKey[:8])
+	// Derive stable clientID from the shared secret — same user reconnects with the same secret,
+	// so gets the same clientID and same IP from the pool.
+	mac := hmac.New(sha256.New, usedSecret)
+	mac.Write([]byte("tiredvpn-client-id-v1"))
+	clientID := fmt.Sprintf("reality:%x", mac.Sum(nil)[:8])
 
 	logger.Info("REALITY: Tunnel established for %s (client: %s)", conn.RemoteAddr(), clientID)
 
-	// Handle VPN tunnel (similar to raw tunnel handler)
-	handleRawTunnel(conn, srvCtx, logger, clientID)
+	// Read negotiation byte: TypeMux (0x08) → smux session, anything else → legacy raw tunnel.
+	var negBuf [1]byte
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	_, err = io.ReadFull(conn, negBuf[:])
+	conn.SetReadDeadline(time.Time{})
+	if err != nil {
+		logger.Debug("REALITY: Failed to read negotiation byte: %v", err)
+		return
+	}
+
+	if negBuf[0] == protocol.TypeMux {
+		logger.Debug("REALITY: Client requested smux multiplexing")
+		handleREALITYMuxSession(conn, srvCtx, logger, clientID, usedSecret, realityExt.PubKey)
+		return
+	}
+
+	// Legacy mode: prepend the peeked byte and handle as raw tunnel.
+	handleRawTunnel(&realityPrependConn{Conn: conn, first: negBuf[0]}, srvCtx, logger, clientID)
+}
+
+// realityPrependConn is a net.Conn that prepends a single already-read byte to the first Read call.
+type realityPrependConn struct {
+	net.Conn
+	first byte
+	used  bool
+}
+
+func (c *realityPrependConn) Read(b []byte) (int, error) {
+	if !c.used {
+		c.used = true
+		if len(b) == 0 {
+			return 0, nil
+		}
+		b[0] = c.first
+		return 1, nil
+	}
+	return c.Conn.Read(b)
+}
+
+// handleREALITYMuxSession runs a smux server over the post-auth REALITY connection.
+// Each stream is handled as an independent raw tunnel request.
+// usedSecret and clientPubKey are used to wrap the connection in the same
+// chacha20-over-TLS-record framing that the client uses after its TypeMux write.
+func handleREALITYMuxSession(conn net.Conn, srvCtx *serverContext, logger *log.Logger, clientID string, usedSecret []byte, clientPubKey [32]byte) {
+	// Mirror the client-side wrap: server is !isClient so write/read keys are reversed.
+	dataConn, err := strategy.NewRealityDataConn(conn, usedSecret, clientPubKey[:], false)
+	if err != nil {
+		logger.Error("REALITY: data conn init failed: %v", err)
+		return
+	}
+
+	sess, err := smux.Server(dataConn, smux.DefaultConfig())
+	if err != nil {
+		logger.Error("REALITY: smux server create failed: %v", err)
+		return
+	}
+	defer sess.Close()
+
+	logger.Debug("REALITY: smux session started")
+	for {
+		stream, err := sess.AcceptStream()
+		if err != nil {
+			logger.Debug("REALITY: smux session closed: %v", err)
+			return
+		}
+		go handleRawTunnel(stream, srvCtx, logger, clientID)
+	}
 }
 
 // handleREALITYUnauthorized proxies unauthorized REALITY clients to the configured
@@ -359,93 +429,3 @@ func sendTLSAlert(conn net.Conn, alertCode byte) {
 	conn.Write(alert)
 }
 
-// ValidateREALITYDestination checks if a destination is reachable
-func ValidateREALITYDestination(dest string, timeout time.Duration) error {
-	conn, err := net.DialTimeout("tcp", dest, timeout)
-	if err != nil {
-		return err
-	}
-	conn.Close()
-	return nil
-}
-
-// REALITYStats tracks REALITY protocol statistics
-type REALITYStats struct {
-	mu                  sync.RWMutex
-	TotalConnections    uint64
-	AuthorizedTunnels   uint64
-	UnauthorizedProxies uint64
-	DestinationErrors   uint64
-	LastSuccess         time.Time
-	LastFailure         time.Time
-}
-
-var globalREALITYStats = &REALITYStats{}
-
-// RecordREALITYSuccess records a successful REALITY tunnel establishment
-func RecordREALITYSuccess() {
-	globalREALITYStats.mu.Lock()
-	defer globalREALITYStats.mu.Unlock()
-
-	globalREALITYStats.TotalConnections++
-	globalREALITYStats.AuthorizedTunnels++
-	globalREALITYStats.LastSuccess = time.Now()
-}
-
-// RecordREALITYUnauthorized records an unauthorized proxy session
-func RecordREALITYUnauthorized() {
-	globalREALITYStats.mu.Lock()
-	defer globalREALITYStats.mu.Unlock()
-
-	globalREALITYStats.TotalConnections++
-	globalREALITYStats.UnauthorizedProxies++
-}
-
-// RecordREALITYDestError records a destination connection failure
-func RecordREALITYDestError() {
-	globalREALITYStats.mu.Lock()
-	defer globalREALITYStats.mu.Unlock()
-
-	globalREALITYStats.TotalConnections++
-	globalREALITYStats.DestinationErrors++
-	globalREALITYStats.LastFailure = time.Now()
-}
-
-// GetREALITYStats returns current statistics
-func GetREALITYStats() REALITYStats {
-	globalREALITYStats.mu.RLock()
-	defer globalREALITYStats.mu.RUnlock()
-	return REALITYStats{
-		TotalConnections:    globalREALITYStats.TotalConnections,
-		AuthorizedTunnels:   globalREALITYStats.AuthorizedTunnels,
-		UnauthorizedProxies: globalREALITYStats.UnauthorizedProxies,
-		DestinationErrors:   globalREALITYStats.DestinationErrors,
-		LastSuccess:         globalREALITYStats.LastSuccess,
-		LastFailure:         globalREALITYStats.LastFailure,
-	}
-}
-
-// VerifyREALITYCertificate validates that the destination certificate matches expected SNI
-func VerifyREALITYCertificate(conn *tls.Conn, expectedSNI string) error {
-	state := conn.ConnectionState()
-
-	if len(state.PeerCertificates) == 0 {
-		return errors.New("no peer certificates")
-	}
-
-	cert := state.PeerCertificates[0]
-
-	// Verify DNSNames
-	for _, name := range cert.DNSNames {
-		if name == expectedSNI {
-			return nil
-		}
-	}
-
-	// Verify Subject Common Name
-	if cert.Subject.CommonName == expectedSNI {
-		return nil
-	}
-
-	return fmt.Errorf("certificate does not match SNI %s", expectedSNI)
-}
