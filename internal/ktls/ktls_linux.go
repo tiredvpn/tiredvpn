@@ -323,6 +323,17 @@ func Enable(tlsConn *tls.Conn) *Conn {
 			break
 		}
 
+		// Prefer an explicit NetConn() net.Conn accessor when the wrapper
+		// exposes one (e.g. evasion.FragmentedWriter). This covers wrappers
+		// whose underlying conn lives in an unexported field, which the
+		// embedded-field reflection below cannot reach.
+		if u, ok := netConn.(interface{ NetConn() net.Conn }); ok {
+			if inner := u.NetConn(); inner != nil && inner != netConn {
+				netConn = inner
+				continue
+			}
+		}
+
 		// Check if it's a wrapper with embedded net.Conn
 		v := reflect.ValueOf(netConn)
 		if v.Kind() == reflect.Pointer {

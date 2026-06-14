@@ -9,6 +9,18 @@ import (
 	"golang.org/x/crypto/curve25519"
 )
 
+// computeSharedSecret derives the X25519 shared secret. Defined here because
+// the production code no longer exposes this helper (it is only needed in tests).
+func computeSharedSecret(privKey, peerPubKey [32]byte) ([32]byte, error) {
+	out, err := curve25519.X25519(privKey[:], peerPubKey[:])
+	if err != nil {
+		return [32]byte{}, err
+	}
+	var shared [32]byte
+	copy(shared[:], out)
+	return shared, nil
+}
+
 func TestGenerateX25519KeyPair(t *testing.T) {
 	privKey, pubKey, err := GenerateX25519KeyPair()
 	if err != nil {
@@ -39,12 +51,12 @@ func TestComputeSharedSecret(t *testing.T) {
 	bobPriv, bobPub, _ := GenerateX25519KeyPair()
 
 	// Compute shared secrets
-	aliceShared, err := ComputeSharedSecret(alicePriv, bobPub)
+	aliceShared, err := computeSharedSecret(alicePriv, bobPub)
 	if err != nil {
 		t.Fatalf("Alice shared secret computation failed: %v", err)
 	}
 
-	bobShared, err := ComputeSharedSecret(bobPriv, alicePub)
+	bobShared, err := computeSharedSecret(bobPriv, alicePub)
 	if err != nil {
 		t.Fatalf("Bob shared secret computation failed: %v", err)
 	}
@@ -182,8 +194,8 @@ func TestClientServerAuthFlow(t *testing.T) {
 	}
 
 	// Both compute shared secret
-	clientShared, _ := ComputeSharedSecret(clientPriv, serverPub)
-	serverShared, _ := ComputeSharedSecret(serverPriv, clientPub)
+	clientShared, _ := computeSharedSecret(clientPriv, serverPub)
+	serverShared, _ := computeSharedSecret(serverPriv, clientPub)
 
 	if !bytes.Equal(clientShared[:], serverShared[:]) {
 		t.Error("Shared secrets do not match")
@@ -191,16 +203,8 @@ func TestClientServerAuthFlow(t *testing.T) {
 }
 
 func TestREALITYExtensionConstants(t *testing.T) {
-	if REALITYExtensionType != 0xFF01 {
-		t.Errorf("REALITYExtensionType = 0x%04X, want 0xFF01", REALITYExtensionType)
-	}
-
 	if REALITYMagic != "REAL" {
 		t.Errorf("REALITYMagic = %q, want %q", REALITYMagic, "REAL")
-	}
-
-	if REALITYVersion != 0x01 {
-		t.Errorf("REALITYVersion = 0x%02X, want 0x01", REALITYVersion)
 	}
 
 	expectedLen := 32 + 32 // pubkey + auth token (no magic, no version)
@@ -226,6 +230,41 @@ func TestHMACAuthTokenConsistency(t *testing.T) {
 	}
 }
 
+// TestVerifyClientAuthGrace verifies the blast-radius-min T1 invariant: the
+// auth-token grace window is exactly +-1 bucket. Tokens minted for the current
+// bucket and for the immediately adjacent buckets (offset -1 and +1) must pass;
+// tokens two buckets away (offset -2 and +2) must be rejected.
+//
+// generateAuthTokenAtBucket is package-private but reachable from this in-package
+// test, so we mint tokens at precise offsets without mocking time.
+func TestVerifyClientAuthGrace(t *testing.T) {
+	secret := []byte("grace-window-secret")
+	var pubKey [32]byte
+	copy(pubKey[:], "grace-pubkey-32-bytes-fixed-val!")
+
+	cases := []struct {
+		name   string
+		offset int64
+		want   bool
+	}{
+		{"offset 0 (now)", 0, true},
+		{"offset -1 (previous bucket)", -1, true},
+		{"offset +1 (next bucket)", 1, true},
+		{"offset -2 (too old)", -2, false},
+		{"offset +2 (too new)", 2, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			token := generateAuthTokenAtBucket(secret, pubKey, tc.offset)
+			got := VerifyClientAuth(secret, pubKey, token)
+			if got != tc.want {
+				t.Errorf("VerifyClientAuth with bucketOffset=%d = %v, want %v", tc.offset, got, tc.want)
+			}
+		})
+	}
+}
+
 func BenchmarkGenerateX25519KeyPair(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		GenerateX25519KeyPair()
@@ -238,7 +277,7 @@ func BenchmarkComputeSharedSecret(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		ComputeSharedSecret(privKey, pubKey)
+		computeSharedSecret(privKey, pubKey)
 	}
 }
 

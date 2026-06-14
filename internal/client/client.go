@@ -81,7 +81,7 @@ type Config struct {
 
 	// QUIC transport
 	QUICEnabled bool // Enable QUIC strategy
-	QUICPort    int  // QUIC server port (default 443)
+	QUICPort    int  // QUIC server port (default 8443)
 
 	// RTT Masking
 	RTTMaskingEnabled bool   // Enable RTT masking

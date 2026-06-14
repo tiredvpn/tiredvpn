@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
-	"math/big"
 	mathrand "math/rand"
 	"sync"
 	"time"
@@ -56,7 +55,7 @@ func NewPortHopper(config *Config) (*PortHopper, error) {
 	}
 
 	// Initialize RNG based on seed
-	if config.Seed != nil && len(config.Seed) > 0 {
+	if len(config.Seed) > 0 {
 		// Deterministic RNG from seed for client-server sync
 		h := sha256.Sum256(config.Seed)
 		seed := int64(binary.BigEndian.Uint64(h[:8]))
@@ -162,10 +161,7 @@ func (ph *PortHopper) Stats() Stats {
 	ph.mu.RLock()
 	defer ph.mu.RUnlock()
 
-	timeUntilHop := ph.jitteredInterval - time.Since(ph.lastHop)
-	if timeUntilHop < 0 {
-		timeUntilHop = 0
-	}
+	timeUntilHop := max(ph.jitteredInterval-time.Since(ph.lastHop), 0)
 
 	return Stats{
 		Enabled:          ph.config.Enabled,
@@ -198,7 +194,7 @@ func (ph *PortHopper) Reset() {
 	ph.fibCurr = 1
 
 	// Reset RNG to initial state if using deterministic seed
-	if ph.config.Seed != nil && len(ph.config.Seed) > 0 {
+	if len(ph.config.Seed) > 0 {
 		h := sha256.Sum256(ph.config.Seed)
 		seed := int64(binary.BigEndian.Uint64(h[:8]))
 		ph.rng = mathrand.New(mathrand.NewSource(seed))
@@ -214,6 +210,24 @@ func (ph *PortHopper) Reset() {
 // calculateNextPort computes the next port based on strategy
 // Must be called with lock held
 func (ph *PortHopper) calculateNextPort() int {
+	// Skip ReservedPort443: it collides with the fixed default connection
+	// listener. Loop until we land on a non-reserved port. Bounded by range
+	// size + 1 to avoid spinning when the range is a single reserved port.
+	//
+	// For StrategySequential, calculateNextPortRaw advances from ph.currentPort,
+	// so we move currentPort forward on each skip to keep the sequence walking
+	// instead of re-returning the same reserved port.
+	port := ph.calculateNextPortRaw()
+	for attempts := 0; port == ReservedPort443 && attempts <= ph.config.PortRange(); attempts++ {
+		ph.currentPort = port
+		port = ph.calculateNextPortRaw()
+	}
+	return port
+}
+
+// calculateNextPortRaw computes the next port for the configured strategy
+// without filtering reserved ports. Must be called with lock held.
+func (ph *PortHopper) calculateNextPortRaw() int {
 	rangeSize := ph.config.PortRangeEnd - ph.config.PortRangeStart + 1
 
 	switch ph.config.Strategy {
@@ -262,19 +276,6 @@ func (ph *PortHopper) randomizeInterval() time.Duration {
 	// Apply jitter: -30% to +30%
 	jitterFactor := 0.7 + ph.rng.Float64()*0.6 // 0.7 to 1.3
 	return time.Duration(float64(base) * jitterFactor)
-}
-
-// cryptoRandomInt returns a cryptographically random int in [0, n)
-func cryptoRandomInt(n int) int {
-	if n <= 0 {
-		return 0
-	}
-	nBig, err := rand.Int(rand.Reader, big.NewInt(int64(n)))
-	if err != nil {
-		// Fallback to time-based random
-		return int(time.Now().UnixNano() % int64(n))
-	}
-	return int(nBig.Int64())
 }
 
 // Stats contains port hopper statistics

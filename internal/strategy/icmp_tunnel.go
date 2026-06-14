@@ -378,6 +378,28 @@ func (c *icmpTunnelConn) parseHandshakeReply(data []byte) error {
 		return fmt.Errorf("unsupported version: %d", version)
 	}
 
+	// Parse header to extract sessionID and replySeq for nonce construction.
+	header := ParseTunnelHeader(echo.Data[:TunnelHeaderSize])
+
+	// Verify this reply belongs to our session.
+	if header.SessionID != c.sessionID {
+		return fmt.Errorf("handshake: session ID mismatch")
+	}
+
+	// Decrypt the reply payload using recvCipher to prove server knows the shared secret.
+	// Any host's kernel can echo ICMP with the same plaintext payload, but only a server
+	// with the correct key can produce a valid ciphertext that passes AEAD authentication.
+	// Nonce: [sessionID:4][zeros:12][replySeq:8]
+	nonce := make([]byte, 24)
+	binary.BigEndian.PutUint32(nonce[0:], header.SessionID)
+	binary.BigEndian.PutUint64(nonce[16:], uint64(header.PacketSeq))
+
+	encrypted := echo.Data[TunnelHeaderSize:]
+	headerBytes := echo.Data[:TunnelHeaderSize]
+	if _, err := c.recvCipher.Open(nil, nonce, encrypted, headerBytes); err != nil {
+		return errors.New("handshake: server auth failed")
+	}
+
 	return nil
 }
 
@@ -399,9 +421,12 @@ func (c *icmpTunnelConn) buildPacket(data []byte, flags uint8) ([]byte, error) {
 	headerBytes := SerializeTunnelHeader(header)
 
 	// Nonce: [sessionID:4][zeros:12][seq:8] - sessionID prevents nonce reuse across sessions
+	// Use uint64(uint32(seq)) to keep sender and receiver nonces in sync: PacketSeq in the
+	// header is uint32, so recvLoop reconstructs nonce[16:] from uint64(header.PacketSeq).
+	// Without the cast, sender and receiver would diverge after 2^32 packets.
 	nonce := make([]byte, 24) // XChaCha20 uses 24-byte nonce
 	binary.BigEndian.PutUint32(nonce[0:], c.sessionID)
-	binary.BigEndian.PutUint64(nonce[16:], seq)
+	binary.BigEndian.PutUint64(nonce[16:], uint64(uint32(seq)))
 
 	// Encrypt with c2s direction key.
 	encrypted := c.sendCipher.Seal(nil, nonce, data, headerBytes)
@@ -490,6 +515,7 @@ func (c *icmpTunnelConn) sendLoop() {
 // recvLoop handles incoming packets
 func (c *icmpTunnelConn) recvLoop() {
 	buf := make([]byte, 1500)
+	consecutiveErrors := 0
 
 	for {
 		select {
@@ -504,13 +530,18 @@ func (c *icmpTunnelConn) recvLoop() {
 			if c.closed.Load() {
 				return
 			}
-			// Timeout is OK, continue
+			// Timeout is OK, continue without counting against error budget
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue
 			}
+			consecutiveErrors++
 			log.Debug("ICMP Tunnel: recv error: %v", err)
+			if consecutiveErrors >= 5 {
+				time.Sleep(100 * time.Millisecond)
+			}
 			continue
 		}
+		consecutiveErrors = 0
 
 		// Verify sender
 		if peer.String() != c.serverIP.String() {

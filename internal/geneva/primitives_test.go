@@ -50,7 +50,7 @@ func createTestPacket() []byte {
 }
 
 func TestDropPrimitive(t *testing.T) {
-	drop := NewDropPrimitive()
+	drop := &DropPrimitive{}
 
 	packet := createTestPacket()
 	result, err := drop.Apply(packet)
@@ -69,7 +69,7 @@ func TestDropPrimitive(t *testing.T) {
 }
 
 func TestSendPrimitive(t *testing.T) {
-	send := NewSendPrimitive()
+	send := &SendPrimitive{}
 
 	packet := createTestPacket()
 	result, err := send.Apply(packet)
@@ -363,11 +363,10 @@ func TestIPChecksumRecalculation(t *testing.T) {
 }
 
 func BenchmarkDropPrimitive(b *testing.B) {
-	drop := NewDropPrimitive()
+	drop := &DropPrimitive{}
 	packet := createTestPacket()
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		drop.Apply(packet)
 	}
 }
@@ -376,8 +375,7 @@ func BenchmarkDuplicatePrimitive(b *testing.B) {
 	dup := NewDuplicatePrimitive(2)
 	packet := createTestPacket()
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		dup.Apply(packet)
 	}
 }
@@ -386,8 +384,7 @@ func BenchmarkTamperFlags(b *testing.B) {
 	tamper := NewTamperPrimitive("flags", uint8(TCPFlagRST))
 	packet := createTestPacket()
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		tamper.Apply(packet)
 	}
 }
@@ -396,8 +393,7 @@ func BenchmarkFragmentPrimitive(b *testing.B) {
 	frag := NewFragmentPrimitive(10, 0)
 	packet := createTestPacket()
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		frag.Apply(packet)
 	}
 }

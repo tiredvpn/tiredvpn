@@ -315,19 +315,13 @@ func (p *IPPool) Allocate(clientID string, requestedIP net.IP, hostname string) 
 			Static:   false,
 		}
 
-		// For clients with Redis secret (clientID != ""), assign permanent IP
-		// This prevents pool exhaustion on frequent reconnects
-		if clientID != "" && p.redis != nil {
-			// Permanent lease - never expires
-			lease.ExpiresAt = time.Time{} // zero time = permanent
-			log.Info("Allocated permanent IP %s to Redis client %s", ipStr, clientID)
+		// Dynamic leases always carry a TTL so CleanupExpired can reclaim them.
+		if p.config.LeaseTime > 0 {
+			lease.ExpiresAt = time.Now().Add(p.config.LeaseTime)
 		} else {
-			// Legacy behavior: temporary lease
-			if p.config.LeaseTime > 0 {
-				lease.ExpiresAt = time.Now().Add(p.config.LeaseTime)
-			}
-			log.Info("Allocated temporary IP %s to client %s", ipStr, clientID)
+			lease.ExpiresAt = time.Now().Add(24 * time.Hour)
 		}
+		log.Info("Allocated IP %s to client %s", ipStr, clientID)
 
 		if err := p.saveLease(lease); err != nil {
 			return nil, err
@@ -351,13 +345,6 @@ func (p *IPPool) Release(ip net.IP) {
 			return
 		}
 
-		// Don't release permanent leases (Redis clients with secrets)
-		// These clients need the same IP on reconnect
-		if lease.ClientID != "" && p.redis != nil && lease.ExpiresAt.IsZero() {
-			log.Debug("Not releasing permanent IP %s for Redis client %s", ipStr, lease.ClientID)
-			return
-		}
-
 		p.deleteLease(ipStr)
 		log.Info("Released IP %s", ipStr)
 	}
@@ -373,12 +360,6 @@ func (p *IPPool) ReleaseByClient(clientID string) {
 			// Don't release static assignments
 			if lease.Static {
 				log.Debug("Not releasing static IP %s for client %s", ipStr, clientID)
-				return
-			}
-
-			// Don't release permanent leases (Redis clients)
-			if clientID != "" && p.redis != nil && lease.ExpiresAt.IsZero() {
-				log.Debug("Not releasing permanent IP %s for Redis client %s", ipStr, clientID)
 				return
 			}
 

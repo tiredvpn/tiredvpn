@@ -23,16 +23,16 @@ const (
 	// Padding extension type (RFC 7685) - used to hide REALITY data
 	PaddingExtensionType = 0x0015
 
-	// Legacy extension type (for postquantum V2 path)
-	REALITYExtensionType = 0xFF01
-
-	// REALITYMagic and REALITYVersion are used only by the postquantum V2 path.
+	// REALITYMagic is used only by the postquantum V2 path.
 	// V1 format contains no magic markers - just PubKey+AuthToken at a fixed offset.
-	REALITYMagic   = "REAL"
-	REALITYVersion = 0x01
+	REALITYMagic = "REAL"
 
 	REALITYExtensionLength = 32 + 32 // pubkey + auth token (no magic, no version)
 	MinPaddingSize         = 256     // minimum padding size for REALITY data + random
+
+	// authTokenGraceBuckets is the number of adjacent 5-minute buckets accepted
+	// on each side of the current one in VerifyClientAuth, to tolerate clock skew.
+	authTokenGraceBuckets = 1
 )
 
 // REALITYExtension carries client credentials hidden inside TLS padding extension.
@@ -101,19 +101,25 @@ func (e *REALITYExtension) Unmarshal(data []byte) error {
 // Accepts tokens from the current 5-minute bucket and the adjacent ones to
 // tolerate clock skew between client and server.
 func VerifyClientAuth(secret []byte, clientPubKey [32]byte, authToken [32]byte) bool {
-	now := time.Now().Unix() / 300
-	for _, delta := range []int64{0, -1, 1} {
-		expected := authTokenAtBucket(secret, clientPubKey, now+delta)
+	// Check the current bucket first, then the grace buckets on either side.
+	offsets := []int64{0}
+	for g := int64(1); g <= authTokenGraceBuckets; g++ {
+		offsets = append(offsets, -g, g)
+	}
+	for _, offset := range offsets {
+		expected := generateAuthTokenAtBucket(secret, clientPubKey, offset)
 		if hmac.Equal(authToken[:], expected[:]) {
 			return true
 		}
 	}
-	log.Debug("REALITY-AUTH: token mismatch (checked buckets %d..%d)", now-1, now+1)
+	log.Debug("REALITY-AUTH: token mismatch (grace +-%d buckets)", authTokenGraceBuckets)
 	return false
 }
 
-// authTokenAtBucket computes the token for an explicit time bucket.
-func authTokenAtBucket(secret []byte, clientPubKey [32]byte, bucket int64) [32]byte {
+// generateAuthTokenAtBucket computes HMAC-SHA256(secret, pubKey || timestamp_bucket)
+// for the bucket offset by bucketOffset from the current 5-minute bucket.
+func generateAuthTokenAtBucket(secret []byte, clientPubKey [32]byte, bucketOffset int64) [32]byte {
+	bucket := (time.Now().Unix() / 300) + bucketOffset
 	h := hmac.New(sha256.New, secret)
 	h.Write(clientPubKey[:])
 	var tsBuf [8]byte
@@ -135,10 +141,11 @@ func VerifyServerAuth(secret, clientPubKey []byte, authToken [32]byte) bool {
 	return hmac.Equal(expected, authToken[:])
 }
 
-// generateAuthToken creates HMAC-SHA256(secret, pubKey || timestamp_bucket).
-// Binding to pubKey makes the token unique per connection and unreplayable.
+// generateAuthToken creates HMAC-SHA256(secret, pubKey || timestamp_bucket) for
+// the current 5-minute bucket. Binding to pubKey makes the token unique per
+// connection. It is a thin wrapper over generateAuthTokenAtBucket with offset 0.
 func generateAuthToken(secret []byte, clientPubKey [32]byte) [32]byte {
-	return authTokenAtBucket(secret, clientPubKey, time.Now().Unix()/300)
+	return generateAuthTokenAtBucket(secret, clientPubKey, 0)
 }
 
 // GenerateX25519KeyPair generates a new X25519 key pair
@@ -149,13 +156,6 @@ func GenerateX25519KeyPair() (privKey, pubKey [32]byte, err error) {
 
 	curve25519.ScalarBaseMult(&pubKey, &privKey)
 	return privKey, pubKey, nil
-}
-
-// ComputeSharedSecret derives shared secret from X25519 key exchange
-func ComputeSharedSecret(privKey, peerPubKey [32]byte) ([32]byte, error) {
-	var sharedSecret [32]byte
-	curve25519.ScalarMult(&sharedSecret, &privKey, &peerPubKey)
-	return sharedSecret, nil
 }
 
 // InjectREALITYIntoPadding finds padding extension in ClientHello and injects REALITY data

@@ -138,11 +138,13 @@ func ExtractREALITYExtensionFromClientHello(data []byte) (*customtls.REALITYExte
 	extensionsLen := int(binary.BigEndian.Uint16(payload[offset:]))
 	offset += 2
 
-	if offset+extensionsLen > len(payload) {
-		return nil, errors.New("invalid extensions length")
+	extEnd := offset + extensionsLen
+	if extEnd > len(payload) {
+		// DPI may have dropped trailing bytes; search through whatever arrived.
+		extEnd = len(payload)
 	}
 
-	extensions := payload[offset : offset+extensionsLen]
+	extensions := payload[offset:extEnd]
 
 	// Search for REALITY extension (0xFF01)
 	return findREALITYExtension(extensions)
@@ -157,18 +159,25 @@ func findREALITYExtension(extensions []byte) (*customtls.REALITYExtension, error
 		extLen := int(binary.BigEndian.Uint16(extensions[offset+2:]))
 		offset += 4
 
-		if offset+extLen > len(extensions) {
-			return nil, errors.New("invalid extension length")
+		available := len(extensions) - offset
+		// Check padding extension BEFORE the truncation break; DPI may have
+		// dropped trailing random padding while leaving the 64-byte auth data intact.
+		if extType == customtls.PaddingExtensionType {
+			if extLen >= customtls.REALITYExtensionLength && available >= customtls.REALITYExtensionLength {
+				bodyLen := available
+				if bodyLen > extLen {
+					bodyLen = extLen
+				}
+				ext, err := customtls.ExtractREALITYFromPadding(extensions[offset : offset+bodyLen])
+				if err != nil {
+					return nil, err
+				}
+				return ext, nil
+			}
 		}
 
-		// Search for REALITY in padding extension (0x0015) - no magic, just size check
-		if extType == customtls.PaddingExtensionType && extLen >= customtls.REALITYExtensionLength {
-			extData := extensions[offset : offset+extLen]
-			ext, err := customtls.ExtractREALITYFromPadding(extData)
-			if err != nil {
-				return nil, err
-			}
-			return ext, nil
+		if offset+extLen > len(extensions) {
+			return nil, errors.New("reality extension not found (truncated before padding ext)")
 		}
 
 		offset += extLen

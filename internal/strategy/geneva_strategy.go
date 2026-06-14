@@ -9,15 +9,20 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/tiredvpn/tiredvpn/internal/capabilities"
 	"github.com/tiredvpn/tiredvpn/internal/geneva"
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/padding"
 )
 
 // GenevaStrategy applies Geneva-style packet manipulation to evade DPI
-// It works by fragmenting the TLS ClientHello during connection establishment
+// It works by fragmenting the TLS ClientHello during connection establishment.
+// On Linux with CAP_NET_ADMIN it also wires up an NFQUEUE Injector that
+// intercepts raw outgoing packets and applies the same strategies at the
+// kernel level, which is more reliable than application-layer fragmentation.
 type GenevaStrategy struct {
 	manager    *Manager // Reference to Manager for IPv6/IPv4 support
 	serverAddr string   // Deprecated: use manager.GetServerAddr() instead
@@ -26,6 +31,11 @@ type GenevaStrategy struct {
 	strategies []*geneva.Strategy
 	wsHost     string
 	wsPath     string
+
+	// NFQUEUE injector — started once on first Connect(), stopped via Close().
+	injector     *geneva.Injector
+	injectorOnce sync.Once
+	injectorStop context.CancelFunc
 }
 
 // NewGenevaStrategy creates a new Geneva strategy for a specific country
@@ -83,10 +93,51 @@ func (g *GenevaStrategy) Description() string {
 		g.country, count, strings.Join(rates, ", "))
 }
 
+// startInjector brings up the NFQUEUE Injector on Linux when CAP_NET_ADMIN is
+// available. It is called lazily on the first Connect() via sync.Once so that
+// the cost is paid only when the strategy is actually used.
+func (g *GenevaStrategy) startInjector() {
+	g.injectorOnce.Do(func() {
+		caps := capabilities.Probe()
+		if !caps.HasNetAdmin {
+			log.Debug("Geneva: skipping NFQUEUE injector — CAP_NET_ADMIN not available (%s)", caps)
+			return
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		inj := geneva.NewInjector(0, g.strategies)
+		if err := inj.Start(ctx); err != nil {
+			cancel()
+			log.Debug("Geneva: NFQUEUE injector failed to start: %v", err)
+			return
+		}
+
+		g.injector = inj
+		g.injectorStop = cancel
+	})
+}
+
+// Close stops the NFQUEUE injector and releases its resources.
+// It is safe to call multiple times.
+func (g *GenevaStrategy) Close() {
+	if g.injectorStop != nil {
+		g.injectorStop()
+		g.injectorStop = nil
+	}
+	if g.injector != nil {
+		g.injector.Stop()
+		g.injector = nil
+	}
+}
+
 // Connect establishes connection using Geneva-style TCP fragmentation
 // The key insight: fragment the TLS ClientHello at TCP level BEFORE TLS negotiation
 func (g *GenevaStrategy) Connect(ctx context.Context, target string) (net.Conn, error) {
 	log.Debug("Geneva: Connecting to %s using %s strategies", target, g.country)
+
+	// Start the NFQUEUE injector on the first connection attempt.
+	// On non-Linux or without CAP_NET_ADMIN this is a cheap no-op.
+	g.startInjector()
 
 	// Step 1: Get server address (IPv6/IPv4 with automatic fallback)
 	serverAddr := g.manager.GetServerAddr(ctx)

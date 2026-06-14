@@ -1,6 +1,17 @@
 package porthopping
 
-import "time"
+import (
+	"time"
+
+	"github.com/tiredvpn/tiredvpn/internal/log"
+)
+
+// ReservedPort443 is the standard HTTPS port. Port hopping deliberately avoids
+// it: the default connection port (without hopping) already lives on 443/8443,
+// and a hopper landing on 443 would collide with that fixed listener. The
+// default range (47000-65535) excludes 443 by design; this constant guards
+// against custom ranges that include it.
+const ReservedPort443 = 443
 
 // Strategy defines the port hopping algorithm
 type Strategy string
@@ -73,6 +84,14 @@ func (c *Config) Validate() error {
 		// Valid strategies
 	default:
 		return ErrInvalidStrategy
+	}
+
+	// 443 must not be part of the hopping range: it overlaps the fixed default
+	// connection port. Warn instead of failing - the hopper itself skips 443
+	// (see calculateNextPort), so this is recoverable, just unexpected.
+	if c.PortRangeStart <= ReservedPort443 && c.PortRangeEnd >= ReservedPort443 {
+		log.Warn("port hopping range %d-%d includes reserved port %d; it will be skipped during hopping",
+			c.PortRangeStart, c.PortRangeEnd, ReservedPort443)
 	}
 
 	return nil

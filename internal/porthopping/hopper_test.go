@@ -60,7 +60,7 @@ func TestPortHopperRandom(t *testing.T) {
 	}
 
 	ports := make(map[int]bool)
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		port := hopper.NextPort()
 		if port < config.PortRangeStart || port > config.PortRangeEnd {
 			t.Errorf("port %d outside range [%d, %d]",
@@ -90,7 +90,7 @@ func TestPortHopperSequential(t *testing.T) {
 	firstPort := hopper.CurrentPort()
 
 	// Test sequential increment
-	for i := 0; i < 15; i++ {
+	for i := range 15 {
 		port := hopper.NextPort()
 		expectedPort := config.PortRangeStart + ((firstPort - config.PortRangeStart + i + 1) % (config.PortRangeEnd - config.PortRangeStart + 1))
 
@@ -112,7 +112,7 @@ func TestPortHopperFibonacci(t *testing.T) {
 	}
 
 	ports := make([]int, 20)
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		ports[i] = hopper.NextPort()
 		if ports[i] < config.PortRangeStart || ports[i] > config.PortRangeEnd {
 			t.Errorf("fibonacci port %d outside range", ports[i])
@@ -153,7 +153,7 @@ func TestPortHopperSeedDeterminism(t *testing.T) {
 	}
 
 	// With same seed, should produce same sequence
-	for i := 0; i < 50; i++ {
+	for i := range 50 {
 		port1 := hopper1.NextPort()
 		port2 := hopper2.NextPort()
 
@@ -209,7 +209,7 @@ func TestPortHopperDisabled(t *testing.T) {
 	}
 
 	// NextPort should return same port when disabled
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		port := hopper.NextPort()
 		if port != initialPort {
 			t.Errorf("disabled hopper changed port from %d to %d", initialPort, port)
@@ -223,7 +223,7 @@ func TestPortHopperJitter(t *testing.T) {
 
 	intervals := make([]time.Duration, 100)
 
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		hopper, err := NewPortHopper(config)
 		if err != nil {
 			t.Fatalf("failed to create hopper: %v", err)
@@ -330,7 +330,7 @@ func TestPortHopperStats(t *testing.T) {
 	}
 
 	// Perform some hops
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		hopper.NextPort()
 	}
 
@@ -352,7 +352,7 @@ func TestPortHopperReset(t *testing.T) {
 	initialPort := hopper.CurrentPort()
 
 	// Perform some hops
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		hopper.NextPort()
 	}
 
@@ -386,11 +386,9 @@ func TestPortHopperConcurrency(t *testing.T) {
 	var wg sync.WaitGroup
 	numGoroutines := 100
 
-	for i := 0; i < numGoroutines; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < 100; j++ {
+	for range numGoroutines {
+		wg.Go(func() {
+			for j := range 100 {
 				port := hopper.CurrentPort()
 				if port < config.PortRangeStart || port > config.PortRangeEnd {
 					t.Errorf("concurrent read got invalid port %d", port)
@@ -403,7 +401,7 @@ func TestPortHopperConcurrency(t *testing.T) {
 				hopper.ShouldHop()
 				hopper.Stats()
 			}
-		}()
+		})
 	}
 
 	wg.Wait()
@@ -483,12 +481,60 @@ func TestConfigValidation(t *testing.T) {
 	}
 }
 
+// TestNoPort443 verifies freeze-resist-mux T3: a hopper whose range includes the
+// reserved HTTPS port 443 never actually lands on it, neither on the initial
+// port nor across many hops.
+func TestNoPort443(t *testing.T) {
+	config := DefaultConfig()
+	config.PortRangeStart = 400
+	config.PortRangeEnd = 500
+
+	hopper, err := NewPortHopper(config)
+	if err != nil {
+		t.Fatalf("failed to create hopper: %v", err)
+	}
+
+	if got := hopper.CurrentPort(); got == ReservedPort443 {
+		t.Fatalf("initial port is reserved port %d", ReservedPort443)
+	}
+
+	for i := range 1000 {
+		port := hopper.NextPort()
+		if port == ReservedPort443 {
+			t.Fatalf("hop %d landed on reserved port %d", i, ReservedPort443)
+		}
+		if port < config.PortRangeStart || port > config.PortRangeEnd {
+			t.Fatalf("hop %d port %d outside range [%d, %d]", i, port, config.PortRangeStart, config.PortRangeEnd)
+		}
+	}
+}
+
+// TestDefaultRangeNo443 verifies the default hopper configuration never produces
+// port 443 across many hops. (The default range 47000-65535 already excludes it,
+// so this guards against a regression that would widen the range.)
+func TestDefaultRangeNo443(t *testing.T) {
+	hopper, err := NewPortHopper(DefaultConfig())
+	if err != nil {
+		t.Fatalf("failed to create hopper: %v", err)
+	}
+
+	if got := hopper.CurrentPort(); got == ReservedPort443 {
+		t.Fatalf("initial port is reserved port %d", ReservedPort443)
+	}
+
+	for i := range 1000 {
+		if port := hopper.NextPort(); port == ReservedPort443 {
+			t.Fatalf("hop %d landed on reserved port %d", i, ReservedPort443)
+		}
+	}
+}
+
 func BenchmarkPortHopperNextPort(b *testing.B) {
 	config := DefaultConfig()
 	hopper, _ := NewPortHopper(config)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		hopper.NextPort()
 	}
 }
@@ -498,7 +544,7 @@ func BenchmarkPortHopperCurrentPort(b *testing.B) {
 	hopper, _ := NewPortHopper(config)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		hopper.CurrentPort()
 	}
 }

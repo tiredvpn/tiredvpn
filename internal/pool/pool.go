@@ -282,6 +282,21 @@ func (e *poolError) Error() string {
 	return e.msg
 }
 
+// isRelayTimeout reports whether err is a transient timeout that should trigger
+// an activity check rather than an immediate relay close.
+//
+// Handles both standard net.Error timeouts and smux v2's errTimeout which is
+// defined as errors.New("timeout") and does not implement net.Error.
+func isRelayTimeout(err error) bool {
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		return true
+	}
+	// smux v2 wraps its internal errTimeout ("timeout") via pkg/errors.WithStack;
+	// the wrapper does not implement net.Error, so we fall back to string matching.
+	msg := err.Error()
+	return msg == "timeout" || msg == "i/o timeout"
+}
+
 // PooledRelay relays data between client and pooled server connection
 // Unlike HealthyRelay, it does NOT penalize strategy for idle timeouts
 func PooledRelay(client net.Conn, server *PooledConn, idleTimeout time.Duration) error {
@@ -320,7 +335,7 @@ func PooledRelay(client net.Conn, server *PooledConn, idleTimeout time.Duration)
 			n, err := client.Read(buf)
 			if err != nil {
 				if err != io.EOF {
-					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					if isRelayTimeout(err) {
 						// Check if we should give up (no activity in either direction)
 						if !checkActivity() {
 							log.Debug("Relay: closing due to inactivity (client side)")
@@ -356,7 +371,7 @@ func PooledRelay(client net.Conn, server *PooledConn, idleTimeout time.Duration)
 			n, err := server.Read(buf)
 			if err != nil {
 				if err != io.EOF {
-					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					if isRelayTimeout(err) {
 						// Check if we should give up
 						if !checkActivity() {
 							log.Debug("Relay: closing due to inactivity (server side)")
@@ -420,7 +435,7 @@ func PooledRelayLengthPrefixed(client net.Conn, server *PooledConn, idleTimeout 
 			n, err := client.Read(buf)
 			if err != nil {
 				if err != io.EOF {
-					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					if isRelayTimeout(err) {
 						if !checkActivity() {
 							errCh <- io.EOF
 							return
@@ -456,7 +471,7 @@ func PooledRelayLengthPrefixed(client net.Conn, server *PooledConn, idleTimeout 
 			server.SetReadDeadline(time.Now().Add(30 * time.Second))
 			if _, err := io.ReadFull(server, lenBuf); err != nil {
 				if err != io.EOF {
-					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					if isRelayTimeout(err) {
 						if !checkActivity() {
 							errCh <- io.EOF
 							return

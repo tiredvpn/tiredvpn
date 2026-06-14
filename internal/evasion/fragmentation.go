@@ -118,6 +118,14 @@ func isTLSClientHello(data []byte) bool {
 		data[5] == 0x01 // ClientHello handshake type
 }
 
+// NetConn returns the underlying connection. It lets kTLS (and other
+// optimizations) unwrap past the fragmentation layer to reach the raw
+// *net.TCPConn — fragmentation only applies to the first write (ClientHello),
+// so the underlying conn is safe to operate on directly in the relay phase.
+func (f *FragmentedWriter) NetConn() net.Conn {
+	return f.conn
+}
+
 // Read passes through to underlying connection
 func (f *FragmentedWriter) Read(p []byte) (int, error) {
 	return f.conn.Read(p)

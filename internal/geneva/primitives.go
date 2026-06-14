@@ -14,48 +14,8 @@ type Primitive interface {
 	String() string
 }
 
-// Action represents a Geneva action with optional parameters
-type Action struct {
-	Type   ActionType
-	Params map[string]interface{}
-}
-
-// ActionType defines the type of Geneva primitive
-type ActionType int
-
-const (
-	ActionDrop ActionType = iota
-	ActionTamper
-	ActionFragment
-	ActionDuplicate
-	ActionSend
-)
-
-// String returns the action type name
-func (a ActionType) String() string {
-	switch a {
-	case ActionDrop:
-		return "drop"
-	case ActionTamper:
-		return "tamper"
-	case ActionFragment:
-		return "fragment"
-	case ActionDuplicate:
-		return "duplicate"
-	case ActionSend:
-		return "send"
-	default:
-		return "unknown"
-	}
-}
-
 // DropPrimitive drops a packet (returns empty list)
 type DropPrimitive struct{}
-
-// NewDropPrimitive creates a drop primitive
-func NewDropPrimitive() *DropPrimitive {
-	return &DropPrimitive{}
-}
 
 // Apply drops the packet
 func (d *DropPrimitive) Apply(packet []byte) ([][]byte, error) {
@@ -70,11 +30,11 @@ func (d *DropPrimitive) String() string {
 // TamperPrimitive modifies TCP header fields
 type TamperPrimitive struct {
 	Field string      // "flags", "seq", "ack", "win", "chksum"
-	Value interface{} // New value or modification
+	Value any // New value or modification
 }
 
 // NewTamperPrimitive creates a tamper primitive
-func NewTamperPrimitive(field string, value interface{}) *TamperPrimitive {
+func NewTamperPrimitive(field string, value any) *TamperPrimitive {
 	return &TamperPrimitive{
 		Field: field,
 		Value: value,
@@ -275,11 +235,6 @@ func (d *DuplicatePrimitive) String() string {
 
 // SendPrimitive sends a packet as-is (no-op)
 type SendPrimitive struct{}
-
-// NewSendPrimitive creates a send primitive
-func NewSendPrimitive() *SendPrimitive {
-	return &SendPrimitive{}
-}
 
 // Apply returns the packet unmodified
 func (s *SendPrimitive) Apply(packet []byte) ([][]byte, error) {

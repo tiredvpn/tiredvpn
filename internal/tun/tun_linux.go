@@ -4,6 +4,7 @@
 package tun
 
 import (
+	"encoding/binary"
 	"fmt"
 	"net"
 	"os"
@@ -11,7 +12,11 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/google/nftables"
+	"github.com/google/nftables/expr"
 	"github.com/tiredvpn/tiredvpn/internal/log"
+	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -21,32 +26,27 @@ const (
 	iffNoPi   = 0x1000
 )
 
-// ifReq is the Linux interface request structure
 type ifReq struct {
 	Name  [ifnamsiz]byte
 	Flags uint16
 	pad   [24 - ifnamsiz - 2]byte
 }
 
-// TUNDevice represents a TUN network interface
 type TUNDevice struct {
 	name     string
 	file     *os.File
 	mtu      int
 	localIP  net.IP
 	remoteIP net.IP
-	routes   []string // Store routes to re-add after IP changes
+	routes   []string
 }
 
-// CreateTUN creates a new TUN device
 func CreateTUN(name string, mtu int) (*TUNDevice, error) {
-	// Open TUN device
 	fd, err := syscall.Open(tunDevice, syscall.O_RDWR|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open %s: %w", tunDevice, err)
 	}
 
-	// Configure interface
 	var req ifReq
 	req.Flags = iffTun | iffNoPi
 	copy(req.Name[:], name)
@@ -57,7 +57,6 @@ func CreateTUN(name string, mtu int) (*TUNDevice, error) {
 		return nil, fmt.Errorf("ioctl TUNSETIFF failed: %v", errno)
 	}
 
-	// Get actual name
 	actualName := string(req.Name[:])
 	for i, b := range req.Name {
 		if b == 0 {
@@ -82,72 +81,54 @@ func CreateTUN(name string, mtu int) (*TUNDevice, error) {
 	return tun, nil
 }
 
-// Name returns the device name
 func (t *TUNDevice) Name() string {
 	return t.name
 }
 
-// Read reads a packet from the TUN device
 func (t *TUNDevice) Read(p []byte) (int, error) {
 	return t.file.Read(p)
 }
 
-// Write writes a packet to the TUN device
 func (t *TUNDevice) Write(p []byte) (int, error) {
 	return t.file.Write(p)
 }
 
-// SetReadDeadline sets the read deadline on the TUN device
-// This can be used to unblock goroutines waiting on Read()
 func (t *TUNDevice) SetReadDeadline(deadline time.Time) error {
 	return t.file.SetReadDeadline(deadline)
 }
 
-// Close closes the TUN device and removes the interface
 func (t *TUNDevice) Close() error {
-	// Clean up iptables MSS clamping rules before removing interface
 	if t.name != "" && t.mtu > 40 {
-		mssStr := fmt.Sprintf("%d", t.mtu-40)
-		runIPTables("-t", "mangle", "-D", "FORWARD", "-o", t.name,
-			"-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
-			"-j", "TCPMSS", "--set-mss", mssStr)
-		runIPTables("-t", "mangle", "-D", "FORWARD", "-i", t.name,
-			"-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
-			"-j", "TCPMSS", "--set-mss", mssStr)
+		if err := removeMSSClamping(t.name); err != nil {
+			log.Warn("Failed to remove MSS clamping rules: %v", err)
+		}
 	}
 
-	// Set immediate deadline to unblock any goroutines blocked on Read()
 	t.file.SetReadDeadline(time.Now())
 
-	// Close the file descriptor
 	err := t.file.Close()
 
-	// Then explicitly delete the interface to ensure cleanup
-	// This is needed because closing fd alone may not remove the interface
-	// if there are goroutines blocked on Read()
 	if t.name != "" {
-		runIP("link", "delete", t.name)
+		link, lerr := netlink.LinkByName(t.name)
+		if lerr == nil {
+			if derr := netlink.LinkDel(link); derr != nil {
+				log.Warn("Failed to delete link %s: %v", t.name, derr)
+			}
+		}
 	}
 
 	return err
 }
 
-// File returns the underlying file descriptor
 func (t *TUNDevice) File() *os.File {
 	return t.file
 }
 
-// Configure sets up the TUN device with IP address and routes
 func (t *TUNDevice) Configure(localIP, remoteIP net.IP, routes []string) error {
-	// Save IP addresses and routes
 	t.localIP = localIP
 	t.remoteIP = remoteIP
 	t.routes = routes
 
-	// Use netlink or ip command to configure
-	// For simplicity, we'll use the ip command
-
-	// Disable IPv6 BEFORE bringing interface up
 	sysctlPath := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/disable_ipv6", t.name)
 	if err := os.WriteFile(sysctlPath, []byte("1"), 0644); err != nil {
 		log.Warn("Failed to disable IPv6 on %s: %v", t.name, err)
@@ -155,126 +136,137 @@ func (t *TUNDevice) Configure(localIP, remoteIP net.IP, routes []string) error {
 		log.Debug("Disabled IPv6 on %s (before up)", t.name)
 	}
 
-	// Set interface up with IP
-	if err := runIP("link", "set", "dev", t.name, "up"); err != nil {
+	link, err := netlink.LinkByName(t.name)
+	if err != nil {
+		return fmt.Errorf("failed to find link %s: %w", t.name, err)
+	}
+
+	if err := netlink.LinkSetUp(link); err != nil {
 		return fmt.Errorf("failed to bring up interface: %w", err)
 	}
 
-	// Set MTU
-	if err := runIP("link", "set", "dev", t.name, "mtu", fmt.Sprintf("%d", t.mtu)); err != nil {
+	if err := netlink.LinkSetMTU(link, t.mtu); err != nil {
 		return fmt.Errorf("failed to set MTU: %w", err)
 	}
 
-	// Set IP address (point-to-point)
-	addr := fmt.Sprintf("%s/32", localIP.String())
-	if err := runIP("addr", "add", addr, "peer", remoteIP.String(), "dev", t.name); err != nil {
-		// Try without peer for simpler setup
-		if err2 := runIP("addr", "add", fmt.Sprintf("%s/24", localIP.String()), "dev", t.name); err2 != nil {
+	nlAddr := &netlink.Addr{
+		IPNet: &net.IPNet{IP: localIP, Mask: net.CIDRMask(32, 32)},
+		Peer:  &net.IPNet{IP: remoteIP, Mask: net.CIDRMask(32, 32)},
+	}
+	if err := netlink.AddrAdd(link, nlAddr); err != nil {
+		_, ipNet, perr := net.ParseCIDR(fmt.Sprintf("%s/24", localIP.String()))
+		if perr != nil {
+			return fmt.Errorf("failed to set IP address: %w", err)
+		}
+		if err2 := netlink.AddrAdd(link, &netlink.Addr{IPNet: ipNet}); err2 != nil {
 			return fmt.Errorf("failed to set IP address: %w", err)
 		}
 	}
 
-	// Add routes
 	for _, route := range routes {
-		if err := runIP("route", "add", route, "dev", t.name); err != nil {
+		_, dst, err := net.ParseCIDR(route)
+		if err != nil {
+			log.Warn("Failed to parse route %s: %v", route, err)
+			continue
+		}
+		if err := netlink.RouteAdd(&netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst}); err != nil {
 			log.Warn("Failed to add route %s: %v", route, err)
 		}
 	}
 
-	// TCP MSS clamping: prevent TCP sessions from negotiating segments larger than tunnel MTU
-	// MSS = MTU - 20 (IP header) - 20 (TCP header)
 	mss := t.mtu - 40
 	if mss > 0 {
-		mssStr := fmt.Sprintf("%d", mss)
-		if err := runIPTables("-t", "mangle", "-A", "FORWARD", "-o", t.name,
-			"-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
-			"-j", "TCPMSS", "--set-mss", mssStr); err != nil {
-			log.Warn("Failed to set MSS clamping (FORWARD out): %v", err)
+		if err := addMSSClamping(t.name, t.mtu); err != nil {
+			log.Warn("Failed to set MSS clamping: %v", err)
+		} else {
+			log.Info("TCP MSS clamping set to %d on %s", mss, t.name)
 		}
-		if err := runIPTables("-t", "mangle", "-A", "FORWARD", "-i", t.name,
-			"-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
-			"-j", "TCPMSS", "--set-mss", mssStr); err != nil {
-			log.Warn("Failed to set MSS clamping (FORWARD in): %v", err)
-		}
-		log.Info("TCP MSS clamping set to %d on %s", mss, t.name)
 	}
 
 	log.Info("TUN device %s configured: local=%s, remote=%s", t.name, localIP, remoteIP)
 	return nil
 }
 
-// ConfigureSubnet sets up the TUN device with subnet routing (not point-to-point)
-// Used for shared TUN where multiple clients share one interface
 func (t *TUNDevice) ConfigureSubnet(localIP net.IP, network *net.IPNet) error {
 	t.localIP = localIP
 
-	// Disable IPv6 BEFORE bringing interface up
 	sysctlPath := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/disable_ipv6", t.name)
 	if err := os.WriteFile(sysctlPath, []byte("1"), 0644); err != nil {
 		log.Warn("Failed to disable IPv6 on %s: %v", t.name, err)
 	}
 
-	// Bring interface up
-	if err := runIP("link", "set", "dev", t.name, "up"); err != nil {
+	link, err := netlink.LinkByName(t.name)
+	if err != nil {
+		return fmt.Errorf("failed to find link %s: %w", t.name, err)
+	}
+
+	if err := netlink.LinkSetUp(link); err != nil {
 		return fmt.Errorf("failed to bring up interface: %w", err)
 	}
 
-	// Set MTU
-	if err := runIP("link", "set", "dev", t.name, "mtu", fmt.Sprintf("%d", t.mtu)); err != nil {
+	if err := netlink.LinkSetMTU(link, t.mtu); err != nil {
 		return fmt.Errorf("failed to set MTU: %w", err)
 	}
 
-	// Set IP address with subnet mask (NOT point-to-point)
-	// Example: ip addr add 10.9.0.1/24 dev tiredvpn0
 	ones, _ := network.Mask.Size()
+	_, ipNet, err := net.ParseCIDR(fmt.Sprintf("%s/%d", localIP.String(), ones))
+	if err != nil {
+		return fmt.Errorf("failed to parse CIDR: %w", err)
+	}
 	addr := fmt.Sprintf("%s/%d", localIP.String(), ones)
-	if err := runIP("addr", "add", addr, "dev", t.name); err != nil {
+	if err := netlink.AddrAdd(link, &netlink.Addr{IPNet: ipNet}); err != nil {
 		return fmt.Errorf("failed to set IP address: %w", err)
 	}
 
-	// TCP MSS clamping for server-side shared TUN
 	mss := t.mtu - 40
 	if mss > 0 {
-		mssStr := fmt.Sprintf("%d", mss)
-		if err := runIPTables("-t", "mangle", "-A", "FORWARD", "-o", t.name,
-			"-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
-			"-j", "TCPMSS", "--set-mss", mssStr); err != nil {
-			log.Warn("Failed to set MSS clamping (FORWARD out): %v", err)
+		if err := addMSSClamping(t.name, t.mtu); err != nil {
+			log.Warn("Failed to set MSS clamping: %v", err)
+		} else {
+			log.Info("TCP MSS clamping set to %d on %s", mss, t.name)
 		}
-		if err := runIPTables("-t", "mangle", "-A", "FORWARD", "-i", t.name,
-			"-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
-			"-j", "TCPMSS", "--set-mss", mssStr); err != nil {
-			log.Warn("Failed to set MSS clamping (FORWARD in): %v", err)
-		}
-		log.Info("TCP MSS clamping set to %d on %s", mss, t.name)
 	}
 
 	log.Info("TUN device %s configured with subnet: %s", t.name, addr)
 	return nil
 }
 
-// UpdatePeerIP updates the peer IP address of the TUN device
 func (t *TUNDevice) UpdatePeerIP(newRemoteIP net.IP) error {
 	if newRemoteIP.Equal(t.remoteIP) {
-		return nil // No change needed
+		return nil
 	}
 
-	// Remove old address
-	oldAddr := fmt.Sprintf("%s/32", t.localIP.String())
-	runIP("addr", "del", oldAddr, "peer", t.remoteIP.String(), "dev", t.name)
+	link, err := netlink.LinkByName(t.name)
+	if err != nil {
+		return fmt.Errorf("failed to find link %s: %w", t.name, err)
+	}
 
-	// Add new address with updated peer
-	newAddr := fmt.Sprintf("%s/32", t.localIP.String())
-	if err := runIP("addr", "add", newAddr, "peer", newRemoteIP.String(), "dev", t.name); err != nil {
+	oldAddr := &netlink.Addr{
+		IPNet: &net.IPNet{IP: t.localIP, Mask: net.CIDRMask(32, 32)},
+		Peer:  &net.IPNet{IP: t.remoteIP, Mask: net.CIDRMask(32, 32)},
+	}
+	if err := netlink.AddrDel(link, oldAddr); err != nil {
+		log.Warn("Failed to delete old peer addr: %v", err)
+	}
+
+	newAddr := &netlink.Addr{
+		IPNet: &net.IPNet{IP: t.localIP, Mask: net.CIDRMask(32, 32)},
+		Peer:  &net.IPNet{IP: newRemoteIP, Mask: net.CIDRMask(32, 32)},
+	}
+	if err := netlink.AddrAdd(link, newAddr); err != nil {
 		return fmt.Errorf("failed to update peer IP: %w", err)
 	}
 
 	t.remoteIP = newRemoteIP
 	log.Info("TUN device %s peer IP updated to %s", t.name, newRemoteIP)
 
-	// Re-add routes (Linux removes them when IP is deleted)
 	for _, route := range t.routes {
-		if err := runIP("route", "add", route, "dev", t.name); err != nil {
+		_, dst, err := net.ParseCIDR(route)
+		if err != nil {
+			log.Warn("Failed to parse route %s: %v", route, err)
+			continue
+		}
+		if err := netlink.RouteAdd(&netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst}); err != nil {
 			log.Warn("Failed to re-add route %s: %v", route, err)
 		} else {
 			log.Debug("Re-added route %s after peer IP change", route)
@@ -284,29 +276,42 @@ func (t *TUNDevice) UpdatePeerIP(newRemoteIP net.IP) error {
 	return nil
 }
 
-// UpdateLocalIP updates the local IP address of the TUN device
-// This is used when server assigns a different IP than requested
 func (t *TUNDevice) UpdateLocalIP(newLocalIP net.IP) error {
 	if newLocalIP.Equal(t.localIP) {
-		return nil // No change needed
+		return nil
 	}
 
-	// Remove old address
-	oldAddr := fmt.Sprintf("%s/32", t.localIP.String())
-	runIP("addr", "del", oldAddr, "peer", t.remoteIP.String(), "dev", t.name)
+	link, err := netlink.LinkByName(t.name)
+	if err != nil {
+		return fmt.Errorf("failed to find link %s: %w", t.name, err)
+	}
 
-	// Add new address
-	newAddr := fmt.Sprintf("%s/32", newLocalIP.String())
-	if err := runIP("addr", "add", newAddr, "peer", t.remoteIP.String(), "dev", t.name); err != nil {
+	oldAddr := &netlink.Addr{
+		IPNet: &net.IPNet{IP: t.localIP, Mask: net.CIDRMask(32, 32)},
+		Peer:  &net.IPNet{IP: t.remoteIP, Mask: net.CIDRMask(32, 32)},
+	}
+	if err := netlink.AddrDel(link, oldAddr); err != nil {
+		log.Warn("Failed to delete old local addr: %v", err)
+	}
+
+	newAddr := &netlink.Addr{
+		IPNet: &net.IPNet{IP: newLocalIP, Mask: net.CIDRMask(32, 32)},
+		Peer:  &net.IPNet{IP: t.remoteIP, Mask: net.CIDRMask(32, 32)},
+	}
+	if err := netlink.AddrAdd(link, newAddr); err != nil {
 		return fmt.Errorf("failed to update local IP: %w", err)
 	}
 
 	t.localIP = newLocalIP
 	log.Info("TUN device %s local IP updated to %s", t.name, newLocalIP)
 
-	// Re-add routes (Linux removes them when IP is deleted)
 	for _, route := range t.routes {
-		if err := runIP("route", "add", route, "dev", t.name); err != nil {
+		_, dst, err := net.ParseCIDR(route)
+		if err != nil {
+			log.Warn("Failed to parse route %s: %v", route, err)
+			continue
+		}
+		if err := netlink.RouteAdd(&netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst}); err != nil {
 			log.Warn("Failed to re-add route %s: %v", route, err)
 		} else {
 			log.Debug("Re-added route %s after IP change", route)
@@ -316,55 +321,202 @@ func (t *TUNDevice) UpdateLocalIP(newLocalIP net.IP) error {
 	return nil
 }
 
-// runIP executes the ip command
-func runIP(args ...string) error {
-	cmd := fmt.Sprintf("ip %s", args)
-	log.Debug("Running: %s", cmd)
+// nftablesTableName is the nftables table created for MSS clamping rules.
+const nftablesTableName = "tiredvpn"
 
-	// Use syscall.ForkExec for simplicity
-	pid, err := syscall.ForkExec("/sbin/ip", append([]string{"ip"}, args...), &syscall.ProcAttr{
-		Env:   os.Environ(),
-		Files: []uintptr{0, 1, 2},
+// ifnamePad pads an interface name to 16 bytes (IFNAMSIZ) as required by nftables.
+func ifnamePad(name string) []byte {
+	b := make([]byte, 16)
+	copy(b, name+"\x00")
+	return b
+}
+
+// mssRule builds the nftables expressions for a single MSS clamping rule.
+// It matches: oifname == ifName AND tcp AND tcp flags SYN (SYN|RST mask) AND sets MSS.
+func mssRule(ifName string, mtu int) []expr.Any {
+	mss := uint16(mtu - 40)
+	mssBE := make([]byte, 2)
+	binary.BigEndian.PutUint16(mssBE, mss)
+
+	return []expr.Any{
+		// oifname == ifName
+		&expr.Meta{Key: expr.MetaKeyOIFNAME, Register: 1},
+		&expr.Cmp{
+			Op:       expr.CmpOpEq,
+			Register: 1,
+			Data:     ifnamePad(ifName),
+		},
+
+		// ip protocol == tcp
+		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
+		&expr.Cmp{
+			Op:       expr.CmpOpEq,
+			Register: 1,
+			Data:     []byte{unix.IPPROTO_TCP},
+		},
+
+		// tcp flags byte (offset 13 of transport header)
+		&expr.Payload{
+			DestRegister: 1,
+			Base:         expr.PayloadBaseTransportHeader,
+			Offset:       13,
+			Len:          1,
+		},
+		// mask: flags & (SYN|RST) == SYN  =>  & 0x06, compare == 0x02
+		&expr.Bitwise{
+			DestRegister:   1,
+			SourceRegister: 1,
+			Len:            1,
+			Mask:           []byte{0x06}, // SYN=0x02 | RST=0x04
+			Xor:            []byte{0x00},
+		},
+		&expr.Cmp{
+			Op:       expr.CmpOpEq,
+			Register: 1,
+			Data:     []byte{0x02}, // SYN only
+		},
+
+		// load fixed MSS value into reg 1 (network byte order)
+		&expr.Immediate{
+			Register: 1,
+			Data:     mssBE,
+		},
+
+		// write reg 1 into TCP MSS option field: tcpopt 2b @ type=2 offset=2
+		&expr.Exthdr{
+			SourceRegister: 1,
+			Type:           2, // TCP option kind: MSS
+			Offset:         2,
+			Len:            2,
+			Op:             expr.ExthdrOpTcpopt,
+		},
+	}
+}
+
+// addMSSClamping installs nftables rules for TCP MSS clamping on ifName.
+// Creates table "tiredvpn" (IPv4, filter/forward/mangle priority) with two rules:
+// one matching outbound (oifname) and one matching inbound (iifname) on ifName.
+// Non-fatal: logs a warning and returns nil if nftables is unavailable.
+func addMSSClamping(ifName string, mtu int) error {
+	conn, err := nftables.New()
+	if err != nil {
+		log.Warn("nftables unavailable, skipping MSS clamping: %v", err)
+		return nil
+	}
+
+	tbl := conn.AddTable(&nftables.Table{
+		Family: nftables.TableFamilyIPv4,
+		Name:   nftablesTableName,
 	})
-	if err != nil {
-		return err
+
+	chain := conn.AddChain(&nftables.Chain{
+		Name:     "mssclamping",
+		Table:    tbl,
+		Type:     nftables.ChainTypeFilter,
+		Hooknum:  nftables.ChainHookForward,
+		Priority: nftables.ChainPriorityMangle,
+		Policy:   chainPolicyAcceptPtr(),
+	})
+
+	// outbound: oifname == ifName
+	conn.AddRule(&nftables.Rule{
+		Table: tbl,
+		Chain: chain,
+		Exprs: mssRule(ifName, mtu),
+	})
+
+	// inbound: iifname == ifName
+	conn.AddRule(&nftables.Rule{
+		Table: tbl,
+		Chain: chain,
+		Exprs: mssRuleIIF(ifName, mtu),
+	})
+
+	if err := conn.Flush(); err != nil {
+		log.Warn("Failed to flush nftables MSS clamping rules: %v", err)
+		return nil
 	}
 
-	var status syscall.WaitStatus
-	_, err = syscall.Wait4(pid, &status, 0, nil)
-	if err != nil {
-		return err
-	}
-
-	if status.ExitStatus() != 0 {
-		return fmt.Errorf("ip command failed with status %d", status.ExitStatus())
-	}
-
+	log.Debug("nftables MSS clamping installed for %s (MSS=%d)", ifName, mtu-40)
 	return nil
 }
 
-// runIPTables executes the iptables command
-func runIPTables(args ...string) error {
-	cmd := fmt.Sprintf("iptables %s", args)
-	log.Debug("Running: %s", cmd)
+// mssRuleIIF is like mssRule but matches iifname (inbound).
+func mssRuleIIF(ifName string, mtu int) []expr.Any {
+	mss := uint16(mtu - 40)
+	mssBE := make([]byte, 2)
+	binary.BigEndian.PutUint16(mssBE, mss)
 
-	pid, err := syscall.ForkExec("/sbin/iptables", append([]string{"iptables"}, args...), &syscall.ProcAttr{
-		Env:   os.Environ(),
-		Files: []uintptr{0, 1, 2},
+	return []expr.Any{
+		&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
+		&expr.Cmp{
+			Op:       expr.CmpOpEq,
+			Register: 1,
+			Data:     ifnamePad(ifName),
+		},
+		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
+		&expr.Cmp{
+			Op:       expr.CmpOpEq,
+			Register: 1,
+			Data:     []byte{unix.IPPROTO_TCP},
+		},
+		&expr.Payload{
+			DestRegister: 1,
+			Base:         expr.PayloadBaseTransportHeader,
+			Offset:       13,
+			Len:          1,
+		},
+		&expr.Bitwise{
+			DestRegister:   1,
+			SourceRegister: 1,
+			Len:            1,
+			Mask:           []byte{0x06},
+			Xor:            []byte{0x00},
+		},
+		&expr.Cmp{
+			Op:       expr.CmpOpEq,
+			Register: 1,
+			Data:     []byte{0x02},
+		},
+		&expr.Immediate{
+			Register: 1,
+			Data:     mssBE,
+		},
+		&expr.Exthdr{
+			SourceRegister: 1,
+			Type:           2,
+			Offset:         2,
+			Len:            2,
+			Op:             expr.ExthdrOpTcpopt,
+		},
+	}
+}
+
+// chainPolicyAcceptPtr returns a pointer to ChainPolicyAccept, as required by the nftables API.
+func chainPolicyAcceptPtr() *nftables.ChainPolicy {
+	p := nftables.ChainPolicyAccept
+	return &p
+}
+
+// removeMSSClamping deletes the "tiredvpn" nftables table, removing all MSS clamping rules.
+// Non-fatal: logs a warning and returns nil if the operation fails.
+func removeMSSClamping(ifName string) error {
+	conn, err := nftables.New()
+	if err != nil {
+		log.Warn("nftables unavailable, cannot remove MSS clamping: %v", err)
+		return nil
+	}
+
+	conn.DelTable(&nftables.Table{
+		Family: nftables.TableFamilyIPv4,
+		Name:   nftablesTableName,
 	})
-	if err != nil {
-		return err
+
+	if err := conn.Flush(); err != nil {
+		log.Warn("Failed to remove nftables MSS clamping table: %v", err)
+		return nil
 	}
 
-	var status syscall.WaitStatus
-	_, err = syscall.Wait4(pid, &status, 0, nil)
-	if err != nil {
-		return err
-	}
-
-	if status.ExitStatus() != 0 {
-		return fmt.Errorf("iptables command failed with status %d", status.ExitStatus())
-	}
-
+	log.Debug("nftables MSS clamping table %q removed", nftablesTableName)
 	return nil
 }

@@ -2,10 +2,8 @@ package strategy
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 	"net"
-	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -127,21 +125,14 @@ func (c *ConnectivityChecker) Check(ctx context.Context) ConnectivityResult {
 	return result
 }
 
-// checkTCP attempts a TLS connection to the server
-// Note: Server requires TLS handshake, plain TCP connect will be rejected
+// checkTCP verifies that the server's TCP port is reachable.
+// A plain TCP dial is enough — the server speaks a custom protocol, so a TLS
+// handshake would always fail the connectivity check even when the port is up.
 func (c *ConnectivityChecker) checkTCP(ctx context.Context, addr string) error {
-	dialer := &net.Dialer{
-		Timeout: c.timeout,
-	}
-
-	// Server requires TLS - do TLS handshake instead of plain TCP
-	tlsConfig := &tls.Config{
-		InsecureSkipVerify: true, // Skip cert validation for connectivity check
-	}
-
-	conn, err := tls.DialWithDialer(dialer, "tcp", addr, tlsConfig)
+	dialer := &net.Dialer{Timeout: c.timeout}
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
-		return fmt.Errorf("TLS connect failed: %w", err)
+		return fmt.Errorf("TCP connect failed: %w", err)
 	}
 	conn.Close()
 	return nil
@@ -198,15 +189,18 @@ func (c *ConnectivityChecker) checkUDP(ctx context.Context, addr string) error {
 	return nil
 }
 
-// checkICMP runs ping command to check ICMP connectivity
 func (c *ConnectivityChecker) checkICMP(ctx context.Context, host string) error {
-	// Use system ping command with 1 packet and 2 second timeout
-	cmd := exec.CommandContext(ctx, "ping", "-c", "1", "-W", "2", host)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("ICMP ping failed: %w (output: %s)", err, string(output))
+	conn, err := net.DialTimeout("tcp", host+":443", 2*time.Second)
+	if err == nil {
+		conn.Close()
+		return nil
 	}
-	return nil
+	conn2, err2 := net.DialTimeout("tcp", host+":80", 2*time.Second)
+	if err2 == nil {
+		conn2.Close()
+		return nil
+	}
+	return fmt.Errorf("host unreachable: %w", err2)
 }
 
 // WaitForConnectivity waits in a loop until connectivity is available
