@@ -14,8 +14,10 @@ package mux
 
 import (
 	"fmt"
+	"math/rand"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/log"
@@ -32,6 +34,14 @@ type Client struct {
 
 	mu     sync.Mutex
 	closed bool
+
+	// Per-session byte counters (carrier budget tracking)
+	bytesSent     atomic.Int64
+	bytesReceived atomic.Int64
+
+	// effectiveBudget is the carrier budget with jitter applied once at
+	// creation. 0 means budget tracking is disabled.
+	effectiveBudget int64
 
 	// Callback for connection recreation
 	reconnectFn func() (net.Conn, error)
@@ -63,12 +73,22 @@ func NewClient(conn net.Conn, config *Config) (*Client, error) {
 	globalMetrics.RecordSessionCreate()
 	log.Debug("Mux client created (keepalive=%v)", config.KeepAliveInterval)
 
-	return &Client{
+	c := &Client{
 		config:  config,
 		session: session,
 		conn:    conn,
 		metrics: globalMetrics,
-	}, nil
+	}
+
+	// Compute the effective carrier budget once, applying jitter so that
+	// sessions rotate at slightly different byte thresholds.
+	if config.CarrierBudgetBytes > 0 {
+		jitter := 1.0 + (rand.Float64()*2-1)*config.CarrierBudgetJitter
+		c.effectiveBudget = int64(float64(config.CarrierBudgetBytes) * jitter)
+		log.Debug("Mux carrier budget enabled (effective=%d bytes)", c.effectiveBudget)
+	}
+
+	return c, nil
 }
 
 // SetReconnectFunc sets a callback for recreating the underlying connection
@@ -212,6 +232,21 @@ func (c *Client) GetMetrics() MetricsSnapshot {
 	return c.metrics.Snapshot()
 }
 
+// BytesOnCarrier returns the total bytes sent and received over this
+// client's underlying carrier connection.
+func (c *Client) BytesOnCarrier() int64 {
+	return c.bytesSent.Load() + c.bytesReceived.Load()
+}
+
+// BudgetExceeded reports whether this client has reached its carrier byte
+// budget. Returns false when budget tracking is disabled.
+func (c *Client) BudgetExceeded() bool {
+	if c.config.CarrierBudgetBytes == 0 {
+		return false
+	}
+	return c.BytesOnCarrier() >= c.effectiveBudget
+}
+
 // Server provides server-side multiplexing
 // Accepts streams from a multiplexed connection
 type Server struct {
@@ -339,6 +374,9 @@ func (s *trackedStream) Read(p []byte) (int, error) {
 	if n > 0 {
 		s.metrics.RecordBytesReceived(uint64(n))
 		s.metrics.RecordFrameReceived()
+		if s.client != nil {
+			s.client.bytesReceived.Add(int64(n))
+		}
 	}
 	if err != nil {
 		s.metrics.RecordReadError()
@@ -351,6 +389,9 @@ func (s *trackedStream) Write(p []byte) (int, error) {
 	if n > 0 {
 		s.metrics.RecordBytesSent(uint64(n))
 		s.metrics.RecordFrameSent()
+		if s.client != nil {
+			s.client.bytesSent.Add(int64(n))
+		}
 	}
 	if err != nil {
 		s.metrics.RecordWriteError()

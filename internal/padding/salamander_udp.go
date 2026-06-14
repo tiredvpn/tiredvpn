@@ -34,34 +34,16 @@ func (s *SalamanderPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err err
 
 	encrypted := buf[:n]
 
-	// Decrypt with Salamander
+	// Decrypt with Salamander (tag-verified UDP framing)
 	s.mu.Lock()
-	decrypted, err := s.padder.Decrypt(encrypted)
+	payload, ok := s.padder.DecryptUDP(encrypted)
 	s.mu.Unlock()
 
-	if err != nil {
-		return 0, addr, err
+	if !ok {
+		return 0, addr, fmt.Errorf("salamander: packet failed secret verification")
 	}
 
-	// QUIC packets have 2-byte length prefix for actual data
-	if len(decrypted) < 2 {
-		// No length prefix - use full decrypted data (backwards compat)
-		n = copy(p, decrypted)
-		return n, addr, nil
-	}
-
-	// Check if this has a length prefix (first 2 bytes)
-	// If first 2 bytes look like a reasonable length (< len(decrypted)), use it
-	dataLen := int(decrypted[0])<<8 | int(decrypted[1])
-	if dataLen > 0 && dataLen <= len(decrypted)-2 {
-		// Has length prefix
-		actualData := decrypted[2 : 2+dataLen]
-		n = copy(p, actualData)
-		return n, addr, nil
-	}
-
-	// No valid length prefix - use full data
-	n = copy(p, decrypted)
+	n = copy(p, payload)
 	return n, addr, nil
 }
 
@@ -71,15 +53,9 @@ func (s *SalamanderPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err erro
 		return 0, fmt.Errorf("salamander: payload too large (%d > 65535)", len(p))
 	}
 
-	// Prepend 2-byte length prefix
-	dataWithLen := make([]byte, 2+len(p))
-	dataWithLen[0] = byte(len(p) >> 8)
-	dataWithLen[1] = byte(len(p))
-	copy(dataWithLen[2:], p)
-
-	// Encrypt with Salamander
+	// Encrypt with Salamander (tag-verified UDP framing)
 	s.mu.Lock()
-	encrypted, err := s.padder.Encrypt(dataWithLen)
+	encrypted, err := s.padder.EncryptUDP(p)
 	s.mu.Unlock()
 
 	if err != nil {

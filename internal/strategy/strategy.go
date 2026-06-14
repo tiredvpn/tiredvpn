@@ -95,11 +95,12 @@ type Manager struct {
 	rttProfile        *RTTProfile
 
 	// Mux configuration
-	muxEnabled bool
-	muxConfig  *mux.Config
-	muxClient  *mux.Client
-	muxConn    net.Conn   // underlying connection for mux
-	muxMu      sync.Mutex // separate mutex for mux operations
+	muxEnabled          bool
+	muxConfig           *mux.Config
+	muxClient           *mux.Client
+	muxConn             net.Conn   // underlying connection for mux
+	muxMu               sync.Mutex // separate mutex for mux operations
+	recyclingInProgress bool       // true while budget recycling goroutine is running (under muxMu)
 
 	// Last successful strategy for fast reconnect
 	lastSuccessfulStrategy Strategy
@@ -1031,7 +1032,25 @@ func registerAllStrategies(m *Manager, cfg DefaultManagerConfig) {
 	registerMorphStrategies(m, cfg, hasSecret)
 	registerMeshAndAntiProbe(m, cfg, hasServer, hasSecret)
 	registerConfusionAndExhaustion(m)
+	registerSSHCamouflage(m, cfg, hasServer, hasSecret)
+	registerIMAPCamouflage(m, cfg, hasServer, hasSecret)
 	registerGenevaStrategies(m, cfg, hasServer, hasSecret)
+}
+
+// registerSSHCamouflage registers the SSH camouflage strategy.
+func registerSSHCamouflage(m *Manager, cfg DefaultManagerConfig, hasServer, hasSecret bool) {
+	if !hasServer || !hasSecret {
+		return
+	}
+	m.Register(NewSSHCamouflageStrategy(m, cfg.Secret))
+}
+
+// registerIMAPCamouflage registers the IMAP camouflage strategy.
+func registerIMAPCamouflage(m *Manager, cfg DefaultManagerConfig, hasServer, hasSecret bool) {
+	if !hasServer || !hasSecret {
+		return
+	}
+	m.Register(NewIMAPCamouflageStrategy(m, cfg.Secret))
 }
 
 // registerQUICStrategies registers QUIC and QUIC-Salamander strategies.
@@ -1350,6 +1369,12 @@ func (m *Manager) wrapWithMux(conn net.Conn, config *mux.Config) (net.Conn, erro
 
 	// Reuse existing mux session if available and not closed
 	if m.muxClient != nil && !m.muxClient.IsClosed() {
+		// Trigger budget recycling if carrier exceeded its byte limit.
+		// New streams continue on current carrier until the swap completes.
+		if m.muxClient.BudgetExceeded() && !m.recyclingInProgress {
+			m.recyclingInProgress = true
+			go m.performBudgetRecycling()
+		}
 		stream, err := m.muxClient.OpenStream()
 		if err == nil {
 			log.Debug("Mux stream opened on existing session (active=%d)", m.muxClient.NumStreams())
@@ -1870,6 +1895,85 @@ func (m *Manager) performMakeBeforeBreak(newPort int) {
 		// Run callback in goroutine to avoid blocking
 		go callback(0, newPort) // oldPort not tracked, just pass newPort
 	}
+}
+
+// performBudgetRecycling replaces the current mux carrier once its byte budget
+// is exhausted. Runs in a goroutine; clears recyclingInProgress when done.
+//
+// Make-before-break: new carrier is fully established before old one is touched.
+// Old carrier drains gracefully (up to 10 s) so in-flight streams finish cleanly.
+func (m *Manager) performBudgetRecycling() {
+	defer func() {
+		m.muxMu.Lock()
+		m.recyclingInProgress = false
+		m.muxMu.Unlock()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	m.mu.Lock()
+	target := m.reprobeTarget
+	lastStrategy := m.lastSuccessfulStrategy
+	m.mu.Unlock()
+
+	if target == "" || lastStrategy == nil {
+		log.Debug("Budget recycling: no target/strategy, skipping")
+		return
+	}
+
+	log.Debug("Budget recycling: pre-warming new carrier to %s", target)
+
+	conn, err := lastStrategy.Connect(ctx, target)
+	if err != nil {
+		log.Warn("Budget recycling: new connection failed (%v), keeping current carrier", err)
+		return
+	}
+
+	m.muxMu.Lock()
+	config := m.muxConfig
+	if config == nil {
+		config = mux.DefaultConfig()
+	}
+	newClient, err := mux.NewClient(conn, config)
+	if err != nil {
+		m.muxMu.Unlock()
+		conn.Close()
+		log.Warn("Budget recycling: mux client creation failed (%v)", err)
+		return
+	}
+	// Verify new carrier with a probe stream
+	probe, err := newClient.OpenStream()
+	if err != nil {
+		m.muxMu.Unlock()
+		newClient.Close()
+		conn.Close()
+		log.Warn("Budget recycling: probe stream failed (%v)", err)
+		return
+	}
+	probe.Close()
+
+	// Atomic swap: from this point new streams go to newClient
+	oldClient := m.muxClient
+	oldConn := m.muxConn
+	m.muxClient = newClient
+	m.muxConn = conn
+	m.muxMu.Unlock()
+
+	log.Info("Budget recycling: carrier swapped, draining old session")
+
+	// Graceful drain: wait for in-flight streams to finish (10 s max)
+	drainDeadline := time.Now().Add(10 * time.Second)
+	for oldClient != nil && oldClient.NumStreams() > 0 && time.Now().Before(drainDeadline) {
+		time.Sleep(200 * time.Millisecond)
+	}
+	if oldClient != nil {
+		oldClient.Close()
+	}
+	if oldConn != nil {
+		oldConn.Close()
+	}
+	log.Debug("Budget recycling: old carrier closed")
 }
 
 // SetPortHopCallback sets a callback function that will be called when port hop occurs

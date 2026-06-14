@@ -90,33 +90,12 @@ func (s *MultiSecretSalamanderPacketConn) getPadder(secret []byte) *SalamanderPa
 	return padder
 }
 
-// tryDecrypt attempts to decrypt with a specific padder
-// Returns decrypted data and true if successful, nil and false otherwise
+// tryDecrypt attempts to decrypt with a specific padder using the tag-verified
+// UDP framing. It returns the recovered payload and true only when the embedded
+// keyed tag matches the padder's secret, so a wrong secret can never
+// false-accept and poison the per-address secret cache.
 func (s *MultiSecretSalamanderPacketConn) tryDecrypt(padder *SalamanderPadder, encrypted []byte) ([]byte, bool) {
-	decrypted, err := padder.Decrypt(encrypted)
-	if err != nil {
-		return nil, false
-	}
-
-	// Check if decrypted data looks valid (has valid length prefix)
-	if len(decrypted) < 2 {
-		return nil, false
-	}
-
-	dataLen := int(decrypted[0])<<8 | int(decrypted[1])
-	if dataLen > 0 && dataLen <= len(decrypted)-2 && dataLen < 65000 {
-		// Valid QUIC packet with length prefix
-		return decrypted, true
-	}
-
-	// Also check if it looks like a QUIC long header (for initial packets)
-	// QUIC long header starts with 1xxx xxxx (high bit set)
-	if len(decrypted) >= 5 && (decrypted[0]&0x80) != 0 {
-		// Could be a QUIC packet without our length prefix (shouldn't happen but check anyway)
-		return decrypted, true
-	}
-
-	return nil, false
+	return padder.DecryptUDP(encrypted)
 }
 
 // ReadFrom reads a packet and decrypts it with Salamander
@@ -141,7 +120,7 @@ func (s *MultiSecretSalamanderPacketConn) ReadFrom(p []byte) (n int, addr net.Ad
 		padder := s.getPadder(knownSecret)
 		if decrypted, ok := s.tryDecrypt(padder, encrypted); ok {
 			s.addrLastSeen[addrStr] = time.Now()
-			return s.extractData(decrypted, p), addr, nil
+			return copy(p, decrypted), addr, nil
 		}
 		// Secret didn't work - client might have changed, continue trying others
 		delete(s.addrSecrets, addrStr)
@@ -151,7 +130,7 @@ func (s *MultiSecretSalamanderPacketConn) ReadFrom(p []byte) (n int, addr net.Ad
 	// 1. Try global secret first (most common case)
 	if decrypted, ok := s.tryDecrypt(s.globalPadder, encrypted); ok {
 		s.recordAddr(addrStr, s.globalSecret)
-		return s.extractData(decrypted, p), addr, nil
+		return copy(p, decrypted), addr, nil
 	}
 
 	// 2. Try per-client secrets
@@ -162,7 +141,7 @@ func (s *MultiSecretSalamanderPacketConn) ReadFrom(p []byte) (n int, addr net.Ad
 			if decrypted, ok := s.tryDecrypt(padder, encrypted); ok {
 				log.Debug("QUIC Salamander: decrypted with client secret for %s", addrStr)
 				s.recordAddr(addrStr, secret)
-				return s.extractData(decrypted, p), addr, nil
+				return copy(p, decrypted), addr, nil
 			}
 		}
 	}
@@ -193,35 +172,12 @@ func (s *MultiSecretSalamanderPacketConn) recordAddr(addrStr string, secret []by
 	s.addrLastSeen[addrStr] = time.Now()
 }
 
-// extractData extracts actual data from decrypted packet (handles length prefix)
-func (s *MultiSecretSalamanderPacketConn) extractData(decrypted []byte, p []byte) int {
-	if len(decrypted) < 2 {
-		return copy(p, decrypted)
-	}
-
-	// Check for length prefix
-	dataLen := int(decrypted[0])<<8 | int(decrypted[1])
-	if dataLen > 0 && dataLen <= len(decrypted)-2 {
-		actualData := decrypted[2 : 2+dataLen]
-		return copy(p, actualData)
-	}
-
-	// No valid length prefix - use full data
-	return copy(p, decrypted)
-}
-
 // WriteTo encrypts a packet with Salamander and writes it
 // Uses the same secret that was used to decrypt packets from this address
 func (s *MultiSecretSalamanderPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	if len(p) > 65535 {
 		return 0, fmt.Errorf("salamander: payload too large (%d > 65535)", len(p))
 	}
-
-	// Prepend 2-byte length prefix
-	dataWithLen := make([]byte, 2+len(p))
-	dataWithLen[0] = byte(len(p) >> 8)
-	dataWithLen[1] = byte(len(p))
-	copy(dataWithLen[2:], p)
 
 	s.mu.Lock()
 	// Find the padder for this address (use global as fallback)
@@ -232,7 +188,7 @@ func (s *MultiSecretSalamanderPacketConn) WriteTo(p []byte, addr net.Addr) (n in
 	} else {
 		padder = s.globalPadder
 	}
-	encrypted, err := padder.Encrypt(dataWithLen)
+	encrypted, err := padder.EncryptUDP(p)
 	s.mu.Unlock()
 
 	if err != nil {

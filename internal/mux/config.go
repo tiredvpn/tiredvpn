@@ -19,6 +19,15 @@ type Config struct {
 
 	// MaxStreams is the maximum number of concurrent streams (0 = unlimited)
 	MaxStreams int
+
+	// CarrierBudgetBytes is the per-session byte budget before the carrier
+	// connection is considered exhausted (0 = disabled).
+	// Recommended value when enabled: 12288 (12KB).
+	CarrierBudgetBytes int64
+
+	// CarrierBudgetJitter randomizes the effective budget by ±jitter fraction
+	// (0.0-1.0). Applied once per client at creation. Recommended: 0.2 (±20%).
+	CarrierBudgetJitter float64
 }
 
 // DefaultConfig returns sensible defaults optimized for DPI evasion
@@ -33,6 +42,9 @@ func DefaultConfig() *Config {
 		MaxFrameSize:      32768,            // 32KB frames - good balance
 		MaxReceiveBuffer:  4194304,          // 4MB total receive buffer
 		MaxStreams:        0,                // Unlimited streams
+		// CarrierBudgetBytes left at 0 (disabled by default).
+		// Enabled via strategy; recommended value is 12288 (12KB) with
+		// CarrierBudgetJitter 0.2 (±20%).
 	}
 }
 
@@ -92,10 +104,12 @@ func (c *Config) Validate() error {
 // Clone creates a deep copy of the config
 func (c *Config) Clone() *Config {
 	return &Config{
-		KeepAliveInterval: c.KeepAliveInterval,
-		KeepAliveTimeout:  c.KeepAliveTimeout,
-		MaxFrameSize:      c.MaxFrameSize,
-		MaxReceiveBuffer:  c.MaxReceiveBuffer,
-		MaxStreams:        c.MaxStreams,
+		KeepAliveInterval:   c.KeepAliveInterval,
+		KeepAliveTimeout:    c.KeepAliveTimeout,
+		MaxFrameSize:        c.MaxFrameSize,
+		MaxReceiveBuffer:    c.MaxReceiveBuffer,
+		MaxStreams:          c.MaxStreams,
+		CarrierBudgetBytes:  c.CarrierBudgetBytes,
+		CarrierBudgetJitter: c.CarrierBudgetJitter,
 	}
 }

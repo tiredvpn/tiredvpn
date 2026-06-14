@@ -270,7 +270,7 @@ func TestMultipleStreams(t *testing.T) {
 	streams := make([]net.Conn, numStreams)
 
 	// Open multiple streams
-	for i := 0; i < numStreams; i++ {
+	for i := range numStreams {
 		stream, err := client.OpenStream()
 		if err != nil {
 			t.Fatalf("OpenStream %d failed: %v", i, err)
@@ -324,7 +324,7 @@ func TestMaxStreamsLimit(t *testing.T) {
 
 	// Open streams up to the limit
 	streams := make([]net.Conn, 0)
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		stream, err := client.OpenStream()
 		if err != nil {
 			t.Fatalf("OpenStream %d failed: %v", i, err)
@@ -512,7 +512,7 @@ func TestConcurrentStreams(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(numGoroutines)
 
-	for i := 0; i < numGoroutines; i++ {
+	for i := range numGoroutines {
 		go func(id int) {
 			defer wg.Done()
 			stream, err := client.OpenStream()
@@ -629,7 +629,7 @@ func TestBidirectionalData(t *testing.T) {
 	}()
 
 	// Check for errors
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		if err := <-errCh; err != nil {
 			t.Fatalf("Bidirectional test failed: %v", err)
 		}
@@ -731,6 +731,181 @@ func TestConfigClone(t *testing.T) {
 	}
 }
 
+// newBudgetTestPair spins up a client with the given config and a server that
+// accepts and drains every stream, so client writes complete over net.Pipe.
+// The returned cleanup closes both sides and the underlying conns.
+func newBudgetTestPair(t *testing.T, config *Config) (*Client, func()) {
+	t.Helper()
+	clientConn, serverConn := net.Pipe()
+
+	serverReady := make(chan struct{})
+	var server *Server
+	go func() {
+		var err error
+		server, err = NewServer(serverConn, nil)
+		close(serverReady)
+		if err != nil {
+			return
+		}
+		for {
+			stream, err := server.AcceptStream()
+			if err != nil {
+				return
+			}
+			go func(s net.Conn) {
+				io.Copy(io.Discard, s)
+				s.Close()
+			}(stream)
+		}
+	}()
+
+	client, err := NewClient(clientConn, config)
+	if err != nil {
+		clientConn.Close()
+		serverConn.Close()
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	<-serverReady
+
+	cleanup := func() {
+		client.Close()
+		if server != nil {
+			server.Close()
+		}
+		clientConn.Close()
+		serverConn.Close()
+	}
+	return client, cleanup
+}
+
+// writeN opens a stream and writes total bytes through it, in chunks. It blocks
+// until all bytes are written (drained by the test server), so the client's
+// carrier counter is fully updated on return.
+func writeN(t *testing.T, client *Client, total int) {
+	t.Helper()
+	stream, err := client.OpenStream()
+	if err != nil {
+		t.Fatalf("OpenStream failed: %v", err)
+	}
+	defer stream.Close()
+
+	buf := make([]byte, total)
+	written := 0
+	for written < total {
+		n, err := stream.Write(buf[written:])
+		if err != nil {
+			t.Fatalf("Write failed after %d/%d bytes: %v", written, total, err)
+		}
+		written += n
+	}
+}
+
+// TestClientBudgetExceeded verifies freeze-resist-mux T1: a per-session byte
+// counter trips BudgetExceeded once the carrier budget is reached. Jitter is 0
+// so the effective budget equals CarrierBudgetBytes exactly.
+func TestClientBudgetExceeded(t *testing.T) {
+	config := DefaultConfig()
+	config.CarrierBudgetBytes = 1000
+	config.CarrierBudgetJitter = 0
+
+	client, cleanup := newBudgetTestPair(t, config)
+	defer cleanup()
+
+	// 500 bytes: under budget.
+	writeN(t, client, 500)
+	if client.BudgetExceeded() {
+		t.Errorf("BudgetExceeded() = true after 500 bytes (budget 1000), want false (BytesOnCarrier=%d)", client.BytesOnCarrier())
+	}
+
+	// +600 bytes = 1100 total: over budget.
+	writeN(t, client, 600)
+	if !client.BudgetExceeded() {
+		t.Errorf("BudgetExceeded() = false after 1100 bytes (budget 1000), want true (BytesOnCarrier=%d)", client.BytesOnCarrier())
+	}
+}
+
+// TestClientBudgetDisabled verifies that with CarrierBudgetBytes=0 the budget is
+// disabled and BudgetExceeded() is always false regardless of traffic.
+func TestClientBudgetDisabled(t *testing.T) {
+	config := DefaultConfig()
+	config.CarrierBudgetBytes = 0
+
+	client, cleanup := newBudgetTestPair(t, config)
+	defer cleanup()
+
+	if client.BudgetExceeded() {
+		t.Error("BudgetExceeded() = true on fresh client with budget disabled")
+	}
+
+	writeN(t, client, 5000)
+	if client.BudgetExceeded() {
+		t.Errorf("BudgetExceeded() = true after 5000 bytes with budget disabled (BytesOnCarrier=%d)", client.BytesOnCarrier())
+	}
+}
+
+// TestClientBytesOnCarrier verifies BytesOnCarrier() counts both written and
+// read bytes. The server echoes data back so the client both sends and receives.
+func TestClientBytesOnCarrier(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	serverReady := make(chan struct{})
+	var server *Server
+	go func() {
+		var err error
+		server, err = NewServer(serverConn, nil)
+		close(serverReady)
+		if err != nil {
+			return
+		}
+		for {
+			stream, err := server.AcceptStream()
+			if err != nil {
+				return
+			}
+			// Echo: read then write the same bytes back.
+			go func(s net.Conn) {
+				defer s.Close()
+				io.Copy(s, s)
+			}(stream)
+		}
+	}()
+
+	client, err := NewClient(clientConn, nil)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+	defer client.Close()
+
+	<-serverReady
+	defer server.Close()
+
+	stream, err := client.OpenStream()
+	if err != nil {
+		t.Fatalf("OpenStream failed: %v", err)
+	}
+	defer stream.Close()
+
+	payload := []byte("carrier-byte-accounting-payload")
+	if _, err := stream.Write(payload); err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+
+	// Read the echo back so received bytes are counted.
+	buf := make([]byte, len(payload))
+	if _, err := io.ReadFull(stream, buf); err != nil {
+		t.Fatalf("ReadFull failed: %v", err)
+	}
+
+	got := client.BytesOnCarrier()
+	want := int64(2 * len(payload)) // sent + received
+	if got != want {
+		t.Errorf("BytesOnCarrier() = %d, want %d (sent %d + received %d)", got, want, len(payload), len(payload))
+	}
+}
+
 // BenchmarkOpenStream benchmarks stream opening performance
 func BenchmarkOpenStream(b *testing.B) {
 	clientConn, serverConn := net.Pipe()
@@ -755,7 +930,7 @@ func BenchmarkOpenStream(b *testing.B) {
 	defer client.Close()
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		stream, err := client.OpenStream()
 		if err != nil {
 			b.Fatalf("OpenStream failed: %v", err)
@@ -804,7 +979,7 @@ func BenchmarkDataTransfer(b *testing.B) {
 	}
 	defer stream.Close()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		if _, err := stream.Write(data); err != nil {
 			b.Fatalf("Write failed: %v", err)
 		}

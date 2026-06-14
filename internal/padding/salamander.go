@@ -144,6 +144,126 @@ func (sp *SalamanderPadder) Decrypt(ciphertext []byte) ([]byte, error) {
 	return plaintext, nil
 }
 
+// keyTag derives a deterministic 2-byte verification tag from the secret and
+// salt. It is used by the UDP/QUIC framing to confirm that a packet was
+// encrypted with the same secret before trusting the (XOR-only, unauthenticated)
+// length prefix. A wrong secret yields a different keystream and therefore a
+// different tag, so mismatches are rejected deterministically instead of being
+// guessed at via header heuristics.
+func (sp *SalamanderPadder) keyTag(salt []byte) ([2]byte, error) {
+	h, err := blake2b.New256(sp.secret)
+	if err != nil {
+		return [2]byte{}, err
+	}
+	// Domain-separate the tag from the XOR keystream so the tag never leaks
+	// keystream bytes used to mask the payload.
+	h.Write([]byte("tag"))
+	h.Write(salt)
+	sum := h.Sum(nil)
+	return [2]byte{sum[0], sum[1]}, nil
+}
+
+// EncryptUDP frames a single UDP/QUIC payload for transmission. The inner
+// plaintext layout is [tag:2][lenHi][lenLo][payload], which Encrypt then masks
+// with the keystream and pads to a bucket. The tag lets the receiver verify the
+// secret deterministically.
+func (sp *SalamanderPadder) EncryptUDP(payload []byte) ([]byte, error) {
+	if len(payload) > 65535 {
+		return nil, fmt.Errorf("salamander: payload too large (%d > 65535)", len(payload))
+	}
+
+	inner := make([]byte, 4+len(payload))
+	// tag is filled after we know the salt, so encrypt manually below.
+	inner[2] = byte(len(payload) >> 8)
+	inner[3] = byte(len(payload))
+	copy(inner[4:], payload)
+
+	// Generate salt + keystream exactly like Encrypt, but inject the tag.
+	salt := make([]byte, 8)
+	if _, err := rand.Read(salt); err != nil {
+		return nil, err
+	}
+	tag, err := sp.keyTag(salt)
+	if err != nil {
+		return nil, err
+	}
+	inner[0] = tag[0]
+	inner[1] = tag[1]
+
+	h, err := blake2b.New256(sp.secret)
+	if err != nil {
+		return nil, err
+	}
+	h.Write(salt)
+	hash := h.Sum(nil)
+
+	encrypted := make([]byte, len(inner))
+	for i, b := range inner {
+		encrypted[i] = b ^ hash[i%32]
+	}
+
+	targetSize := sp.normalizeToucket(len(inner))
+	totalDataLen := 8 + len(encrypted)
+	paddingLen := targetSize - totalDataLen
+	if paddingLen < 0 {
+		paddingLen = 0
+	}
+	padding := make([]byte, paddingLen)
+	if paddingLen > 0 {
+		if _, err := rand.Read(padding); err != nil {
+			return nil, fmt.Errorf("failed to generate padding: %w", err)
+		}
+	}
+
+	result := make([]byte, 0, 8+len(encrypted)+paddingLen)
+	result = append(result, salt...)
+	result = append(result, encrypted...)
+	result = append(result, padding...)
+	return result, nil
+}
+
+// DecryptUDP reverses EncryptUDP. It returns the original payload only if the
+// embedded tag matches the secret; otherwise ok is false. This is the
+// authoritative secret-match check for the UDP/QUIC transport.
+func (sp *SalamanderPadder) DecryptUDP(ciphertext []byte) (payload []byte, ok bool) {
+	if len(ciphertext) < 8+4 {
+		return nil, false
+	}
+	salt := ciphertext[:8]
+
+	wantTag, err := sp.keyTag(salt)
+	if err != nil {
+		return nil, false
+	}
+
+	h, err := blake2b.New256(sp.secret)
+	if err != nil {
+		return nil, false
+	}
+	h.Write(salt)
+	hash := h.Sum(nil)
+
+	enc := ciphertext[8:]
+	// Decrypt just the header first (tag + length) to validate cheaply.
+	var hdr [4]byte
+	for i := 0; i < 4; i++ {
+		hdr[i] = enc[i] ^ hash[i%32]
+	}
+	if hdr[0] != wantTag[0] || hdr[1] != wantTag[1] {
+		return nil, false
+	}
+	dataLen := int(hdr[2])<<8 | int(hdr[3])
+	if dataLen < 0 || 4+dataLen > len(enc) {
+		return nil, false
+	}
+
+	payload = make([]byte, dataLen)
+	for i := 0; i < dataLen; i++ {
+		payload[i] = enc[4+i] ^ hash[(4+i)%32]
+	}
+	return payload, true
+}
+
 // DecryptWithLength decrypts data and returns only the specified plaintext length
 func (sp *SalamanderPadder) DecryptWithLength(ciphertext []byte, plaintextLen int) ([]byte, error) {
 	decrypted, err := sp.Decrypt(ciphertext)

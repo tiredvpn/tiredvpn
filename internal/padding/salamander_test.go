@@ -517,12 +517,60 @@ func TestMultiSecretGlobalFallbackMisdecrypts(t *testing.T) {
 	n, _, readErr := serverConn.ReadFrom(p)
 	_ = n
 
-	// Bug: readErr is nil because global fallback always "decrypts" and returns data
-	// After fix: readErr should be non-nil for unrecognized packets
+	// A packet encrypted with an unknown secret must be rejected: the keyed tag
+	// in the UDP framing won't match secretA's keystream.
 	if readErr == nil {
-		t.Log("KNOWN BUG: MultiSecretSalamanderPacketConn.ReadFrom returns nil error for unknown secret (global fallback misdecrypts) - fix removes fallback at salamander_multi.go:131-139")
-		// We mark this as expected-to-fail until the fix lands
-		// The test serves as a regression guard after the fix
+		t.Fatalf("expected ReadFrom to reject packet encrypted with unknown secret, got nil error")
+	}
+}
+
+// TestSalamanderUDPRoundtrip verifies the tag-verified UDP framing roundtrips a
+// payload across the full bucket range, mirroring real QUIC packet sizes.
+func TestSalamanderUDPRoundtrip(t *testing.T) {
+	secret := []byte("shared-secret-1234567890")
+	padder := NewSalamanderPadder(secret, Balanced)
+
+	for _, sz := range []int{1, 2, 20, 30, 1200, 1232, 1350, 1392} {
+		payload := make([]byte, sz)
+		rand.Read(payload)
+
+		enc, err := padder.EncryptUDP(payload)
+		if err != nil {
+			t.Fatalf("size %d: EncryptUDP: %v", sz, err)
+		}
+		got, ok := padder.DecryptUDP(enc)
+		if !ok {
+			t.Fatalf("size %d: DecryptUDP rejected a self-encrypted packet", sz)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Errorf("size %d: payload mismatch", sz)
+		}
+	}
+}
+
+// TestSalamanderUDPWrongSecretRejected ensures a wrong secret can never
+// false-accept a UDP packet. This is the regression guard for the QUIC
+// Salamander "no matching secret" / per-address cache poisoning bug, where the
+// old length-prefix + 0x80 long-header heuristic accepted ~50% of garbage.
+func TestSalamanderUDPWrongSecretRejected(t *testing.T) {
+	right := NewSalamanderPadder([]byte("the-correct-secret-AAAAA"), Balanced)
+	wrong := NewSalamanderPadder([]byte("a-different-secret-BBBBB"), Balanced)
+
+	falseAccepts := 0
+	const n = 20000
+	for i := 0; i < n; i++ {
+		payload := make([]byte, 1200)
+		rand.Read(payload)
+		enc, err := right.EncryptUDP(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := wrong.DecryptUDP(enc); ok {
+			falseAccepts++
+		}
+	}
+	if falseAccepts != 0 {
+		t.Fatalf("wrong secret false-accepted %d/%d packets, want 0", falseAccepts, n)
 	}
 }
 
@@ -577,9 +625,9 @@ func (c *chanPacketConn) Close() error {
 	return nil
 }
 
-func (c *chanPacketConn) LocalAddr() net.Addr              { return &chanAddr{} }
-func (c *chanPacketConn) SetDeadline(_ time.Time) error    { return nil }
-func (c *chanPacketConn) SetReadDeadline(t time.Time) error { return nil }
+func (c *chanPacketConn) LocalAddr() net.Addr                { return &chanAddr{} }
+func (c *chanPacketConn) SetDeadline(_ time.Time) error      { return nil }
+func (c *chanPacketConn) SetReadDeadline(t time.Time) error  { return nil }
 func (c *chanPacketConn) SetWriteDeadline(_ time.Time) error { return nil }
 
 type chanAddr struct{}
