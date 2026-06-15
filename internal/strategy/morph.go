@@ -16,7 +16,6 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/protocol"
 	"github.com/tiredvpn/tiredvpn/internal/shaper"
-	"github.com/tiredvpn/tiredvpn/internal/shaper/presets"
 )
 
 // TrafficMorphStrategy morphs traffic to match target application patterns
@@ -254,21 +253,16 @@ func NewTrafficMorphStrategy(manager *Manager, profile *TrafficProfile, base Str
 	profileCopy := *profile
 	profileCopy.ApplyPaddingPreset(GlobalPaddingPreset)
 
-	// Enable a real traffic shaper by default.
-	// youtube_streaming is data-plane-safe and matches the most common heavy-traffic cover story.
-	// SetShaper can override this after construction (e.g. from TOML [shaper] config).
-	defaultShaper, err := presets.ByName(presets.PresetYouTubeStreaming, time.Now().UnixNano())
-	if err != nil {
-		log.Debug("morph: failed to load default shaper preset: %v, falling back to noop", err)
-		defaultShaper = shaper.NoopShaper{}
-	}
-
+	// Default to NoopShaper: the server read path has no matching Unwrap call,
+	// so any shaper that adds framing (e.g. youtube_streaming's 4-byte length
+	// prefix) desynchronises the wire format and silently kills the tunnel.
+	// Override via SetShaper once client+server both handle it.
 	return &TrafficMorphStrategy{
 		manager:      manager,
 		profile:      &profileCopy,
 		baseStrat:    base,
 		secret:       secret,
-		customShaper: defaultShaper,
+		customShaper: shaper.NoopShaper{},
 	}
 }
 
