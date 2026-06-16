@@ -7,6 +7,13 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-06-16
+
+### Fixed
+
+- **Embedded/JNI client dropped most flags.** `parseClientArgs` (the Android/host-managed entry point in `cmd/tiredvpn/jni_android.go`) was a hand-rolled switch that recognized only ~11 flags and had no default case, so every other flag was silently ignored. Embedded clients (the Android app) passing `-quic`, `-quic-port`, `-rtt-masking`, `-rtt-profile`, `-fallback`, and `-cover` got none of them - those features were dead on mobile. The parser also expected `-cover-host` while the CLI and the app send `-cover`, so the cover host was a guaranteed no-op.
+- The parser now honors the full client flag contract (`-quic`, `-quic-port`, `-quic-sni-frag`, `-rtt-masking`, `-rtt-profile`, `-fallback`, `-shaper`, `-shaper-seed`, `-ech`, `-ech-config`, `-ech-public-name`, `-server-v6`, `-prefer-ipv6`, `-fallback-v4`), parsing into the same `client.Config` fields as the CLI path. The Traffic Shaper is built via the same `applyShaperFlag` helper as `runClient`, so embedded and CLI cannot drift. `-cover` is now canonical with `-cover-host` kept as an alias, and unknown flags are logged with `log.Warn` instead of dropped silently.
+
 ## [1.1.4] - 2026-06-02
 
 ### Added

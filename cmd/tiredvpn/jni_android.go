@@ -137,6 +137,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -394,6 +395,13 @@ func parseClientArgs(args []string) (*client.Config, error) {
 		TunMTU:      1500,
 	}
 
+	// Shaper preset/seed are captured during the scan and applied after the loop
+	// so a -shaper-seed in any position still feeds the same -shaper build.
+	var (
+		shaperName string
+		shaperSeed int64
+	)
+
 	// Parse flags from args (simple parser, doesn't use flag package)
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -437,7 +445,9 @@ func parseClientArgs(args []string) (*client.Config, error) {
 				cfg.StrategyName = args[i+1]
 				i++
 			}
-		case "-cover-host":
+		// -cover is the canonical flag (matches CLI -cover and what the app sends).
+		// -cover-host is kept as a legacy alias.
+		case "-cover", "-cover-host":
 			if i+1 < len(args) {
 				cfg.CoverHost = args[i+1]
 				i++
@@ -448,6 +458,103 @@ func parseClientArgs(args []string) (*client.Config, error) {
 			cfg.TunMode = true
 		case "-android":
 			cfg.AndroidMode = true
+
+		// QUIC transport
+		case "-quic":
+			cfg.QUICEnabled = true
+		case "-quic-port":
+			if i+1 < len(args) {
+				if v, err := strconv.Atoi(args[i+1]); err == nil {
+					cfg.QUICPort = v
+				} else {
+					log.Warn("parseClientArgs: invalid -quic-port value %q: %v", args[i+1], err)
+				}
+				i++
+			}
+		case "-quic-sni-frag":
+			cfg.QUICSNIFragEnabled = true
+
+		// RTT masking
+		case "-rtt-masking":
+			cfg.RTTMaskingEnabled = true
+		case "-rtt-profile":
+			if i+1 < len(args) {
+				cfg.RTTProfile = args[i+1]
+				i++
+			}
+
+		// Mid-session fallback
+		case "-fallback":
+			cfg.EnableFallback = true
+
+		// Traffic shaper (built identically to CLI runClient via applyShaperFlag)
+		case "-shaper":
+			if i+1 < len(args) {
+				shaperName = args[i+1]
+				i++
+			}
+		case "-shaper-seed":
+			if i+1 < len(args) {
+				if v, err := strconv.ParseInt(args[i+1], 10, 64); err == nil {
+					shaperSeed = v
+				} else {
+					log.Warn("parseClientArgs: invalid -shaper-seed value %q: %v", args[i+1], err)
+				}
+				i++
+			}
+
+		// ECH (Encrypted Client Hello)
+		case "-ech":
+			cfg.ECHEnabled = true
+		case "-ech-config":
+			if i+1 < len(args) {
+				cfg.ECHConfigB64 = args[i+1]
+				i++
+			}
+		case "-ech-public-name":
+			if i+1 < len(args) {
+				cfg.ECHPublicName = args[i+1]
+				i++
+			}
+
+		// IPv6 transport
+		case "-server-v6":
+			if i+1 < len(args) {
+				cfg.ServerAddrV6 = args[i+1]
+				i++
+			}
+		case "-prefer-ipv6":
+			if i+1 < len(args) {
+				if v, err := strconv.ParseBool(args[i+1]); err == nil {
+					cfg.PreferIPv6 = v
+				} else {
+					log.Warn("parseClientArgs: invalid -prefer-ipv6 value %q: %v", args[i+1], err)
+				}
+				i++
+			}
+		case "-fallback-v4":
+			if i+1 < len(args) {
+				if v, err := strconv.ParseBool(args[i+1]); err == nil {
+					cfg.FallbackToV4 = v
+				} else {
+					log.Warn("parseClientArgs: invalid -fallback-v4 value %q: %v", args[i+1], err)
+				}
+				i++
+			}
+
+		default:
+			// No more silent drops: log every unrecognized token so flag
+			// contract drift between the app and the core is visible.
+			log.Warn("parseClientArgs: ignoring unknown flag %q", args[i])
+		}
+	}
+
+	// Build the shaper exactly like the CLI path (runClient -> applyShaperFlag):
+	// presets.ByName(name, seed) for cfg.Shaper and presets.IDForName(name) for
+	// cfg.ShaperID, including the unknown-preset error.
+	if shaperName != "" {
+		if err := applyShaperFlag(cfg, shaperName, shaperSeed); err != nil {
+			return nil, err
 		}
 	}
 
