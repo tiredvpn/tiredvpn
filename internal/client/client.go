@@ -356,7 +356,9 @@ func runBenchmark(cfg *Config, mgr *strategy.Manager) error {
 }
 
 // runBenchmarkJSON runs the parallel strategy probe and writes results as JSON to stdout.
+// Log output is redirected to stderr so stdout contains only the JSON payload.
 func runBenchmarkJSON(cfg *Config, mgr *strategy.Manager) error {
+	log.SetOutput(os.Stderr)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	result := benchmark.ParallelProbe(ctx, mgr, cfg.ServerAddr)

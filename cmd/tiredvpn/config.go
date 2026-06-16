@@ -70,6 +70,7 @@ func applyShaperFlag(cfg *client.Config, name string, seed int64) error {
 	}
 	cfg.Shaper = sh
 	cfg.ShaperID = byte(presets.IDForName(name))
+	log.Info("shaper active: preset=%s id=%d", name, cfg.ShaperID)
 	return nil
 }
 

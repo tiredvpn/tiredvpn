@@ -169,6 +169,10 @@ MULTI-HOP OPTIONS:
   -upstream-secret string
         Secret for upstream authentication
 
+ICMP TUNNEL:
+  -enable-icmp
+        Enable ICMP tunnel listener (requires CAP_NET_RAW)
+
 ADVANCED OPTIONS:
   -fake-root string
         Fake website root directory (default "./www")
@@ -178,6 +182,8 @@ ADVANCED OPTIONS:
         TUN interface name (default "tiredvpn0")
   -pprof string
         Enable pprof profiling on address (e.g., :6060)
+  -config string
+        Path to TOML config (overrides defaults; CLI flags override TOML)
   -version
         Show version`)
 }
@@ -284,11 +290,19 @@ ADAPTIVE STRATEGY:
   -fallback
         Enable mid-session fallback to other strategies (default true)
 
+TRAFFIC SHAPING (morph strategies):
+  -shaper string
+        Traffic shaper preset: youtube_streaming, chrome_browsing, imap_sync, random_per_session
+  -shaper-seed int
+        Seed for deterministic shaper (0 = random)
+  -config string
+        Path to TOML config (overrides defaults; CLI flags override TOML)
+
 BENCHMARKING:
   -benchmark
         Run strategy benchmark (latency test)
   -benchmark-json
-        Run strategy benchmark, output results as JSON (for automation)
+        Run strategy benchmark, output results as JSON (for automation); logs go to stderr
   -benchmark-full
         Run FULL strategy benchmark (HTTP, latency, speed, IP change)
   -benchmark-all
@@ -347,6 +361,9 @@ func runServer(args []string) {
 	fs.StringVar(&cfg.ListenAddrV6, "listen-v6", "[::]:995", "IPv6 listen address")
 	fs.BoolVar(&cfg.EnableIPv6, "enable-v6", true, "Enable IPv6 listener")
 	fs.BoolVar(&cfg.DualStack, "dual-stack", true, "Listen on both IPv4 and IPv6")
+
+	// ICMP tunnel
+	fs.BoolVar(&cfg.EnableICMP, "enable-icmp", false, "Enable ICMP tunnel listener (requires CAP_NET_RAW)")
 
 	showVersion := fs.Bool("version", false, "Show version")
 
