@@ -31,6 +31,8 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/padding"
 	"github.com/tiredvpn/tiredvpn/internal/protocol"
+	"github.com/tiredvpn/tiredvpn/internal/shaper"
+	"github.com/tiredvpn/tiredvpn/internal/shaper/presets"
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
 	"github.com/tiredvpn/tiredvpn/internal/tun"
 	"golang.org/x/net/http2"
@@ -1402,6 +1404,71 @@ func forwardH2ProxyData(conn net.Conn, tunnel *h2TunnelState, payload []byte, lo
 }
 
 // handleMorphConnection handles Morph protocol connections
+// morphShaperReadTimeout bounds how long the server waits for the optional
+// wire-protocol v2 shaper-ID byte. v2 clients send it in the same TCP segment
+// as the auth token, so it is present immediately; pre-v2 clients never send
+// it and the read times out, yielding a noop shaper.
+const morphShaperReadTimeout = 2 * time.Second
+
+// readMorphShaperID reads the optional 1-byte shaper ID that trails the MRPH
+// auth token in wire-protocol v2. On timeout, EOF or an unknown ID it returns
+// a NoopShaper so the connection falls back to the legacy byte-relay framing.
+// The seed is drawn locally: it only affects this side's outbound packet
+// sizing, never Unwrap correctness (the frame layout is seed-independent).
+func readMorphShaperID(conn net.Conn, logger *log.Logger) shaper.Shaper {
+	idBuf := make([]byte, 1)
+	_ = conn.SetReadDeadline(time.Now().Add(morphShaperReadTimeout))
+	_, err := io.ReadFull(conn, idBuf)
+	_ = conn.SetReadDeadline(time.Time{})
+	if err != nil {
+		// Old client (no ID byte) or slow link: stay on the legacy wire format.
+		logger.Debug("Morph shaper ID absent (%v); using noop", err)
+		return shaper.NoopShaper{}
+	}
+	id := presets.ShaperID(idBuf[0])
+	if id == presets.ShaperIDNoop {
+		return shaper.NoopShaper{}
+	}
+	sh, err := presets.ShaperByID(id, 0)
+	if err != nil {
+		logger.Warn("Morph: unknown shaper ID %d (%v); using noop", idBuf[0], err)
+		return shaper.NoopShaper{}
+	}
+	logger.Debug("Morph: negotiated shaper ID %d", idBuf[0])
+	return sh
+}
+
+// isMorphNoopShaper reports whether sh is the passthrough shaper. The legacy
+// byte-relay path stays bit-identical when this is true.
+func isMorphNoopShaper(sh shaper.Shaper) bool {
+	if sh == nil {
+		return true
+	}
+	switch sh.(type) {
+	case shaper.NoopShaper, *shaper.NoopShaper:
+		return true
+	}
+	return false
+}
+
+// writeMorphShapedFrames writes each shaper frame as one morph packet
+// [dataLen:4][paddingLen:2][frame:N], mirroring the client's writeShaped. The
+// shaper already padded each frame to its target size, so no extra morph
+// padding is added here (paddingLen=0); the client's readShaped reads the
+// whole frame and hands it to Unwrap, which strips the shaper's own padding.
+func writeMorphShapedFrames(conn net.Conn, sh shaper.Shaper, frames [][]byte) error {
+	for _, frame := range frames {
+		hdr := make([]byte, 6+len(frame))
+		binary.BigEndian.PutUint32(hdr[0:4], uint32(len(frame)))
+		// paddingLen stays 0: the shaper frame carries its own padding.
+		copy(hdr[6:], frame)
+		if _, err := conn.Write(hdr); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func handleMorphConnection(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
 	logger.Debug("Processing Morph connection")
 
@@ -1478,6 +1545,13 @@ func handleMorphConnection(conn net.Conn, srvCtx *serverContext, logger *log.Log
 
 	_ = usedSecret // Mark as used
 
+	// Wire-protocol v2: a 1-byte shaper ID trails the auth token in the same
+	// handshake write. v2 clients always send it; pre-v2 clients send nothing
+	// more until they read the ack, so a short read deadline distinguishes the
+	// two without a version negotiation. Timeout / EOF => ID 0 (noop), keeping
+	// the legacy wire format for old clients.
+	morphShaper := readMorphShaperID(conn, logger)
+
 	// Track per-client connection for metrics. Use a closure on the conn
 	// variable so the defer picks up the kTLS-wrapped value if we hand
 	// the socket over later via ktls.TryEnable + registry.SwapConn.
@@ -1538,7 +1612,16 @@ func handleMorphConnection(conn net.Conn, srvCtx *serverContext, logger *log.Log
 		paddingLen = int(morphHdr[4])<<8 | int(morphHdr[5])
 	}
 
-	if dataLen > 256 || dataLen < 2 {
+	// With a shaper active the address payload is wrapped (len-prefixed +
+	// zero-padded up to the preset's packet size), so the wire dataLen can be
+	// up to MTU rather than the tight [2,256] the legacy address frame uses.
+	// Validate the unwrapped length below instead.
+	noopShaper := isMorphNoopShaper(morphShaper)
+	maxFirstFrame := 256
+	if !noopShaper {
+		maxFirstFrame = 1500
+	}
+	if dataLen > maxFirstFrame || dataLen < 2 {
 		logger.Debug("Invalid morph data length: %d", dataLen)
 		return
 	}
@@ -1556,6 +1639,16 @@ func handleMorphConnection(conn net.Conn, srvCtx *serverContext, logger *log.Log
 		io.ReadFull(conn, discard)
 	}
 
+	// Unwrap the shaper framing to recover the original address payload. For
+	// NoopShaper this is identity, so the legacy path is byte-unchanged.
+	if !noopShaper {
+		morphData = morphShaper.Unwrap([][]byte{morphData})
+		if len(morphData) < 2 {
+			logger.Debug("Morph data too short after unwrap: %d", len(morphData))
+			return
+		}
+	}
+
 	// Parse target address from morph data
 	// Client sends: [mode:1][...] where mode=0x02 is TUN, otherwise [addrLen:2][address:N]
 	logger.Debug("Morph data: len=%d, first 10 bytes=%x", len(morphData), morphData[:minInt(10, len(morphData))])
@@ -1566,6 +1659,16 @@ func handleMorphConnection(conn net.Conn, srvCtx *serverContext, logger *log.Log
 
 	// Check for TUN mode (first byte = 0x02)
 	if morphData[0] == 0x02 {
+		// The TUN relay path (SharedTUN dispatcher + morphPacketWriter) does
+		// not yet apply shaper Wrap/Unwrap, so a negotiated shaper would
+		// corrupt the stream. Refuse loudly rather than relay garbage; the
+		// addr-relay path below fully supports shapers.
+		if !noopShaper {
+			logger.Warn("Morph TUN mode with non-noop shaper is unsupported; closing")
+			failPacket := []byte{0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01}
+			conn.Write(failPacket)
+			return
+		}
 		logger.Info("Morph TUN mode detected")
 		handleMorphTUNMode(conn, morphData[1:], srvCtx, logger, clientID)
 		return
@@ -1643,6 +1746,15 @@ func handleMorphConnection(conn net.Conn, srvCtx *serverContext, logger *log.Log
 				io.ReadFull(conn, discard)
 			}
 
+			// Strip shaper framing to recover the original payload. NoopShaper
+			// is identity here, preserving the legacy wire format exactly.
+			if !noopShaper {
+				data = morphShaper.Unwrap([][]byte{data})
+				if len(data) == 0 {
+					continue
+				}
+			}
+
 			// Check for control message
 			if control.IsControlMessage(data) {
 				control.HandleServerMessage(conn, data)
@@ -1666,6 +1778,23 @@ func handleMorphConnection(conn net.Conn, srvCtx *serverContext, logger *log.Log
 			if err != nil {
 				return
 			}
+
+			if !noopShaper {
+				// Shaper path: fragment+pad the payload into shaper frames,
+				// then wrap each frame in the morph header. This mirrors the
+				// client's writeShaped so its readShaped/Unwrap reconstructs
+				// the bytes. Downstream sizing uses this side's own RNG; only
+				// the frame layout has to match, which it does by construction.
+				frames := morphShaper.Wrap(buf[:n])
+				werr := writeMorphShapedFrames(conn, morphShaper, frames)
+				morphShaper.Release(frames)
+				atomic.AddInt64(&bytesDown, int64(n))
+				if werr != nil {
+					return
+				}
+				continue
+			}
+
 			// Wrap in morph packet: [dataLen:4][paddingLen:2][data:n][padding:M]
 			padLen := 30 // Simple fixed padding
 			packet := make([]byte, 6+n+padLen)

@@ -29,6 +29,11 @@ type TrafficMorphStrategy struct {
 	// customShaper, when non-nil, is injected into MorphedConn instead of the
 	// legacy NoopShaper. Wired from TOML [shaper] via the manager config.
 	customShaper shaper.Shaper
+
+	// shaperID is the 1-byte negotiation value sent in the MRPH handshake so
+	// the server can rebuild the matching framing. 0 (noop) keeps the legacy
+	// wire format.
+	shaperID byte
 }
 
 // TrafficProfile defines statistical properties of traffic to mimic.
@@ -349,11 +354,16 @@ func (s *TrafficMorphStrategy) Connect(ctx context.Context, target string) (net.
 		// sequence counter matches the next byte on the wire.
 		profileName := []byte(s.profile.Name)
 		authToken := generateAuthToken(s.secret)
-		hs := make([]byte, 5+len(profileName)+32)
+		// Layout: MRPH(4) + nameLen(1) + name(N) + auth(32) + shaperID(1).
+		// The trailing shaperID byte is the wire-protocol v2 addition; servers
+		// that predate it ignore the extra byte, and a server that expects it
+		// reads 0 (noop) when an old client omits it.
+		hs := make([]byte, 5+len(profileName)+32+1)
 		copy(hs[0:4], []byte("MRPH"))
 		hs[4] = byte(len(profileName))
 		copy(hs[5:], profileName)
 		copy(hs[5+len(profileName):], authToken)
+		hs[5+len(profileName)+32] = s.shaperID
 		if _, err := tlsConn.Write(hs); err != nil {
 			tcpConn.Close()
 			return nil, fmt.Errorf("morph handshake write: %w", err)
@@ -391,7 +401,7 @@ func (s *TrafficMorphStrategy) Connect(ctx context.Context, target string) (net.
 	// For the baseStrat path the handshake goes through the underlying strategy
 	// transport via NewMorphedConnWithShaper as before.
 	if s.baseStrat != nil {
-		return NewMorphedConnWithShaper(baseConn, s.profile, s.secret, s.customShaper), nil
+		return newMorphedConnWithShaperID(baseConn, s.profile, s.secret, s.customShaper, s.shaperID), nil
 	}
 	sh := s.customShaper
 	if sh == nil {
@@ -406,8 +416,18 @@ func (s *TrafficMorphStrategy) Connect(ctx context.Context, target string) (net.
 
 // SetShaper injects a custom Shaper into all subsequent MorphedConn instances
 // produced by this strategy. nil reverts to the legacy passthrough shaper.
+// The negotiation ID is left at its zero value (noop); use SetShaperWithID to
+// also advertise a non-noop framing to the server.
 func (s *TrafficMorphStrategy) SetShaper(sh shaper.Shaper) {
 	s.customShaper = sh
+}
+
+// SetShaperWithID is SetShaper plus the 1-byte negotiation ID transmitted in
+// the MRPH handshake. id must match the shaper sh so the server reconstructs
+// the same framing; id 0 (noop) keeps the legacy wire format.
+func (s *TrafficMorphStrategy) SetShaperWithID(sh shaper.Shaper, id byte) {
+	s.customShaper = sh
+	s.shaperID = id
 }
 
 // MorphedConn wraps a connection with traffic morphing.
@@ -471,6 +491,13 @@ func NewMorphedConn(conn net.Conn, profile *TrafficProfile, secret []byte) *Morp
 // behavioral shaper. A nil sh defaults to shaper.NoopShaper, which keeps the
 // wire format and Write/Read pipeline byte-identical to the pre-shaper code.
 func NewMorphedConnWithShaper(conn net.Conn, profile *TrafficProfile, secret []byte, sh shaper.Shaper) *MorphedConn {
+	return newMorphedConnWithShaperID(conn, profile, secret, sh, 0)
+}
+
+// newMorphedConnWithShaperID is NewMorphedConnWithShaper plus the 1-byte
+// negotiation ID appended to the MRPH handshake. id 0 keeps the legacy wire
+// format byte-identical.
+func newMorphedConnWithShaperID(conn net.Conn, profile *TrafficProfile, secret []byte, sh shaper.Shaper, id byte) *MorphedConn {
 	if sh == nil {
 		sh = shaper.NoopShaper{}
 	}
@@ -481,21 +508,25 @@ func NewMorphedConnWithShaper(conn net.Conn, profile *TrafficProfile, secret []b
 	}
 
 	// --- TLS / handshake (do not touch in shaper migration) ---
-	// Send magic handshake so server recognizes Morph protocol
-	// Format: "MRPH" + profile name length (1 byte) + profile name + auth token (32 bytes)
+	// Send magic handshake so server recognizes Morph protocol.
+	// Layout: "MRPH" + nameLen(1) + name(N) + auth(32) + shaperID(1).
+	// The trailing shaperID byte is the wire-protocol v2 addition; pre-v2
+	// servers ignore it, and a v2 server reads 0 (noop) when an old client
+	// omits it.
 	magic := []byte("MRPH")
 	profileName := []byte(profile.Name)
 
 	// Generate auth token (same as HTTP/2 Stego)
 	authToken := generateAuthToken(secret)
 
-	handshake := make([]byte, 5+len(profileName)+32)
+	handshake := make([]byte, 5+len(profileName)+32+1)
 	copy(handshake[0:4], magic)
 	handshake[4] = byte(len(profileName))
 	copy(handshake[5:], profileName)
 	copy(handshake[5+len(profileName):], authToken)
+	handshake[5+len(profileName)+32] = id
 
-	log.Debug("Morph: sending handshake, secret_prefix=%x..., token=%x...", secret[:min(8, len(secret))], authToken[:8])
+	log.Debug("Morph: sending handshake, secret_prefix=%x..., token=%x..., shaperID=%d", secret[:min(8, len(secret))], authToken[:8], id)
 	conn.Write(handshake)
 
 	return mc

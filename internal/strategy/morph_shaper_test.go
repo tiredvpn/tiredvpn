@@ -52,7 +52,8 @@ func (f *fakeConn) writtenAfterHandshake(handshakeLen int) []byte {
 // newTestMorphedConn skips the real handshake's randomness and just
 // computes the handshake length so tests can read post-handshake bytes.
 func handshakeLen(profile *TrafficProfile) int {
-	return 5 + len(profile.Name) + 32
+	// wire-protocol v2: +1 byte for shaperID trailing the auth token
+	return 5 + len(profile.Name) + 32 + 1
 }
 
 // TestMorphedConn_NoopShaper_BackwardCompat: with default (nil) shaper the

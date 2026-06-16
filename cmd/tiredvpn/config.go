@@ -52,7 +52,24 @@ func applyClientTOMLConfig(cfg *client.Config, path string, fs *flag.FlagSet) er
 			return fmt.Errorf("shaper: %w", err)
 		}
 		cfg.Shaper = sh
+		// A custom (non-preset) shaper has no negotiation ID; the server
+		// cannot reconstruct an arbitrary distribution, so it stays noop on
+		// the wire. Named presets map to a stable ID.
+		cfg.ShaperID = byte(presets.IDForName(tcfg.Shaper.Preset))
 	}
+	return nil
+}
+
+// applyShaperFlag builds cfg.Shaper from the -shaper preset name and seed.
+// It also resolves the negotiation ID transmitted to the server so the
+// server-side morph relay reconstructs the same framing.
+func applyShaperFlag(cfg *client.Config, name string, seed int64) error {
+	sh, err := presets.ByName(name, seed)
+	if err != nil {
+		return fmt.Errorf("shaper %q: %w", name, err)
+	}
+	cfg.Shaper = sh
+	cfg.ShaperID = byte(presets.IDForName(name))
 	return nil
 }
 

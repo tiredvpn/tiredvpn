@@ -113,6 +113,10 @@ type Config struct {
 	// Shaper, when non-nil, is forwarded to the strategy manager and drives
 	// MorphedConn behaviour. Built from TOML [shaper] in cmd/tiredvpn.
 	Shaper shaper.Shaper
+
+	// ShaperID is the negotiation byte advertised to the server so it can
+	// reconstruct the same framing. Set alongside Shaper from the preset name.
+	ShaperID byte
 }
 
 // Run starts the client with the given configuration
@@ -252,6 +256,7 @@ func buildManager(cfg *Config, secret string) (*strategy.Manager, error) {
 		AndroidMode:        cfg.AndroidMode || cfg.MacOSMode,
 		PortHopping:        portHoppingCfg,
 		Shaper:             cfg.Shaper,
+		ShaperID:           cfg.ShaperID,
 	}
 	mgr := strategy.NewDefaultManager(mgrCfg)
 

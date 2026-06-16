@@ -933,6 +933,11 @@ type DefaultManagerConfig struct {
 	// drives sizing/inter-arrival in MorphedConn. nil keeps the legacy
 	// NoopShaper behaviour (wire-format unchanged).
 	Shaper shaper.Shaper
+
+	// ShaperID is the 1-byte value advertised to the server in the MRPH
+	// handshake so it can rebuild the matching framing. 0 (noop) keeps the
+	// legacy wire format. Ignored when Shaper is nil.
+	ShaperID byte
 }
 
 // NewDefaultManager creates a manager with all strategies pre-registered
@@ -1126,7 +1131,7 @@ func registerMorphStrategies(m *Manager, cfg DefaultManagerConfig, hasSecret boo
 	} {
 		strat := NewTrafficMorphStrategy(m, profile, nil, cfg.Secret)
 		if cfg.Shaper != nil {
-			strat.SetShaper(cfg.Shaper)
+			strat.SetShaperWithID(cfg.Shaper, cfg.ShaperID)
 		}
 		m.Register(strat)
 	}

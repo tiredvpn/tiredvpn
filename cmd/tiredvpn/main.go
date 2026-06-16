@@ -470,6 +470,10 @@ func runClient(args []string) {
 	fs.StringVar(&cfg.PortHopStrategy, "port-hop-strategy", "random", "Hop strategy: random, sequential, fibonacci")
 	fs.StringVar(&cfg.PortHopSeed, "port-hop-seed", "", "Seed for deterministic hopping (optional)")
 
+	// Traffic shaper for Morph strategies
+	shaperName := fs.String("shaper", "", "Traffic shaper preset for morph strategies (youtube_streaming, chrome_browsing, imap_sync, random_per_session)")
+	shaperSeed := fs.Int64("shaper-seed", 0, "Seed for deterministic shaper (0 = random)")
+
 	showVersion := fs.Bool("version", false, "Show version")
 
 	fs.Parse(args)
@@ -483,6 +487,15 @@ func runClient(args []string) {
 	if err := applyClientTOMLConfig(cfg, *configPath, fs); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
+	}
+
+	// Build shaper from -shaper flag last so an explicit CLI flag wins over
+	// any [shaper] section in the TOML (CLI > TOML precedence).
+	if *shaperName != "" {
+		if err := applyShaperFlag(cfg, *shaperName, *shaperSeed); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	if *showVersion {

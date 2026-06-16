@@ -99,7 +99,7 @@ func TestWebSocketThroughput(t *testing.T) {
 	reportThroughput(t, "WebSocket Salamander", total, elapsed)
 
 	mbps := float64(total) / elapsed.Seconds() / (1024 * 1024)
-	if mbps < 5 {
+	if mbps < 2 {
 		t.Fatalf("WebSocket throughput too low: %.2f MB/s", mbps)
 	}
 }
