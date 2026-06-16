@@ -391,8 +391,11 @@ func runClientWithContext(ctx context.Context, args []string) error {
 func parseClientArgs(args []string) (*client.Config, error) {
 	cfg := &client.Config{
 		AndroidMode: true,
-		TunMode:     true,
-		TunMTU:      1500,
+		// TUN is opt-in via -tun. The app's TUN path always passes -tun; proxy mode
+		// passes -listen instead and must NOT be forced into TUN (it has no tun-fd,
+		// so a forced TUN setup fails and proxy mode never starts).
+		TunMode: false,
+		TunMTU:  1500,
 	}
 
 	// Shaper preset/seed are captured during the scan and applied after the loop
@@ -413,6 +416,18 @@ func parseClientArgs(args []string) (*client.Config, error) {
 		case "-secret":
 			if i+1 < len(args) {
 				cfg.Secret = args[i+1]
+				i++
+			}
+		// Proxy mode: SOCKS5/HTTP listener (no -tun). Without this the app's
+		// proxy connection mode silently lost its listen address.
+		case "-listen":
+			if i+1 < len(args) {
+				cfg.ListenAddr = args[i+1]
+				i++
+			}
+		case "-http-listen":
+			if i+1 < len(args) {
+				cfg.HTTPListenAddr = args[i+1]
 				i++
 			}
 		case "-tun-ip":

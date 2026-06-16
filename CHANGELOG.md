@@ -7,6 +7,12 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-06-16
+
+### Fixed
+
+- **Proxy mode was unusable on the embedded/JNI client.** `parseClientArgs` defaulted `TunMode = true` and did not recognize `-listen`, so an embedded client started in proxy mode (no `-tun`, just `-listen`) was forced into TUN setup with no tun-fd and never came up. TUN is now opt-in via `-tun` (which the app's TUN path always passes), and `-listen` / `-http-listen` are parsed into `client.Config`.
+
 ## [1.2.1] - 2026-06-16
 
 ### Fixed
