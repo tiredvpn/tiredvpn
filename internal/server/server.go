@@ -1099,14 +1099,13 @@ func handleTLSConnectionLegacy(conn net.Conn, srvCtx *serverContext, connID uint
 // and the handover is lossless. The framer is rebuilt on the kTLS wrapper
 // for the relay phase; the HPACK decoder state is carried over unchanged.
 func handleHTTP2WithALPN(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
-	logger.Debug("HTTP/2 via ALPN — kTLS upgrade deferred until after auth")
+	logger.Debug("HTTP/2 via ALPN")
 
 	// Read the preface through the TLS stack.
 	if err := readH2Preface(conn, logger); err != nil {
 		return
 	}
 
-	// Auth phase still runs over the TLS stack (no kTLS yet).
 	framer, err := newH2Framer(conn, logger)
 	if err != nil {
 		return
@@ -1118,31 +1117,19 @@ func handleHTTP2WithALPN(conn net.Conn, srvCtx *serverContext, logger *log.Logge
 	var tunnel *h2TunnelState
 	var connTracked bool
 
-	// kTLS handover fires exactly once, the moment auth succeeds: the socket
-	// moves to the kernel and the framer is rebuilt on the new wrapper. Any
-	// connection tracking registered against the pre-swap conn is repointed.
-	handover := func(authedConn net.Conn) (net.Conn, *http2.Framer) {
-		preSwap := authedConn
-		swapped := ktls.TryEnable(authedConn, "tired-stego")
-		if swapped != preSwap {
-			if connTracked && srvCtx.registry != nil && authClientID != "" {
-				srvCtx.registry.SwapConn(authClientID, preSwap, swapped)
-			}
-			// Rebuild the framer on the kTLS wrapper. ReadFrame never reads
-			// past a single frame, so no client bytes are buffered inside the
-			// old framer; the client is parked in waitForServerAck so the TLS
-			// stack buffer is empty too.
-			newFramer := http2.NewFramer(swapped, swapped)
-			newFramer.AllowIllegalReads = true
-			newFramer.AllowIllegalWrites = true
-			return swapped, newFramer
-		}
-		return authedConn, framer
-	}
+	// kTLS handover is intentionally disabled for the stego path.
+	//
+	// On loopback (and on fast links in general) the client pipelines relay
+	// frames immediately after the auth HEADERS before the server's handover
+	// has completed. The http2.Framer / tls.Conn pair buffers those TLS
+	// records in userspace; when the kernel takes over the raw socket its RX
+	// sequence counter is already behind → EBADMSG → RST. Staying on the
+	// userspace TLS stack for the full session avoids the sequence-number
+	// desync with no correctness impact (kTLS is only a CPU optimisation).
 
 	defer func() { cleanupH2Conn(conn, srvCtx, &tunnel, &connTracked, &authClientID) }()
 
-	runH2FrameLoop(&conn, &framer, hpackDec, srvCtx, logger, &authenticated, &authClientID, &connTracked, &tunnel, handover)
+	runH2FrameLoop(&conn, &framer, hpackDec, srvCtx, logger, &authenticated, &authClientID, &connTracked, &tunnel, nil)
 }
 
 // handleMorphConnectionWithALPN handles Morph protocol when ALPN was used
