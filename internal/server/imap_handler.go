@@ -117,7 +117,7 @@ func imapServerHandshake(conn net.Conn, srvCtx *serverContext, logger *log.Logge
 	if _, err := conn.Write([]byte(strategy.IMAPPostLoginCaps())); err != nil {
 		return "", nil, err
 	}
-	if _, err := conn.Write([]byte(fmt.Sprintf("%s OK [CAPABILITY %s] Logged in\r\n", loginTag, strategy.IMAPCapsInline()))); err != nil {
+	if _, err := fmt.Fprintf(conn, "%s OK [CAPABILITY %s] Logged in\r\n", loginTag, strategy.IMAPCapsInline()); err != nil {
 		return "", nil, err
 	}
 

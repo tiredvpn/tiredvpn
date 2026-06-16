@@ -142,7 +142,7 @@ func performIMAPClientHandshake(conn net.Conn, secret []byte) (*bufio.Reader, er
 	user := imapUsername(secret)
 	token := GenerateIMAPAuthToken(secret)
 	pw := base64.StdEncoding.EncodeToString(token)
-	if _, err := conn.Write([]byte(fmt.Sprintf("A002 LOGIN %s %s\r\n", user, pw))); err != nil {
+	if _, err := fmt.Fprintf(conn, "A002 LOGIN %s %s\r\n", user, pw); err != nil {
 		return nil, err
 	}
 	if err := readIMAPUntilTagged(br, "A002"); err != nil {

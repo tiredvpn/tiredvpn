@@ -225,7 +225,7 @@ func fakeIMAPServerHandshake(conn net.Conn, secret []byte) error {
 	if _, err := conn.Write([]byte(IMAPPostLoginCaps())); err != nil {
 		return err
 	}
-	if _, err := conn.Write([]byte(fmt.Sprintf("%s OK [CAPABILITY %s] Logged in\r\n", fields[0], IMAPCapsInline()))); err != nil {
+	if _, err := fmt.Fprintf(conn, "%s OK [CAPABILITY %s] Logged in\r\n", fields[0], IMAPCapsInline()); err != nil {
 		return err
 	}
 
