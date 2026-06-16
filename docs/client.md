@@ -194,7 +194,9 @@ Disable fallback with `-fallback=false` if you want to stay on the forced `-stra
 |------|---------|-------------|
 | `-benchmark` | `false` | Test all strategies: latency only |
 | `-benchmark-full` | `false` | Full benchmark: HTTP, latency, throughput, IP change |
-| `-benchmark-all` | `false` | Exhaustive: all strategies × all RTT profiles (78 combinations) |
+| `-benchmark-all` | `false` | Exhaustive: all strategies x all RTT profiles (78 combinations) |
+| `-benchmark-json` | `false` | Run benchmark for one strategy, output JSON result to stdout (logs go to stderr) |
+| `-shaper-seed` | `0` | Deterministic seed for shaper randomization (0 = random) |
 
 ```bash
 # Quick latency test
@@ -268,6 +270,7 @@ Enable via `[shaper]` in TOML. Available presets:
 | `youtube_streaming`    | HD video streaming mimicry          | sleep-bound   | bulk transfer caps in single-digit MB/s  |
 | `random_per_session`   | rotates basis preset per connection | sleep-bound   | hardest to fingerprint, same caveat      |
 | `bittorrent_idle`      | cover traffic only                  | n/a           | rejected in data plane (median ~7 s)     |
+| `imap_sync`            | IMAP desktop client cadence         | n/a           | DataPlaneSafe=false - cover traffic only, not for real data plane (LogNormal inter-arrival ~36s median) |
 
 Recommendation: start with `chrome_browsing`. Switch to
 `random_per_session` when you specifically need the rotation property

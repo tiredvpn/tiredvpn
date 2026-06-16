@@ -190,6 +190,7 @@ TiredVPN is configured entirely via CLI flags. Run `tiredvpn server -help` or
 | `-no-quic` | `false` | Disable QUIC/UDP listener |
 | `-upstream` | | Upstream server for multi-hop |
 | `-fake-root` | `./www` | Directory served to unauthenticated visitors |
+| `-enable-icmp` | `false` | Enable ICMP tunnel listener (requires CAP_NET_RAW) |
 | `-debug` | `false` | Verbose logging |
 
 ### Client flags
@@ -236,7 +237,7 @@ Pre-built images are available on Docker Hub. Platforms: `linux/amd64`, `linux/a
 | Tag | Description |
 |-----|-------------|
 | `latest` | Latest stable release |
-| `1.0.0` | Pinned version |
+| `1.2.0` | Pinned version |
 | `edge` | Latest main branch build |
 
 ### Run the server
@@ -369,6 +370,8 @@ best transport. Each strategy targets a different aspect of DPI evasion.
 | `state_exhaustion` | State Exhaustion | Floods DPI state table with decoys to trigger fail-open mode |
 | `mesh_relay` | Mesh Relay | Routes through relay nodes in regions with lighter filtering |
 | `icmp_tunnel` | ICMP Tunnel | Backup tunnel over ICMP Echo (stealth mode, requires CAP_NET_RAW) |
+| `ssh_camouflage` | SSH Camouflage | Tunnel under SSH traffic (priority 28, requires server support) |
+| `imap_camouflage` | IMAP Camouflage | Tunnel under IMAP mail protocol (priority 29, requires server support) |
 
 The strategy engine supports:
 

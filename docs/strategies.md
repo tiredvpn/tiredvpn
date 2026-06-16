@@ -25,6 +25,8 @@ TiredVPN implements 20+ DPI evasion strategies. The adaptive strategy engine aut
 | `antiprobe` | Anti-Probe | TLS/TCP | Serves real website; reveals tunnel only to auth clients | Medium |
 | `state_exhaustion` | State Exhaustion | TCP | Floods DPI state table with decoy streams | Low |
 | `mesh_relay` | Mesh Relay | TCP/UDP | Routes through relay nodes in lighter-filtered regions | Variable |
+| `ssh_camouflage` | SSH Camouflage | TCP | Masquerades as SSH session; correct banner + KEXINIT, then data in SSH packet framing (type 0xFF); HMAC-SHA256 auth with 300s time window | 28 |
+| `imap_camouflage` | IMAP Camouflage | TCP | Masquerades as IMAP mailbox sync; data in FETCH responses and APPEND literals; HMAC-SHA256 auth | 29 |
 | `icmp_tunnel` | ICMP Tunnel | ICMP | Backup tunnel over ICMP Echo/Reply | Emergency |
 
 To see the full list on your binary:
@@ -157,20 +159,20 @@ tiredvpn client -server host:443 -secret <s> -benchmark-full
 tiredvpn client -server host:443 -secret <s> -benchmark-all
 ```
 
-Sample output:
+Sample output (success rate depends on the censor and is not shown - run on your own network path to get meaningful numbers):
 
 ```
 Strategy Benchmark Results:
-┌─────────────────────┬──────────┬─────────┬───────────┐
-│ Strategy            │ Latency  │ Success │ Throughput│
-├─────────────────────┼──────────┼─────────┼───────────┤
-│ quic_salamander     │  45ms    │  100%   │  98 Mbps  │
-│ quic                │  48ms    │  100%   │  95 Mbps  │
-│ http2_stego         │  52ms    │  100%   │  87 Mbps  │
-│ reality             │  55ms    │  100%   │  89 Mbps  │
-│ websocket_padded    │  61ms    │   95%   │  72 Mbps  │
-│ icmp_tunnel         │ 120ms    │   80%   │  31 Mbps  │
-└─────────────────────┴──────────┴─────────┴───────────┘
+┌─────────────────────┬──────────┬───────────┐
+│ Strategy            │ Latency  │ Throughput│
+├─────────────────────┼──────────┼───────────┤
+│ quic_salamander     │  45ms    │  98 Mbps  │
+│ quic                │  48ms    │  95 Mbps  │
+│ http2_stego         │  52ms    │  87 Mbps  │
+│ reality             │  55ms    │  89 Mbps  │
+│ websocket_padded    │  61ms    │  72 Mbps  │
+│ icmp_tunnel         │ 120ms    │  31 Mbps  │
+└─────────────────────┴──────────┴───────────┘
 ```
 
 ## Strategy Details
@@ -196,6 +198,20 @@ Best against: Iran's HTTP inspection, sophisticated DPI.
 ### Geneva Engine
 
 Integrates the [Geneva](https://geneva.cs.umd.edu) censorship circumvention engine. Applies country-specific packet manipulation rules (fragment, duplicate, send out-of-order) that have been shown to confuse DPI implementations in specific countries.
+
+On Linux with `CAP_NET_ADMIN`, Geneva uses NFQUEUE to inject raw packets directly into the network stack. On non-Linux systems and without the required capability, it falls back to byte-level fragmentation of the TLS ClientHello.
+
+### SSH Camouflage
+
+Masquerades the tunnel as a real SSH session. The client sends a correct SSH banner (`SSH-2.0-OpenSSH_8.9`) and a synthetic KEXINIT packet, then wraps tunnel data in SSH binary packet framing with message type `0xFF`. The server authenticates the connection via HMAC-SHA256 over a shared token, accepting timestamps within a 300-second window.
+
+RequiresServer: yes.
+
+### IMAP Camouflage
+
+Masquerades the tunnel as IMAP mailbox synchronization. Tunnel data is carried inside FETCH response bodies and APPEND literals, following the IMAP4rev1 wire format closely enough to pass shallow inspection. Authentication uses the same HMAC-SHA256 scheme as SSH Camouflage.
+
+RequiresServer: yes.
 
 ### ICMP Tunnel
 

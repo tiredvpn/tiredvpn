@@ -110,10 +110,13 @@ Client → Server A (relay) → Server B (upstream/exit) → Internet
 | `-fake-root` | `./www` | Directory served as a fake website to unauthenticated visitors |
 | `-tun-ip` | `10.8.0.1` | TUN interface IP address on the server side |
 | `-tun-name` | `tiredvpn0` | TUN interface name |
+| `-enable-icmp` | `false` | Enable ICMP tunnel listener (requires CAP_NET_RAW) |
 | `-pprof` | | Enable pprof profiling endpoint (e.g., `:6060`) |
 | `-version` | | Print version and exit |
 
 The fake website (`-fake-root`) is what any DPI probe or direct browser sees when connecting without a valid auth token. Put static HTML files there to mimic a real web service.
+
+At startup the server reads `/proc/self/status` to check available Linux capabilities. If `CAP_NET_RAW` is absent, the ICMP listener is silently skipped - no error, no crash.
 
 ## Configuration via TOML (preferred)
 
