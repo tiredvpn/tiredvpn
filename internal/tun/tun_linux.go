@@ -39,6 +39,20 @@ type TUNDevice struct {
 	localIP  net.IP
 	remoteIP net.IP
 	routes   []string
+
+	// addedRoutes records the destinations actually installed on this link so
+	// teardown can remove exactly its own routes (netlink.RouteDel) instead of
+	// relying on the kernel's cascade delete from LinkDel. On a multi-tunnel
+	// host that cascade is fine, but explicit scoped deletion keeps cleanup
+	// from ever touching the main table / default route or another tunnel.
+	addedRoutes []*net.IPNet
+}
+
+// mssTableName returns the per-interface nftables table name for MSS clamping.
+// It is scoped to the interface so tearing down one tunnel never deletes the
+// clamping table of another tunnel sharing the same host.
+func mssTableName(ifName string) string {
+	return nftablesTableName + "-" + ifName
 }
 
 func CreateTUN(name string, mtu int) (*TUNDevice, error) {
@@ -104,6 +118,13 @@ func (t *TUNDevice) Close() error {
 		}
 	}
 
+	// Remove only the routes this device installed, before deleting the link.
+	// This avoids relying on LinkDel's cascade delete and guarantees teardown
+	// never disturbs the main table / default route or another tunnel.
+	if t.name != "" && len(t.addedRoutes) > 0 {
+		t.delRoutes()
+	}
+
 	t.file.SetReadDeadline(time.Now())
 
 	err := t.file.Close()
@@ -118,6 +139,24 @@ func (t *TUNDevice) Close() error {
 	}
 
 	return err
+}
+
+// delRoutes removes the routes recorded in t.addedRoutes from this link. Only
+// destinations scoped to this interface's index are deleted, so cleanup cannot
+// touch routes owned by the host or by other tunnels.
+func (t *TUNDevice) delRoutes() {
+	link, err := netlink.LinkByName(t.name)
+	if err != nil {
+		log.Warn("Cannot delete routes, link %s lookup failed: %v", t.name, err)
+		return
+	}
+	idx := link.Attrs().Index
+	for _, dst := range t.addedRoutes {
+		if err := netlink.RouteDel(&netlink.Route{LinkIndex: idx, Dst: dst}); err != nil {
+			log.Debug("Failed to delete route %s on %s: %v", dst, t.name, err)
+		}
+	}
+	t.addedRoutes = nil
 }
 
 func (t *TUNDevice) File() *os.File {
@@ -197,6 +236,7 @@ func (t *TUNDevice) addRoutes(link netlink.Link, routes []string) {
 			log.Warn("Failed to parse route %s: %v", route, err)
 			continue
 		}
+		t.trackRoute(dst)
 		if err := netlink.RouteAdd(&netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst}); err != nil {
 			log.Warn("Failed to add route %s: %v", route, err)
 		}
@@ -205,6 +245,17 @@ func (t *TUNDevice) addRoutes(link netlink.Link, routes []string) {
 		log.Error("%d of %d routes invalid, not added to %s: %v",
 			len(invalid), len(routes), t.name, invalid)
 	}
+}
+
+// trackRoute records dst in t.addedRoutes for scoped teardown, deduping so
+// reconnect re-adds do not grow the list unbounded.
+func (t *TUNDevice) trackRoute(dst *net.IPNet) {
+	for _, existing := range t.addedRoutes {
+		if existing.String() == dst.String() {
+			return
+		}
+	}
+	t.addedRoutes = append(t.addedRoutes, dst)
 }
 
 // reAddRoutes re-installs t.routes after an address change, normalizing bare
@@ -223,6 +274,7 @@ func (t *TUNDevice) reAddRoutes(link netlink.Link, reason string) {
 			log.Warn("Failed to parse route %s: %v", route, err)
 			continue
 		}
+		t.trackRoute(dst)
 		if err := netlink.RouteAdd(&netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst}); err != nil {
 			log.Warn("Failed to re-add route %s: %v", route, err)
 		} else {
@@ -343,7 +395,10 @@ func (t *TUNDevice) UpdateLocalIP(newLocalIP net.IP) error {
 	return nil
 }
 
-// nftablesTableName is the nftables table created for MSS clamping rules.
+// nftablesTableName is the prefix for the per-interface nftables tables created
+// for MSS clamping rules. The actual table name is derived per interface via
+// mssTableName (e.g. "tiredvpn-tiredvpn0") so tearing down one tunnel never
+// deletes the clamping table of another tunnel on the same host.
 const nftablesTableName = "tiredvpn"
 
 // ifnamePad pads an interface name to 16 bytes (IFNAMSIZ) as required by nftables.
@@ -416,8 +471,9 @@ func mssRule(ifName string, mtu int) []expr.Any {
 }
 
 // addMSSClamping installs nftables rules for TCP MSS clamping on ifName.
-// Creates table "tiredvpn" (IPv4, filter/forward/mangle priority) with two rules:
-// one matching outbound (oifname) and one matching inbound (iifname) on ifName.
+// Creates a per-interface table mssTableName(ifName) (IPv4, filter/forward/
+// mangle priority) with two rules: one matching outbound (oifname) and one
+// matching inbound (iifname) on ifName.
 // Non-fatal: logs a warning and returns nil if nftables is unavailable.
 func addMSSClamping(ifName string, mtu int) error {
 	conn, err := nftables.New()
@@ -428,7 +484,7 @@ func addMSSClamping(ifName string, mtu int) error {
 
 	tbl := conn.AddTable(&nftables.Table{
 		Family: nftables.TableFamilyIPv4,
-		Name:   nftablesTableName,
+		Name:   mssTableName(ifName),
 	})
 
 	chain := conn.AddChain(&nftables.Chain{
@@ -520,7 +576,9 @@ func chainPolicyAcceptPtr() *nftables.ChainPolicy {
 	return &p
 }
 
-// removeMSSClamping deletes the "tiredvpn" nftables table, removing all MSS clamping rules.
+// removeMSSClamping deletes this interface's per-interface nftables table
+// (mssTableName(ifName)), removing only its own MSS clamping rules and leaving
+// other tunnels' tables untouched.
 // Non-fatal: logs a warning and returns nil if the operation fails.
 func removeMSSClamping(ifName string) error {
 	conn, err := nftables.New()
@@ -531,7 +589,7 @@ func removeMSSClamping(ifName string) error {
 
 	conn.DelTable(&nftables.Table{
 		Family: nftables.TableFamilyIPv4,
-		Name:   nftablesTableName,
+		Name:   mssTableName(ifName),
 	})
 
 	if err := conn.Flush(); err != nil {
@@ -539,6 +597,6 @@ func removeMSSClamping(ifName string) error {
 		return nil
 	}
 
-	log.Debug("nftables MSS clamping table %q removed", nftablesTableName)
+	log.Debug("nftables MSS clamping table %q removed", mssTableName(ifName))
 	return nil
 }
