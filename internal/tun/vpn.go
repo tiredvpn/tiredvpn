@@ -85,6 +85,11 @@ type VPNClient struct {
 	mu           sync.Mutex
 	lastActive   time.Time // Track last activity for keepalive
 
+	// connCancel cancels the context of an in-flight connect() so Stop() can
+	// abort a dial/handshake that is blocked on the network without waiting
+	// for v.mu (connect no longer holds v.mu while dialing). Accessed atomically.
+	connCancel atomic.Pointer[context.CancelFunc]
+
 	// Server capabilities (received during handshake)
 	serverCaps ServerCapabilities
 
@@ -359,42 +364,122 @@ func (v *VPNClient) performHandshake(conn net.Conn) error {
 	return nil
 }
 
-// connect establishes connection to server
-func (v *VPNClient) connect(ctx context.Context) error {
-	v.mu.Lock()
-	defer v.mu.Unlock()
+// connect establishes connection to server.
+//
+// The dial and handshake run WITHOUT holding v.mu so that Stop() can abort an
+// in-flight connect immediately (via connCancel + the conn deadline) instead of
+// blocking on the mutex until a 10-30s network timeout elapses. v.mu is taken
+// only briefly: at the start to snapshot localIP and close the old conn, and at
+// the end to publish the new conn/strategy/caps.
+func (v *VPNClient) connect(parent context.Context) error {
+	// Register a cancellable context so Stop() can abort the dial without v.mu.
+	ctx, cancel := context.WithCancel(parent)
+	cancelPtr := &cancel
+	v.connCancel.Store(cancelPtr)
+	defer func() {
+		// Only clear our own cancel pointer (Stop may have swapped/cancelled).
+		v.connCancel.CompareAndSwap(cancelPtr, nil)
+		cancel()
+	}()
 
-	// Close existing connection
-	if v.conn != nil {
-		v.conn.Close()
+	// If Stop already fired, bail before opening anything.
+	if atomic.LoadInt32(&v.running) == 0 {
+		return context.Canceled
 	}
 
-	// Connect via strategy manager
+	// Close any existing connection before dialing a new one.
+	v.mu.Lock()
+	oldConn := v.conn
+	v.conn = nil
+	localIP := v.localIP
+	v.mu.Unlock()
+	if oldConn != nil {
+		oldConn.Close()
+	}
+
+	// Connect via strategy manager (no lock held — may block on the network).
 	conn, strat, err := v.manager.Connect(ctx, v.serverAddr)
 	if err != nil {
 		return err
 	}
 
+	// Perform the TUN-mode handshake on local variables (still no lock).
+	resp, n, err := v.doHandshake(conn, localIP)
+	if err != nil {
+		conn.Close()
+		return err
+	}
+
+	// Server sends its TUN IP and assigned client IP.
+	serverIP := net.IP(resp[1:5])
+	assignedIP := net.IP(resp[5:9])
+	log.Info("VPN connected via %s (server IP: %s, assigned IP: %s)", strat.Name(), serverIP, assignedIP)
+
+	// Enable raw mode for ConfusedConn - VPN mode handles framing itself.
+	// Without this, ConfusedConn.Read() strips length prefix, then vpn.go tries to read it again.
+	if confusedConn, ok := conn.(*strategy.ConfusedConn); ok {
+		confusedConn.SetRawMode(true)
+		log.Debug("Enabled raw mode for ConfusedConn (VPN mode)")
+	}
+
+	caps, hasCaps := parseServerCapabilities(resp, n)
+
+	// Publish the new connection under the lock. If Stop() ran while we were
+	// dialing, abandon the freshly built conn instead of resurrecting the tunnel.
+	v.mu.Lock()
+	if atomic.LoadInt32(&v.running) == 0 {
+		v.mu.Unlock()
+		conn.Close()
+		return context.Canceled
+	}
 	v.conn = conn
 	v.strategy = strat
+	if hasCaps {
+		v.serverCaps = caps
+	}
 
-	// Send TUN mode handshake
+	// Update local IP if the server assigned a different one (mutates v.localIP
+	// and the TUN device, so it stays under the lock).
+	if !assignedIP.Equal(v.localIP) && !assignedIP.Equal(net.IPv4zero) {
+		log.Info("Server assigned IP: %s (requested: %s)", assignedIP, v.localIP)
+		v.localIP = assignedIP
+		if err := v.tun.UpdateLocalIP(assignedIP); err != nil {
+			log.Warn("Failed to update TUN local IP: %v", err)
+		}
+	}
+
+	// Update TUN peer IP if it changed.
+	if !serverIP.Equal(v.tun.remoteIP) {
+		log.Info("Updating TUN peer IP from %s to %s", v.tun.remoteIP, serverIP)
+		if err := v.tun.UpdatePeerIP(serverIP); err != nil {
+			log.Warn("Failed to update TUN peer IP: %v", err)
+		}
+	}
+	v.mu.Unlock()
+
+	return nil
+}
+
+// doHandshake writes the TUN-mode handshake and reads the server response.
+// It runs without holding v.mu and returns the raw response buffer and its
+// length for the caller to parse.
+func (v *VPNClient) doHandshake(conn net.Conn, localIP net.IP) ([]byte, int, error) {
+	// Send TUN mode handshake.
 	// Format: [mode:1][localIP:4][mtu:2][version:1]
-	// If localIP is 0.0.0.0, server will auto-assign an IP
+	// If localIP is 0.0.0.0, server will auto-assign an IP.
 	// version=0x02 means client supports full port hopping config (interval, strategy, seed)
 	handshake := make([]byte, 8)
 	handshake[0] = 0x02 // TUN mode
-	copy(handshake[1:5], v.localIP.To4())
+	copy(handshake[1:5], localIP.To4())
 	binary.BigEndian.PutUint16(handshake[5:7], uint16(v.tun.mtu))
 	handshake[7] = 0x02 // Version 2: supports full port hopping config
 
 	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	if _, err := conn.Write(handshake); err != nil {
-		conn.Close()
-		return err
+		return nil, 0, err
 	}
 
-	// Read server response
+	// Read server response.
 	// Legacy (9 bytes): [status:1][serverIP:4][clientIP:4]
 	// Extended v1 (14 bytes): [status:1][serverIP:4][clientIP:4][flags:1][portStart:2][portEnd:2]
 	// Extended v2 (20+ bytes): [status:1][serverIP:4][clientIP:4][flags:1][portStart:2][portEnd:2][hopInterval:4][strategy:1][seedLen:1][seed:0-32]
@@ -402,108 +487,81 @@ func (v *VPNClient) connect(ctx context.Context) error {
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	n, err := conn.Read(resp)
 	if err != nil {
-		conn.Close()
-		return err
+		return nil, 0, err
 	}
 	if n < 9 {
-		conn.Close()
-		return fmt.Errorf("invalid server response: got %d bytes, expected at least 9", n)
+		return nil, 0, fmt.Errorf("invalid server response: got %d bytes, expected at least 9", n)
 	}
-
 	if resp[0] != 0x00 {
-		conn.Close()
 		switch resp[0] {
 		case 0x01:
-			return fmt.Errorf("server error: IP pool exhausted")
+			return nil, 0, fmt.Errorf("server error: IP pool exhausted")
 		case 0x02:
-			return fmt.Errorf("server error: no IP pool configured (auto IP not supported)")
+			return nil, 0, fmt.Errorf("server error: no IP pool configured (auto IP not supported)")
 		default:
-			return fmt.Errorf("server error: status=%d", resp[0])
+			return nil, 0, fmt.Errorf("server error: status=%d", resp[0])
 		}
 	}
+	return resp, n, nil
+}
 
-	// Server sends its TUN IP and assigned client IP
-	serverIP := net.IP(resp[1:5])
-	assignedIP := net.IP(resp[5:9])
-	log.Info("VPN connected via %s (server IP: %s, assigned IP: %s)", strat.Name(), serverIP, assignedIP)
-
-	// Update local IP if server assigned a different one
-	if !assignedIP.Equal(v.localIP) && !assignedIP.Equal(net.IPv4zero) {
-		log.Info("Server assigned IP: %s (requested: %s)", assignedIP, v.localIP)
-		v.localIP = assignedIP
-		// Update TUN device with new local IP
-		if err := v.tun.UpdateLocalIP(assignedIP); err != nil {
-			log.Warn("Failed to update TUN local IP: %v", err)
-		}
+// parseServerCapabilities decodes the optional port-hopping capabilities from a
+// handshake response. The second return value reports whether any capabilities
+// were present.
+func parseServerCapabilities(resp []byte, n int) (ServerCapabilities, bool) {
+	if n < 14 {
+		return ServerCapabilities{}, false
 	}
 
-	// Update TUN peer IP if it changed
-	if !serverIP.Equal(v.tun.remoteIP) {
-		log.Info("Updating TUN peer IP from %s to %s", v.tun.remoteIP, serverIP)
-		if err := v.tun.UpdatePeerIP(serverIP); err != nil {
-			log.Warn("Failed to update TUN peer IP: %v", err)
-		}
+	flags := resp[9]
+	portStart := int(binary.BigEndian.Uint16(resp[10:12]))
+	portEnd := int(binary.BigEndian.Uint16(resp[12:14]))
+	if flags&0x01 == 0 || portStart <= 0 || portEnd <= portStart {
+		return ServerCapabilities{}, false
 	}
 
-	// Parse extended capabilities if server sent them
-	if n >= 14 {
-		flags := resp[9]
-		portStart := int(binary.BigEndian.Uint16(resp[10:12]))
-		portEnd := int(binary.BigEndian.Uint16(resp[12:14]))
-
-		if flags&0x01 != 0 && portStart > 0 && portEnd > portStart {
-			v.serverCaps = ServerCapabilities{
-				PortHoppingEnabled: true,
-				PortRangeStart:     portStart,
-				PortRangeEnd:       portEnd,
-				HopIntervalSec:     60,       // Default
-				HopStrategy:        "random", // Default
-			}
-
-			// Parse extended v2 fields if available (20+ bytes)
-			if n >= 20 {
-				hopInterval := int(binary.BigEndian.Uint32(resp[14:18]))
-				strategyByte := resp[18]
-				seedLen := int(resp[19])
-
-				if hopInterval > 0 {
-					v.serverCaps.HopIntervalSec = hopInterval
-				}
-
-				// Decode strategy
-				switch strategyByte {
-				case 0x00:
-					v.serverCaps.HopStrategy = "random"
-				case 0x01:
-					v.serverCaps.HopStrategy = "sequential"
-				case 0x02:
-					v.serverCaps.HopStrategy = "fibonacci"
-				}
-
-				// Parse seed if present
-				if seedLen > 0 && n >= 20+seedLen && seedLen <= 32 {
-					v.serverCaps.HopSeed = make([]byte, seedLen)
-					copy(v.serverCaps.HopSeed, resp[20:20+seedLen])
-					log.Info("Server advertises port hopping: range %d-%d, interval %ds, strategy %s, seed_len %d",
-						portStart, portEnd, v.serverCaps.HopIntervalSec, v.serverCaps.HopStrategy, seedLen)
-				} else {
-					log.Info("Server advertises port hopping: range %d-%d, interval %ds, strategy %s",
-						portStart, portEnd, v.serverCaps.HopIntervalSec, v.serverCaps.HopStrategy)
-				}
-			} else {
-				log.Info("Server advertises port hopping: range %d-%d (v1 response)", portStart, portEnd)
-			}
-		}
+	caps := ServerCapabilities{
+		PortHoppingEnabled: true,
+		PortRangeStart:     portStart,
+		PortRangeEnd:       portEnd,
+		HopIntervalSec:     60,       // Default
+		HopStrategy:        "random", // Default
 	}
 
-	// Enable raw mode for ConfusedConn - VPN mode handles framing itself
-	// Without this, ConfusedConn.Read() strips length prefix, then vpn.go tries to read it again
-	if confusedConn, ok := conn.(*strategy.ConfusedConn); ok {
-		confusedConn.SetRawMode(true)
-		log.Debug("Enabled raw mode for ConfusedConn (VPN mode)")
+	// Parse extended v2 fields if available (20+ bytes).
+	if n < 20 {
+		log.Info("Server advertises port hopping: range %d-%d (v1 response)", portStart, portEnd)
+		return caps, true
 	}
 
-	return nil
+	hopInterval := int(binary.BigEndian.Uint32(resp[14:18]))
+	strategyByte := resp[18]
+	seedLen := int(resp[19])
+
+	if hopInterval > 0 {
+		caps.HopIntervalSec = hopInterval
+	}
+
+	switch strategyByte {
+	case 0x00:
+		caps.HopStrategy = "random"
+	case 0x01:
+		caps.HopStrategy = "sequential"
+	case 0x02:
+		caps.HopStrategy = "fibonacci"
+	}
+
+	if seedLen > 0 && n >= 20+seedLen && seedLen <= 32 {
+		caps.HopSeed = make([]byte, seedLen)
+		copy(caps.HopSeed, resp[20:20+seedLen])
+		log.Info("Server advertises port hopping: range %d-%d, interval %ds, strategy %s, seed_len %d",
+			portStart, portEnd, caps.HopIntervalSec, caps.HopStrategy, seedLen)
+	} else {
+		log.Info("Server advertises port hopping: range %d-%d, interval %ds, strategy %s",
+			portStart, portEnd, caps.HopIntervalSec, caps.HopStrategy)
+	}
+
+	return caps, true
 }
 
 // GetServerCapabilities returns capabilities received from server during handshake
@@ -950,7 +1008,14 @@ func (v *VPNClient) Stop() {
 
 	close(v.stopCh)
 
-	// Set immediate deadline to unblock any blocking reads before closing
+	// Abort any in-flight connect() dial/handshake. connect() does NOT hold
+	// v.mu while dialing, so cancelling its context (and, below, closing the
+	// conn) lets Stop() proceed without waiting on a 10-30s network timeout.
+	if cancel := v.connCancel.Swap(nil); cancel != nil {
+		(*cancel)()
+	}
+
+	// Set immediate deadline to unblock any blocking reads before closing.
 	v.mu.Lock()
 	if v.conn != nil {
 		v.conn.SetDeadline(time.Now()) // Force immediate timeout
