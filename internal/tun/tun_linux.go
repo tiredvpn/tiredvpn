@@ -163,16 +163,7 @@ func (t *TUNDevice) Configure(localIP, remoteIP net.IP, routes []string) error {
 		}
 	}
 
-	for _, route := range routes {
-		_, dst, err := net.ParseCIDR(route)
-		if err != nil {
-			log.Warn("Failed to parse route %s: %v", route, err)
-			continue
-		}
-		if err := netlink.RouteAdd(&netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst}); err != nil {
-			log.Warn("Failed to add route %s: %v", route, err)
-		}
-	}
+	t.addRoutes(link, routes)
 
 	mss := t.mtu - 40
 	if mss > 0 {
@@ -185,6 +176,59 @@ func (t *TUNDevice) Configure(localIP, remoteIP net.IP, routes []string) error {
 
 	log.Info("TUN device %s configured: local=%s, remote=%s", t.name, localIP, remoteIP)
 	return nil
+}
+
+// addRoutes installs the given routes on the link, normalizing bare IPs to
+// host CIDRs (/32, /128). Invalid routes are skipped rather than aborting the
+// whole tunnel, but their count is reported at ERROR level so a misconfigured
+// -tun-routes does not fail silently and leak traffic outside the tunnel.
+func (t *TUNDevice) addRoutes(link netlink.Link, routes []string) {
+	var invalid []string
+	for _, route := range routes {
+		cidr, err := normalizeRoute(route)
+		if err != nil {
+			invalid = append(invalid, route)
+			log.Warn("Failed to parse route %s: %v", route, err)
+			continue
+		}
+		_, dst, err := net.ParseCIDR(cidr)
+		if err != nil {
+			invalid = append(invalid, route)
+			log.Warn("Failed to parse route %s: %v", route, err)
+			continue
+		}
+		if err := netlink.RouteAdd(&netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst}); err != nil {
+			log.Warn("Failed to add route %s: %v", route, err)
+		}
+	}
+	if len(invalid) > 0 {
+		log.Error("%d of %d routes invalid, not added to %s: %v",
+			len(invalid), len(routes), t.name, invalid)
+	}
+}
+
+// reAddRoutes re-installs t.routes after an address change, normalizing bare
+// IPs the same way addRoutes does. It logs at debug level since this runs on
+// every reconnect/IP update; hard failures are already surfaced by addRoutes
+// at configure time.
+func (t *TUNDevice) reAddRoutes(link netlink.Link, reason string) {
+	for _, route := range t.routes {
+		cidr, err := normalizeRoute(route)
+		if err != nil {
+			log.Warn("Failed to parse route %s: %v", route, err)
+			continue
+		}
+		_, dst, err := net.ParseCIDR(cidr)
+		if err != nil {
+			log.Warn("Failed to parse route %s: %v", route, err)
+			continue
+		}
+		if err := netlink.RouteAdd(&netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst}); err != nil {
+			log.Warn("Failed to re-add route %s: %v", route, err)
+		} else {
+			log.Debug("Re-added route %s after %s", route, reason)
+		}
+	}
 }
 
 func (t *TUNDevice) ConfigureSubnet(localIP net.IP, network *net.IPNet) error {
@@ -260,18 +304,7 @@ func (t *TUNDevice) UpdatePeerIP(newRemoteIP net.IP) error {
 	t.remoteIP = newRemoteIP
 	log.Info("TUN device %s peer IP updated to %s", t.name, newRemoteIP)
 
-	for _, route := range t.routes {
-		_, dst, err := net.ParseCIDR(route)
-		if err != nil {
-			log.Warn("Failed to parse route %s: %v", route, err)
-			continue
-		}
-		if err := netlink.RouteAdd(&netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst}); err != nil {
-			log.Warn("Failed to re-add route %s: %v", route, err)
-		} else {
-			log.Debug("Re-added route %s after peer IP change", route)
-		}
-	}
+	t.reAddRoutes(link, "peer IP change")
 
 	return nil
 }
@@ -305,18 +338,7 @@ func (t *TUNDevice) UpdateLocalIP(newLocalIP net.IP) error {
 	t.localIP = newLocalIP
 	log.Info("TUN device %s local IP updated to %s", t.name, newLocalIP)
 
-	for _, route := range t.routes {
-		_, dst, err := net.ParseCIDR(route)
-		if err != nil {
-			log.Warn("Failed to parse route %s: %v", route, err)
-			continue
-		}
-		if err := netlink.RouteAdd(&netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst}); err != nil {
-			log.Warn("Failed to re-add route %s: %v", route, err)
-		} else {
-			log.Debug("Re-added route %s after IP change", route)
-		}
-	}
+	t.reAddRoutes(link, "IP change")
 
 	return nil
 }
