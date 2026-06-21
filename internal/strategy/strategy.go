@@ -79,6 +79,16 @@ type Manager struct {
 	// Circuit breaker
 	circuitBreakers *CircuitBreakerManager
 
+	// Storm detector: catches strategies that connect successfully but whose
+	// sessions are repeatedly torn down (e.g. DPI killing a REALITY pattern
+	// after a few seconds). The circuit breaker cannot see this because every
+	// connect() succeeds.
+	stormDetector *StormDetector
+
+	// forced is true when ForceStrategy() was called (user passed -strategy X).
+	// In forced mode storms are logged loudly but never trigger a switch.
+	forced bool
+
 	// Periodic re-probe
 	reprobeInterval time.Duration
 	reprobeTarget   string
@@ -151,6 +161,7 @@ func NewManager() *Manager {
 		parallelProbes:        3,
 		adaptiveOrder:         true,
 		circuitBreakers:       NewCircuitBreakerManager(DefaultCircuitBreakerConfig()),
+		stormDetector:         NewStormDetector(StormConfig{}),
 		reprobeInterval:       5 * time.Minute,
 		stopReprobe:           make(chan struct{}),
 		tcpFailuresBeforeQUIC: 3, // Switch to QUIC after 3 TCP timeouts
@@ -285,8 +296,17 @@ func (m *Manager) ForceStrategy(idPrefix string) error {
 	}
 
 	m.strategies = matched
+	m.forced = true
 	log.Info("Forced %d strategies matching '%s'", len(matched), idPrefix)
 	return nil
+}
+
+// IsForced reports whether a strategy was explicitly forced via ForceStrategy.
+// In forced mode the manager never auto-switches away from a storming strategy.
+func (m *Manager) IsForced() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.forced
 }
 
 // ListStrategyIDs returns comma-separated list of all strategy IDs
@@ -490,6 +510,45 @@ func (m *Manager) UpdateStrategyConfidence(id string, success bool) {
 	m.sortStrategies()
 }
 
+// RecordSessionStart marks the moment a tunnel session became usable for the
+// given strategy. Pair it with RecordSessionEnd to let the storm detector
+// measure how long the session survived.
+func (m *Manager) RecordSessionStart(strategyID string) {
+	m.stormDetector.SessionOpened(strategyID)
+}
+
+// RecordSessionEnd reports that the session for strategyID has ended and
+// returns whether the strategy is now storming (repeatedly short-lived
+// sessions). On a storm in auto-mode the strategy is parked and excluded from
+// selection for the cooldown; the caller should drop the cached fast-reconnect
+// strategy so the next Connect picks a fresh one. In forced mode the verdict is
+// still returned (for loud logging) but the strategy stays in use.
+func (m *Manager) RecordSessionEnd(strategyID string) (storming bool) {
+	storming = m.stormDetector.SessionClosed(strategyID)
+	if !storming {
+		return false
+	}
+
+	if m.IsForced() {
+		log.Error("STORM on forced strategy %s: sessions keep dying within %v of connecting. "+
+			"DPI is likely tearing down this pattern. Consider switching strategy (-strategy ...) "+
+			"or running in auto mode.", strategyID, stormShortSession)
+		return true
+	}
+
+	log.Warn("STORM detected on %s: repeated short-lived sessions, parking for %v and failing over to next strategy",
+		strategyID, stormCooldown)
+
+	// Drop the cached fast-reconnect strategy if it is the storming one, so the
+	// next reconnect does not immediately retry it.
+	m.mu.Lock()
+	if m.lastSuccessfulStrategy != nil && m.lastSuccessfulStrategy.ID() == strategyID {
+		m.lastSuccessfulStrategy = nil
+	}
+	m.mu.Unlock()
+	return true
+}
+
 // Connect tries strategies in order until one succeeds
 func (m *Manager) Connect(ctx context.Context, target string) (net.Conn, Strategy, error) {
 	// IPv6 Transport Layer: select IPv6 or IPv4 address
@@ -596,8 +655,12 @@ func (m *Manager) connectWithRTT(ctx context.Context, target string, excludeIDs 
 	tcpFailuresThreshold := m.tcpFailuresBeforeQUIC
 	m.mu.RUnlock()
 
-	// Try last successful strategy first if it was recent (within 5 minutes)
-	if lastSuccessful != nil && time.Since(lastSuccessfulTime) < 5*time.Minute {
+	// Try last successful strategy first if it was recent (within 5 minutes).
+	// Skip it in auto-mode if it is parked for a storm - that is precisely the
+	// strategy we want to move away from. In forced mode there is no
+	// alternative, so we still use it.
+	if lastSuccessful != nil && time.Since(lastSuccessfulTime) < 5*time.Minute &&
+		(m.forced || !m.stormDetector.IsParked(lastSuccessful.ID())) {
 		log.Info("Trying last successful strategy first: %s", lastSuccessful.Name())
 
 		connectCtx, cancel := context.WithTimeout(ctx, m.connectTimeout)
@@ -654,6 +717,12 @@ func (m *Manager) connectWithRTT(ctx context.Context, target string, excludeIDs 
 			log.Debug("Skipping strategy %s (circuit breaker open)", s.Name())
 			continue
 		}
+		// Skip strategies parked by the storm detector (auto-mode only).
+		// Forced mode keeps its single strategy regardless.
+		if !m.forced && m.stormDetector.IsParked(s.ID()) {
+			log.Debug("Skipping strategy %s (storm cooldown)", s.Name())
+			continue
+		}
 		// Skip UDP-based strategies (like QUIC) if UDP is not working
 		if excludeUDP && isUDPBasedStrategy(s) {
 			log.Debug("Skipping UDP strategy %s (UDP connectivity issue)", s.Name())
@@ -670,6 +739,14 @@ func (m *Manager) connectWithRTT(ctx context.Context, target string, excludeIDs 
 	m.mu.RUnlock()
 
 	if len(strategies) == 0 {
+		// If storm parking emptied the list, unpark everything and retry with
+		// the full set: a storming strategy is still better than no tunnel.
+		// This guarantees the failover loop converges instead of dead-ending.
+		if !m.forced && m.stormDetector.AnyParked() {
+			log.Warn("All strategies parked by storm cooldown - unparking to avoid total outage")
+			m.stormDetector.Reset()
+			return m.connectWithRTT(ctx, target, excludeIDs, useRTTMasking)
+		}
 		return nil, nil, fmt.Errorf("no available strategies (all excluded or circuit-broken)")
 	}
 
@@ -1622,6 +1699,9 @@ func (m *Manager) ResetForNetworkChange() {
 			result.LastFailure = time.Time{}
 		}
 	}
+
+	// Storm state is tied to the old network - clear it after a network change.
+	m.stormDetector.Reset()
 
 	// Stop any running emergency reprobe
 	if m.emergencyReprobeRunning && m.emergencyReprobeStop != nil {
