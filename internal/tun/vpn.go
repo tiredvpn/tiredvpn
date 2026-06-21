@@ -457,6 +457,14 @@ func (v *VPNClient) connect(parent context.Context) error {
 	}
 	v.mu.Unlock()
 
+	// Mark the start of this session for storm detection. If the DPI tears the
+	// session down within seconds, handleDisconnect's RecordSessionEnd will see
+	// a short lifetime and (in auto mode) park this strategy. Called without
+	// v.mu held, after the conn is published.
+	if v.manager != nil {
+		v.manager.RecordSessionStart(strat.ID())
+	}
+
 	return nil
 }
 
@@ -822,11 +830,18 @@ func (v *VPNClient) handleDisconnect() {
 		v.conn.Close()
 		v.conn = nil
 	}
+	endedStrategy := v.strategy
 	v.mu.Unlock()
 
-	// Update strategy confidence
-	if v.strategy != nil && v.manager != nil {
-		v.manager.UpdateStrategyConfidence(v.strategy.ID(), false)
+	// Update strategy confidence and feed the storm detector. A session that
+	// connected fine but died within seconds is the signature of DPI tearing
+	// down a strategy's pattern: connect() keeps succeeding so the circuit
+	// breaker never trips, but the tunnel carries no traffic. The detector
+	// catches this by session lifetime and (in auto mode) parks the strategy so
+	// the next reconnect picks a different one.
+	if endedStrategy != nil && v.manager != nil {
+		v.manager.UpdateStrategyConfidence(endedStrategy.ID(), false)
+		v.manager.RecordSessionEnd(endedStrategy.ID())
 	}
 
 	// Initialize exponential backoff
