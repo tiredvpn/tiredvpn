@@ -7,6 +7,13 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.2] - 2026-06-23
+
+### Fixed
+
+- **JNI bridge mangled client arguments with spaces.** The Android entry point joined argv into a single space-separated string and the core split it back with `strings.Fields()`, so any value containing a space was torn apart — notably the canonical morph strategy IDs (e.g. `morph_Yandex Video`), which only survived via a fragile space-free-prefix workaround. `startClient` now takes a real string array (`jobjectArray`, decoded element by element) and the app passes argv as an array, so quoted/space-bearing flags (`-tun-routes`, secrets, morph IDs) arrive intact.
+- **Android TUN throughput was throttled by an MTU mismatch.** The VpnService interface came up at MTU 1400 while the core framed packets and clamped TCP MSS against its own 1500 TUN MTU, so outer packets exceeded the real path MTU and hit fragmentation / PMTUD black-holing (worse on download). The interface and the core now default to MTU 1280 (the IPv6 minimum) so framing and clamping agree.
+
 ## [1.3.1] - 2026-06-22
 
 ### Fixed
