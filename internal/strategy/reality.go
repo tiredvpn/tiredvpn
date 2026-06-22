@@ -45,21 +45,32 @@ type REALITYStrategy struct {
 	pqKeyExchange  *customtls.HybridKeyExchange
 	pqSignature    *customtls.QuantumSignature
 	serverPQKemPub []byte // Server's Kyber768 public key (for encapsulation)
+}
 
-	// smux session reuse: one TCP connection per server, N streams per session.
-	// Avoids the DPI-drop-second-segment problem by eliminating new TCP connections.
-	muxMu   sync.Mutex
-	muxSess *smux.Session
-	muxConn net.Conn // underlying TCP for muxSess
+// realityConn owns the full per-request stack: TCP connection → ChaCha20/TLS
+// framing → smux session → the single stream handed to the caller. Closing it
+// tears down the whole stack, so every Connect() is fully self-contained and
+// closing one caller's connection can never disturb another's.
+type realityConn struct {
+	net.Conn               // the smux stream (Read/Write/Deadlines)
+	sess     *smux.Session // owns the smux session over the data conn
+	tcpConn  net.Conn      // underlying TCP, closed last
+}
+
+func (c *realityConn) Close() error {
+	streamErr := c.Conn.Close()
+	c.sess.Close()
+	c.tcpConn.Close()
+	return streamErr
 }
 
 // NewREALITYStrategy creates a new REALITY strategy
 // manager is required for IPv6/IPv4 transport layer support
 func NewREALITYStrategy(manager *Manager, secret []byte) *REALITYStrategy {
-	// Use "developer" category (github.com, hetzner.com) as the primary cover pool.
+	// Use "developer" category (github.com et al.) as the primary cover pool.
 	// Empirically, TSPU (Russia) does NOT validate these domains' IPs against the
-	// real server address — so TLS ClientHello with github.com SNI reaches a
-	// Hetzner VPN server without being RST'd. Microsoft/Azure domains are blocked
+	// real server address — so TLS ClientHello with github.com SNI reaches the
+	// VPN server without being RST'd. Microsoft/Azure domains are blocked
 	// because TSPU whitelists their IP ranges and rejects mismatches.
 	developerPool := make([]string, 0, 8)
 	for _, entry := range evasion.WhitelistedSNIs {
@@ -183,25 +194,23 @@ func (r *REALITYStrategy) Probe(ctx context.Context, target string) error {
 }
 
 // Connect establishes a REALITY connection to the target.
-// Connect dials a new REALITY connection for each request.
+// Connect dials a new REALITY connection for each request and returns a
+// self-contained conn (see realityConn): the returned conn owns its own TCP,
+// framing and smux session, and closing it tears down only that stack.
+//
 // Smux session reuse is intentionally disabled: TSPU (Russian DPI) throttles
 // the underlying TCP after the first stream finishes, so any subsequent stream
 // on the same TCP arrives after an idle gap and gets dropped. A fresh TCP per
 // request avoids this — at the cost of one REALITY handshake (~200ms) each time.
+//
+// The strategy holds NO shared session state: multiple callers (TUN tunnel,
+// proxy pool, health checker) dial concurrently, and one caller closing its
+// conn must never close another's TCP. A prior implementation kept a single
+// r.muxSess/r.muxConn on the strategy and closed it on every new Connect, which
+// silently tore down a live tunnel whenever a second caller dialed — the root
+// cause of the reconnect storm.
 func (r *REALITYStrategy) Connect(ctx context.Context, target string) (net.Conn, error) {
-	// Clean up any stale session from a prior connection.
-	r.muxMu.Lock()
-	if r.muxSess != nil {
-		r.muxSess.Close()
-		r.muxSess = nil
-	}
-	if r.muxConn != nil {
-		r.muxConn.Close()
-		r.muxConn = nil
-	}
-	r.muxMu.Unlock()
-
-	// Slow path: new TCP connection + REALITY handshake + smux negotiation.
+	// New TCP connection + REALITY handshake + smux negotiation.
 	serverAddr := r.manager.GetServerAddr(ctx)
 	log.Debug("REALITY: Connecting to %s via %s", target, serverAddr)
 
@@ -332,13 +341,8 @@ func (r *REALITYStrategy) Connect(ctx context.Context, target string) (net.Conn,
 		return nil, fmt.Errorf("reality: first mux stream: %w", err)
 	}
 
-	r.muxMu.Lock()
-	r.muxSess = newSess
-	r.muxConn = tcpConn
-	r.muxMu.Unlock()
-
 	log.Info("REALITY: Mux session established to %s via %s", target, dest)
-	return stream, nil
+	return &realityConn{Conn: stream, sess: newSess, tcpConn: tcpConn}, nil
 }
 
 // selectDestination chooses a legitimate destination from the SNI whitelist
@@ -623,19 +627,6 @@ func (r *REALITYStrategy) validateServerHello(serverHello []byte, expectedDest s
 	log.Debug("REALITY: Server auth validated (padding mode)")
 
 	return nil
-}
-
-// realityConn wraps the underlying connection
-type realityConn struct {
-	net.Conn
-	target  string
-	dest    string
-	isEstab bool
-}
-
-// Close closes the connection
-func (rc *realityConn) Close() error {
-	return rc.Conn.Close()
 }
 
 // Helper functions

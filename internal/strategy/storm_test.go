@@ -34,8 +34,10 @@ func newTestDetector(clk *fakeClock) *StormDetector {
 		MinSessions:  3,
 		Window:       3 * time.Minute,
 		Cooldown:     5 * time.Minute,
+		Grace:        -1, // disable grace window: these tests exercise parking directly
 	})
 	d.now = clk.Now
+	d.startedAt = clk.Now()
 	return d
 }
 
@@ -243,4 +245,79 @@ func TestStorm_ConcurrentAccess(t *testing.T) {
 		})
 	}
 	wg.Wait()
+}
+
+// newTestDetectorWithGrace builds a detector with the grace window enabled and
+// the fake clock wired through both `now` and the grace start time.
+func newTestDetectorWithGrace(clk *fakeClock, grace time.Duration) *StormDetector {
+	d := NewStormDetector(StormConfig{
+		ShortSession: 20 * time.Second,
+		MinSessions:  3,
+		Window:       3 * time.Minute,
+		Cooldown:     5 * time.Minute,
+		Grace:        grace,
+	})
+	d.now = clk.Now
+	d.startedAt = clk.Now()
+	return d
+}
+
+// TestStorm_GraceWindowSuppressesStartupChurn verifies that short sessions
+// inside the grace window never park a strategy, while the same pattern after
+// the window does. This is the guard against startup turbulence (and post
+// network-change churn) falsely parking the best strategy.
+func TestStorm_GraceWindowSuppressesStartupChurn(t *testing.T) {
+	clk := newFakeClock()
+	d := newTestDetectorWithGrace(clk, 30*time.Second)
+
+	// Three short sessions inside the 30s grace window: must NOT park.
+	for range 5 {
+		if d.RecordSession("reality", 2*time.Second) {
+			t.Fatal("parked during grace window — startup churn should be ignored")
+		}
+		clk.Advance(3 * time.Second) // stays within 30s for the first few
+	}
+	if d.IsParked("reality") {
+		t.Fatal("reality parked during grace window")
+	}
+
+	// Move well past the grace window.
+	clk.Advance(60 * time.Second)
+
+	// Now the same short-session pattern must park after MinSessions.
+	parked := false
+	for range 3 {
+		if d.RecordSession("reality", 2*time.Second) {
+			parked = true
+		}
+		clk.Advance(1 * time.Second)
+	}
+	if !parked || !d.IsParked("reality") {
+		t.Fatal("reality should park on sustained short sessions after grace window")
+	}
+}
+
+// TestStorm_ResetRestartsGraceWindow verifies a network change (Reset) reopens
+// the grace window so post-change churn is tolerated again.
+func TestStorm_ResetRestartsGraceWindow(t *testing.T) {
+	clk := newFakeClock()
+	d := newTestDetectorWithGrace(clk, 30*time.Second)
+
+	// Burn past the initial grace window with a healthy session.
+	clk.Advance(60 * time.Second)
+	d.RecordSession("reality", time.Minute) // healthy, resets streak
+
+	// Network change.
+	d.Reset()
+
+	// Short sessions right after Reset are within the new grace window.
+	for range 4 {
+		if d.RecordSession("reality", 2*time.Second) {
+			t.Fatal("parked during post-Reset grace window")
+		}
+		clk.Advance(2 * time.Second)
+	}
+	if d.IsParked("reality") {
+		t.Fatal("reality parked during post-Reset grace window")
+	}
 }

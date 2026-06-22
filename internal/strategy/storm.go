@@ -38,6 +38,16 @@ const (
 	// selection before it becomes eligible again (DPI patterns are often
 	// temporary). Aligned with the manager reprobe interval (5m).
 	stormCooldown = 5 * time.Minute
+
+	// stormGrace is a settling window after the detector starts (and after every
+	// network change / Reset) during which short sessions are NOT counted toward
+	// a storm. Client startup and network changes legitimately churn through a
+	// few short-lived sessions (handshakes, route setup, transport warm-up, the
+	// occasional racey reconnect) before the tunnel stabilizes; parking a
+	// strategy on that transient turbulence is exactly the false positive that
+	// dumped traffic onto worse fallback strategies. A real storm persists well
+	// past this window.
+	stormGrace = 30 * time.Second
 )
 
 // StormConfig holds tunable storm-detection thresholds. Zero values fall back
@@ -47,6 +57,10 @@ type StormConfig struct {
 	MinSessions  int           // consecutive short sessions to declare a storm
 	Window       time.Duration // max gap between short sessions in one streak
 	Cooldown     time.Duration // how long a storming strategy stays parked
+	// Grace is the post-start/post-Reset settling window in which short sessions
+	// are ignored. Zero falls back to the default; a negative value disables the
+	// grace window entirely (used by unit tests that exercise parking directly).
+	Grace time.Duration
 }
 
 func (c StormConfig) withDefaults() StormConfig {
@@ -61,6 +75,12 @@ func (c StormConfig) withDefaults() StormConfig {
 	}
 	if c.Cooldown <= 0 {
 		c.Cooldown = stormCooldown
+	}
+	switch {
+	case c.Grace < 0:
+		c.Grace = 0 // explicitly disabled
+	case c.Grace == 0:
+		c.Grace = stormGrace
 	}
 	return c
 }
@@ -82,18 +102,20 @@ type StormDetector struct {
 	cfg StormConfig
 	now func() time.Time
 
-	mu       sync.Mutex
-	byID     map[string]*strategyStorm
-	openedAt map[string]time.Time // strategyID -> when its current session began
+	mu        sync.Mutex
+	byID      map[string]*strategyStorm
+	openedAt  map[string]time.Time // strategyID -> when its current session began
+	startedAt time.Time            // start of the current grace window (start / last Reset)
 }
 
 // NewStormDetector creates a detector with the given config (defaults applied).
 func NewStormDetector(cfg StormConfig) *StormDetector {
 	return &StormDetector{
-		cfg:      cfg.withDefaults(),
-		now:      time.Now,
-		byID:     make(map[string]*strategyStorm),
-		openedAt: make(map[string]time.Time),
+		cfg:       cfg.withDefaults(),
+		now:       time.Now,
+		byID:      make(map[string]*strategyStorm),
+		openedAt:  make(map[string]time.Time),
+		startedAt: time.Now(),
 	}
 }
 
@@ -151,6 +173,15 @@ func (d *StormDetector) RecordSession(strategyID string, lifetime time.Duration)
 		// Healthy session - clear the streak.
 		st.consecutiveShort = 0
 		st.lastShortEnd = time.Time{}
+		return false
+	}
+
+	// Within the grace window after start / network change, short sessions are
+	// expected churn (handshakes, route setup, transport warm-up). Don't count
+	// them and never park: a real storm persists past the window and gets caught
+	// then. This is what stops startup turbulence from dumping traffic onto worse
+	// fallback strategies.
+	if d.cfg.Grace > 0 && now.Sub(d.startedAt) < d.cfg.Grace {
 		return false
 	}
 
@@ -221,10 +252,13 @@ func (d *StormDetector) Unpark(strategyID string) {
 	}
 }
 
-// Reset clears all storm and parking state. Used on network change.
+// Reset clears all storm and parking state. Used on network change, which also
+// restarts the grace window: a fresh network legitimately churns through a few
+// short sessions before stabilizing.
 func (d *StormDetector) Reset() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	clear(d.byID)
 	clear(d.openedAt)
+	d.startedAt = d.now()
 }
