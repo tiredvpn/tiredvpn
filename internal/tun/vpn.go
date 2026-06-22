@@ -78,6 +78,14 @@ type VPNClient struct {
 	bytesUp     int64
 	bytesDown   int64
 
+	// Lifecycle counters for observability (accessed atomically). Polled by the
+	// client's metrics syncer and surfaced as reconnects_total / connections_total
+	// — previously these Prometheus counters were always zero in TUN mode because
+	// nothing fed them.
+	tunnelConnects int64 // successful tunnel establishments (initial + reconnects)
+	reconnectsOK   int64 // reconnect attempts that re-established the tunnel
+	reconnectsFail int64 // reconnect attempts that failed and backed off
+
 	// Control
 	running      int32
 	reconnecting int32 // Prevents concurrent reconnect attempts
@@ -464,6 +472,10 @@ func (v *VPNClient) connect(parent context.Context) error {
 	if v.manager != nil {
 		v.manager.RecordSessionStart(strat.ID())
 	}
+
+	// Count every successful tunnel establishment (initial connect and every
+	// reconnect) so connections_total reflects reality in TUN mode.
+	atomic.AddInt64(&v.tunnelConnects, 1)
 
 	return nil
 }
@@ -889,9 +901,12 @@ func (v *VPNClient) handleDisconnect() {
 		cancel()
 
 		if err == nil {
+			atomic.AddInt64(&v.reconnectsOK, 1)
 			log.Info("VPN reconnected successfully after %d attempts", consecutiveFailures)
 			return
 		}
+
+		atomic.AddInt64(&v.reconnectsFail, 1)
 
 		// Classify error type for better logging
 		errType := classifyError(err)
@@ -1052,6 +1067,16 @@ func (v *VPNClient) Stats() (packetsUp, packetsDown, bytesUp, bytesDown int64) {
 		atomic.LoadInt64(&v.packetsDown),
 		atomic.LoadInt64(&v.bytesUp),
 		atomic.LoadInt64(&v.bytesDown)
+}
+
+// LifecycleStats returns cumulative tunnel lifecycle counters: total successful
+// tunnel establishments, successful reconnects and failed reconnect attempts.
+// The client's metrics syncer polls these to feed connections_total and
+// reconnects_total.
+func (v *VPNClient) LifecycleStats() (connects, reconnectsOK, reconnectsFail int64) {
+	return atomic.LoadInt64(&v.tunnelConnects),
+		atomic.LoadInt64(&v.reconnectsOK),
+		atomic.LoadInt64(&v.reconnectsFail)
 }
 
 // CurrentStrategy returns the current strategy being used

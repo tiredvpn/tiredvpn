@@ -27,7 +27,7 @@ import (
 )
 
 var (
-	Version   = "1.3.0"
+	Version   = "1.3.1"
 	BuildTime = "unknown"
 
 	// Global metrics instance (nil if metrics disabled)
@@ -674,6 +674,7 @@ func runTUNMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) erro
 			ticker := time.NewTicker(1 * time.Second)
 			defer ticker.Stop()
 			var lastPacketsUp, lastPacketsDown, lastBytesUp, lastBytesDown int64
+			var lastConnects, lastReconnectsOK, lastReconnectsFail int64
 			for {
 				select {
 				case <-ticker.C:
@@ -695,10 +696,23 @@ func runTUNMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) erro
 					lastPacketsDown = packetsDown
 					lastBytesUp = bytesUp
 					lastBytesDown = bytesDown
+					// Sync lifecycle counters (connections_total / reconnects_total),
+					// which are otherwise never fed in TUN mode.
+					connects, reconnectsOK, reconnectsFail := vpnClient.LifecycleStats()
+					deltaConnects := connects - lastConnects
+					clientMetrics.AddConnectionsTotal(deltaConnects)
+					clientMetrics.AddReconnects(reconnectsOK-lastReconnectsOK, reconnectsFail-lastReconnectsFail)
+					lastConnects = connects
+					lastReconnectsOK = reconnectsOK
+					lastReconnectsFail = reconnectsFail
 					// Sync current strategy from manager
 					info := mgr.GetLastConnectionInfo()
 					if info.Strategy != "" {
 						clientMetrics.SetCurrentStrategy(info.StrategyID, info.Strategy)
+						// Refresh last-connect timestamp whenever a new tunnel came up.
+						if deltaConnects > 0 {
+							clientMetrics.RecordConnect(info.StrategyID, info.Strategy)
+						}
 					}
 				case <-ctx.Done():
 					return

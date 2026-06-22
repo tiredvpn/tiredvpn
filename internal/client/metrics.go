@@ -119,6 +119,26 @@ func (m *ClientMetrics) IncReconnect(success bool) {
 	}
 }
 
+// AddConnectionsTotal adds to the total connections counter. Used in TUN mode,
+// where connections are counted by polling the tunnel's lifecycle counters
+// rather than per-accept as in proxy mode.
+func (m *ClientMetrics) AddConnectionsTotal(n int64) {
+	if n > 0 {
+		atomic.AddInt64(&m.totalConnections, n)
+	}
+}
+
+// AddReconnects adds deltas to the reconnect counters. Used by the TUN-mode
+// metrics syncer, which polls cumulative counters and forwards the increments.
+func (m *ClientMetrics) AddReconnects(okDelta, failDelta int64) {
+	if okDelta > 0 {
+		atomic.AddInt64(&m.reconnectsSuccess, okDelta)
+	}
+	if failDelta > 0 {
+		atomic.AddInt64(&m.reconnectsFailed, failDelta)
+	}
+}
+
 // RecordConnect records successful connection time and strategy
 func (m *ClientMetrics) RecordConnect(strategyID, strategyName string) {
 	atomic.StoreInt64(&m.lastConnectTime, time.Now().Unix())
