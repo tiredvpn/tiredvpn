@@ -7,6 +7,18 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-06-22
+
+### Fixed
+
+- **REALITY reconnect storm that flapped the tunnel every ~1.6s.** `REALITYStrategy` kept a single `muxSess`/`muxConn` on the strategy object and closed it at the start of every `Connect` — a leftover of the intentionally-disabled smux reuse. Because the strategy is shared across the TUN tunnel, the proxy pool and the health checker, any second caller's dial silently tore down the live tunnel's TCP. Sessions died within seconds, the storm detector then parked REALITY for 5 minutes and failed traffic over to far slower polling strategies, which in turn spammed reconnects and tripped the circuit breaker (UDP through the tunnel stopped passing entirely). Each `Connect` now returns a self-contained connection that owns its own TCP, framing and smux session; closing one caller's connection can no longer disturb another's.
+- **Storm detector parked the best strategy on startup turbulence.** A 30-second grace window after start and after every network change now ignores the short-lived sessions that legitimately occur while a tunnel settles (handshakes, route setup, transport warm-up), so a genuine storm still parks a strategy but normal churn does not.
+- **`reconnects_total` and `connections_total` were always zero in TUN mode.** `IncReconnect` had no callers and `IncConnections` only ran in proxy mode, so the Prometheus counters were blind to reconnects. The TUN client now keeps atomic lifecycle counters and the existing metrics syncer forwards them, also refreshing `last_connect_timestamp`.
+
+### Removed
+
+- **Hetzner SNIs from the REALITY cover pool.** `hetzner.com` and `hetzner.cloud` are no longer used as cover destinations — fronting a Hetzner-hosted server with a Hetzner SNI is a needless correlation for a DPI. The `github.com` family remains as the cover pool.
+
 ## [1.2.2] - 2026-06-16
 
 ### Fixed
