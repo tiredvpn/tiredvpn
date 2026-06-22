@@ -34,6 +34,31 @@ static inline jstring jni_new_string(JNIEnv* env, const char* str) {
     return (*env)->NewStringUTF(env, str);
 }
 
+// Helpers for decoding a Java String[] (jobjectArray) argv element-by-element.
+// argv is passed as a real string array so values containing spaces (e.g.
+// "morph_Yandex Video") survive intact instead of being split on whitespace.
+static inline jsize jni_array_length(JNIEnv* env, jobjectArray arr) {
+    if (arr == NULL) return 0;
+    return (*env)->GetArrayLength(env, arr);
+}
+
+// Returns a freshly UTF-8 chars pointer for element i; caller must release with
+// jni_array_release_element. Returns NULL for a null element.
+static inline const char* jni_array_get_element(JNIEnv* env, jobjectArray arr, jsize i) {
+    jstring s = (jstring)(*env)->GetObjectArrayElement(env, arr, i);
+    if (s == NULL) return NULL;
+    return (*env)->GetStringUTFChars(env, s, NULL);
+}
+
+static inline void jni_array_release_element(JNIEnv* env, jobjectArray arr, jsize i, const char* chars) {
+    if (chars == NULL) return;
+    jstring s = (jstring)(*env)->GetObjectArrayElement(env, arr, i);
+    if (s != NULL) {
+        (*env)->ReleaseStringUTFChars(env, s, chars);
+        (*env)->DeleteLocalRef(env, s);
+    }
+}
+
 // Initialize JNI global state
 static inline void jni_init(JNIEnv* env, jobject callback_obj) {
     if (g_vm == NULL) {
@@ -202,7 +227,7 @@ func Java_com_tiredvpn_android_native_TiredVpnNative_cleanupNative(
 func Java_com_tiredvpn_android_native_TiredVpnNative_startClient(
 	env *C.JNIEnv,
 	class C.jclass,
-	argsStr C.jstring,
+	argv C.jobjectArray,
 ) C.jint {
 	clientMutex.Lock()
 	defer clientMutex.Unlock()
@@ -215,15 +240,22 @@ func Java_com_tiredvpn_android_native_TiredVpnNative_startClient(
 		clientCancel = nil
 	}
 
-	// Convert Java string to Go string
-	cStr := C.jni_get_string_chars(env, argsStr)
-	goArgsStr := C.GoString(cStr)
-	C.jni_release_string_chars(env, argsStr, cStr)
+	// Decode the Java String[] element-by-element. Each element is one argv
+	// token already, so no space splitting happens here: values containing
+	// spaces (e.g. a "morph_Yandex Video" strategy ID) survive intact.
+	n := int(C.jni_array_length(env, argv))
+	args := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		cStr := C.jni_array_get_element(env, argv, C.jsize(i))
+		if cStr == nil {
+			continue // skip null elements defensively
+		}
+		args = append(args, C.GoString(cStr))
+		C.jni_array_release_element(env, argv, C.jsize(i), cStr)
+	}
 
-	logMessage(fmt.Sprintf("Starting client with args: %s", goArgsStr))
+	logMessage(fmt.Sprintf("Starting client with %d args: %s", len(args), strings.Join(args, " ")))
 
-	// Parse arguments
-	args := strings.Fields(goArgsStr)
 	if len(args) == 0 {
 		logMessage("ERROR: No arguments provided")
 		return 1
@@ -395,7 +427,14 @@ func parseClientArgs(args []string) (*client.Config, error) {
 		// passes -listen instead and must NOT be forced into TUN (it has no tun-fd,
 		// so a forced TUN setup fails and proxy mode never starts).
 		TunMode: false,
-		TunMTU:  1500,
+		// 1500 left no room for tunnel encapsulation (4-byte length frame + the
+		// strategy's TLS/WebSocket/etc. overhead), so inner TCP segments clamped
+		// to MTU-40 produced outer packets larger than the underlying path MTU.
+		// On Android that meant fragmentation / PMTUD blackholes and badly
+		// degraded download throughput (issue #27). 1280 (the IPv6 minimum, same
+		// as tun.DefaultMTU) leaves a safe margin for all encapsulation. The app
+		// can still override via -tun-mtu.
+		TunMTU: 1280,
 	}
 
 	// Shaper preset/seed are captured during the scan and applied after the loop
