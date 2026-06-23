@@ -2,6 +2,13 @@
 
 TiredVPN exposes Prometheus-compatible metrics and supports pprof profiling.
 
+The client and the server expose **different** metric sets:
+
+- Client metrics use the `tiredvpn_local_*` prefix and are served on the client's `-api-addr`.
+- Server metrics use the `tiredvpn_*` prefix and are served on the server's `-api-addr`.
+
+Pick the matching section below depending on which endpoint you scrape.
+
 ## Enabling the Metrics Endpoint
 
 ### Server
@@ -25,48 +32,113 @@ tiredvpn client \
   -api-addr :9090   # metrics at http://localhost:9090/metrics
 ```
 
-## Available Metrics
+## Client Metrics (`tiredvpn_local_*`)
 
-### Strategy metrics
+Served on the client's `-api-addr`.
+
+### Info and lifecycle
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `tiredvpn_strategy_attempts_total` | Counter | Total connection attempts per strategy |
-| `tiredvpn_strategy_success_total` | Counter | Successful connections per strategy |
-| `tiredvpn_strategy_failures_total` | Counter | Failed connections per strategy |
-| `tiredvpn_strategy_latency_seconds` | Histogram | Connection latency per strategy |
-| `tiredvpn_strategy_active` | Gauge | Name of the currently active strategy |
-| `tiredvpn_strategy_circuit_state` | Gauge | Circuit breaker state (0=closed, 1=open, 2=half-open) |
-| `tiredvpn_strategy_dpi_events_total` | Counter | DPI detection events per strategy |
+| `tiredvpn_local_info` | Gauge | Client info, labels: `version`, `mode` (`proxy` or `tun`) |
+| `tiredvpn_local_uptime_seconds` | Counter | Client uptime in seconds |
+| `tiredvpn_local_last_connect_timestamp_seconds` | Gauge | Unix timestamp of last successful connection |
 
 ### Connection metrics
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `tiredvpn_connections_active` | Gauge | Currently active proxy connections |
-| `tiredvpn_connections_total` | Counter | Total connections handled |
-| `tiredvpn_bytes_sent_total` | Counter | Total bytes sent to server |
-| `tiredvpn_bytes_received_total` | Counter | Total bytes received from server |
+| `tiredvpn_local_connections_total` | Counter | Total proxy connections handled |
+| `tiredvpn_local_connections_active` | Gauge | Currently active connections |
+| `tiredvpn_local_connections_failed_total` | Counter | Failed connection attempts |
+| `tiredvpn_local_reconnects_total` | Counter | Reconnection attempts, label `result` (`success` or `failure`) |
 
-### smux metrics
-
-| Metric | Type | Description |
-|--------|------|-------------|
-| `tiredvpn_mux_streams_active` | Gauge | Active smux streams |
-| `tiredvpn_mux_streams_total` | Counter | Total smux streams opened |
-| `tiredvpn_mux_errors_total` | Counter | smux protocol errors |
-
-### Server metrics (when `-api-addr` is set on server)
+### Traffic metrics
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `tiredvpn_server_clients_active` | Gauge | Active authenticated clients |
-| `tiredvpn_server_connections_total` | Counter | Total server-side connections |
-| `tiredvpn_server_auth_failures_total` | Counter | Authentication failures |
-| `tiredvpn_server_bytes_sent_total` | Counter | Bytes relayed to Internet |
-| `tiredvpn_server_bytes_received_total` | Counter | Bytes relayed from Internet |
+| `tiredvpn_local_bytes_sent_total` | Counter | Total bytes sent through tunnel |
+| `tiredvpn_local_bytes_received_total` | Counter | Total bytes received through tunnel |
+| `tiredvpn_local_packets_sent_total` | Counter | Total packets sent (TUN mode only) |
+| `tiredvpn_local_packets_received_total` | Counter | Total packets received (TUN mode only) |
+
+### Strategy metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `tiredvpn_local_strategy_current` | Gauge | Current active strategy, labels `id`, `name` |
+| `tiredvpn_local_strategy_available` | Gauge | Strategy availability (1=available, 0=unavailable), labels `id`, `name` |
+| `tiredvpn_local_strategy_confidence` | Gauge | Strategy confidence score (0.0-1.0), label `id` |
+| `tiredvpn_local_strategy_success_total` | Counter | Successful connections per strategy, label `id` |
+| `tiredvpn_local_strategy_failure_total` | Counter | Failed connections per strategy, label `id` |
+| `tiredvpn_local_strategy_latency_seconds` | Gauge | Average connection latency per strategy, label `id` |
+
+### Circuit breaker metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `tiredvpn_local_circuit_state` | Gauge | Circuit breaker state (0=closed, 1=open, 2=half-open), label `id` |
+| `tiredvpn_local_circuit_failures` | Gauge | Consecutive failures per strategy, label `id` |
+
+### Pool metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `tiredvpn_local_pool_total` | Gauge | Total connections in pool |
+| `tiredvpn_local_pool_idle` | Gauge | Idle connections in pool |
+
+## Server Metrics (`tiredvpn_*`)
+
+Served on the server's `-api-addr`.
+
+### Info and lifecycle
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `tiredvpn_info` | Gauge | Server info, label `version` |
+| `tiredvpn_uptime_seconds` | Counter | Server uptime in seconds |
+| `tiredvpn_clients_total` | Gauge | Number of registered clients |
+
+### Connection metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `tiredvpn_connections_total` | Counter | Total connections since start |
+| `tiredvpn_connections_active` | Gauge | Current active connections |
+| `tiredvpn_auth_failures_total` | Counter | Total authentication failures |
+| `tiredvpn_connection_errors_total` | Counter | Total connection errors |
+
+### Traffic metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `tiredvpn_bytes_sent_total` | Counter | Total bytes sent (download direction) |
+| `tiredvpn_bytes_received_total` | Counter | Total bytes received (upload direction) |
+
+### Per-client metrics
+
+All carry the labels `client_id` and `client_name`.
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `tiredvpn_client_connections_active` | Gauge | Active connections per client |
+| `tiredvpn_client_connections_total` | Counter | Total connections per client |
+| `tiredvpn_client_bytes_sent_total` | Counter | Bytes sent per client |
+| `tiredvpn_client_bytes_received_total` | Counter | Bytes received per client |
+| `tiredvpn_client_info` | Gauge | Client enabled flag, extra label `max_conns` |
+| `tiredvpn_client_expires_timestamp_seconds` | Gauge | Client expiry timestamp (0 = never) |
+
+### DPI and anti-censorship metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `tiredvpn_dpi_probes_detected_total` | Counter | DPI / active probes detected |
+| `tiredvpn_reality_handshake_result_total` | Counter | REALITY handshake results |
+| `tiredvpn_sni_fragmentation_events_total` | Counter | SNI fragmentation events |
 
 ### Runtime metrics
+
+The Go runtime collectors are exposed on both endpoints under their own prefixes:
 
 | Metric | Type | Description |
 |--------|------|-------------|
@@ -92,38 +164,59 @@ scrape_configs:
 
 ## Grafana Dashboard
 
-Example panels to create:
+Example panels to create.
 
-**Strategy Health:**
+**Strategy success rate (client):**
 
 ```promql
 # Success rate per strategy (last 5m)
-rate(tiredvpn_strategy_success_total[5m]) /
-rate(tiredvpn_strategy_attempts_total[5m])
+rate(tiredvpn_local_strategy_success_total[5m]) /
+(rate(tiredvpn_local_strategy_success_total[5m]) + rate(tiredvpn_local_strategy_failure_total[5m]))
 
-# Active strategy
-tiredvpn_strategy_active
+# Current active strategy
+tiredvpn_local_strategy_current
 ```
 
-**Latency:**
+**Strategy latency (client):**
 
 ```promql
-# p50/p95/p99 latency
-histogram_quantile(0.95, rate(tiredvpn_strategy_latency_seconds_bucket[5m]))
+# Average connection latency per strategy
+tiredvpn_local_strategy_latency_seconds
 ```
 
-**Traffic:**
+**Strategy confidence (client):**
+
+```promql
+tiredvpn_local_strategy_confidence
+```
+
+**Client throughput:**
 
 ```promql
 # Throughput (bytes/sec)
+rate(tiredvpn_local_bytes_sent_total[1m]) + rate(tiredvpn_local_bytes_received_total[1m])
+```
+
+**Server throughput:**
+
+```promql
 rate(tiredvpn_bytes_sent_total[1m]) + rate(tiredvpn_bytes_received_total[1m])
 ```
 
-**DPI Events:**
+**Active connections:**
 
 ```promql
-# DPI detection events (rate)
-rate(tiredvpn_strategy_dpi_events_total[5m])
+# Client
+tiredvpn_local_connections_active
+
+# Server
+tiredvpn_connections_active
+```
+
+**DPI events (server):**
+
+```promql
+rate(tiredvpn_dpi_probes_detected_total[5m])
 ```
 
 ## REST API (Server)
@@ -131,9 +224,9 @@ rate(tiredvpn_strategy_dpi_events_total[5m])
 The server's management API at `-api-addr` also exposes:
 
 ```bash
-# Health check
+# Health check (also verifies Redis connectivity)
 curl http://127.0.0.1:8080/health
-# {"status":"ok","version":"1.0.0","uptime":"2h34m"}
+# {"status":"healthy","clients":3}
 
 # Raw Prometheus metrics
 curl http://127.0.0.1:8080/metrics

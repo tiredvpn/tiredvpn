@@ -122,7 +122,7 @@ tiredvpn client \
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-quic` | `false` | Enable QUIC transport (UDP, highest priority) |
-| `-quic-port` | `443` | Server QUIC port |
+| `-quic-port` | `8443` | Server QUIC port |
 | `-quic-sni-frag` | `false` | Fragment QUIC Initial SNI (GFW bypass) |
 | `-ech` | `false` | Enable Encrypted Client Hello (hides SNI) |
 | `-ech-config` | | ECHConfigList in base64 (from server) |
@@ -259,10 +259,27 @@ table and roadmap.
 
 The shaper is a behavioural masking layer that sits between strategy and
 transport. Strategies (REALITY, morph, etc.) hide *what* you send; the shaper
-hides *the timing and sizes of how you send it*, so DPI cannot kluster
+hides *the timing and sizes of how you send it*, so DPI cannot cluster
 multiple users by their packet-distribution histogram.
 
-Enable via `[shaper]` in TOML. Available presets:
+Enable on the command line with `-shaper <preset>`, or via the `[shaper]`
+section in TOML. An explicit `-shaper` flag overrides any `[shaper]` value in
+the config file.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-shaper` | | Traffic shaper preset (see table below): `youtube_streaming`, `chrome_browsing`, `imap_sync`, `random_per_session` |
+| `-shaper-seed` | `0` | Seed for deterministic shaper (0 = random) |
+
+```bash
+tiredvpn client \
+  -server your-server.com:443 \
+  -secret <secret> \
+  -strategy morph \
+  -shaper chrome_browsing
+```
+
+Available presets:
 
 | Preset                 | Use case                            | Throughput    | Trade-off                                |
 |------------------------|-------------------------------------|---------------|------------------------------------------|

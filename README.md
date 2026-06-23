@@ -214,6 +214,7 @@ TiredVPN is configured entirely via CLI flags. Run `tiredvpn server -help` or
 | `-redis` | | Redis address for multi-client mode |
 | `-api-addr` | `127.0.0.1:8080` | REST API for client management |
 | `-ip-pool` | | CIDR for TUN client IP assignment |
+| `-tun-mtu` | `1280` | TUN interface MTU (1280-9000) |
 | `-port-range` | | Multi-port listening (e.g. `47000-47100`) |
 | `-no-quic` | `false` | Disable QUIC/UDP listener |
 | `-upstream` | | Upstream server for multi-hop |
@@ -265,7 +266,7 @@ Pre-built images are available on Docker Hub. Platforms: `linux/amd64`, `linux/a
 | Tag | Description |
 |-----|-------------|
 | `latest` | Latest stable release |
-| `1.2.0` | Pinned version |
+| `1.3.3` | Pinned version |
 | `edge` | Latest main branch build |
 
 ### Run the server

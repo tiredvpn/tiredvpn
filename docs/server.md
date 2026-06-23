@@ -107,9 +107,11 @@ Client → Server A (relay) → Server B (upstream/exit) → Internet
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `-config` | | Path to a TOML config file (CLI flags override TOML; see below) |
 | `-fake-root` | `./www` | Directory served as a fake website to unauthenticated visitors |
 | `-tun-ip` | `10.8.0.1` | TUN interface IP address on the server side |
 | `-tun-name` | `tiredvpn0` | TUN interface name |
+| `-tun-mtu` | `1280` | TUN interface MTU (valid range 1280-9000) |
 | `-enable-icmp` | `false` | Enable ICMP tunnel listener (requires CAP_NET_RAW) |
 | `-pprof` | | Enable pprof profiling endpoint (e.g., `:6060`) |
 | `-version` | | Print version and exit |
@@ -117,6 +119,23 @@ Client → Server A (relay) → Server B (upstream/exit) → Internet
 The fake website (`-fake-root`) is what any DPI probe or direct browser sees when connecting without a valid auth token. Put static HTML files there to mimic a real web service.
 
 At startup the server reads `/proc/self/status` to check available Linux capabilities. If `CAP_NET_RAW` is absent, the ICMP listener is silently skipped - no error, no crash.
+
+## Forwarding and NAT (required for TUN mode)
+
+When clients connect in TUN mode (`-tun` / `-ip-pool`), the server hands each
+client an IP from the pool, but it does not touch the host firewall or routing.
+You must enable forwarding and NAT yourself, otherwise client packets reach the
+server's TUN interface and have nowhere to go (SOCKS5 proxy mode is unaffected).
+
+The host needs three things:
+
+- `net.ipv4.ip_forward=1` so the kernel routes between the TUN interface and the uplink.
+- An iptables `MASQUERADE` rule on the uplink for the `-ip-pool` CIDR.
+- A `FORWARD` `ACCEPT` rule for the pool if your `FORWARD` policy is `DROP`.
+
+The binary never modifies these rules. For the exact commands (including the
+IPv6 variant), see the [Server firewall and forwarding](../README.md#server-firewall-and-forwarding-required-for-tun-mode)
+section in the README and [deployment.md](deployment.md).
 
 ## Configuration via TOML (preferred)
 

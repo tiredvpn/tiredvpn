@@ -56,7 +56,7 @@ QUIC connections use TLS 1.3 internally (as per RFC 9001). QUIC version draft-29
 
 ### Kernel TLS offload (kTLS)
 
-On Linux kernels that support it, TLS encryption/decryption is offloaded to the kernel (`AF_KTLSt`). This reduces CPU overhead and improves throughput. TiredVPN detects kTLS support at startup:
+On Linux kernels that support it, TLS encryption/decryption is offloaded to the kernel (`AF_KTLS`). This reduces CPU overhead and improves throughput. TiredVPN detects kTLS support at startup:
 
 ```
 INF kTLS: kernel TLS support detected, will offload encryption

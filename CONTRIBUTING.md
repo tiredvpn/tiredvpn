@@ -12,17 +12,17 @@
 git clone https://github.com/tiredvpn/tiredvpn.git
 cd tiredvpn
 go build ./cmd/tiredvpn/
-go test ./internal/...
+make test
 ```
 
-Requires Go 1.24+.
+Requires Go 1.26+.
 
 ## Pull Requests
 
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feat/my-feature`)
 3. Write tests for new functionality
-4. Ensure `go test ./internal/...` passes
+4. Ensure `make test` passes
 5. Run `gofmt -s -w .` before committing
 6. Submit a PR with a clear description
 

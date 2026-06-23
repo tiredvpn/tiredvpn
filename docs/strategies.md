@@ -21,7 +21,6 @@ TiredVPN implements 20+ DPI evasion strategies. The adaptive strategy engine aut
 | `geneva_russia` | Geneva (Russia) | TCP | TSPU-specific packet manipulation rules | Variable |
 | `geneva_china` | Geneva (China) | TCP | GFW-specific packet manipulation rules | Variable |
 | `geneva_iran` | Geneva (Iran) | TCP | Iran-specific packet manipulation rules | Variable |
-| `geneva_turkey` | Geneva (Turkey) | TCP | Turkey-specific packet manipulation rules | Variable |
 | `antiprobe` | Anti-Probe | TLS/TCP | Serves real website; reveals tunnel only to auth clients | Medium |
 | `state_exhaustion` | State Exhaustion | TCP | Floods DPI state table with decoy streams | Low |
 | `mesh_relay` | Mesh Relay | TCP/UDP | Routes through relay nodes in lighter-filtered regions | Variable |
@@ -34,6 +33,8 @@ To see the full list on your binary:
 ```bash
 tiredvpn client -list
 ```
+
+The Geneva strategy ships with four country rule-sets (`russia`, `china`, `iran`, `turkey`), but only `geneva_russia`, `geneva_china`, and `geneva_iran` are registered as strategy IDs by default. The `turkey` rule-set exists in the engine but is not exposed as a registered ID - using it requires a code change to register `NewGenevaStrategy(m, secret, "turkey")`.
 
 ## How the Adaptive Engine Works
 
@@ -205,13 +206,13 @@ On Linux with `CAP_NET_ADMIN`, Geneva uses NFQUEUE to inject raw packets directl
 
 Masquerades the tunnel as a real SSH session. The client sends a correct SSH banner (`SSH-2.0-OpenSSH_8.9`) and a synthetic KEXINIT packet, then wraps tunnel data in SSH binary packet framing with message type `0xFF`. The server authenticates the connection via HMAC-SHA256 over a shared token, accepting timestamps within a 300-second window.
 
-RequiresServer: yes.
+Requires server: yes.
 
 ### IMAP Camouflage
 
 Masquerades the tunnel as IMAP mailbox synchronization. Tunnel data is carried inside FETCH response bodies and APPEND literals, following the IMAP4rev1 wire format closely enough to pass shallow inspection. Authentication uses the same HMAC-SHA256 scheme as SSH Camouflage.
 
-RequiresServer: yes.
+Requires server: yes.
 
 ### ICMP Tunnel
 
