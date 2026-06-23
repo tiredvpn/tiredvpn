@@ -143,6 +143,34 @@ The server listens on both TCP (TLS) and UDP (QUIC) by default. It serves a
 fake website to unauthenticated visitors, making it indistinguishable from a
 normal HTTPS server.
 
+### Server firewall and forwarding (required for TUN mode)
+
+**If you use TUN mode (`-tun` / `-ip-pool`), you must enable IP forwarding and
+NAT on the server host yourself.** TiredVPN deliberately does not modify your
+firewall or routing. Without this, a TUN client connects and the server logs
+`TUN mode established`, but no traffic flows — the client's packets reach the
+server's TUN interface and have nowhere to go. (SOCKS5 proxy mode is unaffected:
+the server process egresses that traffic itself.)
+
+```bash
+# 1) Enable IP forwarding (persist it too)
+sysctl -w net.ipv4.ip_forward=1
+echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+
+# 2) NAT the client pool out your uplink interface.
+#    Find the uplink with: ip route get 1.1.1.1   (the "dev <iface>" part)
+iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o <wan-iface> -j MASQUERADE
+
+# 3) Only if your FORWARD policy is DROP (check: iptables -S FORWARD | head -1)
+iptables -A FORWARD -s 10.8.0.0/24 -j ACCEPT
+iptables -A FORWARD -d 10.8.0.0/24 -j ACCEPT
+```
+
+Replace `10.8.0.0/24` with your `-ip-pool` CIDR and `<wan-iface>` with your real
+uplink (e.g. `eth0`, `enp1s0`). For IPv6 pools, mirror the rules with `ip6tables`
+and `net.ipv6.conf.all.forwarding=1`. Use a firewall manager (nftables, ufw,
+firewalld) if you prefer — the requirement is the same: forward + NAT the pool.
+
 ### Client (SOCKS5 proxy)
 
 ```bash
