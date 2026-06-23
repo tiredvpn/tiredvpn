@@ -148,7 +148,7 @@ normal HTTPS server.
 **If you use TUN mode (`-tun` / `-ip-pool`), you must enable IP forwarding and
 NAT on the server host yourself.** TiredVPN deliberately does not modify your
 firewall or routing. Without this, a TUN client connects and the server logs
-`TUN mode established`, but no traffic flows — the client's packets reach the
+`TUN mode established`, but no traffic flows - the client's packets reach the
 server's TUN interface and have nowhere to go. (SOCKS5 proxy mode is unaffected:
 the server process egresses that traffic itself.)
 
@@ -169,7 +169,7 @@ iptables -A FORWARD -d 10.8.0.0/24 -j ACCEPT
 Replace `10.8.0.0/24` with your `-ip-pool` CIDR and `<wan-iface>` with your real
 uplink (e.g. `eth0`, `enp1s0`). For IPv6 pools, mirror the rules with `ip6tables`
 and `net.ipv6.conf.all.forwarding=1`. Use a firewall manager (nftables, ufw,
-firewalld) if you prefer — the requirement is the same: forward + NAT the pool.
+firewalld) if you prefer - the requirement is the same: forward and NAT the pool.
 
 ### Client (SOCKS5 proxy)
 
