@@ -122,6 +122,24 @@ type VPNConfig struct {
 	ProtectPath string // Unix socket path for VpnService.protect() calls
 }
 
+// resolveServerBypassIP extracts the server's public IP from a "host:port"
+// address for the full-tunnel bypass route. Returns nil if the host cannot be
+// resolved to an IP, in which case the bypass is simply skipped.
+func resolveServerBypassIP(serverAddr string) net.IP {
+	host, _, err := net.SplitHostPort(serverAddr)
+	if err != nil {
+		host = serverAddr
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil || len(ips) == 0 {
+		return nil
+	}
+	return ips[0]
+}
+
 // NewVPNClient creates a new VPN client
 func NewVPNClient(cfg VPNConfig) (*VPNClient, error) {
 	if cfg.MTU == 0 {
@@ -164,6 +182,11 @@ func NewVPNClient(cfg VPNConfig) (*VPNClient, error) {
 		tunDev, err = CreateTUN(cfg.TunName, cfg.MTU)
 		if err != nil {
 			return nil, err
+		}
+		// Pin a server bypass route before configuring routes, so a full-tunnel
+		// default route does not loop the client's own server traffic.
+		if bypassIP := resolveServerBypassIP(cfg.ServerAddr); bypassIP != nil {
+			tunDev.SetServerBypassIP(bypassIP)
 		}
 		// Configure TUN device
 		if err := tunDev.Configure(cfg.LocalIP, cfg.RemoteIP, cfg.Routes); err != nil {

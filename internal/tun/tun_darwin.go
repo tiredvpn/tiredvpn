@@ -182,6 +182,11 @@ func (t *TUNDevice) SetReadDeadline(deadline time.Time) error {
 	return t.file.SetReadDeadline(deadline)
 }
 
+// SetServerBypassIP is a no-op on macOS. Full-tunnel server bypass is not yet
+// implemented for the utun/scutil path; provided so cross-platform callers
+// (vpn.go) compile.
+func (t *TUNDevice) SetServerBypassIP(net.IP) {}
+
 // Close closes the utun socket. macOS removes the interface automatically
 // when the controlling socket is closed.
 func (t *TUNDevice) Close() error {

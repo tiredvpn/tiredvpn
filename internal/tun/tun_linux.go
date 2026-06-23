@@ -46,6 +46,24 @@ type TUNDevice struct {
 	// host that cascade is fine, but explicit scoped deletion keeps cleanup
 	// from ever touching the main table / default route or another tunnel.
 	addedRoutes []*net.IPNet
+
+	// serverBypassIP is the VPN server's public IP. When the route set includes
+	// a default route (0.0.0.0/0 or ::/0), a /32 (or /128) host route to this IP
+	// is pinned through the current physical gateway so server traffic does not
+	// loop back into the tunnel. Set via SetServerBypassIP before Configure.
+	serverBypassIP net.IP
+	// bypassRoute is the host route installed for serverBypassIP, kept so
+	// teardown removes exactly it (it lives on the physical link, not the TUN,
+	// so delRoutes does not cover it).
+	bypassRoute *netlink.Route
+}
+
+// SetServerBypassIP records the VPN server's public IP so that, when a default
+// route is installed, traffic to the server keeps leaving via the physical
+// interface instead of looping through the tunnel. Linux only; on Android the
+// server socket is protected via VpnService.protect() instead.
+func (t *TUNDevice) SetServerBypassIP(ip net.IP) {
+	t.serverBypassIP = ip
 }
 
 // mssTableName returns the per-interface nftables table name for MSS clamping.
@@ -123,6 +141,15 @@ func (t *TUNDevice) Close() error {
 	// never disturbs the main table / default route or another tunnel.
 	if t.name != "" && len(t.addedRoutes) > 0 {
 		t.delRoutes()
+	}
+
+	// Remove the server bypass host route (it lives on the physical link, not
+	// the TUN, so delRoutes does not cover it).
+	if t.bypassRoute != nil {
+		if err := netlink.RouteDel(t.bypassRoute); err != nil {
+			log.Debug("Failed to delete server bypass route: %v", err)
+		}
+		t.bypassRoute = nil
 	}
 
 	t.file.SetReadDeadline(time.Now())
@@ -221,7 +248,64 @@ func (t *TUNDevice) Configure(localIP, remoteIP net.IP, routes []string) error {
 // host CIDRs (/32, /128). Invalid routes are skipped rather than aborting the
 // whole tunnel, but their count is reported at ERROR level so a misconfigured
 // -tun-routes does not fail silently and leak traffic outside the tunnel.
+// routesHaveDefault reports whether routes includes a default route (which would
+// pull all traffic, including traffic to the server, into the tunnel).
+func routesHaveDefault(routes []string) bool {
+	for _, route := range routes {
+		cidr, err := normalizeRoute(route)
+		if err != nil {
+			continue
+		}
+		if cidr == "0.0.0.0/0" || cidr == "::/0" {
+			return true
+		}
+	}
+	return false
+}
+
+// addServerBypass pins a host route to the VPN server through the current
+// physical gateway. It must run BEFORE the default route is pointed at the TUN,
+// so RouteGet still resolves the real gateway. Without it, a full-tunnel client
+// loops its own server traffic (handshake, keepalive, reconnect) back into the
+// tunnel. No-op if no server IP was set or the server already routes via the TUN.
+func (t *TUNDevice) addServerBypass() {
+	if t.serverBypassIP == nil {
+		return
+	}
+	resolved, err := netlink.RouteGet(t.serverBypassIP)
+	if err != nil || len(resolved) == 0 {
+		log.Warn("Server bypass: cannot resolve physical route to %s: %v", t.serverBypassIP, err)
+		return
+	}
+	r := resolved[0]
+	if link, e := netlink.LinkByName(t.name); e == nil && r.LinkIndex == link.Attrs().Index {
+		// Already points at our TUN — adding a bypass here would loop.
+		log.Warn("Server bypass: route to %s already via %s, skipping", t.serverBypassIP, t.name)
+		return
+	}
+	bits := 32
+	if t.serverBypassIP.To4() == nil {
+		bits = 128
+	}
+	bypass := &netlink.Route{
+		LinkIndex: r.LinkIndex,
+		Dst:       &net.IPNet{IP: t.serverBypassIP, Mask: net.CIDRMask(bits, bits)},
+		Gw:        r.Gw,
+		Src:       r.Src,
+	}
+	if err := netlink.RouteReplace(bypass); err != nil {
+		log.Warn("Server bypass: failed to pin host route to %s: %v", t.serverBypassIP, err)
+		return
+	}
+	t.bypassRoute = bypass
+	log.Info("Server bypass route pinned: %s/%d via %v (linkIndex %d)", t.serverBypassIP, bits, r.Gw, r.LinkIndex)
+}
+
 func (t *TUNDevice) addRoutes(link netlink.Link, routes []string) {
+	// Pin the server bypass before any default route lands on the TUN.
+	if routesHaveDefault(routes) {
+		t.addServerBypass()
+	}
 	var invalid []string
 	for _, route := range routes {
 		cidr, err := normalizeRoute(route)
