@@ -40,7 +40,7 @@ import (
 )
 
 var (
-	Version     = "1.3.2"
+	Version     = "1.3.3"
 	connCounter uint64
 )
 
@@ -191,6 +191,7 @@ type Config struct {
 	Debug       bool
 	TunIP       net.IP
 	TunName     string // TUN interface name (default: tiredvpn0)
+	TunMTU      int    // TUN interface MTU (0 = tun.DefaultMTU = 1280)
 
 	// Multi-client mode (Redis)
 	RedisAddr string // e.g., "localhost:6379"
@@ -428,7 +429,7 @@ func initIPPool(cfg *Config, srvCtx *serverContext) error {
 	if tunName == "" {
 		tunName = "tiredvpn0"
 	}
-	sharedTUN, err := NewSharedTUN(tunName, cfg.TunIP, network, tun.DefaultMTU, 0)
+	sharedTUN, err := NewSharedTUN(tunName, cfg.TunIP, network, resolveTunMTU(cfg), 0)
 	if err != nil {
 		return fmt.Errorf("failed to create shared TUN: %w", err)
 	}
@@ -2769,17 +2770,36 @@ func handleTUNModeWithContext(conn net.Conn, cfg *Config, srvCtx *serverContext,
 	handleTUNModeCore(conn, cfg, srvCtx, logger, handshake[:n], "")
 }
 
+// resolveTunMTU returns the configured TUN MTU, falling back to the package
+// default when unset. Both the shared interface setup and the per-connection
+// MTU negotiation go through here so the interface MTU and the MSS clamp can
+// never drift apart.
+func resolveTunMTU(cfg *Config) int {
+	if cfg.TunMTU > 0 {
+		return cfg.TunMTU
+	}
+	return tun.DefaultMTU
+}
+
+// negotiateMTU picks the effective tunnel MTU as min(clientMTU, serverMTU),
+// keeping the legacy guard for clients that advertise no MTU (clientMTU == 0).
+func negotiateMTU(clientMTU, serverMTU int) int {
+	if clientMTU > 0 && clientMTU < serverMTU {
+		return clientMTU
+	}
+	return serverMTU
+}
+
 // handleTUNModeCore is the core TUN mode handler
 // authClientID is the authenticated client ID from QUIC/etc (empty if not available)
 func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger *log.Logger, handshake []byte, authClientID string) {
 	requestedIP := net.IP(handshake[0:4])
 	clientMTU := int(binary.BigEndian.Uint16(handshake[4:6]))
-	// Negotiate MTU: use min(clientMTU, serverMTU) as effective MTU
-	serverMTU := tun.DefaultMTU
-	effectiveMTU := serverMTU
-	if clientMTU > 0 && clientMTU < effectiveMTU {
-		effectiveMTU = clientMTU
-	}
+	// Negotiate MTU: use min(clientMTU, serverMTU) as effective MTU.
+	// serverMTU must match the shared TUN interface MTU (both via resolveTunMTU)
+	// so the MSS clamp below stays in lock-step with the interface.
+	serverMTU := resolveTunMTU(cfg)
+	effectiveMTU := negotiateMTU(clientMTU, serverMTU)
 	logger.Debug("MTU negotiation: client=%d, server=%d, effective=%d", clientMTU, serverMTU, effectiveMTU)
 
 	// Check client version for extended capabilities

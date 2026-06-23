@@ -235,3 +235,29 @@ func buildTCPSYNWithMSS(mss uint16) []byte {
 
 	return pkt
 }
+
+// TestClampTCPMSS_HigherMTUKeeps1460 is the core of the configurable-MTU change:
+// at MTU 1500 a standard 1460 MSS must NOT be clamped down to 1240 (which is what
+// the old hardcoded 1280 ceiling did), so full-size segments flow.
+func TestClampTCPMSS_HigherMTUKeeps1460(t *testing.T) {
+	pkt := buildTCPSYNWithMSS(1460)
+	if ClampTCPMSS(pkt, 1500) {
+		t.Error("MSS 1460 should not be clamped at MTU 1500 (max MSS 1460)")
+	}
+	ihl := int(pkt[0]&0x0F) * 4
+	if mss := binary.BigEndian.Uint16(pkt[ihl+22 : ihl+24]); mss != 1460 {
+		t.Errorf("MSS should stay 1460 at MTU 1500, got %d", mss)
+	}
+}
+
+// TestClampTCPMSS_JumboMTU verifies clamping still works at a jumbo MTU.
+func TestClampTCPMSS_JumboMTU(t *testing.T) {
+	pkt := buildTCPSYNWithMSS(9060)
+	if !ClampTCPMSS(pkt, 9000) {
+		t.Fatal("MSS 9060 should be clamped at MTU 9000")
+	}
+	ihl := int(pkt[0]&0x0F) * 4
+	if mss := binary.BigEndian.Uint16(pkt[ihl+22 : ihl+24]); mss != uint16(9000-40) {
+		t.Errorf("Expected MSS %d at MTU 9000, got %d", 9000-40, mss)
+	}
+}

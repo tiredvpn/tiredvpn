@@ -7,6 +7,14 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.3] - 2026-06-23
+
+### Added
+
+- **Configurable server TUN MTU via `-tun-mtu`, lifting the 1280 ceiling.** The client already had `-tun-mtu`, but the server hardcoded its TUN interface and the MTU negotiation to `tun.DefaultMTU` (1280), so `effectiveMTU = min(clientMTU, 1280)` capped every tunnel at 1280 regardless of the client. The server now takes `-tun-mtu` (default 1280) and feeds it to both the shared TUN interface and the per-connection negotiation, so MTU > 1280 works end-to-end when both ends opt in. Both sides validate the range 1280-9000. Default 1280 keeps behavior identical to 1.3.2.
+
+  Measured on an isolated test stand (REALITY tunnel, 100 MB download): ~2.33 MB/s at MTU 1500 vs ~1.78 MB/s at 1280 — roughly +30% download throughput from the larger MSS.
+
 ## [1.3.2] - 2026-06-23
 
 ### Fixed

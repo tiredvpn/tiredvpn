@@ -180,6 +180,8 @@ ADVANCED OPTIONS:
         TUN interface IP address for VPN server (default "10.8.0.1")
   -tun-name string
         TUN interface name (default "tiredvpn0")
+  -tun-mtu int
+        TUN interface MTU, 1280-9000 (default 1280)
   -pprof string
         Enable pprof profiling on address (e.g., :6060)
   -config string
@@ -333,6 +335,7 @@ func runServer(args []string) {
 	fs.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
 	tunIP := fs.String("tun-ip", "10.8.0.1", "TUN interface IP address for VPN server")
 	fs.StringVar(&cfg.TunName, "tun-name", "tiredvpn0", "TUN interface name")
+	fs.IntVar(&cfg.TunMTU, "tun-mtu", 1280, "TUN interface MTU (1280-9000)")
 	fs.StringVar(&cfg.RedisAddr, "redis", "", "Redis address for multi-client mode (e.g., localhost:6379)")
 	fs.StringVar(&cfg.APIAddr, "api-addr", "127.0.0.1:8080", "HTTP API address for client management")
 	fs.StringVar(&cfg.UpstreamAddr, "upstream", "", "Upstream TiredVPN server for multi-hop (e.g., exit-server.com:443)")
@@ -377,6 +380,11 @@ func runServer(args []string) {
 	cfg.TunIP = net.ParseIP(*tunIP).To4()
 	if cfg.TunIP == nil {
 		fmt.Printf("Error: Invalid TUN IP address: %s\n", *tunIP)
+		os.Exit(1)
+	}
+
+	if cfg.TunMTU < 1280 || cfg.TunMTU > 9000 {
+		fmt.Printf("Error: -tun-mtu must be between 1280 and 9000, got %d\n", cfg.TunMTU)
 		os.Exit(1)
 	}
 
@@ -503,6 +511,12 @@ func runClient(args []string) {
 
 	if err := applyClientTOMLConfig(cfg, *configPath, fs); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Validate MTU after TOML resolution so a TOML-supplied value is checked too.
+	if cfg.TunMTU < 1280 || cfg.TunMTU > 9000 {
+		fmt.Printf("Error: -tun-mtu must be between 1280 and 9000, got %d\n", cfg.TunMTU)
 		os.Exit(1)
 	}
 
