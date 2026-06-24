@@ -336,6 +336,16 @@ volumes:
 docker build -t tiredvpn .
 ```
 
+### TUN mode in containers
+
+The default image is a scratch proxy build with no `iptables`, so server-side
+TUN (`-ip-pool`) does not work in it. For full TUN tunnelling use the `tun`
+build target (`tiredvpn:tun`), which needs `/dev/net/tun`, `NET_ADMIN`, and a
+writable `net.ipv4.ip_forward`; its entrypoint sets up NAT for you. The same
+applies to Helm via `server.tun.enabled`. Full docker run / compose / Helm
+recipes are in
+[docs/deployment.md → TUN mode in containers](docs/deployment.md#tun-mode-in-containers).
+
 ---
 
 ## Building from Source

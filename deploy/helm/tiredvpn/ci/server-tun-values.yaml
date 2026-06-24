@@ -1,0 +1,35 @@
+# Server in TUN exit-node mode: issues IPs from ip-pool and NATs client traffic.
+# Renders the privileged-capable pod (NET_ADMIN, /dev/net/tun, hostNetwork, ip_forward).
+server:
+  enabled: true
+  service:
+    main:
+      type: ClusterIP   # avoid LB for lint
+  tls:
+    create: true
+    cert: |
+      -----BEGIN CERTIFICATE-----
+      TESTCERT
+      -----END CERTIFICATE-----
+    key: |
+      -----BEGIN PRIVATE KEY-----
+      TESTKEY
+      -----END PRIVATE KEY-----
+  auth:
+    mode: secret
+    secret: tun-server-secret
+  config:
+    tun:
+      ip: 10.8.0.1
+      name: tiredvpn0
+      ipPool: "10.8.0.0/24"   # enables IP issuance + NAT in the tun entrypoint
+      ipPoolLease: 24h
+  tun:
+    enabled: true
+    hostNetwork: true
+    privileged: false         # NET_ADMIN + ip_forward sysctl
+    image:
+      repository: "myorg/tiredvpn"
+      tag: "tun"
+client:
+  enabled: false

@@ -130,6 +130,17 @@ Image reference (with optional override via a workload-specific image).
 {{- default .Values.global.image.pullPolicy .Values.client.tun.image.pullPolicy -}}
 {{- end -}}
 
+{{- define "tiredvpn.server.tun.image" -}}
+{{- $img := .Values.server.tun.image -}}
+{{- $repo := default .Values.global.image.repository $img.repository -}}
+{{- $tag := default (default .Chart.AppVersion .Values.global.image.tag) $img.tag -}}
+{{- printf "%s:%s" $repo $tag -}}
+{{- end -}}
+
+{{- define "tiredvpn.server.tun.imagePullPolicy" -}}
+{{- default .Values.global.image.pullPolicy .Values.server.tun.image.pullPolicy -}}
+{{- end -}}
+
 {{/*
 ImagePullSecrets list (rendered into the pod spec).
 */}}

@@ -80,6 +80,40 @@ server:
       listen: ":6060"           # -pprof
     debug: false                # -debug
 
+  # -------- Server TUN / exit-NAT mode --------
+  # When enabled, the server runs as a real exit node: it creates a TUN device,
+  # issues IPs to clients from config.tun.ipPool and NATs their traffic to the WAN.
+  # This requires NET_ADMIN, access to /dev/net/tun and the ability to enable
+  # net.ipv4.ip_forward — none of which the default proxy securityContext allows.
+  #
+  # Build contract: use the `tun` Dockerfile target (alpine + iptables). Its
+  # entrypoint enables ip_forward and installs iptables MASQUERADE/FORWARD rules
+  # for the -ip-pool CIDR automatically (auto-detected WAN interface). So NAT is
+  # NOT configured here — the chart only grants the pod the needed privileges.
+  #
+  # When tun.enabled=false (default) the server stays a plain proxy and the
+  # securityContext / image below are unchanged.
+  tun:
+    enabled: false
+    # Image with the tun entrypoint (alpine + iptables). Empty repository = reuse
+    # global.image.repository; set tag to the tun-variant tag (e.g. "tun" or "x.y.z-tun").
+    image:
+      repository: ""          # empty = global.image.repository
+      tag: "tun"              # tun-variant tag built from the `tun` Dockerfile target
+      pullPolicy: ""          # empty = global.image.pullPolicy
+    # hostNetwork is recommended for an exit node so MASQUERADE uses the node WAN
+    # and return traffic is routed by the node directly.
+    hostNetwork: true
+    # privileged:true is the simplest path — it lets the entrypoint set sysctls
+    # (net.ipv4.ip_forward) and install iptables rules without extra kubelet config.
+    # privileged:false + capabilities below works only if the kubelet allows the
+    # net.ipv4.ip_forward sysctl (see sysctls note in server-deployment.yaml) or
+    # the entrypoint can already toggle it via NET_ADMIN.
+    privileged: false
+    capabilities:
+      - NET_ADMIN
+      - NET_RAW
+
   # Alternative to config.* — raw TOML content (see configs/server.example.toml).
   # When set, mounted at /etc/tiredvpn/server.toml and started as `tiredvpn server -config /etc/tiredvpn/server.toml`.
   tomlConfig: ""

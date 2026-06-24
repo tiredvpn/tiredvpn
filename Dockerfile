@@ -45,3 +45,32 @@ COPY --from=builder /var/www/html/index.html /var/www/html/index.html
 EXPOSE 443/tcp 443/udp 995/tcp 995/udp
 
 ENTRYPOINT ["/tiredvpn"]
+
+# Runtime image (tun) — alpine with iptables/iproute2 for server TUN mode.
+# Auto-configures NAT/forwarding when started with -ip-pool (server TUN mode).
+# Still works in proxy mode (no -ip-pool) and without NET_ADMIN.
+FROM alpine:3.20 AS tun
+
+LABEL org.opencontainers.image.title="TiredVPN (TUN)" \
+      org.opencontainers.image.description="DPI-resistant VPN for censored networks — TUN server image with NAT auto-config" \
+      org.opencontainers.image.url="https://github.com/tiredvpn/tiredvpn" \
+      org.opencontainers.image.source="https://github.com/tiredvpn/tiredvpn" \
+      org.opencontainers.image.licenses="AGPL-3.0"
+
+# iptables + iproute2 for NAT/forwarding, ca-certificates for outbound TLS
+RUN apk add --no-cache iptables iproute2 ca-certificates tzdata
+
+# Timezone data is provided by the tzdata package above.
+
+COPY --from=builder /tiredvpn /usr/local/bin/tiredvpn
+
+# Fake web root for anti-probe masquerade
+COPY --from=builder /var/www/html/index.html /var/www/html/index.html
+
+# NAT/forwarding bootstrap wrapper
+COPY docker/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 443/tcp 443/udp 995/tcp 995/udp
+
+ENTRYPOINT ["/entrypoint.sh"]

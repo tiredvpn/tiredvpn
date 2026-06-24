@@ -137,6 +137,10 @@ The binary never modifies these rules. For the exact commands (including the
 IPv6 variant), see the [Server firewall and forwarding](../README.md#server-firewall-and-forwarding-required-for-tun-mode)
 section in the README and [deployment.md](deployment.md).
 
+Running the server in a container is different - the `tun` image entrypoint sets
+forwarding and NAT automatically from `-ip-pool`, so you do not run these
+commands by hand there. See [deployment.md → TUN mode in containers](deployment.md#tun-mode-in-containers).
+
 ## Configuration via TOML (preferred)
 
 Since v1.1.0 the server accepts `--config <path>` to load all options from a
