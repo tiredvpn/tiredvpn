@@ -1,0 +1,5 @@
+Component: main
+Origin: TiredVPN
+Label: TiredVPN
+Architecture: amd64
+Description: TiredVPN apt repository

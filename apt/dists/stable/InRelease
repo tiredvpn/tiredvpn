@@ -1,0 +1,47 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA512
+
+Origin: TiredVPN
+Label: TiredVPN
+Codename: stable
+Date: Wed, 24 Jun 2026 11:07:07 UTC
+Architectures: amd64 arm64
+Components: main
+Description: TiredVPN apt repository
+MD5Sum:
+ a107c937fe5ea79191c135424b60eee9 763 main/binary-amd64/Packages
+ 4b551111c0567848449f4404f3bc87f0 535 main/binary-amd64/Packages.gz
+ a1cb1598e0aa53fb7a19e480edb1fd61 106 main/binary-amd64/Release
+ aa9d587c7b375bbb8e64769313ceb1c8 763 main/binary-arm64/Packages
+ 7e2f0fb581b60bb33b0c7cba9078830c 534 main/binary-arm64/Packages.gz
+ 833f0c2c40c4bd6fc40c49fa19ba6a0e 106 main/binary-arm64/Release
+SHA1:
+ 1d55d437218480e71e8b8e67a78c07e33db4ac51 763 main/binary-amd64/Packages
+ 1d8a7dd98f18ca189fdf79bb93e594760b6d837d 535 main/binary-amd64/Packages.gz
+ cbfc21b1aea4c89370605c63ec154f6fec1a0765 106 main/binary-amd64/Release
+ 38cfbe2650ce1bb5b626d59d864266e2f733b937 763 main/binary-arm64/Packages
+ f265b59f25fbe51cb0cab078e11f99f2c27370d6 534 main/binary-arm64/Packages.gz
+ 3bca33c026140b27d9e2f0e3015f33da87d18e20 106 main/binary-arm64/Release
+SHA256:
+ 38167b2d7424b1062a6dc1c8be2582ea0276a3486147cc777a6b5c7655203507 763 main/binary-amd64/Packages
+ 7918c1e5acebb5cc6c831f5201ef7f7d69d609cdc5d2cfbabcfd913b78b0d980 535 main/binary-amd64/Packages.gz
+ f56fb9ff2142f536cc47925e506d8cc1e0f6279b4aa0d1ed26922aa43934b7c7 106 main/binary-amd64/Release
+ 4896f88ba96acfced4342710175b0740b901731a479c9199c3cc069789e10a0f 763 main/binary-arm64/Packages
+ cc725d618366a4848c62bf58f85e7d7d7d61c409fa06198f4e92938824fd02ff 534 main/binary-arm64/Packages.gz
+ 2ea051df46bf72e3e60ff7def56f180e193b56db497b982353db591146d6542a 106 main/binary-arm64/Release
+-----BEGIN PGP SIGNATURE-----
+
+iQIzBAEBCgAdFiEERHHoMQRgX2u48+4LJqtRtqgl770FAmo7ulsACgkQJqtRtqgl
+770i2g//V6806LDPJHRv1IorN3D3pXuF7jrp7ixb1bAyLi7yrxnGWTvuFKmk3Us2
+Lv5MSUw1Vnif6xy96padoFZWhidan3Qlb6oTukK9MIq//QkULFLY/gcrJV75hSX5
+WJ0HC/hOZod/SSE3/y0AbuyrjRSHb5eRa+qi3Wt1/Wr7NDAhiDKrA012DMxH2Moo
+dsqbki/q0nug8hlGnV3YDf820Ya6FRGeqDWIfdsaQhO6713kPDPaBIf3Lx3//LGP
+F430m4sLp1HwcyUNU1O2y98H5FTmnufN7O952Qn23cVyOzVRICcJWxSEzls1k+J7
+/QwxitCsw6s3k+8V09MWBvxwBa0uVAYMBWJ57J6xgvvRc3MdUuZZ+w/HZnG97SIN
+rAXaAbNFARY4bqHUJQ7Rm7Xs3wdQoZTaubuwnPqOu1SrlKOJlr+VFNPo0m6hLkIj
+0sbZJOwY+i2CKHfOa1HwvOPVYjxUflQAorziLdakQCjopRmuXw9Fac53SzRzmzZD
+BYMnLPX2DmiFqTxUQykvhXwRIX8crK76Z0iYyJjkhH0T9a+uPPQa6rSQTqTioUoD
+5ZxlaTEK3o/RZlhNDNoABlszHJbfVa5kD8tuR8tp4igIzN2lXaIJe82jWl5XHKMy
+wVWAo53PDwx8JsQ+fZrzi0RkAXpgGw0gSxktkg/n/t+Hh/5E8+U=
+=CAGs
+-----END PGP SIGNATURE-----
