@@ -3236,26 +3236,6 @@ func (c *h2TunConn) SetReadDeadline(t time.Time) error  { return nil }
 func (c *h2TunConn) SetWriteDeadline(t time.Time) error { return nil }
 
 // serveFakeWebsite serves a fake website to probes
-func serveFakeWebsite(conn net.Conn, cfg *Config, logger *log.Logger) {
-	logger.Debug("Serving fake website")
-
-	response := `HTTP/1.1 200 OK
-Content-Type: text/html
-Server: nginx/1.24.0
-Connection: close
-
-<!DOCTYPE html>
-<html>
-<head><title>Welcome</title></head>
-<body>
-<h1>Welcome to nginx!</h1>
-<p>If you see this page, the nginx web server is successfully installed.</p>
-</body>
-</html>`
-
-	conn.Write([]byte(response))
-}
-
 // serveFakeHTTPResponse serves a fake HTTP response
 func serveFakeHTTPResponse(conn net.Conn, cfg *Config, logger *log.Logger) {
 	serveFakeWebsite(conn, cfg, logger)
