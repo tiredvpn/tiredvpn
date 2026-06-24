@@ -7,6 +7,20 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.4] - 2026-06-24
+
+### Added
+
+- **One-line installer and native packages.** `curl -fsSL https://tiredvpn.github.io/tiredvpn/install.sh | sudo bash -s -- --port 443` sets up a server end to end - generates a secret and self-signed cert, starts the service, and prints a `tired://` connection string plus a QR code. Native `.deb`/`.rpm` packages (amd64/arm64) are published to a signed apt/yum repository on GitHub Pages, so `apt install tiredvpn` / `dnf install tiredvpn` work. The package ships a systemd unit in a disabled state; `tiredvpn-init` finishes setup. CI builds and signs the packages and pushes the repo on every release.
+- **Server TUN mode in containers.** A new `tun` Docker target (alpine + iptables) whose entrypoint auto-configures `ip_forward` and NAT from `-ip-pool`, a `docker compose --profile tun` service, and a Helm `server.tun.enabled` path (mounts `/dev/net/tun`, NET_ADMIN, hostNetwork). Previously a TUN server never came up in a container.
+
+### Fixed
+
+- **The fake website now convincingly mimics nginx.** It answered probes with an LF-delimited stub (no `Date`, no `Content-Length`, truncated body) that any scanner could tell apart from nginx instantly. It now replies like a stock nginx: CRLF headers in nginx order, live `Date`, real `Content-Length`, `Last-Modified`, an `ETag` in nginx's `hex-hex` form, `Accept-Ranges`, the byte-exact nginx default page (or files from `-fake-root`), HEAD without a body, and keep-alive.
+- **`TIREDVPN_SECRET` is now actually read.** The server's error message promised it but the code only took `-secret` from the flag. The secret now falls back to the env var, so a systemd unit can pass it via `EnvironmentFile` instead of the command line.
+- **Server `tiredvpn_info` metric reports the real version** instead of a hardcoded `0.2.0`.
+- **Documentation audit:** corrected metric names (the monitoring doc listed metrics that don't exist), `-quic-port` default (443 -> 8443), admin flags, the new server `-tun-mtu`/`-config`, the registered Geneva strategy IDs, and the security reporting policy.
+
 ## [1.3.3] - 2026-06-23
 
 ### Added
