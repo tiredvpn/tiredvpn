@@ -1,0 +1,6 @@
+# The binary is a statically linked Go program (CGO disabled), so it has no
+# dynamic libc dependency - lintian's check assumes a C program.
+tiredvpn: missing-dependency-on-libc
+# This package is served from a self-hosted apt repository, not uploaded to the
+# Debian archive, so a Debian changelog is not required.
+tiredvpn: no-changelog

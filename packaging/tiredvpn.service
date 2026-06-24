@@ -1,0 +1,20 @@
+[Unit]
+Description=TiredVPN server (DPI-resistant VPN)
+Documentation=https://github.com/tiredvpn/tiredvpn
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/tiredvpn/env
+# The secret is read from TIREDVPN_SECRET in the EnvironmentFile, not passed on
+# the command line, so it never shows up in ps/cmdline.
+ExecStart=/usr/bin/tiredvpn server -listen ${TIREDVPN_LISTEN} -cert ${TIREDVPN_CERT} -key ${TIREDVPN_KEY}
+Restart=always
+RestartSec=2
+LimitNOFILE=65536
+# TUN mode needs these capabilities; they are harmless in proxy mode.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target

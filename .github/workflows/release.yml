@@ -124,3 +124,186 @@ jobs:
             tiredvpn-linux-amd64.tar.gz
             tiredvpn-linux-arm64.tar.gz
             checksums.txt
+
+      # Upload the raw (un-tarred) binaries so the package job can feed them to nfpm.
+      - name: Upload raw binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: tiredvpn-binaries
+          path: |
+            tiredvpn-linux-amd64
+            tiredvpn-linux-arm64
+          retention-days: 1
+
+  package:
+    runs-on: ubuntu-latest
+    needs: [release]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      # Pull the raw binaries built by the release job into CWD (nfpm-build.sh
+      # expects tiredvpn-linux-amd64 and tiredvpn-linux-arm64 next to nfpm.yaml).
+      - name: Download raw binaries
+        uses: actions/download-artifact@v7
+        with:
+          name: tiredvpn-binaries
+          path: .
+
+      - name: Install nfpm
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+
+      - name: Build .deb and .rpm packages
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          chmod +x tiredvpn-linux-amd64 tiredvpn-linux-arm64
+          VERSION="$VERSION" bash packaging/nfpm-build.sh
+
+      # Append the native packages to the release created by the release job.
+      - name: Attach packages to release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/*.deb
+            dist/*.rpm
+
+      # Hand the built packages to the publish-repo job.
+      - name: Upload packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: tiredvpn-packages
+          path: |
+            dist/*.deb
+            dist/*.rpm
+          retention-days: 1
+
+  publish-repo:
+    runs-on: ubuntu-latest
+    needs: [package]
+    permissions:
+      contents: write
+    concurrency:
+      group: gh-pages-repo
+    env:
+      PAGES_URL: https://tiredvpn.github.io/tiredvpn
+    steps:
+      # main checkout supplies install.sh and any repo config.
+      - uses: actions/checkout@v6
+
+      - name: Import GPG signing key
+        id: gpg
+        uses: crazy-max/ghaction-import-gpg@v6
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.GPG_PASSPHRASE }}
+
+      # Check out the accumulating gh-pages branch. The repo is additive: reprepro
+      # db/ + pool/ and the rpm trees must survive across releases, so we never
+      # rebuild from scratch.
+      - name: Checkout gh-pages branch
+        uses: actions/checkout@v6
+        with:
+          ref: gh-pages
+          path: pages
+        continue-on-error: true
+
+      - name: Ensure gh-pages worktree exists
+        env:
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          if [ ! -d pages/.git ]; then
+            echo "::group::bootstrap orphan gh-pages"
+            git clone "$REPO_URL" pages
+            cd pages
+            git checkout --orphan gh-pages
+            git rm -rf . >/dev/null 2>&1 || true
+            echo "TiredVPN package repository" > index.html
+            cd ..
+            echo "::endgroup::"
+          fi
+
+      - name: Download built packages
+        uses: actions/download-artifact@v7
+        with:
+          name: tiredvpn-packages
+          path: dist
+
+      - name: Install repo tooling
+        run: sudo apt-get update -y && sudo apt-get install -y reprepro createrepo-c
+
+      # APT repository (reprepro). distributions conf is generated with the
+      # imported key id; reprepro signs the Release file with SignWith.
+      - name: Build APT repository
+        env:
+          KEYID: ${{ steps.gpg.outputs.keyid }}
+        run: |
+          echo "::group::reprepro includedeb"
+          mkdir -p pages/apt/conf
+          cat > pages/apt/conf/distributions <<EOF
+          Origin: TiredVPN
+          Label: TiredVPN
+          Codename: stable
+          Architectures: amd64 arm64
+          Components: main
+          Description: TiredVPN apt repository
+          SignWith: ${KEYID}
+          EOF
+          # includedeb is idempotent per version; pool/ accumulates across releases.
+          for deb in dist/*.deb; do
+            reprepro -b pages/apt includedeb stable "$deb"
+          done
+          echo "::endgroup::"
+
+      # YUM repository (createrepo_c). nfpm names rpm arch x86_64 / aarch64, so
+      # sort by filename into the $basearch trees that install.sh expects.
+      - name: Build YUM repository
+        run: |
+          echo "::group::createrepo_c"
+          mkdir -p pages/rpm/x86_64 pages/rpm/aarch64
+          for rpm in dist/*.rpm; do
+            case "$rpm" in
+              *x86_64*)  cp "$rpm" pages/rpm/x86_64/ ;;
+              *aarch64*) cp "$rpm" pages/rpm/aarch64/ ;;
+              *) echo "unknown rpm arch: $rpm" >&2; exit 1 ;;
+            esac
+          done
+          for arch in x86_64 aarch64; do
+            createrepo_c --update "pages/rpm/${arch}"
+            # repo_gpgcheck=1 in install.sh requires a signed repomd.xml.
+            gpg --batch --yes --detach-sign --armor "pages/rpm/${arch}/repodata/repomd.xml"
+          done
+          echo "::endgroup::"
+
+      - name: Export public key and installer
+        env:
+          KEYID: ${{ steps.gpg.outputs.keyid }}
+        run: |
+          gpg --armor --export "${KEYID}" > pages/gpg.key
+          cp install.sh pages/install.sh
+
+      # Manual add/commit/push so the accumulated db/pool/rpm state is preserved.
+      - name: Commit and push gh-pages
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          cd pages
+          git config user.name "tiredvpn"
+          git config user.email "noreply@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "no repository changes to publish"
+            exit 0
+          fi
+          git commit -m "Publish packages for ${TAG}"
+          git push origin gh-pages

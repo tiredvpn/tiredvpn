@@ -83,7 +83,48 @@ Key design goals:
 
 ### Install
 
-Download the latest binary for your platform:
+#### One-liner (recommended)
+
+```bash
+curl -fsSL https://tiredvpn.github.io/tiredvpn/install.sh | sudo bash -s -- --port 443
+```
+
+Installs the server, generates a secret and TLS cert, starts the service, and
+prints the connection string plus a QR code for the mobile app. Pick a different
+port with `--port N` (default 443).
+
+#### Debian/Ubuntu (apt)
+
+```bash
+curl -fsSL https://tiredvpn.github.io/tiredvpn/gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/tiredvpn-archive-keyring.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/tiredvpn-archive-keyring.gpg] https://tiredvpn.github.io/tiredvpn/apt stable main" | sudo tee /etc/apt/sources.list.d/tiredvpn.list
+sudo apt update && sudo apt install tiredvpn
+sudo tiredvpn-init        # generates secret/cert, prints keys, starts the service
+```
+
+#### Fedora/RHEL (dnf)
+
+```bash
+sudo tee /etc/yum.repos.d/tiredvpn.repo >/dev/null <<'EOF'
+[tiredvpn]
+name=TiredVPN
+baseurl=https://tiredvpn.github.io/tiredvpn/rpm/$basearch
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://tiredvpn.github.io/tiredvpn/gpg.key
+EOF
+sudo dnf install tiredvpn && sudo tiredvpn-init
+```
+
+The apt and dnf packages install the service in a **disabled** state - they
+ship the binary but leave it stopped. Run `sudo tiredvpn-init` to finish setup:
+it generates the secret and cert, prints the access keys, and starts the
+service. The one-liner and `install.sh` already do this for you.
+
+#### Manual binary download
+
+For other distros or hosts without systemd, download the binary directly:
 
 ```bash
 curl -LO https://github.com/tiredvpn/tiredvpn/releases/latest/download/tiredvpn-linux-amd64.tar.gz
@@ -105,6 +146,11 @@ helm install my-tiredvpn oci://ghcr.io/tiredvpn/charts/tiredvpn --version 0.1.0 
 See [deploy/helm/tiredvpn/README.md](deploy/helm/tiredvpn/README.md) for values, examples, and TLS/auth/Redis/HPA options.
 
 ### Generate a shared secret
+
+> The steps below (secret, certs, server flags) are for manual or advanced
+> setups only. The one-liner and the apt/dnf packages handle all of this for
+> you via `tiredvpn-init` - skip ahead to the app sections if you used one of
+> those.
 
 ```bash
 openssl rand -hex 32

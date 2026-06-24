@@ -1,0 +1,72 @@
+# nfpm config for the tiredvpn .deb and .rpm packages.
+# Built per-arch by packaging/nfpm-build.sh with ARCH and VERSION in the env.
+# Requires the per-arch binary tiredvpn-linux-${ARCH} in the working directory.
+name: tiredvpn
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+version_schema: semver
+section: net
+priority: optional
+maintainer: TiredVPN Contributors <noreply@users.noreply.github.com>
+description: |
+  DPI-resistant VPN for censored networks.
+  Tunnels traffic past DPI/TSPU-style censorship using REALITY, QUIC obfuscation,
+  protocol confusion, traffic morphing and other transports, and serves a
+  convincing fake website to unauthenticated probes.
+homepage: https://github.com/tiredvpn/tiredvpn
+license: AGPL-3.0
+
+# Debian dependencies.
+depends:
+  - openssl
+  - iproute2
+recommends:
+  - iptables
+
+# RPM uses different package names for the same tools.
+overrides:
+  rpm:
+    depends:
+      - openssl
+      - iproute
+
+contents:
+  # nfpm does not expand env vars inside contents.src, so nfpm-build.sh copies
+  # the per-arch binary to ./tiredvpn before each run. Binaries go to /usr/bin
+  # (not /usr/local/bin, which Debian policy reserves for the local admin).
+  - src: ./tiredvpn
+    dst: /usr/bin/tiredvpn
+    file_info:
+      mode: 0755
+  - src: ./packaging/tiredvpn-init.sh
+    dst: /usr/bin/tiredvpn-init
+    file_info:
+      mode: 0755
+  - src: ./packaging/tiredvpn.service
+    dst: /lib/systemd/system/tiredvpn.service
+    file_info:
+      mode: 0644
+  - src: ./packaging/tiredvpn.env.example
+    dst: /etc/tiredvpn/env.example
+    type: config|noreplace
+    file_info:
+      mode: 0644
+  - src: ./LICENSE
+    dst: /usr/share/doc/tiredvpn/copyright
+    file_info:
+      mode: 0644
+  - src: ./packaging/lintian-overrides
+    dst: /usr/share/lintian/overrides/tiredvpn
+    packager: deb
+    file_info:
+      mode: 0644
+  - dst: /etc/tiredvpn
+    type: dir
+    file_info:
+      mode: 0750
+
+scripts:
+  postinstall: ./packaging/postinstall.sh
+  preremove: ./packaging/preremove.sh
+  postremove: ./packaging/postremove.sh

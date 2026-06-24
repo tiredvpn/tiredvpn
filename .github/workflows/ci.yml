@@ -138,6 +138,45 @@ jobs:
             echo "::endgroup::"
           done
 
+  package_check:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+          cache: true
+
+      # Build both arch binaries so nfpm-build.sh has its required inputs.
+      - name: Build binaries
+        run: |
+          GOOS=linux GOARCH=amd64 go build -o tiredvpn-linux-amd64 ./cmd/tiredvpn/
+          GOOS=linux GOARCH=arm64 go build -o tiredvpn-linux-arm64 ./cmd/tiredvpn/
+
+      - name: Install nfpm
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+
+      # Dry-run the full packaging path (both arch, deb + rpm) to validate
+      # nfpm.yaml and the maintainer scripts without publishing anything.
+      - name: nfpm package dry-run
+        run: |
+          echo "::group::nfpm build"
+          VERSION=0.0.0-ci bash packaging/nfpm-build.sh
+          echo "::endgroup::"
+
+      - name: Shellcheck packaging scripts
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y shellcheck
+          shellcheck install.sh packaging/*.sh
+
+      # Best-effort Debian policy lint; not allowed to fail the build.
+      - name: Lint .deb (lintian)
+        continue-on-error: true
+        run: |
+          sudo apt-get install -y lintian
+          lintian dist/*amd64.deb || true
+
   vuln_check:
     runs-on: ubuntu-latest
     steps:

@@ -389,6 +389,13 @@ func runServer(args []string) {
 	}
 
 	cfg.Secret = []byte(*secret)
+	// Fall back to the TIREDVPN_SECRET env var when -secret is not given, so a
+	// systemd unit can pass the secret via EnvironmentFile instead of putting it
+	// on the command line (where it would show up in ps/cmdline). The error in
+	// server.go already documents this env var.
+	if len(cfg.Secret) == 0 {
+		cfg.Secret = []byte(os.Getenv("TIREDVPN_SECRET"))
+	}
 	cfg.QUICEnabled = !*noQUIC // QUIC enabled by default
 	cfg.IPPoolLeaseTime = *ipPoolLease
 	cfg.PortHopInterval = *portHopInterval
