@@ -98,7 +98,7 @@ func (m *Metrics) Handler() http.HandlerFunc {
 		// Server info
 		fmt.Fprintf(w, "# HELP tiredvpn_info Server information\n")
 		fmt.Fprintf(w, "# TYPE tiredvpn_info gauge\n")
-		fmt.Fprintf(w, "tiredvpn_info{version=\"%s\"} 1\n", "0.2.0")
+		fmt.Fprintf(w, "tiredvpn_info{version=\"%s\"} 1\n", Version)
 		fmt.Fprintf(w, "\n")
 
 		// Uptime
