@@ -116,7 +116,7 @@ func writeFakeResponse(conn net.Conn, method, path string, cfg *Config, keepAliv
 	h.WriteString("Server: " + nginxServerHeader + "\r\n")
 	h.WriteString("Date: " + time.Now().UTC().Format(http.TimeFormat) + "\r\n")
 	h.WriteString("Content-Type: " + contentType + "\r\n")
-	h.WriteString(fmt.Sprintf("Content-Length: %d\r\n", len(body)))
+	fmt.Fprintf(&h, "Content-Length: %d\r\n", len(body))
 	h.WriteString("Last-Modified: " + modTime.UTC().Format(http.TimeFormat) + "\r\n")
 	h.WriteString("Connection: " + connHdr + "\r\n")
 	h.WriteString("ETag: " + etag + "\r\n")
@@ -189,7 +189,7 @@ func writeNginx404(conn net.Conn, method string, keepAlive bool) {
 	h.WriteString("Server: " + nginxServerHeader + "\r\n")
 	h.WriteString("Date: " + time.Now().UTC().Format(http.TimeFormat) + "\r\n")
 	h.WriteString("Content-Type: text/html\r\n")
-	h.WriteString(fmt.Sprintf("Content-Length: %d\r\n", len(body)))
+	fmt.Fprintf(&h, "Content-Length: %d\r\n", len(body))
 	h.WriteString("Connection: " + connHdr + "\r\n")
 	h.WriteString("\r\n")
 
@@ -198,7 +198,3 @@ func writeNginx404(conn net.Conn, method string, keepAlive bool) {
 		conn.Write(body)
 	}
 }
-
-// writerOf is a tiny indirection so the response builders read cleanly; it just
-// returns the same conn (kept for symmetry / future buffering).
-func writerOf(conn net.Conn) net.Conn { return conn }

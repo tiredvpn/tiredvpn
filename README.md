@@ -68,7 +68,7 @@ Key design goals:
 |---------|----------|------------|----------|---------|
 | Bypass strategies | 20+ | 3–5 | 5–8 | 1–2 |
 | Adaptive fallback | ✅ Mid-session | ❌ | Partial | ❌ |
-| TSPU research | [Daily reports](reports/) | ❌ | ❌ | ❌ |
+| TSPU research | [Daily reports](https://github.com/tiredvpn/tiredvpn-measurements) | ❌ | ❌ | ❌ |
 | Post-quantum crypto | ✅ ML-KEM-768 | ❌ | ❌ | ❌ |
 | Geneva engine | ✅ | ❌ | ❌ | ❌ |
 | RTT masking | ✅ | ❌ | ❌ | ❌ |
