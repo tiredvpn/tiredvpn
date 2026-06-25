@@ -7,6 +7,12 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.5] - 2026-06-25
+
+### Fixed
+
+- **Throughput on long-haul links no longer collapses to ~3 Mbps.** The HTTP/2-stego transport advertised the default flow-control window of 65535 bytes, which caps a single stream at roughly one window per round trip - about 3.4 Mbps at 150 ms RTT, regardless of how much bandwidth the path actually has. On a relayed RU->AMS->USA chain where the underlying links sustain 70-90 Mbps, real throughput sat at ~3 Mbps. The initial window is now raised to 4 MB via `SETTINGS_INITIAL_WINDOW_SIZE`, and WINDOW_UPDATE frames are flushed proactively (256 KB threshold) instead of only on the next `Write`, which previously stalled the download direction where the receiver rarely writes. TCP socket buffers on the server and upstream legs were lifted from 64 KB to 4 MB to match the bandwidth-delay product. Measured end to end through the double tunnel, download went from 3 to 11 Mbps. The full gain needs both server and client updated, since the download rate is bounded by the receiver's advertised window.
+
 ## [1.3.4] - 2026-06-24
 
 ### Added
