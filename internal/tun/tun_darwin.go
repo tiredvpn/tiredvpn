@@ -187,6 +187,14 @@ func (t *TUNDevice) SetReadDeadline(deadline time.Time) error {
 // (vpn.go) compile.
 func (t *TUNDevice) SetServerBypassIP(net.IP) {}
 
+// SetDeferRoutes is a no-op on macOS; route deferral is a Linux-only safeguard.
+// Provided so cross-platform callers (vpn.go) compile.
+func (t *TUNDevice) SetDeferRoutes(bool) {}
+
+// InstallRoutes is a no-op on macOS; routes are installed by Configure (CLI) or
+// by the host (NetworkExtension). Provided for cross-platform parity.
+func (t *TUNDevice) InstallRoutes() {}
+
 // Close closes the utun socket. macOS removes the interface automatically
 // when the controlling socket is closed.
 func (t *TUNDevice) Close() error {

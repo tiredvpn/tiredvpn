@@ -30,6 +30,19 @@ var (
 )
 
 func main() {
+	// Handle -version/--version/version FIRST, before any other work. This must
+	// not depend on flag parsing, network, TUN or kTLS state: a plain
+	// `tiredvpn -version` (or `tiredvpn client -version`) has to print the build
+	// version and exit cleanly even on hosts where later initialization would
+	// fail. Printing here and os.Exit(0) keeps it from ever reaching code that
+	// could crash.
+	for _, arg := range os.Args[1:] {
+		if arg == "version" || arg == "-version" || arg == "--version" {
+			fmt.Printf("tiredvpn %s (built %s)\n", version, buildTime)
+			os.Exit(0)
+		}
+	}
+
 	// Ignore SIGPIPE to prevent crashes when writing to closed sockets
 	// (e.g., Android VpnService closing control socket)
 	signal.Ignore(syscall.SIGPIPE)

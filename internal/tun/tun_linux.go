@@ -56,6 +56,24 @@ type TUNDevice struct {
 	// teardown removes exactly it (it lives on the physical link, not the TUN,
 	// so delRoutes does not cover it).
 	bypassRoute *netlink.Route
+
+	// deferRoutes, when true, makes Configure bring the interface up and assign
+	// the tunnel address but NOT install the route set (notably a 0.0.0.0/0
+	// default route). Routes are installed later via InstallRoutes once a real
+	// connection + handshake to the server succeeds. This prevents the client
+	// from hijacking the default route into a dead tunnel and taking the whole
+	// machine offline when the server is unreachable.
+	deferRoutes bool
+	// routesInstalled guards InstallRoutes so it is idempotent across the
+	// initial connect and subsequent reconnects.
+	routesInstalled bool
+}
+
+// SetDeferRoutes requests that Configure NOT install routes immediately, leaving
+// them for an explicit InstallRoutes call after the tunnel is actually usable.
+// Must be set before Configure. Linux only.
+func (t *TUNDevice) SetDeferRoutes(defer_ bool) {
+	t.deferRoutes = defer_
 }
 
 // SetServerBypassIP records the VPN server's public IP so that, when a default
@@ -229,7 +247,15 @@ func (t *TUNDevice) Configure(localIP, remoteIP net.IP, routes []string) error {
 		}
 	}
 
-	t.addRoutes(link, routes)
+	// When routes are deferred, the interface is up and addressed but no route
+	// (especially a default route) is installed yet. This keeps the host's
+	// normal routing intact until InstallRoutes is called after a successful
+	// connect, so an unreachable server can never strand the machine offline.
+	if t.deferRoutes {
+		log.Info("TUN %s up, routes deferred until server connection is established", t.name)
+	} else {
+		t.addRoutes(link, routes)
+	}
 
 	mss := t.mtu - 40
 	if mss > 0 {
@@ -321,7 +347,11 @@ func (t *TUNDevice) addRoutes(link netlink.Link, routes []string) {
 			continue
 		}
 		t.trackRoute(dst)
-		if err := netlink.RouteAdd(&netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst}); err != nil {
+		// RouteReplace is idempotent: it installs the route if absent and is a
+		// no-op (no EEXIST) if it already exists. addRoutes runs on the initial
+		// install and again on every reconnect, so RouteAdd here used to spam
+		// "file exists" warnings once the route was already present.
+		if err := netlink.RouteReplace(&netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst}); err != nil {
 			log.Warn("Failed to add route %s: %v", route, err)
 		}
 	}
@@ -329,6 +359,36 @@ func (t *TUNDevice) addRoutes(link netlink.Link, routes []string) {
 		log.Error("%d of %d routes invalid, not added to %s: %v",
 			len(invalid), len(routes), t.name, invalid)
 	}
+}
+
+// InstallRoutes installs the deferred route set onto the tunnel. It is called
+// only after a real connection + handshake with the server succeeds, so the
+// default route is never pointed at a dead tunnel. Idempotent: safe to call on
+// every (re)connect; the route adds themselves use RouteReplace. No-op when
+// routes were not deferred (e.g. Android, where VpnService owns routing).
+func (t *TUNDevice) InstallRoutes() {
+	if !t.deferRoutes {
+		return
+	}
+	if t.routesInstalled {
+		// Already installed; refresh idempotently in case a reconnect dropped
+		// the link's routes, but skip the "deferred" log noise.
+		link, err := netlink.LinkByName(t.name)
+		if err != nil {
+			log.Warn("InstallRoutes: cannot find link %s: %v", t.name, err)
+			return
+		}
+		t.reAddRoutes(link, "reconnect")
+		return
+	}
+	link, err := netlink.LinkByName(t.name)
+	if err != nil {
+		log.Warn("InstallRoutes: cannot find link %s: %v", t.name, err)
+		return
+	}
+	t.addRoutes(link, t.routes)
+	t.routesInstalled = true
+	log.Info("Routes installed on %s after successful server connection", t.name)
 }
 
 // trackRoute records dst in t.addedRoutes for scoped teardown, deduping so
@@ -359,7 +419,9 @@ func (t *TUNDevice) reAddRoutes(link netlink.Link, reason string) {
 			continue
 		}
 		t.trackRoute(dst)
-		if err := netlink.RouteAdd(&netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst}); err != nil {
+		// RouteReplace keeps re-adds idempotent across reconnects / IP changes:
+		// an already-present route is refreshed rather than failing with EEXIST.
+		if err := netlink.RouteReplace(&netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst}); err != nil {
 			log.Warn("Failed to re-add route %s: %v", route, err)
 		} else {
 			log.Debug("Re-added route %s after %s", route, reason)

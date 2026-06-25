@@ -188,6 +188,12 @@ func NewVPNClient(cfg VPNConfig) (*VPNClient, error) {
 		if bypassIP := resolveServerBypassIP(cfg.ServerAddr); bypassIP != nil {
 			tunDev.SetServerBypassIP(bypassIP)
 		}
+		// Defer route installation (notably the 0.0.0.0/0 default route) until a
+		// real connection + handshake to the server succeeds. Configure brings
+		// the interface up and assigns its address, but leaves the host's normal
+		// routing intact so an unreachable server cannot strand the machine
+		// offline. Routes go in via InstallRoutes from Start() after connect.
+		tunDev.SetDeferRoutes(true)
 		// Configure TUN device
 		if err := tunDev.Configure(cfg.LocalIP, cfg.RemoteIP, cfg.Routes); err != nil {
 			tunDev.Close()
@@ -215,6 +221,12 @@ func (v *VPNClient) Start(ctx context.Context) error {
 		atomic.StoreInt32(&v.running, 0)
 		return err
 	}
+
+	// Connection + handshake succeeded. Only now point routes (incl. the
+	// default route) at the tunnel. If connect had failed, routes were never
+	// installed and the host kept its normal routing, staying online while the
+	// background reconnect loop retries.
+	v.tun.InstallRoutes()
 
 	// Initialize last activity time
 	v.mu.Lock()
