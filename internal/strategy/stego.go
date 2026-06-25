@@ -334,8 +334,9 @@ func (sc *HTTP2StegoConn) Handshake() error {
 			return err
 		}
 
-		// Send SETTINGS frame
-		if err := sc.framer.WriteSettings(); err != nil {
+		// Send SETTINGS frame with a large initial window so downloads over
+		// high-RTT links are not capped by the default 64 KB flow-control window.
+		if err := sc.framer.WriteSettings(stegoInitialSettings()...); err != nil {
 			return err
 		}
 
@@ -464,8 +465,8 @@ func (sc *HTTP2StegoConn) handleClientHandshake() error {
 		return errors.New("invalid HTTP/2 preface")
 	}
 
-	// Send server SETTINGS
-	if err := sc.framer.WriteSettings(); err != nil {
+	// Send server SETTINGS with a large initial window (see client side).
+	if err := sc.framer.WriteSettings(stegoInitialSettings()...); err != nil {
 		return err
 	}
 
@@ -547,6 +548,24 @@ func (sc *HTTP2StegoConn) sendServerAck(streamID uint32) error {
 	})
 }
 
+// stegoInitialWindow is the HTTP/2 flow-control window we advertise (4 MB).
+// On a 150 ms RTT link the default 64 KB window caps throughput at ~3.4 Mbps;
+// 4 MB lifts that ceiling to well above the 80 Mbps link rate (BDP at 150 ms,
+// 80 Mbps is ~1.5 MB, so 4 MB leaves comfortable headroom).
+const stegoInitialWindow = 4 * 1024 * 1024
+
+// windowUpdateThreshold is how many consumed (read) bytes may accumulate before
+// we proactively return WINDOW_UPDATE credit to the peer, instead of waiting for
+// the next Write. Keeping it well below the window prevents download stalls.
+const windowUpdateThreshold = 256 * 1024
+
+// stegoInitialSettings returns the SETTINGS we send during the handshake.
+func stegoInitialSettings() []http2.Setting {
+	return []http2.Setting{
+		{ID: http2.SettingInitialWindowSize, Val: stegoInitialWindow},
+	}
+}
+
 // flushWindowUpdate sends accumulated WINDOW_UPDATE credits back to the peer.
 // Must be called while sc.mu is held (framer is not concurrent-safe for writes).
 func (sc *HTTP2StegoConn) flushWindowUpdate() {
@@ -559,6 +578,19 @@ func (sc *HTTP2StegoConn) flushWindowUpdate() {
 	if sc.persistentStream != 0 {
 		sc.framer.WriteWindowUpdate(sc.persistentStream, inc) // stream-level
 	}
+}
+
+// proactiveFlushWindowUpdate flushes WINDOW_UPDATE credit from the read path when
+// accumulated consumed bytes exceed windowUpdateThreshold. Called by Read so that
+// download-heavy streams (where Write is rare) keep the peer's send window open.
+// Acquires sc.mu itself since the caller does not hold it.
+func (sc *HTTP2StegoConn) proactiveFlushWindowUpdate() {
+	if atomic.LoadInt64(&sc.recvConsumed) < windowUpdateThreshold {
+		return
+	}
+	sc.mu.Lock()
+	sc.flushWindowUpdate()
+	sc.mu.Unlock()
 }
 
 // Write sends data using various steganographic channels
@@ -853,6 +885,9 @@ func (sc *HTTP2StegoConn) Read(p []byte) (int, error) {
 		// so we don't block Write goroutine while counting bytes.
 		if df, ok := frame.(*http2.DataFrame); ok {
 			atomic.AddInt64(&sc.recvConsumed, int64(len(df.Data())))
+			// Proactively return flow-control credit during downloads so the
+			// peer's send window does not starve while Write is idle.
+			sc.proactiveFlushWindowUpdate()
 		}
 
 		sc.mu.Lock()

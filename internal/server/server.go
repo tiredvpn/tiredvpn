@@ -84,8 +84,8 @@ func setTCPOptions(conn net.Conn) {
 		tc.SetNoDelay(true)   // Disable Nagle's algorithm for low latency
 		tc.SetKeepAlive(true) // Enable TCP keepalive
 		tc.SetKeepAlivePeriod(30 * time.Second)
-		tc.SetReadBuffer(64 * 1024)  // 64KB read buffer
-		tc.SetWriteBuffer(64 * 1024) // 64KB write buffer
+		tc.SetReadBuffer(4 * 1024 * 1024)  // 4MB read buffer (BDP at high RTT)
+		tc.SetWriteBuffer(4 * 1024 * 1024) // 4MB write buffer (BDP at high RTT)
 	}
 }
 

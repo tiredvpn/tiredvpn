@@ -79,9 +79,9 @@ func (d *UpstreamDialer) Dial(ctx context.Context, targetAddr string) (net.Conn,
 		tc.SetNoDelay(true) // Disable Nagle's algorithm
 		tc.SetKeepAlive(true)
 		tc.SetKeepAlivePeriod(30 * time.Second)
-		// Set buffer sizes for better throughput
-		tc.SetReadBuffer(64 * 1024)
-		tc.SetWriteBuffer(64 * 1024)
+		// Set buffer sizes for better throughput (4MB ~ BDP at high RTT)
+		tc.SetReadBuffer(4 * 1024 * 1024)
+		tc.SetWriteBuffer(4 * 1024 * 1024)
 	}
 
 	// TLS handshake on the optimized TCP connection
