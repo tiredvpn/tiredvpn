@@ -361,6 +361,9 @@ func runServer(args []string) {
 	fs.StringVar(&cfg.PortHopStrategy, "port-hop-strategy", "random", "Recommended hop strategy for clients: random, sequential, fibonacci")
 	fs.StringVar(&cfg.PortHopSeed, "port-hop-seed", "", "Optional seed for deterministic hopping (transmitted to clients)")
 
+	// Admission control
+	fs.IntVar(&cfg.MaxConcurrentConns, "max-conns", 0, "Max concurrent in-flight incoming connections (0 = default 4096); excess connections are dropped to bound memory under DPI reconnect storms")
+
 	// Profiling
 	pprofAddr := fs.String("pprof", "", "Enable pprof profiling on address (e.g., :6060)")
 

@@ -44,6 +44,63 @@ var (
 	connCounter uint64
 )
 
+const (
+	// defaultMaxConcurrentConns is the admission-control limit applied when
+	// Config.MaxConcurrentConns is unset. Chosen to comfortably serve a real
+	// client population while capping memory under a probe storm: each in-flight
+	// connection can hold a peek-buffer (up to 16KB) plus relay buffers.
+	defaultMaxConcurrentConns = 4096
+
+	// probeReadDeadline is the initial read deadline for un-classified inbound
+	// connections. Kept short so probe-storm goroutines (and their peek-buffers)
+	// are released quickly instead of lingering for the legitimate-handshake
+	// timeout. 5s is ample for a real ClientHello, including fragmented REALITY.
+	probeReadDeadline = 5 * time.Second
+)
+
+// admissionSem is a buffered-channel semaphore bounding concurrent in-flight
+// incoming TCP connections across all accept-loops. Initialised once by
+// initAdmissionControl before listeners start accepting.
+var admissionSem chan struct{}
+
+// initAdmissionControl sizes the global admission semaphore from cfg. Safe to
+// call once at startup before any accept-loop runs.
+func initAdmissionControl(cfg *Config) {
+	limit := cfg.MaxConcurrentConns
+	if limit <= 0 {
+		limit = defaultMaxConcurrentConns
+	}
+	admissionSem = make(chan struct{}, limit)
+	log.Info("Admission control: max %d concurrent incoming connections", limit)
+}
+
+// acceptConnection applies admission control: it tries to reserve a slot and,
+// on success, spawns handleConnection in a goroutine that releases the slot on
+// exit. When the limit is reached the new connection is dropped (closed)
+// immediately rather than queued, so a reconnect storm cannot accumulate
+// goroutines or buffers. Returns true if the connection was admitted.
+func acceptConnection(conn net.Conn, srvCtx *serverContext, connID uint64) bool {
+	// Defensive: if admission control was not initialised, fall back to the old
+	// unbounded behaviour rather than dropping every connection.
+	if admissionSem == nil {
+		go handleConnection(conn, srvCtx, connID)
+		return true
+	}
+	select {
+	case admissionSem <- struct{}{}:
+		go func() {
+			defer func() { <-admissionSem }()
+			handleConnection(conn, srvCtx, connID)
+		}()
+		return true
+	default:
+		log.Warn("Admission control: dropping connection %d from %s (limit %d reached)",
+			connID, conn.RemoteAddr(), cap(admissionSem))
+		conn.Close()
+		return false
+	}
+}
+
 // checkUDPBufferSizes checks if system UDP buffer sizes are adequate for QUIC
 // Returns true if buffers are properly configured
 func checkUDPBufferSizes() bool {
@@ -217,6 +274,12 @@ type Config struct {
 	PortHopStrategy   string        // Strategy hint: "random", "sequential", "fibonacci" (default: "random")
 	PortHopSeed       string        // Optional seed for deterministic hopping
 
+	// MaxConcurrentConns caps the number of simultaneously in-flight incoming
+	// TCP connections (admission control). Under a DPI reconnect storm the
+	// accept-loop would otherwise spawn unbounded goroutines, each holding a
+	// peek-buffer, leading to OOM. 0 = use defaultMaxConcurrentConns.
+	MaxConcurrentConns int
+
 	// IPv6 Support
 	ListenAddrV6 string // "[::]:995"
 	EnableIPv6   bool   // default: true
@@ -256,6 +319,8 @@ func Run(cfg *Config) error {
 	if cfg.Debug {
 		log.SetDebug(true)
 	}
+
+	initAdmissionControl(cfg)
 
 	if err := InitREALITYKeys(); err != nil {
 		return fmt.Errorf("reality initialization failed: %w", err)
@@ -329,7 +394,7 @@ func Run(cfg *Config) error {
 			continue
 		}
 		connID := atomic.AddUint64(&connCounter, 1)
-		go handleConnection(conn, srvCtx, connID)
+		acceptConnection(conn, srvCtx, connID)
 	}
 }
 
@@ -648,7 +713,7 @@ func startIPv6Listener(addr string, srvCtx *serverContext) error {
 		}
 
 		connID := atomic.AddUint64(&connCounter, 1)
-		go handleConnection(conn, srvCtx, connID)
+		acceptConnection(conn, srvCtx, connID)
 	}
 }
 
@@ -799,8 +864,12 @@ func handleConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 
 	logger.Info("New connection from %s", remoteAddr)
 
-	// Set initial read deadline
-	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	// Set a short initial read deadline for the (still unclassified) connection.
+	// A probe that connects but never sends a valid handshake must not pin a
+	// goroutine and its peek-buffer for 30s under a reconnect storm. A real
+	// ClientHello arrives well within probeReadDeadline; once the TLS record is
+	// being read the deadline is extended below for fragmented handshakes.
+	conn.SetReadDeadline(time.Now().Add(probeReadDeadline))
 
 	// Peek first bytes to detect protocol
 	// First read TLS record header (5 bytes) to get record length
