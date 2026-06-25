@@ -564,7 +564,7 @@ func (t *TUNDevice) linkHasAddr(link netlink.Link, ip net.IP) bool {
 		return false
 	}
 	for _, a := range addrs {
-		if a.IPNet != nil && a.IPNet.IP.Equal(ip) {
+		if a.IPNet != nil && a.IP.Equal(ip) {
 			return true
 		}
 	}
