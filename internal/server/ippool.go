@@ -221,6 +221,33 @@ func (p *IPPool) deleteLease(ip string) {
 	}
 }
 
+// stickyLookup returns the IP previously assigned to clientID, or "" if none.
+// It checks the in-memory map first and falls back to the persisted Redis
+// clientID->IP mapping so reconnects survive a server restart. Caller must hold
+// p.mu. A Redis hit is folded back into the in-memory map for subsequent calls.
+func (p *IPPool) stickyLookup(clientID string) string {
+	if ip, ok := p.byClient[clientID]; ok {
+		return ip
+	}
+	if p.redis == nil {
+		return ""
+	}
+	ctx := context.Background()
+	ip, err := p.redis.Get(ctx, p.redisClientKey(clientID)).Result()
+	if err != nil || ip == "" {
+		return ""
+	}
+	// Validate the mapping still resolves to a live lease owned by this client.
+	if data, err := p.redis.Get(ctx, p.redisKey(ip)).Bytes(); err == nil {
+		var lease IPLease
+		if json.Unmarshal(data, &lease) == nil && lease.ClientID == clientID {
+			p.leases[ip] = &lease
+		}
+	}
+	p.byClient[clientID] = ip
+	return ip
+}
+
 // Allocate allocates an IP address for a client
 // If requestedIP is provided and available, it will be used
 // If clientID already has a lease, returns existing IP
@@ -229,17 +256,38 @@ func (p *IPPool) Allocate(clientID string, requestedIP net.IP, hostname string) 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Check if client already has a lease
-	if existingIP, ok := p.byClient[clientID]; ok {
-		lease := p.leases[existingIP]
-		if lease != nil && (lease.ExpiresAt.IsZero() || time.Now().Before(lease.ExpiresAt)) {
-			// Renew lease
-			if p.config.LeaseTime > 0 {
-				lease.ExpiresAt = time.Now().Add(p.config.LeaseTime)
-				p.saveLease(lease)
+	// Sticky lookup: a client that reconnects must get the SAME IP it had before,
+	// otherwise the client tears down and rebuilds its TUN address on every
+	// reconnect and L3 routes flap. We first consult the in-memory map and, on a
+	// miss (e.g. after a server restart that cleared memory but not Redis), fall
+	// back to the persisted clientID->IP mapping in Redis.
+	if clientID != "" {
+		if existingIP := p.stickyLookup(clientID); existingIP != "" {
+			lease := p.leases[existingIP]
+			if lease == nil {
+				// Recover a lease record we know about from Redis but lost from memory.
+				lease = &IPLease{
+					IP:       existingIP,
+					ClientID: clientID,
+					Hostname: hostname,
+					LeasedAt: time.Now(),
+				}
 			}
-			log.Debug("Renewed existing lease for client %s: %s", clientID, existingIP)
-			return net.ParseIP(existingIP), nil
+			if lease.ExpiresAt.IsZero() || time.Now().Before(lease.ExpiresAt) {
+				// Renew/refresh the lease so it does not expire mid-session.
+				if !lease.ExpiresAt.IsZero() {
+					if p.config.LeaseTime > 0 {
+						lease.ExpiresAt = time.Now().Add(p.config.LeaseTime)
+					} else {
+						lease.ExpiresAt = time.Now().Add(24 * time.Hour)
+					}
+				}
+				if err := p.saveLease(lease); err != nil {
+					log.Warn("Failed to persist sticky lease for client %s: %v", clientID, err)
+				}
+				log.Debug("Sticky lease for client %s: %s", clientID, existingIP)
+				return net.ParseIP(existingIP), nil
+			}
 		}
 	}
 

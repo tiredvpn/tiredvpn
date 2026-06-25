@@ -517,6 +517,18 @@ func (t *TUNDevice) UpdateLocalIP(newLocalIP net.IP) error {
 		return fmt.Errorf("failed to find link %s: %w", t.name, err)
 	}
 
+	// Compare against the address the interface ACTUALLY carries, not just the
+	// cached t.localIP. If the kernel already has newLocalIP on the link (struct
+	// drift, or the sticky server handed back the same IP), skip the AddrDel +
+	// AddrAdd entirely — that del/add is what flushes the link's routes and makes
+	// the L3 path flap on every reconnect.
+	if t.linkHasAddr(link, newLocalIP) {
+		t.localIP = newLocalIP
+		log.Debug("TUN device %s already carries %s, skipping addr swap", t.name, newLocalIP)
+		t.reAddRoutes(link, "IP sync")
+		return nil
+	}
+
 	oldAddr := &netlink.Addr{
 		IPNet: &net.IPNet{IP: t.localIP, Mask: net.CIDRMask(32, 32)},
 		Peer:  &net.IPNet{IP: t.remoteIP, Mask: net.CIDRMask(32, 32)},
@@ -536,9 +548,27 @@ func (t *TUNDevice) UpdateLocalIP(newLocalIP net.IP) error {
 	t.localIP = newLocalIP
 	log.Info("TUN device %s local IP updated to %s", t.name, newLocalIP)
 
+	// AddrDel above flushes every route bound to the old source/link, so re-add
+	// the tracked route set idempotently (RouteReplace, same as 27109a3) to
+	// restore the default route and any split-tunnel routes. The server-bypass
+	// host route lives on the physical link, so it is unaffected by this swap.
 	t.reAddRoutes(link, "IP change")
 
 	return nil
+}
+
+// linkHasAddr reports whether the link already carries ip as an IPv4 address.
+func (t *TUNDevice) linkHasAddr(link netlink.Link, ip net.IP) bool {
+	addrs, err := netlink.AddrList(link, netlink.FAMILY_V4)
+	if err != nil {
+		return false
+	}
+	for _, a := range addrs {
+		if a.IPNet != nil && a.IPNet.IP.Equal(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // nftablesTableName is the prefix for the per-interface nftables tables created
