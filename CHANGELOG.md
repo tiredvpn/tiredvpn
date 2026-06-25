@@ -9,6 +9,10 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [1.3.6] - 2026-06-25
 
+### Added
+
+- **kTLS kernel module is auto-loaded on startup.** When kernel TLS offload is supported but the `tls` module isn't loaded, the process now tries to `modprobe tls` once at startup (5 s timeout) and enables offload if it succeeds. If it can't (no root, no modprobe), it logs a clear message and falls back to userspace crypto without blocking startup. For a permanent fix the log hints at adding `tls` to `/etc/modules-load.d/`.
+
 ### Fixed
 
 - **The client no longer takes the whole machine offline when the server is unreachable.** It used to bring up the TUN device and install the default route (`0.0.0.0/0`) before the tunnel was connected, so with no connectivity to the server all traffic was black-holed into a dead interface - the host lost the network entirely and sat in a `waiting for network...` loop. Routes are now installed only after a successful connect and handshake; until then host routing is left intact and the client retries in the background.
