@@ -259,8 +259,19 @@ jobs:
           Description: TiredVPN apt repository
           SignWith: ${KEYID}
           EOF
-          # includedeb is idempotent per version; pool/ accumulates across releases.
+          # reprepro includedeb is NOT idempotent: re-running a release whose
+          # version is already registered in db/ (with a rebuilt deb that has a
+          # different hash) fails with "cannot be included" / exit 254. Drop any
+          # existing copy of each package's exact version first, then include.
+          # This removes only the version being (re)published; older versions
+          # already in pool/ stay registered and untouched.
           for deb in dist/*.deb; do
+            pkg=$(dpkg-deb -f "$deb" Package)
+            ver=$(dpkg-deb -f "$deb" Version)
+            echo "publishing ${pkg}=${ver}"
+            # removefilter is a no-op (exit 0) when nothing matches the filter.
+            reprepro -b pages/apt removefilter stable \
+              "Package (== ${pkg}), Version (== ${ver})"
             reprepro -b pages/apt includedeb stable "$deb"
           done
           echo "::endgroup::"
