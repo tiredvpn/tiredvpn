@@ -4,7 +4,7 @@ Hash: SHA512
 Origin: TiredVPN
 Label: TiredVPN
 Codename: stable
-Date: Thu, 25 Jun 2026 18:09:36 UTC
+Date: Thu, 25 Jun 2026 19:08:19 UTC
 Architectures: amd64 arm64
 Components: main
 Description: TiredVPN apt repository
@@ -12,36 +12,36 @@ MD5Sum:
  d41d8cd98f00b204e9800998ecf8427e 0 main/binary-amd64/Packages
  7029066c27ac6f5ef18d660d5741979a 20 main/binary-amd64/Packages.gz
  a1cb1598e0aa53fb7a19e480edb1fd61 106 main/binary-amd64/Release
- ec74b24e538e578ac1b910c1f84648ba 763 main/binary-arm64/Packages
- d2eab82144d08200e1063474e1aa14a0 534 main/binary-arm64/Packages.gz
+ 8fd93e7afebb63770046f58e9613adfc 763 main/binary-arm64/Packages
+ 5ef7fb2ce43f3d661ac03794ababd966 533 main/binary-arm64/Packages.gz
  833f0c2c40c4bd6fc40c49fa19ba6a0e 106 main/binary-arm64/Release
 SHA1:
  da39a3ee5e6b4b0d3255bfef95601890afd80709 0 main/binary-amd64/Packages
  46c6643f07aa7f6bfe7118de926b86defc5087c4 20 main/binary-amd64/Packages.gz
  cbfc21b1aea4c89370605c63ec154f6fec1a0765 106 main/binary-amd64/Release
- 50e856e8ec64ae10c9f9918821546b060fda257e 763 main/binary-arm64/Packages
- e6563c0f526961729b9be54fa9f4010ddd9b1e9c 534 main/binary-arm64/Packages.gz
+ c55ac717f19309b8d5613212feb6c0332d8676a3 763 main/binary-arm64/Packages
+ 38df52fbed7966638ea98d5ec8a67cef7e41fef3 533 main/binary-arm64/Packages.gz
  3bca33c026140b27d9e2f0e3015f33da87d18e20 106 main/binary-arm64/Release
 SHA256:
  e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 0 main/binary-amd64/Packages
  59869db34853933b239f1e2219cf7d431da006aa919635478511fabbfc8849d2 20 main/binary-amd64/Packages.gz
  f56fb9ff2142f536cc47925e506d8cc1e0f6279b4aa0d1ed26922aa43934b7c7 106 main/binary-amd64/Release
- 9fd3df91c5584633b769fcf93adb863cb6148efdc9a8ae4ac3077badcb571ccd 763 main/binary-arm64/Packages
- e2a0811d33d77c6603bd282267df45f347cd525735326ae67967635453b888b8 534 main/binary-arm64/Packages.gz
+ 7eef07fceaecd2d8b990b7f7cc8dc2664d5d25b19d09ddab62457fad8a5c9442 763 main/binary-arm64/Packages
+ 7a35f194080d4ea05de41c0e9c6d87a9812bc0e254cb2e3cf665fa4889d4a236 533 main/binary-arm64/Packages.gz
  2ea051df46bf72e3e60ff7def56f180e193b56db497b982353db591146d6542a 106 main/binary-arm64/Release
 -----BEGIN PGP SIGNATURE-----
 
-iQIzBAEBCgAdFiEERHHoMQRgX2u48+4LJqtRtqgl770FAmo9buAACgkQJqtRtqgl
-7729mQ/8C2sBIFvwOeN09eCLuMe+DIXovsRmLmhVMQw5MSCl9D1Hy2QWeVlP80Ce
-gpIiIj81S7h19UZKiR2MTVVF5BWOE7njRaSq42XEmaQ1T1kwIQHVXw1r8eRjOt60
-kF4yCRwfguiMzPbRbCiKdzLFrYAmsZb887ipYnUiEIe7DUnFjfRhvwSd1K6Oxq85
-nELKaGEA6syd8Zv8P8q2yKIqFlsB06LKlhiR8Oah7gSA8dFoq+WLna5uLKS969Aq
-UhBPMD47uA2oylSjB/YxokPOe9vPZ8Kq276DGOprbErsRx7e50ytK+ySd6dTq1DZ
-bbzOOBX+DHg/wOGXQI20yH63CnUA4TFobw7s0+P5dsjea6ZeYYJzIoJa8nH3MGh2
-0PFWT8cYubvzMYD5GF2xmp4qZBsJdneCgT1RFeaPtzSGVIgHhFzF67RCoObQtlJj
-vh0WssniNuyINyjqfMAF9tdyeqh977Ui2Q9tym8ogoMwBh7hW5AXbrKwBi+ekbki
-M9xWCtXHQb3MDhp9o/FxzZHXCBK1dsXVLM59L9ca9afgqghBhXBcKREIWntnr2gK
-1rL2m6RAR7LRLG5eqya7jgBfwKwgyCGsqpoAWzXNC2UFXRDer1LpCzFhaJ9lRJWJ
-9TfkTWRsIXuCJyCVNzV40FWlYzX8SLh6XUhxGiSwEIq2AwSemmA=
-=7SCd
+iQIzBAEBCgAdFiEERHHoMQRgX2u48+4LJqtRtqgl770FAmo9fKMACgkQJqtRtqgl
+771Vlw//Xkn6zWpdpCwiQai+zsYRDeCpkYTQ5UQ+1Ah2+Nj0QT+Oa6hNWMOIOra6
+uplEXkfLM26gp44mXU/+U9q2EetBk3Vx1i+sloA4IiQY16oQncRaMiVqvESGtiMQ
+42ZK1zSlqyurmIZlCuTTD8VaJ3D7qO0TVnsUOUbVnMhssfkgtzO1rcIbazOQbCjj
+S3/BLCKWG98LC6XQPQNvwfQAr5sL7ePHajhztTRVdaRZDU/LxNDmXukjVXXqazDJ
+Fv+FI7yOEBd7dwKlGE/2ez+Sj2O0pxBnOMMGQC1q+D0GwAjV0hEAdqoAww7Os7zR
+jAKV+czC/5kiOvtmQ3jJCcM5s4YPEN69NeUN6Gli3dYBAxihv2HyAAwEzAoNq/Ti
+x9pwg0gWlnqqde2j8QaBkYqt/bpWw5ltqtc0PVG3rXkP9r/vwZkqtA+0prA4qGbA
+bn3Cae5AtnQocKRMDWhrzzeFQ6IHp/wetRFAs9JWUbKLS1zQYfphB+n3xQm5AQn3
+dFihhGtFoWidCsb7V2O/JTsK2m22rr5D7lvOnsgpOTfOzVLbthqg3OfzyTzkajfA
+3wRJE0cbfYSdvHVpncoOaso8hkWlBipBkeqGCw8EOR7JZ4avctxuMjKdVVYngNPS
+C1TRU8XOIXs1aNiZcN7Fn9b2Xtoyc5QXwLH1VlDnd3t5jKdwjkg=
+=aWcI
 -----END PGP SIGNATURE-----
