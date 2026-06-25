@@ -535,6 +535,10 @@ func startQUICServer(cfg *Config, srvCtx *serverContext) *strategy.QUICServer {
 	quicCfg := buildQUICServerConfig(cfg, srvCtx, quicAddr)
 	srv := strategy.NewQUICServer(quicCfg)
 
+	// QUIC server lifecycle is driven by srv.Stop() (closes its internal stopChan),
+	// invoked from handleShutdownSignal. acceptLoop selects on stopChan for both
+	// shutdown and interruptible accept-error backoff, so a non-cancelable
+	// background context here does not block shutdown or cause CPU spin.
 	ctx := context.Background()
 	err := srv.Start(ctx, func(conn net.Conn) {
 		connID := atomic.AddUint64(&connCounter, 1)

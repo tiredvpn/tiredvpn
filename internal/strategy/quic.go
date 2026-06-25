@@ -708,6 +708,16 @@ func (s *QUICServer) wrapPacketConn(udpConn net.PacketConn) net.PacketConn {
 }
 
 func (s *QUICServer) acceptLoop(ctx context.Context, handler func(net.Conn), listener *quic.Listener) {
+	const (
+		acceptBackoffMin    = 10 * time.Millisecond
+		acceptBackoffMax    = 5 * time.Second
+		acceptDegradedAfter = 50 // consecutive errors before logging degradation
+	)
+
+	backoff := acceptBackoffMin
+	consecutiveErrors := 0
+	degradedLogged := false
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -722,9 +732,43 @@ func (s *QUICServer) acceptLoop(ctx context.Context, handler func(net.Conn), lis
 			if ctx.Err() != nil {
 				return
 			}
-			log.Warn("QUIC accept error: %v", err)
+
+			consecutiveErrors++
+			log.Warn("QUIC accept error (consecutive=%d, backoff=%s): %v", consecutiveErrors, backoff, err)
+
+			// Persistent failure: warn once at ERROR level so it's visible in prod,
+			// but keep serving TCP — do not panic or exit the process.
+			if consecutiveErrors >= acceptDegradedAfter && !degradedLogged {
+				log.Error("QUIC listener degraded: %d consecutive Accept errors, last: %v (TCP unaffected)", consecutiveErrors, err)
+				degradedLogged = true
+			}
+
+			// Interruptible backoff so shutdown does not hang.
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-s.stopChan:
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+
+			// Exponential backoff with cap.
+			if backoff < acceptBackoffMax {
+				backoff *= 2
+				if backoff > acceptBackoffMax {
+					backoff = acceptBackoffMax
+				}
+			}
 			continue
 		}
+
+		// Successful Accept: reset backoff and degradation state.
+		backoff = acceptBackoffMin
+		consecutiveErrors = 0
+		degradedLogged = false
 
 		go s.handleConnection(ctx, conn, handler)
 	}
