@@ -6,6 +6,7 @@ package ktls
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"crypto/sha512"
 	"crypto/tls"
@@ -15,9 +16,11 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"reflect"
 	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/tiredvpn/tiredvpn/internal/log"
@@ -120,16 +123,65 @@ func checkSupport() bool {
 	}
 
 	// Look for "tls" module
-	if bytes.Contains(data, []byte("tls ")) {
+	if tlsModuleLoaded(data) {
 		supported.Store(true)
 		initialized.Store(true)
 		log.Info("kTLS: kernel TLS support detected, will offload encryption")
 		return true
 	}
 
-	log.Warn("kTLS: TLS kernel module not loaded")
+	// Module not loaded - try to load it once. Needs root/CAP_SYS_MODULE.
+	// Degrades gracefully: on any failure we fall back to userspace crypto.
+	log.Info("kTLS: TLS kernel module not loaded, attempting auto-load via modprobe")
+	if tryLoadModule() {
+		supported.Store(true)
+		initialized.Store(true)
+		log.Info("kTLS: tls module loaded, will offload encryption " +
+			"(hint: add 'tls' to /etc/modules-load.d/ for persistence)")
+		return true
+	}
+
+	log.Warn("kTLS: module not loaded and auto-load failed " +
+		"(need root or modprobe); falling back to userspace crypto")
 	initialized.Store(true)
 	return false
+}
+
+// tlsModuleLoaded reports whether the "tls" kernel module is present in the
+// contents of /proc/modules.
+func tlsModuleLoaded(procModules []byte) bool {
+	return bytes.Contains(procModules, []byte("tls "))
+}
+
+// tryLoadModule attempts to load the kernel "tls" module via modprobe.
+// It runs once at startup (not in the hot-path) and never blocks the caller
+// for long: a short timeout guards against a hung modprobe. Returns true only
+// if the module is confirmed loaded afterwards.
+func tryLoadModule() bool {
+	path, err := exec.LookPath("modprobe")
+	if err != nil {
+		log.Debug("kTLS: modprobe not found in PATH: %v", err)
+		return false
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, path, "tls")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		// Most common cause: no CAP_SYS_MODULE (not running as root).
+		log.Debug("kTLS: modprobe tls failed: %v (output: %q)", err, bytes.TrimSpace(out))
+		return false
+	}
+
+	// Re-verify against /proc/modules rather than trusting modprobe's exit
+	// code alone (e.g. tls may be built-in, or a no-op success).
+	data, err := os.ReadFile("/proc/modules")
+	if err != nil {
+		log.Debug("kTLS: cannot re-read /proc/modules after modprobe: %v", err)
+		return false
+	}
+	return tlsModuleLoaded(data)
 }
 
 // Supported returns true if kTLS is available
