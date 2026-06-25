@@ -7,6 +7,17 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.6] - 2026-06-25
+
+### Fixed
+
+- **The client no longer takes the whole machine offline when the server is unreachable.** It used to bring up the TUN device and install the default route (`0.0.0.0/0`) before the tunnel was connected, so with no connectivity to the server all traffic was black-holed into a dead interface - the host lost the network entirely and sat in a `waiting for network...` loop. Routes are now installed only after a successful connect and handshake; until then host routing is left intact and the client retries in the background.
+- **TUN mode now works over the REALITY-mux transport.** The server reassigned a pool IP on every reconnect (ignoring `-tun-ip` and changing the address mid-session), so the interface address stopped matching the tunnel session and packets were dropped, while each reconnect tore down the policy route. IP allocation is now sticky per client: the same client gets the same address across reconnects (remembered in memory and Redis), and the client skips the address swap when the IP is unchanged, so routes stop flapping.
+- **QUIC no longer pegs a CPU at 100%.** A failing QUIC accept loop spun without any backoff, retrying instantly forever and burning a full core whenever the listener returned a persistent error. The loop now backs off exponentially (10 ms up to 5 s, reset on a successful accept, interruptible on shutdown) and logs once if it stays degraded. TCP serving is unaffected.
+- **Route installation is idempotent.** Adding a route that already existed failed with `file exists` and spammed warnings on every reconnect; route adds now use replace semantics.
+- **`tiredvpn -version` no longer segfaults.** The flag is handled at the very start of `main`, before any initialization.
+- **The IP pool no longer leaks addresses.** Dynamic (auto-assigned) leases now always carry a finite TTL so the background cleanup can reclaim them when a client disappears without a clean disconnect; sticky leases still survive reconnects within the TTL. A requested IP already held by another client is logged explicitly and falls back to a distinct address (never double-allocated), and out-of-network requested IPs are handled explicitly instead of silently.
+
 ## [1.3.5] - 2026-06-25
 
 ### Fixed
