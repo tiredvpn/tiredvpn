@@ -13,6 +13,18 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/log"
 )
 
+// dynamicLeaseTTL is the fallback lease duration applied to every dynamically
+// allocated (non-static, sticky-renewed, or auto-assigned) lease when the pool
+// is configured with LeaseTime == 0 (permanent). Without a finite TTL such
+// leases would never be reclaimed by CleanupExpired: the TUN disconnect path
+// deliberately does NOT Release() the IP (so a fast reconnect gets the same IP
+// via stickyLookup), so the ONLY reclaim path for an abandoned dynamic lease is
+// TTL expiry. The value is intentionally generous: it must comfortably outlast
+// the longest expected client outage (port hopping, mobile network drops) so a
+// reconnect within the window still lands on the same IP, while still bounding
+// pool growth from clients that never come back.
+const dynamicLeaseTTL = 24 * time.Hour
+
 // IPLease represents an IP address lease
 type IPLease struct {
 	IP        string    `json:"ip"`
@@ -279,7 +291,7 @@ func (p *IPPool) Allocate(clientID string, requestedIP net.IP, hostname string) 
 					if p.config.LeaseTime > 0 {
 						lease.ExpiresAt = time.Now().Add(p.config.LeaseTime)
 					} else {
-						lease.ExpiresAt = time.Now().Add(24 * time.Hour)
+						lease.ExpiresAt = time.Now().Add(dynamicLeaseTTL)
 					}
 				}
 				if err := p.saveLease(lease); err != nil {
@@ -297,7 +309,13 @@ func (p *IPPool) Allocate(clientID string, requestedIP net.IP, hostname string) 
 		ipUint := binary.BigEndian.Uint32(requestedIP)
 
 		// Check if in our network
-		if p.network.Contains(requestedIP) {
+		if !p.network.Contains(requestedIP) {
+			// Out-of-network request: never honor it (it would be unroutable on
+			// the shared TUN). Fall through to auto-allocation, but log it so the
+			// misconfiguration is visible instead of silently picking a random IP.
+			log.Warn("Requested IP %s is outside pool network %s; ignoring and auto-allocating for client %s",
+				requestedIP.String(), p.config.Network, clientID)
+		} else {
 			// Check if not reserved
 			if !p.reserved[ipUint] {
 				ipStr := requestedIP.String()
@@ -328,7 +346,20 @@ func (p *IPPool) Allocate(clientID string, requestedIP net.IP, hostname string) 
 					}
 					return requestedIP, nil
 				}
-				log.Debug("Requested IP %s is already in use", ipStr)
+				// Collision: the requested IP is held by a DIFFERENT clientID. We
+				// must NOT hand it out twice, so we fall through to auto-allocation
+				// (the caller gets a different, free IP). Surface this at Warn with
+				// both clientIDs so a real collision is visible in prod rather than
+				// being swallowed at Debug level.
+				owner := "<unknown>"
+				if existingLease, ok := p.leases[ipStr]; ok {
+					owner = existingLease.ClientID
+				}
+				log.Warn("Requested IP %s already leased to client %s; client %s will be auto-allocated a different IP",
+					ipStr, owner, clientID)
+			} else {
+				log.Warn("Requested IP %s is reserved; auto-allocating for client %s",
+					requestedIP.String(), clientID)
 			}
 		}
 	}
@@ -363,11 +394,15 @@ func (p *IPPool) Allocate(clientID string, requestedIP net.IP, hostname string) 
 			Static:   false,
 		}
 
-		// Dynamic leases always carry a TTL so CleanupExpired can reclaim them.
+		// Dynamic leases ALWAYS carry a finite TTL so CleanupExpired can reclaim
+		// them. When LeaseTime == 0 (permanent) we fall back to dynamicLeaseTTL
+		// instead of leaving ExpiresAt zero, otherwise auto-allocated leases on
+		// the Morph/Confusion/H2/Polling paths (which never call Release) would
+		// be permanent and leak the pool to exhaustion under frequent reconnects.
 		if p.config.LeaseTime > 0 {
 			lease.ExpiresAt = time.Now().Add(p.config.LeaseTime)
 		} else {
-			lease.ExpiresAt = time.Now().Add(24 * time.Hour)
+			lease.ExpiresAt = time.Now().Add(dynamicLeaseTTL)
 		}
 		log.Info("Allocated IP %s to client %s", ipStr, clientID)
 
