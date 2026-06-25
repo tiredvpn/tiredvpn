@@ -7,6 +7,12 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.7] - 2026-06-25
+
+### Fixed
+
+- **The server no longer runs out of memory under a reconnect storm.** With no admission control, every accepted connection unconditionally spawned a handler goroutine, each holding a peek buffer and a 30 s read deadline; under a flood of probe/reconnect attempts (common under DPI pressure) goroutines piled up without bound and the process ballooned to gigabytes of RSS until the kernel OOM-killed it. Incoming connections are now bounded by a semaphore (`-max-conns`, default 4096): once the limit is reached, new connections are dropped and closed immediately rather than queued, so a storm sheds instead of accumulating, while legitimate clients keep being served. The initial read deadline for unclassified connections was also lowered from 30 s to 5 s so probe connections release their buffers quickly; the full fragmented-handshake deadline still applies once a connection is recognized.
+
 ## [1.3.6] - 2026-06-25
 
 ### Added
