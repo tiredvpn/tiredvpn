@@ -74,28 +74,44 @@ func initAdmissionControl(cfg *Config) {
 	log.Info("Admission control: max %d concurrent incoming connections", limit)
 }
 
+// onHandlerDone, when non-nil, is invoked after a spawned handler goroutine
+// fully exits and releases its admission slot. Production leaves it nil; tests
+// set it to observe goroutine completion deterministically (no shared-var
+// polling), which keeps `go test -race` clean.
+var onHandlerDone func()
+
 // acceptConnection applies admission control: it tries to reserve a slot and,
 // on success, spawns handleConnection in a goroutine that releases the slot on
 // exit. When the limit is reached the new connection is dropped (closed)
 // immediately rather than queued, so a reconnect storm cannot accumulate
 // goroutines or buffers. Returns true if the connection was admitted.
 func acceptConnection(conn net.Conn, srvCtx *serverContext, connID uint64) bool {
+	// Capture the semaphore into a local so the spawned goroutine releases the
+	// exact channel it acquired and never reads the package-level admissionSem
+	// variable concurrently with any reassignment.
+	sem := admissionSem
+
 	// Defensive: if admission control was not initialised, fall back to the old
 	// unbounded behaviour rather than dropping every connection.
-	if admissionSem == nil {
+	if sem == nil {
 		go handleConnection(conn, srvCtx, connID)
 		return true
 	}
 	select {
-	case admissionSem <- struct{}{}:
+	case sem <- struct{}{}:
 		go func() {
-			defer func() { <-admissionSem }()
+			defer func() {
+				<-sem
+				if onHandlerDone != nil {
+					onHandlerDone()
+				}
+			}()
 			handleConnection(conn, srvCtx, connID)
 		}()
 		return true
 	default:
 		log.Warn("Admission control: dropping connection %d from %s (limit %d reached)",
-			connID, conn.RemoteAddr(), cap(admissionSem))
+			connID, conn.RemoteAddr(), cap(sem))
 		conn.Close()
 		return false
 	}

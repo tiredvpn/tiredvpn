@@ -7,11 +7,15 @@ import (
 	"time"
 )
 
-// resetAdmission restores the global admission semaphore after a test.
+// resetAdmission restores the global admission state after a test.
 func resetAdmission(t *testing.T) {
 	t.Helper()
-	prev := admissionSem
-	t.Cleanup(func() { admissionSem = prev })
+	prevSem := admissionSem
+	prevHook := onHandlerDone
+	t.Cleanup(func() {
+		admissionSem = prevSem
+		onHandlerDone = prevHook
+	})
 }
 
 // TestInitAdmissionControlDefault verifies the semaphore falls back to the
@@ -94,6 +98,11 @@ func TestAcceptConnectionAdmitsAndReleases(t *testing.T) {
 	initAdmissionControl(&Config{MaxConcurrentConns: 2})
 	srvCtx := &serverContext{cfg: &Config{}}
 
+	// Signal handler completion deterministically instead of polling the shared
+	// admissionSem variable (which would race with this test's cleanup).
+	done := make(chan struct{})
+	onHandlerDone = func() { close(done) }
+
 	// Drive a connection through handleConnection. The peer is closed
 	// immediately so handleConnection's read fails fast and the handler exits,
 	// releasing the slot.
@@ -104,13 +113,15 @@ func TestAcceptConnectionAdmitsAndReleases(t *testing.T) {
 		t.Fatal("expected first connection to be admitted")
 	}
 
-	// Wait for the slot to be released (handler exits and drains the semaphore).
-	deadline := time.After(2 * time.Second)
-	for len(admissionSem) != 0 {
-		select {
-		case <-deadline:
-			t.Fatalf("slot not released: len=%d", len(admissionSem))
-		case <-time.After(5 * time.Millisecond):
-		}
+	// Wait for the handler goroutine to fully exit (slot already released by the
+	// time onHandlerDone fires). Reading len(admissionSem) only after this point
+	// is safe: no goroutine still references the semaphore.
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not complete / slot not released")
+	}
+	if got := len(admissionSem); got != 0 {
+		t.Fatalf("slot not released: len=%d, want 0", got)
 	}
 }
