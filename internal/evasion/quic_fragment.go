@@ -2,19 +2,12 @@ package evasion
 
 import (
 	"crypto/rand"
-	"encoding/binary"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/log"
 )
-
-// QUICCryptoFragmenter fragments QUIC CRYPTO frames to bypass GFW SNI inspection
-// GFW does NOT reassemble fragmented CRYPTO frames, allowing SNI to be hidden
-type QUICCryptoFragmenter struct {
-	config *QUICFragmentConfig
-}
 
 // QUICFragmentConfig configures QUIC CRYPTO frame fragmentation
 type QUICFragmentConfig struct {
@@ -51,129 +44,6 @@ func DefaultQUICFragmentConfig() *QUICFragmentConfig {
 		PaddingFrameCount:     2,
 		SplitAtSNI:            true,
 	}
-}
-
-// NewQUICCryptoFragmenter creates a new fragmenter
-func NewQUICCryptoFragmenter(config *QUICFragmentConfig) *QUICCryptoFragmenter {
-	if config == nil {
-		config = DefaultQUICFragmentConfig()
-	}
-	return &QUICCryptoFragmenter{config: config}
-}
-
-// CryptoFrame represents a QUIC CRYPTO frame
-type CryptoFrame struct {
-	Offset uint64
-	Data   []byte
-}
-
-// FragmentCryptoFrame splits a CRYPTO frame into multiple smaller frames
-func (f *QUICCryptoFragmenter) FragmentCryptoFrame(data []byte) []CryptoFrame {
-	if !f.config.Enabled || len(data) <= f.config.FragmentSize {
-		return []CryptoFrame{{Offset: 0, Data: data}}
-	}
-
-	fragments := []CryptoFrame{}
-	offset := uint64(0)
-
-	// If SplitAtSNI, find SNI offset and ensure split there
-	var sniOffset int
-	if f.config.SplitAtSNI {
-		sniOffset = findSNIOffset(data)
-		log.Debug("SNI offset in ClientHello: %d", sniOffset)
-	}
-
-	for len(data) > 0 {
-		fragSize := f.config.FragmentSize
-		if fragSize > len(data) {
-			fragSize = len(data)
-		}
-
-		// If SplitAtSNI is enabled and we haven't passed SNI yet
-		if f.config.SplitAtSNI && sniOffset > 0 && int(offset) < sniOffset && int(offset)+fragSize >= sniOffset {
-			// Split exactly at SNI offset
-			fragSize = sniOffset - int(offset)
-			if fragSize <= 0 {
-				fragSize = f.config.FragmentSize / 2 // Split in middle of SNI
-			}
-		}
-
-		fragments = append(fragments, CryptoFrame{
-			Offset: offset,
-			Data:   data[:fragSize],
-		})
-
-		data = data[fragSize:]
-		offset += uint64(fragSize)
-	}
-
-	log.Debug("Fragmented CRYPTO frame into %d fragments", len(fragments))
-	return fragments
-}
-
-// findSNIOffset finds the offset of SNI extension in ClientHello
-func findSNIOffset(data []byte) int {
-	// ClientHello structure:
-	// [0]: HandshakeType (1 byte)
-	// [1-3]: Length (3 bytes)
-	// [4-5]: Version (2 bytes)
-	// [6-37]: Random (32 bytes)
-	// [38]: Session ID Length (1 byte)
-	// [...]: Session ID
-	// [...]: Cipher Suites
-	// [...]: Compression Methods
-	// [...]: Extensions
-
-	if len(data) < 44 {
-		return -1
-	}
-
-	// Skip to Session ID
-	offset := 38
-	if offset >= len(data) {
-		return -1
-	}
-	sessionIDLen := int(data[offset])
-	offset += 1 + sessionIDLen
-
-	// Skip Cipher Suites
-	if offset+2 > len(data) {
-		return -1
-	}
-	cipherLen := int(binary.BigEndian.Uint16(data[offset:]))
-	offset += 2 + cipherLen
-
-	// Skip Compression Methods
-	if offset >= len(data) {
-		return -1
-	}
-	compLen := int(data[offset])
-	offset += 1 + compLen
-
-	// Now at extensions
-	if offset+2 > len(data) {
-		return -1
-	}
-	extLen := int(binary.BigEndian.Uint16(data[offset:]))
-	offset += 2
-
-	// Search for SNI extension (type 0x0000)
-	extEnd := offset + extLen
-	for offset+4 <= extEnd && offset+4 <= len(data) {
-		extType := binary.BigEndian.Uint16(data[offset:])
-		extDataLen := int(binary.BigEndian.Uint16(data[offset+2:]))
-
-		if extType == 0x0000 { // SNI extension
-			// Found SNI, return offset to the hostname
-			// SNI format: [list_len:2][name_type:1][name_len:2][name]
-			sniDataOffset := offset + 4 + 2 + 1 + 2 // Skip to hostname
-			return sniDataOffset
-		}
-
-		offset += 4 + extDataLen
-	}
-
-	return -1
 }
 
 // QUICFragmentPacketConn wraps net.PacketConn with UDP datagram fragmentation
