@@ -2916,6 +2916,16 @@ func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger
 
 	logger.Info("TUN client request: IP=%s, clientID=%s", requestedIP, clientID)
 
+	// Multi-hop relay: when -upstream is set this node is a relay, not an exit.
+	// Forward the downstream client's raw IP packets to the upstream exit over a
+	// stego TUN tunnel instead of terminating them on our local TUN. Without this
+	// branch the loop below writes client packets into our own TUN device, the
+	// kernel never routes them to the upstream, and the client gets no exit.
+	if srvCtx != nil && srvCtx.upstreamDialer != nil {
+		relayTUNToUpstream(conn, srvCtx, logger, handshake)
+		return
+	}
+
 	// Check if shared TUN is available
 	if srvCtx == nil || srvCtx.sharedTUN == nil {
 		logger.Error("Shared TUN not initialized")
@@ -3110,6 +3120,62 @@ func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger
 			logger.Debug("TUN write error: %v", err)
 		}
 	}
+}
+
+// relayTUNToUpstream bridges a downstream TUN client to the upstream exit when
+// this node runs in multi-hop relay mode (-upstream set). It opens a stego TUN
+// tunnel to the upstream, relays the upstream's handshake response (including the
+// IP the upstream assigned) back to the downstream client, then byte-copies the
+// raw [len:4][pkt:N] frames (and zero-length keepalives) in both directions. The
+// relay never touches its own sharedTUN/ippool for these clients.
+func relayTUNToUpstream(conn net.Conn, srvCtx *serverContext, logger *log.Logger, handshake []byte) {
+	dialCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	upstreamConn, resp, err := srvCtx.upstreamDialer.DialTUN(dialCtx, handshake)
+	cancel()
+	if err != nil {
+		logger.Warn("Relay: upstream TUN dial failed: %v", err)
+		// Mirror the local error response so the client fails fast instead of hanging.
+		failResp := make([]byte, 9)
+		failResp[0] = 0x01
+		conn.Write(failResp)
+		return
+	}
+	defer upstreamConn.Close()
+
+	// Forward the upstream's handshake response (assigned IP etc.) to the client.
+	if _, err := conn.Write(resp); err != nil {
+		logger.Debug("Relay: failed to send handshake response to client: %v", err)
+		return
+	}
+
+	logger.Info("Relay TUN bridge established (client=%s, upstream-assigned=%s)",
+		conn.RemoteAddr(), net.IP(resp[5:9]))
+
+	// Bidirectional transparent copy. Both ends speak the identical TUN wire
+	// format, so no reframing is needed. First copy to return closes the bridge.
+	var once sync.Once
+	closeBoth := func() {
+		once.Do(func() {
+			conn.Close()
+			upstreamConn.Close()
+		})
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		defer closeBoth()
+		io.Copy(upstreamConn, conn) // client -> upstream
+	}()
+	go func() {
+		defer wg.Done()
+		defer closeBoth()
+		io.Copy(conn, upstreamConn) // upstream -> client
+	}()
+	wg.Wait()
+
+	logger.Info("Relay TUN bridge closed (client=%s)", conn.RemoteAddr())
 }
 
 // setupH2Tunnel establishes the tunnel connection for HTTP/2 stego

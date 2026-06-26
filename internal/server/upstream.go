@@ -4,12 +4,14 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"io"
 	"net"
 	"sync"
 	"time"
 
 	// "github.com/tiredvpn/tiredvpn/internal/ktls"
 	"github.com/tiredvpn/tiredvpn/internal/log"
+	"github.com/tiredvpn/tiredvpn/internal/protocol"
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
 )
 
@@ -50,11 +52,11 @@ func NewUpstreamDialer(addr string, secret []byte) *UpstreamDialer {
 	}
 }
 
-// Dial connects to the target address through the upstream TiredVPN server
-// Returns a net.Conn that transparently tunnels through the upstream
-func (d *UpstreamDialer) Dial(ctx context.Context, targetAddr string) (net.Conn, error) {
-	log.Debug("Upstream dial to %s via %s", targetAddr, d.upstreamAddr)
-
+// connectStego establishes the TLS + HTTP/2 stego session to the upstream and
+// completes the stego handshake. It is shared by Dial (address-proxy mode) and
+// DialTUN (multi-hop TUN bridge). Returns the live stego conn and the underlying
+// tls.Conn (caller closes the latter on any post-handshake failure).
+func (d *UpstreamDialer) connectStego(ctx context.Context) (net.Conn, *tls.Conn, error) {
 	// Get timeout from context or use default
 	deadline, hasDeadline := ctx.Deadline()
 	timeout := 30 * time.Second
@@ -71,7 +73,7 @@ func (d *UpstreamDialer) Dial(ctx context.Context, targetAddr string) (net.Conn,
 	// Dial TCP first to set options before TLS
 	tcpConn, err := dialer.DialContext(ctx, "tcp", d.upstreamAddr)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Set TCP optimizations
@@ -96,7 +98,7 @@ func (d *UpstreamDialer) Dial(ctx context.Context, targetAddr string) (net.Conn,
 
 	if err := tlsConn.Handshake(); err != nil {
 		tcpConn.Close()
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Try to enable kTLS after successful handshake
@@ -117,15 +119,37 @@ func (d *UpstreamDialer) Dial(ctx context.Context, targetAddr string) (net.Conn,
 	// Verify HTTP/2 was negotiated
 	if state.NegotiatedProtocol != "h2" {
 		tlsConn.Close()
-		return nil, errors.New("HTTP/2 not negotiated with upstream")
+		return nil, nil, errors.New("HTTP/2 not negotiated with upstream")
 	}
 
-	// 2. Create HTTP/2 Stego connection (reuse client implementation)
+	// Send the protocol discriminator FIRST so the upstream routes us via
+	// handleTLSConnection -> protocol.TypeStego. Without this the upstream reads
+	// the first stego byte as the dispatch type, fails to authenticate the relay,
+	// and the multi-hop tunnel never establishes. Mirrors strategy/stego.go.
+	if err := protocol.WriteDispatch(tlsConn, protocol.TypeStego); err != nil {
+		tlsConn.Close()
+		return nil, nil, err
+	}
+
+	// Create HTTP/2 Stego connection (reuse client implementation)
 	stegoConn := strategy.NewHTTP2StegoConn(tlsConn, d.upstreamSecret, true, strategy.NaivePaddingStandard)
 
-	// 3. Perform handshake (sends auth headers)
+	// Perform handshake (sends auth headers)
 	if err := stegoConn.Handshake(); err != nil {
 		tlsConn.Close()
+		return nil, nil, err
+	}
+
+	return stegoConn, tlsConn, nil
+}
+
+// Dial connects to the target address through the upstream TiredVPN server
+// Returns a net.Conn that transparently tunnels through the upstream
+func (d *UpstreamDialer) Dial(ctx context.Context, targetAddr string) (net.Conn, error) {
+	log.Debug("Upstream dial to %s via %s", targetAddr, d.upstreamAddr)
+
+	stegoConn, tlsConn, err := d.connectStego(ctx)
+	if err != nil {
 		return nil, err
 	}
 
@@ -158,6 +182,52 @@ func (d *UpstreamDialer) Dial(ctx context.Context, targetAddr string) (net.Conn,
 	// Return the stego connection - it implements net.Conn
 	// Read/Write will automatically handle HTTP/2 stego framing
 	return stegoConn, nil
+}
+
+// DialTUN opens a multi-hop TUN tunnel to the upstream server and performs the
+// HTTP/2 stego TUN handshake (the same one a native TUN client performs). It is
+// used by a relay node (-upstream set) to forward a downstream client's raw IP
+// packets to the upstream exit instead of terminating them on the relay's local
+// TUN. tunHandshake is the [localIP:4][mtu:2][version:1] payload received from the
+// downstream client (without the leading 0x02 mode byte).
+//
+// Returns the live stego conn (a transparent byte stream over which [len:4][pkt:N]
+// frames flow in both directions, exactly as between a native client and exit) and
+// the [status:1][serverIP:4][clientIP:4] response the upstream assigned.
+func (d *UpstreamDialer) DialTUN(ctx context.Context, tunHandshake []byte) (net.Conn, []byte, error) {
+	log.Debug("Upstream TUN dial via %s", d.upstreamAddr)
+
+	stegoConn, tlsConn, err := d.connectStego(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Send the TUN-mode setup over the stego stream. The upstream's setupH2Tunnel
+	// dispatches on the leading 0x02 mode byte to setupH2TUNTunnel, which parses the
+	// remaining [localIP:4][mtu:2][version:1].
+	setup := make([]byte, 1+len(tunHandshake))
+	setup[0] = 0x02 // TUN mode
+	copy(setup[1:], tunHandshake)
+	if _, err := stegoConn.Write(setup); err != nil {
+		tlsConn.Close()
+		return nil, nil, err
+	}
+
+	// Read the handshake response: [status:1][serverIP:4][clientIP:4]. The upstream
+	// frames it as a single stego payload; reassemble up to 9 bytes.
+	resp := make([]byte, 9)
+	if _, err := io.ReadFull(stegoConn, resp); err != nil {
+		tlsConn.Close()
+		return nil, nil, err
+	}
+
+	if resp[0] != 0x00 {
+		tlsConn.Close()
+		return nil, nil, errors.New("upstream rejected TUN handshake")
+	}
+
+	log.Debug("Upstream TUN tunnel established (assigned IP=%s)", net.IP(resp[5:9]))
+	return stegoConn, resp, nil
 }
 
 // DialTimeout is a convenience wrapper with explicit timeout
