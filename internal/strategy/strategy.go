@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -148,6 +149,14 @@ type Manager struct {
 	ipv6Available   bool   // Cached IPv6 availability
 	ipv6CheckedOnce bool   // Whether we've checked IPv6 availability
 	ipv6Mu          sync.Mutex
+
+	// Shared TLS client session cache for resumption across reconnects.
+	// The adaptive manager reconnects frequently (fallback, reprobe); without a
+	// shared cache every stdlib-TLS strategy does a full handshake each time,
+	// costing 1-2 extra RTTs. tls.ClientSessionCache is safe for concurrent use,
+	// and resumption is keyed by ServerName, so strategies with different SNI
+	// never collide. Set once at construction, never mutated => race-free.
+	tlsSessionCache tls.ClientSessionCache
 }
 
 // NewManager creates a new strategy manager
@@ -165,6 +174,7 @@ func NewManager() *Manager {
 		reprobeInterval:       5 * time.Minute,
 		stopReprobe:           make(chan struct{}),
 		tcpFailuresBeforeQUIC: 3, // Switch to QUIC after 3 TCP timeouts
+		tlsSessionCache:       tls.NewLRUClientSessionCache(64),
 	}
 	log.Debug("Strategy Manager created (probeTimeout=%v, connectTimeout=%v, maxRetries=%d)",
 		m.probeTimeout, m.connectTimeout, m.maxRetries)
@@ -2173,6 +2183,13 @@ func (m *Manager) EnablePortHopping(cfg *porthopping.Config) bool {
 // IsPortHoppingEnabled returns true if port hopping is enabled
 func (m *Manager) IsPortHoppingEnabled() bool {
 	return m.portHopper != nil
+}
+
+// TLSSessionCache returns the shared client session cache used by stdlib-TLS
+// strategies for resumption across reconnects. Safe for concurrent use; the
+// returned value is fixed at construction and never replaced.
+func (m *Manager) TLSSessionCache() tls.ClientSessionCache {
+	return m.tlsSessionCache
 }
 
 // GetServerAddr returns the effective server address considering IPv6/IPv4 preferences

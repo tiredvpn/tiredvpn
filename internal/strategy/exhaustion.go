@@ -130,6 +130,7 @@ func (s *StateExhaustionStrategy) Connect(ctx context.Context, target string) (n
 	tlsConfig := &tls.Config{
 		InsecureSkipVerify: true,
 		NextProtos:         []string{"http/1.1"},
+		ClientSessionCache: s.manager.TLSSessionCache(), // resume across reconnects
 	}
 	dialer := &net.Dialer{Timeout: 30 * time.Second}
 	conn, err := tls.DialWithDialer(dialer, "tcp", target, tlsConfig)

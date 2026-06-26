@@ -98,6 +98,7 @@ func (s *AntiProbeStrategy) Connect(ctx context.Context, target string) (net.Con
 		InsecureSkipVerify: true,
 		ServerName:         "www.google.com", // Mimic Google
 		NextProtos:         []string{"http/1.1"},
+		ClientSessionCache: s.manager.TLSSessionCache(), // resume across reconnects
 	}
 
 	var tlsConn *tls.Conn
