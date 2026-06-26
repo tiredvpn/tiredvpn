@@ -1448,6 +1448,22 @@ func forwardH2TUNPacket(tunnel *h2TunnelState, streamID uint32, payload []byte, 
 	}
 	pktLen := binary.BigEndian.Uint32(payload[0:4])
 	logger.Debug("H2 TUN: received payload len=%d, pktLen=%d", len(payload), pktLen)
+	// Handle keepalive packet (zero length) - echo back. The morph, confusion
+	// and native TUN handlers all echo zero-length keepalives; H2-stego TUN was
+	// the only path that dropped them (pktLen<20 below), so idle H2 clients got
+	// no inbound traffic and self-disconnected when their readTimeout expired.
+	if pktLen == 0 {
+		if h2c, ok := tunnel.targetConn.(*h2TunConn); ok {
+			logger.Debug("H2 TUN: received keepalive, echoing back")
+			tunnel.mu.Lock()
+			sendStegoResponse(h2c.framer, tunnel.streamID, []byte{0, 0, 0, 0}, h2c.cfg)
+			tunnel.mu.Unlock()
+		}
+		if tunnel.sharedTUNWriter != nil {
+			tunnel.sharedTUNWriter.UpdateActivity()
+		}
+		return
+	}
 	if int(pktLen) > len(payload)-4 || pktLen < 20 {
 		logger.Debug("H2 TUN: invalid packet - pktLen=%d, payload=%d", pktLen, len(payload))
 		return
