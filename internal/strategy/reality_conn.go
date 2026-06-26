@@ -1,6 +1,7 @@
 package strategy
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
@@ -11,6 +12,17 @@ import (
 	"golang.org/x/crypto/chacha20"
 	"golang.org/x/crypto/hkdf"
 )
+
+// realityReadBufferSize is the bufio.Reader size on the REALITY read path. The
+// max TLS record body is 16383 + 5-byte header; a buffer above that lets a full
+// record (and often the next header) be pulled in one syscall instead of the two
+// io.ReadFull triggered per record before. Read-only sizing, no wire impact.
+const realityReadBufferSize = 32 * 1024
+
+// realityMaxRecordBody is the largest TLS Application Data body we accept on read
+// (and the size of the per-conn decrypt buffer). Write caps chunks at 16383; the
+// read side tolerates up to 16384 for robustness.
+const realityMaxRecordBody = 16384
 
 // realityFramePool reuses Write frame buffers (TLS 5-byte header + up to the
 // max 16383-byte record body = 16388 bytes). A buffer is borrowed for the
@@ -43,9 +55,11 @@ var realityFramePool = sync.Pool{
 // Server reverses the direction: write=[32:64], read=[0:32].
 type realityDataConn struct {
 	net.Conn
+	br      *bufio.Reader    // buffered reads from c.Conn (batches header+body syscalls)
 	wCipher *chacha20.Cipher // encrypt on write
 	rCipher *chacha20.Cipher // decrypt on read
-	rbuf    []byte           // leftover plaintext from last record
+	decBuf  []byte           // per-conn decrypt scratch (realityMaxRecordBody bytes)
+	rbuf    []byte           // leftover plaintext, a slice into decBuf
 }
 
 // deriveRealityDataKeys derives directional chacha20 keys for post-handshake data.
@@ -96,8 +110,10 @@ func NewRealityDataConn(conn net.Conn, sharedSecret, clientPubKey []byte, isClie
 
 	return &realityDataConn{
 		Conn:    conn,
+		br:      bufio.NewReaderSize(conn, realityReadBufferSize),
 		wCipher: wCipher,
 		rCipher: rCipher,
+		decBuf:  make([]byte, realityMaxRecordBody),
 	}, nil
 }
 
@@ -153,32 +169,36 @@ func (c *realityDataConn) Read(b []byte) (int, error) {
 		return n, nil
 	}
 
-	// Read TLS record header (5 bytes).
+	// Read TLS record header (5 bytes) through the buffered reader.
 	var hdr [5]byte
-	if _, err := io.ReadFull(c.Conn, hdr[:]); err != nil {
+	if _, err := io.ReadFull(c.br, hdr[:]); err != nil {
 		return 0, err
 	}
 	if hdr[0] != 0x17 {
 		return 0, errors.New("reality: unexpected TLS record type")
 	}
 	dataLen := int(binary.BigEndian.Uint16(hdr[3:]))
-	if dataLen == 0 || dataLen > 16384 {
+	if dataLen == 0 || dataLen > realityMaxRecordBody {
 		return 0, errors.New("reality: invalid TLS record length")
 	}
 
-	// Read encrypted payload.
-	enc := make([]byte, dataLen)
-	if _, err := io.ReadFull(c.Conn, enc); err != nil {
+	// Read the encrypted payload into the per-conn scratch buffer (no per-Read
+	// allocation). dataLen <= realityMaxRecordBody == len(c.decBuf).
+	buf := c.decBuf[:dataLen]
+	if _, err := io.ReadFull(c.br, buf); err != nil {
 		return 0, err
 	}
 
-	// Decrypt in-place.
-	c.rCipher.XORKeyStream(enc, enc)
+	// Decrypt in-place. ChaCha20 keystream consumption stays byte-for-byte in
+	// sync with the wire: bufio only changes how bytes are fetched, not which
+	// bytes or their order, so framing is identical to the unbuffered path.
+	c.rCipher.XORKeyStream(buf, buf)
 
-	// Copy to b, buffer remainder.
-	n := copy(b, enc)
-	if n < len(enc) {
-		c.rbuf = enc[n:]
+	// Copy to b; any remainder stays in decBuf as a bounded leftover slice
+	// (no retention of a separate full-record allocation).
+	n := copy(b, buf)
+	if n < dataLen {
+		c.rbuf = c.decBuf[n:dataLen]
 	}
 	return n, nil
 }
