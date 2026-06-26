@@ -7,6 +7,19 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.12] - 2026-06-27
+
+### Security
+
+- **Fixed a remote denial of service in ClientHello parsing.** `ExtractSNI` (and `RemoveREALITYExtension`) read into the handshake buffer without bounds checks, so a malformed, short ClientHello sent by any client could panic the server with an index-out-of-range and take down every connection. Both functions now bounds-check before each access, matching the existing safe parser.
+- **Stopped logging client secrets and auth tokens at debug level.** Several debug log lines printed a prefix of the client secret and the raw auth token; these were removed so credentials no longer end up in logs.
+- **Removed a `panic` from the packet data path.** The Morph padding path called `panic` if `crypto/rand` ever failed mid-stream, which would crash the whole server; it now uses a non-crypto source for padding (the wire format is unchanged) so a transient RNG error can't kill the process.
+- **Optional bearer-token authentication for the management API.** The `/clients`, `/stats` and `/health` API had no authentication - safe only on loopback, but a misconfigured `-api-addr 0.0.0.0` exposed unauthenticated client management. A new `-api-token` (or `TIREDVPN_API_TOKEN`) enables `Authorization: Bearer` checking (constant-time comparison); when unset, behavior is unchanged and a warning is logged if the API binds to a non-loopback address. The admin CLI sends the token automatically.
+
+### Removed
+
+- **Dead-code cleanup.** Removed unreachable packages (`internal/proxy`, `internal/tunnel`, `internal/multiport`, the legacy JSON `internal/config/config.go`), unused structures (fake-packet injector, QUIC crypto fragmenter, resilient/health-monitored connections), the pre-pooled client handlers superseded by the pooled ones, duplicate secret/clientID generators, and deprecated unused `serverAddr` fields - about 160 unreachable symbols. No behavior change.
+
 ## [1.3.11] - 2026-06-26
 
 ### Fixed
