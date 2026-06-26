@@ -1604,10 +1604,10 @@ func handleMorphConnection(conn net.Conn, srvCtx *serverContext, logger *log.Log
 	// 1. Try per-client secrets from Redis (if registry exists)
 	if srvCtx.registry != nil {
 		clients := srvCtx.registry.ListClients()
-		logger.Debug("Traffic Morph: checking %d clients from registry, token: %x...", len(clients), authToken[:8])
+		logger.Debug("Traffic Morph: checking %d clients from registry", len(clients))
 		for _, client := range clients {
 			secretBytes := []byte(client.Secret)
-			logger.Debug("Traffic Morph: trying client '%s' with secret len=%d prefix=%s...", client.Name, len(client.Secret), client.Secret[:min(16, len(client.Secret))])
+			logger.Debug("Traffic Morph: trying client '%s' (secret len=%d)", client.Name, len(client.Secret))
 			if verifyMorphAuth(authToken, secretBytes) {
 				logger.Info("Traffic Morph authenticated (client: %s, id: %s)", client.Name, client.ID)
 				authenticated = true
@@ -4200,8 +4200,7 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 			clientID = existingSess.ClientID
 		} else {
 			// Debug: try all secrets to find which one would match
-			logger.Debug("HTTP Polling: Auth failed for existing session %s (token mismatch), sess.Secret prefix=%x, authToken=%s",
-				sessionID[:8], existingSess.Secret[:min(8, len(existingSess.Secret))], authToken)
+			logger.Debug("HTTP Polling: Auth failed for existing session %s (token mismatch)", sessionID[:8])
 
 			// Try registered clients to see if any match
 			if srvCtx.registry != nil {
@@ -4209,12 +4208,12 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 				for _, c := range clients {
 					secretBytes := []byte(c.Secret)
 					if verifyPollingAuth(authToken, sessionID, secretBytes) {
-						logger.Debug("HTTP Polling: Token would match client '%s' secret prefix=%x", c.Name, secretBytes[:min(8, len(secretBytes))])
+						logger.Debug("HTTP Polling: Token would match client '%s'", c.Name)
 					}
 				}
 			}
 			if verifyPollingAuth(authToken, sessionID, srvCtx.cfg.Secret) {
-				logger.Debug("HTTP Polling: Token would match global secret prefix=%x", srvCtx.cfg.Secret[:min(8, len(srvCtx.cfg.Secret))])
+				logger.Debug("HTTP Polling: Token would match global secret")
 			}
 
 			sendHTTPPollingError(conn, "Authentication failed")
