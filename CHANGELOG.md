@@ -7,6 +7,12 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.9] - 2026-06-26
+
+### Fixed
+
+- **`apt install tiredvpn` now works on amd64 again.** The APT repository was being published with only the last architecture processed - the amd64 package was missing from the index entirely (`binary-amd64/Packages` was empty), so `apt-get install tiredvpn` failed with "Unable to locate package tiredvpn" on amd64 hosts while arm64 worked. The cause was in the repository publish step: `reprepro removefilter` was scoped only by package and version, so when the loop processed the arm64 `.deb` it removed the amd64 entry of the same version that had just been added (and vice versa), leaving the repo with a single architecture. The filter is now scoped by architecture as well, so each `.deb` only replaces its own arch. (Fixes #45.)
+
 ## [1.3.8] - 2026-06-26
 
 ### Fixed

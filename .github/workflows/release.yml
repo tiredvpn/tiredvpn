@@ -268,10 +268,15 @@ jobs:
           for deb in dist/*.deb; do
             pkg=$(dpkg-deb -f "$deb" Package)
             ver=$(dpkg-deb -f "$deb" Version)
-            echo "publishing ${pkg}=${ver}"
+            arch=$(dpkg-deb -f "$deb" Architecture)
+            echo "publishing ${pkg}=${ver} (${arch})"
             # removefilter is a no-op (exit 0) when nothing matches the filter.
+            # MUST scope by Architecture: removefilter on Package+Version alone
+            # drops ALL arches of that version, so processing the arm64 deb would
+            # wipe the amd64 one just added in this same loop (and vice versa) -
+            # leaving the repo with only the last arch (issue #45).
             reprepro -b pages/apt removefilter stable \
-              "Package (== ${pkg}), Version (== ${ver})"
+              "Package (== ${pkg}), Version (== ${ver}), Architecture (== ${arch})"
             reprepro -b pages/apt includedeb stable "$deb"
           done
           echo "::endgroup::"
