@@ -18,6 +18,7 @@ import (
 
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/crypto/hkdf"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
 )
@@ -693,26 +694,26 @@ func (c *icmpTunnelConn) SetWriteDeadline(t time.Time) error {
 	return c.icmpConn.SetWriteDeadline(t)
 }
 
-// DeriveICMPKey derives a 32-byte key for ChaCha20-Poly1305 from secret
+// DeriveICMPKey derives a 32-byte master key for the ICMP tunnel from the shared
+// secret using HKDF-SHA256, matching the KDF used elsewhere (reality_conn.go).
+//
+// WIRE-COMPATIBILITY: both client (icmp_tunnel.go Connect) and server
+// (server/icmp_server.go) call this same function with the same shared secret,
+// so both derive an identical master key and the directional keys stay in sync.
+// Changing this derivation is wire-incompatible across versions, but client and
+// server ship together so the new HKDF applies to both at once.
 func DeriveICMPKey(secret []byte) []byte {
-	// Simple key derivation
-	// In production, use HKDF or similar
-	h := make([]byte, 32)
-	if len(secret) >= 32 {
-		copy(h, secret[:32])
-	} else if len(secret) > 0 {
-		// Pad with deterministic expansion
-		copy(h, secret)
-		for i := len(secret); i < 32; i++ {
-			h[i] = byte(i ^ int(secret[i%len(secret)]))
-		}
-	} else {
-		// Empty secret: use deterministic fill (not secure, but valid for testing)
-		for i := 0; i < 32; i++ {
-			h[i] = byte(i * 7) // Deterministic but distinct bytes
-		}
+	r := hkdf.New(sha256.New, secret, nil, []byte("tiredvpn-icmp-master-v1"))
+	out := make([]byte, 32)
+	// HKDF-SHA256 never fails for a 32-byte output (well under the 255*HashLen
+	// limit), so io.ReadFull cannot error here; the check is defensive.
+	if _, err := io.ReadFull(r, out); err != nil {
+		// Should be unreachable; fall back to a deterministic SHA-256 of the
+		// secret so callers still receive a valid 32-byte key.
+		sum := sha256.Sum256(secret)
+		copy(out, sum[:])
 	}
-	return h
+	return out
 }
 
 // DeriveICMPDirectionalKey derives a 32-byte key for a specific traffic direction.
