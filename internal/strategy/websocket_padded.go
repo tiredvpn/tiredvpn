@@ -25,22 +25,20 @@ import (
 // WebSocketPaddedStrategy implements WebSocket transport with Salamander padding
 // Priority 8 (high, between HTTP/2 Stego and Traffic Morph)
 type WebSocketPaddedStrategy struct {
-	manager    *Manager // IPv6/IPv4 transport layer support
-	serverAddr string   // Deprecated: use manager.GetServerAddr() instead
-	secret     []byte
-	wsPath     string
-	wsHost     string
+	manager *Manager // IPv6/IPv4 transport layer support
+	secret  []byte
+	wsPath  string
+	wsHost  string
 }
 
 // NewWebSocketPaddedStrategy creates a new WebSocket Padded strategy
 // manager is required for IPv6/IPv4 transport layer support
 func NewWebSocketPaddedStrategy(manager *Manager, secret []byte) *WebSocketPaddedStrategy {
 	return &WebSocketPaddedStrategy{
-		manager:    manager,
-		serverAddr: "", // Deprecated: use manager.GetServerAddr() instead
-		secret:     secret,
-		wsPath:     "/ws",
-		wsHost:     "chat.openai.com", // Mimic ChatGPT WebSocket
+		manager: manager,
+		secret:  secret,
+		wsPath:  "/ws",
+		wsHost:  "chat.openai.com", // Mimic ChatGPT WebSocket
 	}
 }
 

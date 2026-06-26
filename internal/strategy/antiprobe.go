@@ -18,7 +18,6 @@ import (
 // Server appears as a normal website to unknown clients
 type AntiProbeStrategy struct {
 	manager      *Manager // Reference to Manager for IPv6/IPv4 support
-	serverAddr   string   // Deprecated: use manager.GetServerAddr() instead
 	knockSecret  []byte
 	timingWindow time.Duration
 	baseStrat    Strategy
@@ -40,7 +39,6 @@ type KnockSequence struct {
 func NewAntiProbeStrategy(manager *Manager, secret []byte) *AntiProbeStrategy {
 	return &AntiProbeStrategy{
 		manager:      manager,
-		serverAddr:   "", // Deprecated: use manager.GetServerAddr() instead
 		knockSecret:  secret,
 		timingWindow: 100 * time.Millisecond,
 	}
@@ -243,4 +241,3 @@ func (s *AntiProbeStrategy) verifyServerAuth(conn *tls.Conn) error {
 	// Server already sent 0x01 ACK in timingKnock, now ready for tunnel
 	return nil
 }
-

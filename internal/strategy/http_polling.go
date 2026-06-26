@@ -25,22 +25,20 @@ import (
 // Each data chunk is sent as a short-lived HTTP/1.1 request
 // This evades DPI that throttles long-lived connections (like TSPU)
 type HTTPPollingStrategy struct {
-	manager    *Manager // IPv6/IPv4 transport layer support
-	serverAddr string   // Deprecated: use manager.GetServerAddr() instead
-	secret     []byte
-	host       string // Cover host for TLS SNI
-	path       string
+	manager *Manager // IPv6/IPv4 transport layer support
+	secret  []byte
+	host    string // Cover host for TLS SNI
+	path    string
 }
 
 // NewHTTPPollingStrategy creates a new HTTP polling strategy
 // manager is required for IPv6/IPv4 transport layer support
 func NewHTTPPollingStrategy(manager *Manager, secret []byte) *HTTPPollingStrategy {
 	return &HTTPPollingStrategy{
-		manager:    manager,
-		serverAddr: "", // Deprecated: use manager.GetServerAddr() instead
-		secret:     secret,
-		host:       "cdn.jsdelivr.net", // Looks like CDN traffic
-		path:       "/npm/jquery/dist/jquery.min.js",
+		manager: manager,
+		secret:  secret,
+		host:    "cdn.jsdelivr.net", // Looks like CDN traffic
+		path:    "/npm/jquery/dist/jquery.min.js",
 	}
 }
 

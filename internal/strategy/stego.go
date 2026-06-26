@@ -25,7 +25,6 @@ import (
 	"golang.org/x/net/http2/hpack"
 )
 
-
 // NaivePaddingMode defines the padding strategy (inspired by NaiveProxy)
 type NaivePaddingMode int
 
@@ -56,7 +55,6 @@ func (m NaivePaddingMode) String() string {
 // Uses custom headers, DATA frames with steganographic encoding
 type HTTP2StegoStrategy struct {
 	manager     *Manager // Reference to Manager for IPv6/IPv4 support
-	serverAddr  string   // Deprecated: use manager.GetServerAddr() instead
 	secret      []byte
 	coverHost   string // Host to impersonate (e.g., "www.googleapis.com")
 	paddingMode NaivePaddingMode
@@ -75,7 +73,6 @@ func NewHTTP2StegoStrategy(manager *Manager, secret []byte, coverHost string) *H
 	}
 	return &HTTP2StegoStrategy{
 		manager:     manager,
-		serverAddr:  "", // Deprecated: use manager.GetServerAddr() instead
 		secret:      secret,
 		coverHost:   coverHost,
 		paddingMode: NaivePaddingMinimal, // Default to minimal for low latency
@@ -90,7 +87,6 @@ func NewHTTP2StegoStrategyWithPadding(manager *Manager, secret []byte, coverHost
 	}
 	return &HTTP2StegoStrategy{
 		manager:     manager,
-		serverAddr:  "", // Deprecated: use manager.GetServerAddr() instead
 		secret:      secret,
 		coverHost:   coverHost,
 		paddingMode: mode,
@@ -105,7 +101,6 @@ func NewHTTP2StegoStrategyWithECH(manager *Manager, secret []byte, coverHost str
 	}
 	return &HTTP2StegoStrategy{
 		manager:       manager,
-		serverAddr:    "", // Deprecated: use manager.GetServerAddr() instead
 		secret:        secret,
 		coverHost:     coverHost,
 		paddingMode:   NaivePaddingStandard,
@@ -308,7 +303,7 @@ func NewHTTP2StegoConn(conn net.Conn, secret []byte, isClient bool, paddingMode 
 	if isClient {
 		sc.nextStreamID = 1
 		// Rate limiter disabled - was causing 80 KB/s bottleneck
-		} else {
+	} else {
 		sc.nextStreamID = 2
 	}
 
@@ -878,7 +873,7 @@ func (sc *HTTP2StegoConn) Read(p []byte) (int, error) {
 		n, err := sc.readBuf.Read(p)
 		sc.mu.Unlock()
 		// Apply rate limiting to downloads to create TCP backpressure
-			return n, err
+		return n, err
 	}
 	sc.mu.Unlock()
 

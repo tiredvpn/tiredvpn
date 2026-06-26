@@ -25,7 +25,6 @@ import (
 // kernel level, which is more reliable than application-layer fragmentation.
 type GenevaStrategy struct {
 	manager    *Manager // Reference to Manager for IPv6/IPv4 support
-	serverAddr string   // Deprecated: use manager.GetServerAddr() instead
 	secret     []byte
 	country    string // "russia", "china", "iran", "turkey"
 	strategies []*geneva.Strategy
@@ -43,7 +42,6 @@ type GenevaStrategy struct {
 func NewGenevaStrategy(manager *Manager, secret []byte, country string) *GenevaStrategy {
 	return &GenevaStrategy{
 		manager:    manager,
-		serverAddr: "", // Deprecated: use manager.GetServerAddr() instead
 		secret:     secret,
 		country:    strings.ToLower(country),
 		strategies: geneva.GetStrategiesByCountry(country),

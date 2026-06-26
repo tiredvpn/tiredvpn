@@ -28,7 +28,6 @@ import (
 // Server impersonates legitimate websites (yandex.ru, microsoft.com) without their private keys
 type REALITYStrategy struct {
 	manager    *Manager // IPv6/IPv4 transport layer support
-	serverAddr string   // Deprecated: use manager.GetServerAddr() instead
 	secret     []byte
 	sniRotator *evasion.SNIRotator
 
@@ -92,7 +91,6 @@ func NewREALITYStrategy(manager *Manager, secret []byte) *REALITYStrategy {
 
 	return &REALITYStrategy{
 		manager:       manager,
-		serverAddr:    "", // Deprecated: use manager.GetServerAddr() instead
 		secret:        secret,
 		sniRotator:    sniRotator,
 		recentDests:   make(map[string]time.Time),

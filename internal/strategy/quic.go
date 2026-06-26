@@ -29,11 +29,9 @@ import (
 // 3. Connection migration makes blocking harder
 // 4. Multiplexed streams over single connection
 type QUICStrategy struct {
-	manager    *Manager // IPv6/IPv4 transport layer support
-	serverAddr string   // Deprecated: use manager.GetServerAddr() instead
-	secret     []byte
-	port       int
-
+	manager *Manager // IPv6/IPv4 transport layer support
+	secret  []byte
+	port    int
 
 	// Salamander obfuscation (optional)
 	useSalamander  bool
@@ -49,7 +47,6 @@ type QUICStrategy struct {
 func NewQUICStrategy(manager *Manager, secret []byte, port int) *QUICStrategy {
 	return &QUICStrategy{
 		manager:        manager,
-		serverAddr:     "", // Deprecated: use manager.GetServerAddr() instead
 		secret:         secret,
 		port:           port,
 		useSalamander:  false,
@@ -62,7 +59,6 @@ func NewQUICStrategy(manager *Manager, secret []byte, port int) *QUICStrategy {
 func NewQUICSalamanderStrategy(manager *Manager, secret []byte, port int) *QUICStrategy {
 	return &QUICStrategy{
 		manager:        manager,
-		serverAddr:     "", // Deprecated: use manager.GetServerAddr() instead
 		secret:         secret,
 		port:           port,
 		useSalamander:  true,
@@ -158,7 +154,7 @@ func (s *QUICStrategy) buildProbePacket() []byte {
 	packet := make([]byte, 100)
 
 	// Use draft-29 version (less likely to be blocked)
-	packet[0] = 0xc0 // Long header, Initial
+	packet[0] = 0xc0                                    // Long header, Initial
 	binary.BigEndian.PutUint32(packet[1:5], 0xff00001d) // QUIC draft-29
 
 	// Random connection IDs
