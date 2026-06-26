@@ -74,8 +74,13 @@ func (s *AntiProbeStrategy) RequiresServer() bool {
 }
 
 func (s *AntiProbeStrategy) Probe(ctx context.Context, target string) error {
-	// Check basic connectivity
-	conn, err := net.DialTimeout("tcp", target, 5*time.Second)
+	// Lightweight reachability check: a plain TCP connect against the same
+	// address Connect uses (no TLS handshake, no knock). A full TLS dial here
+	// multiplied across ProbeAll's parallel strategies and periodic reprobes
+	// triggers server admission control and anti-probe defenses.
+	serverAddr := s.manager.GetServerAddr(ctx)
+	dialer := &net.Dialer{Timeout: 3 * time.Second}
+	conn, err := dialer.DialContext(ctx, "tcp", serverAddr)
 	if err != nil {
 		return err
 	}

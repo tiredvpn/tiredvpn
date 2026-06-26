@@ -9,10 +9,20 @@ import (
 	"io"
 	mathrand "math/rand"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/log"
 )
+
+// confusionDiscardPool provides reusable scratch buffers for draining the tail
+// of oversized server frames in ConfusedConn.Read without allocating per call.
+var confusionDiscardPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 4096)
+		return &b
+	},
+}
 
 // ProtocolConfusionStrategy crafts packets that look like different protocols
 // to different parsers (DPI vs real server)
@@ -78,8 +88,13 @@ func (s *ProtocolConfusionStrategy) RequiresServer() bool {
 }
 
 func (s *ProtocolConfusionStrategy) Probe(ctx context.Context, target string) error {
-	// Basic connectivity check
-	conn, err := net.DialTimeout("tcp", target, 15*time.Second)
+	// Lightweight reachability check: a plain TCP connect (no confusion
+	// preamble, no TLS) against the same address Connect uses. This keeps
+	// ProbeAll's parallel fan-out cheap and avoids a thundering herd of full
+	// handshakes hammering server-side admission control.
+	serverAddr := s.manager.GetServerAddr(ctx)
+	dialer := &net.Dialer{Timeout: 3 * time.Second}
+	conn, err := dialer.DialContext(ctx, "tcp", serverAddr)
 	if err != nil {
 		return err
 	}
@@ -417,12 +432,12 @@ func (c *ConfusedConn) Read(p []byte) (int, error) {
 
 	// Read length-prefixed frame from server
 	// Format: [4 bytes length (big-endian)][data]
-	lenBuf := make([]byte, 4)
-	if _, err := io.ReadFull(c.Conn, lenBuf); err != nil {
+	var lenBuf [4]byte
+	if _, err := io.ReadFull(c.Conn, lenBuf[:]); err != nil {
 		return 0, err
 	}
 
-	pktLen := binary.BigEndian.Uint32(lenBuf)
+	pktLen := binary.BigEndian.Uint32(lenBuf[:])
 	if pktLen == 0 {
 		// Zero-length packet, return empty read
 		return 0, nil
@@ -440,10 +455,23 @@ func (c *ConfusedConn) Read(p []byte) (int, error) {
 		if err != nil {
 			return n, err
 		}
-		// Discard remaining bytes
+		// Discard remaining bytes using a pooled scratch buffer so an
+		// oversized frame doesn't allocate proportional to its length.
 		remaining := int(pktLen) - len(p)
-		discard := make([]byte, remaining)
-		io.ReadFull(c.Conn, discard)
+		bufPtr := confusionDiscardPool.Get().(*[]byte)
+		scratch := *bufPtr
+		for remaining > 0 {
+			chunk := remaining
+			if chunk > len(scratch) {
+				chunk = len(scratch)
+			}
+			rn, rerr := io.ReadFull(c.Conn, scratch[:chunk])
+			remaining -= rn
+			if rerr != nil {
+				break
+			}
+		}
+		confusionDiscardPool.Put(bufPtr)
 		return n, nil
 	}
 

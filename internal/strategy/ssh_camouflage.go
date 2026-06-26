@@ -64,7 +64,13 @@ func (s *SSHCamouflageStrategy) Description() string {
 func (s *SSHCamouflageStrategy) RequiresServer() bool { return true }
 
 func (s *SSHCamouflageStrategy) Probe(ctx context.Context, target string) error {
-	conn, err := net.DialTimeout("tcp", target, 15*time.Second)
+	// Lightweight reachability check: a plain TCP connect against the same
+	// address Connect uses (no fake SSH handshake). The full handshake is
+	// expensive and, fanned out across ProbeAll plus reprobes, hammers the
+	// server.
+	serverAddr := s.manager.GetServerAddr(ctx)
+	dialer := &net.Dialer{Timeout: 3 * time.Second}
+	conn, err := dialer.DialContext(ctx, "tcp", serverAddr)
 	if err != nil {
 		return err
 	}
