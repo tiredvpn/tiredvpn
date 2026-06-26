@@ -95,17 +95,31 @@ func TestPacer_OverflowReturnsError(t *testing.T) {
 	}
 	c := &countingConn{}
 	gate := make(chan struct{})
+	reached := make(chan struct{})
 	c.blockWrite = gate
+	c.reachedWrite = reached
 	p := newWritePacer(c, &constShaper{delay: 0, size: 1})
 
+	// Prime one frame so the pacer pulls, flushes, and wedges inside the gated
+	// Write before we saturate via non-blocking sends. This avoids the old
+	// hardcoded pacerQueueCap+maxCoalesceFrames fill, whose in-flight count is
+	// scheduling-dependent and could itself trip the 1s overflow timeout.
 	frame := []byte{0}
-	// Fill: pacerQueueCap in the channel plus up to maxCoalesceFrames the
-	// pacer goroutine has pulled into its local writev vector while blocked
-	// on the gated Conn.Write.
-	for range pacerQueueCap + maxCoalesceFrames {
-		if err := p.enqueue(pacedFrame{packet: frame, bucket: -1}); err != nil {
-			t.Fatalf("fill: %v", err)
+	if err := p.enqueue(pacedFrame{packet: frame, bucket: -1}); err != nil {
+		t.Fatalf("prime enqueue: %v", err)
+	}
+	select {
+	case <-reached:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pacer never reached Conn.Write")
+	}
+	for {
+		select {
+		case p.queue <- pacedFrame{packet: frame, bucket: -1}:
+			continue
+		default:
 		}
+		break
 	}
 	start := time.Now()
 	err := p.enqueue(pacedFrame{packet: frame, bucket: -1})

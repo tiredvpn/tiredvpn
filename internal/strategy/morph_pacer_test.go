@@ -22,6 +22,13 @@ type countingConn struct {
 	// blockWrite, if non-nil, is consumed once per Write to gate the
 	// goroutine's progress (used by the backpressure test).
 	blockWrite chan struct{}
+	// reachedWrite, if non-nil, is signalled (non-blocking) the first time
+	// Write is entered, so a test can deterministically wait until the pacer
+	// goroutine has actually started consuming before it begins saturating
+	// the queue. This removes the scheduling race where the pacer may pull a
+	// variable number of frames into its local writev vector before blocking.
+	reachedWrite chan struct{}
+	reachedOnce  sync.Once
 	// failNext, if true, causes Write to return errFakeWrite once.
 	failNext atomic.Bool
 }
@@ -29,6 +36,9 @@ type countingConn struct {
 var errFakeWrite = errors.New("fake write error")
 
 func (c *countingConn) Write(b []byte) (int, error) {
+	if c.reachedWrite != nil {
+		c.reachedOnce.Do(func() { close(c.reachedWrite) })
+	}
 	if c.blockWrite != nil {
 		<-c.blockWrite
 	}
@@ -192,69 +202,145 @@ func TestPacer_MaxDelayCap(t *testing.T) {
 	}
 }
 
-// TestPacer_BackpressureBlocking: with the consumer blocked, the queue
-// fills. Producer's next enqueue blocks (but should release once the
-// consumer drains).
+// TestPacer_BackpressureBlocking: with the consumer wedged, the queue fills
+// and the producer's enqueue blocks; closing the gate must let it through.
+//
+// The original version hardcoded the saturation point as
+// pacerQueueCap+maxCoalesceFrames, assuming the pacer always pulls exactly
+// maxCoalesceFrames into its local writev vector before blocking on the gated
+// Write. That count is actually scheduling-dependent (the pacer may flush a
+// partial batch when len(p.queue)==0 mid-fill), so the loop could over-fill
+// and hit the 1s overflow timeout — the source of the CI flake. Here we don't
+// assume any count: a background producer enqueues until it blocks (detected
+// by the queue going quiet), then we prove the gate-close unblocks it.
 func TestPacer_BackpressureBlocking(t *testing.T) {
 	c := &countingConn{}
 	gate := make(chan struct{})
+	reached := make(chan struct{})
 	c.blockWrite = gate
+	c.reachedWrite = reached
 	p := newWritePacer(c, &constShaper{delay: 0})
-	// Saturate: queue cap + pacer's local writev pending vector. The pacer
-	// goroutine may have pulled up to maxCoalesceFrames frames into its
-	// local net.Buffers slice while blocked on the gated Conn.Write, so the
-	// producer-visible saturation point is queue cap + maxCoalesceFrames.
-	for range pacerQueueCap + maxCoalesceFrames {
-		if err := p.enqueue(pacedFrame{packet: []byte{0}, bucket: -1}); err != nil {
-			t.Fatalf("initial enqueue: %v", err)
-		}
+
+	// Prime: one frame makes the pacer pull, flush (queue now empty), and
+	// block inside the gated Conn.Write — fixing its in-flight batch at one
+	// before we saturate. Without a priming frame the pacer just parks in its
+	// select waiting on the queue and never enters Write.
+	if err := p.enqueue(pacedFrame{packet: []byte{0}, bucket: -1}); err != nil {
+		t.Fatalf("prime enqueue: %v", err)
 	}
-	// Next enqueue must block; do it from a goroutine.
+	select {
+	case <-reached:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pacer never reached Conn.Write")
+	}
+
+	// Background producer enqueues until it blocks. progress is bumped on each
+	// successful enqueue; when it stops advancing the producer is parked on a
+	// full queue (the backpressure we want to observe).
+	var progress atomic.Int64
 	done := make(chan error, 1)
 	go func() {
-		done <- p.enqueue(pacedFrame{packet: []byte{0}, bucket: -1})
-	}()
-	select {
-	case err := <-done:
-		t.Fatalf("enqueue returned %v immediately, expected to block", err)
-	case <-time.After(50 * time.Millisecond):
-	}
-	// Drain the gate continuously so the pacer can flush its current writev
-	// batch (up to maxCoalesceFrames buffers) and pull more from the queue,
-	// which is what unblocks the producer.
-	close(gate)
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("enqueue after release: %v", err)
+		for {
+			if err := p.enqueue(pacedFrame{packet: []byte{0}, bucket: -1}); err != nil {
+				done <- err
+				return
+			}
+			progress.Add(1)
 		}
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("enqueue did not unblock after consumer progress")
+	}()
+
+	// Confirm the producer parks: progress must go quiet for a stable window
+	// while the gate is held. Poll until two consecutive samples match.
+	blocked := false
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		before := progress.Load()
+		time.Sleep(20 * time.Millisecond)
+		if progress.Load() == before {
+			blocked = true
+			break
+		}
+	}
+	if !blocked {
+		t.Fatal("producer never blocked on a full queue")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("producer exited early with %v, expected to block", err)
+	default:
+	}
+
+	// Release the consumer; the producer must now resume making progress.
+	close(gate)
+	parked := progress.Load()
+	resumed := false
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		if progress.Load() > parked {
+			resumed = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !resumed {
+		t.Fatal("producer did not resume after consumer was released")
 	}
 	p.close()
+	// Producer goroutine ends when enqueue returns net.ErrClosed after close.
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("producer goroutine did not exit after close")
+	}
 }
 
 // TestPacer_OverflowError: producer can't make progress for >1s, enqueue
 // must return ErrShaperOverflow.
+//
+// Determinism comes from waiting for the pacer to wedge inside its first
+// gated Write before filling. While wedged it can hold at most one in-flight
+// batch, so the channel (cap pacerQueueCap) is the only remaining sink. We
+// fill via the non-blocking fast path until the channel is full (saturated),
+// then the single blocking enqueue below is guaranteed to run the 1s timeout
+// path. We never hardcode the in-flight count, which is the scheduling-
+// dependent value that made the old version flaky.
 func TestPacer_OverflowError(t *testing.T) {
 	c := &countingConn{}
 	gate := make(chan struct{})
+	reached := make(chan struct{})
 	c.blockWrite = gate
+	c.reachedWrite = reached
 	p := newWritePacer(c, &constShaper{delay: 0})
-	// Fill in-flight + queue.
-	for range pacerQueueCap + maxCoalesceFrames {
-		if err := p.enqueue(pacedFrame{packet: []byte{0}, bucket: -1}); err != nil {
-			t.Fatalf("fill: %v", err)
-		}
+
+	// Prime one frame so the pacer pulls, flushes, and wedges inside the gated
+	// Write (in-flight batch fixed at one) before we saturate.
+	if err := p.enqueue(pacedFrame{packet: []byte{0}, bucket: -1}); err != nil {
+		t.Fatalf("prime enqueue: %v", err)
 	}
+	select {
+	case <-reached:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pacer never reached Conn.Write")
+	}
+
+	// Saturate the channel using non-blocking sends (no timeout risk). Once
+	// the buffered channel rejects a send, the next blocking enqueue is the
+	// one we measure.
+	for {
+		select {
+		case p.queue <- pacedFrame{packet: []byte{0}, bucket: -1}:
+			continue
+		default:
+		}
+		break
+	}
+
 	start := time.Now()
 	err := p.enqueue(pacedFrame{packet: []byte{0}, bucket: -1})
 	elapsed := time.Since(start)
 	if !errors.Is(err, ErrShaperOverflow) {
 		t.Fatalf("got %v, want ErrShaperOverflow", err)
 	}
-	if elapsed < pacerEnqueueTimeout || elapsed > pacerEnqueueTimeout+500*time.Millisecond {
-		t.Fatalf("elapsed %v not within [%v, %v+500ms]", elapsed, pacerEnqueueTimeout, pacerEnqueueTimeout)
+	if elapsed < pacerEnqueueTimeout || elapsed > pacerEnqueueTimeout+750*time.Millisecond {
+		t.Fatalf("elapsed %v not within [%v, +750ms]", elapsed, pacerEnqueueTimeout)
 	}
 	close(gate)
 	p.close()

@@ -30,7 +30,6 @@ jobs:
       - name: Unit Tests
         run: |
           go test -race -timeout 5m -short \
-            -skip "TestWebSocket|TestQUICSalamander|TestDefaultPadding|TestConfusedConnWrite" \
             ./internal/...
 
       - name: Lint

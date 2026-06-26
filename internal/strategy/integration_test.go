@@ -150,8 +150,9 @@ func TestWebSocketPaddedIntegration(t *testing.T) {
 	wg.Add(1)
 	go mockWebSocketPaddedServer(listener, secret, tlsCert, &wg)
 
-	// Give server time to start
-	time.Sleep(100 * time.Millisecond)
+	// No startup sleep needed: the listener is already bound before the
+	// goroutine launches, so the kernel queues the client's SYN until Accept
+	// runs. A fixed sleep here was a CI flake source under load.
 
 	// Create client strategy with manager pointing to our test server
 	mgr := NewManager()
@@ -229,8 +230,9 @@ func TestQUICSalamanderUDPIntegration(t *testing.T) {
 	wg.Add(1)
 	go mockQUICSalamanderServer(serverConn, secret, &wg)
 
-	// Give server time to start
-	time.Sleep(100 * time.Millisecond)
+	// No startup sleep: serverConn is already bound, so datagrams sent to it
+	// are buffered by the kernel until ReadFrom runs. A fixed sleep was a CI
+	// flake source under load.
 
 	// Create client connection
 	clientConn, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -296,7 +298,7 @@ func TestWebSocketPaddedMultipleMessages(t *testing.T) {
 	wg.Add(1)
 	go mockWebSocketPaddedServer(listener, secret, tlsCert, &wg)
 
-	time.Sleep(100 * time.Millisecond)
+	// Listener already bound before goroutine launch; no startup sleep needed.
 
 	mgr := NewManager()
 	mgr.serverAddrV4 = addr
@@ -380,7 +382,7 @@ func TestQUICSalamanderPaddingLevels(t *testing.T) {
 				}
 			}()
 
-			time.Sleep(50 * time.Millisecond)
+			// serverConn already bound; no startup sleep needed.
 
 			// Create client with same padding level
 			clientConn, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -444,7 +446,7 @@ func TestWebSocketPaddedLargePayload(t *testing.T) {
 	wg.Add(1)
 	go mockWebSocketPaddedServer(listener, secret, tlsCert, &wg)
 
-	time.Sleep(100 * time.Millisecond)
+	// Listener already bound before goroutine launch; no startup sleep needed.
 
 	mgr := NewManager()
 	mgr.serverAddrV4 = addr
@@ -504,7 +506,7 @@ func TestQUICSalamanderConcurrent(t *testing.T) {
 	wg.Add(1)
 	go mockQUICSalamanderServer(serverConn, secret, &wg)
 
-	time.Sleep(100 * time.Millisecond)
+	// serverConn already bound; no startup sleep needed.
 
 	// Create multiple concurrent clients
 	numClients := 10

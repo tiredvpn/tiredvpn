@@ -41,7 +41,6 @@ jobs:
       - name: Unit Tests with Coverage
         run: |
           go test -race -timeout 5m -short \
-            -skip "TestWebSocketPadded|TestQUICSalamander" \
             -coverprofile=coverage.out \
             -covermode=atomic \
             ./internal/...

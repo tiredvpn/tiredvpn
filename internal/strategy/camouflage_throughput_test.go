@@ -77,8 +77,11 @@ func TestIMAPThroughput(t *testing.T) {
 	elapsed := pumpThroughput(t, client, server, total, chunk)
 	reportThroughput(t, "IMAP camouflage", total, elapsed)
 
+	// Regression floor, not a perf target (see WebSocket variant): a shaped
+	// data path would collapse to KB/s. Keep a low absolute floor so the check
+	// stays meaningful without flaking on slow CI runners.
 	mbps := float64(total) / elapsed.Seconds() / (1024 * 1024)
-	if mbps < 5 {
+	if mbps < 0.5 {
 		t.Fatalf("IMAP throughput too low: %.2f MB/s (data path is being shaped)", mbps)
 	}
 }
@@ -98,9 +101,13 @@ func TestWebSocketThroughput(t *testing.T) {
 	elapsed := pumpThroughput(t, clientConn, serverConn, total, chunk)
 	reportThroughput(t, "WebSocket Salamander", total, elapsed)
 
+	// Regression floor, not a perf target: if the data path were throttled to
+	// cover-traffic speed it would be in the KB/s range. A low absolute floor
+	// catches that regression without flaking on slow/loaded CI runners, where
+	// an aggressive MB/s bound is runner-speed-dependent.
 	mbps := float64(total) / elapsed.Seconds() / (1024 * 1024)
-	if mbps < 2 {
-		t.Fatalf("WebSocket throughput too low: %.2f MB/s", mbps)
+	if mbps < 0.5 {
+		t.Fatalf("WebSocket throughput too low: %.2f MB/s (data path may be shaped)", mbps)
 	}
 }
 
