@@ -2,8 +2,10 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -18,16 +20,20 @@ type APIServer struct {
 	store    *RedisStore
 	metrics  *Metrics
 	addr     string
+	token    string // optional bearer token; empty disables auth
 	server   *http.Server
 }
 
-// NewAPIServer creates a new API server
-func NewAPIServer(registry *ClientRegistry, store *RedisStore, addr string) *APIServer {
+// NewAPIServer creates a new API server. When token is non-empty every endpoint
+// requires an "Authorization: Bearer <token>" header; an empty token preserves
+// the historical unauthenticated behaviour.
+func NewAPIServer(registry *ClientRegistry, store *RedisStore, addr, token string) *APIServer {
 	return &APIServer{
 		registry: registry,
 		store:    store,
 		metrics:  NewMetrics(registry),
 		addr:     addr,
+		token:    token,
 	}
 }
 
@@ -49,12 +55,19 @@ func (s *APIServer) Start(ctx context.Context) error {
 
 	s.server = &http.Server{
 		Addr:         s.addr,
-		Handler:      s.logMiddleware(mux),
+		Handler:      s.authMiddleware(s.logMiddleware(mux)),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}
 
-	log.Info("API server starting on %s", s.addr)
+	if s.token == "" {
+		log.Info("API server starting on %s (no auth token set)", s.addr)
+		if !apiAddrIsLoopback(s.addr) {
+			log.Warn("API exposed without -api-token on %s: anyone who can reach this address can create/delete clients and read their secrets", s.addr)
+		}
+	} else {
+		log.Info("API server starting on %s (bearer auth enabled)", s.addr)
+	}
 
 	go func() {
 		<-ctx.Done()
@@ -74,6 +87,46 @@ func (s *APIServer) logMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 		log.Debug("API %s %s %v", r.Method, r.URL.Path, time.Since(start))
 	})
+}
+
+// authMiddleware enforces bearer-token auth on every endpoint when a token is
+// configured. With an empty token it is a transparent pass-through, so the
+// default (unauthenticated) behaviour is unchanged.
+func (s *APIServer) authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.token != "" {
+			const prefix = "Bearer "
+			var presented string
+			if h := r.Header.Get("Authorization"); strings.HasPrefix(h, prefix) {
+				presented = h[len(prefix):]
+			}
+			// Constant-time compare to avoid leaking the token via timing.
+			if subtle.ConstantTimeCompare([]byte(presented), []byte(s.token)) != 1 {
+				s.jsonError(w, "Unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// apiAddrIsLoopback reports whether addr binds only to a loopback address.
+// A missing/empty host (e.g. ":8080") means all interfaces -> not loopback.
+func apiAddrIsLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	if host == "" {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 // handleClients handles /clients (GET list, POST create)

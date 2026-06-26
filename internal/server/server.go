@@ -270,6 +270,7 @@ type Config struct {
 	// Multi-client mode (Redis)
 	RedisAddr string // e.g., "localhost:6379"
 	APIAddr   string // e.g., "127.0.0.1:8080"
+	APIToken  string // optional bearer token for the management API ("" = no auth)
 
 	// Upstream (multi-hop) mode
 	UpstreamAddr   string // e.g., "exit-server.com:443"
@@ -448,7 +449,7 @@ func initRedisMode(cfg *Config, srvCtx *serverContext) error {
 	if cfg.APIAddr == "" {
 		cfg.APIAddr = "127.0.0.1:8080"
 	}
-	api := NewAPIServer(registry, store, cfg.APIAddr)
+	api := NewAPIServer(registry, store, cfg.APIAddr, cfg.APIToken)
 	srvCtx.metrics = api.Metrics()
 	go func() {
 		if err := api.Start(ctx); err != nil {

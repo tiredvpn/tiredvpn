@@ -351,6 +351,7 @@ func runServer(args []string) {
 	fs.IntVar(&cfg.TunMTU, "tun-mtu", 1280, "TUN interface MTU (1280-9000)")
 	fs.StringVar(&cfg.RedisAddr, "redis", "", "Redis address for multi-client mode (e.g., localhost:6379)")
 	fs.StringVar(&cfg.APIAddr, "api-addr", "127.0.0.1:8080", "HTTP API address for client management")
+	fs.StringVar(&cfg.APIToken, "api-token", "", "Bearer token required for the management API (falls back to TIREDVPN_API_TOKEN; empty = no auth)")
 	fs.StringVar(&cfg.UpstreamAddr, "upstream", "", "Upstream TiredVPN server for multi-hop (e.g., exit-server.com:443)")
 	fs.StringVar(&cfg.UpstreamSecret, "upstream-secret", "", "Secret for upstream authentication")
 
@@ -411,6 +412,11 @@ func runServer(args []string) {
 	// server.go already documents this env var.
 	if len(cfg.Secret) == 0 {
 		cfg.Secret = []byte(os.Getenv("TIREDVPN_SECRET"))
+	}
+	// Same pattern for the management-API token: prefer the flag, fall back to
+	// the env var so it need not appear in the process command line.
+	if cfg.APIToken == "" {
+		cfg.APIToken = os.Getenv("TIREDVPN_API_TOKEN")
 	}
 	cfg.QUICEnabled = !*noQUIC // QUIC enabled by default
 	cfg.IPPoolLeaseTime = *ipPoolLease
@@ -615,6 +621,7 @@ Commands:
 Add client:
   tiredvpn admin add -api http://127.0.0.1:8080 -server vpn.example.com:443 -name alice [options]
     -api         API endpoint (required)
+    -api-token   Bearer token if the server runs with -api-token (or TIREDVPN_API_TOKEN)
     -server      Server address for connection string (required)
     -name        Client name (required)
     -tun-ip      Fixed TUN IP (default: server-assigned)
@@ -716,10 +723,29 @@ func printQRCode(data string) {
 	fmt.Println()
 }
 
+// adminAPIToken resolves the management-API token from the flag, falling back
+// to TIREDVPN_API_TOKEN so the CLI matches the server's resolution order. When
+// both are empty the CLI sends no Authorization header (pre-auth behaviour).
+func adminAPIToken(flagVal string) string {
+	if flagVal != "" {
+		return flagVal
+	}
+	return os.Getenv("TIREDVPN_API_TOKEN")
+}
+
+// adminDoRequest sends req, attaching the bearer token when one is configured.
+func adminDoRequest(req *http.Request, token string) (*http.Response, error) {
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	return http.DefaultClient.Do(req)
+}
+
 func adminAdd(args []string) {
 	fs := flag.NewFlagSet("admin add", flag.ExitOnError)
 
 	apiAddr := fs.String("api", "", "API endpoint (e.g., http://127.0.0.1:8080)")
+	apiToken := fs.String("api-token", "", "Bearer token if the API requires auth (falls back to TIREDVPN_API_TOKEN)")
 	serverAddr := fs.String("server", "", "Server address for connection string")
 	name := fs.String("name", "", "Client name (required)")
 	tunIP := fs.String("tun-ip", "", "Fixed TUN IP (optional, server assigns if empty)")
@@ -756,7 +782,13 @@ func adminAdd(args []string) {
 	}
 	jsonData, _ := json.Marshal(payload)
 
-	resp, err := http.Post(apiURL, "application/json", strings.NewReader(string(jsonData)))
+	req, err := http.NewRequest(http.MethodPost, apiURL, strings.NewReader(string(jsonData)))
+	if err != nil {
+		fmt.Printf("Error building request: %v\n", err)
+		os.Exit(1)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := adminDoRequest(req, adminAPIToken(*apiToken))
 	if err != nil {
 		fmt.Printf("Error calling API: %v\n", err)
 		os.Exit(1)
@@ -799,6 +831,7 @@ func adminList(args []string) {
 	fs := flag.NewFlagSet("admin list", flag.ExitOnError)
 
 	apiAddr := fs.String("api", "", "API endpoint")
+	apiToken := fs.String("api-token", "", "Bearer token if the API requires auth (falls back to TIREDVPN_API_TOKEN)")
 
 	fs.Parse(args)
 
@@ -810,7 +843,12 @@ func adminList(args []string) {
 
 	apiURL := strings.TrimSuffix(*apiAddr, "/") + "/clients"
 
-	resp, err := http.Get(apiURL)
+	req, err := http.NewRequest(http.MethodGet, apiURL, nil)
+	if err != nil {
+		fmt.Printf("Error building request: %v\n", err)
+		os.Exit(1)
+	}
+	resp, err := adminDoRequest(req, adminAPIToken(*apiToken))
 	if err != nil {
 		fmt.Printf("Error calling API: %v\n", err)
 		os.Exit(1)
@@ -853,6 +891,7 @@ func adminDelete(args []string) {
 
 	apiAddr := fs.String("api", "", "API endpoint")
 	clientID := fs.String("id", "", "Client ID to delete")
+	apiToken := fs.String("api-token", "", "Bearer token if the API requires auth (falls back to TIREDVPN_API_TOKEN)")
 
 	fs.Parse(args)
 
@@ -865,7 +904,7 @@ func adminDelete(args []string) {
 	apiURL := strings.TrimSuffix(*apiAddr, "/") + "/clients/" + *clientID
 
 	req, _ := http.NewRequest(http.MethodDelete, apiURL, nil)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := adminDoRequest(req, adminAPIToken(*apiToken))
 	if err != nil {
 		fmt.Printf("Error calling API: %v\n", err)
 		os.Exit(1)
