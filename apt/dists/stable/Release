@@ -1,7 +1,7 @@
 Origin: TiredVPN
 Label: TiredVPN
 Codename: stable
-Date: Thu, 25 Jun 2026 19:08:19 UTC
+Date: Fri, 26 Jun 2026 10:49:01 UTC
 Architectures: amd64 arm64
 Components: main
 Description: TiredVPN apt repository
@@ -9,20 +9,20 @@ MD5Sum:
  d41d8cd98f00b204e9800998ecf8427e 0 main/binary-amd64/Packages
  7029066c27ac6f5ef18d660d5741979a 20 main/binary-amd64/Packages.gz
  a1cb1598e0aa53fb7a19e480edb1fd61 106 main/binary-amd64/Release
- 8fd93e7afebb63770046f58e9613adfc 763 main/binary-arm64/Packages
- 5ef7fb2ce43f3d661ac03794ababd966 533 main/binary-arm64/Packages.gz
+ bc33e4945cec5c9f305c095f957e112d 763 main/binary-arm64/Packages
+ 566b0e3a339ccd5a60f3f784c2db93dd 534 main/binary-arm64/Packages.gz
  833f0c2c40c4bd6fc40c49fa19ba6a0e 106 main/binary-arm64/Release
 SHA1:
  da39a3ee5e6b4b0d3255bfef95601890afd80709 0 main/binary-amd64/Packages
  46c6643f07aa7f6bfe7118de926b86defc5087c4 20 main/binary-amd64/Packages.gz
  cbfc21b1aea4c89370605c63ec154f6fec1a0765 106 main/binary-amd64/Release
- c55ac717f19309b8d5613212feb6c0332d8676a3 763 main/binary-arm64/Packages
- 38df52fbed7966638ea98d5ec8a67cef7e41fef3 533 main/binary-arm64/Packages.gz
+ 3c2bdc2f82abb53e866308e6dc69bba0435511c6 763 main/binary-arm64/Packages
+ b02f024241abf28f7affce62bbadfde5021293cd 534 main/binary-arm64/Packages.gz
  3bca33c026140b27d9e2f0e3015f33da87d18e20 106 main/binary-arm64/Release
 SHA256:
  e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 0 main/binary-amd64/Packages
  59869db34853933b239f1e2219cf7d431da006aa919635478511fabbfc8849d2 20 main/binary-amd64/Packages.gz
  f56fb9ff2142f536cc47925e506d8cc1e0f6279b4aa0d1ed26922aa43934b7c7 106 main/binary-amd64/Release
- 7eef07fceaecd2d8b990b7f7cc8dc2664d5d25b19d09ddab62457fad8a5c9442 763 main/binary-arm64/Packages
- 7a35f194080d4ea05de41c0e9c6d87a9812bc0e254cb2e3cf665fa4889d4a236 533 main/binary-arm64/Packages.gz
+ 23f79d063acd84cba99b5591715c10db96f6f5aaf237f0ac477224821dadf0f8 763 main/binary-arm64/Packages
+ 3d9ca1f9555176d52b70a3fd2a445a6221c2f4211e7c39eb6a83590605300201 534 main/binary-arm64/Packages.gz
  2ea051df46bf72e3e60ff7def56f180e193b56db497b982353db591146d6542a 106 main/binary-arm64/Release
