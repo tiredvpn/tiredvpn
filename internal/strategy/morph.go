@@ -2,11 +2,11 @@ package strategy
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
 	"io"
-	mathrand "math/rand"
+	mathrand "math/rand/v2"
 	"net"
 	"sync"
 	"time"
@@ -178,23 +178,27 @@ func (prof *TrafficProfile) ApplyPaddingPreset(preset PaddingPreset) {
 // Global padding preset (can be set via CLI flag)
 var GlobalPaddingPreset PaddingPreset = PaddingPresetMinimal
 
-// Fast RNG for non-cryptographic padding (10× faster than crypto/rand)
-var (
-	fastRand   = mathrand.New(mathrand.NewSource(time.Now().UnixNano()))
-	fastRandMu sync.Mutex
-)
+// Fast RNG for non-cryptographic padding. math/rand/v2 top-level functions are
+// auto-seeded and per-goroutine (lock-free), so no shared mutex is needed — this
+// removes the global serialization point that throttled the data plane under
+// multi-connection load.
 
 func fastRandBytes(b []byte) {
-	fastRandMu.Lock()
-	fastRand.Read(b)
-	fastRandMu.Unlock()
+	// Fill in 8-byte chunks from a single Uint64 each — cheaper than per-byte
+	// calls and never contends on a shared lock.
+	for len(b) >= 8 {
+		binary.LittleEndian.PutUint64(b, mathrand.Uint64())
+		b = b[8:]
+	}
+	if len(b) > 0 {
+		var tail [8]byte
+		binary.LittleEndian.PutUint64(tail[:], mathrand.Uint64())
+		copy(b, tail[:])
+	}
 }
 
 func fastRandInt(min, max int) int {
-	fastRandMu.Lock()
-	n := fastRand.Intn(max-min+1) + min
-	fastRandMu.Unlock()
-	return n
+	return mathrand.IntN(max-min+1) + min
 }
 
 // packetBucketSizes defines capacity tiers for the bucketed frame pool.
@@ -569,10 +573,7 @@ func (mc *MorphedConn) selectPacketSize() int {
 // randomFloat returns a random float64 in [0, 1).
 // Uses fast math/rand (non-cryptographic) — only feeds shaping decisions.
 func (mc *MorphedConn) randomFloat() float64 {
-	fastRandMu.Lock()
-	f := fastRand.Float64()
-	fastRandMu.Unlock()
-	return f
+	return mathrand.Float64()
 }
 
 // --- Wire format helpers (do not change without bumping protocol) ---
@@ -629,9 +630,10 @@ func (mc *MorphedConn) buildDummyFrame() []byte {
 	packet := make([]byte, morphHeaderLen+paddingLen)
 	writeFrameHeader(packet, 0, paddingLen)
 	if paddingLen > 0 {
-		// Crypto-quality randomness for dummies — they go on the wire
-		// without surrounding plaintext, so any bias would be observable.
-		_, _ = rand.Read(packet[morphHeaderLen:])
+		// Same fast non-crypto padding source as buildFrame — dummies only
+		// carry shaping noise, so crypto-quality randomness is unnecessary
+		// and would reintroduce the crypto/rand cost on the keepalive path.
+		fastRandBytes(packet[morphHeaderLen:])
 	}
 	return packet
 }
