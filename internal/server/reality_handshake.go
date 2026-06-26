@@ -200,23 +200,42 @@ func RemoveREALITYExtension(clientHello []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	// Navigate to extensions
+	// Navigate to extensions (bounds-checked; a malformed/truncated ClientHello
+	// must not panic the server with index-out-of-range).
+	payload := msg.Payload
+	if len(payload) < 34 {
+		return nil, errors.New("clienthello too short")
+	}
 	offset := 34 // version + random
 
-	payload := msg.Payload
+	if offset >= len(payload) {
+		return nil, errors.New("invalid clienthello: no session id length")
+	}
 	sessionIDLen := int(payload[offset])
 	offset += 1 + sessionIDLen
 
+	if offset+2 > len(payload) {
+		return nil, errors.New("invalid clienthello: no cipher suites")
+	}
 	cipherSuitesLen := int(binary.BigEndian.Uint16(payload[offset:]))
 	offset += 2 + cipherSuitesLen
 
+	if offset >= len(payload) {
+		return nil, errors.New("invalid clienthello: no compression methods")
+	}
 	compressionMethodsLen := int(payload[offset])
 	offset += 1 + compressionMethodsLen
 
+	if offset+2 > len(payload) {
+		return nil, errors.New("invalid clienthello: no extensions")
+	}
 	extensionsLenOffset := offset
 	extensionsLen := int(binary.BigEndian.Uint16(payload[offset:]))
 	offset += 2
 
+	if offset+extensionsLen > len(payload) {
+		return nil, errors.New("invalid clienthello: extensions length out of range")
+	}
 	extensions := payload[offset : offset+extensionsLen]
 
 	// Remove padding extension (which contains REALITY data)
@@ -425,23 +444,48 @@ func ExtractSNI(clientHello []byte) (string, error) {
 		return "", err
 	}
 
-	// Navigate to extensions (same as ExtractREALITYExtensionFromClientHello)
-	offset := 34
+	// Navigate to extensions (bounds-checked; a malformed/truncated ClientHello
+	// from the network must not panic the server with index-out-of-range).
 	payload := msg.Payload
+	if len(payload) < 34 {
+		return "", errors.New("clienthello too short")
+	}
+	offset := 34
 
+	// Skip session ID
+	if offset >= len(payload) {
+		return "", errors.New("invalid clienthello: no session id length")
+	}
 	sessionIDLen := int(payload[offset])
 	offset += 1 + sessionIDLen
 
+	// Skip cipher suites
+	if offset+2 > len(payload) {
+		return "", errors.New("invalid clienthello: no cipher suites")
+	}
 	cipherSuitesLen := int(binary.BigEndian.Uint16(payload[offset:]))
 	offset += 2 + cipherSuitesLen
 
+	// Skip compression methods
+	if offset >= len(payload) {
+		return "", errors.New("invalid clienthello: no compression methods")
+	}
 	compressionMethodsLen := int(payload[offset])
 	offset += 1 + compressionMethodsLen
 
+	// Extensions
+	if offset+2 > len(payload) {
+		return "", errors.New("invalid clienthello: no extensions")
+	}
 	extensionsLen := int(binary.BigEndian.Uint16(payload[offset:]))
 	offset += 2
 
-	extensions := payload[offset : offset+extensionsLen]
+	extEnd := offset + extensionsLen
+	if extEnd > len(payload) {
+		// DPI may have dropped trailing bytes; search whatever arrived.
+		extEnd = len(payload)
+	}
+	extensions := payload[offset:extEnd]
 
 	// Search for SNI extension (type 0x0000)
 	return findSNIExtension(extensions)
