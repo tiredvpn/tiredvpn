@@ -13,6 +13,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	mrand "math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -1928,6 +1929,21 @@ func handleMorphConnection(conn net.Conn, srvCtx *serverContext, logger *log.Log
 	}
 }
 
+// fillRandPadding fills b with non-cryptographic random bytes. These bytes are
+// frame padding that only varies packet sizes for DPI evasion; the peer
+// discards them by length and never inspects their content. A fast PRNG is
+// therefore sufficient and, unlike crypto/rand, cannot fail - so it must never
+// panic and tear down the data plane. This mirrors the client side, which
+// already fills morph padding with a fast RNG.
+func fillRandPadding(b []byte) {
+	for i := 0; i < len(b); i += 8 {
+		v := mrand.Uint64()
+		for j := 0; j < 8 && i+j < len(b); j++ {
+			b[i+j] = byte(v >> (8 * j))
+		}
+	}
+}
+
 // morphFramePacket creates Morph-framed packet for TUN->Client
 // Format: [dataLen:4][paddingLen:2][len:4][packet:N][padding]
 func morphFramePacket(pkt []byte) []byte {
@@ -1940,9 +1956,7 @@ func morphFramePacket(pkt []byte) []byte {
 	binary.BigEndian.PutUint16(framed[4:6], uint16(padLen))
 	binary.BigEndian.PutUint32(framed[6:10], uint32(len(pkt)))
 	copy(framed[10:], pkt)
-	if _, err := rand.Read(framed[10+len(pkt):]); err != nil {
-		panic("crypto/rand unavailable: " + err.Error())
-	}
+	fillRandPadding(framed[10+len(pkt):])
 	return framed
 }
 
@@ -2018,9 +2032,7 @@ func handleMorphTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverConte
 	binary.BigEndian.PutUint32(resp[0:4], uint32(len(respData)))
 	binary.BigEndian.PutUint16(resp[4:6], uint16(padLen))
 	copy(resp[6:], respData)
-	if _, err := rand.Read(resp[6+len(respData):]); err != nil {
-		panic("crypto/rand unavailable: " + err.Error())
-	}
+	fillRandPadding(resp[6+len(respData):])
 	conn.Write(resp)
 
 	// Register client with shared TUN using Morph framing
