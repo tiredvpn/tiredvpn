@@ -19,6 +19,12 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/shaper"
 )
 
+// clientSocketBufferBytes is the SO_RCVBUF/SO_SNDBUF size applied to client TCP
+// sockets in optimizeTCPConn. On high-RTT censored links (150-300ms) the BDP far
+// exceeds the old 64KB default, which capped the TCP window and throughput. This
+// matches the 4MB the server already uses (server/upstream.go, server/server.go).
+const clientSocketBufferBytes = 4 * 1024 * 1024
+
 // Strategy defines interface for DPI evasion techniques
 type Strategy interface {
 	// Name returns human-readable strategy name
@@ -1579,15 +1585,18 @@ func optimizeTCPConn(conn net.Conn) {
 		log.Debug("Failed to set TCP_NODELAY: %v", err)
 	}
 
-	// Increase socket buffers for throughput
-	if err := tcpConn.SetReadBuffer(64 * 1024); err != nil {
+	// Increase socket buffers to cover the BDP on high-RTT links. 64KB was far
+	// below the bandwidth-delay product at 150-300ms RTT and throttled the TCP
+	// window. Applies to both client and relay sockets; relay sockets only
+	// benefit from the larger buffer (the server side already uses 4MB).
+	if err := tcpConn.SetReadBuffer(clientSocketBufferBytes); err != nil {
 		log.Debug("Failed to set read buffer: %v", err)
 	}
-	if err := tcpConn.SetWriteBuffer(64 * 1024); err != nil {
+	if err := tcpConn.SetWriteBuffer(clientSocketBufferBytes); err != nil {
 		log.Debug("Failed to set write buffer: %v", err)
 	}
 
-	log.Debug("TCP connection optimized: NoDelay=true, buffers=64KB")
+	log.Debug("TCP connection optimized: NoDelay=true, buffers=%dKB", clientSocketBufferBytes/1024)
 }
 
 // TriggerEmergencyReprobe starts aggressive re-probing when all strategies fail
