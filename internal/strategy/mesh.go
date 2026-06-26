@@ -107,33 +107,72 @@ func (s *MeshRelayStrategy) Probe(ctx context.Context, target string) error {
 }
 
 func (s *MeshRelayStrategy) Connect(ctx context.Context, target string) (net.Conn, error) {
-	// Select best relay
-	relay, err := s.selectBestRelay()
-	if err != nil {
-		return nil, err
+	// Bound the number of attempts by the relay count so a chain of failing
+	// relays can't loop forever. selectBestRelay always picks the best of the
+	// currently-available relays, and a failed relay is marked unavailable
+	// below, so each iteration narrows the candidate set.
+	maxAttempts := s.relayCount()
+	if maxAttempts == 0 {
+		return nil, errors.New("no available relays")
 	}
 
-	// Connect to relay
-	relayConn, err := s.connectToRelay(ctx, relay)
-	if err != nil {
-		// Mark relay as unavailable and try next
-		relay.Available = false
-		return s.Connect(ctx, target) // Retry with different relay
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		// Select best relay
+		relay, err := s.selectBestRelay()
+		if err != nil {
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			return nil, err
+		}
+
+		// Connect to relay
+		relayConn, err := s.connectToRelay(ctx, relay)
+		if err != nil {
+			// Mark relay as unavailable and try next.
+			// Mutate relay fields under s.mu: selectBestRelay/Probe read
+			// Available under the same lock. s.mu is not held here (Connect
+			// and connectToRelay don't hold it), so this is deadlock-free.
+			s.markRelayUnavailable(relay)
+			lastErr = err
+			continue
+		}
+
+		// Ask relay to connect to exit node
+		exitConn, err := s.connectThroughRelay(relayConn, s.exitNode)
+		if err != nil {
+			relayConn.Close()
+			return nil, err
+		}
+
+		// Return wrapped connection
+		return &MeshConn{
+			Conn:     exitConn,
+			relay:    relay,
+			exitNode: s.exitNode,
+		}, nil
 	}
 
-	// Ask relay to connect to exit node
-	exitConn, err := s.connectThroughRelay(relayConn, s.exitNode)
-	if err != nil {
-		relayConn.Close()
-		return nil, err
+	if lastErr != nil {
+		return nil, lastErr
 	}
+	return nil, errors.New("no available relays")
+}
 
-	// Return wrapped connection
-	return &MeshConn{
-		Conn:     exitConn,
-		relay:    relay,
-		exitNode: s.exitNode,
-	}, nil
+// relayCount returns the number of configured relays under the lock.
+func (s *MeshRelayStrategy) relayCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.relays)
+}
+
+// markRelayUnavailable flips a relay's Available flag under the write lock so
+// it is safe against concurrent selectBestRelay/Probe readers.
+func (s *MeshRelayStrategy) markRelayUnavailable(relay *RelayNode) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	relay.Available = false
 }
 
 // selectBestRelay chooses the best available relay

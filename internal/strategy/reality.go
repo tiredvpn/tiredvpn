@@ -675,78 +675,15 @@ func readFull(conn net.Conn, buf []byte) (int, error) {
 // byte search to avoid false positives inside key_share data (kyber768, ~1152 bytes
 // of semi-random bytes that can contain any short hostname as a substring).
 func sniFragmentSplitPoint(clientHello []byte, sniHost string, defaultSize int) int {
-	if len(sniHost) < 2 || len(clientHello) < 47 {
+	if len(sniHost) < 2 {
 		return defaultSize
 	}
-
-	// TLS Record header (5) + Handshake header (4) + CH version (2) + CH random (32) = 43
-	offset := 43
-	if offset >= len(clientHello) {
+	nameStart, nameLen, ok := walkSNIHostname(clientHello)
+	if !ok {
+		log.Debug("REALITY: SNI ext not found, using default fragment size %d", defaultSize)
 		return defaultSize
 	}
-
-	// Skip session ID
-	sessionIDLen := int(clientHello[offset])
-	offset += 1 + sessionIDLen
-	if offset+2 > len(clientHello) {
-		return defaultSize
-	}
-
-	// Skip cipher suites
-	cipherLen := int(clientHello[offset])<<8 | int(clientHello[offset+1])
-	offset += 2 + cipherLen
-	if offset+1 > len(clientHello) {
-		return defaultSize
-	}
-
-	// Skip compression methods
-	compLen := int(clientHello[offset])
-	offset += 1 + compLen
-	if offset+2 > len(clientHello) {
-		return defaultSize
-	}
-
-	// Extensions: 2-byte total length, then each ext is type(2)+len(2)+data(len)
-	extTotalLen := int(clientHello[offset])<<8 | int(clientHello[offset+1])
-	offset += 2
-	extEnd := offset + extTotalLen
-	if extEnd > len(clientHello) {
-		extEnd = len(clientHello)
-	}
-
-	for offset+4 <= extEnd {
-		extType := int(clientHello[offset])<<8 | int(clientHello[offset+1])
-		extLen := int(clientHello[offset+2])<<8 | int(clientHello[offset+3])
-		extDataStart := offset + 4
-
-		if extType == 0x0000 { // SNI extension
-			// SNI body: server_name_list_len(2) + name_type(1) + name_len(2) + name(name_len)
-			if extDataStart+5 > extEnd {
-				log.Debug("REALITY: SNI ext too short at offset %d", extDataStart)
-				return defaultSize
-			}
-			nameType := clientHello[extDataStart+2]
-			if nameType != 0x00 {
-				log.Debug("REALITY: SNI ext name_type=%d (not hostname)", nameType)
-				return defaultSize
-			}
-			nameLen := int(clientHello[extDataStart+3])<<8 | int(clientHello[extDataStart+4])
-			nameStart := extDataStart + 5
-			if nameStart+nameLen > extEnd {
-				log.Debug("REALITY: SNI name extends past buffer")
-				return defaultSize
-			}
-			mid := nameStart + nameLen/2
-			log.Debug("REALITY: SNI ext at offset %d, name at %d len=%d, splitting at mid=%d", offset, nameStart, nameLen, mid)
-			return mid
-		}
-
-		if extDataStart+extLen > extEnd {
-			break
-		}
-		offset = extDataStart + extLen
-	}
-
-	log.Debug("REALITY: SNI ext not found, using default fragment size %d", defaultSize)
-	return defaultSize
+	mid := nameStart + nameLen/2
+	log.Debug("REALITY: SNI ext name at %d len=%d, splitting at mid=%d", nameStart, nameLen, mid)
+	return mid
 }

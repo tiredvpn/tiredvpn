@@ -1,7 +1,6 @@
 package strategy
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
@@ -11,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	mathrand "math/rand/v2"
 	"net"
 	"strings"
 	"sync"
@@ -402,52 +402,74 @@ func (sc *SalamanderConn) readWebSocketFrame() ([]byte, error) {
 	return payload, nil
 }
 
-// buildWebSocketFrame constructs a WebSocket binary frame
+// buildWebSocketFrame constructs a WebSocket binary frame (RFC 6455).
+// Single known-size allocation, 4-byte unrolled XOR masking.
 func (sc *SalamanderConn) buildWebSocketFrame(payload []byte) []byte {
-	var frame bytes.Buffer
-
-	// Byte 0: FIN + RSV + OPCODE (0x82 = FIN + Binary)
-	frame.WriteByte(0x82)
-
-	// Byte 1: MASK + Payload length
 	payloadLen := len(payload)
+
+	// Header size: byte0 + byte1 (+ extended length) (+ 4-byte mask key).
+	headerLen := 2
+	switch {
+	case payloadLen < 126:
+		// no extended length
+	case payloadLen < 65536:
+		headerLen += 2
+	default:
+		headerLen += 8
+	}
+
 	maskBit := byte(0x00)
 	if sc.isClient {
 		maskBit = 0x80 // Client must mask
+		headerLen += 4 // 4-byte masking key
 	}
 
-	if payloadLen < 126 {
-		frame.WriteByte(maskBit | byte(payloadLen))
-	} else if payloadLen < 65536 {
-		frame.WriteByte(maskBit | 126)
-		lenBuf := make([]byte, 2)
-		binary.BigEndian.PutUint16(lenBuf, uint16(payloadLen))
-		frame.Write(lenBuf)
-	} else {
-		frame.WriteByte(maskBit | 127)
-		lenBuf := make([]byte, 8)
-		binary.BigEndian.PutUint64(lenBuf, uint64(payloadLen))
-		frame.Write(lenBuf)
+	frame := make([]byte, headerLen+payloadLen)
+
+	// Byte 0: FIN + RSV + OPCODE (0x82 = FIN + Binary)
+	frame[0] = 0x82
+
+	// Byte 1 (+ extended length): MASK + payload length
+	pos := 2
+	switch {
+	case payloadLen < 126:
+		frame[1] = maskBit | byte(payloadLen)
+	case payloadLen < 65536:
+		frame[1] = maskBit | 126
+		binary.BigEndian.PutUint16(frame[2:4], uint16(payloadLen))
+		pos = 4
+	default:
+		frame[1] = maskBit | 127
+		binary.BigEndian.PutUint64(frame[2:10], uint64(payloadLen))
+		pos = 10
 	}
 
-	// Masking key (client only)
-	if sc.isClient {
-		var maskKey [4]byte
-		rand.Read(maskKey[:])
-		frame.Write(maskKey[:])
-
-		// Mask payload
-		maskedPayload := make([]byte, len(payload))
-		for i, b := range payload {
-			maskedPayload[i] = b ^ maskKey[i%4]
-		}
-		frame.Write(maskedPayload)
-	} else {
-		// Server doesn't mask
-		frame.Write(payload)
+	if !sc.isClient {
+		// Server doesn't mask: header followed by raw payload.
+		copy(frame[pos:], payload)
+		return frame
 	}
 
-	return frame.Bytes()
+	// Masking key. WS masking exists only to confuse middleboxes, not for
+	// cryptographic strength, so a fast non-crypto RNG is sufficient here.
+	var maskKey [4]byte
+	binary.LittleEndian.PutUint32(maskKey[:], mathrand.Uint32())
+	copy(frame[pos:pos+4], maskKey[:])
+	out := frame[pos+4:]
+
+	// XOR-mask payload, unrolled by 4 bytes.
+	i := 0
+	for ; i+4 <= payloadLen; i += 4 {
+		out[i] = payload[i] ^ maskKey[0]
+		out[i+1] = payload[i+1] ^ maskKey[1]
+		out[i+2] = payload[i+2] ^ maskKey[2]
+		out[i+3] = payload[i+3] ^ maskKey[3]
+	}
+	for ; i < payloadLen; i++ {
+		out[i] = payload[i] ^ maskKey[i&3]
+	}
+
+	return frame
 }
 
 // Close closes the connection

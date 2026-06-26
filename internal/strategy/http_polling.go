@@ -99,6 +99,8 @@ func (s *HTTPPollingStrategy) Connect(ctx context.Context, target string) (net.C
 		sendSignal:      make(chan struct{}, 1),
 		ready:           make(chan struct{}), // Closed when first data written
 	}
+	// recvCond coordinates Read() wakeups with poll()/Close() without busy-waiting.
+	pollConn.recvCond = sync.NewCond(&pollConn.recvLock)
 
 	// Initialize session (no target - SOCKS handler will write destination via Write())
 	if err := pollConn.init(ctx); err != nil {
@@ -133,6 +135,15 @@ type HTTPPollingConn struct {
 	recvBuf  *bytes.Buffer
 	sendLock sync.Mutex
 	recvLock sync.Mutex
+
+	// recvCond is signaled (under recvLock) whenever new data lands in
+	// recvBuf or the connection is closed. Read waits on it instead of
+	// busy-waiting with time.Sleep.
+	recvCond *sync.Cond
+
+	// Read deadline support (honors SetReadDeadline/SetDeadline).
+	deadlineMu   sync.Mutex
+	readDeadline time.Time
 
 	// Polling config
 	pollInterval time.Duration
@@ -298,6 +309,8 @@ func (c *HTTPPollingConn) poll() bool {
 	if len(resp) > 0 {
 		c.recvLock.Lock()
 		c.recvBuf.Write(resp)
+		// Wake any goroutine blocked in Read waiting for data.
+		c.recvCond.Broadcast()
 		c.recvLock.Unlock()
 		c.lastRecv = time.Now()
 
@@ -433,31 +446,57 @@ func (c *HTTPPollingConn) generateAuthToken() string {
 	return base64.StdEncoding.EncodeToString(h.Sum(nil))[:16]
 }
 
-// Read implements net.Conn
+// Read implements net.Conn.
+//
+// Blocks on recvCond until data is available, the connection is closed, or the
+// read deadline expires - no busy-waiting. The effective deadline is whatever
+// SetReadDeadline/SetDeadline set; if unset, a 30s fallback preserves the
+// previous behavior of never blocking forever.
 func (c *HTTPPollingConn) Read(p []byte) (int, error) {
-	// Wait for data with timeout
-	deadline := time.Now().Add(30 * time.Second)
+	// Resolve the effective deadline.
+	c.deadlineMu.Lock()
+	deadline := c.readDeadline
+	c.deadlineMu.Unlock()
+	if deadline.IsZero() {
+		deadline = time.Now().Add(30 * time.Second)
+	}
 
+	// Watcher broadcasts the cond when the connection closes or the deadline
+	// fires, so a Read blocked in cond.Wait() is woken in those cases too.
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		timer := time.NewTimer(time.Until(deadline))
+		defer timer.Stop()
+		select {
+		case <-done:
+		case <-c.closed:
+		case <-timer.C:
+		}
+		c.recvLock.Lock()
+		c.recvCond.Broadcast()
+		c.recvLock.Unlock()
+	}()
+
+	c.recvLock.Lock()
+	defer c.recvLock.Unlock()
 	for {
+		if c.recvBuf.Len() > 0 {
+			return c.recvBuf.Read(p)
+		}
+
+		// Closed connection: report EOF once buffer is drained.
 		select {
 		case <-c.closed:
 			return 0, io.EOF
 		default:
 		}
 
-		c.recvLock.Lock()
-		if c.recvBuf.Len() > 0 {
-			n, err := c.recvBuf.Read(p)
-			c.recvLock.Unlock()
-			return n, err
-		}
-		c.recvLock.Unlock()
-
-		if time.Now().After(deadline) {
+		if !time.Now().Before(deadline) {
 			return 0, errors.New("read timeout")
 		}
 
-		time.Sleep(10 * time.Millisecond)
+		c.recvCond.Wait()
 	}
 }
 
@@ -493,6 +532,10 @@ func (c *HTTPPollingConn) Write(p []byte) (int, error) {
 func (c *HTTPPollingConn) Close() error {
 	c.closeOnce.Do(func() {
 		close(c.closed)
+		// Wake any Read blocked on recvCond so it can return EOF.
+		c.recvLock.Lock()
+		c.recvCond.Broadcast()
+		c.recvLock.Unlock()
 	})
 	return nil
 }
@@ -515,10 +558,17 @@ func (c *HTTPPollingConn) RemoteAddr() net.Addr {
 }
 
 func (c *HTTPPollingConn) SetDeadline(t time.Time) error {
-	return nil
+	return c.SetReadDeadline(t)
 }
 
 func (c *HTTPPollingConn) SetReadDeadline(t time.Time) error {
+	c.deadlineMu.Lock()
+	c.readDeadline = t
+	c.deadlineMu.Unlock()
+	// Wake a blocked Read so it re-evaluates the new deadline.
+	c.recvLock.Lock()
+	c.recvCond.Broadcast()
+	c.recvLock.Unlock()
 	return nil
 }
 

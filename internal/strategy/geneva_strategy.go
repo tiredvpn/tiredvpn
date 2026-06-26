@@ -398,26 +398,19 @@ func (g *GenevaConn) fragmentAtSNI(p []byte) [][]byte {
 		return [][]byte{p}
 	}
 
-	// Find SNI extension (type 0x00 0x00) in ClientHello
-	// SNI is usually around offset 40-100
-	sniOffset := -1
-	for i := 40; i < len(p)-5 && i < 200; i++ {
-		// Look for SNI extension type (0x00 0x00)
-		if p[i] == 0x00 && p[i+1] == 0x00 {
-			// Verify it looks like SNI (next bytes are length)
-			if p[i+2] == 0x00 && p[i+4] == 0x00 {
-				sniOffset = i + 5 // Point to start of hostname
-				break
+	// Locate the SNI hostname via proper TLS extension-type walking instead of a
+	// raw 0x00 0x00 byte scan. The naive scan produced false positives inside
+	// semi-random fields (notably post-quantum key_share data), splitting at the
+	// wrong offset. walkSNIHostname returns the exact hostname bounds.
+	nameStart, nameLen, ok := walkSNIHostname(p)
+	if ok {
+		// Split in the middle of the SNI hostname so DPI sees a partial name.
+		splitPoint := nameStart + nameLen/2
+		if splitPoint > 0 && splitPoint < len(p) {
+			return [][]byte{
+				p[:splitPoint],
+				p[splitPoint:],
 			}
-		}
-	}
-
-	if sniOffset > 0 && sniOffset < len(p)-10 {
-		// Split in the middle of the SNI hostname
-		splitPoint := sniOffset + 5 // Few bytes into hostname
-		return [][]byte{
-			p[:splitPoint],
-			p[splitPoint:],
 		}
 	}
 

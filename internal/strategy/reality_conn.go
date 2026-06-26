@@ -6,10 +6,23 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 
 	"golang.org/x/crypto/chacha20"
 	"golang.org/x/crypto/hkdf"
 )
+
+// realityFramePool reuses Write frame buffers (TLS 5-byte header + up to the
+// max 16383-byte record body = 16388 bytes). A buffer is borrowed for the
+// duration of a single c.Conn.Write call and returned immediately after, so
+// no reference outlives the write. Stores *[]byte to avoid per-Get allocation
+// of the slice header.
+var realityFramePool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 5+16383)
+		return &b
+	},
+}
 
 // realityDataConn wraps a net.Conn and encrypts post-handshake data using
 // ChaCha20 keystream framed as TLS Application Data records (type 0x17).
@@ -98,22 +111,26 @@ func (c *realityDataConn) Write(p []byte) (int, error) {
 			chunk = chunk[:16383]
 		}
 
-		// Encrypt in-place into a temporary buffer.
-		enc := make([]byte, len(chunk))
-		c.wCipher.XORKeyStream(enc, chunk)
+		// Borrow a pooled frame buffer: 5-byte TLS header + encrypted payload.
+		bufp := realityFramePool.Get().(*[]byte)
+		frame := (*bufp)[:5+len(chunk)]
 
-		// TLS Application Data record header.
-		var hdr [5]byte
-		hdr[0] = 0x17         // content type: Application Data
-		hdr[1] = 0x03         // TLS 1.2 legacy version
-		hdr[2] = 0x03
-		binary.BigEndian.PutUint16(hdr[3:], uint16(len(enc)))
+		// TLS Application Data record header, written directly into the frame.
+		frame[0] = 0x17 // content type: Application Data
+		frame[1] = 0x03 // TLS 1.2 legacy version
+		frame[2] = 0x03
+		binary.BigEndian.PutUint16(frame[3:5], uint16(len(chunk)))
 
-		// Write header + encrypted payload as one syscall where possible.
-		frame := make([]byte, 5+len(enc))
-		copy(frame, hdr[:])
-		copy(frame[5:], enc)
-		if _, err := c.Conn.Write(frame); err != nil {
+		// Encrypt straight into the payload region (ChaCha20 XOR is symmetric
+		// and consumes the same keystream regardless of dst/src aliasing, so
+		// this is byte-identical to encrypting into a scratch buffer + copy).
+		c.wCipher.XORKeyStream(frame[5:], chunk)
+
+		_, err := c.Conn.Write(frame)
+		// Return the buffer only after Write completes (Conn.Write does not
+		// retain the slice past the call), then handle any error.
+		realityFramePool.Put(bufp)
+		if err != nil {
 			return total, err
 		}
 

