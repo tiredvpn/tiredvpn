@@ -1,8 +1,6 @@
 package main
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -645,24 +643,6 @@ Generate QR:
     -quic-port  QUIC port (default: 8443)
     -strategy   Strategy (default: auto)
     -cover      Cover host (default: api.googleapis.com)`)
-}
-
-// generateSecret generates a random hex secret
-func generateSecret(length int) string {
-	b := make([]byte, length)
-	if _, err := rand.Read(b); err != nil {
-		panic(fmt.Sprintf("failed to generate secret: %v", err))
-	}
-	return hex.EncodeToString(b)
-}
-
-// generateClientID generates a random client ID
-func generateClientID() string {
-	b := make([]byte, 4)
-	if _, err := rand.Read(b); err != nil {
-		panic(fmt.Sprintf("failed to generate client ID: %v", err))
-	}
-	return "client-" + hex.EncodeToString(b)
 }
 
 // buildConnectionString builds a tired:// connection string
