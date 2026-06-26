@@ -7,6 +7,12 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.8] - 2026-06-26
+
+### Fixed
+
+- **Relay mode (`-upstream`) now actually forwards client traffic to the upstream server.** In TUN mode the relay never invoked the upstream dialer - `handleTUNModeCore` had no upstream branch, so it always wrote client packets into its own local TUN device instead of proxying them onward, and no connection to the upstream was ever opened. On top of that, the upstream dialer never sent the `TypeStego` dispatch byte before the steganography handshake, so even the address-proxy path failed to authenticate against the upstream (the upstream saw a new connection but never authenticated it). The relay now opens a steganography tunnel to the upstream, performs the TUN handshake, forwards the upstream-assigned IP to the client, and transparently relays raw packet frames in both directions. A relay chain (client → relay → upstream → exit) now works end to end. Requires both the relay and the upstream server to run this version.
+
 ## [1.3.7] - 2026-06-25
 
 ### Fixed
