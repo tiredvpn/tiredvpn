@@ -7,6 +7,21 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.11] - 2026-06-26
+
+### Fixed
+
+- **Idle clients on the HTTP/2-stego strategy no longer reconnect every 30 seconds.** A client with no traffic sends a zero-length keepalive every 10 s and relies on the server echoing it back to reset its 30 s read deadline. Every TUN handler echoed a zero-length keepalive except the HTTP/2-stego one, which silently dropped it - so an idle HTTP/2-stego client received nothing for 30 s, hit its read-deadline, and did a (fast) reconnect. Over a long-RTT or relayed path this caused a brief blip on the first request after a pause and could break a transfer that ran longer than the idle window. The HTTP/2-stego handler now echoes the keepalive like the others.
+- **ICMP tunnel key derivation now uses HKDF** instead of an ad-hoc construction, matching the rest of the codebase. Wire-compatible change deployed to both client and server together.
+
+### Changed
+
+- **More hot-path performance work on the strategies** (continuing the perf audit, each verified with `go test -race` and the linter):
+  - REALITY reads are now buffered (`bufio`) and use a bounded per-connection decode buffer, instead of reading straight from the socket and retaining a full 16 KB buffer for a few leftover bytes.
+  - Client TCP socket buffers raised from 64 KB to 4 MB to match the bandwidth-delay product on high-RTT links (the server upstream was already at 4 MB), so a single connection no longer caps throughput on long-latency paths.
+  - A shared TLS client session cache across the TLS strategies enables session resumption, avoiding a full handshake on every reconnect.
+- **Flaky timing tests stabilized.** Several tests relied on `time.Sleep` and runner-speed-dependent throughput assertions and intermittently failed in CI; they were rewritten to be deterministic, and the CI skip-list for them was removed so they actually run.
+
 ## [1.3.10] - 2026-06-26
 
 ### Changed
