@@ -7,6 +7,24 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.10] - 2026-06-26
+
+### Changed
+
+- **Hot-path performance pass across the transport strategies** (from an internal perf audit, each change verified with `go test -race` and the linter):
+  - REALITY (the primary data path): encrypt in place with `XORKeyStream` into a single pooled buffer instead of a separate allocation plus two copies per chunk.
+  - Morph: replaced a global RNG mutex with per-goroutine `math/rand/v2`, removing a lock that serialized the whole Morph data plane under concurrent connections.
+  - Geneva: use the correct TLS-extension SNI walker (shared with REALITY) instead of a naive `00 00` scan that false-matched inside `key_share`.
+  - HTTP polling: replaced a 10 ms busy-wait loop with a condition variable and made `SetReadDeadline` actually take effect.
+  - WebSocket padding: build frames in one correctly sized buffer with an unrolled XOR mask and a non-cryptographic mask source.
+  - State exhaustion: reuse a single packet buffer instead of 6+ allocations per decoy (byte-identical output verified).
+  - HTTP/2 stego: use the standard library hex encoder and drop a dead code path.
+  - Probe paths (confusion / anti-probe / SSH camouflage): a lightweight TCP-connect probe instead of a full TLS handshake (less load on server admission control), and they now resolve the same address as Connect (`GetServerAddr`, IPv6-aware).
+
+### Fixed
+
+- **Data race in the mesh strategy.** `relay.Available` was written without holding the lock that readers use; the relay-failure path also recursed instead of looping. Both fixed.
+
 ## [1.3.9] - 2026-06-26
 
 ### Fixed
