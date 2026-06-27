@@ -1240,7 +1240,16 @@ type h2TunnelState struct {
 	mu              sync.Mutex
 	sharedTUNWriter *ClientWriter // For shared TUN mode
 	sharedTUN       *SharedTUN    // Reference to shared TUN
+	// reasmBuf accumulates inbound TUN bytes across stego DATA frames so a single
+	// [len:4][pkt:N] frame split over several payloads (relay leg uses a non-tunMode
+	// stego conn that chunks at 1000/1400 bytes) is reassembled instead of dropped.
+	// Read/written only from the single runH2FrameLoop goroutine -> no lock needed.
+	reasmBuf []byte
 }
+
+// h2ReasmBufLimit caps the inbound reassembly buffer. AMS prod runs with swap 0, so
+// a desynced stream must not grow the buffer without bound.
+const h2ReasmBufLimit = 128 * 1024
 
 // handleHTTP2 handles HTTP/2 connections (including steganography)
 func handleHTTP2(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
@@ -1442,44 +1451,89 @@ func handleH2DataFrame(conn net.Conn, f *http2.DataFrame, framer *http2.Framer, 
 	}
 }
 
-// forwardH2TUNPacket writes an IP packet from the stego payload to the shared TUN device.
+// forwardH2TUNPacket reassembles inbound TUN frames from stego payloads and writes
+// the contained IP packets to the shared TUN device.
+//
+// The stego stream is a byte stream carrying [len:4][pkt:N] frames. A single frame
+// can arrive split across several stego DATA-frame payloads: a relay forwards a
+// downstream client's packets over a non-tunMode upstream stego conn that caps
+// chunks at 1000/1400 bytes (writeViaPaddedData / writeViaData), so a 1404-byte
+// frame (1400-byte inner packet) is emitted as 2+ payloads. The previous version
+// treated each payload as one self-contained frame and dropped anything that did
+// not fit (int(pktLen) > len(payload)-4), black-holing every inner packet above
+// ~996 bytes on relay chains. We now buffer across payloads like the morph path.
 func forwardH2TUNPacket(tunnel *h2TunnelState, streamID uint32, payload []byte, logger *log.Logger) {
 	tunnel.streamID = streamID
-	if len(payload) < 4 || tunnel.sharedTUN == nil {
+	if tunnel.sharedTUN == nil {
 		return
 	}
-	pktLen := binary.BigEndian.Uint32(payload[0:4])
-	logger.Debug("H2 TUN: received payload len=%d, pktLen=%d", len(payload), pktLen)
-	// Handle keepalive packet (zero length) - echo back. The morph, confusion
-	// and native TUN handlers all echo zero-length keepalives; H2-stego TUN was
-	// the only path that dropped them (pktLen<20 below), so idle H2 clients got
-	// no inbound traffic and self-disconnected when their readTimeout expired.
-	if pktLen == 0 {
-		if h2c, ok := tunnel.targetConn.(*h2TunConn); ok {
-			logger.Debug("H2 TUN: received keepalive, echoing back")
-			tunnel.mu.Lock()
-			sendStegoResponse(h2c.framer, tunnel.streamID, []byte{0, 0, 0, 0}, h2c.cfg)
-			tunnel.mu.Unlock()
+
+	tunnel.reasmBuf = append(tunnel.reasmBuf, payload...)
+	tunnel.reasmBuf = reassembleH2TUNFrames(tunnel.reasmBuf,
+		func(ipPkt []byte) {
+			logger.Debug("H2 TUN: writing %d bytes to TUN, first 20: %x", len(ipPkt), ipPkt[:minInt(20, len(ipPkt))])
+			if _, err := tunnel.sharedTUN.TUNDevice().Write(ipPkt); err != nil {
+				logger.Debug("H2 TUN write error: %v", err)
+			} else {
+				logger.Debug("H2 TUN: wrote %d bytes to TUN successfully", len(ipPkt))
+			}
+			if tunnel.sharedTUNWriter != nil {
+				tunnel.sharedTUNWriter.UpdateActivity()
+			}
+		},
+		func() {
+			// Keepalive (zero length) - echo back. The morph, confusion and native
+			// TUN handlers all echo zero-length keepalives; without it idle H2
+			// clients get no inbound traffic and self-disconnect when their
+			// readTimeout expires.
+			if h2c, ok := tunnel.targetConn.(*h2TunConn); ok {
+				logger.Debug("H2 TUN: received keepalive, echoing back")
+				tunnel.mu.Lock()
+				sendStegoResponse(h2c.framer, tunnel.streamID, []byte{0, 0, 0, 0}, h2c.cfg)
+				tunnel.mu.Unlock()
+			}
+			if tunnel.sharedTUNWriter != nil {
+				tunnel.sharedTUNWriter.UpdateActivity()
+			}
+		})
+}
+
+// reassembleH2TUNFrames extracts complete [len:4][pkt:N] frames from buf, calling
+// deliver(ipPkt) for each data packet and onKeepalive() for each zero-length frame.
+// It returns the unconsumed remainder (a partial frame awaiting more bytes). A bogus
+// length desyncs the stream, recovered by sliding one byte forward like the morph
+// reassembler. If the remainder exceeds h2ReasmBufLimit (a persistently desynced
+// stream) it is dropped and nil is returned, so the buffer cannot grow without bound
+// on the swap-0 AMS box.
+func reassembleH2TUNFrames(buf []byte, deliver func(ipPkt []byte), onKeepalive func()) []byte {
+	for len(buf) >= 4 {
+		pktLen := binary.BigEndian.Uint32(buf[0:4])
+
+		if pktLen == 0 {
+			buf = buf[4:]
+			onKeepalive()
+			continue
 		}
-		if tunnel.sharedTUNWriter != nil {
-			tunnel.sharedTUNWriter.UpdateActivity()
+
+		if pktLen < 20 || pktLen > 65535 {
+			buf = buf[1:]
+			continue
 		}
-		return
+
+		totalLen := 4 + int(pktLen)
+		if len(buf) < totalLen {
+			break
+		}
+
+		deliver(buf[4:totalLen])
+		buf = buf[totalLen:]
 	}
-	if int(pktLen) > len(payload)-4 || pktLen < 20 {
-		logger.Debug("H2 TUN: invalid packet - pktLen=%d, payload=%d", pktLen, len(payload))
-		return
+
+	if len(buf) > h2ReasmBufLimit {
+		log.Warn("H2 TUN reassembly buffer overflow (%d bytes), resetting", len(buf))
+		return nil
 	}
-	ipPkt := payload[4 : 4+pktLen]
-	logger.Debug("H2 TUN: writing %d bytes to TUN, first 20: %x", len(ipPkt), ipPkt[:minInt(20, len(ipPkt))])
-	if _, err := tunnel.sharedTUN.TUNDevice().Write(ipPkt); err != nil {
-		logger.Debug("H2 TUN write error: %v", err)
-	} else {
-		logger.Debug("H2 TUN: wrote %d bytes to TUN successfully", len(ipPkt))
-	}
-	if tunnel.sharedTUNWriter != nil {
-		tunnel.sharedTUNWriter.UpdateActivity()
-	}
+	return buf
 }
 
 // forwardH2ProxyData forwards stego payload to the proxy target connection.
