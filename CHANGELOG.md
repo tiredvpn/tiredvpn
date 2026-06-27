@@ -7,6 +7,16 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.13] - 2026-06-27
+
+### Fixed
+
+- **Relay multi-hop MTU blackhole.** On relayed chains (client -> relay -> exit) the relay's upstream leg splits each TUN frame across multiple stego frames, but the exit's H2 TUN receiver expected a whole frame per stego payload and silently dropped anything larger. This capped the effective relay MTU around 996 bytes while direct tunnels carried the full 1400, so large packets over relayed chains were lost (visible as a PMTU blackhole). The exit now reassembles fragmented frames (bounded 128 KiB buffer, resync on malformed length, keepalives preserved), so relayed tunnels carry the full negotiated MTU. The reverse direction was already correct.
+
+### Removed
+
+- Dead buffer-pool helpers in `internal/server/bufpool.go`.
+
 ## [1.3.12] - 2026-06-27
 
 ### Security
