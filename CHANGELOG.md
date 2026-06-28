@@ -7,6 +7,12 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.14] - 2026-06-28
+
+### Added
+
+- **Auto-MTU active probe.** Tunnels now discover the largest packet size that actually traverses the path instead of relying on a hand-set `-tun-mtu`. After the TUN handshake the client sends echo probe frames through the data channel itself and the exit reflects same-size replies; the client searches for the ceiling (anchor 1280 -> optimistic jump to the configured cap -> binary search, with retries to distinguish packet loss from an MTU drop) and applies `min(probed, cap)` to the interface via a live MTU update. This measures the real path including relay framing, so relayed chains get their true MTU without per-node tuning. Capability is negotiated (handshake version `0x03` + server flag); peers that do not support it fall back to the existing static MTU negotiation. New `-auto-mtu` flag (default on); `-tun-mtu` becomes the upper bound. Exposes `tiredvpn_local_mtu_probed` and related probe metrics. Android live-raise (VpnService re-establish) is a follow-up; the full probe runs on standalone Linux/macOS today.
+
 ## [1.3.13] - 2026-06-27
 
 ### Fixed
