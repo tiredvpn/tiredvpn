@@ -11,6 +11,12 @@ type TunProxyMetrics struct {
 	tunDNSQueries uint64
 	tunMTUIssues  uint64
 
+	// Auto-MTU active probe metrics
+	mtuProbedMTU   uint64 // gauge: last applied probed MTU
+	mtuProbeCount  uint64 // gauge: probe frames sent in the last run
+	mtuProbeTotal  uint64 // counter: completed probe runs
+	mtuProbeFallbk uint64 // counter: probe runs that fell back to static/floor
+
 	// Proxy mode metrics
 	proxyProtocol uint64 // 0=none, 1=socks5, 2=http
 	poolHitRate   uint64 // hit rate * 10000 for precision
@@ -27,6 +33,18 @@ func (tpm *TunProxyMetrics) RecordTunDNSQuery() {
 
 func (tpm *TunProxyMetrics) RecordTunMTUIssue() {
 	atomic.AddUint64(&tpm.tunMTUIssues, 1)
+}
+
+// RecordMTUProbe records the outcome of a completed auto-MTU probe run.
+// appliedMTU is the MTU put into effect, probes is how many frames were sent,
+// and fellBack is true when the run could not measure (no capability / floor).
+func (tpm *TunProxyMetrics) RecordMTUProbe(appliedMTU, probes int, fellBack bool) {
+	atomic.StoreUint64(&tpm.mtuProbedMTU, uint64(appliedMTU))
+	atomic.StoreUint64(&tpm.mtuProbeCount, uint64(probes))
+	atomic.AddUint64(&tpm.mtuProbeTotal, 1)
+	if fellBack {
+		atomic.AddUint64(&tpm.mtuProbeFallbk, 1)
+	}
 }
 
 // Proxy mode methods
@@ -65,6 +83,27 @@ func (tpm *TunProxyMetrics) ExportPrometheus(w http.ResponseWriter) {
 	fmt.Fprintf(w, "# HELP tiredvpn_local_tun_mtu_issues_total MTU/fragmentation issues in TUN mode\n")
 	fmt.Fprintf(w, "# TYPE tiredvpn_local_tun_mtu_issues_total counter\n")
 	fmt.Fprintf(w, "tiredvpn_local_tun_mtu_issues_total %d\n", atomic.LoadUint64(&tpm.tunMTUIssues))
+	fmt.Fprintf(w, "\n")
+
+	// Auto-MTU probe
+	fmt.Fprintf(w, "# HELP tiredvpn_local_mtu_probed The MTU put into effect by the auto-MTU probe\n")
+	fmt.Fprintf(w, "# TYPE tiredvpn_local_mtu_probed gauge\n")
+	fmt.Fprintf(w, "tiredvpn_local_mtu_probed %d\n", atomic.LoadUint64(&tpm.mtuProbedMTU))
+	fmt.Fprintf(w, "\n")
+
+	fmt.Fprintf(w, "# HELP tiredvpn_local_mtu_probe_frames Probe frames sent in the last auto-MTU run\n")
+	fmt.Fprintf(w, "# TYPE tiredvpn_local_mtu_probe_frames gauge\n")
+	fmt.Fprintf(w, "tiredvpn_local_mtu_probe_frames %d\n", atomic.LoadUint64(&tpm.mtuProbeCount))
+	fmt.Fprintf(w, "\n")
+
+	fmt.Fprintf(w, "# HELP tiredvpn_local_mtu_probe_total Completed auto-MTU probe runs\n")
+	fmt.Fprintf(w, "# TYPE tiredvpn_local_mtu_probe_total counter\n")
+	fmt.Fprintf(w, "tiredvpn_local_mtu_probe_total %d\n", atomic.LoadUint64(&tpm.mtuProbeTotal))
+	fmt.Fprintf(w, "\n")
+
+	fmt.Fprintf(w, "# HELP tiredvpn_local_mtu_probe_fallback_total Auto-MTU runs that fell back to static/floor\n")
+	fmt.Fprintf(w, "# TYPE tiredvpn_local_mtu_probe_fallback_total counter\n")
+	fmt.Fprintf(w, "tiredvpn_local_mtu_probe_fallback_total %d\n", atomic.LoadUint64(&tpm.mtuProbeFallbk))
 	fmt.Fprintf(w, "\n")
 
 	// Proxy protocol

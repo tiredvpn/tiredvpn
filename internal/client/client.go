@@ -56,6 +56,7 @@ type Config struct {
 	TunPeerIP string
 	TunMTU    int
 	TunRoutes string
+	AutoMTU   bool // active end-to-end MTU probe; TunMTU becomes the upper bound (cap)
 
 	// Host-supplied TUN integration (Android VpnService / macOS NetworkExtension).
 	// In both modes the TUN fd is created by the host and passed in via TunFd;
@@ -493,7 +494,7 @@ func runControlSocketMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Si
 			handshake[0] = 0x02 // TUN mode
 			copy(handshake[1:5], currentIP.To4())
 			binary.BigEndian.PutUint16(handshake[5:7], uint16(mtu))
-			handshake[7] = 0x02 // Version 2: supports full port hopping config
+			handshake[7] = 0x03 // Version 3: full port hopping config + auto-MTU probe
 
 			if _, err := conn.Write(handshake); err != nil {
 				conn.Close()
@@ -611,6 +612,7 @@ func runTUNMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) erro
 		Routes:      routes,
 		ServerAddr:  cfg.ServerAddr,
 		Manager:     mgr,
+		AutoMTU:     cfg.AutoMTU,     // active end-to-end MTU probe
 		TunFd:       cfg.TunFd,       // Android VpnService TUN fd
 		ProtectPath: cfg.ProtectPath, // Android socket protection path
 	}
@@ -675,6 +677,7 @@ func runTUNMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) erro
 			defer ticker.Stop()
 			var lastPacketsUp, lastPacketsDown, lastBytesUp, lastBytesDown int64
 			var lastConnects, lastReconnectsOK, lastReconnectsFail int64
+			var lastProbeMTU, lastProbeCount int
 			for {
 				select {
 				case <-ticker.C:
@@ -705,6 +708,14 @@ func runTUNMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) erro
 					lastConnects = connects
 					lastReconnectsOK = reconnectsOK
 					lastReconnectsFail = reconnectsFail
+					// Surface the auto-MTU probe result once per new outcome.
+					if res, ok := vpnClient.LastMTUProbe(); ok {
+						if res.AppliedMTU != lastProbeMTU || res.Probes != lastProbeCount {
+							clientMetrics.RecordMTUProbe(res.AppliedMTU, res.Probes, res.FallbackReason != "")
+							lastProbeMTU = res.AppliedMTU
+							lastProbeCount = res.Probes
+						}
+					}
 					// Sync current strategy from manager
 					info := mgr.GetLastConnectionInfo()
 					if info.Strategy != "" {

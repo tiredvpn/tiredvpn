@@ -64,9 +64,10 @@ func CreateTUNFromFd(fd int, name string, mtu int) (*TUNDevice, error) {
 	}
 
 	tun := &TUNDevice{
-		name: name,
-		file: file,
-		mtu:  mtu,
+		name:      name,
+		file:      file,
+		mtu:       mtu,
+		atomicMTU: int32(mtu),
 	}
 
 	log.Info("Created TUN device from fd: %d (name=%s, MTU=%d)", fd, name, mtu)

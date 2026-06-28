@@ -357,3 +357,10 @@ func (m *ClientMetrics) Handler() http.HandlerFunc {
 		}
 	}
 }
+
+// RecordMTUProbe surfaces an auto-MTU probe outcome through the TUN metrics.
+func (m *ClientMetrics) RecordMTUProbe(appliedMTU, probes int, fellBack bool) {
+	if m != nil && m.tunProxyMetrics != nil {
+		m.tunProxyMetrics.RecordMTUProbe(appliedMTU, probes, fellBack)
+	}
+}

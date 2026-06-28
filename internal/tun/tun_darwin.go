@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -55,15 +56,41 @@ type sockaddrCtl struct {
 
 // TUNDevice represents a macOS utun interface.
 type TUNDevice struct {
-	name     string
-	file     *os.File
-	mtu      int
-	localIP  net.IP
-	remoteIP net.IP
-	routes   []string
+	name string
+	file *os.File
+	// mtu is the construction-time MTU (configured cap), immutable afterwards.
+	// The live MTU updated by SetMTU is held in atomicMTU and read via MTU().
+	mtu       int
+	atomicMTU int32
+	localIP   net.IP
+	remoteIP  net.IP
+	routes    []string
 
 	writeMu sync.Mutex
 	readBuf []byte
+}
+
+// MTU returns the current effective interface MTU (atomic read).
+func (t *TUNDevice) MTU() int {
+	if m := int(atomic.LoadInt32(&t.atomicMTU)); m > 0 {
+		return m
+	}
+	return t.mtu
+}
+
+// SetMTU changes the live interface MTU. On the utun-owned path it runs ifconfig;
+// on the NetworkExtension fd path the host owns the link, so only the framing MTU
+// is updated.
+func (t *TUNDevice) SetMTU(mtu int) error {
+	if mtu <= 0 {
+		return fmt.Errorf("invalid MTU: %d", mtu)
+	}
+	if out, err := exec.Command("ifconfig", t.name, "mtu", fmt.Sprintf("%d", mtu)).CombinedOutput(); err != nil {
+		log.Warn("SetMTU: ifconfig %s mtu %d failed: %v (%s)", t.name, mtu, err, string(out))
+	}
+	atomic.StoreInt32(&t.atomicMTU, int32(mtu))
+	log.Info("TUN device %s MTU set to %d", t.name, mtu)
+	return nil
 }
 
 // CreateTUN opens a new utun device. The `name` argument is advisory — macOS
@@ -124,10 +151,11 @@ func CreateTUN(name string, mtu int) (*TUNDevice, error) {
 	}
 
 	t := &TUNDevice{
-		name:    ifName,
-		file:    file,
-		mtu:     mtu,
-		readBuf: make([]byte, 65536+4),
+		name:      ifName,
+		file:      file,
+		mtu:       mtu,
+		atomicMTU: int32(mtu),
+		readBuf:   make([]byte, 65536+4),
 	}
 	log.Info("Created utun device: %s (MTU=%d)", ifName, mtu)
 	return t, nil
@@ -331,10 +359,11 @@ func CreateTUNFromFd(fd int, name string, mtu int) (*TUNDevice, error) {
 		return nil, fmt.Errorf("os.NewFile failed for fd %d", fd)
 	}
 	t := &TUNDevice{
-		name:    name,
-		file:    file,
-		mtu:     mtu,
-		readBuf: make([]byte, 65536+4),
+		name:      name,
+		file:      file,
+		mtu:       mtu,
+		atomicMTU: int32(mtu),
+		readBuf:   make([]byte, 65536+4),
 	}
 	log.Info("Created TUN device from fd=%d (name=%s, MTU=%d)", fd, name, mtu)
 	return t, nil

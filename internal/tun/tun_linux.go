@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -33,12 +34,19 @@ type ifReq struct {
 }
 
 type TUNDevice struct {
-	name     string
-	file     *os.File
-	mtu      int
-	localIP  net.IP
-	remoteIP net.IP
-	routes   []string
+	name string
+	file *os.File
+	// mtu is the MTU set at construction (the configured cap). It is immutable
+	// after construction; the live MTU (which auto-MTU may lower/raise on the fly)
+	// is held in atomicMTU and read via MTU().
+	mtu int
+	// atomicMTU is the current effective interface MTU, updated atomically by
+	// SetMTU so the hot data-path goroutines can read it without a lock while a
+	// background probe adjusts it.
+	atomicMTU int32
+	localIP   net.IP
+	remoteIP  net.IP
+	routes    []string
 
 	// addedRoutes records the destinations actually installed on this link so
 	// teardown can remove exactly its own routes (netlink.RouteDel) instead of
@@ -122,9 +130,10 @@ func CreateTUN(name string, mtu int) (*TUNDevice, error) {
 	}
 
 	tun := &TUNDevice{
-		name: actualName,
-		file: file,
-		mtu:  mtu,
+		name:      actualName,
+		file:      file,
+		mtu:       mtu,
+		atomicMTU: int32(mtu),
 	}
 
 	log.Info("Created TUN device: %s (MTU=%d)", tun.name, mtu)
@@ -206,6 +215,37 @@ func (t *TUNDevice) delRoutes() {
 
 func (t *TUNDevice) File() *os.File {
 	return t.file
+}
+
+// MTU returns the current effective interface MTU. It reads the value updated by
+// SetMTU atomically so the hot data-path may consult it without a lock.
+func (t *TUNDevice) MTU() int {
+	if m := int(atomic.LoadInt32(&t.atomicMTU)); m > 0 {
+		return m
+	}
+	return t.mtu
+}
+
+// SetMTU changes the live interface MTU (auto-MTU result). It updates the kernel
+// link MTU and the atomic value read by the data path. The construction-time
+// t.mtu (the cap) is left untouched so read buffers sized at the cap stay valid.
+// Lowering is always safe; raising never exceeds the cap the buffers were sized
+// for. On the fd-supplied (Android) path the kernel link is owned by the host, so
+// only the framing MTU is updated.
+func (t *TUNDevice) SetMTU(mtu int) error {
+	if mtu <= 0 {
+		return fmt.Errorf("invalid MTU: %d", mtu)
+	}
+	if link, err := netlink.LinkByName(t.name); err == nil {
+		if err := netlink.LinkSetMTU(link, mtu); err != nil {
+			log.Warn("SetMTU: failed to set kernel MTU on %s to %d: %v", t.name, mtu, err)
+		}
+	} else {
+		log.Debug("SetMTU: link %s not found (fd mode?), updating framing MTU only: %v", t.name, err)
+	}
+	atomic.StoreInt32(&t.atomicMTU, int32(mtu))
+	log.Info("TUN device %s MTU set to %d", t.name, mtu)
+	return nil
 }
 
 func (t *TUNDevice) Configure(localIP, remoteIP net.IP, routes []string) error {

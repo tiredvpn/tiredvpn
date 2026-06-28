@@ -1176,9 +1176,9 @@ func (cs *ControlServer) performTUNHandshake() (assignedIP, serverIP net.IP, err
 	handshake[0] = 0x02 // TUN mode
 	// localIP = 0.0.0.0 (bytes 1:5 remain zero to request auto assignment)
 	binary.BigEndian.PutUint16(handshake[5:7], uint16(mtu))
-	handshake[7] = 0x02 // Version 2: supports full port hopping config
+	handshake[7] = tunHandshakeVersion // v3: also signals auto-MTU probe support
 
-	log.Debug("Sending TUN handshake: mode=0x02, mtu=%d, version=2", mtu)
+	log.Debug("Sending TUN handshake: mode=0x02, mtu=%d, version=0x%02x", mtu, tunHandshakeVersion)
 	if _, err := cs.serverConn.Write(handshake); err != nil {
 		return nil, nil, fmt.Errorf("handshake write failed: %w", err)
 	}

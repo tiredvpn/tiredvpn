@@ -54,6 +54,18 @@ const (
 )
 
 // VPNClient manages the TUN-based VPN connection
+// tunHandshakeVersion is the TUN handshake version byte sent by this client.
+// v3 is additive over v2 (full port-hop config) and additionally advertises that
+// the client understands the auto-MTU active probe. Older servers treat >=0x02
+// identically, so the bump is backward-compatible.
+const tunHandshakeVersion = 0x03
+
+// Handshake-response flag bits (resp[9]).
+const (
+	tunFlagPortHopping = 0x01         // server advertises port hopping
+	tunFlagMTUProbe    = ProbeCapFlag // server supports the auto-MTU echo (exit only)
+)
+
 // ServerCapabilities contains optional features advertised by server
 type ServerCapabilities struct {
 	PortHoppingEnabled bool
@@ -62,6 +74,7 @@ type ServerCapabilities struct {
 	HopIntervalSec     int    // Hop interval in seconds (0 = use default 60s)
 	HopStrategy        string // "random", "sequential", "fibonacci" (empty = "random")
 	HopSeed            []byte // Optional seed for deterministic hopping
+	MTUProbeSupported  bool   // exit echoes auto-MTU probe frames
 }
 
 type VPNClient struct {
@@ -101,6 +114,14 @@ type VPNClient struct {
 	// Server capabilities (received during handshake)
 	serverCaps ServerCapabilities
 
+	// Auto-MTU active probe state.
+	autoMTU       bool                   // -auto-mtu enabled
+	ownsInterface bool                   // we created the TUN (can change MTU live)
+	prober        atomic.Pointer[Prober] // current prober (replies routed here)
+	lastProbeMu   sync.Mutex
+	lastProbe     ProbeResult
+	lastProbeOK   bool
+
 	// Port hop state for seamless reconnect
 	portHopInProgress int32    // 1 if port hop reconnect in progress
 	pendingConn       net.Conn // New connection being established during port hop
@@ -116,6 +137,11 @@ type VPNConfig struct {
 	Routes     []string // Routes to add (e.g., "0.0.0.0/0")
 	ServerAddr string   // Server address (host:port)
 	Manager    *strategy.Manager
+
+	// AutoMTU enables the active MTU probe. When set, MTU becomes the upper bound
+	// (cap) and the client measures the real end-to-end ceiling, applying
+	// min(probed, cap). Only effective on interfaces we own (non-fd Linux/macOS).
+	AutoMTU bool
 
 	// Android VpnService support
 	TunFd       int    // Use existing TUN file descriptor (from VpnService.establish())
@@ -202,11 +228,13 @@ func NewVPNClient(cfg VPNConfig) (*VPNClient, error) {
 	}
 
 	return &VPNClient{
-		tun:        tunDev,
-		manager:    cfg.Manager,
-		serverAddr: cfg.ServerAddr,
-		localIP:    cfg.LocalIP,
-		stopCh:     make(chan struct{}),
+		tun:           tunDev,
+		manager:       cfg.Manager,
+		serverAddr:    cfg.ServerAddr,
+		localIP:       cfg.LocalIP,
+		stopCh:        make(chan struct{}),
+		autoMTU:       cfg.AutoMTU,
+		ownsInterface: cfg.TunFd <= 0,
 	}, nil
 }
 
@@ -248,8 +276,147 @@ func (v *VPNClient) Start(ctx context.Context) error {
 	go v.readFromServer()
 	go v.sendKeepalive()
 
+	// Auto-MTU: measure the real end-to-end ceiling and apply min(probed, cap).
+	// readFromServer is already running so PROBE_REPLY frames can be routed to the
+	// prober. Runs in the background so connectivity is never blocked beyond the
+	// fast-probe deadline.
+	v.maybeStartMTUProbe(ctx, "connect")
+
 	log.Info("VPN tunnel started")
 	return nil
+}
+
+// maybeStartMTUProbe launches the active MTU probe when enabled, supported by the
+// exit, and the interface MTU can be changed live (interfaces we created). It is a
+// no-op otherwise, leaving the statically negotiated MTU in place.
+func (v *VPNClient) maybeStartMTUProbe(ctx context.Context, trigger string) {
+	if !v.autoMTU {
+		return
+	}
+	if !v.serverCaps.MTUProbeSupported {
+		log.Info("Auto-MTU: exit did not advertise probe support, keeping static MTU %d (reason=no-capability)", v.tun.mtu)
+		v.storeProbeResult(ProbeResult{AppliedMTU: v.tun.mtu, Source: "cap", FallbackReason: "no-capability"})
+		return
+	}
+	if !v.ownsInterface {
+		// Host-owned fd (Android VpnService / macOS NE): the MTU can only be set at
+		// establish() time by the host, so a live probe-and-raise is not possible
+		// here. The host should probe before establish (out of scope for Go core).
+		// TODO: expose a probe-before-establish entry point for host integrations.
+		log.Debug("Auto-MTU: interface is host-owned (fd mode), skipping live probe")
+		return
+	}
+	go v.runMTUProbe(ctx, trigger)
+}
+
+// runMTUProbe performs the connect-time fast probe and, on failure, lowers the
+// interface to the floor and refines in the background. See
+// research/auto-mtu-design-2026-06-28.md section 4.4.
+func (v *VPNClient) runMTUProbe(ctx context.Context, trigger string) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error("runMTUProbe panic: %v", r)
+		}
+	}()
+
+	capMTU := v.tun.mtu
+	if capMTU < MTUFloor {
+		// Configured below the floor: nothing to measure, the floor is the ceiling.
+		log.Debug("Auto-MTU: configured MTU %d <= floor, skipping probe", capMTU)
+		return
+	}
+
+	// Per-probe timeout from the measured RTT (>= 500ms floor).
+	timeout := minProbeTimeout
+	if v.manager != nil {
+		if rtt := v.manager.GetLastConnectionInfo().Latency; rtt > 0 {
+			if t := 3 * rtt; t > timeout {
+				timeout = t
+			}
+		}
+	}
+
+	prober := NewProber(ProbeConfig{
+		Floor:   MTUFloor,
+		Cap:     capMTU,
+		Step:    defaultProbeStep,
+		Timeout: timeout,
+		Retries: defaultProbeRetries,
+	}, v.sendProbeFrame)
+	v.prober.Store(prober)
+	defer v.prober.Store(nil)
+
+	start := time.Now()
+
+	// Fast synchronous probe of cap: the common 1500-path case answers in ~1 RTT
+	// and we keep the tunnel at full MTU.
+	if prober.FastProbe(ctx, fastProbeDeadline) {
+		v.applyProbedMTU(capMTU)
+		res := ProbeResult{AppliedMTU: capMTU, Source: "cap", Probes: prober.Probes(), DurationMs: time.Since(start).Milliseconds()}
+		v.storeProbeResult(res)
+		log.Info("Auto-MTU[%s]: cap %d confirmed via fast probe in %dms (%d probes)", trigger, capMTU, res.DurationMs, res.Probes)
+		return
+	}
+
+	// Fast probe failed: drop to the conservative floor immediately (safe, see 5.2)
+	// so oversized frames cannot black-hole, then refine the real ceiling and raise.
+	log.Info("Auto-MTU[%s]: fast probe of cap %d failed, lowering to floor %d and refining in background", trigger, capMTU, MTUFloor)
+	v.applyProbedMTU(MTUFloor)
+
+	res := prober.Run(ctx)
+	v.applyProbedMTU(res.AppliedMTU)
+	v.storeProbeResult(res)
+	log.Info("Auto-MTU[%s]: probed=%d source=%s probes=%d duration=%dms fallback=%q",
+		trigger, res.AppliedMTU, res.Source, res.Probes, res.DurationMs, res.FallbackReason)
+}
+
+// sendProbeFrame frames a probe control payload as [len:4][payload] and writes it
+// to the current server connection.
+func (v *VPNClient) sendProbeFrame(payload []byte) error {
+	frame := make([]byte, 4+len(payload))
+	binary.BigEndian.PutUint32(frame[:4], uint32(len(payload)))
+	copy(frame[4:], payload)
+
+	v.mu.Lock()
+	conn := v.conn
+	v.mu.Unlock()
+	if conn == nil {
+		return fmt.Errorf("no server connection")
+	}
+	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	_, err := conn.Write(frame)
+	return err
+}
+
+// applyProbedMTU sets the live interface MTU to min(max(mtu, floor), cap). It is a
+// no-op when the value is unchanged.
+func (v *VPNClient) applyProbedMTU(mtu int) {
+	if mtu < MTUFloor {
+		mtu = MTUFloor
+	}
+	if mtu > v.tun.mtu {
+		mtu = v.tun.mtu
+	}
+	if mtu == v.tun.MTU() {
+		return
+	}
+	if err := v.tun.SetMTU(mtu); err != nil {
+		log.Warn("Auto-MTU: failed to apply MTU %d: %v", mtu, err)
+	}
+}
+
+func (v *VPNClient) storeProbeResult(res ProbeResult) {
+	v.lastProbeMu.Lock()
+	v.lastProbe = res
+	v.lastProbeOK = true
+	v.lastProbeMu.Unlock()
+}
+
+// LastMTUProbe returns the most recent probe result and whether one has completed.
+func (v *VPNClient) LastMTUProbe() (ProbeResult, bool) {
+	v.lastProbeMu.Lock()
+	defer v.lastProbeMu.Unlock()
+	return v.lastProbe, v.lastProbeOK
 }
 
 // ForceReconnect forces an immediate VPN reconnect
@@ -366,7 +533,7 @@ func (v *VPNClient) performHandshake(conn net.Conn) error {
 	handshake[0] = 0x02 // TUN mode
 	copy(handshake[1:5], v.localIP.To4())
 	binary.BigEndian.PutUint16(handshake[5:7], uint16(v.tun.mtu))
-	handshake[7] = 0x02 // Version 2: supports full port hopping config
+	handshake[7] = tunHandshakeVersion // v3: also signals auto-MTU probe support
 
 	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	if _, err := conn.Write(handshake); err != nil {
@@ -527,7 +694,7 @@ func (v *VPNClient) doHandshake(conn net.Conn, localIP net.IP) ([]byte, int, err
 	handshake[0] = 0x02 // TUN mode
 	copy(handshake[1:5], localIP.To4())
 	binary.BigEndian.PutUint16(handshake[5:7], uint16(v.tun.mtu))
-	handshake[7] = 0x02 // Version 2: supports full port hopping config
+	handshake[7] = tunHandshakeVersion // v3: also signals auto-MTU probe support
 
 	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	if _, err := conn.Write(handshake); err != nil {
@@ -564,24 +731,34 @@ func (v *VPNClient) doHandshake(conn net.Conn, localIP net.IP) ([]byte, int, err
 // handshake response. The second return value reports whether any capabilities
 // were present.
 func parseServerCapabilities(resp []byte, n int) (ServerCapabilities, bool) {
-	if n < 14 {
+	// The flags byte at resp[9] is present in any extended response (>=10 bytes).
+	// A v3 exit may emit a 10-byte response carrying only the MTU-probe flag (no
+	// port hopping), so we no longer require the full 14-byte port-hop response.
+	if n < 10 {
 		return ServerCapabilities{}, false
 	}
 
 	flags := resp[9]
-	portStart := int(binary.BigEndian.Uint16(resp[10:12]))
-	portEnd := int(binary.BigEndian.Uint16(resp[12:14]))
-	if flags&0x01 == 0 || portStart <= 0 || portEnd <= portStart {
-		return ServerCapabilities{}, false
+	caps := ServerCapabilities{
+		MTUProbeSupported: flags&tunFlagMTUProbe != 0,
 	}
 
-	caps := ServerCapabilities{
-		PortHoppingEnabled: true,
-		PortRangeStart:     portStart,
-		PortRangeEnd:       portEnd,
-		HopIntervalSec:     60,       // Default
-		HopStrategy:        "random", // Default
+	// Port-hopping fields need the full 14-byte form.
+	if n < 14 || flags&tunFlagPortHopping == 0 {
+		return caps, caps.MTUProbeSupported
 	}
+
+	portStart := int(binary.BigEndian.Uint16(resp[10:12]))
+	portEnd := int(binary.BigEndian.Uint16(resp[12:14]))
+	if portStart <= 0 || portEnd <= portStart {
+		return caps, caps.MTUProbeSupported
+	}
+
+	caps.PortHoppingEnabled = true
+	caps.PortRangeStart = portStart
+	caps.PortRangeEnd = portEnd
+	caps.HopIntervalSec = 60    // Default
+	caps.HopStrategy = "random" // Default
 
 	// Parse extended v2 fields if available (20+ bytes).
 	if n < 20 {
@@ -684,6 +861,8 @@ func (v *VPNClient) readFromTun() {
 
 	buf := make([]byte, v.tun.mtu+4)
 	log.Debug("readFromTun goroutine started, waiting for packets from TUN device")
+	// buf is sized at the construction-time cap; auto-MTU only lowers (or raises
+	// back up to the cap) the live MTU, so this buffer always fits a read.
 
 	for atomic.LoadInt32(&v.running) == 1 {
 		log.Debug("Attempting to read from TUN device...")
@@ -702,7 +881,7 @@ func (v *VPNClient) readFromTun() {
 		log.Debug("Read %d bytes from TUN, first 20 bytes: % x", n, buf[4:dumpEnd])
 
 		// Clamp TCP MSS on SYN/SYN-ACK packets to prevent oversized segments
-		ClampTCPMSS(buf[4:4+n], v.tun.mtu)
+		ClampTCPMSS(buf[4:4+n], v.tun.MTU())
 
 		// Frame packet: [length:4][data:n]
 		binary.BigEndian.PutUint32(buf[:4], uint32(n))
@@ -778,23 +957,9 @@ func (v *VPNClient) readFromServer() {
 		log.Debug("Read length header: %d bytes, value=%d (0x%02x %02x %02x %02x)",
 			nLen, pktLen, lenBuf[0], lenBuf[1], lenBuf[2], lenBuf[3])
 
-		if pktLen > uint32(v.tun.mtu) {
-			// Instead of disconnecting, read and discard the oversized packet
-			// and inject ICMP Fragmentation Needed back into the TUN
-			log.Debug("Packet too large (%d > MTU %d), dropping and sending ICMP", pktLen, v.tun.mtu)
-			oversized := make([]byte, pktLen)
-			if _, err := io.ReadFull(conn, oversized); err != nil {
-				log.Debug("Failed to read oversized packet: %v", err)
-				v.handleDisconnect()
-				continue
-			}
-			// Generate ICMP Fragmentation Needed and inject into TUN
-			icmpPkt := BuildICMPFragNeeded(v.tun.remoteIP, oversized, uint16(v.tun.mtu))
-			if icmpPkt != nil {
-				if _, err := v.tun.Write(icmpPkt); err != nil {
-					log.Debug("Failed to inject ICMP frag needed: %v", err)
-				}
-			}
+		if pktLen > 65535 {
+			log.Debug("Frame length %d exceeds protocol max, disconnecting", pktLen)
+			v.handleDisconnect()
 			continue
 		}
 
@@ -804,6 +969,30 @@ func (v *VPNClient) readFromServer() {
 		if err != nil {
 			log.Debug("Server read data error: %v", err)
 			v.handleDisconnect()
+			continue
+		}
+
+		// Auto-MTU: intercept PROBE_REPLY control frames before any IP handling.
+		// They must never be written to the TUN device, and a reply may be larger
+		// than the current (lowered) interface MTU, so this check precedes the
+		// oversized-packet guard below.
+		if isProbeFramePayload(buf) {
+			if pr := v.prober.Load(); pr != nil {
+				pr.HandleReply(buf)
+			}
+			continue
+		}
+
+		// Oversized real packet: drop and inject ICMP Fragmentation Needed so the
+		// inner peer shrinks instead of black-holing.
+		if pktLen > uint32(v.tun.MTU()) {
+			log.Debug("Packet too large (%d > MTU %d), dropping and sending ICMP", pktLen, v.tun.MTU())
+			icmpPkt := BuildICMPFragNeeded(v.tun.remoteIP, buf, uint16(v.tun.MTU()))
+			if icmpPkt != nil {
+				if _, err := v.tun.Write(icmpPkt); err != nil {
+					log.Debug("Failed to inject ICMP frag needed: %v", err)
+				}
+			}
 			continue
 		}
 		if len(buf) >= 8 {
@@ -826,7 +1015,7 @@ func (v *VPNClient) readFromServer() {
 		}
 
 		// Clamp TCP MSS on incoming SYN/SYN-ACK before writing to TUN
-		ClampTCPMSS(actualBuf, v.tun.mtu)
+		ClampTCPMSS(actualBuf, v.tun.MTU())
 
 		// Write to TUN
 		if len(actualBuf) > 0 {
@@ -938,6 +1127,10 @@ func (v *VPNClient) handleDisconnect() {
 		if err == nil {
 			atomic.AddInt64(&v.reconnectsOK, 1)
 			log.Info("VPN reconnected successfully after %d attempts", consecutiveFailures)
+			// Re-probe MTU on reconnect (network change may shift path-MTU). Uses a
+			// background context, not the short-lived connect ctx; the probe is
+			// self-bounded by its own deadlines.
+			v.maybeStartMTUProbe(context.Background(), "reconnect")
 			return
 		}
 

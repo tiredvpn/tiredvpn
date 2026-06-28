@@ -468,7 +468,8 @@ func runClient(args []string) {
 	fs.StringVar(&cfg.TunName, "tun-name", "tiredvpn0", "TUN device name")
 	fs.StringVar(&cfg.TunIP, "tun-ip", "10.8.0.2", "Local TUN IP address")
 	fs.StringVar(&cfg.TunPeerIP, "tun-peer-ip", "10.8.0.1", "Remote TUN IP address (server's TUN IP)")
-	fs.IntVar(&cfg.TunMTU, "tun-mtu", 1280, "TUN device MTU")
+	fs.IntVar(&cfg.TunMTU, "tun-mtu", 1280, "TUN device MTU (with -auto-mtu this is the upper bound/cap)")
+	fs.BoolVar(&cfg.AutoMTU, "auto-mtu", true, "Actively probe the real end-to-end MTU and apply min(probed, -tun-mtu); floor 1280")
 	fs.StringVar(&cfg.TunRoutes, "tun-routes", "", "Routes to add (comma-separated, e.g. '0.0.0.0/0' for full tunnel)")
 
 	// Android VpnService flags

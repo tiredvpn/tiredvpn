@@ -1471,6 +1471,26 @@ func forwardH2TUNPacket(tunnel *h2TunnelState, streamID uint32, payload []byte, 
 	tunnel.reasmBuf = append(tunnel.reasmBuf, payload...)
 	tunnel.reasmBuf = reassembleH2TUNFrames(tunnel.reasmBuf,
 		func(ipPkt []byte) {
+			// Auto-MTU: reflect probe REQUESTs back over the stego channel instead
+			// of writing them to the TUN device. Reassembly above has already
+			// rebuilt the whole frame, so the marker check sees a complete probe.
+			if tun.IsProbeFrame(ipPkt) {
+				if reply := tun.MakeProbeReply(ipPkt); reply != nil {
+					if h2c, ok := tunnel.targetConn.(*h2TunConn); ok {
+						frame := make([]byte, 4+len(reply))
+						binary.BigEndian.PutUint32(frame[:4], uint32(len(reply)))
+						copy(frame[4:], reply)
+						tunnel.mu.Lock()
+						sendStegoResponse(h2c.framer, tunnel.streamID, frame, h2c.cfg)
+						tunnel.mu.Unlock()
+						logger.Debug("Auto-MTU: H2 echoed PROBE_REPLY size=%d", len(reply))
+					}
+					if tunnel.sharedTUNWriter != nil {
+						tunnel.sharedTUNWriter.UpdateActivity()
+					}
+				}
+				return
+			}
 			logger.Debug("H2 TUN: writing %d bytes to TUN, first 20: %x", len(ipPkt), ipPkt[:minInt(20, len(ipPkt))])
 			if _, err := tunnel.sharedTUN.TUNDevice().Write(ipPkt); err != nil {
 				logger.Debug("H2 TUN write error: %v", err)
@@ -3053,6 +3073,14 @@ func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger
 	// Legacy (9 bytes): [status:1][serverIP:4][clientIP:4]
 	// Extended v1 (14 bytes): [status:1][serverIP:4][clientIP:4][flags:1][portStart:2][portEnd:2]
 	// Extended v2 (20+ bytes): [status:1][serverIP:4][clientIP:4][flags:1][portStart:2][portEnd:2][hopInterval:4][strategy:1][seedLen:1][seed:0-32]
+	//
+	// Auto-MTU: a v3 client understands the active probe. As the terminating exit
+	// (no upstream relay - that branch returned earlier) we always echo probe
+	// frames, so advertise the capability via the flags byte (bit 0x02).
+	var probeFlags byte
+	if clientVersion >= 0x03 {
+		probeFlags = tun.ProbeCapFlag
+	}
 	var resp []byte
 	if clientVersion >= 0x01 && cfg.PortRange != "" {
 		// Get port range bounds for extended response
@@ -3070,7 +3098,7 @@ func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger
 				resp[0] = 0x00 // Success
 				copy(resp[1:5], serverIP.To4())
 				copy(resp[5:9], clientIP.To4())
-				resp[9] = 0x01 // flags: port hopping available
+				resp[9] = 0x01 | probeFlags // flags: port hopping available (+ auto-MTU)
 				binary.BigEndian.PutUint16(resp[10:12], uint16(portStart))
 				binary.BigEndian.PutUint16(resp[12:14], uint16(portEnd))
 
@@ -3105,12 +3133,23 @@ func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger
 				resp[0] = 0x00 // Success
 				copy(resp[1:5], serverIP.To4())
 				copy(resp[5:9], clientIP.To4())
-				resp[9] = 0x01 // flags: port hopping available
+				resp[9] = 0x01 | probeFlags // flags: port hopping available (+ auto-MTU)
 				binary.BigEndian.PutUint16(resp[10:12], uint16(portStart))
 				binary.BigEndian.PutUint16(resp[12:14], uint16(portEnd))
 				logger.Info("Sending v1 extended response with port hopping: %d-%d", portStart, portEnd)
 			}
 		}
+	}
+
+	// v3 client without a port-hop extended response still needs the flags byte to
+	// carry the auto-MTU probe capability: emit a 10-byte response.
+	if resp == nil && probeFlags != 0 {
+		resp = make([]byte, 10)
+		resp[0] = 0x00 // Success
+		copy(resp[1:5], serverIP.To4())
+		copy(resp[5:9], clientIP.To4())
+		resp[9] = probeFlags
+		logger.Debug("Sending v3 response advertising auto-MTU probe capability")
 	}
 
 	// Fallback to legacy response
@@ -3183,6 +3222,27 @@ func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger
 		if _, err := io.ReadFull(conn, pkt); err != nil {
 			logger.Debug("TUN read packet error: %v", err)
 			break
+		}
+
+		// Auto-MTU: if this is a probe REQUEST, reflect a same-size REPLY and do
+		// NOT write it to the TUN device. The reply tests the return path at the
+		// same size. Detection by marker precedes any IP handling.
+		if tun.IsProbeFrame(pkt) {
+			if reply := tun.MakeProbeReply(pkt); reply != nil {
+				if cfg.Debug {
+					logger.Debug("Auto-MTU: echoing PROBE_REPLY size=%d", len(reply))
+				}
+				replyFrame := make([]byte, 4+len(reply))
+				binary.BigEndian.PutUint32(replyFrame[:4], uint32(len(reply)))
+				copy(replyFrame[4:], reply)
+				writeMu.Lock()
+				conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+				conn.Write(replyFrame)
+				writeMu.Unlock()
+				writer.UpdateActivity()
+			}
+			// A non-request or malformed probe frame is dropped silently.
+			continue
 		}
 
 		// Clamp TCP MSS on SYN/SYN-ACK to fit negotiated tunnel MTU
