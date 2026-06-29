@@ -7,6 +7,14 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.15] - 2026-06-29
+
+### Fixed
+
+- **Reconnect storm on long-but-dying sessions.** The storm detector only parked a strategy after a streak of *short* sessions (under 20s). A meek/HTTP-polling tunnel that connects fine but is torn down at ~30s read past that threshold, so every session looked "healthy", the streak reset, and the client reconnect-stormed forever on a transport that could not hold a tunnel (observed as ~21 minutes of 30s reconnect cycles on a relayed chain). Added a frequency criterion: a strategy that reconnects 4 times within 3 minutes is parked regardless of individual session length, so the client falls through to a working strategy instead of looping.
+- **Meek HTTP-polling sessions torn down on a slow keepalive echo.** The shared TUN relay tears a session down if no framed packet arrives within its 30s read timeout - correct for persistent transports, wrong for meek, whose liveness is the poll round-trip rather than tunnel payload. On an idle or degraded channel the server's keepalive echo could take more than one poll round-trip to return, killing an otherwise healthy polling session. A keepalive feeder now injects a synthetic frame off poll liveness (only at a frame boundary, so it cannot corrupt a packet); the relay stays up exactly as long as the poll layer is alive and times out promptly once polls genuinely stop.
+- **Fast-reconnect loop guard.** `connectWithRTT` re-used the last successful strategy on a fast path while it was not parked, letting a strategy that connects but whose tunnel dies seconds later loop without ever being parked. More than 3 fast reconnects of one strategy within 5 minutes now forces a full strategy scan. The relay-mode `ConnectForReconnect` path, which retried a strategy up to 5 times with no parking check, now skips a storming (parked) strategy straight to the full scan.
+
 ## [1.3.14] - 2026-06-28
 
 ### Added
