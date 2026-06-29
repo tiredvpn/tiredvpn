@@ -14,11 +14,27 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/protect"
 	"github.com/tiredvpn/tiredvpn/internal/protocol"
+)
+
+// Meek keepalive feeder tuning. The shared TUN relay tears a session down if no
+// framed packet arrives within tun.readTimeout (30s) - a sane signal for the
+// persistent transports (REALITY/H2/WS) but wrong for meek, whose liveness is
+// the poll round-trip, not the tunnel payload. On an idle or degraded channel
+// the server's keepalive echo can take more than one poll round-trip to come
+// back (each poll has its own 3s timeout plus up to 2s backoff), so the relay
+// would tear down a perfectly healthy polling session and trigger a reconnect
+// storm. The feeder injects a synthetic keepalive frame into the receive buffer
+// while polls keep succeeding, so the relay stays up exactly as long as the
+// poll layer - the real liveness signal for meek - is alive.
+const (
+	pollingKeepaliveFeed   = 10 * time.Second // inject a keepalive frame this often while idle
+	pollingPollHealthGrace = 20 * time.Second // stop feeding if no poll has succeeded within this
 )
 
 // HTTPPollingStrategy implements meek-style HTTP polling transport
@@ -115,6 +131,10 @@ func (s *HTTPPollingStrategy) Connect(ctx context.Context, target string) (net.C
 		}()
 	}
 
+	// Feed the TUN relay's read deadline off poll liveness so a healthy meek
+	// session is never torn down waiting on a slow keepalive echo round-trip.
+	go pollConn.runKeepaliveFeeder()
+
 	log.Info("HTTP Polling: Connection established (session=%s, workers=%d)", sessionID[:8], pollConn.numWorkers)
 	return pollConn, nil
 }
@@ -166,6 +186,13 @@ type HTTPPollingConn struct {
 	// Acknowledgement tracking for reliable delivery
 	ackSeq  int64 // Total bytes received (sent to server as ack)
 	ackLock sync.Mutex
+
+	// lastPollOK is the unix-nano time of the most recent successful poll. It is
+	// meek's true liveness signal: the poll layer round-trips every ~50ms-2s
+	// independent of tunnel payload. runKeepaliveFeeder reads it to decide
+	// whether the connection is alive enough to keep the TUN relay's read
+	// deadline fed.
+	lastPollOK atomic.Int64
 
 	// Signal when data is available to send
 	sendSignal chan struct{}
@@ -326,7 +353,40 @@ func (c *HTTPPollingConn) poll() bool {
 	c.successfulPolls++
 	c.statsMu.Unlock()
 
+	// Record liveness for the keepalive feeder: a completed poll round-trip is
+	// proof the meek transport is alive even when no tunnel payload is flowing.
+	c.lastPollOK.Store(time.Now().UnixNano())
+
 	return true
+}
+
+// runKeepaliveFeeder keeps the TUN relay's read deadline fed while the poll
+// layer is healthy. See the pollingKeepaliveFeed comment for why meek needs
+// this. It injects a synthetic keepalive frame ([0,0,0,0]) only when the
+// receive buffer is empty - i.e. at a frame boundary - so it can never corrupt
+// a partially delivered packet. If polls stop succeeding the connection is
+// genuinely dead, the feeder goes quiet, and the relay's own read deadline
+// fires to tear the session down.
+func (c *HTTPPollingConn) runKeepaliveFeeder() {
+	ticker := time.NewTicker(pollingKeepaliveFeed)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.closed:
+			return
+		case <-ticker.C:
+			last := c.lastPollOK.Load()
+			if last == 0 || time.Since(time.Unix(0, last)) > pollingPollHealthGrace {
+				continue // poll layer is not proving liveness - let the relay time out
+			}
+			c.recvLock.Lock()
+			if c.recvBuf.Len() == 0 {
+				c.recvBuf.Write([]byte{0, 0, 0, 0})
+				c.recvCond.Broadcast()
+			}
+			c.recvLock.Unlock()
+		}
+	}
 }
 
 // doRequest performs a single HTTP request (new connection per request)
