@@ -231,5 +231,72 @@ func TestManager_StormClearsLastSuccessful(t *testing.T) {
 	}
 }
 
+// TestManager_FastReconnectLoopGuard verifies that a strategy which keeps
+// fast-reconnecting (connects fine, tunnel dies before the storm detector parks
+// it) is eventually pushed off the fast path into a full scan.
+func TestManager_FastReconnectLoopGuard(t *testing.T) {
+	m := NewManager()
+	const id = "http_polling"
+
+	now := time.Unix(1_700_000_000, 0)
+	// First fastReconnectLimit calls stay on the fast path.
+	for i := range fastReconnectLimit {
+		if m.shouldSkipFastReconnect(id, now.Add(time.Duration(i)*time.Second)) {
+			t.Fatalf("fast reconnect %d/%d should NOT be skipped yet", i+1, fastReconnectLimit)
+		}
+	}
+	// The next one exceeds the limit and must force a full scan.
+	if !m.shouldSkipFastReconnect(id, now.Add(time.Duration(fastReconnectLimit)*time.Second)) {
+		t.Fatal("fast reconnect past the limit should be skipped")
+	}
+
+	// A different strategy restarts the count.
+	if m.shouldSkipFastReconnect("reality", now.Add(time.Minute)) {
+		t.Fatal("switching strategy must restart the fast-reconnect count")
+	}
+
+	// An expired window also restarts the count for the same strategy.
+	for range fastReconnectLimit {
+		m.shouldSkipFastReconnect(id, now.Add(2*time.Minute))
+	}
+	if m.shouldSkipFastReconnect(id, now.Add(2*time.Minute+fastReconnectWindow+time.Second)) {
+		t.Fatal("a fast reconnect after the window expired must not be skipped")
+	}
+}
+
+// TestManager_ReconnectSkipsParkedStrategy verifies ConnectForReconnect does NOT
+// retry a parked lastSuccessful strategy (Phase 1) and instead reconnects via
+// another strategy. This is the relay-mode source of the reconnect storm.
+func TestManager_ReconnectSkipsParkedStrategy(t *testing.T) {
+	clk := newFakeClock()
+	m, _ := newStormTestManager(t, clk)
+	ctx := t.Context()
+
+	// Storm parks reality (and clears it as lastSuccessful). Re-pin reality as the
+	// last successful strategy so Phase 1 of ConnectForReconnect would target it.
+	storm(m, clk, "reality")
+	if !m.stormDetector.IsParked("reality") {
+		t.Fatal("reality should be parked after storm")
+	}
+	var reality Strategy
+	for _, s := range m.strategies {
+		if s.ID() == "reality" {
+			reality = s
+		}
+	}
+	m.mu.Lock()
+	m.lastSuccessfulStrategy = reality
+	m.mu.Unlock()
+
+	conn, strat, err := m.ConnectForReconnect(ctx, m.serverAddrV4)
+	if err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+	conn.Close()
+	if strat.ID() != "http2_stego" {
+		t.Fatalf("reconnect must skip parked reality and pick http2_stego, got %s", strat.ID())
+	}
+}
+
 // ensure the helper compiles against the real signature
 var _ = func() time.Duration { return stormCooldown }

@@ -123,6 +123,18 @@ type Manager struct {
 	lastSuccessfulStrategy Strategy
 	lastSuccessfulTime     time.Time // When the last successful connection was made
 
+	// Fast-reconnect loop guard. connectWithRTT re-uses lastSuccessfulStrategy on
+	// a "fast reconnect" path while it is not parked. A strategy that connects
+	// fine but whose tunnel dies seconds later (meek under DPI) can ride that path
+	// in a tight loop without the storm detector ever parking it (the storm
+	// detector keys on session lifetime; these sessions can outlive the short
+	// threshold). These fields count consecutive fast reconnects of one strategy
+	// inside fastReconnectWindow; past the limit the fast path is skipped so a
+	// full scan gives other strategies (and the detector) a turn. Guarded by m.mu.
+	fastReconnectStrategy string
+	fastReconnectCount    int
+	fastReconnectFirst    time.Time
+
 	// Connectivity checker for pre-flight checks
 	connectivityChecker  *ConnectivityChecker
 	excludeUDPStrategies bool // Temporarily exclude UDP-based strategies if UDP is blocked
@@ -163,6 +175,29 @@ type Manager struct {
 	// and resumption is keyed by ServerName, so strategies with different SNI
 	// never collide. Set once at construction, never mutated => race-free.
 	tlsSessionCache tls.ClientSessionCache
+}
+
+// Fast-reconnect loop-guard tuning. See Manager.fastReconnectStrategy.
+const (
+	fastReconnectLimit  = 3               // fast reconnects of one strategy allowed before forcing a full scan
+	fastReconnectWindow = 5 * time.Minute // window over which fast reconnects are counted
+)
+
+// shouldSkipFastReconnect records a fast-reconnect attempt for strategyID and
+// reports whether the fast path should be skipped in favor of a full scan. A
+// strategy that fast-reconnects more than fastReconnectLimit times inside
+// fastReconnectWindow is looping on a tunnel that connects but will not hold;
+// the full scan then gives the storm detector and other strategies a chance.
+// A different strategy, or an expired window, restarts the count.
+// Caller must hold m.mu.
+func (m *Manager) shouldSkipFastReconnect(strategyID string, now time.Time) bool {
+	if m.fastReconnectStrategy != strategyID || now.Sub(m.fastReconnectFirst) > fastReconnectWindow {
+		m.fastReconnectStrategy = strategyID
+		m.fastReconnectCount = 0
+		m.fastReconnectFirst = now
+	}
+	m.fastReconnectCount++
+	return m.fastReconnectCount > fastReconnectLimit
 }
 
 // NewManager creates a new strategy manager
@@ -677,34 +712,48 @@ func (m *Manager) connectWithRTT(ctx context.Context, target string, excludeIDs 
 	// alternative, so we still use it.
 	if lastSuccessful != nil && time.Since(lastSuccessfulTime) < 5*time.Minute &&
 		(m.forced || !m.stormDetector.IsParked(lastSuccessful.ID())) {
-		log.Info("Trying last successful strategy first: %s", lastSuccessful.Name())
 
-		connectCtx, cancel := context.WithTimeout(ctx, m.connectTimeout)
-		start := time.Now()
-		conn, err := lastSuccessful.Connect(connectCtx, target)
-		latency := time.Since(start)
-		cancel()
+		// Loop guard: a strategy that connects but whose tunnel dies seconds later
+		// can ride this fast path in a tight reconnect loop without ever being
+		// parked. After too many fast reconnects in a short window, fall through
+		// to the full scan (forced mode has no alternative, so never skips).
+		m.mu.Lock()
+		skipFast := !m.forced && m.shouldSkipFastReconnect(lastSuccessful.ID(), time.Now())
+		m.mu.Unlock()
 
-		if err == nil {
-			// Success - update stats
-			m.mu.Lock()
-			m.lastSuccessfulTime = time.Now()
-			m.consecutiveTCPTimeouts = 0 // Reset TCP timeout counter on success
-			m.updateConfidenceWithLatency(lastSuccessful.ID(), true, latency)
-			m.mu.Unlock()
+		if skipFast {
+			log.Warn("Fast reconnect via %s exceeded %d attempts within %v - forcing full strategy scan",
+				lastSuccessful.Name(), fastReconnectLimit, fastReconnectWindow)
+		} else {
+			log.Info("Trying last successful strategy first: %s", lastSuccessful.Name())
 
-			optimizeTCPConn(conn)
-			if useRTTMasking {
-				m.mu.RLock()
-				rttProfile := m.rttProfile
-				m.mu.RUnlock()
-				conn = WrapWithRTTMasking(conn, rttProfile)
+			connectCtx, cancel := context.WithTimeout(ctx, m.connectTimeout)
+			start := time.Now()
+			conn, err := lastSuccessful.Connect(connectCtx, target)
+			latency := time.Since(start)
+			cancel()
+
+			if err == nil {
+				// Success - update stats
+				m.mu.Lock()
+				m.lastSuccessfulTime = time.Now()
+				m.consecutiveTCPTimeouts = 0 // Reset TCP timeout counter on success
+				m.updateConfidenceWithLatency(lastSuccessful.ID(), true, latency)
+				m.mu.Unlock()
+
+				optimizeTCPConn(conn)
+				if useRTTMasking {
+					m.mu.RLock()
+					rttProfile := m.rttProfile
+					m.mu.RUnlock()
+					conn = WrapWithRTTMasking(conn, rttProfile)
+				}
+
+				log.Info("Fast reconnect via %s (latency=%v)", lastSuccessful.Name(), latency)
+				return conn, lastSuccessful, nil
 			}
-
-			log.Info("Fast reconnect via %s (latency=%v)", lastSuccessful.Name(), latency)
-			return conn, lastSuccessful, nil
+			log.Debug("Last successful strategy failed: %v, falling back to full strategy list", err)
 		}
-		log.Debug("Last successful strategy failed: %v, falling back to full strategy list", err)
 	}
 
 	m.mu.RLock()
@@ -1764,8 +1813,10 @@ func (m *Manager) ConnectForReconnect(ctx context.Context, target string) (net.C
 	var lastErr error
 
 	// Phase 1: Try last successful strategy up to 5 times
-	// This is optimized for Android network handoff where the network needs time to stabilize
-	if lastStrategy != nil {
+	// This is optimized for Android network handoff where the network needs time to stabilize.
+	// Skip Phase 1 in auto-mode if the strategy is parked for a storm: retrying it 5x is exactly
+	// the relay-mode reconnect-storm we are trying to break. Forced mode has no alternative.
+	if lastStrategy != nil && (m.IsForced() || !m.stormDetector.IsParked(lastStrategy.ID())) {
 		log.Info("Reconnecting to %s: trying last successful strategy %s (up to 5 attempts)", target, lastStrategy.Name())
 
 		for attempt := 1; attempt <= 5; attempt++ {
