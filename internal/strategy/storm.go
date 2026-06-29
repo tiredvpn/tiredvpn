@@ -48,6 +48,18 @@ const (
 	// dumped traffic onto worse fallback strategies. A real storm persists well
 	// past this window.
 	stormGrace = 30 * time.Second
+
+	// stormFreqSessions and stormFreqWindow back the frequency criterion: a
+	// strategy that reconnects this many times within the window is storming
+	// regardless of how long each individual session lived. This catches the
+	// case the short-session streak misses entirely - meek (HTTP Polling) is
+	// torn down at ~30s, which is ABOVE stormShortSession (20s), so every meek
+	// session reads as "healthy", the consecutive-short streak resets, and the
+	// client reconnect-storms forever on a strategy that cannot hold a tunnel.
+	// 4 reconnects in 3 minutes means sessions averaging <45s - clearly churn,
+	// not a stable tunnel.
+	stormFreqSessions = 4
+	stormFreqWindow   = 3 * time.Minute
 )
 
 // StormConfig holds tunable storm-detection thresholds. Zero values fall back
@@ -57,6 +69,11 @@ type StormConfig struct {
 	MinSessions  int           // consecutive short sessions to declare a storm
 	Window       time.Duration // max gap between short sessions in one streak
 	Cooldown     time.Duration // how long a storming strategy stays parked
+	// FreqSessions and FreqWindow back the frequency criterion: this many
+	// reconnects within FreqWindow park the strategy regardless of session
+	// length. Zero values fall back to the package defaults.
+	FreqSessions int
+	FreqWindow   time.Duration
 	// Grace is the post-start/post-Reset settling window in which short sessions
 	// are ignored. Zero falls back to the default; a negative value disables the
 	// grace window entirely (used by unit tests that exercise parking directly).
@@ -76,6 +93,12 @@ func (c StormConfig) withDefaults() StormConfig {
 	if c.Cooldown <= 0 {
 		c.Cooldown = stormCooldown
 	}
+	if c.FreqSessions <= 0 {
+		c.FreqSessions = stormFreqSessions
+	}
+	if c.FreqWindow <= 0 {
+		c.FreqWindow = stormFreqWindow
+	}
 	switch {
 	case c.Grace < 0:
 		c.Grace = 0 // explicitly disabled
@@ -88,8 +111,9 @@ func (c StormConfig) withDefaults() StormConfig {
 // strategyStorm tracks the short-session streak and cooldown for one strategy.
 type strategyStorm struct {
 	consecutiveShort int
-	lastShortEnd     time.Time // when the most recent short session ended
-	parkedUntil      time.Time // strategy excluded from selection until this time
+	lastShortEnd     time.Time   // when the most recent short session ended
+	recentEnds       []time.Time // reconnect timestamps inside FreqWindow (frequency criterion)
+	parkedUntil      time.Time   // strategy excluded from selection until this time
 }
 
 // StormDetector tracks per-strategy session lifetimes and decides when a
@@ -169,19 +193,50 @@ func (d *StormDetector) RecordSession(strategyID string, lifetime time.Duration)
 
 	now := d.now()
 
+	// Within the grace window after start / network change, every session is
+	// expected churn (handshakes, route setup, transport warm-up) and is never
+	// counted toward either criterion: a real storm persists past the window and
+	// gets caught then. This is what stops startup turbulence from dumping
+	// traffic onto worse fallback strategies.
+	inGrace := d.cfg.Grace > 0 && now.Sub(d.startedAt) < d.cfg.Grace
+
+	// Frequency criterion: count EVERY reconnect of this strategy regardless of
+	// session length. A session that alone outlives FreqWindow is proof of a
+	// stable tunnel and clears the streak; anything shorter (including meek's
+	// ~30s sessions, which read as "healthy" against ShortSession) is a
+	// reconnect mark. FreqSessions marks inside FreqWindow => storm.
+	if !inGrace {
+		cutoff := now.Add(-d.cfg.FreqWindow)
+		kept := st.recentEnds[:0]
+		for _, t := range st.recentEnds {
+			if t.After(cutoff) {
+				kept = append(kept, t)
+			}
+		}
+		st.recentEnds = kept
+
+		if lifetime >= d.cfg.FreqWindow {
+			st.recentEnds = st.recentEnds[:0]
+		} else {
+			st.recentEnds = append(st.recentEnds, now)
+			if len(st.recentEnds) >= d.cfg.FreqSessions {
+				st.parkedUntil = now.Add(d.cfg.Cooldown)
+				st.recentEnds = st.recentEnds[:0]
+				st.consecutiveShort = 0
+				st.lastShortEnd = time.Time{}
+				return true
+			}
+		}
+	}
+
 	if lifetime >= d.cfg.ShortSession {
-		// Healthy session - clear the streak.
+		// Healthy session - clear the short streak.
 		st.consecutiveShort = 0
 		st.lastShortEnd = time.Time{}
 		return false
 	}
 
-	// Within the grace window after start / network change, short sessions are
-	// expected churn (handshakes, route setup, transport warm-up). Don't count
-	// them and never park: a real storm persists past the window and gets caught
-	// then. This is what stops startup turbulence from dumping traffic onto worse
-	// fallback strategies.
-	if d.cfg.Grace > 0 && now.Sub(d.startedAt) < d.cfg.Grace {
+	if inGrace {
 		return false
 	}
 
@@ -249,6 +304,7 @@ func (d *StormDetector) Unpark(strategyID string) {
 		st.parkedUntil = time.Time{}
 		st.consecutiveShort = 0
 		st.lastShortEnd = time.Time{}
+		st.recentEnds = st.recentEnds[:0]
 	}
 }
 

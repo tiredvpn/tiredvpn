@@ -247,6 +247,46 @@ func TestStorm_ConcurrentAccess(t *testing.T) {
 	wg.Wait()
 }
 
+// TestStorm_FrequencyParksLongSessions covers the meek (HTTP Polling) storm the
+// short-session streak misses: every session outlives ShortSession (30s > 20s)
+// so the consecutive-short streak never trips, yet the strategy reconnects
+// rapidly enough that the frequency criterion must park it.
+func TestStorm_FrequencyParksLongSessions(t *testing.T) {
+	clk := newFakeClock()
+	d := newTestDetector(clk) // FreqSessions=4, FreqWindow=3m via defaults
+	const id = "http_polling"
+
+	parked := false
+	for range 4 {
+		if d.RecordSession(id, 30*time.Second) { // 30s > ShortSession (20s) => "healthy"
+			parked = true
+		}
+		clk.Advance(30 * time.Second) // 4 reconnects span 90s, well inside the 3m window
+	}
+	if !parked || !d.IsParked(id) {
+		t.Fatal("frequency criterion should park a strategy reconnecting 4x in-window despite long-ish sessions")
+	}
+}
+
+// TestStorm_FrequencyWindowPrunes verifies that the same long-ish sessions do
+// NOT park when spread far enough apart that fewer than FreqSessions land inside
+// the window - a tunnel that reconnects every couple of minutes is not a storm.
+func TestStorm_FrequencyWindowPrunes(t *testing.T) {
+	clk := newFakeClock()
+	d := newTestDetector(clk)
+	const id = "http_polling"
+
+	for range 6 {
+		if d.RecordSession(id, 30*time.Second) {
+			t.Fatal("parked though reconnects are spread beyond the frequency window")
+		}
+		clk.Advance(70 * time.Second) // >FreqWindow/FreqSessions: at most 3 marks in 3m
+	}
+	if d.IsParked(id) {
+		t.Fatal("strategy parked despite well-spaced reconnects")
+	}
+}
+
 // newTestDetectorWithGrace builds a detector with the grace window enabled and
 // the fake clock wired through both `now` and the grace start time.
 func newTestDetectorWithGrace(clk *fakeClock, grace time.Duration) *StormDetector {
