@@ -139,6 +139,14 @@ type Manager struct {
 	connectivityChecker  *ConnectivityChecker
 	excludeUDPStrategies bool // Temporarily exclude UDP-based strategies if UDP is blocked
 
+	// consecutiveConnectFailures counts back-to-back failed Connect() calls. The
+	// blocking pre-flight connectivity check is skipped on the hot reconnect path
+	// (a brief server-side RST/EOF should not cost a full check) and only re-armed
+	// after this many failures in a row, which is the real "network is down"
+	// signal rather than a one-off reset. Reset on any successful connect.
+	// Guarded by m.mu.
+	consecutiveConnectFailures int
+
 	// Android mode - deprioritize QUIC/UDP strategies
 	androidMode bool
 
@@ -182,6 +190,40 @@ const (
 	fastReconnectLimit  = 3               // fast reconnects of one strategy allowed before forcing a full scan
 	fastReconnectWindow = 5 * time.Minute // window over which fast reconnects are counted
 )
+
+// preflightFailThreshold is how many consecutive failed connects must pile up
+// before Connect re-arms the blocking pre-flight connectivity check. See
+// Manager.consecutiveConnectFailures.
+const preflightFailThreshold = 2
+
+// recordConnectResult tracks the consecutive-failure streak that gates the
+// pre-flight connectivity check on reconnect.
+func (m *Manager) recordConnectResult(success bool) {
+	m.mu.Lock()
+	if success {
+		m.consecutiveConnectFailures = 0
+	} else {
+		m.consecutiveConnectFailures++
+	}
+	m.mu.Unlock()
+}
+
+// applyUDPGate flips QUIC/UDP strategy exclusion based on a fresh UDP probe.
+func (m *Manager) applyUDPGate(udpOK bool) {
+	m.mu.Lock()
+	if !udpOK {
+		if !m.excludeUDPStrategies {
+			log.Info("UDP not working, temporarily excluding QUIC strategies")
+		}
+		m.excludeUDPStrategies = true
+	} else {
+		if m.excludeUDPStrategies {
+			log.Info("UDP connectivity restored, QUIC strategies enabled")
+		}
+		m.excludeUDPStrategies = false
+	}
+	m.mu.Unlock()
+}
 
 // shouldSkipFastReconnect records a fast-reconnect attempt for strategyID and
 // reports whether the fast path should be skipped in favor of a full scan. A
@@ -620,39 +662,42 @@ func (m *Manager) Connect(ctx context.Context, target string) (net.Conn, Strateg
 	m.mu.RUnlock()
 
 	if checker != nil {
-		result := checker.Check(ctx)
+		m.mu.RLock()
+		connectedBefore := m.lastSuccessfulStrategy != nil
+		fails := m.consecutiveConnectFailures
+		m.mu.RUnlock()
 
-		if !result.TCP {
-			// No TCP connectivity - wait in loop until it's restored
-			log.Warn("No TCP connectivity to server, waiting for network...")
-			result = checker.WaitForConnectivity(ctx, 5*time.Second)
+		// Skip the blocking pre-flight on the hot reconnect path: the real
+		// connect below has its own 15s timeout and would reach a briefly-reset
+		// server itself, so checking first only adds latency to recovery. Run
+		// the pre-flight (and the connectivity wait loop) only on the very first
+		// connect, or once several connects in a row have failed - the signal
+		// that the network is genuinely down rather than a one-off server RST.
+		if !connectedBefore || fails >= preflightFailThreshold {
+			result := checker.Check(ctx)
 
 			if !result.TCP {
-				return nil, nil, fmt.Errorf("no connectivity to server: %w", result.Error)
-			}
-		}
+				// No TCP connectivity - wait in loop until it's restored
+				log.Warn("No TCP connectivity to server, waiting for network...")
+				result = checker.WaitForConnectivity(ctx, defaultProbeInterval)
 
-		// Check UDP connectivity for QUIC strategies
-		m.mu.Lock()
-		if !result.UDP {
-			if !m.excludeUDPStrategies {
-				log.Info("UDP not working, temporarily excluding QUIC strategies")
+				if !result.TCP {
+					m.recordConnectResult(false)
+					return nil, nil, fmt.Errorf("no connectivity to server: %w", result.Error)
+				}
 			}
-			m.excludeUDPStrategies = true
-		} else {
-			if m.excludeUDPStrategies {
-				log.Info("UDP connectivity restored, QUIC strategies enabled")
-			}
-			m.excludeUDPStrategies = false
+
+			m.applyUDPGate(result.UDP)
 		}
-		m.mu.Unlock()
 	}
 
 	// Connect through strategy
 	conn, strategy, err := m.ConnectExcluding(ctx, target, nil)
 	if err != nil {
+		m.recordConnectResult(false)
 		return nil, nil, err
 	}
+	m.recordConnectResult(true)
 
 	// Wrap with mux if enabled (BEFORE RTT masking in the chain)
 	// Architecture: [Application] -> [RTT Camouflage] -> [Mux Layer] -> [Transport]
