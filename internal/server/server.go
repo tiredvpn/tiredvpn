@@ -52,6 +52,14 @@ const (
 	// connection can hold a peek-buffer (up to 16KB) plus relay buffers.
 	defaultMaxConcurrentConns = 4096
 
+	// defaultRelayMaxConcurrentConns is the admission-control limit applied to a
+	// relay node (-upstream set) when Config.MaxConcurrentConns is unset. A relay
+	// holds a full upstream stego/TLS bridge per client (socket buffers + framer
+	// + goroutines), so it is far heavier per connection than an exit node and a
+	// 3GB box cannot survive the 4096 exit default. 256 keeps the worst-case
+	// memory ceiling bounded while still serving a real client population.
+	defaultRelayMaxConcurrentConns = 256
+
 	// probeReadDeadline is the initial read deadline for un-classified inbound
 	// connections. Kept short so probe-storm goroutines (and their peek-buffers)
 	// are released quickly instead of lingering for the legitimate-handshake
@@ -69,7 +77,14 @@ var admissionSem chan struct{}
 func initAdmissionControl(cfg *Config) {
 	limit := cfg.MaxConcurrentConns
 	if limit <= 0 {
-		limit = defaultMaxConcurrentConns
+		// A relay (-upstream) holds a heavy per-client upstream bridge, so it gets
+		// a much smaller default than an exit node. An explicit -max-conns always
+		// wins for both roles.
+		if cfg.UpstreamAddr != "" {
+			limit = defaultRelayMaxConcurrentConns
+		} else {
+			limit = defaultMaxConcurrentConns
+		}
 	}
 	admissionSem = make(chan struct{}, limit)
 	log.Info("Admission control: max %d concurrent incoming connections", limit)
