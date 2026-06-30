@@ -30,12 +30,16 @@ var ErrServerRejected = errors.New("pool: server rejected target connection")
 // dialTargetTimeout bounds each write/read of the target-address handshake.
 const dialTargetTimeout = 30 * time.Second
 
-// Config holds pool configuration
+// Config holds pool configuration.
+//
+// MaxConnections and ConnectTimeout are live (enforced by Get/createConn).
+// MaxIdle and IdleTimeout drive only the idle-reuse path, which is currently
+// inert - see PooledConn.Release. They are still surfaced in init/stats logging.
 type Config struct {
-	MaxConnections int           // Max total connections
-	MaxIdle        int           // Max idle connections in pool
-	IdleTimeout    time.Duration // Close idle connections after this
-	ConnectTimeout time.Duration // Timeout for new connections
+	MaxConnections int           // Max total connections (live: Get enforces it)
+	MaxIdle        int           // Max idle connections in pool (inert: see Release)
+	IdleTimeout    time.Duration // Close idle connections after this (inert: see Release)
+	ConnectTimeout time.Duration // Timeout for new connections (live)
 }
 
 // DefaultConfig returns default pool configuration
@@ -64,7 +68,18 @@ func (pc *PooledConn) Strategy() strategy.Strategy {
 	return pc.strategy
 }
 
-// Release returns the connection to the pool
+// Release returns the connection to the pool for reuse.
+//
+// TODO(pool): this idle-reuse path (Release -> put -> the Get reuse loop ->
+// cleanup/IdleTimeout/MaxIdle) is currently INERT. No caller invokes Release:
+// every proxy handler in internal/client closes its connection after one
+// target because a tunnel stream is single-use server-side, and the REALITY
+// strategy deliberately opens a fresh TCP per request to dodge TSPU throttling
+// (see internal/strategy/reality.go "Smux session reuse is intentionally
+// disabled"). DialTarget is the live dial path. The machinery is kept (not
+// ripped out) because Stats()/metrics and the init logging still read the idle
+// counters, and a future multiplexing design may wire reuse back up - but until
+// then it does nothing at runtime.
 func (pc *PooledConn) Release() {
 	pc.pool.put(pc)
 }
