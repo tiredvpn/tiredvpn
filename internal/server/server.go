@@ -60,6 +60,15 @@ const (
 	// memory ceiling bounded while still serving a real client population.
 	defaultRelayMaxConcurrentConns = 256
 
+	// defaultRelayIdleTimeout is the idle deadline for a relay->upstream TUN
+	// bridge when Config.RelayIdleTimeout is unset. If no bytes flow in either
+	// direction for this long the bridge is force-closed to reap half-open
+	// downstreams (lost RU->AMS link) that would otherwise pin an admission slot,
+	// an 8MB-buffered upstream conn and goroutines forever. A healthy TUN client
+	// sends a keepalive frame every 10s (internal/tun keepaliveInterval), so 90s
+	// never trips a live session.
+	defaultRelayIdleTimeout = 90 * time.Second
+
 	// probeReadDeadline is the initial read deadline for un-classified inbound
 	// connections. Kept short so probe-storm goroutines (and their peek-buffers)
 	// are released quickly instead of lingering for the legitimate-handshake
@@ -290,6 +299,11 @@ type Config struct {
 	// Upstream (multi-hop) mode
 	UpstreamAddr   string // e.g., "exit-server.com:443"
 	UpstreamSecret string // secret for upstream auth
+
+	// RelayIdleTimeout is the idle deadline for a relay->upstream TUN bridge.
+	// 0 = use defaultRelayIdleTimeout. A bridge with no traffic in either
+	// direction for this long is force-closed to reap half-open downstreams.
+	RelayIdleTimeout time.Duration
 
 	// RelayUpstreamBufBytes overrides the SO_RCVBUF/SO_SNDBUF size set on the TCP
 	// connection to the upstream exit. 0 = use defaultUpstreamSockBuf (512KB).
@@ -3319,31 +3333,110 @@ func relayTUNToUpstream(conn net.Conn, srvCtx *serverContext, logger *log.Logger
 	logger.Info("Relay TUN bridge established (client=%s, upstream-assigned=%s)",
 		conn.RemoteAddr(), net.IP(resp[5:9]))
 
-	// Bidirectional transparent copy. Both ends speak the identical TUN wire
-	// format, so no reframing is needed. First copy to return closes the bridge.
+	// Bidirectional transparent copy with an idle watchdog. Both ends speak the
+	// identical TUN wire format, so no reframing is needed.
+	idleTimeout := srvCtx.cfg.RelayIdleTimeout
+	if idleTimeout <= 0 {
+		idleTimeout = defaultRelayIdleTimeout
+	}
+	runIdleWatchedBridge(conn, upstreamConn, idleTimeout, logger)
+
+	logger.Info("Relay TUN bridge closed (client=%s)", conn.RemoteAddr())
+}
+
+// runIdleWatchedBridge byte-copies traffic in both directions between a and b
+// and force-closes BOTH once no bytes flow in either direction for idleTimeout.
+// It returns when both copy directions have finished (peer close, error, or the
+// idle force-close).
+//
+// The idle watchdog exists because SetReadDeadline cannot reap a stuck relay
+// bridge: the downstream may be an h2TunConn whose SetReadDeadline is a no-op,
+// so a silently-vanished client leaves the client->upstream copy blocked on Read
+// forever, pinning the admission slot and the upstream's socket buffers. Both
+// copy goroutines stamp lastActivity on every read; the watchdog closes both
+// sides once the stamp ages past idleTimeout. Real traffic - including 10s TUN
+// keepalive frames - keeps the stamp fresh, so a live session is never reaped.
+func runIdleWatchedBridge(a, b net.Conn, idleTimeout time.Duration, logger *log.Logger) {
 	var once sync.Once
 	closeBoth := func() {
 		once.Do(func() {
-			conn.Close()
-			upstreamConn.Close()
+			a.Close()
+			b.Close()
 		})
 	}
+
+	var lastActivity atomic.Int64
+	lastActivity.Store(time.Now().UnixNano())
+	watchdogDone := make(chan struct{})
+	go func() {
+		// Poll at a quarter of the timeout so the bridge is reaped within
+		// ~idleTimeout of going silent, without a tight spin.
+		interval := idleTimeout / 4
+		if interval < time.Second {
+			interval = time.Second
+		}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-watchdogDone:
+				return
+			case <-ticker.C:
+				idle := time.Since(time.Unix(0, lastActivity.Load()))
+				if idle >= idleTimeout {
+					if logger != nil {
+						logger.Info("Relay TUN bridge idle for %s, force-closing", idle.Round(time.Second))
+					}
+					closeBoth()
+					return
+				}
+			}
+		}
+	}()
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
 		defer closeBoth()
-		io.Copy(upstreamConn, conn) // client -> upstream
+		copyWithActivity(b, a, &lastActivity) // a -> b
 	}()
 	go func() {
 		defer wg.Done()
 		defer closeBoth()
-		io.Copy(conn, upstreamConn) // upstream -> client
+		copyWithActivity(a, b, &lastActivity) // b -> a
 	}()
 	wg.Wait()
+	close(watchdogDone)
+}
 
-	logger.Info("Relay TUN bridge closed (client=%s)", conn.RemoteAddr())
+// copyWithActivity is io.Copy with an activity stamp: it records time.Now (as
+// UnixNano) into lastActivity on every successful read from src. The relay
+// idle-watchdog reads this stamp to detect a silent bridge and force-close it.
+// Buffer size matches io.Copy's internal 32KB.
+func copyWithActivity(dst io.Writer, src io.Reader, lastActivity *atomic.Int64) (int64, error) {
+	buf := make([]byte, 32*1024)
+	var written int64
+	for {
+		nr, rerr := src.Read(buf)
+		if nr > 0 {
+			lastActivity.Store(time.Now().UnixNano())
+			nw, werr := dst.Write(buf[:nr])
+			written += int64(nw)
+			if werr != nil {
+				return written, werr
+			}
+			if nw < nr {
+				return written, io.ErrShortWrite
+			}
+		}
+		if rerr != nil {
+			if rerr == io.EOF {
+				return written, nil
+			}
+			return written, rerr
+		}
+	}
 }
 
 // setupH2Tunnel establishes the tunnel connection for HTTP/2 stego
