@@ -3,6 +3,8 @@ package pool
 import (
 	"context"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -12,6 +14,21 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
 )
+
+// Connector establishes a fresh tunnel connection to the server using the best
+// available strategy. *strategy.Manager satisfies it; tests inject a fake.
+type Connector interface {
+	Connect(ctx context.Context, target string) (net.Conn, strategy.Strategy, error)
+}
+
+// ErrServerRejected means the server was reached but refused to open the
+// requested target (it returned a non-zero ack byte). The rejection is
+// deliberate, so DialTarget does not retry it - the caller should surface a
+// proxy-level error to the browser.
+var ErrServerRejected = errors.New("pool: server rejected target connection")
+
+// dialTargetTimeout bounds each write/read of the target-address handshake.
+const dialTargetTimeout = 30 * time.Second
 
 // Config holds pool configuration
 type Config struct {
@@ -61,7 +78,7 @@ func (pc *PooledConn) Close() error {
 // TunnelPool manages a pool of tunnel connections
 type TunnelPool struct {
 	config     Config
-	manager    *strategy.Manager
+	manager    Connector
 	serverAddr string
 
 	mu          sync.Mutex
@@ -71,6 +88,10 @@ type TunnelPool struct {
 	closed   bool
 	closedCh chan struct{}
 }
+
+// manager-typed assertion: keep *strategy.Manager wired through the Connector
+// seam so tests can substitute a scripted connector.
+var _ Connector = (*strategy.Manager)(nil)
 
 // NewTunnelPool creates a new connection pool
 func NewTunnelPool(mgr *strategy.Manager, serverAddr string, cfg Config) *TunnelPool {
@@ -121,6 +142,73 @@ func (p *TunnelPool) Get(ctx context.Context) (*PooledConn, error) {
 
 	// Create new connection
 	return p.createConn(ctx)
+}
+
+// DialTarget gets a tunnel connection, sends the length-prefixed target address
+// and reads the server's 1-byte ack, returning a connection that is ready for
+// relay. A fresh REALITY/smux handshake backs every Get (the strategy
+// deliberately avoids session reuse for DPI reasons, see strategy/reality.go),
+// so a just-opened connection occasionally loses the race against a transient
+// server-side stream teardown and dies before the ack - surfacing to the user
+// as "No response from server: EOF" -> 502. On any transient failure (Get
+// error, write error, or EOF/read error before the ack) DialTarget discards the
+// connection and retries ONCE with a brand-new one. It never reuses a
+// connection, so the DPI-evasion property (one TCP per request) is preserved.
+//
+// A non-zero ack byte is a deliberate server-side rejection (e.g. the target is
+// unreachable from the exit) and is returned as ErrServerRejected without retry.
+// On success the returned PooledConn has its deadlines cleared; the caller owns
+// it and must Close it when the relay finishes.
+func (p *TunnelPool) DialTarget(ctx context.Context, targetAddr string) (*PooledConn, error) {
+	addrBytes := []byte(targetAddr)
+	if len(addrBytes) > 65535 {
+		return nil, fmt.Errorf("pool: target address too long (%d bytes)", len(addrBytes))
+	}
+	addrPacket := make([]byte, 2+len(addrBytes))
+	binary.BigEndian.PutUint16(addrPacket[:2], uint16(len(addrBytes)))
+	copy(addrPacket[2:], addrBytes)
+
+	const maxAttempts = 2 // initial try + one retry on a transient failure
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		serverConn, err := p.Get(ctx)
+		if err != nil {
+			lastErr = err
+			log.Debug("Pool DialTarget %s: get attempt %d failed: %v", targetAddr, attempt, err)
+			continue
+		}
+
+		serverConn.SetWriteDeadline(time.Now().Add(dialTargetTimeout))
+		if _, err := serverConn.Write(addrPacket); err != nil {
+			serverConn.Close()
+			lastErr = err
+			log.Debug("Pool DialTarget %s: send-target attempt %d failed: %v", targetAddr, attempt, err)
+			continue
+		}
+
+		serverConn.SetReadDeadline(time.Now().Add(dialTargetTimeout))
+		ack := make([]byte, 1)
+		if _, err := io.ReadFull(serverConn.Conn, ack); err != nil {
+			serverConn.Close()
+			lastErr = err
+			log.Debug("Pool DialTarget %s: ack attempt %d failed: %v", targetAddr, attempt, err)
+			continue
+		}
+
+		if ack[0] != 0x00 {
+			serverConn.Close()
+			return nil, ErrServerRejected
+		}
+
+		serverConn.SetReadDeadline(time.Time{})
+		serverConn.SetWriteDeadline(time.Time{})
+		if attempt > 1 {
+			log.Debug("Pool DialTarget %s: succeeded on retry", targetAddr)
+		}
+		return serverConn, nil
+	}
+
+	return nil, fmt.Errorf("pool: dial %s failed after %d attempts: %w", targetAddr, maxAttempts, lastErr)
 }
 
 // createConn creates a new pooled connection
