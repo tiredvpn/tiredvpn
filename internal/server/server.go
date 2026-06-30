@@ -41,7 +41,7 @@ import (
 )
 
 var (
-	Version     = "1.3.16"
+	Version     = "1.3.17"
 	connCounter uint64
 )
 

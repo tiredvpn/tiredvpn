@@ -7,6 +7,12 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.17] - 2026-07-01
+
+### Fixed
+
+- **Spurious 502 / connection failure on the proxy path.** Each proxied request opens a fresh tunnel connection (a new connection per request is deliberate — it avoids the TSPU throttle that drops a second stream reused on the same TCP). Occasionally a just-opened connection lost the race against a transient server-side stream teardown and died before the server's acknowledgement byte, surfacing to the user as `No response from server: EOF` and an immediate 502 (or SOCKS failure). The proxy handlers now go through a single dial helper that, on such a transient failure (connect error, write error, or EOF before the ack), transparently retries once with a brand-new connection before giving up. A deliberate server-side rejection (non-zero ack) is still surfaced immediately without a retry, and connections are never reused — the one-TCP-per-request DPI property is preserved.
+
 ## [1.3.16] - 2026-06-30
 
 ### Fixed
