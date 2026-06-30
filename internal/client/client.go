@@ -1019,13 +1019,16 @@ func handleHTTPProxyPooled(conn net.Conn, tunnelPool *pool.TunnelPool, connID ui
 
 	logger.Info("CONNECT %s", targetAddr)
 
-	// Get connection from pool
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Establish a tunnel to the target. DialTarget sends the target address and
+	// reads the server ack, retrying once on a connection that dies before the
+	// ack (removes the "No response from server: EOF" -> 502 failures).
+	// Allow room for the one retry (two handshakes worst case).
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
-	serverConn, err := tunnelPool.Get(ctx)
+	serverConn, err := tunnelPool.DialTarget(ctx, targetAddr)
 	if err != nil {
-		logger.Warn("Failed to get connection from pool: %v", err)
+		logger.Warn("Failed to establish tunnel for %s: %v", targetAddr, err)
 		if clientMetrics != nil {
 			clientMetrics.IncFailed()
 		}
@@ -1038,39 +1041,7 @@ func handleHTTPProxyPooled(conn net.Conn, tunnelPool *pool.TunnelPool, connID ui
 	if clientMetrics != nil {
 		clientMetrics.RecordConnect(strat.ID(), strat.Name())
 	}
-	logger.Debug("Got pooled connection (strategy=%s)", strat.Name())
-
-	// Send target address to server
-	addrBytes := []byte(targetAddr)
-	addrPacket := make([]byte, 2+len(addrBytes))
-	addrPacket[0] = byte(len(addrBytes) >> 8)
-	addrPacket[1] = byte(len(addrBytes))
-	copy(addrPacket[2:], addrBytes)
-
-	serverConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-	if _, err := serverConn.Write(addrPacket); err != nil {
-		logger.Warn("Failed to send target address: %v", err)
-		serverConn.Close() // Don't return broken connection to pool
-		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
-		return
-	}
-
-	// Read server response
-	resp := make([]byte, 1)
-	serverConn.SetReadDeadline(time.Now().Add(30 * time.Second))
-	if _, err := io.ReadFull(serverConn.Conn, resp); err != nil {
-		logger.Warn("No response from server: %v", err)
-		serverConn.Close()
-		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
-		return
-	}
-
-	if resp[0] != 0x00 {
-		logger.Warn("Server rejected connection: %d", resp[0])
-		serverConn.Close()
-		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
-		return
-	}
+	logger.Debug("Got tunnel connection (strategy=%s)", strat.Name())
 
 	// Send 200 OK
 	conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
@@ -1122,39 +1093,13 @@ func handlePlainHTTPPooled(conn net.Conn, tunnelPool *pool.TunnelPool, request s
 
 	logger.Info("%s %s", method, parsedURL.Host)
 
-	// Get connection from pool
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Establish a tunnel to the target (retries once on a dead connection).
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
-	serverConn, err := tunnelPool.Get(ctx)
+	serverConn, err := tunnelPool.DialTarget(ctx, targetHost)
 	if err != nil {
-		logger.Warn("Failed to get connection from pool: %v", err)
-		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
-		return
-	}
-
-	// Send target address
-	addrBytes := []byte(targetHost)
-	addrPacket := make([]byte, 2+len(addrBytes))
-	addrPacket[0] = byte(len(addrBytes) >> 8)
-	addrPacket[1] = byte(len(addrBytes))
-	copy(addrPacket[2:], addrBytes)
-
-	serverConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-	serverConn.Write(addrPacket)
-
-	// Read server response
-	resp := make([]byte, 1)
-	serverConn.SetReadDeadline(time.Now().Add(30 * time.Second))
-	if _, err := io.ReadFull(serverConn.Conn, resp); err != nil {
-		logger.Warn("No response from server: %v", err)
-		serverConn.Close()
-		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
-		return
-	}
-
-	if resp[0] != 0x00 {
-		serverConn.Close()
+		logger.Warn("Failed to establish tunnel for %s: %v", targetHost, err)
 		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return
 	}
@@ -1281,13 +1226,13 @@ func handleSOCKS5Pooled(conn net.Conn, tunnelPool *pool.TunnelPool, connID uint6
 
 	logger.Info("CONNECT %s", targetAddr)
 
-	// Get connection from pool
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Establish a tunnel to the target (retries once on a dead connection).
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
-	serverConn, err := tunnelPool.Get(ctx)
+	serverConn, err := tunnelPool.DialTarget(ctx, targetAddr)
 	if err != nil {
-		logger.Warn("Failed to get connection from pool: %v", err)
+		logger.Warn("Failed to establish tunnel for %s: %v", targetAddr, err)
 		if clientMetrics != nil {
 			clientMetrics.IncFailed()
 		}
@@ -1300,39 +1245,7 @@ func handleSOCKS5Pooled(conn net.Conn, tunnelPool *pool.TunnelPool, connID uint6
 	if clientMetrics != nil {
 		clientMetrics.RecordConnect(strat.ID(), strat.Name())
 	}
-	logger.Debug("Got pooled connection (strategy=%s)", strat.Name())
-
-	// Send target address
-	addrBytes := []byte(targetAddr)
-	addrPacket := make([]byte, 2+len(addrBytes))
-	addrPacket[0] = byte(len(addrBytes) >> 8)
-	addrPacket[1] = byte(len(addrBytes))
-	copy(addrPacket[2:], addrBytes)
-
-	serverConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-	if _, err := serverConn.Write(addrPacket); err != nil {
-		logger.Warn("Failed to send target: %v", err)
-		serverConn.Close()
-		conn.Write([]byte{0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		return
-	}
-
-	// Read server response (ConfusedConn handles length-prefix internally)
-	serverConn.SetReadDeadline(time.Now().Add(30 * time.Second))
-	resp := make([]byte, 1)
-	if _, err := io.ReadFull(serverConn.Conn, resp); err != nil {
-		logger.Warn("No response from server: %v", err)
-		serverConn.Close()
-		conn.Write([]byte{0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		return
-	}
-
-	if resp[0] != 0x00 {
-		logger.Warn("Server rejected connection: %d", resp[0])
-		serverConn.Close()
-		conn.Write([]byte{0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		return
-	}
+	logger.Debug("Got tunnel connection (strategy=%s)", strat.Name())
 
 	// Send SOCKS5 success
 	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
