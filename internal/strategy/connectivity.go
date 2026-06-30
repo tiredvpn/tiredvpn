@@ -6,9 +6,20 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/log"
+)
+
+// Probe pacing for the connectivity wait loop. After a server-side reset the
+// real outage is usually sub-second, so we retry quickly first and back off
+// exponentially rather than polling on a flat 5s ticker (which turned a <1s
+// reset into a ~5s freeze). See WaitForConnectivity.
+const (
+	defaultProbeInterval = 250 * time.Millisecond  // first retry after a failed check
+	maxProbeInterval     = 2500 * time.Millisecond // backoff ceiling
+	probeBackoffFactor   = 2                        // interval multiplier per miss
 )
 
 // ConnectivityResult holds the result of a connectivity check
@@ -29,7 +40,9 @@ func (r ConnectivityResult) HasBasicConnectivity() bool {
 // ConnectivityChecker performs pre-flight connectivity checks before trying strategies
 type ConnectivityChecker struct {
 	serverAddr  string        // full addr host:port
-	timeout     time.Duration // timeout for each check (2-3 sec)
+	timeout     time.Duration // timeout for the TCP gate (2-3 sec)
+	auxTimeout  time.Duration // bounded timeout for the UDP/ICMP probes
+	auxGrace    time.Duration // how long Check waits for UDP/ICMP after TCP lands
 	androidMode bool          // skip ICMP check on Android (os/exec not allowed)
 
 	mu         sync.RWMutex
@@ -44,6 +57,8 @@ func NewConnectivityChecker(serverAddr string, timeout time.Duration, androidMod
 	return &ConnectivityChecker{
 		serverAddr:  serverAddr,
 		timeout:     timeout,
+		auxTimeout:  700 * time.Millisecond,
+		auxGrace:    300 * time.Millisecond,
 		androidMode: androidMode,
 	}
 }
@@ -61,56 +76,70 @@ func (c *ConnectivityChecker) Check(ctx context.Context) ConnectivityResult {
 		return result
 	}
 
-	// Run checks in parallel
-	var wg sync.WaitGroup
-	var tcpLatency, udpLatency time.Duration
-	var tcpErr, udpErr, icmpErr error
-
-	// TCP check (required)
-	wg.Add(1)
+	// TCP is the only gate (HasBasicConnectivity == TCP), so it runs on the hot
+	// reconnect path and decides the result. UDP/ICMP only gate QUIC selection,
+	// so they run concurrently but must never delay the TCP verdict: we wait for
+	// them just auxGrace, then fall back to the last known value and let them
+	// finish updating the cache in the background.
+	var tcpErr error
+	var tcpLatency time.Duration
+	tcpDone := make(chan struct{})
 	go func() {
-		defer wg.Done()
 		start := time.Now()
 		tcpErr = c.checkTCP(ctx, c.serverAddr)
 		tcpLatency = time.Since(start)
-		result.TCP = tcpErr == nil
+		close(tcpDone)
 	}()
 
-	// UDP check (for QUIC)
-	wg.Add(1)
+	var udpOK, icmpOK atomic.Bool
+	auxDone := make(chan struct{})
 	go func() {
-		defer wg.Done()
-		start := time.Now()
-		udpErr = c.checkUDP(ctx, c.serverAddr)
-		udpLatency = time.Since(start)
-		result.UDP = udpErr == nil
-	}()
-
-	// ICMP check (optional, may fail without root)
-	// Skip on Android - os/exec causes SIGSYS due to seccomp
-	if !c.androidMode {
+		defer close(auxDone)
+		var wg sync.WaitGroup
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			icmpErr = c.checkICMP(ctx, host)
-			result.ICMP = icmpErr == nil
+			udpOK.Store(c.checkUDP(ctx, c.serverAddr) == nil)
 		}()
-	}
+		// ICMP check (optional, may fail without root).
+		// Skip on Android - os/exec causes SIGSYS due to seccomp.
+		if !c.androidMode {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				icmpOK.Store(c.checkICMP(ctx, host) == nil)
+			}()
+		}
+		wg.Wait()
+	}()
 
-	wg.Wait()
-
-	// Use TCP latency as primary, fallback to UDP
+	<-tcpDone
+	result.TCP = tcpErr == nil
 	if result.TCP {
 		result.Latency = tcpLatency
-	} else if result.UDP {
-		result.Latency = udpLatency
 	}
-
-	// Set last error (prefer TCP error as it's most important)
 	if tcpErr != nil {
 		result.Error = tcpErr
-	} else if udpErr != nil {
-		result.Error = udpErr
+	}
+
+	select {
+	case <-auxDone:
+		result.UDP = udpOK.Load()
+		result.ICMP = icmpOK.Load()
+	case <-time.After(c.auxGrace):
+		// Aux probes are slow this round; reuse the last known verdict and let
+		// them refresh the cache once they land.
+		c.mu.RLock()
+		result.UDP = c.lastResult.UDP
+		result.ICMP = c.lastResult.ICMP
+		c.mu.RUnlock()
+		go func() {
+			<-auxDone
+			c.mu.Lock()
+			c.lastResult.UDP = udpOK.Load()
+			c.lastResult.ICMP = icmpOK.Load()
+			c.mu.Unlock()
+		}()
 	}
 
 	// Log results
@@ -119,6 +148,32 @@ func (c *ConnectivityChecker) Check(ctx context.Context) ConnectivityResult {
 
 	// Cache result
 	c.mu.Lock()
+	c.lastResult = result
+	c.mu.Unlock()
+
+	return result
+}
+
+// checkTCPOnly performs just the TCP gate, carrying forward the last known
+// UDP/ICMP verdict. Used on the hot retry path (WaitForConnectivity) where the
+// only thing that matters is whether the server's TCP port is back; pulling in
+// UDP/ICMP probes there only adds latency to recovery.
+func (c *ConnectivityChecker) checkTCPOnly(ctx context.Context) ConnectivityResult {
+	result := ConnectivityResult{CheckedAt: time.Now()}
+
+	start := time.Now()
+	err := c.checkTCP(ctx, c.serverAddr)
+	result.TCP = err == nil
+	if err != nil {
+		result.Error = err
+	} else {
+		result.Latency = time.Since(start)
+	}
+
+	// Carry forward last known UDP/ICMP (they gate QUIC and rarely flip).
+	c.mu.Lock()
+	result.UDP = c.lastResult.UDP
+	result.ICMP = c.lastResult.ICMP
 	c.lastResult = result
 	c.mu.Unlock()
 
@@ -142,7 +197,7 @@ func (c *ConnectivityChecker) checkTCP(ctx context.Context, addr string) error {
 // Note: UDP is connectionless, so we just check if we can send and receive
 func (c *ConnectivityChecker) checkUDP(ctx context.Context, addr string) error {
 	dialer := &net.Dialer{
-		Timeout: c.timeout,
+		Timeout: c.auxTimeout,
 	}
 
 	conn, err := dialer.DialContext(ctx, "udp", addr)
@@ -152,7 +207,7 @@ func (c *ConnectivityChecker) checkUDP(ctx context.Context, addr string) error {
 	defer conn.Close()
 
 	// Set short deadline for write/read
-	deadline := time.Now().Add(c.timeout)
+	deadline := time.Now().Add(c.auxTimeout)
 	conn.SetDeadline(deadline)
 
 	// Send a probe packet that won't trigger Salamander "ciphertext too short" errors
@@ -190,12 +245,13 @@ func (c *ConnectivityChecker) checkUDP(ctx context.Context, addr string) error {
 }
 
 func (c *ConnectivityChecker) checkICMP(ctx context.Context, host string) error {
-	conn, err := net.DialTimeout("tcp", host+":443", 2*time.Second)
+	d := net.Dialer{Timeout: c.auxTimeout}
+	conn, err := d.DialContext(ctx, "tcp", host+":443")
 	if err == nil {
 		conn.Close()
 		return nil
 	}
-	conn2, err2 := net.DialTimeout("tcp", host+":80", 2*time.Second)
+	conn2, err2 := d.DialContext(ctx, "tcp", host+":80")
 	if err2 == nil {
 		conn2.Close()
 		return nil
@@ -203,22 +259,30 @@ func (c *ConnectivityChecker) checkICMP(ctx context.Context, host string) error 
 	return fmt.Errorf("host unreachable: %w", err2)
 }
 
-// WaitForConnectivity waits in a loop until connectivity is available
+// WaitForConnectivity waits in a loop until TCP connectivity is available.
+//
+// interval is the FIRST retry delay; on each miss it backs off by
+// probeBackoffFactor up to maxProbeInterval. A short server-side reset is
+// usually back within a few hundred ms, so the early retries are fast (recovery
+// drops from the old flat ~5s to <1s) while the ceiling keeps a truly-down
+// network from being hammered. Only the TCP gate is probed here — UDP/ICMP just
+// gate QUIC selection and are carried forward from the cache.
 func (c *ConnectivityChecker) WaitForConnectivity(ctx context.Context, interval time.Duration) ConnectivityResult {
-	if interval == 0 {
-		interval = 5 * time.Second
+	if interval <= 0 {
+		interval = defaultProbeInterval
 	}
 
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	// First check immediately
-	result := c.Check(ctx)
+	// First check immediately.
+	result := c.checkTCPOnly(ctx)
 	if result.TCP {
 		return result
 	}
 
 	log.Warn("No connectivity to %s, waiting for network...", c.serverAddr)
+
+	backoff := interval
+	timer := time.NewTimer(backoff)
+	defer timer.Stop()
 
 	for {
 		select {
@@ -227,13 +291,20 @@ func (c *ConnectivityChecker) WaitForConnectivity(ctx context.Context, interval 
 				Error:     ctx.Err(),
 				CheckedAt: time.Now(),
 			}
-		case <-ticker.C:
-			result = c.Check(ctx)
+		case <-timer.C:
+			result = c.checkTCPOnly(ctx)
 			if result.TCP {
 				log.Info("Connectivity restored to %s", c.serverAddr)
 				return result
 			}
-			log.Debug("Still no connectivity to %s, retrying in %v...", c.serverAddr, interval)
+			if backoff < maxProbeInterval {
+				backoff *= probeBackoffFactor
+				if backoff > maxProbeInterval {
+					backoff = maxProbeInterval
+				}
+			}
+			timer.Reset(backoff)
+			log.Debug("Still no connectivity to %s, retrying in %v...", c.serverAddr, backoff)
 		}
 	}
 }
