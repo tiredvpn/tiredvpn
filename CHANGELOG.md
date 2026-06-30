@@ -7,6 +7,13 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.16] - 2026-06-30
+
+### Fixed
+
+- **Relay memory exhaustion under load (OOM crash loop).** A relay node (`-upstream`) holds a full per-client upstream bridge, and three compounding issues let those bridges pile up in RAM until the OOM killer reaped the process every ~15 seconds on a memory-tight box, tearing down every tunnel through it. (1) Each upstream dial committed 8 MB of socket buffers (4 MB SO_RCVBUF + 4 MB SO_SNDBUF); on a slow upstream leg the send buffer stayed full of undrained data. Bounded to 512 KB (configurable via `RelayUpstreamBufBytes`). (2) The relay→upstream copy had no idle deadline, so a silently-vanished downstream (lost link, half-open connection) left the copy blocked on read forever, pinning an admission slot, the upstream connection and its buffers — `SetReadDeadline` could not reap it because an h2 TUN downstream ignores deadlines. Added an idle watchdog that force-closes a bridge after 90 s with no traffic in either direction; live sessions are kept fresh by the existing 10 s TUN keepalive (configurable via `RelayIdleTimeout`). (3) The 4096 admission limit assumed an exit node's light per-connection cost; a relay now defaults to 256 concurrent connections, and a new `-max-conns` flag overrides the limit for any role.
+- **Multi-second freeze recovering from a brief server reset.** When a session was dropped (server EOF/RST), the client's connectivity wait used a fixed 5 s ticker, so even a sub-second server blip quantized into a hard ~5 s stall with the data plane dead the whole time. Recovery now uses fast backoff (250 ms → 2.5 s) instead of a flat 5 s wait, the connectivity check returns as soon as TCP reachability is confirmed instead of blocking on parallel UDP/ICMP probes, and the blocking pre-flight check is skipped on the hot reconnect path (only re-armed after repeated connect failures). Typical recovery from a short reset drops from ~5 s to under 1 s.
+
 ## [1.3.15] - 2026-06-29
 
 ### Fixed
