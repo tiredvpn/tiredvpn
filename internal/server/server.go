@@ -276,6 +276,12 @@ type Config struct {
 	UpstreamAddr   string // e.g., "exit-server.com:443"
 	UpstreamSecret string // secret for upstream auth
 
+	// RelayUpstreamBufBytes overrides the SO_RCVBUF/SO_SNDBUF size set on the TCP
+	// connection to the upstream exit. 0 = use defaultUpstreamSockBuf (512KB).
+	// Each relay bridge commits these buffers, so this is a direct memory
+	// multiplier on a relay node under load.
+	RelayUpstreamBufBytes int
+
 	// QUIC mode
 	QUICEnabled           bool   // Enable QUIC listener
 	QUICListenAddr        string // e.g., ":443" (UDP)
@@ -475,7 +481,11 @@ func initUpstreamMode(cfg *Config, srvCtx *serverContext) error {
 	if cfg.UpstreamSecret == "" {
 		return fmt.Errorf("upstream-secret required when using upstream mode")
 	}
-	srvCtx.upstreamDialer = NewUpstreamDialer(cfg.UpstreamAddr, []byte(cfg.UpstreamSecret))
+	dialer := NewUpstreamDialer(cfg.UpstreamAddr, []byte(cfg.UpstreamSecret))
+	if cfg.RelayUpstreamBufBytes > 0 {
+		dialer.sockBufBytes = cfg.RelayUpstreamBufBytes
+	}
+	srvCtx.upstreamDialer = dialer
 	log.Info("Upstream mode enabled: %s", cfg.UpstreamAddr)
 	return nil
 }

@@ -352,6 +352,7 @@ func runServer(args []string) {
 	fs.StringVar(&cfg.APIToken, "api-token", "", "Bearer token required for the management API (falls back to TIREDVPN_API_TOKEN; empty = no auth)")
 	fs.StringVar(&cfg.UpstreamAddr, "upstream", "", "Upstream TiredVPN server for multi-hop (e.g., exit-server.com:443)")
 	fs.StringVar(&cfg.UpstreamSecret, "upstream-secret", "", "Secret for upstream authentication")
+	fs.IntVar(&cfg.RelayUpstreamBufBytes, "relay-upstream-buf", 0, "SO_RCVBUF/SO_SNDBUF size in bytes for the TCP dial to the upstream exit (0 = default 512KB); lower to bound relay memory")
 
 	// Port hopping flags
 	fs.StringVar(&cfg.PortRange, "port-range", "", "Port or range for multi-port listening (e.g., '995' or '47000-47100')")

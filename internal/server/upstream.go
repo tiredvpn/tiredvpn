@@ -15,12 +15,24 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
 )
 
+// defaultUpstreamSockBuf is the SO_RCVBUF/SO_SNDBUF size set on the TCP
+// connection to the upstream exit. Each live relay bridge commits these buffers,
+// so on a relay node this is a direct per-connection memory multiplier. 512KB is
+// ample for the BDP at the current throughput ceiling even on a ~500ms upstream;
+// the previous 4MB (= 8MB read+write per dial) was the main relay OOM amplifier.
+const defaultUpstreamSockBuf = 512 * 1024
+
 // UpstreamDialer connects to target servers through an upstream TiredVPN server
 type UpstreamDialer struct {
 	upstreamAddr   string
 	upstreamSecret []byte
 	coverHost      string
 	tlsConfig      *tls.Config
+
+	// sockBufBytes is the SO_RCVBUF/SO_SNDBUF applied to each upstream TCP dial.
+	// 0 falls back to defaultUpstreamSockBuf. Overridable via Config to tune
+	// relay memory without a rebuild.
+	sockBufBytes int
 
 	// TLS session cache for faster reconnects
 	sessionCache tls.ClientSessionCache
@@ -36,6 +48,7 @@ func NewUpstreamDialer(addr string, secret []byte) *UpstreamDialer {
 		upstreamAddr:   addr,
 		upstreamSecret: secret,
 		coverHost:      "api.googleapis.com",
+		sockBufBytes:   defaultUpstreamSockBuf,
 		sessionCache:   sessionCache,
 		tlsConfig: &tls.Config{
 			// InsecureSkipVerify is intentional: the upstream TiredVPN server presents a
@@ -81,9 +94,15 @@ func (d *UpstreamDialer) connectStego(ctx context.Context) (net.Conn, *tls.Conn,
 		tc.SetNoDelay(true) // Disable Nagle's algorithm
 		tc.SetKeepAlive(true)
 		tc.SetKeepAlivePeriod(30 * time.Second)
-		// Set buffer sizes for better throughput (4MB ~ BDP at high RTT)
-		tc.SetReadBuffer(4 * 1024 * 1024)
-		tc.SetWriteBuffer(4 * 1024 * 1024)
+		// Bound the per-dial socket buffers. On a relay each live bridge commits
+		// these, so they are a direct memory multiplier; 512KB covers the BDP at
+		// the current throughput ceiling without the old 4MB blowup.
+		sockBuf := d.sockBufBytes
+		if sockBuf <= 0 {
+			sockBuf = defaultUpstreamSockBuf
+		}
+		tc.SetReadBuffer(sockBuf)
+		tc.SetWriteBuffer(sockBuf)
 	}
 
 	// TLS handshake on the optimized TCP connection
