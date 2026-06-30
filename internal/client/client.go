@@ -788,7 +788,7 @@ func runProxyMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) er
 	// Create connection pool
 	poolCfg := pool.DefaultConfig()
 	tunnelPool := pool.NewTunnelPool(mgr, cfg.ServerAddr, poolCfg)
-	log.Info("Connection pool initialized (max=%d, idle=%d)", poolCfg.MaxConnections, poolCfg.MaxIdle)
+	log.Info("Connection pool initialized (max=%d)", poolCfg.MaxConnections)
 
 	// Initialize metrics if API addr is configured
 	if cfg.APIAddr != "" {
@@ -802,8 +802,7 @@ func runProxyMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) er
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			total, idle := tunnelPool.Stats()
-			log.Info("Pool stats: total=%d, idle=%d, max=%d", total, idle, poolCfg.MaxConnections)
+			log.Info("Pool stats: total=%d, max=%d", tunnelPool.Stats(), poolCfg.MaxConnections)
 		}
 	}()
 

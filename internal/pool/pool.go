@@ -31,36 +31,27 @@ var ErrServerRejected = errors.New("pool: server rejected target connection")
 const dialTargetTimeout = 30 * time.Second
 
 // Config holds pool configuration.
-//
-// MaxConnections and ConnectTimeout are live (enforced by Get/createConn).
-// MaxIdle and IdleTimeout drive only the idle-reuse path, which is currently
-// inert - see PooledConn.Release. They are still surfaced in init/stats logging.
 type Config struct {
-	MaxConnections int           // Max total connections (live: Get enforces it)
-	MaxIdle        int           // Max idle connections in pool (inert: see Release)
-	IdleTimeout    time.Duration // Close idle connections after this (inert: see Release)
-	ConnectTimeout time.Duration // Timeout for new connections (live)
+	MaxConnections int           // Max total live connections (Get enforces it)
+	ConnectTimeout time.Duration // Timeout for establishing a new connection
 }
 
 // DefaultConfig returns default pool configuration
 func DefaultConfig() Config {
 	return Config{
 		MaxConnections: 1000, // Very high limit for heavy browsing
-		MaxIdle:        50,
-		IdleTimeout:    60 * time.Second,
 		ConnectTimeout: 30 * time.Second,
 	}
 }
 
-// PooledConn wraps a connection from the pool
+// PooledConn wraps a tunnel connection handed out by the pool. Connections are
+// never reused - a fresh TCP per request is deliberate, to dodge TSPU throttling
+// of a second stream on the same TCP (see internal/strategy/reality.go) - so a
+// PooledConn is single-use: the caller relays over it and Closes it.
 type PooledConn struct {
 	net.Conn
-	pool       *TunnelPool
-	strategy   strategy.Strategy
-	createdAt  time.Time
-	lastUsedAt time.Time
-	inUse      bool
-	mu         sync.Mutex
+	pool     *TunnelPool
+	strategy strategy.Strategy
 }
 
 // Strategy returns the strategy used for this connection
@@ -68,40 +59,21 @@ func (pc *PooledConn) Strategy() strategy.Strategy {
 	return pc.strategy
 }
 
-// Release returns the connection to the pool for reuse.
-//
-// TODO(pool): this idle-reuse path (Release -> put -> the Get reuse loop ->
-// cleanup/IdleTimeout/MaxIdle) is currently INERT. No caller invokes Release:
-// every proxy handler in internal/client closes its connection after one
-// target because a tunnel stream is single-use server-side, and the REALITY
-// strategy deliberately opens a fresh TCP per request to dodge TSPU throttling
-// (see internal/strategy/reality.go "Smux session reuse is intentionally
-// disabled"). DialTarget is the live dial path. The machinery is kept (not
-// ripped out) because Stats()/metrics and the init logging still read the idle
-// counters, and a future multiplexing design may wire reuse back up - but until
-// then it does nothing at runtime.
-func (pc *PooledConn) Release() {
-	pc.pool.put(pc)
-}
-
-// Close closes the connection and removes from pool
+// Close closes the underlying connection and releases its slot in the pool's
+// live-connection count.
 func (pc *PooledConn) Close() error {
-	pc.pool.remove(pc)
+	atomic.AddInt32(&pc.pool.totalConns, -1)
 	return pc.Conn.Close()
 }
 
-// TunnelPool manages a pool of tunnel connections
+// TunnelPool hands out fresh tunnel connections, bounded by MaxConnections.
+// Connections are single-use and never returned for reuse (see PooledConn).
 type TunnelPool struct {
 	config     Config
 	manager    Connector
 	serverAddr string
 
-	mu          sync.Mutex
-	connections []*PooledConn
-	totalConns  int32 // atomic counter
-
-	closed   bool
-	closedCh chan struct{}
+	totalConns int32 // atomic counter of live connections
 }
 
 // manager-typed assertion: keep *strategy.Manager wired through the Connector
@@ -110,52 +82,18 @@ var _ Connector = (*strategy.Manager)(nil)
 
 // NewTunnelPool creates a new connection pool
 func NewTunnelPool(mgr *strategy.Manager, serverAddr string, cfg Config) *TunnelPool {
-	p := &TunnelPool{
-		config:      cfg,
-		manager:     mgr,
-		serverAddr:  serverAddr,
-		connections: make([]*PooledConn, 0, cfg.MaxIdle),
-		closedCh:    make(chan struct{}),
+	return &TunnelPool{
+		config:     cfg,
+		manager:    mgr,
+		serverAddr: serverAddr,
 	}
-
-	// Start cleanup goroutine
-	go p.cleanupLoop()
-
-	return p
 }
 
-// Get retrieves a connection from the pool or creates a new one
+// Get establishes a fresh tunnel connection, bounded by MaxConnections.
 func (p *TunnelPool) Get(ctx context.Context) (*PooledConn, error) {
-	p.mu.Lock()
-
-	// Try to get an idle connection
-	for i := len(p.connections) - 1; i >= 0; i-- {
-		pc := p.connections[i]
-		if !pc.inUse {
-			pc.mu.Lock()
-			pc.inUse = true
-			pc.lastUsedAt = time.Now()
-			pc.mu.Unlock()
-
-			// Remove from idle list
-			p.connections = append(p.connections[:i], p.connections[i+1:]...)
-			p.mu.Unlock()
-
-			log.Debug("Pool: reusing connection (strategy=%s, idle=%v)",
-				pc.strategy.Name(), time.Since(pc.lastUsedAt))
-			return pc, nil
-		}
-	}
-
-	// Check if we can create a new connection
 	if int(atomic.LoadInt32(&p.totalConns)) >= p.config.MaxConnections {
-		p.mu.Unlock()
 		return nil, ErrPoolExhausted
 	}
-
-	p.mu.Unlock()
-
-	// Create new connection
 	return p.createConn(ctx)
 }
 
@@ -246,12 +184,9 @@ func (p *TunnelPool) createConn(ctx context.Context) (*PooledConn, error) {
 	}
 
 	pc := &PooledConn{
-		Conn:       conn,
-		pool:       p,
-		strategy:   usedStrategy,
-		createdAt:  time.Now(),
-		lastUsedAt: time.Now(),
-		inUse:      true,
+		Conn:     conn,
+		pool:     p,
+		strategy: usedStrategy,
 	}
 
 	log.Debug("Pool: created new connection (strategy=%s, total=%d)",
@@ -260,113 +195,14 @@ func (p *TunnelPool) createConn(ctx context.Context) (*PooledConn, error) {
 	return pc, nil
 }
 
-// put returns a connection to the pool
-func (p *TunnelPool) put(pc *PooledConn) {
-	pc.mu.Lock()
-	pc.inUse = false
-	pc.lastUsedAt = time.Now()
-	pc.mu.Unlock()
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.closed {
-		pc.Conn.Close()
-		atomic.AddInt32(&p.totalConns, -1)
-		return
-	}
-
-	// Check if we have room in the pool
-	if len(p.connections) >= p.config.MaxIdle {
-		// Pool full, close the connection
-		pc.Conn.Close()
-		atomic.AddInt32(&p.totalConns, -1)
-		log.Debug("Pool: discarded connection (pool full)")
-		return
-	}
-
-	// Add to pool
-	p.connections = append(p.connections, pc)
-	log.Debug("Pool: returned connection (idle=%d)", len(p.connections))
+// Stats returns the number of live connections handed out by the pool.
+func (p *TunnelPool) Stats() (total int) {
+	return int(atomic.LoadInt32(&p.totalConns))
 }
 
-// remove removes a connection from the pool
-func (p *TunnelPool) remove(pc *PooledConn) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	for i, c := range p.connections {
-		if c == pc {
-			p.connections = append(p.connections[:i], p.connections[i+1:]...)
-			break
-		}
-	}
-	atomic.AddInt32(&p.totalConns, -1)
-}
-
-// cleanupLoop periodically cleans up idle connections
-func (p *TunnelPool) cleanupLoop() {
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			p.cleanup()
-		case <-p.closedCh:
-			return
-		}
-	}
-}
-
-// cleanup removes stale connections
-func (p *TunnelPool) cleanup() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	now := time.Now()
-	kept := make([]*PooledConn, 0, len(p.connections))
-
-	for _, pc := range p.connections {
-		pc.mu.Lock()
-		idle := now.Sub(pc.lastUsedAt)
-		pc.mu.Unlock()
-
-		if idle > p.config.IdleTimeout {
-			log.Debug("Pool: closing idle connection (idle=%v)", idle)
-			pc.Conn.Close()
-			atomic.AddInt32(&p.totalConns, -1)
-		} else {
-			kept = append(kept, pc)
-		}
-	}
-
-	p.connections = kept
-}
-
-// Stats returns pool statistics
-func (p *TunnelPool) Stats() (total, idle int) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return int(atomic.LoadInt32(&p.totalConns)), len(p.connections)
-}
-
-// Close closes the pool and all connections
+// Close is a no-op kept for API symmetry: the pool holds no idle connections of
+// its own (every handed-out connection is owned and closed by its caller).
 func (p *TunnelPool) Close() error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.closed {
-		return nil
-	}
-	p.closed = true
-	close(p.closedCh)
-
-	for _, pc := range p.connections {
-		pc.Conn.Close()
-	}
-	p.connections = nil
-
 	log.Info("Pool: closed")
 	return nil
 }
@@ -374,7 +210,6 @@ func (p *TunnelPool) Close() error {
 // Errors
 var (
 	ErrPoolExhausted = &poolError{"pool exhausted"}
-	ErrPoolClosed    = &poolError{"pool closed"}
 )
 
 type poolError struct {

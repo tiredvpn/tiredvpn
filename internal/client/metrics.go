@@ -314,15 +314,9 @@ func (m *ClientMetrics) Handler() http.HandlerFunc {
 
 		// Pool stats
 		if m.tunnelPool != nil {
-			total, idle := m.tunnelPool.Stats()
-			fmt.Fprintf(w, "# HELP tiredvpn_local_pool_total Total connections in pool\n")
+			fmt.Fprintf(w, "# HELP tiredvpn_local_pool_total Total live connections handed out by the pool\n")
 			fmt.Fprintf(w, "# TYPE tiredvpn_local_pool_total gauge\n")
-			fmt.Fprintf(w, "tiredvpn_local_pool_total %d\n", total)
-			fmt.Fprintf(w, "\n")
-
-			fmt.Fprintf(w, "# HELP tiredvpn_local_pool_idle Idle connections in pool\n")
-			fmt.Fprintf(w, "# TYPE tiredvpn_local_pool_idle gauge\n")
-			fmt.Fprintf(w, "tiredvpn_local_pool_idle %d\n", idle)
+			fmt.Fprintf(w, "tiredvpn_local_pool_total %d\n", m.tunnelPool.Stats())
 			fmt.Fprintf(w, "\n")
 		}
 

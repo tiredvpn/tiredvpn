@@ -85,11 +85,9 @@ func readTarget(t *testing.T, server net.Conn) string {
 // background cleanup loop.
 func newTestPool(c Connector) *TunnelPool {
 	return &TunnelPool{
-		config:      DefaultConfig(),
-		manager:     c,
-		serverAddr:  "test-server:443",
-		connections: make([]*PooledConn, 0),
-		closedCh:    make(chan struct{}),
+		config:     DefaultConfig(),
+		manager:    c,
+		serverAddr: "test-server:443",
 	}
 }
 
