@@ -656,6 +656,18 @@ func (m *Manager) Connect(ctx context.Context, target string) (net.Conn, Strateg
 		target = m.replacePort(target, m.portHopper.CurrentPort())
 	}
 
+	// Mux fast-path: if mux is enabled and a live session already exists, open a
+	// new stream on it and return immediately - do NOT dial a fresh transport.
+	// Without this, every call (e.g. every proxy CONNECT routed through
+	// pool.DialTarget) unconditionally completes a full REALITY handshake below,
+	// which wrapWithMux then discards in its reuse branch. That orphaned transport
+	// is never used nor closed, so it hangs pre-auth on the server (goroutine +
+	// peek-buffer + admission slot) until probeReadDeadline, and under a busy
+	// client the accumulation outpaces reclamation -> server OOM.
+	if stream, strat, ok := m.tryMuxFastPath(); ok {
+		return stream, strat, nil
+	}
+
 	// Pre-flight connectivity check
 	m.mu.RLock()
 	checker := m.connectivityChecker
@@ -1553,6 +1565,50 @@ func (m *Manager) IsMuxEnabled() bool {
 	return m.muxEnabled
 }
 
+// tryMuxFastPath opens a stream on the existing mux session, if mux is enabled
+// and the session is alive, without dialing a new transport. It returns the
+// stream, the last successful strategy (for logging/metrics parity with the full
+// path) and true on success. On a dead session it tears the session down and
+// returns false so the caller falls through to a full dial. When mux is disabled
+// or no session exists it returns false.
+func (m *Manager) tryMuxFastPath() (net.Conn, Strategy, bool) {
+	m.muxMu.Lock()
+	if !m.muxEnabled || m.muxClient == nil || m.muxClient.IsClosed() {
+		m.muxMu.Unlock()
+		return nil, nil, false
+	}
+
+	// Trigger budget recycling if the carrier exceeded its byte limit; new
+	// streams keep flowing on the current carrier until the swap completes.
+	if m.muxClient.BudgetExceeded() && !m.recyclingInProgress {
+		m.recyclingInProgress = true
+		go m.performBudgetRecycling()
+	}
+
+	stream, err := m.muxClient.OpenStream()
+	if err != nil {
+		// Session is dead - tear it down and let the caller do a full dial.
+		log.Debug("Mux fast-path: existing session failed, recreating: %v", err)
+		m.muxClient.Close()
+		m.muxClient = nil
+		if m.muxConn != nil {
+			m.muxConn.Close()
+			m.muxConn = nil
+		}
+		m.muxMu.Unlock()
+		return nil, nil, false
+	}
+	active := m.muxClient.NumStreams()
+	m.muxMu.Unlock()
+
+	m.mu.RLock()
+	strat := m.lastSuccessfulStrategy
+	m.mu.RUnlock()
+
+	log.Debug("Mux fast-path: stream on existing session, no new dial (active=%d)", active)
+	return stream, strat, true
+}
+
 // wrapWithMux wraps a connection with mux layer and opens a stream
 // If an existing mux session is available and not closed, reuse it
 func (m *Manager) wrapWithMux(conn net.Conn, config *mux.Config) (net.Conn, error) {
@@ -1569,6 +1625,14 @@ func (m *Manager) wrapWithMux(conn net.Conn, config *mux.Config) (net.Conn, erro
 		}
 		stream, err := m.muxClient.OpenStream()
 		if err == nil {
+			// The passed-in conn is a freshly dialed transport that this reuse
+			// branch does not adopt (m.muxConn stays on the live carrier). Close
+			// it, otherwise it is orphaned: never written to, it hangs pre-auth on
+			// the server and piles up until OOM. Belt-and-suspenders behind the
+			// Connect() fast-path, which normally avoids the dial entirely.
+			if conn != nil && conn != m.muxConn {
+				conn.Close()
+			}
 			log.Debug("Mux stream opened on existing session (active=%d)", m.muxClient.NumStreams())
 			return stream, nil
 		}

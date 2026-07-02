@@ -7,6 +7,12 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.18] - 2026-07-03
+
+### Fixed
+
+- **Server OOM crash loop driven by orphaned mux dials.** With mux enabled, every call into the strategy manager (notably every proxy CONNECT routed through the connection pool, which deliberately opens one tunnel per request) unconditionally completed a full REALITY handshake before checking whether the shared mux session was still alive. When it was, the manager multiplexed a new stream onto the existing carrier and silently discarded the freshly dialed transport without closing it. That orphaned connection was never written to, so the server classified it as an unfinished handshake and held it pre-auth (goroutine + peek buffer + admission slot) until the probe deadline. Under a busy client the orphans accumulated faster than they were reaped, ballooning server memory until the OOM killer reaped the process — tearing down every tunnel and triggering a reconnect storm. The manager now opens a stream on a live mux session before dialing anything, skipping the throwaway handshake entirely; as a safety net, the session-reuse path also closes any connection it does not adopt. No orphaned pre-auth connections, so a busy mux client no longer drives the exit node into OOM.
+
 ## [1.3.17] - 2026-07-01
 
 ### Fixed
