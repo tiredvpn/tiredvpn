@@ -233,8 +233,13 @@ func (s *HTTP2StegoStrategy) Connect(ctx context.Context, target string) (net.Co
 	// Create steganographic connection with padding mode
 	stegoConn := NewHTTP2StegoConn(finalConn, s.secret, true, s.paddingMode)
 
-	// Perform initial handshake
-	if err := stegoConn.Handshake(); err != nil {
+	// Perform initial handshake, bounded by the caller's context so a
+	// non-responding server can't hold this strategy past the strategy
+	// manager's own per-attempt timeout (waitForServerAck used a hardcoded
+	// 30s deadline regardless of ctx, which on Android - connectTimeout=10s -
+	// let one stalled HTTP/2-stego attempt block the entire sequential
+	// strategy race for up to 30s).
+	if err := stegoConn.HandshakeContext(ctx); err != nil {
 		conn.Close()
 		return nil, err
 	}
@@ -324,6 +329,15 @@ func NewHTTP2StegoConn(conn net.Conn, secret []byte, isClient bool, paddingMode 
 
 // Handshake performs HTTP/2 connection preface and initial exchange
 func (sc *HTTP2StegoConn) Handshake() error {
+	return sc.HandshakeContext(context.Background())
+}
+
+// HandshakeContext is Handshake with a caller-supplied deadline. If ctx has a
+// deadline earlier than the default 30s server-ack wait, that earlier
+// deadline wins - so a strategy manager racing multiple strategies with a
+// shorter per-attempt timeout (e.g. Android's connectTimeout) can actually
+// cut this strategy off instead of it silently running past the race.
+func (sc *HTTP2StegoConn) HandshakeContext(ctx context.Context) error {
 	if sc.isClient {
 		// Send HTTP/2 connection preface
 		_, err := sc.Conn.Write([]byte(http2.ClientPreface))
@@ -343,7 +357,7 @@ func (sc *HTTP2StegoConn) Handshake() error {
 		}
 
 		// Wait for server response
-		return sc.waitForServerAck()
+		return sc.waitForServerAck(ctx)
 	}
 
 	// Server side handshake
@@ -389,9 +403,15 @@ func (sc *HTTP2StegoConn) sendCovertHandshake() error {
 	})
 }
 
-// waitForServerAck waits for server acknowledgment
-func (sc *HTTP2StegoConn) waitForServerAck() error {
-	sc.SetReadDeadline(time.Now().Add(30 * time.Second))
+// waitForServerAck waits for server acknowledgment. The read deadline is
+// 30s by default, but shrinks to ctx's deadline when the caller asked for
+// less - see HandshakeContext.
+func (sc *HTTP2StegoConn) waitForServerAck(ctx context.Context) error {
+	deadline := time.Now().Add(30 * time.Second)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	sc.SetReadDeadline(deadline)
 	defer sc.SetReadDeadline(time.Time{})
 
 	for {

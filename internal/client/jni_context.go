@@ -22,14 +22,7 @@ func RunWithContext(ctx context.Context, cfg *Config) error {
 	}
 
 	// Try environment variable for secret
-	secret := cfg.Secret
-	if secret == "" {
-		secret = os.Getenv("TIREDVPN_SECRET")
-	}
-	if secret == "" {
-		log.Warn("No secret provided - using default (INSECURE!)")
-		secret = "default-secret-change-me"
-	}
+	secret := resolveSecret(cfg)
 	cfg.Secret = secret
 
 	if cfg.Debug {
@@ -42,37 +35,21 @@ func RunWithContext(ctx context.Context, cfg *Config) error {
 	}
 
 	// Apply defaults for adaptive config
-	if cfg.ReprobeInterval == 0 {
-		cfg.ReprobeInterval = 5 * 60 * 1000000000 // 5 minutes in nanoseconds
+	applyAdaptiveDefaults(cfg)
+
+	// Build the strategy manager the same way the non-JNI entrypoint does
+	// (buildManager sets AndroidMode/ECH/QUIC-SNI-frag/PQ/port-hopping/shaper
+	// on the manager config and wires up the connectivity checker). This
+	// used to be duplicated here with a hand-rolled DefaultManagerConfig that
+	// silently dropped AndroidMode and half the other flags - on Android that
+	// meant the manager never applied the android-mode timeout/retry/QUIC
+	// deprioritization, so QUIC strategies (dead on QUIC-less servers) were
+	// tried first with full 30s/2-retry timeouts before any TCP strategy got
+	// a chance, blowing past the control-socket's client-side read timeout.
+	mgr, err := buildManager(cfg, secret)
+	if err != nil {
+		return err
 	}
-	if cfg.CircuitThreshold == 0 {
-		cfg.CircuitThreshold = 3
-	}
-	if cfg.CircuitResetTime == 0 {
-		cfg.CircuitResetTime = 5 * 60 * 1000000000 // 5 minutes
-	}
-
-	// Create strategy manager
-	mgrCfg := strategy.DefaultManagerConfig{
-		ServerAddr: cfg.ServerAddr,
-		Secret:     []byte(cfg.Secret),
-		CoverHost:  cfg.CoverHost,
-
-		// IPv6 transport
-		ServerAddrV6: cfg.ServerAddrV6,
-		PreferIPv6:   cfg.PreferIPv6,
-		FallbackToV4: cfg.FallbackToV4,
-
-		// QUIC
-		QUICEnabled: cfg.QUICEnabled,
-		QUICPort:    cfg.QUICPort,
-
-		// RTT Masking
-		RTTMaskingEnabled: cfg.RTTMaskingEnabled,
-		RTTProfile:        nil, // Will be set based on network conditions
-	}
-
-	mgr := strategy.NewDefaultManager(mgrCfg)
 
 	log.Info("TiredVPN Client (JNI mode) starting...")
 	log.Info("Server: %s", cfg.ServerAddr)
