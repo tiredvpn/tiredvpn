@@ -7,6 +7,13 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.19] - 2026-07-03
+
+### Fixed
+
+- **Android client stuck negotiating against a `-no-quic` server.** The Android JNI entrypoint built its own strategy config by hand instead of reusing the shared config builder, so it silently dropped `AndroidMode`. Without it, the strategy race never deprioritized QUIC, and dead QUIC/QUIC-Salamander attempts (no UDP listener on a `-no-quic` exit node) sorted first and burned the connect budget before the race ever reached a working strategy like REALITY. Android now builds its strategy config the same way the CLI client does.
+- **HTTP/2-stego handshake ignoring the caller's timeout.** The stego handshake's server-ack wait used a hardcoded 30s deadline regardless of context, so one non-responding attempt could block the entire strategy race longer than the client's own per-attempt timeout. The wait now honors the caller's context deadline when it's shorter than 30s. Server-side behavior is unchanged.
+
 ## [1.3.18] - 2026-07-03
 
 ### Fixed
