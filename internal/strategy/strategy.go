@@ -1812,13 +1812,21 @@ func (m *Manager) TriggerEmergencyReprobe(ctx context.Context) {
 
 				log.Info("Emergency reprobe attempt %d/%d...", attempt, maxAttempts)
 
-				// Reset all circuit breakers to give strategies a fresh chance
+				// Give strategies a fresh chance without wiping accumulated
+				// failure history: only circuits already Open are nudged into
+				// half-open so the next dial gets a graduated-recovery test.
+				// A blind Reset() here would erase the failure window exactly
+				// when it matters most (and is unnecessary - ProbeAll below
+				// probes every strategy regardless of circuit state).
 				m.mu.Lock()
+				nudged := 0
 				for _, s := range m.strategies {
-					cb := m.circuitBreakers.Get(s.ID())
-					cb.Reset()
+					if m.circuitBreakers.Get(s.ID()).AllowRecoveryProbe() {
+						nudged++
+					}
 				}
 				m.mu.Unlock()
+				log.Debug("Emergency reprobe: nudged %d open circuit(s) into half-open", nudged)
 
 				// Probe all strategies
 				reprobeCtx, cancel := context.WithTimeout(ctx, 45*time.Second)

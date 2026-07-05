@@ -389,6 +389,28 @@ func (cb *CircuitBreaker) Reset() {
 	cb.networkDown = false
 }
 
+// AllowRecoveryProbe gives an Open circuit an immediate chance to recover
+// without erasing accumulated failure history. Only a circuit currently in the
+// Open state is nudged into HalfOpen, bypassing the remaining backoff timer so
+// the next request is allowed as a graduated-recovery test. Closed/HalfOpen
+// circuits, and all recorded statistics (window, RTT samples, consecutiveFail,
+// openCount/backoff), are left untouched so a repeated failure re-opens with the
+// backoff progression intact. Returns true if the circuit was nudged.
+func (cb *CircuitBreaker) AllowRecoveryProbe() bool {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	if cb.state != CircuitOpen {
+		return false
+	}
+
+	cb.state = CircuitHalfOpen
+	cb.halfOpenCount = 0
+	cb.halfOpenSuccess = 0
+	cb.lastStateChange = time.Now()
+	return true
+}
+
 // Stats returns current circuit breaker statistics
 func (cb *CircuitBreaker) Stats() CircuitStats {
 	cb.mu.RLock()
