@@ -74,7 +74,17 @@ func (s *WebSocketPaddedStrategy) Description() string {
 
 // Probe tests if WebSocket Padded strategy is likely to work
 func (s *WebSocketPaddedStrategy) Probe(ctx context.Context, target string) error {
-	// WebSocket is always available if we have a server
+	// Shallow reachability check: a plain TCP connect against the same address
+	// Connect uses (no TLS, no WebSocket upgrade). A full handshake here,
+	// multiplied across ProbeAll's parallel strategies and periodic reprobes,
+	// would trip server admission control.
+	serverAddr := s.manager.GetServerAddr(ctx)
+	dialer := &net.Dialer{Timeout: 3 * time.Second}
+	conn, err := dialer.DialContext(ctx, "tcp", serverAddr)
+	if err != nil {
+		return err
+	}
+	conn.Close()
 	return nil
 }
 

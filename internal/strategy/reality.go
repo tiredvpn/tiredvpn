@@ -187,7 +187,17 @@ func (r *REALITYStrategy) Description() string {
 
 // Probe tests if REALITY strategy is likely to work
 func (r *REALITYStrategy) Probe(ctx context.Context, target string) error {
-	// REALITY is always available if we have a server
+	// Shallow reachability check: a plain TCP connect against the same address
+	// Connect uses (no TLS, no REALITY handshake). A full REALITY handshake here,
+	// multiplied across ProbeAll's parallel strategies and periodic reprobes,
+	// would hammer server admission control and defeat the point of probing.
+	serverAddr := r.manager.GetServerAddr(ctx)
+	dialer := &net.Dialer{Timeout: 3 * time.Second}
+	conn, err := dialer.DialContext(ctx, "tcp", serverAddr)
+	if err != nil {
+		return err
+	}
+	conn.Close()
 	return nil
 }
 

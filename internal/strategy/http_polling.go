@@ -83,7 +83,18 @@ func (s *HTTPPollingStrategy) Description() string {
 }
 
 func (s *HTTPPollingStrategy) Probe(ctx context.Context, target string) error {
-	return nil // Always available if server supports it
+	// Shallow reachability check: a plain TCP connect against the same address
+	// Connect uses (no TLS, no HTTP request). A full request here, multiplied
+	// across ProbeAll's parallel strategies and periodic reprobes, would trip
+	// server admission control.
+	serverAddr := s.manager.GetServerAddr(ctx)
+	dialer := &net.Dialer{Timeout: 3 * time.Second}
+	conn, err := dialer.DialContext(ctx, "tcp", serverAddr)
+	if err != nil {
+		return err
+	}
+	conn.Close()
+	return nil
 }
 
 // Connect establishes HTTP polling tunnel
