@@ -313,6 +313,46 @@ func TestDefaultManagerConfig(t *testing.T) {
 	}
 }
 
+// hasICMPTunnel reports whether the ICMP tunnel strategy is registered on m.
+func hasICMPTunnel(m *Manager) bool {
+	for _, s := range m.GetOrderedStrategies() {
+		if s.ID() == "icmp_tunnel" {
+			return true
+		}
+	}
+	return false
+}
+
+// TestICMPTunnelRegistrationGated verifies the ICMP tunnel strategy is only
+// registered when ICMPTunnelEnabled is set (plus server+secret present).
+func TestICMPTunnelRegistrationGated(t *testing.T) {
+	base := DefaultManagerConfig{
+		ServerAddr: "server:443",
+		Secret:     []byte("test-secret"),
+		CoverHost:  "api.googleapis.com",
+	}
+
+	// Disabled (default): must NOT register.
+	if m := NewDefaultManager(base); hasICMPTunnel(m) {
+		t.Error("ICMP tunnel registered while ICMPTunnelEnabled=false")
+	}
+
+	// Enabled: must register.
+	enabled := base
+	enabled.ICMPTunnelEnabled = true
+	if m := NewDefaultManager(enabled); !hasICMPTunnel(m) {
+		t.Error("ICMP tunnel not registered while ICMPTunnelEnabled=true")
+	}
+
+	// Enabled but no secret: must NOT register (raw socket needs auth material).
+	noSecret := base
+	noSecret.ICMPTunnelEnabled = true
+	noSecret.Secret = nil
+	if m := NewDefaultManager(noSecret); hasICMPTunnel(m) {
+		t.Error("ICMP tunnel registered without a secret")
+	}
+}
+
 // TestStrategyPrintSummary tests summary printing
 func TestStrategyPrintSummary(t *testing.T) {
 	m := NewManager()

@@ -1130,6 +1130,9 @@ type DefaultManagerConfig struct {
 	QUICSalamanderEnabled bool // Enable QUIC with Salamander obfuscation
 	QUICSalamanderPort    int  // QUIC Salamander port (default: 8443)
 
+	// ICMP tunnel configuration (backup transport, requires CAP_NET_RAW)
+	ICMPTunnelEnabled bool // Enable ICMP tunnel strategy (off by default)
+
 	// REALITY configuration
 	REALITYEnabled bool // Enable REALITY protocol (99.5% success rate)
 
@@ -1266,6 +1269,17 @@ func registerAllStrategies(m *Manager, cfg DefaultManagerConfig) {
 	registerSSHCamouflage(m, cfg, hasServer, hasSecret)
 	registerIMAPCamouflage(m, cfg, hasServer, hasSecret)
 	registerGenevaStrategies(m, cfg, hasServer, hasSecret)
+	registerICMPStrategy(m, cfg, hasServer, hasSecret)
+}
+
+// registerICMPStrategy registers the ICMP tunnel backup strategy.
+// Off by default: opening a raw ICMP socket needs CAP_NET_RAW, so it is only
+// wired in when the client explicitly opts in via -icmp-tunnel.
+func registerICMPStrategy(m *Manager, cfg DefaultManagerConfig, hasServer, hasSecret bool) {
+	if !cfg.ICMPTunnelEnabled || !hasServer || !hasSecret {
+		return
+	}
+	m.Register(NewICMPTunnelStrategy(cfg.ServerAddr, cfg.Secret))
 }
 
 // registerSSHCamouflage registers the SSH camouflage strategy.

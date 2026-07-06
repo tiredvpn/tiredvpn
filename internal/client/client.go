@@ -84,6 +84,9 @@ type Config struct {
 	QUICEnabled bool // Enable QUIC strategy
 	QUICPort    int  // QUIC server port (default 8443)
 
+	// ICMP tunnel (backup transport, requires CAP_NET_RAW)
+	ICMPTunnelEnabled bool // Enable ICMP tunnel strategy
+
 	// RTT Masking
 	RTTMaskingEnabled bool   // Enable RTT masking
 	RTTProfile        string // RTT profile name
@@ -248,6 +251,7 @@ func buildManager(cfg *Config, secret string) (*strategy.Manager, error) {
 		RTTProfile:         rttProfile,
 		QUICEnabled:        cfg.QUICEnabled,
 		QUICPort:           cfg.QUICPort,
+		ICMPTunnelEnabled:  cfg.ICMPTunnelEnabled,
 		ECHEnabled:         cfg.ECHEnabled,
 		ECHConfigList:      echConfigList,
 		ECHPublicName:      cfg.ECHPublicName,

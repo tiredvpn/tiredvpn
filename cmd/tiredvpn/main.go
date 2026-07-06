@@ -293,6 +293,10 @@ ADVANCED EVASION:
   -cover string
         Cover host for traffic mimicry (default "api.googleapis.com")
 
+ICMP TUNNEL (backup transport):
+  -icmp-tunnel
+        Enable ICMP tunnel backup strategy (requires CAP_NET_RAW; server must run with -enable-icmp)
+
 ADAPTIVE STRATEGY:
   -reprobe-interval duration
         How often to re-probe strategies (default 5m0s)
@@ -495,6 +499,9 @@ func runClient(args []string) {
 	// QUIC transport flags
 	fs.BoolVar(&cfg.QUICEnabled, "quic", false, "Enable QUIC transport (highest priority, hardest to block)")
 	fs.IntVar(&cfg.QUICPort, "quic-port", 8443, "QUIC server port")
+
+	// ICMP tunnel (backup transport, requires CAP_NET_RAW)
+	fs.BoolVar(&cfg.ICMPTunnelEnabled, "icmp-tunnel", false, "Enable ICMP tunnel backup strategy (requires CAP_NET_RAW; server must run with -enable-icmp)")
 
 	// RTT Masking flags
 	fs.BoolVar(&cfg.RTTMaskingEnabled, "rtt-masking", false, "Enable RTT masking (hides proxy timing signature)")
