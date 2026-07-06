@@ -228,18 +228,16 @@ func TestConnectWithRTT_AllFailTriggersEmergencyReprobe(t *testing.T) {
 	m.StopEmergencyReprobe() // stop the background goroutine
 }
 
-// TestConnectWithRTT_ExhaustedStrategyCircuitBreakerBaseline pins the CURRENT
-// (over-counting) behaviour so a later fix (task zze) has a baseline to change.
+// TestConnectWithRTT_ExhaustedStrategyCircuitBreakerBaseline verifies that the
+// double/triple-counting bug (task zze) is fixed: one exhausted strategy is
+// recorded in the circuit breaker exactly ONCE, regardless of maxRetries.
 //
-// For one exhausted strategy the circuit breaker is recorded maxRetries+1 times:
-//   - one RecordFailure per retry inside the retry loop (maxRetries records), plus
-//   - one more via updateConfidence(false) on exhaustion, which itself calls
-//     RecordFailure.
-//
-// With the default maxRetries=2 that is 3 circuit-breaker records for a single
-// logical strategy failure. This is the double/triple-counting bug; the number
-// asserted here is the baseline to be reduced by the follow-up fix, NOT desired
-// behaviour.
+// Before the fix the breaker was recorded maxRetries+1 times (one RecordFailure
+// per retry inside the retry loop, plus one more via updateConfidence(false) on
+// exhaustion) - 3 records for a single logical failure with the default
+// maxRetries=2. Now the retry loop no longer writes to the breaker and
+// exhaustion records a single failure, while the confidence EMA is still updated
+// on every attempt.
 func TestConnectWithRTT_ExhaustedStrategyCircuitBreakerBaseline(t *testing.T) {
 	m := newTestManager() // maxRetries = 2
 	bad := &mockStrategy{id: "bad", priority: 1, connectErr: errors.New("connection refused")}
@@ -256,17 +254,28 @@ func TestConnectWithRTT_ExhaustedStrategyCircuitBreakerBaseline(t *testing.T) {
 
 	stats := m.circuitBreakers.Get("bad").Stats()
 
-	const baselineRecords = 3 // maxRetries(2) retry-loop records + 1 updateConfidence record
+	// One logical strategy failure = one circuit-breaker record, independent of
+	// the internal retry count (maxRetries=2 here).
+	const baselineRecords = 1
 	if stats.WindowSamples != baselineRecords {
-		t.Errorf("BASELINE circuit-breaker records per exhausted strategy = %d, expected %d "+
-			"(if this changed, the double-counting fix in task zze landed - update the baseline)",
-			stats.WindowSamples, baselineRecords)
+		t.Errorf("circuit-breaker records per exhausted strategy = %d, expected %d "+
+			"(retry count is %d; a single logical failure must count once)",
+			stats.WindowSamples, baselineRecords, m.maxRetries)
 	}
 	if stats.ConsecutiveFail != baselineRecords {
-		t.Errorf("BASELINE consecutive failures = %d, expected %d",
+		t.Errorf("consecutive failures = %d, expected %d",
 			stats.ConsecutiveFail, baselineRecords)
 	}
-	t.Logf("BASELINE: one exhausted strategy => %d circuit-breaker failure records "+
-		"(%d retry-loop + 1 updateConfidence); target for task zze is %d",
-		stats.WindowSamples, m.maxRetries, m.maxRetries)
+
+	// Confidence EMA must still reflect every failed attempt honestly: the
+	// per-strategy result records one failure per exhausted strategy.
+	m.mu.RLock()
+	failureCount := m.results["bad"].FailureCount
+	m.mu.RUnlock()
+	if failureCount != 1 {
+		t.Errorf("confidence stats FailureCount = %d, expected 1", failureCount)
+	}
+
+	t.Logf("one exhausted strategy => %d circuit-breaker record (maxRetries=%d): double-counting fixed",
+		stats.WindowSamples, m.maxRetries)
 }

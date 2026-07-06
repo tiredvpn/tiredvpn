@@ -520,8 +520,27 @@ func (m *Manager) updateConfidence(id string, success bool) {
 	m.updateConfidenceWithLatency(id, success, 0)
 }
 
-// updateConfidenceWithLatency adjusts confidence with latency tracking
+// updateConfidenceWithLatency updates the confidence stats/EMA and records the
+// outcome in the circuit breaker exactly once.
 func (m *Manager) updateConfidenceWithLatency(id string, success bool, latency time.Duration) {
+	m.updateConfidenceStats(id, success, latency)
+	if success {
+		// Record success in circuit breaker (with RTT for adaptive thresholds)
+		if latency > 0 {
+			m.circuitBreakers.RecordSuccessWithRTT(id, latency)
+		} else {
+			m.circuitBreakers.RecordSuccess(id)
+		}
+	} else {
+		m.circuitBreakers.RecordFailure(id)
+	}
+}
+
+// updateConfidenceStats updates the confidence EMA and per-strategy statistics
+// WITHOUT recording anything in the circuit breaker. Callers that record the
+// circuit-breaker outcome themselves (e.g. the connect retry loop, which counts
+// one logical strategy failure once) use this to avoid double-counting.
+func (m *Manager) updateConfidenceStats(id string, success bool, latency time.Duration) {
 	r, ok := m.results[id]
 	if !ok {
 		return
@@ -539,18 +558,10 @@ func (m *Manager) updateConfidenceWithLatency(id string, success bool, latency t
 			r.LatencyCount++
 			r.AvgLatency = r.LatencySum / time.Duration(r.LatencyCount)
 		}
-		// Record success in circuit breaker (with RTT for adaptive thresholds)
-		if latency > 0 {
-			m.circuitBreakers.RecordSuccessWithRTT(id, latency)
-		} else {
-			m.circuitBreakers.RecordSuccess(id)
-		}
 	} else {
 		r.FailureCount++
 		r.ConsecutiveFail++
 		r.LastFailure = now
-		// Record failure in circuit breaker
-		m.circuitBreakers.RecordFailure(id)
 	}
 
 	// Base: Exponential moving average
@@ -933,6 +944,10 @@ func (m *Manager) connectWithRTT(ctx context.Context, target string, excludeIDs 
 		log.Debug("Trying strategy %d/%d: %s (confidence=%.2f)%s",
 			i+1, len(strategies), s.Name(), confidence, modeStr)
 
+		// Tracks whether the strategy's final failing attempt was a timeout, so
+		// the single circuit-breaker record on exhaustion reflects the right
+		// outcome (timeouts are treated more aggressively by the breaker).
+		strategyTimedOut := false
 		for retry := 0; retry < m.maxRetries; retry++ {
 			attemptCount++
 			log.Debug("  Attempt %d/%d for %s", retry+1, m.maxRetries, s.Name())
@@ -976,10 +991,13 @@ func (m *Manager) connectWithRTT(ctx context.Context, target string, excludeIDs 
 
 			lastErr = fmt.Errorf("%s: %w", s.Name(), err)
 
-			// Distinguish between timeout and regular errors
+			// Distinguish between timeout and regular errors. The circuit
+			// breaker is NOT recorded per retry here - it is recorded once when
+			// the strategy is exhausted, so one logical failure counts once
+			// regardless of maxRetries.
 			if isTimeoutError(err) {
 				log.Debug("  Failed: %s TIMEOUT (latency=%v)", s.Name(), latency)
-				m.circuitBreakers.RecordTimeout(s.ID())
+				strategyTimedOut = true
 
 				// Track TCP timeouts for Android fast fallback
 				if androidMode && !isUDPBasedStrategy(s) {
@@ -993,7 +1011,7 @@ func (m *Manager) connectWithRTT(ctx context.Context, target string, excludeIDs 
 				}
 			} else {
 				log.Debug("  Failed: %v (latency=%v)", err, latency)
-				m.circuitBreakers.RecordFailure(s.ID())
+				strategyTimedOut = false
 			}
 
 			// Brief pause before retry
@@ -1005,9 +1023,18 @@ func (m *Manager) connectWithRTT(ctx context.Context, target string, excludeIDs 
 			}
 		}
 
-		// Strategy exhausted all retries - update confidence
+		// Strategy exhausted all retries - update confidence EMA and record
+		// exactly one circuit-breaker failure for the whole strategy attempt.
+		// The retry loop no longer writes to the breaker, so a single logical
+		// strategy failure counts once (as timeout or failure) regardless of
+		// maxRetries. Confidence EMA is still updated honestly on every attempt.
 		m.mu.Lock()
-		m.updateConfidence(s.ID(), false)
+		m.updateConfidenceStats(s.ID(), false, 0)
+		if strategyTimedOut {
+			m.circuitBreakers.RecordTimeout(s.ID())
+		} else {
+			m.circuitBreakers.RecordFailure(s.ID())
+		}
 		m.mu.Unlock()
 
 		log.Debug("Strategy %s exhausted, moving to next", s.Name())
