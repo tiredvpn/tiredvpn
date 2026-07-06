@@ -3811,6 +3811,13 @@ func detectConfusionMagic(data []byte) bool {
 	return false
 }
 
+// authClockSkewGraceMinutes bounds how many 1-minute buckets on either side of
+// "now" verifyH2Auth/verifyMorphAuth accept, tolerating client/server clock
+// drift. REALITY tolerates roughly +-5 minutes via its own 5-minute bucket
+// scheme (internal/tls/reality_extension.go); matching that order of magnitude
+// here fixes clients whose clock drifts by more than the original 1 minute.
+const authClockSkewGraceMinutes int64 = 10
+
 func verifyH2Auth(apiKey, requestID string, secret []byte) bool {
 	// Decode hex values
 	apiKeyBytes := decodeHex(apiKey)
@@ -3823,9 +3830,12 @@ func verifyH2Auth(apiKey, requestID string, secret []byte) bool {
 	// Reconstruct token
 	receivedToken := append(apiKeyBytes[:16], requestIDBytes[:16]...)
 
-	// Check timestamps in range [-1, 0, +1] minutes to handle clock skew
+	// Check timestamps in range [-authClockSkewGraceMinutes, +authClockSkewGraceMinutes]
+	// to handle clock skew (widened from the original +-1 minute, which rejected
+	// clients with more than ~60s of drift - see REALITY's +-5min bucket for the
+	// same tolerance class).
 	currentMinute := time.Now().Unix() / 60
-	for offset := int64(-1); offset <= 1; offset++ {
+	for offset := -authClockSkewGraceMinutes; offset <= authClockSkewGraceMinutes; offset++ {
 		timestamp := make([]byte, 8)
 		binary.BigEndian.PutUint64(timestamp, uint64(currentMinute+offset))
 
@@ -3846,9 +3856,12 @@ func verifyMorphAuth(receivedToken, secret []byte) bool {
 		return false
 	}
 
-	// Check timestamps in range [-1, 0, +1] minutes to handle clock skew
+	// Check timestamps in range [-authClockSkewGraceMinutes, +authClockSkewGraceMinutes]
+	// to handle clock skew (widened from the original +-1 minute - prod measured
+	// 509 FAILED/7 OK over 7 days, traced to clients with clock drift beyond the
+	// old +-1min window; REALITY tolerates ~+-5min via its own bucket scheme).
 	currentMinute := time.Now().Unix() / 60
-	for offset := int64(-1); offset <= 1; offset++ {
+	for offset := -authClockSkewGraceMinutes; offset <= authClockSkewGraceMinutes; offset++ {
 		timestamp := make([]byte, 8)
 		binary.BigEndian.PutUint64(timestamp, uint64(currentMinute+offset))
 
