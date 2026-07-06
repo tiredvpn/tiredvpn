@@ -724,6 +724,146 @@ func BenchmarkCircuitBreaker_RecordFailure(b *testing.B) {
 	}
 }
 
+// TestCircuitBreaker_AllowRecoveryProbe_PreservesHistory verifies that the
+// emergency-reprobe nudge moves an Open circuit into half-open WITHOUT erasing
+// the accumulated real failure history (window, consecutiveFail, backoff).
+func TestCircuitBreaker_AllowRecoveryProbe_PreservesHistory(t *testing.T) {
+	cfg := DefaultCircuitBreakerConfig()
+	cfg.FailureThreshold = 5
+	cfg.ResetTimeout = 10 * time.Millisecond
+	cb := NewCircuitBreaker(cfg)
+
+	// Accumulate a real failure history and open the circuit.
+	for i := 0; i < 6; i++ {
+		cb.RecordFailure()
+	}
+	if cb.State() != CircuitOpen {
+		t.Fatalf("expected Open after failures, got %s", cb.State())
+	}
+
+	// Re-open a second time to advance the exponential backoff progression:
+	// exhaust the half-open test budget with failures so the circuit re-opens
+	// with openCount=2 and a larger backoff.
+	time.Sleep(15 * time.Millisecond)
+	for i := 0; i < cfg.HalfOpenMax; i++ {
+		cb.Allow()
+		cb.RecordFailure()
+	}
+	if cb.State() != CircuitOpen {
+		t.Fatalf("expected Open after exhausting half-open budget, got %s", cb.State())
+	}
+
+	prevConsecutive := cb.consecutiveFail
+	prevWindow := len(cb.window)
+	prevOpenCount := cb.openCount
+	prevBackoff := cb.currentResetTimeout
+	if prevConsecutive == 0 || prevWindow == 0 || prevOpenCount < 2 {
+		t.Fatalf("test setup weak: consecutive=%d window=%d openCount=%d",
+			prevConsecutive, prevWindow, prevOpenCount)
+	}
+
+	// The emergency nudge: Open -> HalfOpen, history intact.
+	if !cb.AllowRecoveryProbe() {
+		t.Fatal("AllowRecoveryProbe should nudge an Open circuit")
+	}
+	if cb.State() != CircuitHalfOpen {
+		t.Errorf("expected HalfOpen after nudge, got %s", cb.State())
+	}
+
+	// Real failure history must NOT be blindly zeroed.
+	if cb.consecutiveFail != prevConsecutive {
+		t.Errorf("consecutiveFail wiped: got %d want %d", cb.consecutiveFail, prevConsecutive)
+	}
+	if len(cb.window) != prevWindow {
+		t.Errorf("failure window wiped: got %d want %d", len(cb.window), prevWindow)
+	}
+	if cb.openCount != prevOpenCount {
+		t.Errorf("openCount reset: got %d want %d", cb.openCount, prevOpenCount)
+	}
+	if cb.currentResetTimeout != prevBackoff {
+		t.Errorf("backoff reset: got %v want %v", cb.currentResetTimeout, prevBackoff)
+	}
+}
+
+// TestCircuitBreaker_AllowRecoveryProbe_SkipsNonOpen verifies the nudge only
+// touches Open circuits: Closed and HalfOpen are left as-is.
+func TestCircuitBreaker_AllowRecoveryProbe_SkipsNonOpen(t *testing.T) {
+	cb := NewCircuitBreaker(DefaultCircuitBreakerConfig())
+
+	// Closed: not nudged.
+	if cb.AllowRecoveryProbe() {
+		t.Error("should not nudge a Closed circuit")
+	}
+	if cb.State() != CircuitClosed {
+		t.Errorf("Closed circuit changed state to %s", cb.State())
+	}
+
+	// HalfOpen: not nudged (already recovering).
+	cfg := DefaultCircuitBreakerConfig()
+	cfg.FailureThreshold = 5
+	cfg.ResetTimeout = 10 * time.Millisecond
+	cb2 := NewCircuitBreaker(cfg)
+	for i := 0; i < 6; i++ {
+		cb2.RecordFailure()
+	}
+	time.Sleep(15 * time.Millisecond)
+	if !cb2.Allow() {
+		t.Fatal("expected half-open to allow a test request")
+	}
+	if cb2.State() != CircuitHalfOpen {
+		t.Fatalf("expected HalfOpen, got %s", cb2.State())
+	}
+	if cb2.AllowRecoveryProbe() {
+		t.Error("should not nudge a HalfOpen circuit")
+	}
+}
+
+// TestCircuitBreakerManager_EmergencyNudge_DoesNotWipeHistory mirrors the loop
+// that TriggerEmergencyReprobe now runs: iterate breakers and nudge only Open
+// ones. A breaker with real failure history must retain it.
+func TestCircuitBreakerManager_EmergencyNudge_DoesNotWipeHistory(t *testing.T) {
+	cfg := DefaultCircuitBreakerConfig()
+	cfg.FailureThreshold = 5
+	mgr := NewCircuitBreakerManager(cfg)
+
+	// "openStrat" accumulates real failures and opens.
+	for i := 0; i < 6; i++ {
+		mgr.RecordFailure("openStrat")
+	}
+	openCB := mgr.Get("openStrat")
+	if openCB.State() != CircuitOpen {
+		t.Fatalf("openStrat expected Open, got %s", openCB.State())
+	}
+	failHistory := openCB.consecutiveFail
+	windowLen := len(openCB.window)
+
+	// "healthyStrat" stays Closed.
+	healthyCB := mgr.Get("healthyStrat")
+
+	// Emulate the emergency loop.
+	ids := []string{"openStrat", "healthyStrat"}
+	nudged := 0
+	for _, id := range ids {
+		if mgr.Get(id).AllowRecoveryProbe() {
+			nudged++
+		}
+	}
+
+	if nudged != 1 {
+		t.Errorf("expected exactly 1 open circuit nudged, got %d", nudged)
+	}
+	if openCB.State() != CircuitHalfOpen {
+		t.Errorf("openStrat should be HalfOpen after nudge, got %s", openCB.State())
+	}
+	if openCB.consecutiveFail != failHistory || len(openCB.window) != windowLen {
+		t.Errorf("openStrat history wiped by emergency nudge: consecutiveFail %d->%d window %d->%d",
+			failHistory, openCB.consecutiveFail, windowLen, len(openCB.window))
+	}
+	if healthyCB.State() != CircuitClosed {
+		t.Errorf("healthyStrat should stay Closed, got %s", healthyCB.State())
+	}
+}
+
 func BenchmarkCircuitBreaker_RecordSuccessWithRTT(b *testing.B) {
 	cb := NewCircuitBreaker(DefaultCircuitBreakerConfig())
 	for i := 0; i < b.N; i++ {
