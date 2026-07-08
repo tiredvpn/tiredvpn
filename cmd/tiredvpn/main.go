@@ -187,6 +187,8 @@ ICMP TUNNEL:
 ADVANCED OPTIONS:
   -fake-root string
         Fake website root directory (default "./www")
+  -reality-cover-domain string
+        Operator-set hostname to transparently proxy unauthorized REALITY probes to (empty = drop)
   -tun-ip string
         TUN interface IP address for VPN server (default "10.8.0.1")
   -tun-name string
@@ -334,21 +336,40 @@ MONITORING:
         Show version`)
 }
 
-func runServer(args []string) {
-	fs := flag.NewFlagSet("server", flag.ExitOnError)
-	fs.Usage = printServerHelp
+// serverFlagOpts holds the server flags that need post-parse processing because
+// they don't live directly on server.Config (env fallbacks, unit conversion,
+// derived fields).
+type serverFlagOpts struct {
+	configPath      *string
+	secret          *string
+	tunIP           *string
+	pprofAddr       *string
+	portHopInterval *time.Duration
+	ipPoolLease     *time.Duration
+	noQUIC          *bool
+	showVersion     *bool
+}
 
-	cfg := &server.Config{}
+// registerServerFlags binds every server flag onto fs and cfg. It is split out
+// of runServer so the flag surface is unit-testable (guards against config keys
+// silently going dead, e.g. -reality-cover-domain).
+func registerServerFlags(fs *flag.FlagSet, cfg *server.Config) *serverFlagOpts {
+	opts := &serverFlagOpts{}
 
-	configPath := fs.String("config", "", "Path to TOML config (overrides defaults; CLI flags override TOML)")
+	opts.configPath = fs.String("config", "", "Path to TOML config (overrides defaults; CLI flags override TOML)")
 
 	fs.StringVar(&cfg.ListenAddr, "listen", ":443", "Listen address")
 	fs.StringVar(&cfg.CertFile, "cert", "server.crt", "TLS certificate file")
 	fs.StringVar(&cfg.KeyFile, "key", "server.key", "TLS key file")
-	secret := fs.String("secret", "", "Shared secret for authentication (single-client mode)")
+	opts.secret = fs.String("secret", "", "Shared secret for authentication (single-client mode)")
 	fs.StringVar(&cfg.FakeWebRoot, "fake-root", "./www", "Fake website root directory")
+	// Operator-set hostname that unauthorized REALITY probes are transparently
+	// proxied to (see reality.go handleREALITYUnauthorized). Empty = silently
+	// drop. Never sourced from the client's SNI, so there is no SSRF via a
+	// client-controlled hostname.
+	fs.StringVar(&cfg.REALITYCoverDomain, "reality-cover-domain", "", "Hostname to transparently proxy unauthorized REALITY probes to (operator-set, e.g. 'www.microsoft.com'); empty = silently drop. Never derived from client SNI.")
 	fs.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
-	tunIP := fs.String("tun-ip", "10.8.0.1", "TUN interface IP address for VPN server")
+	opts.tunIP = fs.String("tun-ip", "10.8.0.1", "TUN interface IP address for VPN server")
 	fs.StringVar(&cfg.TunName, "tun-name", "tiredvpn0", "TUN interface name")
 	fs.IntVar(&cfg.TunMTU, "tun-mtu", 1280, "TUN interface MTU (1280-9000)")
 	fs.StringVar(&cfg.RedisAddr, "redis", "", "Redis address for multi-client mode (e.g., localhost:6379)")
@@ -362,7 +383,7 @@ func runServer(args []string) {
 	// Port hopping flags
 	fs.StringVar(&cfg.PortRange, "port-range", "", "Port or range for multi-port listening (e.g., '995' or '47000-47100')")
 	fs.IntVar(&cfg.PortRangeMaxPorts, "port-range-max", 50, "Maximum number of ports to listen on when using range")
-	portHopInterval := fs.Duration("port-hop-interval", 60*time.Second, "Recommended hop interval for clients (transmitted during handshake)")
+	opts.portHopInterval = fs.Duration("port-hop-interval", 60*time.Second, "Recommended hop interval for clients (transmitted during handshake)")
 	fs.StringVar(&cfg.PortHopStrategy, "port-hop-strategy", "random", "Recommended hop strategy for clients: random, sequential, fibonacci")
 	fs.StringVar(&cfg.PortHopSeed, "port-hop-seed", "", "Optional seed for deterministic hopping (transmitted to clients)")
 
@@ -370,16 +391,16 @@ func runServer(args []string) {
 	fs.IntVar(&cfg.MaxConcurrentConns, "max-conns", 0, "Max concurrent in-flight incoming connections (0 = default 4096); excess connections are dropped to bound memory under DPI reconnect storms")
 
 	// Profiling
-	pprofAddr := fs.String("pprof", "", "Enable pprof profiling on address (e.g., :6060)")
+	opts.pprofAddr = fs.String("pprof", "", "Enable pprof profiling on address (e.g., :6060)")
 
 	// QUIC flags (enabled by default)
-	noQUIC := fs.Bool("no-quic", false, "Disable QUIC listener (UDP)")
+	opts.noQUIC = fs.Bool("no-quic", false, "Disable QUIC listener (UDP)")
 	fs.StringVar(&cfg.QUICListenAddr, "quic-listen", "", "QUIC listen address (default: same as -listen but UDP)")
 	fs.BoolVar(&cfg.QUICSNIFragReassembly, "quic-sni-reassembly", false, "Enable QUIC SNI fragment reassembly (for clients using -quic-sni-frag)")
 
 	// IP Pool flags for TUN mode
 	fs.StringVar(&cfg.IPPoolNetwork, "ip-pool", "", "IP pool CIDR for TUN clients (e.g., '10.8.0.0/24'). Enables auto IP assignment.")
-	ipPoolLease := fs.Duration("ip-pool-lease", 24*time.Hour, "IP lease duration (0 = permanent)")
+	opts.ipPoolLease = fs.Duration("ip-pool-lease", 24*time.Hour, "IP lease duration (0 = permanent)")
 
 	// IPv6 Transport flags
 	fs.StringVar(&cfg.ListenAddrV6, "listen-v6", "[::]:995", "IPv6 listen address")
@@ -389,18 +410,28 @@ func runServer(args []string) {
 	// ICMP tunnel
 	fs.BoolVar(&cfg.EnableICMP, "enable-icmp", false, "Enable ICMP tunnel listener (requires CAP_NET_RAW)")
 
-	showVersion := fs.Bool("version", false, "Show version")
+	opts.showVersion = fs.Bool("version", false, "Show version")
+
+	return opts
+}
+
+func runServer(args []string) {
+	fs := flag.NewFlagSet("server", flag.ExitOnError)
+	fs.Usage = printServerHelp
+
+	cfg := &server.Config{}
+	opts := registerServerFlags(fs, cfg)
 
 	fs.Parse(args)
 
-	if *showVersion {
+	if *opts.showVersion {
 		fmt.Printf("tiredvpn server %s\n", version)
 		os.Exit(0)
 	}
 
-	cfg.TunIP = net.ParseIP(*tunIP).To4()
+	cfg.TunIP = net.ParseIP(*opts.tunIP).To4()
 	if cfg.TunIP == nil {
-		fmt.Printf("Error: Invalid TUN IP address: %s\n", *tunIP)
+		fmt.Printf("Error: Invalid TUN IP address: %s\n", *opts.tunIP)
 		os.Exit(1)
 	}
 
@@ -409,7 +440,7 @@ func runServer(args []string) {
 		os.Exit(1)
 	}
 
-	cfg.Secret = []byte(*secret)
+	cfg.Secret = []byte(*opts.secret)
 	// Fall back to the TIREDVPN_SECRET env var when -secret is not given, so a
 	// systemd unit can pass the secret via EnvironmentFile instead of putting it
 	// on the command line (where it would show up in ps/cmdline). The error in
@@ -422,20 +453,20 @@ func runServer(args []string) {
 	if cfg.APIToken == "" {
 		cfg.APIToken = os.Getenv("TIREDVPN_API_TOKEN")
 	}
-	cfg.QUICEnabled = !*noQUIC // QUIC enabled by default
-	cfg.IPPoolLeaseTime = *ipPoolLease
-	cfg.PortHopInterval = *portHopInterval
+	cfg.QUICEnabled = !*opts.noQUIC // QUIC enabled by default
+	cfg.IPPoolLeaseTime = *opts.ipPoolLease
+	cfg.PortHopInterval = *opts.portHopInterval
 
-	if err := applyServerTOMLConfig(cfg, *configPath, fs); err != nil {
+	if err := applyServerTOMLConfig(cfg, *opts.configPath, fs); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 
 	// Start pprof server if enabled
-	if *pprofAddr != "" {
+	if *opts.pprofAddr != "" {
 		go func() {
-			fmt.Printf("pprof listening on %s\n", *pprofAddr)
-			if err := http.ListenAndServe(*pprofAddr, nil); err != nil {
+			fmt.Printf("pprof listening on %s\n", *opts.pprofAddr)
+			if err := http.ListenAndServe(*opts.pprofAddr, nil); err != nil {
 				fmt.Printf("pprof error: %v\n", err)
 			}
 		}()

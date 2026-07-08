@@ -18,6 +18,34 @@ func TestVersion_DefaultIsDev(t *testing.T) {
 	}
 }
 
+// TestRegisterServerFlags_REALITYCoverDomain guards issue #50.2: the
+// REALITYCoverDomain config field is consumed in reality.go but was never bound
+// to any flag, leaving it permanently empty (dead code). This asserts the
+// -reality-cover-domain flag wires an operator-set value onto Config.
+func TestRegisterServerFlags_REALITYCoverDomain(t *testing.T) {
+	cfg := &server.Config{}
+	fs := flag.NewFlagSet("server", flag.ContinueOnError)
+	registerServerFlags(fs, cfg)
+
+	// Default must stay empty (empty = silently drop; SSRF-safe no-op).
+	if err := fs.Parse(nil); err != nil {
+		t.Fatalf("parse (defaults): %v", err)
+	}
+	if cfg.REALITYCoverDomain != "" {
+		t.Fatalf("default REALITYCoverDomain = %q, want empty", cfg.REALITYCoverDomain)
+	}
+
+	cfg = &server.Config{}
+	fs = flag.NewFlagSet("server", flag.ContinueOnError)
+	registerServerFlags(fs, cfg)
+	if err := fs.Parse([]string{"-reality-cover-domain", "www.microsoft.com"}); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.REALITYCoverDomain != "www.microsoft.com" {
+		t.Fatalf("REALITYCoverDomain = %q, want %q", cfg.REALITYCoverDomain, "www.microsoft.com")
+	}
+}
+
 // TestApplyClientTOMLConfig_EmptyPath_NoOp verifies that omitting --config
 // leaves the existing CLI-derived client.Config untouched (legacy code path).
 func TestApplyClientTOMLConfig_EmptyPath_NoOp(t *testing.T) {

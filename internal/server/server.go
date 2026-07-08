@@ -440,6 +440,13 @@ func Run(cfg *Config) error {
 		go startICMPServer(srvCtx)
 	}
 
+	// Surface a TUN-incapable exit at boot instead of failing every native
+	// full-tunnel client silently per-connection (issue #51). A proxy-only
+	// deployment without TUN is legitimate, so warn rather than abort.
+	if ok, reason := tunModeReady(srvCtx); !ok {
+		log.Warn("TUN mode unavailable: %s", reason)
+	}
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -517,6 +524,26 @@ func initUpstreamMode(cfg *Config, srvCtx *serverContext) error {
 	srvCtx.upstreamDialer = dialer
 	log.Info("Upstream mode enabled: %s", cfg.UpstreamAddr)
 	return nil
+}
+
+// tunModeReady reports whether this instance can serve native full-tunnel (TUN
+// mode) clients such as the Android app. Relays forward TUN packets to an
+// upstream exit and never need a local TUN; exits need the shared TUN device,
+// which only exists when -ip-pool is configured (see initIPPool). Returns false
+// with an actionable reason when a native TUN client would be rejected at
+// connect time with "Shared TUN not initialized" (issue #51).
+func tunModeReady(srvCtx *serverContext) (bool, string) {
+	if srvCtx == nil {
+		return false, "server context not initialized"
+	}
+	if srvCtx.upstreamDialer != nil {
+		// Relay: TUN packets are forwarded upstream, no local TUN required.
+		return true, ""
+	}
+	if srvCtx.sharedTUN == nil {
+		return false, "shared TUN not initialized (server started without -ip-pool); native full-tunnel clients (e.g. Android) will be rejected — set -ip-pool (e.g. 10.8.0.0/24) to enable"
+	}
+	return true, ""
 }
 
 // initIPPool initialises the IP pool and shared TUN device for TUN mode.
@@ -2344,8 +2371,17 @@ func handleHTTP1(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
 		return
 	}
 
-	// Serve fake response
-	serveFakeHTTPResponse(conn, cfg, logger)
+	// Serve fake response. We already drained the client's request into buf[:n]
+	// above; serveFakeWebsite starts a fresh http.ReadRequest, so without
+	// replaying those bytes it blocks on an empty socket until the 75s
+	// keep-alive timeout — the client gets 0 bytes and the silent hang
+	// fingerprints the box as non-nginx to DPI (issue #50). Replay the consumed
+	// request so the fake nginx answers immediately, exactly like a real server.
+	replay := &bufferedConn{
+		Conn:   conn,
+		reader: io.MultiReader(bytes.NewReader(buf[:n]), conn),
+	}
+	serveFakeHTTPResponse(replay, cfg, logger)
 }
 
 // handleWebSocket handles WebSocket connections
@@ -3068,9 +3104,13 @@ func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger
 		return
 	}
 
-	// Check if shared TUN is available
+	// Check if shared TUN is available. If this fires, the instance was started
+	// without -ip-pool (the only thing that creates the shared TUN, see
+	// initIPPool) and is not a relay, so it cannot terminate native full-tunnel
+	// clients such as the Android app (issue #51). Not IPv6/auto-IP specific:
+	// this guard runs before any IP-family branch.
 	if srvCtx == nil || srvCtx.sharedTUN == nil {
-		logger.Error("Shared TUN not initialized")
+		logger.Error("Shared TUN not initialized: server started without -ip-pool; native full-tunnel clients cannot connect. Set -ip-pool (e.g. 10.8.0.0/24) to enable")
 		resp := make([]byte, 9)
 		resp[0] = 0x03 // Error: TUN not available
 		conn.Write(resp)
