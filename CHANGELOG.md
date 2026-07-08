@@ -7,6 +7,17 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.20] - 2026-07-09
+
+### Fixed
+
+- **Fake website (`-fake-root`) hung silently instead of responding (#50).** `handleHTTP1` read the initial request bytes off the socket with `conn.Read` and then passed the raw connection to the fake-site handler, whose own `http.ReadRequest` blocked on the now-drained socket until the keep-alive timeout. A non-tiredvpn HTTPS client completed the TLS handshake and then received zero bytes until it timed out — a hung TLS connection is a stronger active-probe signal than a plain page would be. The consumed request is now replayed to the fake-site handler, the same way the other fake-site call sites already did, so probes get a normal-looking response.
+- **Native TUN clients failed with "Shared TUN not initialized" and no hint why (#51).** The shared TUN device is only created when `-ip-pool` is set; an exit node started without it accepted the REALITY handshake and then rejected the client's TUN request per connection with an opaque error. Since the Android client is the one that uses native TUN mode, this looked like an Android-specific bug when it was a missing-flag misconfiguration. The server now warns loudly at boot when TUN mode is unavailable, and the per-connection error points at the missing `-ip-pool`.
+
+### Added
+
+- **`-reality-cover-domain` flag.** `Config.REALITYCoverDomain` was implemented in the REALITY auth path but bound to no CLI flag or TOML key, so unauthorized or misdetected REALITY connections were always dropped rather than proxied to a cover domain. The flag now exposes it. The domain is admin-controlled and never derived from the client-supplied SNI, so the anti-SSRF property of the original code is preserved.
+
 ## [1.3.19] - 2026-07-03
 
 ### Fixed
