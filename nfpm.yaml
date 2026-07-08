@@ -43,6 +43,10 @@ contents:
     dst: /usr/bin/tiredvpn-init
     file_info:
       mode: 0755
+  - src: ./packaging/tiredvpn-nat.sh
+    dst: /usr/bin/tiredvpn-nat
+    file_info:
+      mode: 0755
   - src: ./packaging/tiredvpn.service
     dst: /lib/systemd/system/tiredvpn.service
     file_info:

@@ -13,7 +13,12 @@
 # Flags:
 #   --port N            listen port (default 443)
 #   --method repo|binary  force install method (default: repo if apt/dnf exists)
+#   --proxy-only        SOCKS proxy only, disable TUN/full-VPN mode (no NAT)
 #   --force             regenerate secret/certificate even if they exist
+#
+# TUN/full-VPN mode is on by default (the Android app needs it); the service
+# brings up ip_forward + NAT for the client pool automatically. Use --proxy-only
+# for a SOCKS-proxy-only server.
 set -euo pipefail
 
 REPO="tiredvpn/tiredvpn"
@@ -25,6 +30,7 @@ KEYRING="/usr/share/keyrings/tiredvpn-archive-keyring.gpg"
 PORT=443
 METHOD=""
 FORCE=0
+PROXY_ONLY=0
 
 log()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 err()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; }
@@ -36,8 +42,9 @@ while [ $# -gt 0 ]; do
     --port=*) PORT="${1#*=}"; shift ;;
     --method) METHOD="$2"; shift 2 ;;
     --method=*) METHOD="${1#*=}"; shift ;;
+    --proxy-only) PROXY_ONLY=1; shift ;;
     --force) FORCE=1; shift ;;
-    -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
@@ -111,6 +118,8 @@ install_via_binary() {
   log "Installing service unit and init helper"
   curl -fsSL "${RAW_URL}/packaging/tiredvpn-init.sh" -o /usr/bin/tiredvpn-init
   chmod 0755 /usr/bin/tiredvpn-init
+  curl -fsSL "${RAW_URL}/packaging/tiredvpn-nat.sh" -o /usr/bin/tiredvpn-nat
+  chmod 0755 /usr/bin/tiredvpn-nat
   install -d -m 0750 /etc/tiredvpn
   curl -fsSL "${RAW_URL}/packaging/tiredvpn.service" -o /lib/systemd/system/tiredvpn.service
   curl -fsSL "${RAW_URL}/packaging/tiredvpn.env.example" -o /etc/tiredvpn/env.example
@@ -134,6 +143,7 @@ esac
 # Finish: generate keys, start, print connection info.
 init_args="--port ${PORT}"
 [ "$FORCE" -eq 1 ] && init_args="${init_args} --force"
+[ "$PROXY_ONLY" -eq 1 ] && init_args="${init_args} --proxy-only"
 log "Configuring server"
 # shellcheck disable=SC2086
 tiredvpn-init ${init_args}

@@ -15,9 +15,12 @@
 #     and a ready-to-paste client command
 #
 # Flags:
-#   --port N     listen port (default 443, or whatever is already in env)
-#   --force      regenerate secret and certificate even if they exist
-#   --no-start   configure but do not enable/start the service
+#   --port N        listen port (default 443, or whatever is already in env)
+#   --ip-pool CIDR  client IP pool for TUN/full-VPN mode (default 10.8.0.0/24);
+#                   the service brings up ip_forward + NAT for it on start
+#   --proxy-only    disable TUN mode (empty pool, SOCKS proxy only, no NAT)
+#   --force         regenerate secret and certificate even if they exist
+#   --no-start      configure but do not enable/start the service
 
 set -euo pipefail
 
@@ -31,11 +34,19 @@ BIN="$(command -v tiredvpn 2>/dev/null || echo /usr/bin/tiredvpn)"
 PORT=""
 FORCE=0
 START=1
+# IP pool resolution: default -> existing env -> --ip-pool -> --proxy-only.
+# POOL_SET/PROXY_ONLY track explicit flags so they override the sourced env.
+POOL_ARG=""
+POOL_SET=0
+PROXY_ONLY=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --port) PORT="$2"; shift 2 ;;
     --port=*) PORT="${1#*=}"; shift ;;
+    --ip-pool) POOL_ARG="$2"; POOL_SET=1; shift 2 ;;
+    --ip-pool=*) POOL_ARG="${1#*=}"; POOL_SET=1; shift ;;
+    --proxy-only) PROXY_ONLY=1; shift ;;
     --force) FORCE=1; shift ;;
     --no-start) START=0; shift ;;
     -h|--help)
@@ -83,6 +94,22 @@ fi
 CERT="${TIREDVPN_CERT:-$CERT}"
 KEY="${TIREDVPN_KEY:-$KEY}"
 
+# Resolve the client IP pool for TUN mode.
+#   default        -> 10.8.0.0/24 (TUN on by default; Android needs it)
+#   existing env   -> keep whatever is already in the env file, if non-empty
+#   --ip-pool CIDR -> override
+#   --proxy-only   -> force empty (proxy-only, no NAT)
+POOL="10.8.0.0/24"
+if [ -n "${TIREDVPN_IP_POOL:-}" ]; then
+  POOL="${TIREDVPN_IP_POOL}"
+fi
+if [ "$POOL_SET" -eq 1 ]; then
+  POOL="$POOL_ARG"
+fi
+if [ "$PROXY_ONLY" -eq 1 ]; then
+  POOL=""
+fi
+
 # Secret: keep existing unless --force.
 SECRET="${TIREDVPN_SECRET:-}"
 if [ -z "$SECRET" ] || [ "$FORCE" -eq 1 ]; then
@@ -124,6 +151,7 @@ TIREDVPN_LISTEN=${LISTEN}
 TIREDVPN_CERT=${CERT}
 TIREDVPN_KEY=${KEY}
 TIREDVPN_SECRET=${SECRET}
+TIREDVPN_IP_POOL=${POOL}
 EOF
 chmod 0600 "$ENV_FILE"
 
@@ -155,6 +183,11 @@ echo "------------------------------------------------------------"
 if [ "$PUBLIC_IP" = "YOUR_SERVER_IP" ]; then
   echo "  NOTE: public IP could not be detected - replace YOUR_SERVER_IP above."
 fi
-echo "  TUN/full-VPN mode also needs ip_forward + NAT on this host."
+if [ -n "$POOL" ]; then
+  echo "  TUN/full-VPN mode ON (pool ${POOL}); ip_forward + NAT are configured"
+  echo "  automatically by the service on start."
+else
+  echo "  Proxy-only mode (no IP pool): SOCKS proxy only, no TUN/NAT."
+fi
 echo "  See: https://github.com/tiredvpn/tiredvpn#server-firewall-and-forwarding-required-for-tun-mode"
 echo

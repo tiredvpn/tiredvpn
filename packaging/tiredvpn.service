@@ -7,9 +7,14 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/tiredvpn/env
+# Bring up ip_forward + NAT for the client IP pool before start. The leading '-'
+# makes failure non-fatal (proxy-only servers have an empty pool and it no-ops).
+ExecStartPre=-/usr/bin/tiredvpn-nat
 # The secret is read from TIREDVPN_SECRET in the EnvironmentFile, not passed on
 # the command line, so it never shows up in ps/cmdline.
-ExecStart=/usr/bin/tiredvpn server -listen ${TIREDVPN_LISTEN} -cert ${TIREDVPN_CERT} -key ${TIREDVPN_KEY}
+# -ip-pool enables server TUN/full-VPN mode. An empty TIREDVPN_IP_POOL expands to
+# `-ip-pool ""`, which the server treats as proxy-only mode.
+ExecStart=/usr/bin/tiredvpn server -listen ${TIREDVPN_LISTEN} -cert ${TIREDVPN_CERT} -key ${TIREDVPN_KEY} -ip-pool ${TIREDVPN_IP_POOL}
 Restart=always
 RestartSec=2
 LimitNOFILE=65536
