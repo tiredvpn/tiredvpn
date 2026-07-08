@@ -68,7 +68,9 @@ Dual-stack lets clients choose the transport independently. Disable with `-dual-
 | `-ip-pool` | | CIDR block for TUN client IP assignment (e.g., `10.8.0.0/24`) |
 | `-ip-pool-lease` | `24h` | Duration of IP lease per client |
 
-The `-ip-pool` flag is required when clients connect in TUN mode (`tiredvpn client -tun`). The server assigns each client a unique IP from this pool.
+The `-ip-pool` flag is required when clients connect in TUN mode (`tiredvpn client -tun`), including the Android app. The server assigns each client a unique IP from this pool.
+
+Package installs set `-ip-pool 10.8.0.0/24` by default (via `TIREDVPN_IP_POOL` in `/etc/tiredvpn/env`) and auto-configure `ip_forward` + NAT through the service - see [Forwarding and NAT](#forwarding-and-nat-required-for-tun-mode). An empty `TIREDVPN_IP_POOL` (or `--proxy-only`) starts the server in proxy mode with no pool and no NAT.
 
 ### PORT HOPPING OPTIONS
 
@@ -122,10 +124,25 @@ At startup the server reads `/proc/self/status` to check available Linux capabil
 
 ## Forwarding and NAT (required for TUN mode)
 
-When clients connect in TUN mode (`-tun` / `-ip-pool`), the server hands each
-client an IP from the pool, but it does not touch the host firewall or routing.
-You must enable forwarding and NAT yourself, otherwise client packets reach the
-server's TUN interface and have nowhere to go (SOCKS5 proxy mode is unaffected).
+**Package install (`install.sh`, one-liner, apt/dnf): automatic.** These paths
+set TUN mode by default - the env file gets `TIREDVPN_IP_POOL=10.8.0.0/24`, the
+unit starts the server with `-ip-pool ${TIREDVPN_IP_POOL}`, and
+`ExecStartPre=/usr/bin/tiredvpn-nat` flips `net.ipv4.ip_forward=1` and installs
+`MASQUERADE` + `FORWARD` for the pool on every start (idempotent). No manual
+forwarding. This is what lets the Android app (always native TUN) connect to a
+fresh install. Opt out with `install.sh --proxy-only` / `tiredvpn-init
+--proxy-only`, or set `TIREDVPN_IP_POOL=` (empty) in `/etc/tiredvpn/env` and
+restart - an empty pool starts the server in proxy mode and skips NAT. Custom
+CIDR: `tiredvpn-init --ip-pool <CIDR>`.
+
+The rest of this section is the **manual binary / from-source** case (running the
+binary directly, no package or unit).
+
+When you run the binary yourself in TUN mode (`-tun` / `-ip-pool`), the server
+hands each client an IP from the pool, but it does not touch the host firewall or
+routing. You must enable forwarding and NAT yourself, otherwise client packets
+reach the server's TUN interface and have nowhere to go (SOCKS5 proxy mode is
+unaffected).
 
 The host needs three things:
 

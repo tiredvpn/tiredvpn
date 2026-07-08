@@ -246,6 +246,12 @@ Self-signed works fine — TiredVPN does not validate the server certificate fro
 
 ## Systemd Service
 
+The packaged unit (from apt/dnf/`install.sh`) already runs TUN by default and
+sets forwarding/NAT via `ExecStartPre=/usr/bin/tiredvpn-nat`, reading the pool
+from `TIREDVPN_IP_POOL` in `/etc/tiredvpn/env`. The hand-written unit below is
+for a manual binary install - it does not include that step, so set forwarding
+and NAT yourself (see [Firewall](#firewall) above) if you use `-ip-pool` here.
+
 ```ini
 # /etc/systemd/system/tiredvpn.service
 [Unit]
@@ -315,8 +321,16 @@ If you use port hopping, also open the hop range:
 iptables -A INPUT -p udp --dport 47000:47100 -j ACCEPT
 ```
 
-For TUN mode on bare metal or a host install, enable IP forwarding and
-masquerade by hand:
+For TUN mode, forwarding and NAT are handled for you when you install via a
+package: `install.sh`, the one-liner, and the apt/dnf packages set TUN by default
+(`TIREDVPN_IP_POOL=10.8.0.0/24` in `/etc/tiredvpn/env`) and the service's
+`ExecStartPre=/usr/bin/tiredvpn-nat` flips `ip_forward` and installs
+`MASQUERADE` + `FORWARD` for the pool on each start. Opt out with
+`install.sh --proxy-only` / `tiredvpn-init --proxy-only`, or an empty
+`TIREDVPN_IP_POOL`.
+
+Only when you run the binary directly (from source or a raw download, no
+package/unit) do you enable IP forwarding and masquerade by hand:
 
 ```bash
 # Enable IP forwarding
@@ -327,7 +341,7 @@ sysctl -p
 iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o eth0 -j MASQUERADE
 ```
 
-In containers you do not run these by hand - the `tun` image entrypoint sets
+In containers you also do not run these by hand - the `tun` image entrypoint sets
 forwarding and NAT itself. See [TUN mode in containers](#tun-mode-in-containers).
 
 ## Multi-Hop Setup

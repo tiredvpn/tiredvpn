@@ -122,6 +122,13 @@ ship the binary but leave it stopped. Run `sudo tiredvpn-init` to finish setup:
 it generates the secret and cert, prints the access keys, and starts the
 service. The one-liner and `install.sh` already do this for you.
 
+By default the service comes up in **TUN mode** (`TIREDVPN_IP_POOL=10.8.0.0/24`)
+and sets `ip_forward` + NAT for the pool on each start, so the Android app (which
+always uses native TUN) works out of the box - no manual forwarding. For
+proxy-only, use `install.sh --proxy-only` or `tiredvpn-init --proxy-only`. Pick a
+different pool with `tiredvpn-init --ip-pool <CIDR>`. Details:
+[Server firewall and forwarding](#server-firewall-and-forwarding-required-for-tun-mode).
+
 #### Manual binary download
 
 For other distros or hosts without systemd, download the binary directly:
@@ -191,12 +198,27 @@ normal HTTPS server.
 
 ### Server firewall and forwarding (required for TUN mode)
 
-**If you use TUN mode (`-tun` / `-ip-pool`), you must enable IP forwarding and
-NAT on the server host yourself.** TiredVPN deliberately does not modify your
-firewall or routing. Without this, a TUN client connects and the server logs
-`TUN mode established`, but no traffic flows - the client's packets reach the
-server's TUN interface and have nowhere to go. (SOCKS5 proxy mode is unaffected:
-the server process egresses that traffic itself.)
+> **Installed via `install.sh`, the one-liner, or apt/dnf?** Nothing to do here.
+> Those paths set up TUN by default: the env file gets
+> `TIREDVPN_IP_POOL=10.8.0.0/24`, and on every service start
+> `ExecStartPre=/usr/bin/tiredvpn-nat` flips `net.ipv4.ip_forward=1` and installs
+> the `MASQUERADE` + `FORWARD` rules for the pool (idempotent). This is what lets
+> the Android app - which always uses native TUN - connect to a fresh install
+> with no manual steps. To opt out and run proxy-only, use
+> `install.sh --proxy-only` / `tiredvpn-init --proxy-only`, or set
+> `TIREDVPN_IP_POOL=` (empty) in `/etc/tiredvpn/env` and restart. Custom CIDR:
+> `tiredvpn-init --ip-pool <CIDR>`.
+>
+> The manual steps below are only for running the binary directly (from source or
+> a raw download) without the package or systemd unit.
+
+**If you run the binary yourself in TUN mode (`-tun` / `-ip-pool`), you must
+enable IP forwarding and NAT on the server host yourself.** The binary
+deliberately does not modify your firewall or routing. Without this, a TUN
+client connects and the server logs `TUN mode established`, but no traffic flows
+- the client's packets reach the server's TUN interface and have nowhere to go.
+(SOCKS5 proxy mode is unaffected: the server process egresses that traffic
+itself.)
 
 ```bash
 # 1) Enable IP forwarding (persist it too)

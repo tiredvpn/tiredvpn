@@ -67,6 +67,13 @@ The server now:
 - Serves a fake website to unauthenticated visitors (DPI camouflage)
 - Authenticates clients by HMAC-verified secret
 
+> This raw `./tiredvpn server` command starts in proxy mode - fine for a SOCKS5
+> client, but a TUN client (including the Android app) also needs an IP pool plus
+> host forwarding/NAT. If you install via a package (`install.sh`, apt, dnf),
+> TUN is the default and NAT is configured automatically, so Android works out of
+> the box; opt out with `--proxy-only`. See
+> [deployment.md](deployment.md) and [server.md](server.md#forwarding-and-nat-required-for-tun-mode).
+
 To verify the server is running:
 
 ```bash
