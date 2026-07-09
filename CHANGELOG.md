@@ -7,6 +7,12 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.21] - 2026-07-09
+
+### Fixed
+
+- **Relay OOM-killed under reconnect storms from a leaked upstream connection.** A relay node's per-stream `relay()` signalled EOF to the upstream by type-asserting the target to `*net.TCPConn` and calling `CloseWrite`. On the multi-hop path the target is an HTTP/2-stego connection to the upstream exit, which is not a `*net.TCPConn`, so the assertion always failed and no EOF was ever sent. When a downstream client abandoned its stream — routine during a reconnect storm — the upload copy returned but the download copy stayed parked in the upstream framer's `ReadFrame` forever, so `handleStream` never reached its `defer targetConn.Close()`. Every abandoned stream leaked a full upstream connection with its TLS state, framer goroutines and buffers; under a storm this ballooned to gigabytes and the kernel OOM-killed the relay, which dropped every session and fed the storm. `relay()` now force-closes both ends when either copy direction returns, bounding each stream's lifetime. The same code runs on a terminating exit (direct mode), so this also removes the equivalent leak there.
+
 ## [1.3.20] - 2026-07-09
 
 ### Fixed

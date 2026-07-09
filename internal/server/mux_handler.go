@@ -217,10 +217,28 @@ func (h *MuxHandler) handleStream(ctx context.Context, stream net.Conn) {
 	streamLogger.Debug("Relay closed: up=%d down=%d", bytesUp, bytesDown)
 }
 
-// relay copies data bidirectionally between stream and target
+// relay copies data bidirectionally between stream and target.
+//
+// When either copy direction returns, both ends are force-closed so the peer
+// goroutine cannot block forever on a Read. This is critical for the multi-hop
+// path where target is an HTTP/2 stego conn to an upstream exit: a stego conn
+// has no CloseWrite, so signalling EOF one-way is impossible. If a downstream
+// client abandons its stream (common during reconnect storms), the upload
+// goroutine returns but the download goroutine stays parked in the upstream
+// framer's ReadFrame - leaking the whole upstream conn, its goroutines and
+// buffers. Under a storm that leak balloons to gigabytes and OOM-kills the
+// relay. Closing both ends on first completion bounds every stream's lifetime.
 func (h *MuxHandler) relay(stream, target net.Conn) (bytesUp, bytesDown int64) {
 	var wg sync.WaitGroup
 	var up, down int64
+
+	var closeOnce sync.Once
+	closeBoth := func() {
+		closeOnce.Do(func() {
+			stream.Close()
+			target.Close()
+		})
+	}
 
 	wg.Add(2)
 
@@ -229,10 +247,7 @@ func (h *MuxHandler) relay(stream, target net.Conn) (bytesUp, bytesDown int64) {
 		defer wg.Done()
 		n, _ := optimizedRelay(target, stream)
 		atomic.StoreInt64(&up, n)
-		// Close write side of target to signal EOF
-		if tc, ok := target.(*net.TCPConn); ok {
-			tc.CloseWrite()
-		}
+		closeBoth()
 	}()
 
 	// Target -> Stream (download)
@@ -240,6 +255,7 @@ func (h *MuxHandler) relay(stream, target net.Conn) (bytesUp, bytesDown int64) {
 		defer wg.Done()
 		n, _ := optimizedRelay(stream, target)
 		atomic.StoreInt64(&down, n)
+		closeBoth()
 	}()
 
 	wg.Wait()
