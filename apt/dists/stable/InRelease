@@ -4,44 +4,44 @@ Hash: SHA512
 Origin: TiredVPN
 Label: TiredVPN
 Codename: stable
-Date: Wed, 08 Jul 2026 22:00:25 UTC
+Date: Thu, 09 Jul 2026 10:29:44 UTC
 Architectures: amd64 arm64
 Components: main
 Description: TiredVPN apt repository
 MD5Sum:
- b7c22c6b24eb0458b6c0b02dd1688bf4 765 main/binary-amd64/Packages
- 2eb79fbec1c122aa333ab94966654b29 537 main/binary-amd64/Packages.gz
+ 0466403d131d10a0ef9d8548af1ac27d 765 main/binary-amd64/Packages
+ 79bcc5174b565277926d8aa53f4a38e2 536 main/binary-amd64/Packages.gz
  a1cb1598e0aa53fb7a19e480edb1fd61 106 main/binary-amd64/Release
- 944bc365f52632cac2e90a54fb5ea382 765 main/binary-arm64/Packages
- 17b13b6f60175323570b6f2e5cc466ef 537 main/binary-arm64/Packages.gz
+ 26591d336e655778697dbd2ce3d91a46 765 main/binary-arm64/Packages
+ 2c36df9c5c34041bb8b1d5490badf3d7 535 main/binary-arm64/Packages.gz
  833f0c2c40c4bd6fc40c49fa19ba6a0e 106 main/binary-arm64/Release
 SHA1:
- 08c5a13dc28e2874a4e0fed9923d80e7404e4e46 765 main/binary-amd64/Packages
- 011a403d31a761762db9ebc30b0eff35d7a07419 537 main/binary-amd64/Packages.gz
+ 87c71d021bd99e0d04baa89e301491c47679b7bf 765 main/binary-amd64/Packages
+ d3fbb866ddacb55382bcafe7f61c98e0dca55b14 536 main/binary-amd64/Packages.gz
  cbfc21b1aea4c89370605c63ec154f6fec1a0765 106 main/binary-amd64/Release
- 8e0bba9ab7bed56d7b7aded4a5bdce07e756f631 765 main/binary-arm64/Packages
- 28ba53e30e061a507af48c5bdf98e3261e727d85 537 main/binary-arm64/Packages.gz
+ d586825d2862b634f94764061572fe2bf96cc7bb 765 main/binary-arm64/Packages
+ d24b770b834fcc3879de97e89f76a7b25df8defa 535 main/binary-arm64/Packages.gz
  3bca33c026140b27d9e2f0e3015f33da87d18e20 106 main/binary-arm64/Release
 SHA256:
- 1244ddb92a59f812a299c611317d6775be4207cdcaacd1f4aae1f28e135afd08 765 main/binary-amd64/Packages
- c4d186249b7c646ac20579a593207edd69cdb81e809ce4a9937673cdc45a1855 537 main/binary-amd64/Packages.gz
+ 77fa47f8bd4ca66832004eca19fdae6d75dec781f4bccc5cd6643eb51ba97224 765 main/binary-amd64/Packages
+ 8d72fc240bb9b7641de24798986ec5603766c54215d314cd174c1abf0d35d7ec 536 main/binary-amd64/Packages.gz
  f56fb9ff2142f536cc47925e506d8cc1e0f6279b4aa0d1ed26922aa43934b7c7 106 main/binary-amd64/Release
- bd163f04fc5d90e74952ca12a684bb0aa7a66b4cec6f09718abfb6d4e0714a82 765 main/binary-arm64/Packages
- 59f7497421ac8d7ed9bcdf79ec3e7ab19755e0e70e8a77bc0b54b9436090042f 537 main/binary-arm64/Packages.gz
+ 266e021e5286270c4995f5b4ec513b9216c9ea22bce686906160611f9a566e31 765 main/binary-arm64/Packages
+ c544e6358da492866166caf5505a7049a66051b70dc8afd7d22cda9aa3c539eb 535 main/binary-arm64/Packages.gz
  2ea051df46bf72e3e60ff7def56f180e193b56db497b982353db591146d6542a 106 main/binary-arm64/Release
 -----BEGIN PGP SIGNATURE-----
 
-iQIzBAEBCgAdFiEERHHoMQRgX2u48+4LJqtRtqgl770FAmpOyHkACgkQJqtRtqgl
-770Ing/+KAc8l5WtqWSHtQZ3rRqsJWlzPtnoroh7KbslZjse4NCj+eEeDKB1aRxX
-AhiV6aKqhqVxbmnxXZA+dotpOYT6NdygKHCk8o4vuO3Lr88rcaLO/mKTxuemvwGL
-CFlEAblkK2fvSX0jGz7d/rCXc4cy4kjieMOTNJwppZrdnRb8E7kOGkg9mk/om1PQ
-2ABqFQehLztEy9NBOgd+dg62fl2+1H1sUSmDPrcc1UBtZMMFkxWbq94HPv1RhGKm
-m8NAsdoTg2ammunSHYCb7aKOGcJgui+84o+Jmxlw6uRrknIx0rlSWrm594R9+zez
-/jTeEmc9sE2J5grUm6bXbb5bQvYYoDiuWXtzGWXR1ijD+IxV2py6RuZnm9IEU7Ff
-/Iw1N6V+JL4QtZ5zVC0altWtLFW/VUdTY1Yn4dokxA4zCaofZjeYPnGJDAyo4uWf
-D3G9SWKQEPhbmvkUerYemWtGnDnsPEfen7emrr7tSXGCJcMDbs34vmknBHtPDr1W
-9SaEQ28JQlAEJ8i+A7YstbhYnNghRAqkHMDz3ZEnvW0RbxkE5P+hfe/uz06OVMyy
-GQlRNCaFUKaYOiHyHAasUg6+8h25zC3NO6HUfahR575MHEIs4seqxZzmBYaui5i7
-2x/2IOMA1JY4eVawGaJEH9Uw/SCAdx7P/IAk2G/2pC6jR8tWt0I=
-=gvs+
+iQIzBAEBCgAdFiEERHHoMQRgX2u48+4LJqtRtqgl770FAmpPeBgACgkQJqtRtqgl
+772kUxAAmuwTA8dwQc+OiOFB4X4gl9b9+ztnsPS4rUvfze6JYJgmMP1RhvwSL3BZ
+cz8JU9whC3dnCH4ZJbAayeRPLwgjKbgm7g0MHTxcf7X8HWNi+cerTW3oGz4KbimU
+oroPmwGlmLT1fjeLSmiiueoljoE22ixrjcimYQO1XaORRp018wkQGdve9Y1qxoA0
+MyunUiKqUwWWzOxyDz84f6J17IYltYuC73Zt05zzuf0JfQDlUmhHy6x8Fu1JVKp3
+YOI3PQPCMIkSbDDSR6stbsp5L4wyt2WUCTjJ23h7Emz8DyLtwe45yBtH1XN+dlfR
+1KrTC6OovhCD53RAPJqh+U+9WpTHpejwD8oMDeAfoVSXs3EGPeDTf0xNuEWH/11U
+n8K3j+ErIPBX2zp28liejT6ZHVnDtD5dF6KE8TAkbeKCvipVGucT9e9B4bfkG46G
+BG528y3VuPQ9rtOOXfs02R2jZeTgn3kJ8VY1L7NTY8mNmsdjq03F65eQ+QjK5Gqb
+k2zpZ7286JObTQ8UeAvLSbgHwgXEQY0kRoZjZr5jxJn4QZtfk1oeUTdEy+xh6Kua
+Bn5z6wbE3H7iOQHCy8KPyvawvq4Vre5o0UJPM93991yLg/nkN5ScM72kGG104IsM
+VcHqsp36luer+oOXfRLcGubCrCKr4AdkkFvXFYHfekBC2FpHkBw=
+=Jk03
 -----END PGP SIGNATURE-----
