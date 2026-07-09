@@ -162,9 +162,23 @@ jobs:
       - name: Install nfpm
         run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
 
+      # nfpm signs the RPMs with the release GPG key so dnf's per-package
+      # gpgcheck passes and directly-downloaded .rpm files verify (issue #53).
+      - name: Write GPG signing key
+        id: signkey
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          keyfile="$RUNNER_TEMP/tiredvpn-signing.key"
+          printf '%s' "$GPG_PRIVATE_KEY" > "$keyfile"
+          chmod 600 "$keyfile"
+          echo "keyfile=$keyfile" >> "$GITHUB_OUTPUT"
+
       - name: Build .deb and .rpm packages
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          GPG_KEY_FILE: ${{ steps.signkey.outputs.keyfile }}
+          NFPM_RPM_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
           chmod +x tiredvpn-linux-amd64 tiredvpn-linux-arm64
           VERSION="$VERSION" bash packaging/nfpm-build.sh

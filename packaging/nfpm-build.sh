@@ -8,6 +8,9 @@
 set -euo pipefail
 
 VERSION="${VERSION:?set VERSION (e.g. 1.3.3)}"
+# Empty by default so local builds are unsigned; CI exports a real key path to
+# have nfpm sign the RPMs (issue #53).
+export GPG_KEY_FILE="${GPG_KEY_FILE:-}"
 mkdir -p dist
 
 for arch in amd64 arm64; do

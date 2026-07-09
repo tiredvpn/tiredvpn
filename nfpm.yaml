@@ -74,3 +74,10 @@ scripts:
   postinstall: ./packaging/postinstall.sh
   preremove: ./packaging/preremove.sh
   postremove: ./packaging/postremove.sh
+
+# RPM package signing (issue #53). key_file and the NFPM_RPM_PASSPHRASE env are
+# populated in CI from the GPG release secret; empty GPG_KEY_FILE means local
+# builds stay unsigned (nfpm skips signing when key_file resolves to "").
+rpm:
+  signature:
+    key_file: ${GPG_KEY_FILE}
