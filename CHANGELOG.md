@@ -7,6 +7,12 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.22] - 2026-07-09
+
+### Fixed
+
+- **RPM packages were unsigned, so `dnf` rejected them with "GPG check FAILED" (#53).** The release pipeline signed the YUM repository metadata (`repomd.xml`) but not the individual `.rpm` files, so `gpgcheck=1` and a direct `dnf install ./tiredvpn-*.rpm` failed even though the public key was already published. nfpm now signs each RPM with the release GPG key during the package job, embedding the RSA and PGP signature headers that `dnf` verifies against the existing repository key. The `.deb` path is unchanged: APT already trusts the signed `Release` file.
+
 ## [1.3.21] - 2026-07-09
 
 ### Fixed
