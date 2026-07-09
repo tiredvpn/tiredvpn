@@ -555,14 +555,6 @@ func BenchmarkTruncateNameShort(b *testing.B) {
 	}
 }
 
-// BenchmarkGetAllStrategyIDs benchmarks getting strategy IDs
-func BenchmarkGetAllStrategyIDs(b *testing.B) {
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_ = GetAllStrategyIDs()
-	}
-}
-
 func TestToJSONReportNilFastest(t *testing.T) {
 	r := &BenchmarkResult{
 		TestedAt:   time.Now(),

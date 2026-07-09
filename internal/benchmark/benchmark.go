@@ -1,6 +1,7 @@
 package benchmark
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -13,7 +14,6 @@ import (
 	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
-	"golang.org/x/net/proxy"
 )
 
 // TestURL for speed testing - Ubuntu NL mirror (close to most EU servers)
@@ -39,8 +39,8 @@ type StrategyResult struct {
 	ExitIP        string        `json:"exit_ip"`
 	IPChanged     bool          `json:"ip_changed"`
 	HTTPLatency   time.Duration `json:"http_latency"`
-	DownloadSpeed float64       `json:"download_mbps"`
-	UploadSpeed   float64       `json:"upload_mbps"`
+	DownloadSpeed float64       `json:"download_mbs"`
+	UploadSpeed   float64       `json:"upload_mbs"`
 	Score         int           `json:"score"`
 }
 
@@ -135,52 +135,7 @@ func ToJSONReport(r *BenchmarkResult, serverAddr, version string) JSONReport {
 	return report
 }
 
-// RunBenchmark tests all strategies for latency and speed
-func RunBenchmark(ctx context.Context, mgr *strategy.Manager, serverAddr string, testSpeed bool) *BenchmarkResult {
-	result := &BenchmarkResult{
-		TestedAt: time.Now(),
-	}
-
-	strategies := mgr.GetOrderedStrategies()
-
-	// Test each strategy
-	for i, strat := range strategies {
-		if testSpeed {
-			fmt.Printf("  [%d/%d] Testing %s...", i+1, len(strategies), strat.Name())
-		}
-		sr := testStrategy(ctx, mgr, strat, serverAddr, testSpeed)
-		result.Strategies = append(result.Strategies, sr)
-		if testSpeed {
-			if sr.Speed > 0 {
-				fmt.Printf(" %.1f MB/s\n", sr.Speed)
-			} else if sr.Error != "" {
-				fmt.Printf(" FAILED (%s)\n", sr.Error)
-			} else {
-				fmt.Printf(" OK\n")
-			}
-		}
-	}
-
-	// Find fastest latency and best speed
-	for i := range result.Strategies {
-		sr := &result.Strategies[i]
-		if !sr.Available {
-			continue
-		}
-
-		if result.Fastest == nil || (sr.Latency > 0 && sr.Latency < result.Fastest.Latency) {
-			result.Fastest = sr
-		}
-
-		if testSpeed && (result.BestSpeed == nil || sr.Speed > result.BestSpeed.Speed) {
-			result.BestSpeed = sr
-		}
-	}
-
-	return result
-}
-
-func testStrategy(ctx context.Context, mgr *strategy.Manager, strat strategy.Strategy, serverAddr string, testSpeed bool) StrategyResult {
+func testStrategy(ctx context.Context, strat strategy.Strategy, serverAddr string, testSpeed bool) StrategyResult {
 	sr := StrategyResult{
 		ID:   strat.ID(),
 		Name: strat.Name(),
@@ -262,6 +217,7 @@ func testStrategySpeed(ctx context.Context, strat strategy.Strategy, serverAddr 
 	start := time.Now()
 	buf := make([]byte, 32*1024)
 	headerDone := false
+	var leftover []byte
 	var totalRead int64
 
 	conn.SetReadDeadline(time.Now().Add(TestTimeout))
@@ -280,15 +236,21 @@ func testStrategySpeed(ctx context.Context, strat strategy.Strategy, serverAddr 
 		}
 
 		if !headerDone {
-			// Skip HTTP headers
-			data := string(buf[:n])
-			if idx := strings.Index(data, "\r\n\r\n"); idx >= 0 {
+			// The "\r\n\r\n" header/body boundary may straddle reads, so
+			// accumulate bytes until it is found before counting body bytes.
+			leftover = append(leftover, buf[:n]...)
+			if idx := bytes.Index(leftover, []byte("\r\n\r\n")); idx >= 0 {
 				headerDone = true
-				totalRead += int64(n - idx - 4)
+				totalRead += int64(len(leftover) - idx - 4)
+				leftover = nil
+			} else if len(leftover) > 64*1024 {
+				// Sanity cap: headers should never be this large; stop
+				// searching to avoid unbounded growth on a malformed response.
+				headerDone = true
 			}
-		} else {
-			totalRead += int64(n)
+			continue
 		}
+		totalRead += int64(n)
 	}
 
 	duration = time.Since(start)
@@ -434,17 +396,8 @@ func wrapText(text string, maxLen int) []string {
 	return lines
 }
 
-// QuickProbe does a fast latency-only test of all strategies
-func QuickProbe(ctx context.Context, mgr *strategy.Manager, serverAddr string) *BenchmarkResult {
-	return RunBenchmark(ctx, mgr, serverAddr, false)
-}
-
-// FullBenchmark does latency + speed test of all strategies
-func FullBenchmark(ctx context.Context, mgr *strategy.Manager, serverAddr string) *BenchmarkResult {
-	return RunBenchmark(ctx, mgr, serverAddr, true)
-}
-
-// ParallelProbe probes all strategies in parallel for speed
+// ParallelProbe probes all strategies in parallel.
+// It measures LATENCY ONLY and does not run the speed test.
 func ParallelProbe(ctx context.Context, mgr *strategy.Manager, serverAddr string) *BenchmarkResult {
 	result := &BenchmarkResult{
 		TestedAt: time.Now(),
@@ -458,7 +411,7 @@ func ParallelProbe(ctx context.Context, mgr *strategy.Manager, serverAddr string
 		wg.Add(1)
 		go func(idx int, s strategy.Strategy) {
 			defer wg.Done()
-			results[idx] = testStrategy(ctx, mgr, s, serverAddr, false)
+			results[idx] = testStrategy(ctx, s, serverAddr, false)
 		}(i, strat)
 	}
 	wg.Wait()
@@ -505,157 +458,6 @@ func GetOriginalIP(ctx context.Context) (string, error) {
 		return "", err
 	}
 	return result.IP, nil
-}
-
-// RunFullStrategyBenchmark tests all strategies via SOCKS5 proxy
-// Tests: HTTP availability, exit IP, latency, download/upload speed
-func RunFullStrategyBenchmark(ctx context.Context, socksAddr string, strategies []string, originalIP string) *FullStrategyBenchmarkResult {
-	result := &FullStrategyBenchmarkResult{
-		OriginalIP: originalIP,
-		TestedAt:   time.Now(),
-	}
-
-	for i, stratID := range strategies {
-		fmt.Printf("  [%d/%d] Testing %s...\n", i+1, len(strategies), stratID)
-		sr := testStrategyViaSocks(ctx, socksAddr, stratID, originalIP)
-		result.Strategies = append(result.Strategies, sr)
-
-		// Print quick result
-		if sr.Available {
-			fmt.Printf("         ✓ HTTP OK, Exit IP: %s", sr.ExitIP)
-			if sr.IPChanged {
-				fmt.Printf(" (CHANGED)")
-			}
-			fmt.Printf(", Latency: %dms", sr.HTTPLatency.Milliseconds())
-			if sr.DownloadSpeed > 0 {
-				fmt.Printf(", DL: %.1f MB/s", sr.DownloadSpeed)
-			}
-			if sr.UploadSpeed > 0 {
-				fmt.Printf(", UL: %.1f MB/s", sr.UploadSpeed)
-			}
-			fmt.Printf(", Score: %d/100\n", sr.Score)
-		} else {
-			fmt.Printf("         ✗ FAILED: %s\n", sr.Error)
-		}
-	}
-
-	// Find best by score
-	for i := range result.Strategies {
-		sr := &result.Strategies[i]
-		if sr.Available && (result.Best == nil || sr.Score > result.Best.Score) {
-			result.Best = sr
-		}
-	}
-
-	return result
-}
-
-func testStrategyViaSocks(ctx context.Context, socksAddr, strategyID, originalIP string) StrategyResult {
-	sr := StrategyResult{
-		ID:   strategyID,
-		Name: strategyID,
-	}
-
-	// Create SOCKS5 dialer
-	dialer, err := proxy.SOCKS5("tcp", socksAddr, nil, proxy.Direct)
-	if err != nil {
-		sr.Error = fmt.Sprintf("socks5 dialer: %v", err)
-		return sr
-	}
-
-	// Create HTTP client with SOCKS5 proxy
-	transport := &http.Transport{
-		Dial: dialer.Dial,
-	}
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   30 * time.Second,
-	}
-
-	// Test 1: HTTP availability and get exit IP
-	start := time.Now()
-	req, _ := http.NewRequestWithContext(ctx, "GET", "https://api.ipify.org?format=json", nil)
-	resp, err := client.Do(req)
-	if err != nil {
-		sr.Error = fmt.Sprintf("http check: %v", err)
-		return sr
-	}
-	defer resp.Body.Close()
-
-	var ipResult struct {
-		IP string `json:"ip"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&ipResult); err != nil {
-		sr.Error = fmt.Sprintf("decode ip: %v", err)
-		return sr
-	}
-
-	sr.HTTPCheck = true
-	sr.HTTPLatency = time.Since(start)
-	sr.ExitIP = ipResult.IP
-	sr.IPChanged = (ipResult.IP != originalIP)
-	sr.Available = true
-	sr.Latency = sr.HTTPLatency
-
-	// Test 2: Download speed (5MB)
-	sr.DownloadSpeed = measureDownloadSpeed(ctx, client)
-
-	// Test 3: Upload speed (1MB)
-	sr.UploadSpeed = measureUploadSpeed(ctx, client)
-
-	// Calculate score
-	sr.Score = calculateStrategyScore(sr)
-
-	return sr
-}
-
-func measureDownloadSpeed(ctx context.Context, client *http.Client) float64 {
-	// Use a reliable speed test file
-	url := "http://speedtest.tele2.net/1MB.zip"
-
-	start := time.Now()
-	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0
-	}
-	defer resp.Body.Close()
-
-	// Read all data
-	n, err := io.Copy(io.Discard, resp.Body)
-	if err != nil || n == 0 {
-		return 0
-	}
-
-	duration := time.Since(start)
-	if duration > 0 {
-		return float64(n) / duration.Seconds() / (1024 * 1024) // MB/s
-	}
-	return 0
-}
-
-func measureUploadSpeed(ctx context.Context, client *http.Client) float64 {
-	// httpbin.org accepts POST data
-	url := "https://httpbin.org/post"
-
-	// Generate 512KB of test data
-	testData := strings.NewReader(strings.Repeat("X", 512*1024))
-
-	start := time.Now()
-	req, _ := http.NewRequestWithContext(ctx, "POST", url, testData)
-	req.Header.Set("Content-Type", "application/octet-stream")
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0
-	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
-
-	duration := time.Since(start)
-	if duration > 0 {
-		return float64(512*1024) / duration.Seconds() / (1024 * 1024) // MB/s
-	}
-	return 0
 }
 
 func calculateStrategyScore(sr StrategyResult) int {
@@ -796,25 +598,6 @@ func FormatFullResults(r *FullStrategyBenchmarkResult) string {
 	sb.WriteString("╚════════════════════════════════════════════════════════════════════════════════════════════╝\n")
 
 	return sb.String()
-}
-
-// GetAllStrategyIDs returns all available strategy IDs
-func GetAllStrategyIDs() []string {
-	return []string{
-		"quic",
-		"reality",
-		"websocket_padded",
-		"http2_stego",
-		"morph_Yandex Video",
-		"morph_VK Video",
-		"antiprobe",
-		"confusion_0",
-		"confusion_1",
-		"confusion_2",
-		"confusion_3",
-		"confusion_4",
-		"state_exhaustion",
-	}
 }
 
 // RunFullBenchmarkDirect tests all strategies directly through the manager
@@ -1115,7 +898,7 @@ func testCombo(ctx context.Context, strat strategy.Strategy, serverAddr string, 
 	exitIP, httpLatency, err := testHTTPThroughTunnel(conn, serverAddr)
 	if err != nil {
 		cr.Error = fmt.Sprintf("http: %v", err)
-		cr.Score = 10 // Some score for connecting
+		cr.Score = calculateComboScore(cr) // available base; HTTP/IP/speed not awarded
 		return cr
 	}
 
@@ -1318,6 +1101,7 @@ func testDownloadThroughTunnel(conn net.Conn) float64 {
 	start := time.Now()
 	buf := make([]byte, 64*1024) // 64KB buffer for speed
 	headerDone := false
+	var leftover []byte
 	var totalRead int64
 
 	conn.SetReadDeadline(time.Now().Add(readTimeout))
@@ -1335,14 +1119,21 @@ func testDownloadThroughTunnel(conn net.Conn) float64 {
 		}
 
 		if !headerDone {
-			data := string(buf[:n])
-			if idx := strings.Index(data, "\r\n\r\n"); idx >= 0 {
+			// The "\r\n\r\n" header/body boundary may straddle reads, so
+			// accumulate bytes until it is found before counting body bytes.
+			leftover = append(leftover, buf[:n]...)
+			if idx := bytes.Index(leftover, []byte("\r\n\r\n")); idx >= 0 {
 				headerDone = true
-				totalRead += int64(n - idx - 4)
+				totalRead += int64(len(leftover) - idx - 4)
+				leftover = nil
+			} else if len(leftover) > 64*1024 {
+				// Sanity cap: headers should never be this large; stop
+				// searching to avoid unbounded growth on a malformed response.
+				headerDone = true
 			}
-		} else {
-			totalRead += int64(n)
+			continue
 		}
+		totalRead += int64(n)
 	}
 
 	duration := time.Since(start)
