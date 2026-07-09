@@ -50,7 +50,7 @@ while [ $# -gt 0 ]; do
     --force) FORCE=1; shift ;;
     --no-start) START=0; shift ;;
     -h|--help)
-      sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *) echo "tiredvpn-init: unknown argument: $1" >&2; exit 2 ;;
   esac
