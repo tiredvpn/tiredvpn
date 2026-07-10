@@ -410,6 +410,9 @@ func registerServerFlags(fs *flag.FlagSet, cfg *server.Config) *serverFlagOpts {
 	// ICMP tunnel
 	fs.BoolVar(&cfg.EnableICMP, "enable-icmp", false, "Enable ICMP tunnel listener (requires CAP_NET_RAW)")
 
+	// Seqovl level-A packet overlap: server-side input NFQUEUE drop (stub, off by default)
+	fs.BoolVar(&cfg.SeqovlPacketDrop, "seqovl-packet-drop", false, "Enable server-side NFQUEUE drop for packet-level seqovl (stub; not yet implemented)")
+
 	opts.showVersion = fs.Bool("version", false, "Show version")
 
 	return opts
@@ -533,6 +536,9 @@ func runClient(args []string) {
 
 	// ICMP tunnel (backup transport, requires CAP_NET_RAW)
 	fs.BoolVar(&cfg.ICMPTunnelEnabled, "icmp-tunnel", false, "Enable ICMP tunnel backup strategy (requires CAP_NET_RAW; server must run with -enable-icmp)")
+
+	// Seqovl level-A packet overlap (Linux only, requires CAP_NET_ADMIN + OUTPUT NFQUEUE rule)
+	fs.BoolVar(&cfg.SeqovlPacketEnabled, "seqovl-packet", false, "Enable packet-level TCP sequence overlap for seqovl (Linux + CAP_NET_ADMIN; additive to the app-framing decoy)")
 
 	// RTT Masking flags
 	fs.BoolVar(&cfg.RTTMaskingEnabled, "rtt-masking", false, "Enable RTT masking (hides proxy timing signature)")

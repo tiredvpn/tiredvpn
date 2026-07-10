@@ -342,6 +342,13 @@ type Config struct {
 	// If the process lacks the capability, the listener is silently skipped.
 	EnableICMP bool
 
+	// SeqovlPacketDrop requests the server-side input NFQUEUE drop for the
+	// packet-level (level A) seqovl overlap. Currently a stub: the client's
+	// default safe geometry needs no server drop, so enabling this only logs
+	// that the aggressive overlap-into-ClientHello variant is not yet supported.
+	// See internal/geneva/overlap_server.go (OverlapServerDropper).
+	SeqovlPacketDrop bool
+
 	// REALITYCoverDomain is the domain to proxy unauthorized REALITY connections
 	// to, making the server look like a legitimate HTTPS endpoint when probed.
 	// Must be a hostname without port (port 443 is used).
@@ -393,6 +400,14 @@ func Run(cfg *Config) error {
 	}
 	if !caps.HasTUNDevice {
 		log.Warn("TUN device /dev/net/tun not available")
+	}
+	if cfg.SeqovlPacketDrop {
+		// The client's default safe overlap geometry keeps the fake segment
+		// below rcv_nxt, so the kernel discards it on its own. The input NFQUEUE
+		// drop is only needed for the aggressive overlap-into-ClientHello variant,
+		// which is not implemented yet (see geneva.OverlapServerDropper).
+		log.Warn("seqovl -seqovl-packet-drop set but server-side overlap drop is not implemented; safe client geometry needs no drop")
+		cfg.SeqovlPacketDrop = false
 	}
 
 	srvCtx := &serverContext{cfg: cfg}
@@ -933,21 +948,16 @@ func handleQUICConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 	}
 }
 
-func handleConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
-	cfg := srvCtx.cfg
-	defer conn.Close()
-
-	// Track connection metrics
-	if srvCtx.metrics != nil {
-		srvCtx.metrics.IncConnections()
-		defer srvCtx.metrics.DecConnections()
-	}
-
-	remoteAddr := conn.RemoteAddr().String()
-	logger := log.WithPrefix(fmt.Sprintf("conn:%d", connID))
-
-	logger.Info("New connection from %s", remoteAddr)
-
+// readFirstPeek reads the first framing unit from conn for protocol
+// classification: a full TLS record when the 5-byte header is a handshake
+// record, otherwise up to ~2KB of non-TLS data. It preserves the original
+// deadline handling (probeReadDeadline for the header, 30s for the record body)
+// and the partial-REALITY tolerance (DPI may drop trailing padding). ok is false
+// on a fatal read error; the caller then serves the fake website.
+//
+// It is called once per connection, and again for each leading seqovl decoy
+// record that must be skipped before the real first flight.
+func readFirstPeek(conn net.Conn, logger *log.Logger) (header, peekBuf []byte, ok bool) {
 	// Set a short initial read deadline for the (still unclassified) connection.
 	// A probe that connects but never sends a valid handshake must not pin a
 	// goroutine and its peek-buffer for 30s under a reconnect storm. A real
@@ -957,16 +967,14 @@ func handleConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 
 	// Peek first bytes to detect protocol
 	// First read TLS record header (5 bytes) to get record length
-	header := make([]byte, 5)
+	header = make([]byte, 5)
 	n, err := io.ReadFull(conn, header)
 	if err != nil || n < 5 {
 		logger.Debug("Failed to read header: %v (read %d bytes)", err, n)
-		serveFakeWebsite(conn, cfg, logger)
-		return
+		return nil, nil, false
 	}
 
 	// For TLS records, read full record to catch REALITY extension in padding
-	var peekBuf []byte
 	if header[0] == 0x16 { // TLS Handshake
 		recordLen := int(header[3])<<8 | int(header[4])
 		logger.Debug("TLS header received: %02x %02x %02x %02x %02x (record_len=%d, 0x%04x)",
@@ -1002,8 +1010,7 @@ func handleConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 				}
 				logger.Debug("Failed to read TLS record: %v (read %d/%d bytes)",
 					err, totalRead, recordLen)
-				serveFakeWebsite(conn, cfg, logger)
-				return
+				return nil, nil, false
 			}
 
 			totalRead += n
@@ -1021,6 +1028,53 @@ func handleConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 		peekBuf = make([]byte, 5+n)
 		copy(peekBuf, header)
 		copy(peekBuf[5:], restBuf[:n])
+	}
+
+	return header, peekBuf, true
+}
+
+func handleConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
+	cfg := srvCtx.cfg
+	defer conn.Close()
+
+	// Track connection metrics
+	if srvCtx.metrics != nil {
+		srvCtx.metrics.IncConnections()
+		defer srvCtx.metrics.DecConnections()
+	}
+
+	remoteAddr := conn.RemoteAddr().String()
+	logger := log.WithPrefix(fmt.Sprintf("conn:%d", connID))
+
+	logger.Info("New connection from %s", remoteAddr)
+
+	// Read the first framing unit (full TLS record or non-TLS peek) for protocol
+	// classification.
+	header, peekBuf, ok := readFirstPeek(conn, logger)
+	if !ok {
+		serveFakeWebsite(conn, cfg, logger)
+		return
+	}
+
+	// seqovl (level B): the client may prepend one or more secret-marked decoy
+	// TLS records before the real ClientHello to desync stateful DPI reassembly.
+	// Drop any leading decoy(s) so the real first flight classifies normally. The
+	// isSeqovlDecoy gate is additive — a genuine ClientHello (payload[0]==0x01) is
+	// rejected before any HMAC, so REALITY / Geneva / Morph are unaffected.
+	decoyCount := 0
+	for header[0] == 0x16 && isSeqovlDecoy(peekBuf, srvCtx) {
+		decoyCount++
+		if decoyCount > seqovlMaxDecoys {
+			logger.Debug("seqovl: decoy limit (%d) exceeded, serving fake website", seqovlMaxDecoys)
+			serveFakeWebsite(conn, cfg, logger)
+			return
+		}
+		logger.Debug("seqovl: dropped decoy record (%d bytes), reading real first flight", len(peekBuf))
+		header, peekBuf, ok = readFirstPeek(conn, logger)
+		if !ok {
+			serveFakeWebsite(conn, cfg, logger)
+			return
+		}
 	}
 
 	logger.Debug("First %d bytes: %s", len(peekBuf), log.HexDump(peekBuf, 32))

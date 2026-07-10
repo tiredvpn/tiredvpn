@@ -87,6 +87,9 @@ type Config struct {
 	// ICMP tunnel (backup transport, requires CAP_NET_RAW)
 	ICMPTunnelEnabled bool // Enable ICMP tunnel strategy
 
+	// Seqovl level-A packet overlap (Linux + CAP_NET_ADMIN, off by default)
+	SeqovlPacketEnabled bool // Enable packet-level TCP sequence overlap
+
 	// RTT Masking
 	RTTMaskingEnabled bool   // Enable RTT masking
 	RTTProfile        string // RTT profile name
@@ -241,27 +244,28 @@ func buildManager(cfg *Config, secret string) (*strategy.Manager, error) {
 	portHoppingCfg := buildPortHoppingConfig(cfg)
 
 	mgrCfg := strategy.DefaultManagerConfig{
-		ServerAddr:         cfg.ServerAddr,
-		Secret:             []byte(secret),
-		CoverHost:          cfg.CoverHost,
-		ServerAddrV6:       cfg.ServerAddrV6,
-		PreferIPv6:         cfg.PreferIPv6,
-		FallbackToV4:       cfg.FallbackToV4,
-		RTTMaskingEnabled:  cfg.RTTMaskingEnabled,
-		RTTProfile:         rttProfile,
-		QUICEnabled:        cfg.QUICEnabled,
-		QUICPort:           cfg.QUICPort,
-		ICMPTunnelEnabled:  cfg.ICMPTunnelEnabled,
-		ECHEnabled:         cfg.ECHEnabled,
-		ECHConfigList:      echConfigList,
-		ECHPublicName:      cfg.ECHPublicName,
-		QUICSNIFragEnabled: cfg.QUICSNIFragEnabled,
-		PQEnabled:          cfg.PQEnabled,
-		PQServerKemPubB64:  cfg.PQServerKemPubB64,
-		AndroidMode:        cfg.AndroidMode || cfg.MacOSMode,
-		PortHopping:        portHoppingCfg,
-		Shaper:             cfg.Shaper,
-		ShaperID:           cfg.ShaperID,
+		ServerAddr:          cfg.ServerAddr,
+		Secret:              []byte(secret),
+		CoverHost:           cfg.CoverHost,
+		ServerAddrV6:        cfg.ServerAddrV6,
+		PreferIPv6:          cfg.PreferIPv6,
+		FallbackToV4:        cfg.FallbackToV4,
+		RTTMaskingEnabled:   cfg.RTTMaskingEnabled,
+		RTTProfile:          rttProfile,
+		QUICEnabled:         cfg.QUICEnabled,
+		QUICPort:            cfg.QUICPort,
+		ICMPTunnelEnabled:   cfg.ICMPTunnelEnabled,
+		SeqovlPacketEnabled: cfg.SeqovlPacketEnabled,
+		ECHEnabled:          cfg.ECHEnabled,
+		ECHConfigList:       echConfigList,
+		ECHPublicName:       cfg.ECHPublicName,
+		QUICSNIFragEnabled:  cfg.QUICSNIFragEnabled,
+		PQEnabled:           cfg.PQEnabled,
+		PQServerKemPubB64:   cfg.PQServerKemPubB64,
+		AndroidMode:         cfg.AndroidMode || cfg.MacOSMode,
+		PortHopping:         portHoppingCfg,
+		Shaper:              cfg.Shaper,
+		ShaperID:            cfg.ShaperID,
 	}
 	mgr := strategy.NewDefaultManager(mgrCfg)
 

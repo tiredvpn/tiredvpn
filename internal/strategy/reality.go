@@ -218,6 +218,16 @@ func (r *REALITYStrategy) Probe(ctx context.Context, target string) error {
 // silently tore down a live tunnel whenever a second caller dialed — the root
 // cause of the reconnect storm.
 func (r *REALITYStrategy) Connect(ctx context.Context, target string) (net.Conn, error) {
+	return r.connect(ctx, target, nil)
+}
+
+// connect performs the full REALITY dial + handshake. When wrapFirstFlight is
+// non-nil it wraps the raw TCP conn to produce the writer the ClientHello first
+// flight is sent through; every other I/O (ServerHello read, ChaCha framing,
+// smux) uses the raw TCP conn directly. The seqovl strategy uses this hook to
+// prepend a decoy TLS record before the real first flight without duplicating
+// the handshake. wrapFirstFlight == nil is the plain REALITY path.
+func (r *REALITYStrategy) connect(ctx context.Context, target string, wrapFirstFlight func(net.Conn) net.Conn) (net.Conn, error) {
 	// New TCP connection + REALITY handshake + smux negotiation.
 	serverAddr := r.manager.GetServerAddr(ctx)
 	log.Debug("REALITY: Connecting to %s via %s", target, serverAddr)
@@ -306,11 +316,18 @@ func (r *REALITYStrategy) Connect(ctx context.Context, target string) (net.Conn,
 	sniHost, _, _ := net.SplitHostPort(dest)
 	firstFragEnd := sniFragmentSplitPoint(clientHello, sniHost, chelloFragmentSize)
 
+	// Route the ClientHello first flight through the optional wrapper (seqovl
+	// prepends its decoy record here). Plain REALITY writes straight to tcpConn.
+	writeConn := net.Conn(tcpConn)
+	if wrapFirstFlight != nil {
+		writeConn = wrapFirstFlight(tcpConn)
+	}
+
 	totalWritten := 0
 	fragments := 0
 
 	sendFrag := func(b []byte) error {
-		nw, werr := tcpConn.Write(b)
+		nw, werr := writeConn.Write(b)
 		totalWritten += nw
 		fragments++
 		return werr

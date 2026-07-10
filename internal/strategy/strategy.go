@@ -1133,6 +1133,9 @@ type DefaultManagerConfig struct {
 	// ICMP tunnel configuration (backup transport, requires CAP_NET_RAW)
 	ICMPTunnelEnabled bool // Enable ICMP tunnel strategy (off by default)
 
+	// Seqovl level-A packet overlap (Linux + CAP_NET_ADMIN, off by default)
+	SeqovlPacketEnabled bool // Enable packet-level TCP sequence overlap on top of level-B decoy
+
 	// REALITY configuration
 	REALITYEnabled bool // Enable REALITY protocol (99.5% success rate)
 
@@ -1269,7 +1272,19 @@ func registerAllStrategies(m *Manager, cfg DefaultManagerConfig) {
 	registerSSHCamouflage(m, cfg, hasServer, hasSecret)
 	registerIMAPCamouflage(m, cfg, hasServer, hasSecret)
 	registerGenevaStrategies(m, cfg, hasServer, hasSecret)
+	registerSeqovlStrategy(m, cfg, hasServer, hasSecret)
 	registerICMPStrategy(m, cfg, hasServer, hasSecret)
+}
+
+// registerSeqovlStrategy registers the seqovl (TCP sequence overlap, level B
+// app-framing) strategy. It rides the REALITY handshake with a secret-marked
+// decoy prefix, so it needs both a server and a shared secret. Cross-platform,
+// including Android.
+func registerSeqovlStrategy(m *Manager, cfg DefaultManagerConfig, hasServer, hasSecret bool) {
+	if !hasServer || !hasSecret {
+		return
+	}
+	m.Register(NewSeqovlStrategy(m, cfg.Secret, cfg.SeqovlPacketEnabled))
 }
 
 // registerICMPStrategy registers the ICMP tunnel backup strategy.
