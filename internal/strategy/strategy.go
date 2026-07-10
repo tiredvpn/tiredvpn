@@ -1303,31 +1303,38 @@ func registerQUICStrategies(m *Manager, cfg DefaultManagerConfig, hasServer, has
 	if !hasServer || !hasSecret {
 		return
 	}
-	if cfg.QUICEnabled {
-		port := cfg.QUICPort
-		if port == 0 {
-			port = 443
-		}
-		quicStrat := NewQUICStrategy(m, cfg.Secret, port)
-		if cfg.QUICSNIFragEnabled {
-			quicStrat.SetSNIFragmentation(true, nil)
-		}
-		m.Register(quicStrat)
+	// Both plain QUIC and QUIC Salamander are QUIC transports, so both must be
+	// gated behind QUICEnabled. Registering Salamander unconditionally leaked it
+	// into the benchmark/probe list even when -quic was not passed (issue #54).
+	if !cfg.QUICEnabled {
+		return
 	}
 
+	port := cfg.QUICPort
+	if port == 0 {
+		port = 443
+	}
+	quicStrat := NewQUICStrategy(m, cfg.Secret, port)
+	if cfg.QUICSNIFragEnabled {
+		quicStrat.SetSNIFragmentation(true, nil)
+	}
+	m.Register(quicStrat)
+
+	// SNI fragmentation replaces Salamander with the fragmenting plain-QUIC
+	// variant above; only register Salamander when SNI frag is off.
 	if !cfg.QUICSNIFragEnabled {
-		port := cfg.QUICSalamanderPort
-		if port == 0 {
+		salPort := cfg.QUICSalamanderPort
+		if salPort == 0 {
 			if _, portStr, err := net.SplitHostPort(cfg.ServerAddr); err == nil {
 				if p, err := strconv.Atoi(portStr); err == nil {
-					port = p
+					salPort = p
 				}
 			}
-			if port == 0 {
-				port = 443
+			if salPort == 0 {
+				salPort = 443
 			}
 		}
-		m.Register(NewQUICSalamanderStrategy(m, cfg.Secret, port))
+		m.Register(NewQUICSalamanderStrategy(m, cfg.Secret, salPort))
 	}
 }
 

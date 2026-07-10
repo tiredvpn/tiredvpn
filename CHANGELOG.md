@@ -7,6 +7,10 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`-benchmark` probed QUIC Salamander even without `-quic` (#54).** The client's `-quic` flag defaults to off, and the manager gated the plain QUIC strategy behind it correctly — but QUIC Salamander was registered whenever SNI fragmentation was disabled, ignoring `QUICEnabled` entirely. Since the benchmark just probes whatever strategies the manager registered, Salamander leaked into every run as the lone QUIC entry even when the user had not opted into QUIC. Salamander registration now lives inside the same `QUICEnabled` guard as plain QUIC, so no QUIC transport is probed unless `-quic` is passed.
+
 ## [1.3.22] - 2026-07-09
 
 ### Fixed
