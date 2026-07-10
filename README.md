@@ -556,9 +556,3 @@ Before submitting a pull request:
 ## License
 
 TiredVPN is licensed under the [GNU Affero General Public License v3.0](LICENSE).
-
----
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=tiredvpn/tiredvpn&type=Date)](https://star-history.com/#tiredvpn/tiredvpn&Date)
