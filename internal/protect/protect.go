@@ -7,7 +7,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
-	"os"
 	"sync"
 	"syscall"
 	"time"
@@ -70,59 +69,6 @@ func ProtectSocket(fd int) error {
 	return ProtectRawFd(fd)
 }
 
-// protect sends the fd to VpnService for protection
-func (p *protector) protect(fd int) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	// Connect to protect socket
-	conn, err := net.DialTimeout("unix", p.path, protectTimeout)
-	if err != nil {
-		return fmt.Errorf("protect socket connect failed: %w", err)
-	}
-	defer conn.Close()
-
-	// Bound the whole write+read round trip. Without this, a wedged
-	// VpnService-side handler leaves WriteMsgUnix/Read blocked forever with
-	// no way for the caller to interrupt it.
-	conn.SetDeadline(time.Now().Add(protectTimeout))
-
-	// Get underlying unix connection for fd passing
-	unixConn, ok := conn.(*net.UnixConn)
-	if !ok {
-		return fmt.Errorf("not a unix connection")
-	}
-
-	// Send fd via SCM_RIGHTS
-	file := os.NewFile(uintptr(fd), "socket")
-	if file == nil {
-		return fmt.Errorf("invalid fd: %d", fd)
-	}
-
-	// Build ancillary message with fd
-	rights := syscall.UnixRights(fd)
-
-	// Send dummy byte with fd in ancillary data
-	_, _, err = unixConn.WriteMsgUnix([]byte{0}, rights, nil)
-	if err != nil {
-		return fmt.Errorf("fd send failed: %w", err)
-	}
-
-	// Read response (Android sends single byte: 0=success, 1=failure)
-	buf := make([]byte, 1)
-	n, err := conn.Read(buf)
-	if err != nil {
-		return fmt.Errorf("protect response read failed: %w", err)
-	}
-
-	if n == 0 || buf[0] != 0 {
-		return fmt.Errorf("protect failed (response=%d)", buf[0])
-	}
-
-	log.Debug("Socket fd=%d protected", fd)
-	return nil
-}
-
 // ProtectConn protects a net.Conn's underlying socket
 func ProtectConn(conn net.Conn) error {
 	if globalProtector == nil {
@@ -155,15 +101,10 @@ func getConnFd(conn net.Conn) (int, error) {
 		}
 
 		var fd int
-		var controlErr error
-		err = rawConn.Control(func(fdRaw uintptr) {
+		if err := rawConn.Control(func(fdRaw uintptr) {
 			fd = int(fdRaw)
-		})
-		if err != nil {
+		}); err != nil {
 			return -1, err
-		}
-		if controlErr != nil {
-			return -1, controlErr
 		}
 		return fd, nil
 	}
