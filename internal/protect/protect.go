@@ -10,9 +10,22 @@ import (
 	"os"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/log"
 )
+
+// protectTimeout bounds every unix-socket round trip to the Android
+// VpnService protect() handler. This is a purely local IPC call (LocalSocket
+// on Android) that should complete in well under a second; the bound exists
+// so a wedged/unresponsive VpnService side can never hang the caller forever.
+//
+// Every protect() call sits directly on the REALITY dial path (ProtectDialer
+// wraps every TCP dial), so before this fix a stuck protect socket meant the
+// JNI-triggered connect on Android would block indefinitely with no deadline
+// and no way for the caller's context to interrupt it (net.Dial/conn.Read
+// here took no context at all).
+const protectTimeout = 5 * time.Second
 
 // protector handles Android VpnService socket protection
 type protector struct {
@@ -35,7 +48,7 @@ func InitAndroidProtector(socketPath string) error {
 	}
 
 	// Test connection to protect socket
-	conn, err := net.Dial("unix", socketPath)
+	conn, err := net.DialTimeout("unix", socketPath, protectTimeout)
 	if err != nil {
 		return fmt.Errorf("failed to connect to protect socket %s: %w", socketPath, err)
 	}
@@ -63,11 +76,16 @@ func (p *protector) protect(fd int) error {
 	defer p.mu.Unlock()
 
 	// Connect to protect socket
-	conn, err := net.Dial("unix", p.path)
+	conn, err := net.DialTimeout("unix", p.path, protectTimeout)
 	if err != nil {
 		return fmt.Errorf("protect socket connect failed: %w", err)
 	}
 	defer conn.Close()
+
+	// Bound the whole write+read round trip. Without this, a wedged
+	// VpnService-side handler leaves WriteMsgUnix/Read blocked forever with
+	// no way for the caller to interrupt it.
+	conn.SetDeadline(time.Now().Add(protectTimeout))
 
 	// Get underlying unix connection for fd passing
 	unixConn, ok := conn.(*net.UnixConn)
@@ -231,11 +249,14 @@ func ProtectRawFd(fd int) error {
 	defer globalProtector.mu.Unlock()
 
 	// Connect to protect socket
-	conn, err := net.Dial("unix", globalProtector.path)
+	conn, err := net.DialTimeout("unix", globalProtector.path, protectTimeout)
 	if err != nil {
 		return fmt.Errorf("protect socket connect failed: %w", err)
 	}
 	defer conn.Close()
+
+	// Bound the whole write+read round trip (see protectTimeout doc comment).
+	conn.SetDeadline(time.Now().Add(protectTimeout))
 
 	// Send fd as 4-byte little-endian integer
 	fdBytes := make([]byte, 4)

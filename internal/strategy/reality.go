@@ -233,6 +233,10 @@ func (r *REALITYStrategy) Connect(ctx context.Context, target string) (net.Conn,
 	timeout := 30 * time.Second
 	if hasDeadline {
 		timeout = time.Until(deadline)
+	} else {
+		// No caller deadline: still need an absolute time for the hard
+		// handshake deadline set below.
+		deadline = time.Now().Add(timeout)
 	}
 
 	protectedDialer := &protect.ProtectDialer{
@@ -254,6 +258,32 @@ func (r *REALITYStrategy) Connect(ctx context.Context, target string) (net.Conn,
 		tc.SetKeepAlive(true)
 		tc.SetKeepAlivePeriod(30 * time.Second)
 	}
+
+	// Hard deadline covering the ENTIRE handshake (ClientHello write, ServerHello
+	// read, mux negotiate, smux setup below). Without this, a DPI black-hole that
+	// silently drops our bytes after the dial succeeds - exactly the threat
+	// REALITY exists to survive - leaves tcpConn.Write()/Read() blocked forever
+	// with no deadline. On Android that hang propagates all the way up through
+	// the JNI-triggered connect goroutine, so the app never gets a "connected"
+	// or "error" callback and appears permanently stuck.
+	if err := tcpConn.SetDeadline(deadline); err != nil {
+		log.Debug("REALITY: SetDeadline failed: %v", err)
+	}
+
+	// Watch ctx: a bare SetDeadline only fires once the deadline elapses, so if
+	// the caller cancels ctx early (e.g. user hits disconnect mid-handshake) the
+	// blocked Read/Write would otherwise sit until the full timeout instead of
+	// waking up immediately. Force-closing the conn is the only way to wake a
+	// blocked syscall.Read/Write on cancellation - ctx.Done() alone does not.
+	handshakeDone := make(chan struct{})
+	defer close(handshakeDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			tcpConn.Close()
+		case <-handshakeDone:
+		}
+	}()
 
 	clientHello, err := r.buildClientHello(dest)
 	if err != nil {
@@ -347,6 +377,14 @@ func (r *REALITYStrategy) Connect(ctx context.Context, target string) (net.Conn,
 		newSess.Close()
 		tcpConn.Close()
 		return nil, fmt.Errorf("reality: first mux stream: %w", err)
+	}
+
+	// Handshake finished successfully: clear the hard handshake deadline before
+	// handing the connection off. The stream now outlives this deadline's
+	// window (it's a live tunnel, not a bounded handshake), and callers such as
+	// pool.PooledRelay already manage their own per-operation deadlines.
+	if err := tcpConn.SetDeadline(time.Time{}); err != nil {
+		log.Debug("REALITY: clearing deadline failed: %v", err)
 	}
 
 	log.Info("REALITY: Mux session established to %s via %s", target, dest)
@@ -560,10 +598,16 @@ func (r *REALITYStrategy) buildClientHello(dest string) ([]byte, error) {
 	return modifiedHello, nil
 }
 
-// readServerHello reads the ServerHello response with timeout
+// readServerHello reads the ServerHello response.
+//
+// The caller (Connect) already sets a single absolute SetDeadline() covering
+// the whole handshake, so this does not set its own read deadline - doing so
+// here used to both extend the deadline past the caller's original timeout
+// and then clear it entirely on return (SetReadDeadline(zero)), which left
+// every subsequent read in the handshake (mux negotiate, smux setup) with no
+// deadline at all.
 func (r *REALITYStrategy) readServerHello(conn net.Conn, timeout time.Duration) ([]byte, error) {
-	conn.SetReadDeadline(time.Now().Add(timeout))
-	defer conn.SetReadDeadline(time.Time{})
+	_ = timeout // deadline is owned by Connect(); kept for API stability
 
 	// Read TLS record header (5 bytes)
 	header := make([]byte, 5)
