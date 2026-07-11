@@ -300,6 +300,7 @@ TiredVPN is configured entirely via CLI flags. Run `tiredvpn server -help` or
 | `-tun-routes` | | Routes to tunnel (e.g. `0.0.0.0/0`) |
 | `-quic` | `false` | Enable QUIC transport |
 | `-strategy` | | Force a specific strategy |
+| `-seqovl-packet` | `false` | Packet-level TCP sequence overlap for `seqovl` (Linux + CAP_NET_ADMIN) |
 | `-port-hop` | `false` | Enable port hopping |
 | `-ech` | `false` | Enable Encrypted Client Hello |
 | `-pq` | `false` | Enable post-quantum crypto |
@@ -466,6 +467,7 @@ best transport. Each strategy targets a different aspect of DPI evasion.
 | `quic_salamander` | QUIC Salamander | QUIC over UDP with Salamander padding (default, hardest to fingerprint) |
 | `quic` | QUIC Tunnel | QUIC transport with version spoofing (draft-29 to bypass TSPU) |
 | `reality` | REALITY Protocol | Impersonates legitimate websites with authentic TLS fingerprints |
+| `seqovl` | Seqovl (Sequence Overlap) | Prepends a secret-marked decoy TLS record before the REALITY ClientHello to desync stateful DPI reassembly (packet-level overlap on Linux via `-seqovl-packet`) |
 | `http2_stego` | HTTP/2 Steganography | Hides data inside HTTP/2 frames with NaiveProxy-style padding |
 | `websocket_padded` | WebSocket Salamander | WebSocket transport with Salamander obfuscation padding |
 | `http_polling` | HTTP Polling | Short-lived HTTP/1.1 requests (meek-style), evades long-connection detection |

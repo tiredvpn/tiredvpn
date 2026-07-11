@@ -123,6 +123,7 @@ tiredvpn client \
 |------|---------|-------------|
 | `-quic` | `false` | Enable QUIC transport (UDP, highest priority) |
 | `-quic-port` | `8443` | Server QUIC port |
+| `-seqovl-packet` | `false` | Packet-level TCP sequence overlap for the `seqovl` strategy; additive to the app-framing decoy. Linux + `CAP_NET_ADMIN` + an `OUTPUT` NFQUEUE rule. Off = app-framing only (works everywhere, incl. Android) |
 | `-quic-sni-frag` | `false` | Fragment QUIC Initial SNI (GFW bypass) |
 | `-ech` | `false` | Enable Encrypted Client Hello (hides SNI) |
 | `-ech-config` | | ECHConfigList in base64 (from server) |

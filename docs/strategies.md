@@ -9,6 +9,7 @@ TiredVPN implements 20+ DPI evasion strategies. The adaptive strategy engine aut
 | `quic_salamander` | QUIC Salamander | QUIC/UDP | QUIC with Salamander obfuscation padding | High |
 | `quic` | QUIC Tunnel | QUIC/UDP | QUIC with draft-29 version spoofing | High |
 | `reality` | REALITY Protocol | TLS/TCP | X25519 handshake; impersonates real websites | Medium |
+| `seqovl` | Seqovl (Sequence Overlap) | TLS/TCP | Prepends a secret-marked decoy TLS record before the REALITY ClientHello to desync stateful DPI reassembly | Medium |
 | `http2_stego` | HTTP/2 Steganography | HTTP/2 | Data hidden in legitimate HTTP/2 frames | Medium |
 | `websocket_padded` | WebSocket Salamander | WebSocket | WebSocket + Salamander obfuscation | Medium |
 | `http_polling` | HTTP Polling | HTTP/1.1 | Short-lived poll requests (meek-style) | Medium |
@@ -35,6 +36,17 @@ tiredvpn client -list
 ```
 
 The Geneva strategy ships with four country rule-sets (`russia`, `china`, `iran`, `turkey`), but only `geneva_russia`, `geneva_china`, and `geneva_iran` are registered as strategy IDs by default. The `turkey` rule-set exists in the engine but is not exposed as a registered ID - using it requires a code change to register `NewGenevaStrategy(m, secret, "turkey")`.
+
+### Seqovl (TCP sequence overlap)
+
+`seqovl` sits on top of the REALITY handshake and attacks stateful DPI reassembly. The client prepends one or more secret-marked decoy TLS records before the real REALITY ClientHello. A censor's reassembler fingerprints the junk and misses the real first flight; the server recognises each decoy by an HMAC marker derived from the shared secret (the same one REALITY uses), drops it, and reads the genuine ClientHello. A real ClientHello starts its body with `0x01` and is rejected by a fast gate before any HMAC, so the REALITY, Geneva and Morph paths are untouched.
+
+Two levels:
+
+- **App-framing (default, cross-platform incl. Android)** - the decoy is a plain TLS record written before the ClientHello. No special privileges. This is what runs when you select `seqovl`.
+- **Packet-level (`-seqovl-packet`, Linux only, off by default)** - true TCP segment overlap via the Geneva NFQUEUE injector, requires `CAP_NET_ADMIN` and an `OUTPUT` NFQUEUE rule. The aggressive server-side NFQUEUE drop is not implemented yet, so the client uses a safe overlap geometry the receiver's kernel discards on its own. Additive to the app-framing decoy.
+
+Because both tunnel ends are ours, `seqovl` needs none of zapret's fooling machinery (badsum, TTL geometry) - the server just drops the marked decoy. Roll servers before clients: a `seqovl` client against a server that predates decoy support fails REALITY auth on that strategy and falls back.
 
 ## How the Adaptive Engine Works
 
@@ -100,6 +112,7 @@ TSPU blocks QUIC and common VPN protocols. Best options:
 - `quic_salamander` with `-quic-sni-frag` (SNI fragmentation defeats TSPU SNI detection)
 - `http2_stego` (data hidden in HTTP/2 frames, very hard to block)
 - `geneva_russia` (specifically tuned for TSPU rules)
+- `seqovl` (decoy record desyncs TSPU's stateful reassembler of the REALITY ClientHello)
 
 ```bash
 tiredvpn client \

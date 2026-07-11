@@ -115,6 +115,7 @@ Client → Server A (relay) → Server B (upstream/exit) → Internet
 | `-tun-name` | `tiredvpn0` | TUN interface name |
 | `-tun-mtu` | `1280` | TUN interface MTU (valid range 1280-9000) |
 | `-enable-icmp` | `false` | Enable ICMP tunnel listener (requires CAP_NET_RAW) |
+| `-seqovl-packet-drop` | `false` | Server-side NFQUEUE drop for packet-level `seqovl` overlap. Stub: not yet implemented, so this only warns and is a no-op - the client's default safe geometry needs no server drop |
 | `-pprof` | | Enable pprof profiling endpoint (e.g., `:6060`) |
 | `-version` | | Print version and exit |
 
