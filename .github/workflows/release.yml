@@ -336,3 +336,72 @@ jobs:
           fi
           git commit -m "Publish packages for ${TAG}"
           git push origin gh-pages
+
+  # After a successful app release, keep the Helm chart in lockstep: set its
+  # appVersion to the released app version, patch-bump the chart's own version
+  # (chart contents effectively changed), commit to main, and push a chart-v<ver>
+  # tag. That tag triggers chart-release.yml, which re-verifies the version and
+  # publishes to GHCR - no package/push logic is duplicated here.
+  #
+  # IMPORTANT: the chart-v tag is pushed with a PAT (secrets.CHART_RELEASE_TOKEN),
+  # NOT the default GITHUB_TOKEN. A tag pushed by GITHUB_TOKEN does not trigger
+  # other workflows (GitHub's recursion guard), so chart-release.yml would never
+  # fire. The same PAT is used to push the Chart.yaml bump commit to main.
+  chart-bump:
+    runs-on: ubuntu-latest
+    needs: [release]
+    # Only run for stable releases; skip prerelease tags like v1.2.3-rc1.
+    if: ${{ !contains(github.ref_name, '-') }}
+    concurrency:
+      group: chart-bump
+    env:
+      CHART_DIR: deploy/helm/tiredvpn
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          # PAT is required so the chart-v tag push below triggers chart-release.yml
+          # (and to push the bump commit even under branch protection).
+          token: ${{ secrets.CHART_RELEASE_TOKEN }}
+
+      - name: Bump chart appVersion and version
+        id: bump
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          APP_VERSION="${RELEASE_TAG#v}"
+          CHART_FILE="${CHART_DIR}/Chart.yaml"
+
+          CUR_CHART_VERSION="$(grep -E '^version:' "$CHART_FILE" | awk '{print $2}' | tr -d '"')"
+          # Patch-bump: increment the last dotted field (X.Y.Z -> X.Y.(Z+1)).
+          NEW_CHART_VERSION="$(echo "$CUR_CHART_VERSION" | awk -F. -v OFS=. '{$NF += 1; print}')"
+
+          # appVersion is quoted in Chart.yaml; version is bare.
+          sed -i -E "s|^appVersion:.*|appVersion: \"${APP_VERSION}\"|" "$CHART_FILE"
+          sed -i -E "s|^version:.*|version: ${NEW_CHART_VERSION}|" "$CHART_FILE"
+
+          echo "app_version=${APP_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "chart_version=${NEW_CHART_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Chart: appVersion -> ${APP_VERSION}, version ${CUR_CHART_VERSION} -> ${NEW_CHART_VERSION}"
+
+      - name: Commit, push, and tag chart release
+        env:
+          APP_VERSION: ${{ steps.bump.outputs.app_version }}
+          CHART_VERSION: ${{ steps.bump.outputs.chart_version }}
+        run: |
+          set -euo pipefail
+          git config user.name "tiredvpn"
+          git config user.email "noreply@users.noreply.github.com"
+          git add "${CHART_DIR}/Chart.yaml"
+          if git diff --cached --quiet; then
+            echo "no chart changes to commit"
+            exit 0
+          fi
+          git commit -m "chore: bump chart to ${CHART_VERSION} (appVersion ${APP_VERSION})"
+          git push origin HEAD:main
+          # This tag push runs under the PAT -> triggers chart-release.yml.
+          git tag "chart-v${CHART_VERSION}"
+          git push origin "chart-v${CHART_VERSION}"
