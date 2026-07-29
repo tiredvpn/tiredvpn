@@ -7,6 +7,12 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.24] - 2026-07-29
+
+### Fixed
+
+- **A single corrupted length prefix in HTTP Polling TUN mode could OOM-kill the process (and any other tiredvpn instance sharing the box) within seconds.** `runPollingTUNMode`'s packet parser treated a length prefix above the 65535-byte IP packet ceiling the same as a genuinely incomplete read: it wrote the buffered data back into the session and retried. But an over-limit prefix means the byte stream is corrupted, not short - the leading 4 bytes never change on retry, so the loop re-parsed the same bogus header forever while every subsequent poll's body kept piling up behind it, unbounded, since it could never be drained. On a censorship-facing relay where DPI is known to tamper with TCP streams, a single mangled prefix was enough to grow one session's buffer from kilobytes to gigabytes in place, and the box (2-3 GB RAM, no swap) went to the OOM killer in under 20 seconds - taking down every other tunnel through the same process. An invalid prefix now closes the session outright instead of being requeued, and `WriteFromClient` gained a 4 MB hard cap as a backstop against the same failure mode elsewhere.
+
 ## [1.3.23] - 2026-07-11
 
 ### Added

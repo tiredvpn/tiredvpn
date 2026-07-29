@@ -41,7 +41,7 @@ import (
 )
 
 var (
-	Version     = "1.3.23"
+	Version     = "1.3.24"
 	connCounter uint64
 )
 
@@ -4340,10 +4340,22 @@ func (s *HTTPPollingSession) ReadFromClient() []byte {
 	return data
 }
 
+// maxFromClientBuffered bounds fromClient so a stuck consumer (bad framing,
+// dead target) can't grow it without limit under a chatty poller. Legitimate
+// traffic never approaches this - it's individual TUN/SOCKS frames capped at
+// 65535 bytes each, drained every ~10ms.
+const maxFromClientBuffered = 4 * 1024 * 1024
+
 // WriteFromClient writes data received from client
 func (s *HTTPPollingSession) WriteFromClient(data []byte) {
 	s.bufLock.Lock()
 	defer s.bufLock.Unlock()
+	if s.fromClient.Len()+len(data) > maxFromClientBuffered {
+		// Consumer is stuck or the client is misbehaving; drop rather than
+		// grow unbounded. The stuck-consumer case above already tears the
+		// session down, so this is a backstop against similar bugs elsewhere.
+		return
+	}
 	s.fromClient.Write(data)
 }
 
@@ -4926,9 +4938,20 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 				continue
 			}
 
-			// Validate packet length
-			if pktLen > 65535 || int(pktLen)+4 > len(data) {
-				// Not enough data yet, put back for next iteration
+			// A length prefix over the max possible IP packet size is corrupt
+			// framing, not a partial read - the stream can never resync past it.
+			// Putting it back (like the incomplete-data case below) would just
+			// re-parse the same leading 4 bytes forever while every subsequent
+			// poll's body piles up behind it, unbounded. Tear the session down.
+			if pktLen > 65535 {
+				logger.Debug("HTTP Polling TUN: invalid packet length %d, closing session", pktLen)
+				sess.Close()
+				pollingManager.Remove(sess.ID)
+				return
+			}
+
+			if int(pktLen)+4 > len(data) {
+				// Genuinely incomplete - wait for the rest on the next poll.
 				logger.Debug("HTTP Polling TUN: incomplete packet, pktLen=%d, data=%d", pktLen, len(data))
 				sess.WriteFromClient(data)
 				break
