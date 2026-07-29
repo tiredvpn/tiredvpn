@@ -392,12 +392,6 @@ func Run(cfg *Config) error {
 		log.Warn("ICMP tunnel disabled: CAP_NET_RAW required")
 		cfg.EnableICMP = false
 	}
-	if !caps.HasIPCmd {
-		log.Warn("ip command not found: TUN mode will fail; install iproute2")
-	}
-	if !caps.HasIPTablesCmd {
-		log.Warn("iptables not found: MSS clamping disabled")
-	}
 	if !caps.HasTUNDevice {
 		log.Warn("TUN device /dev/net/tun not available")
 	}
@@ -599,6 +593,16 @@ func initIPPool(cfg *Config, srvCtx *serverContext) error {
 	}
 	srvCtx.sharedTUN = sharedTUN
 	sharedTUN.StartCleanupRoutine(2*time.Minute, 5*time.Minute)
+
+	// Bring up ip_forward + NAT for the pool so client traffic egresses
+	// through the host WAN. Non-fatal: a server started without NET_ADMIN
+	// (or one behind an external NAT setup already) should still come up in
+	// a degraded-but-running state, matching the old `ExecStartPre=-` /
+	// Docker entrypoint warn-and-continue behavior this replaces.
+	if err := tun.SetupServerNAT(cfg.IPPoolNetwork, os.Getenv("TIREDVPN_WAN_IFACE")); err != nil {
+		log.Warn("NAT auto-config failed: %v", err)
+	}
+
 	return nil
 }
 

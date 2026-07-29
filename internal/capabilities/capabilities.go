@@ -11,20 +11,6 @@ import (
 func Probe() Set {
 	s := Set{}
 
-	for _, p := range []string{"/sbin/ip", "/usr/sbin/ip", "/bin/ip"} {
-		if _, err := os.Stat(p); err == nil {
-			s.HasIPCmd = true
-			break
-		}
-	}
-
-	for _, p := range []string{"/sbin/iptables", "/usr/sbin/iptables", "/sbin/iptables-legacy"} {
-		if _, err := os.Stat(p); err == nil {
-			s.HasIPTablesCmd = true
-			break
-		}
-	}
-
 	if _, err := os.Stat("/dev/net/tun"); err == nil {
 		s.HasTUNDevice = true
 	}

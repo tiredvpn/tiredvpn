@@ -197,46 +197,34 @@ normal HTTPS server.
 
 ### Server firewall and forwarding (required for TUN mode)
 
-> **Installed via `install.sh`, the one-liner, or apt/dnf?** Nothing to do here.
-> Those paths set up TUN by default: the env file gets
-> `TIREDVPN_IP_POOL=10.8.0.0/24`, and on every service start
-> `ExecStartPre=/usr/bin/tiredvpn-nat` flips `net.ipv4.ip_forward=1` and installs
-> the `MASQUERADE` + `FORWARD` rules for the pool (idempotent). This is what lets
-> the Android app - which always uses native TUN - connect to a fresh install
-> with no manual steps. To opt out and run proxy-only, use
-> `install.sh --proxy-only` / `tiredvpn-init --proxy-only`, or set
-> `TIREDVPN_IP_POOL=` (empty) in `/etc/tiredvpn/env` and restart. Custom CIDR:
-> `tiredvpn-init --ip-pool <CIDR>`.
->
-> The manual steps below are only for running the binary directly (from source or
-> a raw download) without the package or systemd unit.
+**Automatic, for every way of running the server** - package, Docker, or the
+raw binary. Whenever `-ip-pool` is set (the packaged unit sets it by default:
+`TIREDVPN_IP_POOL=10.8.0.0/24` in `/etc/tiredvpn/env`), the server flips
+`net.ipv4.ip_forward=1` and installs `MASQUERADE` + `FORWARD` nftables rules
+for the pool on the WAN interface (autodetected via the route to `1.1.1.1`;
+override with the `TIREDVPN_WAN_IFACE` env var) directly over netlink on
+start - no `iptables`/`ip` binaries, no wrapper script, nothing to install.
+This is what lets the Android app - which always uses native TUN - connect to
+a fresh install with no manual steps. Failure is non-fatal: a host without
+`CAP_NET_ADMIN` logs a warning and comes up proxy-degraded rather than
+refusing to start.
 
-**If you run the binary yourself in TUN mode (`-tun` / `-ip-pool`), you must
-enable IP forwarding and NAT on the server host yourself.** The binary
-deliberately does not modify your firewall or routing. Without this, a TUN
-client connects and the server logs `TUN mode established`, but no traffic flows
-- the client's packets reach the server's TUN interface and have nowhere to go.
-(SOCKS5 proxy mode is unaffected: the server process egresses that traffic
-itself.)
+To opt out and run proxy-only: `install.sh --proxy-only` /
+`tiredvpn-init --proxy-only`, or set `TIREDVPN_IP_POOL=` (empty) in
+`/etc/tiredvpn/env` and restart. Custom CIDR: `tiredvpn-init --ip-pool <CIDR>`.
+
+**The automatic setup is IPv4-only.** For an IPv6 pool, or if you'd rather
+manage NAT yourself (a shared box with its own firewall policy, etc.), the
+automatic MASQUERADE/FORWARD install only ever touches the `-ip-pool` CIDR, so
+your own rules just coexist with it:
 
 ```bash
-# 1) Enable IP forwarding (persist it too)
-sysctl -w net.ipv4.ip_forward=1
-echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
-
-# 2) NAT the client pool out your uplink interface.
-#    Find the uplink with: ip route get 1.1.1.1   (the "dev <iface>" part)
-iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o <wan-iface> -j MASQUERADE
-
-# 3) Only if your FORWARD policy is DROP (check: iptables -S FORWARD | head -1)
-iptables -A FORWARD -s 10.8.0.0/24 -j ACCEPT
-iptables -A FORWARD -d 10.8.0.0/24 -j ACCEPT
+# Find the uplink with: ip route get 1.1.1.1   (the "dev <iface>" part)
+ip6tables -t nat -A POSTROUTING -s <ipv6-pool> -o <wan-iface> -j MASQUERADE
+ip6tables -A FORWARD -s <ipv6-pool> -j ACCEPT
+ip6tables -A FORWARD -d <ipv6-pool> -j ACCEPT
+sysctl -w net.ipv6.conf.all.forwarding=1
 ```
-
-Replace `10.8.0.0/24` with your `-ip-pool` CIDR and `<wan-iface>` with your real
-uplink (e.g. `eth0`, `enp1s0`). For IPv6 pools, mirror the rules with `ip6tables`
-and `net.ipv6.conf.all.forwarding=1`. Use a firewall manager (nftables, ufw,
-firewalld) if you prefer - the requirement is the same: forward and NAT the pool.
 
 ### Client (SOCKS5 proxy)
 
@@ -406,12 +394,11 @@ docker build -t tiredvpn .
 
 ### TUN mode in containers
 
-The default image is a scratch proxy build with no `iptables`, so server-side
-TUN (`-ip-pool`) does not work in it. For full TUN tunnelling use the `tun`
-build target (`tiredvpn:tun`), which needs `/dev/net/tun`, `NET_ADMIN`, and a
-writable `net.ipv4.ip_forward`; its entrypoint sets up NAT for you. The same
-applies to Helm via `server.tun.enabled`. Full docker run / compose / Helm
-recipes are in
+The default image handles server-side TUN (`-ip-pool`) out of the box - the
+binary sets up NAT itself via netlink/nftables on start, no special build
+needed. It just needs `/dev/net/tun`, `NET_ADMIN`, and a writable
+`net.ipv4.ip_forward` from the container runtime. The same applies to Helm via
+`server.tun.enabled`. Full docker run / compose / Helm recipes are in
 [docs/deployment.md → TUN mode in containers](docs/deployment.md#tun-mode-in-containers).
 
 ---

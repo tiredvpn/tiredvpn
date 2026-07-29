@@ -69,10 +69,9 @@ TIREDVPN_SECRET=<secret> docker compose up -d
 ```
 
 This runs the server in SOCKS5/proxy mode - the default image egresses client
-traffic itself, no TUN device involved. If you want full TUN tunnelling
-(`-ip-pool`), the default image will not work: it is a scratch build with no
-`iptables`, so it cannot set up NAT. See [TUN mode in containers](#tun-mode-in-containers)
-below for the tun image and the extra container privileges it needs.
+traffic itself, no TUN device involved. The same image also works for full TUN
+tunnelling (`-ip-pool`) - see [TUN mode in containers](#tun-mode-in-containers)
+below for the extra container privileges that needs.
 
 ### Build the image locally
 
@@ -84,28 +83,23 @@ docker build -t tiredvpn:local .
 
 ## TUN mode in containers
 
-The default image (`tiredvpn/tiredvpn:latest`) is a minimal scratch build aimed
-at proxy mode. It has no `iptables` and no shell, so it cannot create the
-`MASQUERADE`/`FORWARD` rules a TUN server needs. For server-side TUN inside a
-container, build and run the `tun` target instead.
-
-The `tun` image (`tiredvpn:tun`) is Alpine-based with `iptables`. Its entrypoint
-sets up forwarding on its own: it flips `net.ipv4.ip_forward`, detects the WAN
-interface, and installs `MASQUERADE` + `FORWARD` rules for the `-ip-pool` CIDR
-you pass. You do not NAT by hand inside the container - that manual dance is only
-for bare-metal/host setups (see [Server firewall and forwarding](../README.md#server-firewall-and-forwarding-required-for-tun-mode)).
-If WAN auto-detection picks the wrong interface, override it with the
-`TIREDVPN_WAN_IFACE` env var.
+The default image (`tiredvpn/tiredvpn:latest`) handles server-side TUN out of
+the box - no special build, no `iptables`, no entrypoint wrapper. On start,
+whenever `-ip-pool` is set, the binary itself flips `net.ipv4.ip_forward`,
+detects the WAN interface, and installs `MASQUERADE` + `FORWARD` rules for the
+pool CIDR directly over netlink/nftables (see
+[Server firewall and forwarding](../README.md#server-firewall-and-forwarding-required-for-tun-mode)
+for the mechanism and the `TIREDVPN_WAN_IFACE` override). You never NAT by
+hand inside the container.
 
 Whatever the runtime, a TUN server needs three things from the host: the
 `/dev/net/tun` device, the `NET_ADMIN` capability, and a writable
 `net.ipv4.ip_forward`.
 
-Build the tun image:
-
-```bash
-docker build --target tun -t tiredvpn:tun .
-```
+There's also an `alpine`-based `tun` build target with a shell/coreutils for
+in-container troubleshooting - functionally identical to the default image
+otherwise. Build it with `docker build --target tun -t tiredvpn:tun .` if you
+want it; most deployments don't need to.
 
 ### docker run
 
@@ -119,7 +113,7 @@ docker run -d \
   -p 443:443/tcp \
   -p 443:443/udp \
   -v /etc/tiredvpn/certs:/certs:ro \
-  tiredvpn:tun \
+  tiredvpn/tiredvpn:latest \
   server \
   -listen :443 \
   -cert /certs/server.crt \
@@ -128,7 +122,7 @@ docker run -d \
   -ip-pool 10.8.0.0/24
 ```
 
-The `-ip-pool` flag is what turns on TUN serving and tells the entrypoint which
+The `-ip-pool` flag is what turns on TUN serving and tells the binary which
 CIDR to NAT. Once the container is up, a TUN client (`tiredvpn client -tun`) gets
 an IP from that pool and its traffic exits through the container's WAN interface.
 
@@ -141,18 +135,14 @@ unaffected. Bring it up explicitly:
 TIREDVPN_SECRET=<secret> docker compose --profile tun up -d
 ```
 
-The profiled service uses the `tun` image and already carries the right
-settings - `cap_add: NET_ADMIN`, `devices: /dev/net/tun`, and
-`sysctls: net.ipv4.ip_forward=1` - plus the `-ip-pool` flag in its command. The
-entrypoint handles NAT from there.
+The profiled service uses the same default image and already carries the
+right settings - `cap_add: NET_ADMIN`, `devices: /dev/net/tun`, and
+`sysctls: net.ipv4.ip_forward=1` - plus the `-ip-pool` flag in its command.
 
 ```yaml
 services:
   tiredvpn-tun:
-    build:
-      context: .
-      target: tun
-    image: tiredvpn:tun
+    image: tiredvpn/tiredvpn:latest
     profiles: ["tun"]
     ports:
       - "443:443/tcp"
@@ -246,11 +236,11 @@ Self-signed works fine — TiredVPN does not validate the server certificate fro
 
 ## Systemd Service
 
-The packaged unit (from apt/dnf/`install.sh`) already runs TUN by default and
-sets forwarding/NAT via `ExecStartPre=/usr/bin/tiredvpn-nat`, reading the pool
-from `TIREDVPN_IP_POOL` in `/etc/tiredvpn/env`. The hand-written unit below is
-for a manual binary install - it does not include that step, so set forwarding
-and NAT yourself (see [Firewall](#firewall) above) if you use `-ip-pool` here.
+The packaged unit (from apt/dnf/`install.sh`) already runs TUN by default,
+reading the pool from `TIREDVPN_IP_POOL` in `/etc/tiredvpn/env`. Forwarding/NAT
+setup is automatic - the binary does it itself on start whenever `-ip-pool` is
+set (see [Firewall](#firewall) below), including with the hand-written unit
+below.
 
 ```ini
 # /etc/systemd/system/tiredvpn.service
@@ -321,28 +311,19 @@ If you use port hopping, also open the hop range:
 iptables -A INPUT -p udp --dport 47000:47100 -j ACCEPT
 ```
 
-For TUN mode, forwarding and NAT are handled for you when you install via a
-package: `install.sh`, the one-liner, and the apt/dnf packages set TUN by default
-(`TIREDVPN_IP_POOL=10.8.0.0/24` in `/etc/tiredvpn/env`) and the service's
-`ExecStartPre=/usr/bin/tiredvpn-nat` flips `ip_forward` and installs
-`MASQUERADE` + `FORWARD` for the pool on each start. Opt out with
+For TUN mode, forwarding and NAT are automatic - the binary flips `ip_forward`
+and installs `MASQUERADE` + `FORWARD` nftables rules for the `-ip-pool` CIDR
+itself on start, over netlink, regardless of how you're running it (package,
+container, or the raw binary). The packaged unit sets TUN by default
+(`TIREDVPN_IP_POOL=10.8.0.0/24` in `/etc/tiredvpn/env`); opt out with
 `install.sh --proxy-only` / `tiredvpn-init --proxy-only`, or an empty
 `TIREDVPN_IP_POOL`.
 
-Only when you run the binary directly (from source or a raw download, no
-package/unit) do you enable IP forwarding and masquerade by hand:
-
-```bash
-# Enable IP forwarding
-echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
-sysctl -p
-
-# NAT for VPN clients
-iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o eth0 -j MASQUERADE
-```
-
-In containers you also do not run these by hand - the `tun` image entrypoint sets
-forwarding and NAT itself. See [TUN mode in containers](#tun-mode-in-containers).
+The automatic setup is IPv4-only. For an IPv6 pool, add the equivalent
+`ip6tables`/`nft` rules yourself and enable
+`net.ipv6.conf.all.forwarding=1` - see
+[Server firewall and forwarding](../README.md#server-firewall-and-forwarding-required-for-tun-mode)
+in the README.
 
 ## Multi-Hop Setup
 

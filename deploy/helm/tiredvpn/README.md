@@ -89,7 +89,7 @@ From any pod: `curl -x socks5h://proxy-tiredvpn-client-socks:1080 https://ifconf
 
 ### 5. Client in TUN mode (DaemonSet, tunnels node traffic)
 
-> ⚠️  The default `tiredvpn/tiredvpn` image is built `FROM scratch` and does not contain `ip` / `iptables`, which the client uses to configure the TUN device. Build your own image based on alpine/debian with `iproute2` + `iptables` and point `client.tun.image.repository` at it.
+The default `tiredvpn/tiredvpn` image works as-is - the client configures the TUN device (interface, IP, routes, MSS clamping) itself via netlink/nftables, no `ip`/`iptables` binaries needed. `client.tun.image.repository` is only for overriding to a different image on this DaemonSet specifically (e.g. a debug-shell variant).
 
 ```bash
 helm install vpn-tunnel deploy/helm/tiredvpn -f - <<EOF

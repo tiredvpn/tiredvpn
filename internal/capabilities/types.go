@@ -3,11 +3,9 @@ package capabilities
 import "strings"
 
 type Set struct {
-	HasIPCmd       bool
-	HasIPTablesCmd bool
-	HasNetAdmin    bool
-	HasNetRaw      bool
-	HasTUNDevice   bool
+	HasNetAdmin  bool
+	HasNetRaw    bool
+	HasTUNDevice bool
 }
 
 func (s Set) String() string {
@@ -21,8 +19,6 @@ func (s Set) String() string {
 		}
 	}
 
-	label(s.HasIPCmd, "ip")
-	label(s.HasIPTablesCmd, "iptables")
 	label(s.HasNetAdmin, "CAP_NET_ADMIN")
 	label(s.HasNetRaw, "CAP_NET_RAW")
 	label(s.HasTUNDevice, "/dev/net/tun")

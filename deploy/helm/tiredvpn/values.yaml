@@ -86,29 +86,31 @@ server:
   # This requires NET_ADMIN, access to /dev/net/tun and the ability to enable
   # net.ipv4.ip_forward — none of which the default proxy securityContext allows.
   #
-  # Build contract: use the `tun` Dockerfile target (alpine + iptables). Its
-  # entrypoint enables ip_forward and installs iptables MASQUERADE/FORWARD rules
-  # for the -ip-pool CIDR automatically (auto-detected WAN interface). So NAT is
-  # NOT configured here — the chart only grants the pod the needed privileges.
+  # The binary itself enables ip_forward and installs nftables MASQUERADE/FORWARD
+  # rules for the -ip-pool CIDR on start (auto-detected WAN interface, override
+  # via the TIREDVPN_WAN_IFACE env var) — pure netlink, no iptables/ip binaries,
+  # so the default image (global.image) works here unchanged. NAT is NOT
+  # configured by the chart — it only grants the pod the needed privileges.
   #
   # When tun.enabled=false (default) the server stays a plain proxy and the
   # securityContext / image below are unchanged.
   tun:
     enabled: false
-    # Image with the tun entrypoint (alpine + iptables). Empty repository = reuse
-    # global.image.repository; set tag to the tun-variant tag (e.g. "tun" or "x.y.z-tun").
+    # Empty = reuse global.image unchanged; the default image already handles
+    # TUN mode. Override only if you want a different image for this pod
+    # specifically (e.g. the alpine `tun` build tag for a debug shell).
     image:
       repository: ""          # empty = global.image.repository
-      tag: "tun"              # tun-variant tag built from the `tun` Dockerfile target
+      tag: ""                 # empty = global.image.tag
       pullPolicy: ""          # empty = global.image.pullPolicy
     # hostNetwork is recommended for an exit node so MASQUERADE uses the node WAN
     # and return traffic is routed by the node directly.
     hostNetwork: true
-    # privileged:true is the simplest path — it lets the entrypoint set sysctls
-    # (net.ipv4.ip_forward) and install iptables rules without extra kubelet config.
-    # privileged:false + capabilities below works only if the kubelet allows the
-    # net.ipv4.ip_forward sysctl (see sysctls note in server-deployment.yaml) or
-    # the entrypoint can already toggle it via NET_ADMIN.
+    # privileged:true is the simplest path — it lets the binary set sysctls
+    # (net.ipv4.ip_forward) and install nftables rules without extra kubelet
+    # config. privileged:false + capabilities below works only if the kubelet
+    # allows the net.ipv4.ip_forward sysctl (see sysctls note in
+    # server-deployment.yaml) or the binary can already toggle it via NET_ADMIN.
     privileged: false
     capabilities:
       - NET_ADMIN
@@ -338,10 +340,11 @@ client:
       minAvailable: 1
 
   # -------- TUN mode (DaemonSet) --------
-  # NOTE: the default tiredvpn image is FROM scratch and does NOT contain `ip`/`iptables`,
-  # which the client needs to configure the TUN device. Before using TUN mode, build your
-  # own image based on alpine/debian with iproute2+iptables, or override global.image
-  # to point at such an image.
+  # The client configures the TUN device (creation, IP, routes, MSS clamping)
+  # itself via netlink/nftables — no `ip`/`iptables` binaries needed, so the
+  # default tiredvpn image (FROM scratch, global.image) works unchanged here.
+  # Override image below only if you want a different image for this
+  # DaemonSet specifically (e.g. a debug-shell variant).
   tun:
     name: tiredvpn0             # -tun-name
     ip: 10.8.0.2                # -tun-ip
@@ -351,7 +354,7 @@ client:
     hostNetwork: true
     # true → privileged: true; false → drop ALL + add NET_ADMIN,NET_RAW.
     usePrivileged: false
-    # Image override (recommended — build your own with iproute2). Empty = global.image.
+    # Empty = reuse global.image unchanged.
     image:
       repository: ""
       tag: ""

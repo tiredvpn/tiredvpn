@@ -1,5 +1,8 @@
 # Client in TUN mode only (DaemonSet, privileged).
-# NOTE: uses an image override based on alpine with iproute2/iptables.
+# NOTE: exercises the client.tun.image override path with a custom image tag.
+# Not required for TUN mode to work - the default image handles it via
+# netlink/nftables - this just tests that overriding to a different image
+# (e.g. one with extra debug tooling) still renders correctly.
 server:
   enabled: false
 
@@ -20,5 +23,5 @@ client:
     routes: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
     usePrivileged: false   # NET_ADMIN+NET_RAW caps
     image:
-      repository: "myorg/tiredvpn-tun"  # override: image with iproute2+iptables
+      repository: "myorg/tiredvpn-tun"  # override: custom image, e.g. with a debug shell
       tag: "1.1.3"

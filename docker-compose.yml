@@ -15,11 +15,11 @@ services:
 
   # TUN-mode server. Only started with `docker compose --profile tun up`;
   # a plain `docker compose up` leaves it out and runs the proxy server above.
+  # Uses the same default image as the proxy service - NAT/forwarding is
+  # handled by the binary itself (internal/tun/nat_linux.go), not by the
+  # image, so no special TUN-only build is needed.
   tiredvpn-server-tun:
-    build:
-      context: .
-      target: tun
-    image: tiredvpn:tun
+    image: tiredvpn/tiredvpn:latest
     profiles: ["tun"]
     ports:
       - "${TIREDVPN_PORT:-443}:443/tcp"
@@ -29,12 +29,13 @@ services:
     volumes:
       - ./certs:/certs:ro
       - ./configs:/etc/tiredvpn
-    # -ip-pool/-tun-ip switch the server into TUN mode. The tun image entrypoint
-    # auto-enables ip_forward and installs iptables MASQUERADE/FORWARD for the
-    # given -ip-pool, so no NAT config is needed here.
+    # -ip-pool/-tun-ip switch the server into TUN mode. The binary itself
+    # auto-enables ip_forward and installs nftables MASQUERADE/FORWARD rules
+    # for the given -ip-pool on start (internal/tun/nat_linux.go), so no NAT
+    # config is needed here.
     command: ["server", "-listen", ":443", "-cert", "/certs/server.crt", "-key", "/certs/server.key", "-secret", "${TIREDVPN_SECRET}", "-tun-ip", "10.8.0.1", "-ip-pool", "10.8.0.0/24"]
     # These three are mandatory for TUN mode:
-    #   cap_add NET_ADMIN — create the tun device + manage iptables/routes
+    #   cap_add NET_ADMIN — create the tun device + manage nftables/routes
     #   devices /dev/net/tun — expose the host tun char device to the container
     #   sysctls ip_forward — route client traffic between tun and the WAN iface
     cap_add: ["NET_ADMIN"]

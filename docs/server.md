@@ -125,39 +125,30 @@ At startup the server reads `/proc/self/status` to check available Linux capabil
 
 ## Forwarding and NAT (required for TUN mode)
 
-**Package install (`install.sh`, one-liner, apt/dnf): automatic.** These paths
-set TUN mode by default - the env file gets `TIREDVPN_IP_POOL=10.8.0.0/24`, the
-unit starts the server with `-ip-pool ${TIREDVPN_IP_POOL}`, and
-`ExecStartPre=/usr/bin/tiredvpn-nat` flips `net.ipv4.ip_forward=1` and installs
-`MASQUERADE` + `FORWARD` for the pool on every start (idempotent). No manual
-forwarding. This is what lets the Android app (always native TUN) connect to a
-fresh install. Opt out with `install.sh --proxy-only` / `tiredvpn-init
---proxy-only`, or set `TIREDVPN_IP_POOL=` (empty) in `/etc/tiredvpn/env` and
-restart - an empty pool starts the server in proxy mode and skips NAT. Custom
-CIDR: `tiredvpn-init --ip-pool <CIDR>`.
+**Automatic, always** - package, container, or the raw binary run by hand.
+Whenever `-ip-pool` is set, the server flips `net.ipv4.ip_forward=1` and
+installs `MASQUERADE` + `FORWARD` nftables rules for the pool on the WAN
+interface (autodetected via the route to `1.1.1.1`; override with the
+`TIREDVPN_WAN_IFACE` env var) directly over netlink on start - no
+`iptables`/`ip` binaries, no wrapper script or container entrypoint involved.
+Failure is non-fatal: a host without `CAP_NET_ADMIN` logs a warning and comes
+up proxy-degraded instead of refusing to start.
 
-The rest of this section is the **manual binary / from-source** case (running the
-binary directly, no package or unit).
+The packaged unit (`install.sh`, one-liner, apt/dnf) sets TUN mode by default
+- the env file gets `TIREDVPN_IP_POOL=10.8.0.0/24` and the unit starts the
+server with `-ip-pool ${TIREDVPN_IP_POOL}`. This is what lets the Android app
+(always native TUN) connect to a fresh install. Opt out with
+`install.sh --proxy-only` / `tiredvpn-init --proxy-only`, or set
+`TIREDVPN_IP_POOL=` (empty) in `/etc/tiredvpn/env` and restart - an empty pool
+starts the server in proxy mode and skips NAT entirely. Custom CIDR:
+`tiredvpn-init --ip-pool <CIDR>`.
 
-When you run the binary yourself in TUN mode (`-tun` / `-ip-pool`), the server
-hands each client an IP from the pool, but it does not touch the host firewall or
-routing. You must enable forwarding and NAT yourself, otherwise client packets
-reach the server's TUN interface and have nowhere to go (SOCKS5 proxy mode is
-unaffected).
-
-The host needs three things:
-
-- `net.ipv4.ip_forward=1` so the kernel routes between the TUN interface and the uplink.
-- An iptables `MASQUERADE` rule on the uplink for the `-ip-pool` CIDR.
-- A `FORWARD` `ACCEPT` rule for the pool if your `FORWARD` policy is `DROP`.
-
-The binary never modifies these rules. For the exact commands (including the
-IPv6 variant), see the [Server firewall and forwarding](../README.md#server-firewall-and-forwarding-required-for-tun-mode)
-section in the README and [deployment.md](deployment.md).
-
-Running the server in a container is different - the `tun` image entrypoint sets
-forwarding and NAT automatically from `-ip-pool`, so you do not run these
-commands by hand there. See [deployment.md → TUN mode in containers](deployment.md#tun-mode-in-containers).
+If you'd rather manage NAT yourself (IPv6 pools - the automatic setup is
+IPv4-only, a shared box with its own firewall policy, etc.), that's fine: the
+automatic install only ever touches the `-ip-pool` CIDR, so your own rules
+just coexist with it. See the
+[Server firewall and forwarding](../README.md#server-firewall-and-forwarding-required-for-tun-mode)
+section in the README for manual commands.
 
 ## Configuration via TOML (preferred)
 

@@ -17,12 +17,12 @@ description: |
 homepage: https://github.com/tiredvpn/tiredvpn
 license: AGPL-3.0
 
-# Debian dependencies.
+# Debian dependencies. iproute2 is used by tiredvpn-init's public-IP-detection
+# fallback (ip route get); NAT/forwarding setup itself is handled by the
+# binary via netlink/nftables, no iptables package needed.
 depends:
   - openssl
   - iproute2
-recommends:
-  - iptables
 
 # RPM uses different package names for the same tools.
 overrides:
@@ -41,10 +41,6 @@ contents:
       mode: 0755
   - src: ./packaging/tiredvpn-init.sh
     dst: /usr/bin/tiredvpn-init
-    file_info:
-      mode: 0755
-  - src: ./packaging/tiredvpn-nat.sh
-    dst: /usr/bin/tiredvpn-nat
     file_info:
       mode: 0755
   - src: ./packaging/tiredvpn.service

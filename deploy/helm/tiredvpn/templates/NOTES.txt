@@ -67,10 +67,8 @@ SOCKS5 proxy:
 {{- if include "tiredvpn.client.tun.enabled" . }}
 
 TUN tunnel (DaemonSet on each linux node):
-  ⚠️  The default tiredvpn/tiredvpn image is built FROM scratch and does NOT contain
-      `ip`/`iptables`, which the client uses to configure the TUN device. Build your own
-      image based on alpine with iproute2+iptables and set it via
-      client.tun.image.repository (or global.image.repository).
+  The default tiredvpn/tiredvpn image works as-is - the client configures the
+  TUN device itself via netlink/nftables, no `ip`/`iptables` binaries needed.
   Routes: {{ .Values.client.tun.routes }}
   Logs:
     kubectl -n {{ .Release.Namespace }} logs -l app.kubernetes.io/component=client-tun -f
