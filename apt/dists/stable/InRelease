@@ -4,44 +4,44 @@ Hash: SHA512
 Origin: TiredVPN
 Label: TiredVPN
 Codename: stable
-Date: Sat, 11 Jul 2026 00:06:04 UTC
+Date: Wed, 29 Jul 2026 10:08:29 UTC
 Architectures: amd64 arm64
 Components: main
 Description: TiredVPN apt repository
 MD5Sum:
- ed2cc0d1526c9d89371997ed2a15b8ab 765 main/binary-amd64/Packages
- ecce69285a96f6038b1a06dfb7676c15 535 main/binary-amd64/Packages.gz
+ 46ac4dc1b2ff61c5da46f69b18129751 765 main/binary-amd64/Packages
+ 2f8003dfe8df7ac067cdde80605a605c 537 main/binary-amd64/Packages.gz
  a1cb1598e0aa53fb7a19e480edb1fd61 106 main/binary-amd64/Release
- 3136d58018aaec05d913b3b9e6975098 765 main/binary-arm64/Packages
- a7ed3691475b61dc48223b5103f9f32f 534 main/binary-arm64/Packages.gz
+ b929606fe151b496648d6cab2aaf8d7c 765 main/binary-arm64/Packages
+ 6ba14689e22b6dd5cc15376a5f9ad3c1 534 main/binary-arm64/Packages.gz
  833f0c2c40c4bd6fc40c49fa19ba6a0e 106 main/binary-arm64/Release
 SHA1:
- 93bbd93b5303ea6b0b5aa37e1e168fdf2881d11d 765 main/binary-amd64/Packages
- 1c9172ff2103624202ae6d2113cce70758e0aa89 535 main/binary-amd64/Packages.gz
+ ef87eef4133bf04345fd0f8c54793c9e732e210f 765 main/binary-amd64/Packages
+ 5b759fb22379a8d7ea9919b2f5ca77a85466b5b2 537 main/binary-amd64/Packages.gz
  cbfc21b1aea4c89370605c63ec154f6fec1a0765 106 main/binary-amd64/Release
- 5976faa685480e98f1fb0733c3e044f7e236a455 765 main/binary-arm64/Packages
- ee0b722b7e9fbdbe32ea95578b85ff4c04802bc6 534 main/binary-arm64/Packages.gz
+ dff77283fbb97af4b3bea96b95e2f3db0534fd1b 765 main/binary-arm64/Packages
+ a665c0f9bf34eee6f7a0248857f7a7c15645e832 534 main/binary-arm64/Packages.gz
  3bca33c026140b27d9e2f0e3015f33da87d18e20 106 main/binary-arm64/Release
 SHA256:
- 112c4a740936bd7be4d6227bced6067bb8c555d72392fc4c334c3a172ec5a0c7 765 main/binary-amd64/Packages
- 576d150b390d0205dfa7dec477a9504f74801bec604c525c65b315cc6cff5f71 535 main/binary-amd64/Packages.gz
+ 791839043479bbc877d48b717ab5668461bd19e97caffcc9aab7d33f317db596 765 main/binary-amd64/Packages
+ b1c5eab4ce8c79f0ad64e4e9226ff4e0f5d6da57a1c33aae18f04ac49d9b346f 537 main/binary-amd64/Packages.gz
  f56fb9ff2142f536cc47925e506d8cc1e0f6279b4aa0d1ed26922aa43934b7c7 106 main/binary-amd64/Release
- 14e6c354fd301c7bda5c2588396a7c35b9e98d5da72cc55b3988817d5e778c77 765 main/binary-arm64/Packages
- 4ee7285f68d2eac157690c9e189c8a4bcb30401934c43cd6e070262bb7b5241a 534 main/binary-arm64/Packages.gz
+ c06111eaa2e3100f808eda768aa085c4003f848f5609725c178020e4bb590f4d 765 main/binary-arm64/Packages
+ 7a5f307d5853ad70e74cb44a7cce24ae549304eba035da871faa50d604729b55 534 main/binary-arm64/Packages.gz
  2ea051df46bf72e3e60ff7def56f180e193b56db497b982353db591146d6542a 106 main/binary-arm64/Release
 -----BEGIN PGP SIGNATURE-----
 
-iQIzBAEBCgAdFiEERHHoMQRgX2u48+4LJqtRtqgl770FAmpRiOwACgkQJqtRtqgl
-771Bcg/9EpcMsxIYMAscqaKvIBA/IYAW8q1yOZrj0YIMOlVf/0pylNMvFxpxIE1P
-49Hm8zqMA8x3LO/wz90oCKapN65SStC6DG9nYwyi9vdwKdJpkDNMARj3lduzBeo6
-6Evb87pHvVFoSfaSNg1sb58ChQYU8NWLvyPqMmWuPyMDIKCTUxVemB62W3Dh39/b
-wiWmJ5QGYazdghRmKenGgsyA+PPrCbRqS2wtr6JG2fZWKl6nSWqBdWgZF0ft7AO1
-EUPmy2dbsJTjHq2aqIDfaUcatV9ch00mCYEapx6fTPZx8zEYgCMiSnvc66dcCFyy
-7XjZFohvbOQ0GQjhTWufHwgxI0OtE/0c6CjB8H9EsPSNDoroLQ4ztcyjT/UeotXr
-8AutMdX3CETagULK2uj8HfpBMYW6ziKMcRyURP9U22Tawu/py9ALdpS1R3oZFnMH
-ViiGB+R5Vf4/7UCFS3p1raE5fXN0jbLqKO9MjrCZoyL+MHr/HHtMssfln6JB0RPX
-/F7hYWUtzYzEYBLLsz/v0PzY55M9V4TwehP1+nAEKNAl/2HbVeruaBWfJxbJUkdB
-Ga+T2xUazns4To4aInYtNzCGsMDwllG1d8B4YJXCYFslovj6e2w61Y94/8xNeqrW
-hZYKaTa52DZ1NZC5IRFDGC8b395BAbwnPrmyjGpC76F28LjDhMY=
-=Tr+A
+iQIzBAEBCgAdFiEERHHoMQRgX2u48+4LJqtRtqgl770FAmpp0R0ACgkQJqtRtqgl
+770L8w/+K/DXRFKlt2RgAidfLPUY6+m0nIl+8RyqH1ch+c8eL0B/3nxXq7KFHCxn
+BMct8pkWr0BQ5JFbubWROiAfyiIS3ASjo3XNqAeICCweJywdPGPv/M9Tk387Bww0
+vq7hBVNZNOXoOBi5xszdm/UGdi2jqCY7kixoVnPGvKIgqgpffRD8b0IPcVOFgXrO
+etlmeaWmFa2/ZKJKpSytslYFpqWqc/szWvfy4zWPLYxPZK0osK4UNVdMur/BVN1t
+XI2WOxWtACHweJhVOf7aUsZ1uQ+wwzSzyZ04vdXoTa92L563TjKlXCErwcFg5LpU
+/2i5yufSZuo6pPxRfs2RLdAW1crc8S1wVvKtMGW/xEXGWeMpOUmwVRzL839jQ2U3
+djLJ+CVoshXs3p5EP+v5t10NyCVhVVSaKvs6VFRCJKgrDc7jdLPj4dWl710EDzBF
+Fvynv/9wtJYB+nAWLbHU2wuZ5tPfcNxnItExEyuRDqzjia1ERU2VMJlK0j07CdvH
+FrEN8y06VA4pCAd9xkp3QvCjNN35s+hGysH0ng3ZkmOuvSSVMVA9MWq7+m8uPz8W
+woCT6GXtQwum1gGlMv09TMzbFCZay61beGk4Feiv422KF7eV5rucfGlJomh+Dfga
+SFPU+LSH/CA+WCGDCSO0x1X223FSPC9uUeSNTGhIN/R6kPDuvHk=
+=kXfL
 -----END PGP SIGNATURE-----
