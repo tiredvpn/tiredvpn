@@ -99,6 +99,16 @@ func mssTableName(ifName string) string {
 	return nftablesTableName + "-" + ifName
 }
 
+// The device is opened without IFF_VNET_HDR on purpose. A tun fd is a character
+// device, not a socket: one read(2) or readv(2) always yields exactly one frame
+// (readv only scatters that single frame across iovecs), so no syscall-batching
+// is available at this layer. The only way to move more bytes per syscall is
+// IFF_VNET_HDR + TUNSETOFFLOAD, which hands back GSO super-frames of up to 64 KB
+// prefixed by a virtio_net_hdr. That would break the [len:4][pkt:N] wire framing
+// (peers reject frames above 65535 and size them against the negotiated MTU),
+// invalidate the plain-IP assumptions in ClampTCPMSS and pmtu.go, and require
+// software segmentation plus a capability negotiation with already-deployed
+// peers. Not worth it for this datapath.
 func CreateTUN(name string, mtu int) (*TUNDevice, error) {
 	fd, err := syscall.Open(tunDevice, syscall.O_RDWR|syscall.O_CLOEXEC, 0)
 	if err != nil {

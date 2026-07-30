@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -70,11 +71,28 @@ var defaultLogger = &Logger{
 	dedupWindow:  5 * time.Second,
 }
 
+// defaultLevel mirrors defaultLogger.level so per-packet code can test it
+// without taking the logger mutex.
+var defaultLevel atomic.Int32
+
+func init() {
+	defaultLevel.Store(int32(defaultLogger.level))
+}
+
+// DebugEnabled reports whether the package-level Debug output is currently
+// emitted. Per-packet call sites gate their log.Debug on it because Go
+// evaluates the arguments regardless of level: hex dumps, IP.String and the
+// variadic boxing all allocate on every packet even when the line is dropped.
+func DebugEnabled() bool {
+	return Level(defaultLevel.Load()) <= LevelDebug
+}
+
 // SetLevel sets global log level
 func SetLevel(l Level) {
 	defaultLogger.mu.Lock()
 	defaultLogger.level = l
 	defaultLogger.mu.Unlock()
+	defaultLevel.Store(int32(l))
 }
 
 // SetDebug enables debug logging

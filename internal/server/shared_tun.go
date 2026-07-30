@@ -34,16 +34,35 @@ type SharedTUN struct {
 	workerChans []chan *tunPacket
 	bufferSize  int // Channel buffer size per worker
 
+	// pktPool recycles the per-packet buffers handed to workers. Packets cross a
+	// channel, so the dispatcher cannot simply reuse its read buffer.
+	pktPool sync.Pool
+
 	// Control
 	running int32
 	stopCh  chan struct{}
 	wg      sync.WaitGroup
 }
 
-// tunPacket holds a packet to be sent to a client
+// tunPacket holds a packet to be sent to a client. buf is the pooled backing
+// array sized once at the interface MTU; data is the live prefix of it.
 type tunPacket struct {
+	buf   []byte
 	data  []byte
 	dstIP string
+}
+
+// getPacket takes a packet off the pool. Every packet obtained here must reach
+// releasePacket exactly once, otherwise the dispatcher falls back to allocating
+// per packet (correct, just slower).
+func (st *SharedTUN) getPacket() *tunPacket {
+	return st.pktPool.Get().(*tunPacket)
+}
+
+func (st *SharedTUN) releasePacket(pkt *tunPacket) {
+	pkt.data = nil
+	pkt.dstIP = ""
+	st.pktPool.Put(pkt)
 }
 
 // ClientWriter represents a connected client that receives packets from shared TUN
@@ -136,6 +155,11 @@ func NewSharedTUN(name string, serverIP net.IP, network *net.IPNet, mtu, workers
 		workerChans:   make([]chan *tunPacket, workers),
 		bufferSize:    1024, // Buffer up to 1024 packets per worker
 		stopCh:        make(chan struct{}),
+	}
+
+	bufLen := mtu + 100
+	st.pktPool.New = func() any {
+		return &tunPacket{buf: make([]byte, bufLen)}
 	}
 
 	// Initialize worker channels
@@ -276,9 +300,6 @@ func (st *SharedTUN) packetDispatcher() {
 			continue
 		}
 
-		// Debug: log every packet read from TUN
-		log.Debug("SharedTUN: read %d bytes from TUN, dst=%s", n, net.IP(buf[16:20]).String())
-
 		// Check IP version
 		version := buf[0] >> 4
 		if version != 4 {
@@ -289,24 +310,28 @@ func (st *SharedTUN) packetDispatcher() {
 		// Extract destination IP from IPv4 header (bytes 16-19)
 		dstIP := net.IP(buf[16:20]).String()
 
+		if log.DebugEnabled() {
+			log.Debug("SharedTUN: read %d bytes from TUN, dst=%s", n, dstIP)
+		}
+
 		// Copy packet data (buf will be reused)
-		pktData := make([]byte, n)
-		copy(pktData, buf[:n])
+		pkt := st.getPacket()
+		pkt.data = pkt.buf[:n]
+		copy(pkt.data, buf[:n])
+		pkt.dstIP = dstIP
 
 		// Hash destination IP to worker index
 		workerIdx := hashIP(dstIP) % st.workers
 
 		// Send to worker (non-blocking with drop on overflow)
-		pkt := &tunPacket{
-			data:  pktData,
-			dstIP: dstIP,
-		}
-
 		select {
 		case st.workerChans[workerIdx] <- pkt:
-			log.Debug("SharedTUN: dispatched to worker %d for dst=%s", workerIdx, dstIP)
+			if log.DebugEnabled() {
+				log.Debug("SharedTUN: dispatched to worker %d for dst=%s", workerIdx, dstIP)
+			}
 		default:
 			// Channel full - drop packet (backpressure)
+			st.releasePacket(pkt)
 			log.Debug("SharedTUN: worker %d channel full, dropping packet for %s", workerIdx, dstIP)
 		}
 	}
@@ -331,15 +356,21 @@ func (st *SharedTUN) packetWorker(id int, ch chan *tunPacket) {
 
 			if !exists {
 				log.Debug("SharedTUN: worker %d: no client for dst=%s, dropping", id, pkt.dstIP)
+				st.releasePacket(pkt)
 				continue
 			}
 
-			log.Debug("SharedTUN: worker %d: sending %d bytes to %s", id, len(pkt.data), pkt.dstIP)
+			if log.DebugEnabled() {
+				log.Debug("SharedTUN: worker %d: sending %d bytes to %s", id, len(pkt.data), pkt.dstIP)
+			}
 			if err := writer.SendPacket(pkt.data); err != nil {
 				log.Debug("SharedTUN: worker %d: send error to %s: %v", id, pkt.dstIP, err)
-			} else {
+			} else if log.DebugEnabled() {
 				log.Debug("SharedTUN: worker %d: sent OK to %s", id, pkt.dstIP)
 			}
+			// SendPacket writes synchronously and every framer copies the payload
+			// into its own buffer, so the packet can go back to the pool here.
+			st.releasePacket(pkt)
 		}
 	}
 }

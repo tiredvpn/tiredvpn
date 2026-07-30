@@ -58,6 +58,38 @@ func (c *Conn) Write(b []byte) (n int, err error) {
 	return c.tcpConn.Write(b)
 }
 
+// ReadFrom and WriteTo unlock the kernel's native TCP splice fast path for
+// relay copies (io.Copy/io.CopyBuffer prefer these over the buffered
+// Read+Write loop). *net.TCPConn already implements io.ReaderFrom with a
+// Linux splice(2) fast path when both ends are real TCP sockets - but that
+// fast path never fired for kTLS relays because this wrapper only exposed
+// Read/Write, forcing every byte through a userspace copy loop regardless of
+// buffer size. Splicing is safe post-kTLS-enable: the kernel ULP transparently
+// decrypts on the way in and encrypts on the way out, so from read()/write()/
+// splice()'s point of view both ends are always plaintext - splicing moves
+// the exact same bytes Read/Write would have, just without the round-trip.
+//
+// Both directions are implemented because io.copyBuffer checks src.(WriterTo)
+// before dst.(ReaderFrom): a *Conn only as the copy source (e.g. relaying
+// into a plain upstream *net.TCPConn) needs WriteTo to reach the fast path;
+// a *Conn only as the destination needs ReadFrom.
+func (c *Conn) ReadFrom(r io.Reader) (int64, error) {
+	if kc, ok := r.(*Conn); ok {
+		r = kc.tcpConn
+	}
+	return c.tcpConn.ReadFrom(r)
+}
+
+func (c *Conn) WriteTo(w io.Writer) (int64, error) {
+	if kc, ok := w.(*Conn); ok {
+		w = kc.tcpConn
+	}
+	if rf, ok := w.(io.ReaderFrom); ok {
+		return rf.ReadFrom(c.tcpConn)
+	}
+	return io.Copy(w, c.tcpConn)
+}
+
 // Close closes the underlying TCP connection.
 func (c *Conn) Close() error {
 	return c.tcpConn.Close()

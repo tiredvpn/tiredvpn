@@ -39,6 +39,10 @@ const readTimeout = 30 * time.Second           // Must be > keepaliveInterval, d
 const writeTimeout = 30 * time.Second          // Write timeout (was 5s, caused i/o timeouts with bufferbloat)
 const deadConnectionTimeout = 45 * time.Second // Proactive dead connection detection timeout
 
+// maxFrameLen is the largest [len:4][data:N] payload the tunnel protocol accepts;
+// anything above it is treated as a desynced stream and drops the connection.
+const maxFrameLen = 65535
+
 // Reconnect configuration
 const (
 	reconnectInitialDelay = 1 * time.Second // Start with 1 second
@@ -865,7 +869,6 @@ func (v *VPNClient) readFromTun() {
 	// back up to the cap) the live MTU, so this buffer always fits a read.
 
 	for atomic.LoadInt32(&v.running) == 1 {
-		log.Debug("Attempting to read from TUN device...")
 		n, err := v.tun.Read(buf[4:])
 		if err != nil {
 			if atomic.LoadInt32(&v.running) == 0 {
@@ -874,11 +877,13 @@ func (v *VPNClient) readFromTun() {
 			log.Debug("TUN read error: %v", err)
 			continue
 		}
-		dumpEnd := n + 4
-		if dumpEnd > 24 {
-			dumpEnd = 24
+		if log.DebugEnabled() {
+			dumpEnd := n + 4
+			if dumpEnd > 24 {
+				dumpEnd = 24
+			}
+			log.Debug("Read %d bytes from TUN, first 20 bytes: % x", n, buf[4:dumpEnd])
 		}
-		log.Debug("Read %d bytes from TUN, first 20 bytes: % x", n, buf[4:dumpEnd])
 
 		// Clamp TCP MSS on SYN/SYN-ACK packets to prevent oversized segments
 		ClampTCPMSS(buf[4:4+n], v.tun.MTU())
@@ -904,7 +909,9 @@ func (v *VPNClient) readFromTun() {
 			continue
 		}
 
-		log.Debug("TUN->Server: sent %d bytes (payload=%d) to server", written, n)
+		if log.DebugEnabled() {
+			log.Debug("TUN->Server: sent %d bytes (payload=%d) to server", written, n)
+		}
 		atomic.AddInt64(&v.packetsUp, 1)
 		atomic.AddInt64(&v.bytesUp, int64(n))
 	}
@@ -920,6 +927,14 @@ func (v *VPNClient) readFromServer() {
 	}()
 
 	lenBuf := make([]byte, 4)
+
+	// One rx buffer for the whole goroutine instead of a per-packet make(): this
+	// is the single reader of the connection and nothing downstream retains the
+	// slice past the loop iteration (the probe decoder copies out its nonce,
+	// BuildICMPFragNeeded builds a fresh packet, tun.Write is synchronous).
+	// Sized at the protocol frame ceiling because an oversized frame still has to
+	// be read off the wire before it can be dropped.
+	rxBuf := make([]byte, maxFrameLen)
 
 	for atomic.LoadInt32(&v.running) == 1 {
 		v.mu.Lock()
@@ -954,17 +969,19 @@ func (v *VPNClient) readFromServer() {
 			continue
 		}
 
-		log.Debug("Read length header: %d bytes, value=%d (0x%02x %02x %02x %02x)",
-			nLen, pktLen, lenBuf[0], lenBuf[1], lenBuf[2], lenBuf[3])
+		if log.DebugEnabled() {
+			log.Debug("Read length header: %d bytes, value=%d (0x%02x %02x %02x %02x)",
+				nLen, pktLen, lenBuf[0], lenBuf[1], lenBuf[2], lenBuf[3])
+		}
 
-		if pktLen > 65535 {
+		if pktLen > maxFrameLen {
 			log.Debug("Frame length %d exceeds protocol max, disconnecting", pktLen)
 			v.handleDisconnect()
 			continue
 		}
 
 		// Read packet data
-		buf := make([]byte, pktLen)
+		buf := rxBuf[:pktLen]
 		nRead, err := io.ReadFull(conn, buf)
 		if err != nil {
 			log.Debug("Server read data error: %v", err)
@@ -995,11 +1012,13 @@ func (v *VPNClient) readFromServer() {
 			}
 			continue
 		}
-		if len(buf) >= 8 {
-			log.Debug("Read packet data: %d bytes, first 8 bytes: %02x %02x %02x %02x %02x %02x %02x %02x",
-				nRead, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7])
-		} else if len(buf) > 0 {
-			log.Debug("Read packet data: %d bytes: % x", nRead, buf)
+		if log.DebugEnabled() {
+			if len(buf) >= 8 {
+				log.Debug("Read packet data: %d bytes, first 8 bytes: %02x %02x %02x %02x %02x %02x %02x %02x",
+					nRead, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7])
+			} else if len(buf) > 0 {
+				log.Debug("Read packet data: %d bytes: % x", nRead, buf)
+			}
 		}
 
 		// Check if packet data starts with another length prefix (HTTP/2 framing artifact)
@@ -1018,7 +1037,7 @@ func (v *VPNClient) readFromServer() {
 		ClampTCPMSS(actualBuf, v.tun.MTU())
 
 		// Write to TUN
-		if len(actualBuf) > 0 {
+		if log.DebugEnabled() && len(actualBuf) > 0 {
 			// Log first 20 bytes to verify IP packet format
 			dumpLen := 20
 			if len(actualBuf) < dumpLen {
@@ -1032,7 +1051,9 @@ func (v *VPNClient) readFromServer() {
 			log.Debug("TUN write error: %v | len=%d | wrote=%d", err, len(actualBuf), n)
 			continue
 		}
-		log.Debug("Successfully wrote %d bytes to TUN", n)
+		if log.DebugEnabled() {
+			log.Debug("Successfully wrote %d bytes to TUN", n)
+		}
 
 		// Update activity timestamp
 		v.mu.Lock()

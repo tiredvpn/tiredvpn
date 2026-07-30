@@ -257,22 +257,23 @@ func (c *RTTMaskingConn) Write(p []byte) (int, error) {
 func (c *RTTMaskingConn) writeWithBurst(p []byte, delay time.Duration) (int, error) {
 	c.mu.Lock()
 
-	// Copy data to buffer
-	data := make([]byte, len(p))
-	copy(data, p)
-	c.burstBuffer = append(c.burstBuffer, data)
-
-	// Check if we should flush the burst
-	shouldFlush := len(c.burstBuffer) >= c.config.BurstSize ||
+	shouldFlush := len(c.burstBuffer)+1 >= c.config.BurstSize ||
 		time.Since(c.lastBurstTime) >= c.config.BurstInterval
 
 	if !shouldFlush {
+		// Buffered for a later burst, so p outlives this call and must be copied:
+		// the caller owns p and is free to reuse it once Write returns.
+		data := make([]byte, len(p))
+		copy(data, p)
+		c.burstBuffer = append(c.burstBuffer, data)
 		c.mu.Unlock()
-		return len(p), nil // Buffered, will be sent with burst
+		return len(p), nil
 	}
 
-	// Flush burst
-	buffer := c.burstBuffer
+	// Flushing now: p is written before this call returns, so it can go into the
+	// burst by reference. c.burstBuffer is swapped for a fresh slice first, so
+	// the append below cannot be observed by another writer.
+	buffer := append(c.burstBuffer, p)
 	c.burstBuffer = make([][]byte, 0, c.config.BurstSize)
 	c.lastBurstTime = time.Now()
 	c.mu.Unlock()
