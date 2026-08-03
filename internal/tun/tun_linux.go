@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -25,6 +26,12 @@ const (
 	ifnamsiz  = 16
 	iffTun    = 0x0001
 	iffNoPi   = 0x1000
+
+	// bypassWatchInterval is how often the server bypass route is verified. The
+	// healthy check is a single RouteGet, so polling this often is free, and it
+	// bounds how long a link flap can keep the client dialling into its own
+	// tunnel (previously: forever, until the unit was restarted by hand).
+	bypassWatchInterval = 5 * time.Second
 )
 
 type ifReq struct {
@@ -55,15 +62,18 @@ type TUNDevice struct {
 	// from ever touching the main table / default route or another tunnel.
 	addedRoutes []*net.IPNet
 
-	// serverBypassIP is the VPN server's public IP. When the route set includes
-	// a default route (0.0.0.0/0 or ::/0), a /32 (or /128) host route to this IP
-	// is pinned through the current physical gateway so server traffic does not
-	// loop back into the tunnel. Set via SetServerBypassIP before Configure.
+	// serverBypassIP is the VPN server's public IP. When the installed route set
+	// covers this IP (a default route, or the 0.0.0.0/1 + 128.0.0.0/1 pair), a
+	// /32 (or /128) host route to it is pinned through the current physical
+	// gateway so server traffic does not loop back into the tunnel. Set via
+	// SetServerBypassIP before Configure.
 	serverBypassIP net.IP
 	// bypassRoute is the host route installed for serverBypassIP, kept so
 	// teardown removes exactly it (it lives on the physical link, not the TUN,
-	// so delRoutes does not cover it).
+	// so delRoutes does not cover it). Guarded by bypassMu: the watcher
+	// goroutine re-pins it while Close may be tearing it down.
 	bypassRoute *netlink.Route
+	bypassMu    sync.Mutex
 
 	// deferRoutes, when true, makes Configure bring the interface up and assign
 	// the tunnel address but NOT install the route set (notably a 0.0.0.0/0
@@ -89,7 +99,17 @@ func (t *TUNDevice) SetDeferRoutes(defer_ bool) {
 // interface instead of looping through the tunnel. Linux only; on Android the
 // server socket is protected via VpnService.protect() instead.
 func (t *TUNDevice) SetServerBypassIP(ip net.IP) {
+	t.bypassMu.Lock()
 	t.serverBypassIP = ip
+	t.bypassMu.Unlock()
+}
+
+// bypassIP returns the server IP to keep off the tunnel, or nil once the device
+// is torn down. Read under the lock because the watcher goroutine races Close.
+func (t *TUNDevice) bypassIP() net.IP {
+	t.bypassMu.Lock()
+	defer t.bypassMu.Unlock()
+	return t.serverBypassIP
 }
 
 // mssTableName returns the per-interface nftables table name for MSS clamping.
@@ -182,12 +202,16 @@ func (t *TUNDevice) Close() error {
 
 	// Remove the server bypass host route (it lives on the physical link, not
 	// the TUN, so delRoutes does not cover it).
+	t.bypassMu.Lock()
 	if t.bypassRoute != nil {
 		if err := netlink.RouteDel(t.bypassRoute); err != nil {
 			log.Debug("Failed to delete server bypass route: %v", err)
 		}
 		t.bypassRoute = nil
 	}
+	// Stop the watcher from re-pinning a route we just tore down.
+	t.serverBypassIP = nil
+	t.bypassMu.Unlock()
 
 	t.file.SetReadDeadline(time.Now())
 
@@ -324,62 +348,175 @@ func (t *TUNDevice) Configure(localIP, remoteIP net.IP, routes []string) error {
 // host CIDRs (/32, /128). Invalid routes are skipped rather than aborting the
 // whole tunnel, but their count is reported at ERROR level so a misconfigured
 // -tun-routes does not fail silently and leak traffic outside the tunnel.
-// routesHaveDefault reports whether routes includes a default route (which would
-// pull all traffic, including traffic to the server, into the tunnel).
-func routesHaveDefault(routes []string) bool {
+// routesCoverIP reports whether the route set would pull traffic to ip into the
+// tunnel. Checking coverage rather than a literal 0.0.0.0/0 matters because a
+// full tunnel is commonly expressed as the two half-defaults 0.0.0.0/1 +
+// 128.0.0.0/1 (they outrank the host's real default without replacing it), and
+// those need the very same server bypass a 0.0.0.0/0 route does.
+func routesCoverIP(routes []string, ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
 	for _, route := range routes {
 		cidr, err := normalizeRoute(route)
 		if err != nil {
 			continue
 		}
-		if cidr == "0.0.0.0/0" || cidr == "::/0" {
+		_, dst, err := net.ParseCIDR(cidr)
+		if err != nil {
+			continue
+		}
+		if dst.Contains(ip) {
 			return true
 		}
 	}
 	return false
 }
 
+// physicalRouteTo finds the most specific route to ip that does NOT go through
+// our own TUN, i.e. the path the server traffic must keep taking. It reads the
+// main table directly instead of using RouteGet because once the tunnel routes
+// are installed RouteGet answers with the TUN itself — which is exactly the
+// looped state the bypass exists to prevent.
+func (t *TUNDevice) physicalRouteTo(ip net.IP) (*netlink.Route, error) {
+	family := netlink.FAMILY_V4
+	if ip.To4() == nil {
+		family = netlink.FAMILY_V6
+	}
+	tunIdx := -1
+	if link, err := netlink.LinkByName(t.name); err == nil {
+		tunIdx = link.Attrs().Index
+	}
+	routes, err := netlink.RouteListFiltered(family,
+		&netlink.Route{Table: unix.RT_TABLE_MAIN}, netlink.RT_FILTER_TABLE)
+	if err != nil {
+		return nil, fmt.Errorf("route list failed: %w", err)
+	}
+
+	var best *netlink.Route
+	bestOnes := -1
+	for i := range routes {
+		r := &routes[i]
+		if r.LinkIndex == tunIdx || r.LinkIndex <= 0 {
+			continue
+		}
+		ones := 0
+		if r.Dst != nil {
+			if !r.Dst.Contains(ip) {
+				continue
+			}
+			ones, _ = r.Dst.Mask.Size()
+		} else if r.Gw == nil {
+			// Default route without a gateway and without a destination is not
+			// something we can pin through.
+			continue
+		}
+		if ones > bestOnes || (ones == bestOnes && best != nil && r.Priority < best.Priority) {
+			best = r
+			bestOnes = ones
+		}
+	}
+	if best == nil {
+		return nil, fmt.Errorf("no physical route to %s", ip)
+	}
+	return best, nil
+}
+
 // addServerBypass pins a host route to the VPN server through the current
-// physical gateway. It must run BEFORE the default route is pointed at the TUN,
-// so RouteGet still resolves the real gateway. Without it, a full-tunnel client
-// loops its own server traffic (handshake, keepalive, reconnect) back into the
-// tunnel. No-op if no server IP was set or the server already routes via the TUN.
+// physical gateway. Without it, a full-tunnel client loops its own server
+// traffic (handshake, keepalive, reconnect) back into the tunnel and wedges
+// until the process is restarted. Safe to call at any time: it looks the
+// gateway up in the main table, ignoring our own TUN, so it also repairs a
+// bypass that was wiped out from under us (e.g. a Wi-Fi reassociation takes the
+// link down and the kernel drops every route attached to it). No-op if no
+// server IP was set.
 func (t *TUNDevice) addServerBypass() {
-	if t.serverBypassIP == nil {
+	ip := t.bypassIP()
+	if ip == nil {
 		return
 	}
-	resolved, err := netlink.RouteGet(t.serverBypassIP)
-	if err != nil || len(resolved) == 0 {
-		log.Warn("Server bypass: cannot resolve physical route to %s: %v", t.serverBypassIP, err)
-		return
-	}
-	r := resolved[0]
-	if link, e := netlink.LinkByName(t.name); e == nil && r.LinkIndex == link.Attrs().Index {
-		// Already points at our TUN — adding a bypass here would loop.
-		log.Warn("Server bypass: route to %s already via %s, skipping", t.serverBypassIP, t.name)
+	r, err := t.physicalRouteTo(ip)
+	if err != nil {
+		log.Warn("Server bypass: cannot resolve physical route to %s: %v", ip, err)
 		return
 	}
 	bits := 32
-	if t.serverBypassIP.To4() == nil {
+	if ip.To4() == nil {
 		bits = 128
 	}
 	bypass := &netlink.Route{
 		LinkIndex: r.LinkIndex,
-		Dst:       &net.IPNet{IP: t.serverBypassIP, Mask: net.CIDRMask(bits, bits)},
+		Dst:       &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)},
 		Gw:        r.Gw,
 		Src:       r.Src,
 	}
 	if err := netlink.RouteReplace(bypass); err != nil {
-		log.Warn("Server bypass: failed to pin host route to %s: %v", t.serverBypassIP, err)
+		log.Warn("Server bypass: failed to pin host route to %s: %v", ip, err)
 		return
 	}
-	t.bypassRoute = bypass
-	log.Info("Server bypass route pinned: %s/%d via %v (linkIndex %d)", t.serverBypassIP, bits, r.Gw, r.LinkIndex)
+	t.bypassMu.Lock()
+	// Close raced us and tore the device down: undo the pin instead of leaking it.
+	closed := t.serverBypassIP == nil
+	if !closed {
+		t.bypassRoute = bypass
+	}
+	t.bypassMu.Unlock()
+	if closed {
+		netlink.RouteDel(bypass)
+		return
+	}
+	log.Info("Server bypass route pinned: %s/%d via %v (linkIndex %d)", ip, bits, r.Gw, r.LinkIndex)
+}
+
+// EnsureServerBypass re-pins the server bypass if traffic to the server would
+// currently go through the tunnel. Cheap enough to poll: the healthy path costs
+// one RouteGet and touches nothing.
+func (t *TUNDevice) EnsureServerBypass() {
+	ip := t.bypassIP()
+	if ip == nil {
+		return
+	}
+	link, err := netlink.LinkByName(t.name)
+	if err != nil {
+		return
+	}
+	resolved, err := netlink.RouteGet(ip)
+	if err == nil && len(resolved) > 0 && resolved[0].LinkIndex != link.Attrs().Index {
+		return // still leaving through a physical link, nothing to do
+	}
+	if err != nil {
+		log.Debug("Server bypass: route lookup for %s failed: %v, re-pinning", ip, err)
+	} else {
+		log.Warn("Server bypass: traffic to %s now routes via %s, re-pinning", ip, t.name)
+	}
+	t.addServerBypass()
+}
+
+// WatchServerBypass polls the bypass route and restores it when the host drops
+// it. The trigger in practice is a link flap (Wi-Fi roam/reassociation, dock,
+// suspend/resume): the kernel deletes every route attached to the interface
+// that went down, the bypass among them, after which the client's own
+// full-tunnel routes swallow the traffic to the server and every reconnect
+// attempt dials into the dead tunnel. Returns when stop is closed.
+func (t *TUNDevice) WatchServerBypass(stop <-chan struct{}) {
+	if t.bypassIP() == nil {
+		return
+	}
+	ticker := time.NewTicker(bypassWatchInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			t.EnsureServerBypass()
+		}
+	}
 }
 
 func (t *TUNDevice) addRoutes(link netlink.Link, routes []string) {
-	// Pin the server bypass before any default route lands on the TUN.
-	if routesHaveDefault(routes) {
+	// Pin the server bypass before any tunnel route that covers the server lands.
+	if routesCoverIP(routes, t.bypassIP()) {
 		t.addServerBypass()
 	}
 	var invalid []string
@@ -457,6 +594,11 @@ func (t *TUNDevice) trackRoute(dst *net.IPNet) {
 // every reconnect/IP update; hard failures are already surfaced by addRoutes
 // at configure time.
 func (t *TUNDevice) reAddRoutes(link netlink.Link, reason string) {
+	// A reconnect often follows the very event that wiped the bypass (link flap,
+	// gateway change), so verify it before re-asserting the tunnel routes.
+	if routesCoverIP(t.routes, t.bypassIP()) {
+		t.EnsureServerBypass()
+	}
 	for _, route := range t.routes {
 		cidr, err := normalizeRoute(route)
 		if err != nil {

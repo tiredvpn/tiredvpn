@@ -7,24 +7,35 @@ import (
 	"testing"
 )
 
-func TestRoutesHaveDefault(t *testing.T) {
+func TestRoutesCoverIP(t *testing.T) {
+	server := net.ParseIP("31.44.3.165")
 	cases := []struct {
 		name   string
 		routes []string
+		ip     net.IP
 		want   bool
 	}{
-		{"ipv4 default", []string{"0.0.0.0/0"}, true},
-		{"ipv6 default", []string{"::/0"}, true},
-		{"default among others", []string{"10.0.0.0/8", "0.0.0.0/0", "192.168.0.0/16"}, true},
-		{"bare-ip default normalizes", []string{"0.0.0.0/0"}, true},
-		{"split tunnel only", []string{"10.8.0.0/24", "1.1.1.1/32"}, false},
-		{"empty", nil, false},
-		{"single host", []string{"8.8.8.8"}, false},
+		{"ipv4 default", []string{"0.0.0.0/0"}, server, true},
+		{"default among others", []string{"10.0.0.0/8", "0.0.0.0/0", "192.168.0.0/16"}, server, true},
+		// The half-default pair is how a full tunnel is expressed in practice; it
+		// used to slip past the old literal 0.0.0.0/0 check and leave the bypass
+		// unpinned, which wedged the client after any link flap.
+		{"half defaults", []string{"0.0.0.0/1", "128.0.0.0/1"}, server, true},
+		{"half default covering server", []string{"0.0.0.0/1"}, server, true},
+		{"half default not covering server", []string{"128.0.0.0/1"}, server, false},
+		{"ipv6 default vs ipv6 server", []string{"::/0"}, net.ParseIP("2001:db8::1"), true},
+		{"ipv6 default vs ipv4 server", []string{"::/0"}, server, false},
+		{"split tunnel only", []string{"10.8.0.0/24", "1.1.1.1/32"}, server, false},
+		{"split tunnel hitting server", []string{"31.44.0.0/16"}, server, true},
+		{"bare ip route", []string{"31.44.3.165"}, server, true},
+		{"empty", nil, server, false},
+		{"nil ip", []string{"0.0.0.0/0"}, nil, false},
+		{"garbage route", []string{"not-a-route"}, server, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := routesHaveDefault(c.routes); got != c.want {
-				t.Errorf("routesHaveDefault(%v) = %v, want %v", c.routes, got, c.want)
+			if got := routesCoverIP(c.routes, c.ip); got != c.want {
+				t.Errorf("routesCoverIP(%v, %v) = %v, want %v", c.routes, c.ip, got, c.want)
 			}
 		})
 	}

@@ -215,6 +215,12 @@ func (t *TUNDevice) SetReadDeadline(deadline time.Time) error {
 // (vpn.go) compile.
 func (t *TUNDevice) SetServerBypassIP(net.IP) {}
 
+// EnsureServerBypass is a no-op on macOS; see SetServerBypassIP.
+func (t *TUNDevice) EnsureServerBypass() {}
+
+// WatchServerBypass is a no-op on macOS; see SetServerBypassIP.
+func (t *TUNDevice) WatchServerBypass(<-chan struct{}) {}
+
 // SetDeferRoutes is a no-op on macOS; route deferral is a Linux-only safeguard.
 // Provided so cross-platform callers (vpn.go) compile.
 func (t *TUNDevice) SetDeferRoutes(bool) {}

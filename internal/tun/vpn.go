@@ -275,6 +275,15 @@ func (v *VPNClient) Start(ctx context.Context) error {
 		})
 	}
 
+	// Keep the server reachable off-tunnel for as long as the tunnel lives. The
+	// bypass route sits on the physical link, so anything that takes that link
+	// down (Wi-Fi reassociation, dock, suspend) makes the kernel drop it and the
+	// client starts dialling its own server through its own tunnel. Only for
+	// interfaces we own — on Android the socket is protected by VpnService.
+	if v.ownsInterface {
+		go v.tun.WatchServerBypass(v.stopCh)
+	}
+
 	// Start packet forwarding
 	go v.readFromTun()
 	go v.readFromServer()
