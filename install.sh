@@ -118,8 +118,6 @@ install_via_binary() {
   log "Installing service unit and init helper"
   curl -fsSL "${RAW_URL}/packaging/tiredvpn-init.sh" -o /usr/bin/tiredvpn-init
   chmod 0755 /usr/bin/tiredvpn-init
-  curl -fsSL "${RAW_URL}/packaging/tiredvpn-nat.sh" -o /usr/bin/tiredvpn-nat
-  chmod 0755 /usr/bin/tiredvpn-nat
   install -d -m 0750 /etc/tiredvpn
   curl -fsSL "${RAW_URL}/packaging/tiredvpn.service" -o /lib/systemd/system/tiredvpn.service
   curl -fsSL "${RAW_URL}/packaging/tiredvpn.env.example" -o /etc/tiredvpn/env.example
