@@ -7,6 +7,8 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.25] - 2026-08-03
+
 ### Fixed
 
 - **A full-tunnel client wedged permanently after any link flap, dialling its own server through its own tunnel.** The server bypass route (the host route that keeps traffic to the VPN server on the physical link) was only pinned when the route set contained a literal `0.0.0.0/0` — but a full tunnel is commonly configured as the half-default pair `0.0.0.0/1` + `128.0.0.0/1`, which outranks the host's default without replacing it, so the bypass was never installed for that very common setup. Even when it was installed, the route lives on the physical interface: a Wi-Fi reassociation, dock or suspend takes that link down, the kernel drops every route attached to it, and the client's own tunnel routes then swallow traffic to the server. Every reconnect attempt dialled into the dead tunnel, the connectivity checker reported `No TCP connectivity to server` forever, and only a process restart recovered it. The bypass is now pinned whenever the installed routes cover the server IP, resolved from the main table directly (ignoring our own TUN) so it can repair an already-looped state, re-asserted on every reconnect, and watched on a 5s timer for as long as the tunnel lives.
