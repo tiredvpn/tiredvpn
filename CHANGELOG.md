@@ -7,6 +7,8 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.26] - 2026-08-04
+
 ### Fixed
 
 - **Only native TUN clients were forwarded to the upstream exit; every other transport silently exited at the relay.** A relay (`-upstream` set) forwarded a downstream client to the exit from the native TUN handler alone. The morph, confusion, HTTP/2 stego and HTTP polling handlers each terminated the client on the relay's own shared TUN instead, handing out an address from the relay's pool and NATing the traffic out of the relay's own IP. Nothing reported this: the client saw a healthy tunnel, just with the wrong exit country. It bit exactly when it hurt most - a client that lost its preferred transport and fell back to meek-style polling under pressure quietly stopped using the exit it was configured for. All four transports now open the same upstream TUN tunnel the native path does, answer the client with the address the *exit* assigned, and pump the exit's packets back down through their own framing.
