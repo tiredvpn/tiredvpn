@@ -26,12 +26,12 @@ func TestForwardH2TUNKeepaliveEcho(t *testing.T) {
 		cfg:      srvCtx.cfg,
 		mu:       &sync.Mutex{},
 	}
-	// sharedTUN must be non-nil to pass the early guard; the keepalive path
-	// never dereferences it, so a zero value is enough.
+	// A sink must be present to pass the early guard; the keepalive path only
+	// touches UpdateActivity on it, so a no-op sink is enough.
 	tunnel := &h2TunnelState{
 		targetConn: h2c,
 		streamID:   sid,
-		sharedTUN:  &SharedTUN{},
+		sink:       &nopTUNSink{},
 	}
 
 	// Zero-length keepalive: [len:4 = 0]. Must be echoed back (DATA frame out).

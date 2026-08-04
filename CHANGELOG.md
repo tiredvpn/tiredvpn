@@ -7,6 +7,12 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Only native TUN clients were forwarded to the upstream exit; every other transport silently exited at the relay.** A relay (`-upstream` set) forwarded a downstream client to the exit from the native TUN handler alone. The morph, confusion, HTTP/2 stego and HTTP polling handlers each terminated the client on the relay's own shared TUN instead, handing out an address from the relay's pool and NATing the traffic out of the relay's own IP. Nothing reported this: the client saw a healthy tunnel, just with the wrong exit country. It bit exactly when it hurt most - a client that lost its preferred transport and fell back to meek-style polling under pressure quietly stopped using the exit it was configured for. All four transports now open the same upstream TUN tunnel the native path does, answer the client with the address the *exit* assigned, and pump the exit's packets back down through their own framing.
+
+- **Two clients sharing one secret were handed the same tunnel IP and evicted each other in a loop.** Everyone authenticating with the server's global secret ends up as client `"global"`, and `IPPool` leases are sticky per client key — so the second client to connect took over the first one's tunnel IP, the first reconnected and took it back, and the pair flapped once per keepalive interval (~30s) indefinitely. From the client side this looked like an unstable link: `VPN disconnected` every minute or so, then a full strategy rescan that dropped the tunnel onto whatever transport answered first. Multi-hop made it unavoidable: a relay forwards its downstream clients to the exit under its own upstream secret, so every client behind one relay reached the exit as the same `"global"` identity no matter how they authenticated downstream. The lease key for identity-less clients is now qualified with the client's origin, and a relay forwards the downstream client's origin to the exit in a trailer appended after the TUN handshake (exits that predate it parse the fixed fields and ignore the trailer, so mixed-version hops keep working). Named clients (Redis/panel identities) are unaffected and keep their stable IP. A takeover of a connection that was live seconds ago is now logged at WARN instead of INFO, since that is the signature of this collision rather than of a normal reconnect.
+
 ## [1.3.25] - 2026-08-03
 
 ### Fixed

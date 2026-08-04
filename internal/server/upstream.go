@@ -210,10 +210,15 @@ func (d *UpstreamDialer) Dial(ctx context.Context, targetAddr string) (net.Conn,
 // TUN. tunHandshake is the [localIP:4][mtu:2][version:1] payload received from the
 // downstream client (without the leading 0x02 mode byte).
 //
+// origin identifies the downstream client (its address, or the origin a relay
+// further down already attached) and is appended to the setup payload so the
+// exit can tell two clients sharing one secret apart. Upstreams that predate the
+// extension parse the fixed handshake and ignore the trailer.
+//
 // Returns the live stego conn (a transparent byte stream over which [len:4][pkt:N]
 // frames flow in both directions, exactly as between a native client and exit) and
 // the [status:1][serverIP:4][clientIP:4] response the upstream assigned.
-func (d *UpstreamDialer) DialTUN(ctx context.Context, tunHandshake []byte) (net.Conn, []byte, error) {
+func (d *UpstreamDialer) DialTUN(ctx context.Context, tunHandshake []byte, origin string) (net.Conn, []byte, error) {
 	log.Debug("Upstream TUN dial via %s", d.upstreamAddr)
 
 	stegoConn, tlsConn, err := d.connectStego(ctx)
@@ -227,6 +232,7 @@ func (d *UpstreamDialer) DialTUN(ctx context.Context, tunHandshake []byte) (net.
 	setup := make([]byte, 1+len(tunHandshake))
 	setup[0] = 0x02 // TUN mode
 	copy(setup[1:], tunHandshake)
+	setup = appendTUNOrigin(setup, origin)
 	if _, err := stegoConn.Write(setup); err != nil {
 		tlsConn.Close()
 		return nil, nil, err

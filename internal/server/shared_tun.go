@@ -12,6 +12,12 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/tun"
 )
 
+// sharedTUNLiveEvictionWindow is how recently the replaced connection must have
+// carried traffic for the takeover to be reported as an eviction rather than a
+// normal reconnect. Clients keepalive every 30s, so a connection quiet for
+// longer than that is one whose client is gone, not one being stolen.
+const sharedTUNLiveEvictionWindow = 35 // seconds
+
 // SharedTUN manages a single TUN device shared by all VPN clients.
 // Instead of creating one TUN per client, all clients share this interface
 // and packets are multiplexed by destination IP.
@@ -224,8 +230,18 @@ func (st *SharedTUN) RegisterClient(clientIP net.IP, clientID string, conn net.C
 	// Close old connection asynchronously with grace period
 	if hadOld {
 		oldAge := now - atomic.LoadInt64(&old.created)
-		log.Info("SharedTUN: replacing connection for %s (clientID=%s, old_age=%ds, reconnect_count=%d)",
-			ipStr, clientID, oldAge, count)
+		lastSeen := now - atomic.LoadInt64(&old.lastActive)
+		if lastSeen <= sharedTUNLiveEvictionWindow {
+			// The connection being replaced was carrying traffic seconds ago, so
+			// this is not a client recovering a dead session: two clients are
+			// sharing one tunnel IP and evicting each other. Usually means two
+			// boxes on the same global secret (they all authenticate as "global").
+			log.Warn("SharedTUN: replacing LIVE connection for %s (clientID=%s, old_age=%ds, last_seen=%ds ago, reconnect_count=%d) - two clients may be sharing one tunnel IP",
+				ipStr, clientID, oldAge, lastSeen, count)
+		} else {
+			log.Info("SharedTUN: replacing connection for %s (clientID=%s, old_age=%ds, reconnect_count=%d)",
+				ipStr, clientID, oldAge, count)
+		}
 		go func() {
 			// Grace period: let in-flight writes finish
 			time.Sleep(200 * time.Millisecond)

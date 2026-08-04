@@ -1361,9 +1361,13 @@ type h2TunnelState struct {
 	targetConn      net.Conn
 	streamID        uint32
 	clientID        string // Client ID for IP pool allocation
+	remoteAddr      string // Peer host, used to qualify the IP-pool lease key
 	mu              sync.Mutex
 	sharedTUNWriter *ClientWriter // For shared TUN mode
 	sharedTUN       *SharedTUN    // Reference to shared TUN
+	// sink is where packets from this client go: the shared TUN on an exit, the
+	// upstream tunnel on a relay. Set once the TUN handshake completes.
+	sink tunPacketSink
 	// reasmBuf accumulates inbound TUN bytes across stego DATA frames so a single
 	// [len:4][pkt:N] frame split over several payloads (relay leg uses a non-tunMode
 	// stego conn that chunks at 1000/1400 bytes) is reassembled instead of dropped.
@@ -1416,6 +1420,9 @@ func initH2Framer(conn net.Conn, logger *log.Logger) (*http2.Framer, error) {
 func cleanupH2Conn(conn net.Conn, srvCtx *serverContext, tunnel **h2TunnelState, connTracked *bool, authClientID *string) {
 	if *tunnel != nil && (*tunnel).targetConn != nil {
 		(*tunnel).targetConn.Close()
+	}
+	if *tunnel != nil && (*tunnel).sink != nil {
+		(*tunnel).sink.Close()
 	}
 	if *connTracked && srvCtx.registry != nil && *authClientID != "" {
 		srvCtx.registry.RemoveConnection(*authClientID, conn)
@@ -1559,7 +1566,7 @@ func handleH2DataFrame(conn net.Conn, f *http2.DataFrame, framer *http2.Framer, 
 
 	tunnel := *tunnelPtr
 	if tunnel == nil {
-		t := &h2TunnelState{streamID: f.StreamID, clientID: authClientID}
+		t := &h2TunnelState{streamID: f.StreamID, clientID: authClientID, remoteAddr: originOf(conn.RemoteAddr())}
 		setupH2Tunnel(t, framer, payload, srvCtx, logger)
 		*tunnelPtr = t
 		return
@@ -1588,7 +1595,7 @@ func handleH2DataFrame(conn net.Conn, f *http2.DataFrame, framer *http2.Framer, 
 // ~996 bytes on relay chains. We now buffer across payloads like the morph path.
 func forwardH2TUNPacket(tunnel *h2TunnelState, streamID uint32, payload []byte, logger *log.Logger) {
 	tunnel.streamID = streamID
-	if tunnel.sharedTUN == nil {
+	if tunnel.sink == nil {
 		return
 	}
 
@@ -1609,21 +1616,15 @@ func forwardH2TUNPacket(tunnel *h2TunnelState, streamID uint32, payload []byte, 
 						tunnel.mu.Unlock()
 						logger.Debug("Auto-MTU: H2 echoed PROBE_REPLY size=%d", len(reply))
 					}
-					if tunnel.sharedTUNWriter != nil {
-						tunnel.sharedTUNWriter.UpdateActivity()
-					}
+					tunnel.sink.UpdateActivity()
 				}
 				return
 			}
-			logger.Debug("H2 TUN: writing %d bytes to TUN, first 20: %x", len(ipPkt), ipPkt[:minInt(20, len(ipPkt))])
-			if _, err := tunnel.sharedTUN.TUNDevice().Write(ipPkt); err != nil {
-				logger.Debug("H2 TUN write error: %v", err)
-			} else {
-				logger.Debug("H2 TUN: wrote %d bytes to TUN successfully", len(ipPkt))
+			logger.Debug("H2 TUN: forwarding %d bytes, first 20: %x", len(ipPkt), ipPkt[:minInt(20, len(ipPkt))])
+			if err := tunnel.sink.WritePacket(ipPkt); err != nil {
+				logger.Debug("H2 TUN sink write error: %v", err)
 			}
-			if tunnel.sharedTUNWriter != nil {
-				tunnel.sharedTUNWriter.UpdateActivity()
-			}
+			tunnel.sink.UpdateActivity()
 		},
 		func() {
 			// Keepalive (zero length) - echo back. The morph, confusion and native
@@ -1636,9 +1637,7 @@ func forwardH2TUNPacket(tunnel *h2TunnelState, streamID uint32, payload []byte, 
 				sendStegoResponse(h2c.framer, tunnel.streamID, []byte{0, 0, 0, 0}, h2c.cfg)
 				tunnel.mu.Unlock()
 			}
-			if tunnel.sharedTUNWriter != nil {
-				tunnel.sharedTUNWriter.UpdateActivity()
-			}
+			tunnel.sink.UpdateActivity()
 		})
 }
 
@@ -2182,8 +2181,9 @@ func handleMorphTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverConte
 		return
 	}
 
-	// Check if shared TUN is available
-	if srvCtx == nil || srvCtx.sharedTUN == nil {
+	// A relay forwards this client upstream and never touches its own TUN, so
+	// only an exit needs the shared device here.
+	if srvCtx == nil || (srvCtx.sharedTUN == nil && srvCtx.upstreamDialer == nil) {
 		logger.Error("Shared TUN not initialized")
 		failPacket := []byte{0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01}
 		conn.Write(failPacket)
@@ -2201,29 +2201,68 @@ func handleMorphTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverConte
 		logger.Debug("Morph TUN client requested: IP=%s (legacy v1)", requestedIP)
 	}
 
-	// Allocate IP from pool (if available) or use requested IP as fallback
-	var clientIP net.IP
-	if srvCtx.ipPool != nil {
-		allocatedIP, err := srvCtx.ipPool.Allocate(clientID, requestedIP, "")
+	var writeMu sync.Mutex
+	writeMorphFrame := func(framed []byte) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+		_, err := conn.Write(framed)
+		return err
+	}
+
+	var clientIP, serverIP net.IP
+	var sink tunPacketSink
+
+	if srvCtx.upstreamDialer != nil {
+		// Relay: hand this client to the upstream exit instead of terminating it
+		// here, so a client that fell back to morph still exits where it asked.
+		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, remainingData,
+			originOf(conn.RemoteAddr()), func(pkt []byte) error {
+				return writeMorphFrame(morphFramePacket(pkt))
+			})
 		if err != nil {
-			logger.Error("Failed to allocate IP from pool: %v", err)
+			logger.Warn("Morph TUN relay: upstream dial failed: %v", err)
 			failPacket := []byte{0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01}
 			conn.Write(failPacket)
 			return
 		}
-		clientIP = allocatedIP
-		logger.Info("Morph TUN client: allocated IP=%s from pool (requested=%s, clientID=%s)", clientIP, requestedIP, clientID)
+		sink, serverIP, clientIP = relaySink, upServerIP, upClientIP
+		defer func() {
+			relaySink.Close()
+			logger.Info("Morph TUN relay client disconnected: %s (clientID=%s)", clientIP, clientID)
+		}()
 	} else {
-		clientIP = requestedIP
-		logger.Info("Morph TUN client: IP=%s (no pool)", clientIP)
-	}
+		// Allocate IP from pool (if available) or use requested IP as fallback
+		if srvCtx.ipPool != nil {
+			allocatedIP, err := srvCtx.ipPool.Allocate(allocationKey(clientID, originOf(conn.RemoteAddr())), requestedIP, "")
+			if err != nil {
+				logger.Error("Failed to allocate IP from pool: %v", err)
+				failPacket := []byte{0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01}
+				conn.Write(failPacket)
+				return
+			}
+			clientIP = allocatedIP
+			logger.Info("Morph TUN client: allocated IP=%s from pool (requested=%s, clientID=%s)", clientIP, requestedIP, clientID)
+		} else {
+			clientIP = requestedIP
+			logger.Info("Morph TUN client: IP=%s (no pool)", clientIP)
+		}
+		serverIP = cfg.TunIP
 
-	serverIP := cfg.TunIP
+		// Register client with shared TUN using Morph framing
+		writer := srvCtx.sharedTUN.RegisterClient(clientIP, clientID, conn, morphFramePacket)
+		localSink := newLocalTUNSink(srvCtx.sharedTUN, writer, clientIP)
+		sink = localSink
+		defer func() {
+			localSink.Close()
+			logger.Info("Morph TUN client disconnected: %s (clientID=%s)", clientIP, clientID)
+		}()
+	}
 
 	// Send success response via morph packet: [dataLen:4][paddingLen:2][status:1][serverIP:4][clientIP:4]
 	respData := make([]byte, 9)
 	respData[0] = 0x00 // Success
-	copy(respData[1:5], serverIP)
+	copy(respData[1:5], serverIP.To4())
 	copy(respData[5:9], clientIP.To4())
 
 	padLen := 30
@@ -2232,27 +2271,22 @@ func handleMorphTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverConte
 	binary.BigEndian.PutUint16(resp[4:6], uint16(padLen))
 	copy(resp[6:], respData)
 	fillRandPadding(resp[6+len(respData):])
-	conn.Write(resp)
+	if err := writeMorphFrame(resp); err != nil {
+		logger.Debug("Morph TUN handshake response write failed: %v", err)
+		return
+	}
 
-	// Register client with shared TUN using Morph framing
-	writer := srvCtx.sharedTUN.RegisterClient(clientIP, clientID, conn, morphFramePacket)
-	defer func() {
-		srvCtx.sharedTUN.UnregisterClient(clientIP, writer)
-		logger.Info("Morph TUN client disconnected: %s (clientID=%s)", clientIP, clientID)
-	}()
+	logger.Info("Morph TUN mode established (client=%s, server=%s)", clientIP, serverIP)
 
-	logger.Info("Morph TUN mode established (client=%s, server=%s, tun=%s)", clientIP, serverIP, srvCtx.sharedTUN.Name())
-
-	// Main loop: Morph -> TUN (server-bound traffic)
-	// TUN -> Client is handled by SharedTUN packet dispatcher with morphFramePacket
+	// Main loop: Morph -> sink (server-bound traffic)
+	// sink -> Client is handled by SharedTUN's dispatcher (exit) or the relay pump.
 	var packetsUp int64
 	var reassemblyBuf []byte
-	var writeMu sync.Mutex
 
 	for {
 		select {
-		case <-writer.Done():
-			logger.Debug("Morph TUN loop stopping (client replaced)")
+		case <-sink.Done():
+			logger.Debug("Morph TUN loop stopping (client replaced or upstream gone)")
 			return
 		default:
 		}
@@ -2275,11 +2309,8 @@ func handleMorphTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverConte
 				io.ReadFull(conn, discard)
 			}
 			logger.Debug("Morph TUN: received keepalive, echoing back")
-			writeMu.Lock()
-			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			conn.Write([]byte{0, 0, 0, 0, 0, 0})
-			writeMu.Unlock()
-			writer.UpdateActivity()
+			writeMorphFrame([]byte{0, 0, 0, 0, 0, 0})
+			sink.UpdateActivity()
 			continue
 		}
 
@@ -2323,13 +2354,12 @@ func handleMorphTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverConte
 
 			pktUp := atomic.AddInt64(&packetsUp, 1)
 			if pktUp%100 == 0 {
-				writer.UpdateActivity()
+				sink.UpdateActivity()
 			}
-			logger.Debug("Morph->TUN: writing %d bytes to TUN", len(ipPkt))
+			logger.Debug("Morph->sink: forwarding %d bytes", len(ipPkt))
 
-			// Write packet to shared TUN device
-			if _, err := srvCtx.sharedTUN.TUNDevice().Write(ipPkt); err != nil {
-				logger.Debug("TUN write error: %v", err)
+			if err := sink.WritePacket(ipPkt); err != nil {
+				logger.Debug("Morph TUN sink write error: %v", err)
 			}
 		}
 
@@ -2808,8 +2838,9 @@ func handleConfusionTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverC
 		return
 	}
 
-	// Check if shared TUN is available
-	if srvCtx == nil || srvCtx.sharedTUN == nil {
+	// A relay forwards this client upstream and never touches its own TUN, so
+	// only an exit needs the shared device here.
+	if srvCtx == nil || (srvCtx.sharedTUN == nil && srvCtx.upstreamDialer == nil) {
 		logger.Error("Shared TUN not initialized")
 		conn.Write([]byte{0x00, 0x00, 0x00, 0x01, 0x01})
 		return
@@ -2830,50 +2861,86 @@ func handleConfusionTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverC
 		logger.Debug("Confusion TUN client requested: IP=%s, clientID=%s (legacy v1)", requestedIP, clientID)
 	}
 
-	// Allocate IP from pool
-	var clientIP net.IP
-	if srvCtx.ipPool != nil {
-		allocatedIP, err := srvCtx.ipPool.Allocate(clientID, requestedIP, "")
+	var confWriteMu sync.Mutex
+	writeConfusionFrame := func(frame []byte) error {
+		confWriteMu.Lock()
+		defer confWriteMu.Unlock()
+		conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+		_, err := conn.Write(frame)
+		return err
+	}
+
+	var clientIP, serverIP net.IP
+	var sink tunPacketSink
+
+	if srvCtx.upstreamDialer != nil {
+		// Relay: forward to the upstream exit rather than terminating here.
+		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, remainingData,
+			originOf(conn.RemoteAddr()), func(pkt []byte) error {
+				frame := make([]byte, 4+len(pkt))
+				binary.BigEndian.PutUint32(frame[:4], uint32(len(pkt)))
+				copy(frame[4:], pkt)
+				return writeConfusionFrame(frame)
+			})
 		if err != nil {
-			logger.Error("Failed to allocate IP from pool: %v", err)
+			logger.Warn("Confusion TUN relay: upstream dial failed: %v", err)
 			conn.Write([]byte{0x00, 0x00, 0x00, 0x01, 0x01})
 			return
 		}
-		clientIP = allocatedIP
-		logger.Info("Confusion TUN client: allocated IP=%s from pool", clientIP)
+		sink, serverIP, clientIP = relaySink, upServerIP, upClientIP
+		defer func() {
+			relaySink.Close()
+			logger.Info("Confusion TUN relay client disconnected: %s (clientID=%s)", clientIP, clientID)
+		}()
 	} else {
-		clientIP = requestedIP
-		logger.Info("Confusion TUN client: IP=%s (no pool)", clientIP)
+		// Allocate IP from pool
+		if srvCtx.ipPool != nil {
+			allocatedIP, err := srvCtx.ipPool.Allocate(allocationKey(clientID, originOf(conn.RemoteAddr())), requestedIP, "")
+			if err != nil {
+				logger.Error("Failed to allocate IP from pool: %v", err)
+				conn.Write([]byte{0x00, 0x00, 0x00, 0x01, 0x01})
+				return
+			}
+			clientIP = allocatedIP
+			logger.Info("Confusion TUN client: allocated IP=%s from pool", clientIP)
+		} else {
+			clientIP = requestedIP
+			logger.Info("Confusion TUN client: IP=%s (no pool)", clientIP)
+		}
+		serverIP = cfg.TunIP
+
+		// Register client with shared TUN (default framing: [length:4][packet:N])
+		writer := srvCtx.sharedTUN.RegisterClient(clientIP, clientID, conn, nil)
+		localSink := newLocalTUNSink(srvCtx.sharedTUN, writer, clientIP)
+		sink = localSink
+		defer func() {
+			localSink.Close()
+			logger.Info("Confusion TUN client disconnected: %s (clientID=%s)", clientIP, clientID)
+		}()
 	}
 
 	// Send success response with length prefix: [length:4][status:1][serverIP:4][clientIP:4]
 	// Confusion protocol uses length-prefixed frames for all data after "TIRED" magic
-	serverIP := cfg.TunIP
 	resp := make([]byte, 13)                 // 4 bytes length + 9 bytes data
 	binary.BigEndian.PutUint32(resp[0:4], 9) // length = 9
 	resp[4] = 0x00                           // Success
 	copy(resp[5:9], serverIP.To4())
 	copy(resp[9:13], clientIP.To4())
-	conn.Write(resp)
+	if err := writeConfusionFrame(resp); err != nil {
+		logger.Debug("Confusion TUN handshake response write failed: %v", err)
+		return
+	}
 
-	// Register client with shared TUN (default framing: [length:4][packet:N])
-	writer := srvCtx.sharedTUN.RegisterClient(clientIP, clientID, conn, nil)
-	defer func() {
-		srvCtx.sharedTUN.UnregisterClient(clientIP, writer)
-		logger.Info("Confusion TUN client disconnected: %s (clientID=%s)", clientIP, clientID)
-	}()
+	logger.Info("Confusion TUN mode established (client=%s, server=%s)", clientIP, serverIP)
 
-	logger.Info("Confusion TUN mode established (client=%s, server=%s, tun=%s)", clientIP, serverIP, srvCtx.sharedTUN.Name())
-
-	// Main loop: Client -> TUN
-	// TUN -> Client is handled by SharedTUN packet dispatcher
+	// Main loop: Client -> sink
 	var packetsUp int64
 	lenBuf := make([]byte, 4)
 
 	for {
 		select {
-		case <-writer.Done():
-			logger.Debug("Confusion TUN loop stopping (client replaced)")
+		case <-sink.Done():
+			logger.Debug("Confusion TUN loop stopping (client replaced or upstream gone)")
 			return
 		default:
 		}
@@ -2889,9 +2956,8 @@ func handleConfusionTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverC
 		// Handle keepalive packet (zero length) - echo back
 		if pktLen == 0 {
 			logger.Debug("Confusion TUN: received keepalive, echoing back")
-			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			conn.Write(lenBuf)
-			writer.UpdateActivity()
+			writeConfusionFrame(lenBuf)
+			sink.UpdateActivity()
 			continue
 		}
 
@@ -2908,7 +2974,7 @@ func handleConfusionTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverC
 
 		pktUp := atomic.AddInt64(&packetsUp, 1)
 		if pktUp%100 == 0 {
-			writer.UpdateActivity()
+			sink.UpdateActivity()
 		}
 
 		// Check for double framing from ConfusedConn
@@ -2928,9 +2994,8 @@ func handleConfusionTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverC
 			}
 		}
 
-		// Write packet to shared TUN device
-		if _, err := srvCtx.sharedTUN.TUNDevice().Write(actualPkt); err != nil {
-			logger.Debug("TUN write error: %v", err)
+		if err := sink.WritePacket(actualPkt); err != nil {
+			logger.Debug("Confusion TUN sink write error: %v", err)
 		}
 	}
 }
@@ -3180,9 +3245,9 @@ func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger
 	var ipFromPool bool
 
 	if srvCtx.ipPool != nil {
-		// Use IP Pool - it returns same IP for same clientID (from Redis leases)
+		// Use IP Pool - it returns same IP for same lease key (from Redis leases)
 		var err error
-		clientIP, err = srvCtx.ipPool.Allocate(clientID, requestedIP, "")
+		clientIP, err = srvCtx.ipPool.Allocate(allocationKey(clientID, originOf(conn.RemoteAddr())), requestedIP, "")
 		if err != nil {
 			logger.Warn("IP allocation failed: %v", err)
 			resp := make([]byte, 9)
@@ -3409,8 +3474,18 @@ func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger
 // raw [len:4][pkt:N] frames (and zero-length keepalives) in both directions. The
 // relay never touches its own sharedTUN/ippool for these clients.
 func relayTUNToUpstream(conn net.Conn, srvCtx *serverContext, logger *log.Logger, handshake []byte) {
+	// Carry the downstream client's identity upstream. Without it every client
+	// behind this relay reaches the exit as the same anonymous "global" client,
+	// so the exit's sticky IP pool hands them all one tunnel IP and they evict
+	// each other. A relay further down may have attached the origin already;
+	// keep that one so the chain reports the real client, not the middle hop.
+	handshake, origin := splitTUNOrigin(handshake)
+	if origin == "" {
+		origin = originOf(conn.RemoteAddr())
+	}
+
 	dialCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	upstreamConn, resp, err := srvCtx.upstreamDialer.DialTUN(dialCtx, handshake)
+	upstreamConn, resp, err := srvCtx.upstreamDialer.DialTUN(dialCtx, handshake, origin)
 	cancel()
 	if err != nil {
 		logger.Warn("Relay: upstream TUN dial failed: %v", err)
@@ -3642,6 +3717,13 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 	cfg := srvCtx.cfg
 	logger.Debug("Setting up HTTP/2 Stego TUN tunnel: %d bytes", len(data))
 
+	// A relay forwarding a downstream client appends that client's origin after
+	// the handshake; strip it before parsing the fixed fields.
+	data, origin := splitTUNOrigin(data)
+	if origin == "" {
+		origin = tunnel.remoteAddr
+	}
+
 	// Parse TUN handshake: [localIP:4][mtu:2][version:1]
 	// Version byte is optional (v1 clients send 6 bytes, v2 clients send 7 bytes)
 	if len(data) < 6 {
@@ -3650,8 +3732,9 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 		return
 	}
 
-	// Check if shared TUN is available
-	if srvCtx == nil || srvCtx.sharedTUN == nil {
+	// A relay forwards this client upstream and never touches its own TUN, so
+	// only an exit needs the shared device here.
+	if srvCtx == nil || (srvCtx.sharedTUN == nil && srvCtx.upstreamDialer == nil) {
 		logger.Error("Shared TUN not initialized")
 		sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, cfg)
 		return
@@ -3668,44 +3751,18 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 		logger.Debug("H2 TUN client requested: IP=%s (legacy v1)", requestedIP)
 	}
 
-	// Allocate IP from pool
-	var clientIP net.IP
-	if srvCtx.ipPool != nil {
-		allocatedIP, err := srvCtx.ipPool.Allocate(tunnel.clientID, requestedIP, "")
-		if err != nil {
-			logger.Error("Failed to allocate IP from pool: %v", err)
-			sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, cfg)
-			return
-		}
-		clientIP = allocatedIP
-		logger.Info("H2 TUN client: allocated IP=%s from pool (requested=%s, clientID=%s)", clientIP, requestedIP, tunnel.clientID)
-	} else {
-		clientIP = requestedIP
-		logger.Info("H2 TUN client: IP=%s (no pool)", clientIP)
-	}
-
-	// Send success response: [status:1][serverIP:4][clientIP:4]
-	serverIP := cfg.TunIP
-	resp := make([]byte, 9)
-	resp[0] = 0x00 // Success
-	copy(resp[1:5], serverIP)
-	copy(resp[5:9], clientIP.To4())
-	sendStegoResponse(framer, tunnel.streamID, resp, cfg)
-
-	// Create H2 conn adapter for SharedTUN
+	// Create H2 conn adapter (also marks this tunnel as TUN mode)
 	h2Conn := &h2TunConn{
 		framer:   framer,
 		streamID: &tunnel.streamID, // Pointer so it can be updated
 		cfg:      cfg,
 		mu:       &tunnel.mu,
-		clientIP: clientIP,
 		done:     make(chan struct{}),
 	}
 
-	// Register client with shared TUN using custom frame function
-	// Note: For H2, we send directly in frameFunc, so it returns nil
-	writer := srvCtx.sharedTUN.RegisterClient(clientIP, tunnel.clientID, h2Conn, func(pkt []byte) []byte {
-		// Send packet via H2 stego framing: [len:4][packet:N]
+	// sendPacketDown wraps one IP packet in the stego TUN framing the client
+	// expects: [len:4][packet:N].
+	sendPacketDown := func(pkt []byte) error {
 		framed := make([]byte, 4+len(pkt))
 		binary.BigEndian.PutUint32(framed[:4], uint32(len(pkt)))
 		copy(framed[4:], pkt)
@@ -3713,16 +3770,62 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 		tunnel.mu.Lock()
 		sendStegoResponse(framer, tunnel.streamID, framed, cfg)
 		tunnel.mu.Unlock()
+		return nil
+	}
 
-		return nil // Already sent directly
-	})
+	var clientIP, serverIP net.IP
 
-	// Store writer reference in tunnel for DATA frame handling
-	tunnel.sharedTUNWriter = writer
-	tunnel.sharedTUN = srvCtx.sharedTUN
+	if srvCtx.upstreamDialer != nil {
+		// Relay: forward to the upstream exit rather than terminating here.
+		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, data, origin, sendPacketDown)
+		if err != nil {
+			logger.Warn("H2 TUN relay: upstream dial failed: %v", err)
+			sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, cfg)
+			return
+		}
+		clientIP, serverIP = upClientIP, upServerIP
+		tunnel.sink = relaySink
+	} else {
+		// Allocate IP from pool
+		if srvCtx.ipPool != nil {
+			leaseKey := allocationKey(tunnel.clientID, origin)
+			allocatedIP, err := srvCtx.ipPool.Allocate(leaseKey, requestedIP, "")
+			if err != nil {
+				logger.Error("Failed to allocate IP from pool: %v", err)
+				sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, cfg)
+				return
+			}
+			clientIP = allocatedIP
+			logger.Info("H2 TUN client: allocated IP=%s from pool (requested=%s, clientID=%s, origin=%s)", clientIP, requestedIP, tunnel.clientID, origin)
+		} else {
+			clientIP = requestedIP
+			logger.Info("H2 TUN client: IP=%s (no pool)", clientIP)
+		}
+		serverIP = cfg.TunIP
+		h2Conn.clientIP = clientIP
+
+		// Register client with shared TUN using custom frame function
+		// Note: For H2, we send directly in frameFunc, so it returns nil
+		writer := srvCtx.sharedTUN.RegisterClient(clientIP, tunnel.clientID, h2Conn, func(pkt []byte) []byte {
+			sendPacketDown(pkt)
+			return nil // Already sent directly
+		})
+		tunnel.sharedTUNWriter = writer
+		tunnel.sharedTUN = srvCtx.sharedTUN
+		tunnel.sink = newLocalTUNSink(srvCtx.sharedTUN, writer, clientIP)
+	}
+
+	h2Conn.clientIP = clientIP
 	tunnel.targetConn = h2Conn // Mark as TUN mode
 
-	logger.Info("H2 TUN mode established (client=%s, server=%s, tun=%s)", clientIP, serverIP, srvCtx.sharedTUN.Name())
+	// Send success response: [status:1][serverIP:4][clientIP:4]
+	resp := make([]byte, 9)
+	resp[0] = 0x00 // Success
+	copy(resp[1:5], serverIP.To4())
+	copy(resp[5:9], clientIP.To4())
+	sendStegoResponse(framer, tunnel.streamID, resp, cfg)
+
+	logger.Info("H2 TUN mode established (client=%s, server=%s)", clientIP, serverIP)
 }
 
 // h2TunConn adapts HTTP/2 framer to net.Conn interface for SharedTUN
@@ -4198,6 +4301,7 @@ func computeWebSocketAccept(key string) string {
 type HTTPPollingSession struct {
 	ID         string
 	ClientID   string
+	Origin     string // Peer host of the request that opened the session
 	Secret     []byte
 	Created    time.Time
 	LastActive time.Time
@@ -4270,7 +4374,7 @@ func (pm *HTTPPollingManager) cleanup() {
 }
 
 // GetOrCreate gets or creates a session
-func (pm *HTTPPollingManager) GetOrCreate(sessionID string, secret []byte, clientID string) (*HTTPPollingSession, bool) {
+func (pm *HTTPPollingManager) GetOrCreate(sessionID string, secret []byte, clientID, origin string) (*HTTPPollingSession, bool) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
@@ -4283,6 +4387,7 @@ func (pm *HTTPPollingManager) GetOrCreate(sessionID string, secret []byte, clien
 	sess := &HTTPPollingSession{
 		ID:         sessionID,
 		ClientID:   clientID,
+		Origin:     origin,
 		Secret:     secret,
 		Created:    time.Now(),
 		LastActive: time.Now(),
@@ -4619,7 +4724,7 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 	}
 
 	// Get or create session
-	sess, isNew := pollingManager.GetOrCreate(sessionID, usedSecret, clientID)
+	sess, isNew := pollingManager.GetOrCreate(sessionID, usedSecret, clientID, originOf(conn.RemoteAddr()))
 
 	if isNew {
 		logger.Info("HTTP Polling: New session %s (client: %s), body=%d bytes, contentLength=%d", sessionID[:8], clientID, len(body), contentLength)
@@ -4829,14 +4934,14 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 		return
 	}
 
-	// Check if shared TUN is available
-	if srvCtx == nil || srvCtx.sharedTUN == nil {
+	// A relay forwards this client upstream and never touches its own TUN, so
+	// only an exit needs the shared device here.
+	if srvCtx == nil || (srvCtx.sharedTUN == nil && srvCtx.upstreamDialer == nil) {
 		logger.Error("HTTP Polling TUN: Shared TUN not initialized")
 		sess.WriteToClient([]byte{0x01}) // Failure
 		pollingManager.Remove(sess.ID)
 		return
 	}
-	logger.Debug("HTTP Polling TUN: SharedTUN is available, proceeding...")
 
 	requestedIP := net.IP(remainingData[0:4])
 	clientID := fmt.Sprintf("polling:%s", sess.ClientID)
@@ -4851,51 +4956,74 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 		logger.Debug("HTTP Polling TUN client requested: IP=%s, clientID=%s (legacy v1)", requestedIP, clientID)
 	}
 
-	// Allocate IP from pool
-	var clientIP net.IP
-	logger.Debug("HTTP Polling TUN: Checking IP pool, ipPool=%v", srvCtx.ipPool != nil)
-	if srvCtx.ipPool != nil {
-		logger.Debug("HTTP Polling TUN: Calling ipPool.Allocate for clientID=%s, requestedIP=%s", clientID, requestedIP)
-		allocatedIP, err := srvCtx.ipPool.Allocate(clientID, requestedIP, "")
-		if err != nil {
-			logger.Error("HTTP Polling TUN: Failed to allocate IP from pool: %v", err)
-			sess.WriteToClient([]byte{0x01}) // Failure
-			pollingManager.Remove(sess.ID)
-			return
-		}
-		clientIP = allocatedIP
-		logger.Info("HTTP Polling TUN client: allocated IP=%s from pool (clientID=%s)", clientIP, clientID)
-	} else {
-		clientIP = requestedIP
-		logger.Info("HTTP Polling TUN client: IP=%s (no pool)", clientIP)
-	}
-
-	// Send success response: [status:1][serverIP:4][clientIP:4]
-	serverIP := cfg.TunIP
-	resp := make([]byte, 9)
-	resp[0] = 0x00 // Success
-	copy(resp[1:5], serverIP.To4())
-	copy(resp[5:9], clientIP.To4())
-	sess.WriteToClient(resp)
-
 	// Create polling TUN connection adapter
 	pollConn := &pollingTUNConn{
 		sess:   sess,
 		closed: make(chan struct{}),
 	}
 
-	// Register client with shared TUN using custom framer for polling
-	// Polling uses [length:4][packet:N] framing
-	logger.Debug("HTTP Polling TUN: about to register client IP=%s, clientID=%s", clientIP, clientID)
-	writer := srvCtx.sharedTUN.RegisterClient(clientIP, clientID, pollConn, nil)
-	logger.Debug("HTTP Polling TUN: client registered successfully, writer=%p", writer)
-	defer func() {
-		srvCtx.sharedTUN.UnregisterClient(clientIP, writer)
-		pollingManager.Remove(sess.ID)
-		logger.Info("HTTP Polling TUN client disconnected: %s (clientID=%s)", clientIP, clientID)
-	}()
+	var clientIP, serverIP net.IP
+	var sink tunPacketSink
 
-	logger.Info("HTTP Polling TUN mode established (client=%s, server=%s, tun=%s)", clientIP, serverIP, srvCtx.sharedTUN.Name())
+	if srvCtx.upstreamDialer != nil {
+		// Relay: forward to the upstream exit rather than terminating here. This
+		// is the path a client lands on after falling back to meek-style polling,
+		// which used to strand it on the relay's own exit and address pool.
+		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, remainingData, sess.Origin,
+			func(pkt []byte) error {
+				_, err := pollConn.Write(pkt)
+				return err
+			})
+		if err != nil {
+			logger.Warn("HTTP Polling TUN relay: upstream dial failed: %v", err)
+			sess.WriteToClient([]byte{0x01}) // Failure
+			pollingManager.Remove(sess.ID)
+			return
+		}
+		sink, serverIP, clientIP = relaySink, upServerIP, upClientIP
+		defer func() {
+			relaySink.Close()
+			pollingManager.Remove(sess.ID)
+			logger.Info("HTTP Polling TUN relay client disconnected: %s (clientID=%s)", clientIP, clientID)
+		}()
+	} else {
+		// Allocate IP from pool
+		if srvCtx.ipPool != nil {
+			allocatedIP, err := srvCtx.ipPool.Allocate(allocationKey(clientID, sess.Origin), requestedIP, "")
+			if err != nil {
+				logger.Error("HTTP Polling TUN: Failed to allocate IP from pool: %v", err)
+				sess.WriteToClient([]byte{0x01}) // Failure
+				pollingManager.Remove(sess.ID)
+				return
+			}
+			clientIP = allocatedIP
+			logger.Info("HTTP Polling TUN client: allocated IP=%s from pool (clientID=%s)", clientIP, clientID)
+		} else {
+			clientIP = requestedIP
+			logger.Info("HTTP Polling TUN client: IP=%s (no pool)", clientIP)
+		}
+		serverIP = cfg.TunIP
+
+		// Register client with shared TUN using custom framer for polling
+		// Polling uses [length:4][packet:N] framing
+		writer := srvCtx.sharedTUN.RegisterClient(clientIP, clientID, pollConn, nil)
+		localSink := newLocalTUNSink(srvCtx.sharedTUN, writer, clientIP)
+		sink = localSink
+		defer func() {
+			localSink.Close()
+			pollingManager.Remove(sess.ID)
+			logger.Info("HTTP Polling TUN client disconnected: %s (clientID=%s)", clientIP, clientID)
+		}()
+	}
+
+	// Send success response: [status:1][serverIP:4][clientIP:4]
+	resp := make([]byte, 9)
+	resp[0] = 0x00 // Success
+	copy(resp[1:5], serverIP.To4())
+	copy(resp[5:9], clientIP.To4())
+	sess.WriteToClient(resp)
+
+	logger.Info("HTTP Polling TUN mode established (client=%s, server=%s)", clientIP, serverIP)
 
 	// Main loop: Read from polling buffers -> TUN
 	// TUN -> Client is handled by SharedTUN packet dispatcher via pollConn.Write()
@@ -4904,8 +5032,8 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 
 	for {
 		select {
-		case <-writer.Done():
-			logger.Debug("HTTP Polling TUN loop stopping (client replaced)")
+		case <-sink.Done():
+			logger.Debug("HTTP Polling TUN loop stopping (client replaced or upstream gone)")
 			return
 		case <-pollConn.closed:
 			logger.Debug("HTTP Polling TUN loop stopping (connection closed)")
@@ -4971,15 +5099,12 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 				continue
 			}
 
-			logger.Debug("HTTP Polling TUN: about to write %d bytes to TUN", len(ipPkt))
-			// Write to TUN device
-			if _, err := srvCtx.sharedTUN.TUNDevice().Write(ipPkt); err != nil {
-				logger.Debug("HTTP Polling TUN: write to TUN failed: %v", err)
+			if err := sink.WritePacket(ipPkt); err != nil {
+				logger.Debug("HTTP Polling TUN: sink write failed: %v", err)
 				continue
 			}
-			logger.Debug("HTTP Polling TUN: wrote %d bytes to TUN successfully", len(ipPkt))
 			packetsUp++
-			packetsUp++
+			sink.UpdateActivity()
 		}
 
 		// Put remaining partial data back
