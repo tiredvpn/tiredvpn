@@ -355,6 +355,13 @@ type Config struct {
 	// If empty, unauthorized REALITY connections are silently dropped.
 	REALITYCoverDomain string
 
+	// REALITYRequireDataV2 rejects clients that do not negotiate the v2 data
+	// layer (per-connection X25519 keys + ChaCha20-Poly1305). Off during the
+	// rollout so upgraded exits keep serving older clients; turn it on once
+	// every client in the deployment is upgraded, to close the downgrade path
+	// an active attacker could otherwise force by mangling the padding block.
+	REALITYRequireDataV2 bool
+
 	// Shaper, when non-nil, is built from TOML [shaper]. The server-side
 	// pipeline does not yet consume it — server morph processing lives
 	// outside internal/strategy.MorphedConn — so this field is reserved for
