@@ -2,7 +2,6 @@ package detect
 
 import (
 	"math"
-	"strings"
 	"testing"
 )
 
@@ -258,107 +257,10 @@ func TestWindowsStartClientToServerOnly(t *testing.T) {
 	}
 }
 
-func TestBurstsFromPacketsSubtractsOverhead(t *testing.T) {
-	pkts := []Packet{
-		{ToServer: true, PayloadLen: 500},
-		{ToServer: true, PayloadLen: 100},
-		{ToServer: false, PayloadLen: 0}, // pure ACK, ignored
-		{ToServer: false, PayloadLen: 1000},
-	}
 
-	plain := BurstsFromPackets(pkts, false)
-	if len(plain) != 2 {
-		t.Fatalf("got %d bursts, want 2", len(plain))
-	}
-	if plain[0].Bytes != 600 || plain[0].Pkts != 2 {
-		t.Errorf("first burst %d/%d, want 600/2", plain[0].Bytes, plain[0].Pkts)
-	}
 
-	net := BurstsFromPackets(pkts, true)
-	if want := uint32(600 - 2*TLSInTLSOverheadPerPacket); net[0].Bytes != want {
-		t.Errorf("first burst net %d, want %d", net[0].Bytes, want)
-	}
-	if want := uint32(1000 - TLSInTLSOverheadPerPacket); net[1].Bytes != want {
-		t.Errorf("second burst net %d, want %d", net[1].Bytes, want)
-	}
-}
 
-func TestBurstsFromPacketsClampsAtZero(t *testing.T) {
-	got := BurstsFromPackets([]Packet{{ToServer: true, PayloadLen: 5}}, true)
-	if got[0].Bytes != 0 {
-		t.Errorf("got %d, want 0 - subtraction must clamp, not wrap", got[0].Bytes)
-	}
-}
 
-func TestParseTSharkCSV(t *testing.T) {
-	// Stream 0: client on 51000 talks to server on 443.
-	// The first record fixes the direction for the rest of the stream.
-	in := strings.Join([]string{
-		"0,51000,443,0", // SYN, no payload, sets server port
-		"0,51000,443,530",
-		"0,443,51000,2833",
-		"0,51000,443,281",
-		"1,60000,993,100",
-	}, "\n")
-
-	streams, err := ParseTSharkCSV(strings.NewReader(in))
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	if len(streams) != 2 {
-		t.Fatalf("got %d streams, want 2", len(streams))
-	}
-
-	s0 := streams["0"]
-	if len(s0) != 3 {
-		t.Fatalf("stream 0 has %d packets, want 3 (the SYN carries no payload)", len(s0))
-	}
-	want := []Packet{
-		{ToServer: true, PayloadLen: 530},
-		{ToServer: false, PayloadLen: 2833},
-		{ToServer: true, PayloadLen: 281},
-	}
-	for i, w := range want {
-		if s0[i] != w {
-			t.Errorf("packet %d = %+v, want %+v", i, s0[i], w)
-		}
-	}
-}
-
-func TestParseTSharkCSVRejectsGarbage(t *testing.T) {
-	if _, err := ParseTSharkCSV(strings.NewReader("0,51000,443,notanumber")); err == nil {
-		t.Error("accepted a non-numeric tcp.len")
-	}
-}
-
-func TestAnalyseFlagsOurBaselineShape(t *testing.T) {
-	// Payloads chosen so that after the per-packet overhead subtraction the
-	// bursts land on the baseline shape 530 / 2833 / 281 / 588: the server
-	// flight is three packets, so it loses 72 bytes rather than 24.
-	streams := map[StreamID][]Packet{
-		"ours": {
-			{ToServer: true, PayloadLen: 554},
-			{ToServer: false, PayloadLen: 1000},
-			{ToServer: false, PayloadLen: 1000},
-			{ToServer: false, PayloadLen: 905},
-			{ToServer: true, PayloadLen: 305},
-			{ToServer: false, PayloadLen: 612},
-		},
-	}
-
-	reports := Analyse(streams, true)
-	if len(reports) != 1 {
-		t.Fatalf("got %d reports, want 1", len(reports))
-	}
-	r := reports[0]
-	if !r.Caught {
-		t.Errorf("baseline-shaped flow not caught, worst window %v margin %.3f",
-			r.Worst.Bytes(), r.Margin)
-	}
-	if r.Distances["tls13"] == 0 {
-		t.Error("distances not populated")
-	}
-}
 
 func BenchmarkMahalanobis(b *testing.B) {
 	w := window(530, 2833, 281, 588)

@@ -194,29 +194,123 @@ func (w Window) Bytes() [4]uint32 {
 	return [4]uint32{w[0].Bytes, w[1].Bytes, w[2].Bytes, w[3].Bytes}
 }
 
-// Packet is one payload-carrying TCP segment. Pure ACKs carry no payload and
-// take no part in the heuristic, so they are expected to be filtered out
-// before this point.
+// Mode is which of the two branches inside tls_obfuscated_heur_search a flow
+// takes. The branch is chosen by one local variable:
+//
+//	is_tls_in_tls_heur = flow->extra_packets_func &&
+//	    (detected_protocol_stack[0] == TLS || detected_protocol_stack[1] == TLS)
+//
+// and in practice the protocol stack is decided by the PORT. A flow on 995 is
+// subclassified as POPS, so TLS is not in the stack and the branch is Plain; a
+// flow on a port that resolves to TLS takes the TLSInTLS branch. Nothing about
+// what we put on the wire selects this - the port does.
+//
+// The two branches behave differently in two ways that both change the numbers,
+// so a model that ignores the mode answers the wrong question.
+type Mode int
+
+const (
+	// ModePlain: no ChangeCipherSpec gate, no per-packet overhead. Counting
+	// starts at the first payload-carrying packet.
+	ModePlain Mode = iota
+
+	// ModeTLSInTLS: packets are ignored until a ChangeCipherSpec has been seen
+	// in that direction, and TLSInTLSOverheadPerPacket is deducted per packet
+	// to discount the outer tunnel's framing.
+	ModeTLSInTLS
+)
+
+// Packet is one TCP segment. Zero-length segments (pure ACKs) are kept in the
+// slice and skipped during the walk, matching the original, which returns early
+// on payload_packet_len == 0 without touching any counter.
 type Packet struct {
 	ToServer   bool
 	PayloadLen uint32
+	// FirstByte is the first byte of the TCP payload, or 0 for an empty
+	// segment. The heuristic's own gate tests exactly this: payload[0] == 0x14.
+	FirstByte byte
 }
 
-// BurstsFromPackets merges consecutive same-direction packets into bursts.
+// Flow is one TCP connection as the heuristic sees it.
+type Flow struct {
+	Packets []Packet
+	Mode    Mode
+
+	// CCSFromClient and CCSFromServer say whether the main TLS dissector had
+	// already recorded a well-formed ChangeCipherSpec record in that direction
+	// before the heuristic ran.
+	//
+	// There are two independent places that set these flags in nDPI, and only
+	// modelling one of them gives wrong answers:
+	//
+	//   - the main dissector, on a reassembled record with content_type 0x14,
+	//     length 6, version byte 0x03 and a length field of 1. That is a real
+	//     CCS record, found by parsing, not by looking at a segment boundary.
+	//   - the heuristic's own gate, on payload[0] == 0x14 of a segment. Cruder,
+	//     and it is what the walk below implements.
+	//
+	// Reassembly is left to whoever produced the packets - tshark does it
+	// properly - so the first path arrives here as these two booleans.
+	CCSFromClient bool
+	CCSFromServer bool
+
+	// MaxPackets mirrors cfg.tls_heuristics_max_packets: once more than this
+	// many payload-carrying packets have been examined the heuristic gives up.
+	// Zero means no limit.
+	//
+	// The upstream default was not determined during our measurements, so a
+	// zero here is "we do not know", not "there is no limit in nDPI".
+	MaxPackets int
+}
+
+// Bursts walks the flow the way tls_obfuscated_heur_search does and returns the
+// bursts that the models are scored against.
 //
-// When subtractOverhead is true it also removes TLSInTLSOverheadPerPacket for
-// every packet in the burst, which is what nDPI does in TLS-in-TLS mode to
-// discount the outer tunnel's framing. The result is clamped at zero rather
-// than wrapping, since Bytes is unsigned.
-//
-// Zero-length packets are skipped: they neither add bytes nor, in the original,
-// count towards the packet total that MaxFirstBurstPackets guards.
-func BurstsFromPackets(pkts []Packet, subtractOverhead bool) []Burst {
-	var bursts []Burst
-	for _, p := range pkts {
+// excluded reports that the heuristic bailed out on this flow entirely, which
+// is not the same as "scored and found clean": an excluded flow produces no
+// verdict at all.
+func (f Flow) Bursts() (bursts []Burst, excluded bool) {
+	overhead := uint32(0)
+	if f.Mode == ModeTLSInTLS {
+		overhead = TLSInTLSOverheadPerPacket
+	}
+
+	ccsClient, ccsServer := f.CCSFromClient, f.CCSFromServer
+	examined := 0
+
+	for _, p := range f.Packets {
 		if p.PayloadLen == 0 {
 			continue
 		}
+
+		if f.Mode == ModeTLSInTLS {
+			// A segment shorter than the overhead we are about to deduct stops
+			// the heuristic outright rather than being skipped.
+			if p.PayloadLen < overhead {
+				return bursts, true
+			}
+			// The gate. Note that the packet which sets the flag is itself
+			// skipped: the original sets the flag and then returns, so counting
+			// begins on the next packet in that direction.
+			if p.ToServer && !ccsClient {
+				if p.FirstByte == 0x14 {
+					ccsClient = true
+				}
+				continue
+			}
+			if !p.ToServer && !ccsServer {
+				if p.FirstByte == 0x14 {
+					ccsServer = true
+				}
+				continue
+			}
+		}
+
+		examined++
+		if f.MaxPackets > 0 && examined > f.MaxPackets {
+			return bursts, true
+		}
+
 		if n := len(bursts); n > 0 && bursts[n-1].ToServer == p.ToServer {
 			bursts[n-1].Bytes += p.PayloadLen
 			bursts[n-1].Pkts++
@@ -225,17 +319,20 @@ func BurstsFromPackets(pkts []Packet, subtractOverhead bool) []Burst {
 		bursts = append(bursts, Burst{ToServer: p.ToServer, Bytes: p.PayloadLen, Pkts: 1})
 	}
 
-	if subtractOverhead {
+	// The deduction is a property of the mode, never a caller's choice: tying
+	// it to an argument is how the first version of this package grew a bug
+	// that its tests could not see, because they fed vectors and never a flow.
+	if overhead > 0 {
 		for i := range bursts {
-			overhead := bursts[i].Pkts * TLSInTLSOverheadPerPacket
-			if overhead >= bursts[i].Bytes {
+			d := bursts[i].Pkts * overhead
+			if d >= bursts[i].Bytes {
 				bursts[i].Bytes = 0
 				continue
 			}
-			bursts[i].Bytes -= overhead
+			bursts[i].Bytes -= d
 		}
 	}
-	return bursts
+	return bursts, false
 }
 
 // Merge collapses consecutive same-direction bursts. Callers that assembled

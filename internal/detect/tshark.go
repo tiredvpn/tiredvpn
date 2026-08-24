@@ -2,6 +2,7 @@ package detect
 
 import (
 	"encoding/csv"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"strconv"
@@ -12,10 +13,14 @@ type StreamID string
 
 // ParseTSharkCSV turns tshark field output into per-stream packet lists.
 //
-// The expected invocation, four fields, no header:
+// The expected invocation, five fields, no header:
 //
 //	tshark -r dump.pcap -Y tcp -T fields -E separator=, \
-//	       -e tcp.stream -e tcp.srcport -e tcp.dstport -e tcp.len
+//	       -e tcp.stream -e tcp.srcport -e tcp.dstport -e tcp.len -e tcp.payload
+//
+// The payload column may be either the full hex payload or just its first byte;
+// only the first byte is read, because that is all the heuristic's gate looks
+// at. An empty column is fine and means an empty segment.
 //
 // Direction is derived rather than asked for, because tshark has no field for
 // it: the first packet seen on a stream is the client's, so its destination
@@ -23,11 +28,11 @@ type StreamID string
 // mid-flow this guesses, and a capture that starts mid-flow is useless for the
 // heuristic anyway - it scores the handshake.
 //
-// Zero-length segments are dropped here rather than downstream, so the packet
-// counts that MaxFirstBurstPackets guards match what nDPI sees.
+// Zero-length segments are kept, not dropped: the walk in Flow.Bursts needs to
+// see them to match the original, which returns early on them.
 func ParseTSharkCSV(r io.Reader) (map[StreamID][]Packet, error) {
 	cr := csv.NewReader(r)
-	cr.FieldsPerRecord = 4
+	cr.FieldsPerRecord = -1 // the payload column may be absent on empty segments
 	cr.ReuseRecord = true
 
 	out := make(map[StreamID][]Packet)
@@ -41,22 +46,32 @@ func ParseTSharkCSV(r io.Reader) (map[StreamID][]Packet, error) {
 		if err != nil {
 			return nil, fmt.Errorf("tshark csv line %d: %w", line, err)
 		}
+		if len(rec) < 4 {
+			return nil, fmt.Errorf("tshark csv line %d: want at least 4 fields, got %d", line, len(rec))
+		}
 
 		stream, src, dst, lenField := StreamID(rec[0]), rec[1], rec[2], rec[3]
-		payload, err := strconv.ParseUint(lenField, 10, 32)
+		payloadLen, err := strconv.ParseUint(lenField, 10, 32)
 		if err != nil {
 			return nil, fmt.Errorf("tshark csv line %d: tcp.len %q: %w", line, lenField, err)
+		}
+
+		var first byte
+		if len(rec) >= 5 && len(rec[4]) >= 2 {
+			b, err := hex.DecodeString(rec[4][:2])
+			if err != nil {
+				return nil, fmt.Errorf("tshark csv line %d: tcp.payload %q: %w", line, rec[4][:2], err)
+			}
+			first = b[0]
 		}
 
 		if _, seen := serverPort[stream]; !seen {
 			serverPort[stream] = dst
 		}
-		if payload == 0 {
-			continue
-		}
 		out[stream] = append(out[stream], Packet{
 			ToServer:   dst == serverPort[stream] && src != serverPort[stream],
-			PayloadLen: uint32(payload),
+			PayloadLen: uint32(payloadLen),
+			FirstByte:  first,
 		})
 	}
 	return out, nil
@@ -64,7 +79,12 @@ func ParseTSharkCSV(r io.Reader) (map[StreamID][]Packet, error) {
 
 // FlowReport is the verdict for one flow.
 type FlowReport struct {
-	Stream    StreamID
+	Stream StreamID
+	Mode   Mode
+	// Excluded means the heuristic bailed out and produced no verdict. That is
+	// different from Caught == false, which means it looked and found nothing.
+	Excluded  bool
+	Scored    bool
 	Worst     Window
 	Margin    float64
 	Caught    bool
@@ -72,26 +92,33 @@ type FlowReport struct {
 	Distances map[string]float64
 }
 
-// Analyse scores every stream in a capture. subtractOverhead should be true
-// for traffic carrying an inner TLS session, which is the case this heuristic
-// exists for.
-func Analyse(streams map[StreamID][]Packet, subtractOverhead bool) []FlowReport {
+// Analyse scores every stream in a capture under the given mode.
+//
+// The mode is the caller's to supply because it is not visible in the packets:
+// it follows from how nDPI classified the flow, which in practice follows from
+// the port. Guessing it here would hide the very thing that decides the answer.
+func Analyse(streams map[StreamID][]Packet, mode Mode) []FlowReport {
 	var out []FlowReport
 	for id, pkts := range streams {
-		bursts := BurstsFromPackets(pkts, subtractOverhead)
-		w, margin, ok := Worst(bursts)
-		if !ok {
+		rep := FlowReport{Stream: id, Mode: mode}
+
+		bursts, excluded := Flow{Packets: pkts, Mode: mode}.Bursts()
+		if excluded {
+			rep.Excluded = true
+			out = append(out, rep)
 			continue
 		}
-		caught, by := Caught(w)
-		out = append(out, FlowReport{
-			Stream:    id,
-			Worst:     w,
-			Margin:    margin,
-			Caught:    caught,
-			CaughtBy:  by,
-			Distances: Distances(w),
-		})
+
+		w, margin, ok := Worst(bursts)
+		if !ok {
+			out = append(out, rep)
+			continue
+		}
+		rep.Scored = true
+		rep.Worst, rep.Margin = w, margin
+		rep.Caught, rep.CaughtBy = Caught(w)
+		rep.Distances = Distances(w)
+		out = append(out, rep)
 	}
 	return out
 }
