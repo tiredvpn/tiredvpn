@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"sort"
 	"strings"
 
 	utls "github.com/refraction-networking/utls"
@@ -17,69 +18,135 @@ type BrowserFingerprint struct {
 	ClientHello *utls.ClientHelloID
 }
 
-// Predefined browser fingerprints
-// These match real browser signatures to evade JA3-based detection
+// Predefined browser fingerprints.
+//
+// Names here state what uTLS actually parrots, not what we wish it parroted.
+// The previous naming ("Chrome 124" pointing at HelloChrome_Auto) hid a growing
+// gap between the label and the bytes on the wire, which is exactly the kind of
+// thing that gets a transport fingerprinted.
+//
+// Version gap against what browsers ship as of 2026-08 (utls master):
+//
+//	HelloFirefox_Auto  = Firefox 148  — current, no gap
+//	HelloSafari_Auto   = Safari 26.3  — current, no gap
+//	HelloChrome_Auto   = Chrome 133   — Chrome stable is 152, 19 majors behind
+//	HelloEdge_Auto     = Edge 85      — 2020
+//	HelloIOS_Auto      = iOS 14       — 2020
+//	HelloAndroid_11_OkHttp            — 2020
 var (
-	// Chrome 120 on Windows - most common fingerprint globally
+	// Chrome 120 on Windows - pinned, kept only for reproducing old captures.
 	FingerprintChrome120 = &BrowserFingerprint{
 		Name:        "Chrome 120",
 		ClientHello: &utls.HelloChrome_120,
 	}
 
-	// Chrome 124 - latest stable
-	FingerprintChrome124 = &BrowserFingerprint{
-		Name:        "Chrome 124",
+	// Newest Chrome uTLS can parrot. Currently Chrome 133 (see gap table above).
+	FingerprintChromeAuto = &BrowserFingerprint{
+		Name:        "Chrome (uTLS auto)",
 		ClientHello: &utls.HelloChrome_Auto,
 	}
 
-	// Firefox 121
-	FingerprintFirefox121 = &BrowserFingerprint{
-		Name:        "Firefox 121",
+	// Newest Firefox uTLS can parrot. Currently Firefox 148 — matches shipping
+	// Firefox, which is why this is the default profile.
+	FingerprintFirefoxAuto = &BrowserFingerprint{
+		Name:        "Firefox (uTLS auto)",
 		ClientHello: &utls.HelloFirefox_Auto,
 	}
 
-	// Safari 17.2
-	FingerprintSafari17 = &BrowserFingerprint{
-		Name:        "Safari 17",
+	// Firefox 120 - pinned, kept only for reproducing old captures.
+	FingerprintFirefox120 = &BrowserFingerprint{
+		Name:        "Firefox 120",
+		ClientHello: &utls.HelloFirefox_120,
+	}
+
+	// Newest Safari uTLS can parrot. Currently Safari 26.3.
+	FingerprintSafariAuto = &BrowserFingerprint{
+		Name:        "Safari (uTLS auto)",
 		ClientHello: &utls.HelloSafari_Auto,
 	}
 
-	// Edge (Chromium-based)
+	// Edge (Chromium-based). HelloEdge_Auto is still Edge 85 upstream — six
+	// years stale, do not use as a default.
 	FingerprintEdge = &BrowserFingerprint{
-		Name:        "Edge 120",
+		Name:        "Edge 85",
 		ClientHello: &utls.HelloEdge_Auto,
 	}
 
-	// iOS Safari
+	// iOS Safari. HelloIOS_Auto is iOS 14 upstream — stale.
 	FingerprintiOS = &BrowserFingerprint{
-		Name:        "iOS Safari",
+		Name:        "iOS 14 Safari",
 		ClientHello: &utls.HelloIOS_Auto,
 	}
 
-	// Android Chrome
+	// Android OkHttp on Android 11 — stale, and OkHttp is not a browser.
 	FingerprintAndroid = &BrowserFingerprint{
-		Name:        "Android Chrome",
+		Name:        "Android 11 OkHttp",
 		ClientHello: &utls.HelloAndroid_11_OkHttp,
 	}
 
-	// Randomized - changes per connection
+	// Randomized - changes per connection. Matches no real client, so it stands
+	// out against any census of observed ClientHellos. Diagnostics only.
 	FingerprintRandomized = &BrowserFingerprint{
 		Name:        "Randomized",
 		ClientHello: &utls.HelloRandomized,
 	}
 )
 
-// FingerprintMap maps names to fingerprints
+// DefaultFingerprintName is the profile used when nothing is configured.
+//
+// Firefox for two independent reasons:
+//
+//  1. It is the only major-browser profile uTLS parrots at its current shipping
+//     version (148). Chrome_Auto is 19 majors behind Chrome stable, which shows
+//     up in the extension set and in the post-quantum key share — a mismatch a
+//     censor gets for free by comparing our JA4 against live Chrome traffic.
+//  2. Xray issue #6293 reports Chrome/Safari/iOS profiles landing in the
+//     suspicious classes at Russian and Iranian censors, while Firefox, Android,
+//     OkHttp and Edge pass. Of those four, Firefox is the only one uTLS parrots
+//     at a current version — the Edge/iOS/Android parrots are all from 2020.
+const DefaultFingerprintName = "firefox"
+
+// FingerprintMap maps configuration names to fingerprints. The version-suffixed
+// aliases pin a specific parrot; the bare browser names track uTLS upstream.
 var FingerprintMap = map[string]*BrowserFingerprint{
-	"chrome":     FingerprintChrome124,
+	"chrome":     FingerprintChromeAuto,
 	"chrome120":  FingerprintChrome120,
-	"chrome124":  FingerprintChrome124,
-	"firefox":    FingerprintFirefox121,
-	"safari":     FingerprintSafari17,
+	"chrome124":  FingerprintChromeAuto, // legacy alias, never was Chrome 124
+	"chrome133":  FingerprintChromeAuto,
+	"firefox":    FingerprintFirefoxAuto,
+	"firefox120": FingerprintFirefox120,
+	"firefox148": FingerprintFirefoxAuto,
+	"safari":     FingerprintSafariAuto,
 	"edge":       FingerprintEdge,
 	"ios":        FingerprintiOS,
 	"android":    FingerprintAndroid,
 	"randomized": FingerprintRandomized,
+}
+
+// LookupFingerprint resolves a configured profile name, falling back to the
+// default profile when the name is empty or unknown. The bool reports whether
+// the name was recognised, so callers can warn on a typo instead of silently
+// dialing with something the operator did not ask for.
+func LookupFingerprint(name string) (*BrowserFingerprint, bool) {
+	if name == "" {
+		return FingerprintMap[DefaultFingerprintName], true
+	}
+	fp, ok := FingerprintMap[strings.ToLower(name)]
+	if !ok {
+		return FingerprintMap[DefaultFingerprintName], false
+	}
+	return fp, true
+}
+
+// FingerprintNames returns the configurable profile names, sorted, for use in
+// help text and error messages.
+func FingerprintNames() []string {
+	names := make([]string, 0, len(FingerprintMap))
+	for name := range FingerprintMap {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // TLSConn wraps uTLS connection with fingerprint support
@@ -106,7 +173,7 @@ type Config struct {
 func DefaultConfig(serverName string) *Config {
 	return &Config{
 		ServerName:         serverName,
-		Fingerprint:        "chrome",
+		Fingerprint:        DefaultFingerprintName,
 		ALPN:               []string{"h2", "http/1.1"},
 		InsecureSkipVerify: false,
 	}
@@ -115,10 +182,7 @@ func DefaultConfig(serverName string) *Config {
 // Dial creates a new TLS connection with browser fingerprint
 func Dial(network, addr string, config *Config) (*TLSConn, error) {
 	// Get fingerprint
-	fp, ok := FingerprintMap[strings.ToLower(config.Fingerprint)]
-	if !ok {
-		fp = FingerprintChrome124 // Default to Chrome
-	}
+	fp, _ := LookupFingerprint(config.Fingerprint)
 
 	// Establish TCP connection
 	tcpConn, err := net.Dial(network, addr)
@@ -138,15 +202,10 @@ func ClientWithConn(conn net.Conn, config *Config, fp *BrowserFingerprint) (*TLS
 		NextProtos:         config.ALPN,
 	}
 
-	// Create uTLS connection
-	uconn := utls.UClient(conn, tlsConfig, *fp.ClientHello)
-
-	// Apply custom ClientHello modifications if needed
-	if config.PaddingLen > 0 {
-		if err := applyPadding(uconn, config.PaddingLen); err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("padding failed: %w", err)
-		}
+	uconn, err := newUConn(conn, tlsConfig, fp, config.PaddingLen)
+	if err != nil {
+		conn.Close()
+		return nil, err
 	}
 
 	// Perform handshake
@@ -162,21 +221,59 @@ func ClientWithConn(conn net.Conn, config *Config, fp *BrowserFingerprint) (*TLS
 	}, nil
 }
 
-// applyPadding adds padding to ClientHello
-func applyPadding(conn *utls.UConn, targetLen int) error {
-	// Get current ClientHello spec
-	spec, err := utls.UTLSIdToSpec(conn.ClientHelloID)
-	if err != nil {
-		return err
+// newUConn builds a uTLS client for the given profile, optionally with a
+// padding extension of paddingLen bytes appended to the profile's extension
+// list.
+//
+// The padding has to go in through HelloCustom, not through the profile ID.
+// uTLS resolves a profile ID lazily inside BuildHandshakeState: if
+// uconn.clientHelloSpec is still nil at that point it re-derives the pristine
+// spec from the ID and overwrites uconn.Extensions. ApplyPreset does not set
+// clientHelloSpec, so calling UClient(id) and then ApplyPreset(modified spec)
+// — which is what this package used to do — has the modification silently
+// thrown away before the ClientHello is marshalled. Dialing with HelloCustom
+// makes applyPresetByID a no-op and leaves our extensions in place.
+//
+// This matters because REALITY hides its credentials in that padding extension.
+// With the padding lost, callers fell through to AddPaddingWithREALITY, which
+// splices the extension into the marshalled bytes after the fact.
+func newUConn(conn net.Conn, tlsConfig *utls.Config, fp *BrowserFingerprint, paddingLen int) (*utls.UConn, error) {
+	if paddingLen <= 0 {
+		return utls.UClient(conn, tlsConfig, *fp.ClientHello), nil
 	}
 
-	// Add padding extension
-	spec.Extensions = append(spec.Extensions, &utls.UtlsPaddingExtension{
-		PaddingLen: targetLen,
-		WillPad:    true,
-	})
+	spec, err := utls.UTLSIdToSpec(*fp.ClientHello)
+	if err != nil {
+		// Randomized profiles are generated, not tabulated, so they have no
+		// spec to fetch. Fall back to the plain profile; the caller's own
+		// padding splice still runs.
+		return utls.UClient(conn, tlsConfig, *fp.ClientHello), nil //nolint:nilerr // documented fallback
+	}
 
-	return conn.ApplyPreset(&spec)
+	// Some profiles (Chrome 120, Edge 85, iOS 14) already carry a padding
+	// extension sized by BoringPaddingStyle, which pads to 512 bytes and so
+	// yields nothing at all for a modern post-quantum ClientHello. Replace it
+	// rather than appending a second one — uTLS rejects two padding extensions
+	// outright. Replacing instead of mutating keeps us clear of the shared
+	// extension objects UTLSIdToSpec hands out.
+	padding := &utls.UtlsPaddingExtension{PaddingLen: paddingLen, WillPad: true}
+	replaced := false
+	for i, ext := range spec.Extensions {
+		if _, ok := ext.(*utls.UtlsPaddingExtension); ok {
+			spec.Extensions[i] = padding
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		spec.Extensions = append(spec.Extensions, padding)
+	}
+
+	uconn := utls.UClient(conn, tlsConfig, utls.HelloCustom)
+	if err := uconn.ApplyPreset(&spec); err != nil {
+		return nil, fmt.Errorf("apply %s spec: %w", fp.Name, err)
+	}
+	return uconn, nil
 }
 
 // GetNegotiatedProtocol returns the negotiated ALPN protocol
@@ -222,14 +319,10 @@ func BuildClientHelloBytes(config *Config, fp *BrowserFingerprint) ([]byte, erro
 		NextProtos:         config.ALPN,
 	}
 
-	uconn := utls.UClient(client, tlsConfig, *fp.ClientHello)
-
-	// Apply padding if requested
-	if config.PaddingLen > 0 {
-		if err := applyPadding(uconn, config.PaddingLen); err != nil {
-			client.Close()
-			return nil, fmt.Errorf("failed to apply padding: %w", err)
-		}
+	uconn, err := newUConn(client, tlsConfig, fp, config.PaddingLen)
+	if err != nil {
+		client.Close()
+		return nil, err
 	}
 
 	// Get the ClientHello bytes without actually sending

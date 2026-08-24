@@ -18,6 +18,7 @@ import (
 	"github.com/skip2/go-qrcode"
 	"github.com/tiredvpn/tiredvpn/internal/client"
 	"github.com/tiredvpn/tiredvpn/internal/server"
+	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 )
 
 // version is overridden at link time via -ldflags="-X main.version=$VERSION".
@@ -278,6 +279,8 @@ ADVANCED EVASION:
         QUIC server port (default 8443)
   -quic-sni-frag
         Enable QUIC SNI fragmentation for GFW bypass
+  -tls-fingerprint string
+        uTLS browser profile for ClientHello (default "firefox")
   -ech
         Enable ECH (Encrypted Client Hello) to hide SNI from DPI
   -ech-config string
@@ -543,6 +546,9 @@ func runClient(args []string) {
 	// RTT Masking flags
 	fs.BoolVar(&cfg.RTTMaskingEnabled, "rtt-masking", false, "Enable RTT masking (hides proxy timing signature)")
 	fs.StringVar(&cfg.RTTProfile, "rtt-profile", "moscow-yandex", "RTT profile (moscow-yandex, moscow-vk, regional-russia, siberia, cdn, beijing-baidu, tehran-aparat)")
+
+	fs.StringVar(&cfg.TLSFingerprint, "tls-fingerprint", "",
+		"uTLS browser profile for ClientHello ("+strings.Join(customtls.FingerprintNames(), ", ")+"); empty uses "+customtls.DefaultFingerprintName)
 
 	// ECH (Encrypted Client Hello) flags - hide SNI from DPI
 	fs.BoolVar(&cfg.ECHEnabled, "ech", false, "Enable ECH (Encrypted Client Hello) to hide SNI from DPI")

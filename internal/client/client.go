@@ -94,6 +94,10 @@ type Config struct {
 	RTTMaskingEnabled bool   // Enable RTT masking
 	RTTProfile        string // RTT profile name
 
+	// TLSFingerprint names the uTLS browser profile used for ClientHellos.
+	// Empty means the built-in default (see internal/tls.DefaultFingerprintName).
+	TLSFingerprint string
+
 	// ECH (Encrypted Client Hello) - hides SNI from DPI
 	ECHEnabled    bool   // Enable ECH
 	ECHConfigB64  string // ECHConfigList in base64 (from server)
@@ -256,6 +260,7 @@ func buildManager(cfg *Config, secret string) (*strategy.Manager, error) {
 		QUICPort:            cfg.QUICPort,
 		ICMPTunnelEnabled:   cfg.ICMPTunnelEnabled,
 		SeqovlPacketEnabled: cfg.SeqovlPacketEnabled,
+		TLSFingerprint:      cfg.TLSFingerprint,
 		ECHEnabled:          cfg.ECHEnabled,
 		ECHConfigList:       echConfigList,
 		ECHPublicName:       cfg.ECHPublicName,

@@ -32,12 +32,22 @@ type REALITYStrategy struct {
 	sniRotator *evasion.SNIRotator
 
 	// Destination tracking
+	destPool    []string // the derived donor pool, in rotator order
 	recentDests map[string]time.Time
 	destMu      sync.RWMutex
 
 	// Client's ephemeral X25519 key pair
 	clientPrivKey [32]byte
 	clientPubKey  [32]byte
+
+	// fingerprint names the uTLS browser profile used to build the ClientHello.
+	// Fixed for the lifetime of the strategy: switching profiles mid-session is
+	// itself a detection signal (see handshakeGate), so this is set once at
+	// construction and never rotated.
+	fingerprint string
+
+	// gate serialises TLS handshakes per donor SNI. See handshake_gate.go.
+	gate *handshakeGate
 
 	// Post-Quantum crypto (optional)
 	pqEnabled      bool
@@ -93,10 +103,33 @@ func NewREALITYStrategy(manager *Manager, secret []byte) *REALITYStrategy {
 		manager:       manager,
 		secret:        secret,
 		sniRotator:    sniRotator,
+		destPool:      subPool,
 		recentDests:   make(map[string]time.Time),
 		clientPrivKey: privKey,
 		clientPubKey:  pubKey,
+		fingerprint:   customtls.DefaultFingerprintName,
+		gate:          newHandshakeGate(),
 	}
+}
+
+// SetFingerprint selects the uTLS browser profile used for the ClientHello.
+// An empty or unknown name keeps the default profile and logs a warning; the
+// alternative — silently dialing with a profile the operator did not ask for —
+// makes a config typo indistinguishable from a working setup.
+//
+// Call this before the first Connect: the profile is deliberately stable for
+// the lifetime of the strategy, because changing fingerprint after a censor has
+// throttled a SNI escalates a 120 s freeze into a 600 s block of all TLS.
+func (r *REALITYStrategy) SetFingerprint(name string) {
+	if name == "" {
+		return
+	}
+	if _, ok := customtls.LookupFingerprint(name); !ok {
+		log.Warn("REALITY: unknown TLS fingerprint %q, using %q (available: %v)",
+			name, customtls.DefaultFingerprintName, customtls.FingerprintNames())
+		return
+	}
+	r.fingerprint = name
 }
 
 // NewREALITYStrategyPQ creates a REALITY strategy with post-quantum crypto
@@ -239,6 +272,20 @@ func (r *REALITYStrategy) connect(ctx context.Context, target string, wrapFirstF
 
 	log.Debug("REALITY: Using destination %s for cover", dest)
 
+	// Handshake discipline: hold the per-SNI gate for the whole handshake, so
+	// concurrency is measured over handshakes actually in flight and the spacing
+	// is measured between handshake starts. See handshake_gate.go for the
+	// censor behaviour this defends against.
+	sniKey, _, err := net.SplitHostPort(dest)
+	if err != nil {
+		sniKey = dest
+	}
+	releaseGate, err := r.gate.acquire(ctx, sniKey)
+	if err != nil {
+		return nil, fmt.Errorf("reality: handshake gate: %w", err)
+	}
+	defer releaseGate()
+
 	deadline, hasDeadline := ctx.Deadline()
 	timeout := 30 * time.Second
 	if hasDeadline {
@@ -362,6 +409,15 @@ func (r *REALITYStrategy) connect(ctx context.Context, target string, wrapFirstF
 	log.Debug("REALITY: ServerHello received (%d bytes)", len(serverHello))
 	log.Debug("REALITY: ServerHello hex: %s", log.HexDump(serverHello, 128))
 
+	// A HelloRetryRequest here never comes from our own server — it can only be
+	// an in-path probe or the real donor. See handleHelloRetryRequest for what
+	// we do about it and what we still cannot do.
+	if isHelloRetryRequest(serverHello) {
+		r.handleHelloRetryRequest(tcpConn, dest)
+		tcpConn.Close()
+		return nil, errHelloRetryRequest
+	}
+
 	if err := r.validateServerHello(serverHello, dest); err != nil {
 		tcpConn.Close()
 		return nil, fmt.Errorf("reality: validation failed: %w", err)
@@ -423,8 +479,6 @@ func (r *REALITYStrategy) selectDestination() (string, error) {
 
 	// The rotator is already seeded from the per-user derived subpool
 	// (see NewREALITYStrategy / derivePool), so no Tier 1 forcing is needed here.
-	// Fallback list used only if the rotator's pool is somehow empty.
-	fallbackSNIs := getRussianSNIsStatic()
 
 	// Try up to 10 times to find a non-recent destination
 	for attempt := 0; attempt < 10; attempt++ {
@@ -450,10 +504,40 @@ func (r *REALITYStrategy) selectDestination() (string, error) {
 		return dest, nil
 	}
 
-	// Fallback: use any destination
-	sni := fallbackSNIs[0]
+	// Every donor is inside its cooldown window. Pick the least recently used
+	// one rather than a fixed fallback: the previous code returned
+	// getRussianSNIsStatic()[0] here, so under any sustained load — which with
+	// a four-domain donor pool and a fresh handshake per CONNECT arrives fast —
+	// every dial past the first few piled onto yandex.ru. That is precisely the
+	// burst pattern the per-SNI freeze looks for, manufactured by us.
+	sni := r.leastRecentlyUsedDestLocked()
 	r.recentDests[sni] = time.Now()
 	return net.JoinHostPort(sni, "443"), nil
+}
+
+// leastRecentlyUsedDestLocked returns the donor SNI whose last use is furthest
+// in the past. Callers must hold destMu.
+func (r *REALITYStrategy) leastRecentlyUsedDestLocked() string {
+	pool := r.destPool
+	if len(pool) == 0 {
+		pool = getRussianSNIsStatic()
+	}
+
+	var (
+		best    string
+		bestUse time.Time
+	)
+	for _, sni := range pool {
+		lastUse, used := r.recentDests[sni]
+		if !used {
+			// Never used at all: nothing can be less recent than that.
+			return sni
+		}
+		if best == "" || lastUse.Before(bestUse) {
+			best, bestUse = sni, lastUse
+		}
+	}
+	return best
 }
 
 // derivePool derives a deterministic per-user subpool of size n from globalPool.
@@ -558,7 +642,9 @@ func (r *REALITYStrategy) getIranianSNIs() []string {
 }
 
 // buildClientHello constructs a TLS ClientHello with REALITY extension hidden in padding
-// Uses uTLS for realistic browser fingerprint (Chrome) + hides REALITY data in padding extension
+// Uses uTLS for a realistic browser fingerprint + hides REALITY data in padding extension.
+// The profile comes from configuration (see SetFingerprint); it is fixed for the
+// lifetime of the strategy, never rotated per connection.
 func (r *REALITYStrategy) buildClientHello(dest string) ([]byte, error) {
 	log.Info("REALITY-BUILD: Starting buildClientHello for %s", dest)
 
@@ -568,17 +654,17 @@ func (r *REALITYStrategy) buildClientHello(dest string) ([]byte, error) {
 		host = dest
 	}
 
-	// Use uTLS to build realistic Chrome ClientHello with padding
+	fp, _ := customtls.LookupFingerprint(r.fingerprint)
+
 	config := &customtls.Config{
 		ServerName:         host,
-		Fingerprint:        "chrome",
+		Fingerprint:        r.fingerprint,
 		ALPN:               []string{"h2", "http/1.1"},
 		InsecureSkipVerify: true,
 		PaddingLen:         customtls.MinPaddingSize, // 256 bytes for REALITY + random
 	}
 
-	// Build ClientHello with padding using Chrome fingerprint
-	clientHello, err := customtls.BuildClientHelloBytes(config, customtls.FingerprintChrome124)
+	clientHello, err := customtls.BuildClientHelloBytes(config, fp)
 	if err != nil {
 		log.Error("REALITY-BUILD: uTLS build failed: %v", err)
 		return nil, fmt.Errorf("uTLS clientHello build failed: %w", err)

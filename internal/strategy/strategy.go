@@ -1139,6 +1139,12 @@ type DefaultManagerConfig struct {
 	// REALITY configuration
 	REALITYEnabled bool // Enable REALITY protocol (99.5% success rate)
 
+	// TLSFingerprint names the uTLS browser profile used for ClientHellos
+	// (see internal/tls.FingerprintMap). Empty selects the default profile.
+	// It is fixed for the process lifetime on purpose — rotating fingerprints
+	// after a censor throttles a SNI escalates the penalty.
+	TLSFingerprint string
+
 	// WebSocket Padded configuration
 	WebSocketPaddedEnabled bool // Enable WebSocket with Salamander padding
 
@@ -1284,7 +1290,9 @@ func registerSeqovlStrategy(m *Manager, cfg DefaultManagerConfig, hasServer, has
 	if !hasServer || !hasSecret {
 		return
 	}
-	m.Register(NewSeqovlStrategy(m, cfg.Secret, cfg.SeqovlPacketEnabled))
+	seqovl := NewSeqovlStrategy(m, cfg.Secret, cfg.SeqovlPacketEnabled)
+	seqovl.SetFingerprint(cfg.TLSFingerprint)
+	m.Register(seqovl)
 }
 
 // registerICMPStrategy registers the ICMP tunnel backup strategy.
@@ -1360,6 +1368,7 @@ func registerTLSStrategies(m *Manager, cfg DefaultManagerConfig, hasServer, hasS
 	}
 
 	reality := NewREALITYStrategy(m, cfg.Secret)
+	reality.SetFingerprint(cfg.TLSFingerprint)
 	if cfg.PQEnabled && cfg.PQServerKemPubB64 != "" {
 		kemPub, err := base64.StdEncoding.DecodeString(cfg.PQServerKemPubB64)
 		if err == nil && len(kemPub) > 0 {

@@ -144,6 +144,12 @@ func NewSeqovlStrategy(manager *Manager, secret []byte, packetEnabled bool) *Seq
 	}
 }
 
+// SetFingerprint forwards the configured uTLS profile to the REALITY handshake
+// seqovl rides on, so both strategies present the same ClientHello. Two
+// strategies from one client showing different fingerprints to the same donor
+// SNI would be a signal in itself.
+func (s *SeqovlStrategy) SetFingerprint(name string) { s.reality.SetFingerprint(name) }
+
 // Name returns the human-readable strategy name.
 func (s *SeqovlStrategy) Name() string { return "Seqovl" }
 
