@@ -257,6 +257,166 @@ func TestDoHandshakeEndToEndDualStack(t *testing.T) {
 	}
 }
 
+// dripConn serves data one byte per Read, the worst case a TCP segment / TLS
+// record / stego frame boundary can produce. Reads past the end block until
+// the test's deadline, exactly like a server that has stopped talking.
+func dripConn(t *testing.T, payload []byte) net.Conn {
+	t.Helper()
+	cli, srv := net.Pipe()
+	t.Cleanup(func() { cli.Close(); srv.Close() })
+	go func() {
+		for i := range payload {
+			if _, err := srv.Write(payload[i : i+1]); err != nil {
+				return
+			}
+		}
+	}()
+	return cli
+}
+
+// TestReadHandshakeResponseFragmented is the regression for a response split
+// across reads. The old code took whatever the first Read returned: a
+// dual-stack response split at the 9-byte boundary lost its flags byte, the
+// v6 block stayed in the stream, and the packet loop that follows parsed it as
+// [len:4][pkt:N] — a dead session. A legacy server must still not be waited on.
+func TestReadHandshakeResponseFragmented(t *testing.T) {
+	block, server6, client6 := dualBlock()
+	base := []byte{0x00, 10, 8, 0, 1, 10, 8, 0, 2}
+
+	t.Run("legacy 9-byte response, dual requested", func(t *testing.T) {
+		// Nothing follows the 9 bytes: the read must complete on the grace
+		// rather than block until the connect deadline.
+		conn := dripConn(t, base)
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		start := time.Now()
+		resp, n, err := readHandshakeResponse(conn, true)
+		if err != nil {
+			t.Fatalf("readHandshakeResponse: %v", err)
+		}
+		if n != 9 {
+			t.Fatalf("n = %d, want 9", n)
+		}
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Errorf("legacy response took %v, want a bounded peek", elapsed)
+		}
+		if caps, ok := parseServerCapabilities(resp, n); ok || caps.DualStackEnabled {
+			t.Errorf("legacy response must yield no caps: %+v ok=%v", caps, ok)
+		}
+	})
+
+	t.Run("flags-only dual-stack response", func(t *testing.T) {
+		full := append(append(append([]byte{}, base...), tunFlagMTUProbe|tunFlagDualStack), block...)
+		conn := dripConn(t, full)
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		resp, n, err := readHandshakeResponse(conn, true)
+		if err != nil {
+			t.Fatalf("readHandshakeResponse: %v", err)
+		}
+		if n != len(full) {
+			t.Fatalf("n = %d, want %d", n, len(full))
+		}
+		caps, ok := parseServerCapabilities(resp, n)
+		if !ok || !caps.DualStackEnabled {
+			t.Fatalf("dual-stack not detected: %+v ok=%v", caps, ok)
+		}
+		if !caps.ServerIP6.Equal(server6) || !caps.ClientIP6.Equal(client6) {
+			t.Errorf("v6 addrs = %s/%s, want %s/%s", caps.ServerIP6, caps.ClientIP6, server6, client6)
+		}
+	})
+
+	t.Run("port-hop v2 base with seed, then the dual block", func(t *testing.T) {
+		// The seed length lives at resp[19], so the base has to be completed
+		// before the block's offset is even knowable.
+		mid := []byte{0xb7, 0x98, 0xb7, 0xfc, 0, 0, 0, 60, 0x01, 0x04, 's', 'e', 'e', 'd'}
+		full := append(append(append(append([]byte{}, base...),
+			tunFlagPortHopping|tunFlagMTUProbe|tunFlagDualStack), mid...), block...)
+		conn := dripConn(t, full)
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		resp, n, err := readHandshakeResponse(conn, true)
+		if err != nil {
+			t.Fatalf("readHandshakeResponse: %v", err)
+		}
+		if n != len(full) {
+			t.Fatalf("n = %d, want %d", n, len(full))
+		}
+		caps, ok := parseServerCapabilities(resp, n)
+		if !ok || !caps.DualStackEnabled || !caps.PortHoppingEnabled {
+			t.Fatalf("caps wrong: %+v ok=%v", caps, ok)
+		}
+		if !caps.ServerIP6.Equal(server6) || !caps.ClientIP6.Equal(client6) {
+			t.Errorf("v6 addrs = %s/%s, want %s/%s", caps.ServerIP6, caps.ClientIP6, server6, client6)
+		}
+		if !bytes.Equal(caps.HopSeed, []byte("seed")) {
+			t.Errorf("seed = %q, want %q", caps.HopSeed, "seed")
+		}
+		if caps.PortRangeStart != 47000 || caps.PortRangeEnd != 47100 {
+			t.Errorf("port range = %d-%d, want 47000-47100", caps.PortRangeStart, caps.PortRangeEnd)
+		}
+	})
+
+	t.Run("prefix split below 9 bytes still completes", func(t *testing.T) {
+		conn := dripConn(t, base)
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		_, n, err := readHandshakeResponse(conn, false)
+		if err != nil {
+			t.Fatalf("readHandshakeResponse: %v", err)
+		}
+		if n != 9 {
+			t.Errorf("n = %d, want 9 (the fixed prefix is always waited for)", n)
+		}
+	})
+
+	t.Run("truncated prefix is an error, not a short read", func(t *testing.T) {
+		conn := dripConn(t, base[:5])
+		conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		if _, n, err := readHandshakeResponse(conn, false); err == nil {
+			t.Errorf("expected an error for a 5-byte response, got n=%d", n)
+		}
+	})
+}
+
+// TestReadHandshakeResponseNoPeekWithoutDual pins the compatibility guarantee:
+// a v0x03 client cannot be sent the dual-stack flag, so its read path must not
+// grow an extra round trip. The scripted conn errors on any read past the
+// first one, which is what proves it.
+func TestReadHandshakeResponseNoPeekWithoutDual(t *testing.T) {
+	conn := &scriptedConn{chunks: [][]byte{{0x00, 10, 8, 0, 1, 10, 8, 0, 2}}}
+	_, n, err := readHandshakeResponse(conn, false)
+	if err != nil {
+		t.Fatalf("readHandshakeResponse: %v", err)
+	}
+	if n != 9 {
+		t.Errorf("n = %d, want 9", n)
+	}
+}
+
+// TestResolveServerBypassIP6 covers the address the v6 bypass route is pinned
+// for: only a literal IPv6 (with or without a port) qualifies, and an IPv4
+// server address must not produce one — the v4 bypass already covers it.
+func TestResolveServerBypassIP6(t *testing.T) {
+	for _, tc := range []struct {
+		addr string
+		want string
+	}{
+		{"", ""},
+		{"[2001:db8::1]:995", "2001:db8::1"},
+		{"2001:db8::1", "2001:db8::1"},
+		{"1.2.3.4:995", ""},
+		{"1.2.3.4", ""},
+	} {
+		got := resolveServerBypassIP6(tc.addr)
+		if tc.want == "" {
+			if got != nil {
+				t.Errorf("resolveServerBypassIP6(%q) = %s, want nil", tc.addr, got)
+			}
+			continue
+		}
+		if got == nil || !got.Equal(net.ParseIP(tc.want)) {
+			t.Errorf("resolveServerBypassIP6(%q) = %s, want %s", tc.addr, got, tc.want)
+		}
+	}
+}
+
 // TestHandshakeRequestVersionByte checks the request bytes written by
 // doHandshake: still 8 bytes, only the version byte changes.
 func TestHandshakeRequestVersionByte(t *testing.T) {

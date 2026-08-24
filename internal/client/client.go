@@ -490,7 +490,7 @@ func runControlSocketMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Si
 		// ReconnectFn - called on network change (WiFi→LTE, cell handoff)
 		// Resets circuit breakers and uses optimized fast reconnect
 		// Must send TUN handshake with current IP so server knows this is a TUN session
-		ReconnectFn: func(ctx context.Context, currentIP net.IP, mtu int) (net.Conn, net.IP, net.IP, error) {
+		ReconnectFn: func(ctx context.Context, currentIP net.IP, mtu int) (tun.ReconnectResult, error) {
 			log.Info("Network change reconnect triggered (current IP: %s)", currentIP)
 
 			// Reset all circuit breakers and confidences - old network state is invalid
@@ -499,7 +499,7 @@ func runControlSocketMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Si
 			// Use optimized reconnect with shorter timeouts
 			conn, strat, err := mgr.ConnectForReconnect(ctx, cfg.ServerAddr)
 			if err != nil {
-				return nil, nil, nil, err
+				return tun.ReconnectResult{}, err
 			}
 
 			log.Info("Network change reconnect successful via %s, sending TUN handshake", strat.Name())
@@ -512,15 +512,21 @@ func runControlSocketMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Si
 
 			// Send TUN mode handshake with our current IP
 			// Server will recognize us and restore the session
-			serverIP, assignedIP, err := sendReconnectHandshake(conn, currentIP, mtu, dualStack)
+			serverIP, assignedIP, serverIP6, assignedIP6, err := sendReconnectHandshake(conn, currentIP, mtu, dualStack)
 			if err != nil {
 				conn.Close()
-				return nil, nil, nil, err
+				return tun.ReconnectResult{}, err
 			}
 
 			log.Info("Reconnect handshake complete (server: %s, assigned: %s)", serverIP, assignedIP)
 
-			return conn, serverIP, assignedIP, nil
+			return tun.ReconnectResult{
+				Conn:        conn,
+				ServerIP:    serverIP,
+				AssignedIP:  assignedIP,
+				ServerIP6:   serverIP6,
+				AssignedIP6: assignedIP6,
+			}, nil
 		},
 
 		// Connect function - connects to server, returns assigned IP
@@ -607,7 +613,12 @@ func parseTunIPv6Policy(flagValue string) (bool, error) {
 // session. dualStack selects the version byte: v0x04 when -tun-ipv6 dual is
 // active (re-negotiating IPv6 on reconnect too), otherwise the historical
 // v0x03.
-func sendReconnectHandshake(conn net.Conn, currentIP net.IP, mtu int, dualStack bool) (serverIP, assignedIP net.IP, err error) {
+//
+// serverIP6/assignedIP6 carry the re-negotiated dual-stack pair and are both
+// nil when the exit did not offer IPv6 on this reconnect. The caller has to
+// propagate them: the exit derives the client v6 from the v4 lease, so a new
+// v4 silently implies a new v6, and a host-owned interface cannot recompute it.
+func sendReconnectHandshake(conn net.Conn, currentIP net.IP, mtu int, dualStack bool) (serverIP, assignedIP, serverIP6, assignedIP6 net.IP, err error) {
 	version := byte(0x03) // Version 3: full port hopping config + auto-MTU probe
 	if dualStack {
 		version = 0x04 // Version 4: + dual-stack IPv6 negotiation
@@ -619,7 +630,7 @@ func sendReconnectHandshake(conn net.Conn, currentIP net.IP, mtu int, dualStack 
 	handshake[7] = version
 
 	if _, err := conn.Write(handshake); err != nil {
-		return nil, nil, fmt.Errorf("handshake write failed: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("handshake write failed: %w", err)
 	}
 
 	// Read response (up to 64 bytes for extended v2 with port hopping config)
@@ -638,14 +649,14 @@ func sendReconnectHandshake(conn net.Conn, currentIP net.IP, mtu int, dualStack 
 		resp = buf[:n]
 	}
 	if err != nil {
-		return nil, nil, fmt.Errorf("handshake read failed: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("handshake read failed: %w", err)
 	}
 	if n < 9 {
-		return nil, nil, fmt.Errorf("handshake response too short: %d bytes", n)
+		return nil, nil, nil, nil, fmt.Errorf("handshake response too short: %d bytes", n)
 	}
 
 	if resp[0] != 0x00 {
-		return nil, nil, fmt.Errorf("server rejected reconnect: status=%d", resp[0])
+		return nil, nil, nil, nil, fmt.Errorf("server rejected reconnect: status=%d", resp[0])
 	}
 
 	serverIP = net.IP(resp[1:5])
@@ -653,13 +664,14 @@ func sendReconnectHandshake(conn net.Conn, currentIP net.IP, mtu int, dualStack 
 
 	if dualStack {
 		if caps, ok := tun.ParseTUNHandshakeCapabilities(resp[:n]); ok && caps.DualStackEnabled {
-			log.Info("Reconnect re-negotiated dual-stack: client=%s server=%s", caps.ClientIP6, caps.ServerIP6)
+			serverIP6, assignedIP6 = caps.ServerIP6, caps.ClientIP6
+			log.Info("Reconnect re-negotiated dual-stack: client=%s server=%s", assignedIP6, serverIP6)
 		} else {
 			log.Warn("Dual-stack requested but the exit did not negotiate IPv6 on reconnect; continuing IPv4-only")
 		}
 	}
 
-	return serverIP, assignedIP, nil
+	return serverIP, assignedIP, serverIP6, assignedIP6, nil
 }
 
 func runTUNMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) error {
@@ -690,17 +702,21 @@ func runTUNMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) erro
 	}
 
 	vpnCfg := tun.VPNConfig{
-		TunName:     cfg.TunName,
-		MTU:         cfg.TunMTU,
-		LocalIP:     localIP,
-		RemoteIP:    net.ParseIP(cfg.TunPeerIP),
-		Routes:      routes,
-		ServerAddr:  cfg.ServerAddr,
-		Manager:     mgr,
-		AutoMTU:     cfg.AutoMTU, // active end-to-end MTU probe
-		DualStack:   policy == tun.IPv6PolicyDual,
-		TunFd:       cfg.TunFd,       // Android VpnService TUN fd
-		ProtectPath: cfg.ProtectPath, // Android socket protection path
+		TunName:  cfg.TunName,
+		MTU:      cfg.TunMTU,
+		LocalIP:  localIP,
+		RemoteIP: net.ParseIP(cfg.TunPeerIP),
+		Routes:   routes,
+		// Both transport addresses: the v6 one is what -prefer-ipv6 makes the
+		// strategy manager dial, and a dual-stack tunnel's ::/1 + 8000::/1
+		// half-defaults would otherwise route that socket into the tunnel.
+		ServerAddr:   cfg.ServerAddr,
+		ServerAddrV6: cfg.ServerAddrV6,
+		Manager:      mgr,
+		AutoMTU:      cfg.AutoMTU, // active end-to-end MTU probe
+		DualStack:    policy == tun.IPv6PolicyDual,
+		TunFd:        cfg.TunFd,       // Android VpnService TUN fd
+		ProtectPath:  cfg.ProtectPath, // Android socket protection path
 	}
 
 	vpnClient, err := tun.NewVPNClient(vpnCfg)

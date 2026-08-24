@@ -1,6 +1,7 @@
 package tun
 
 import (
+	"context"
 	"encoding/json"
 	"net"
 	"strings"
@@ -218,6 +219,80 @@ func TestPerformTUNHandshakeDualStack(t *testing.T) {
 			t.Errorf("declined dual-stack must leave v6 state nil, got %s/%s", cs.assignedIP6, cs.serverIP6)
 		}
 	})
+}
+
+// closeTrackingConn is a scriptedConn that records Close calls, so a test can
+// prove a failed handshake did not leak the server connection.
+type closeTrackingConn struct {
+	scriptedConn
+	closed bool
+}
+
+func (c *closeTrackingConn) Close() error {
+	c.closed = true
+	return nil
+}
+
+// TestHandleConnectShortHandshakeResponse is the regression for the missing
+// n < 9 guard in performTUNHandshake: a truncated response used to index
+// resp[0] / resp[5:9] and panic. handleConnection's recover() swallowed it, so
+// the host saw the control socket close instead of a {"status":"error"}
+// response, and cs.serverConn stayed assigned and open — a leaked connection
+// plus a session left hanging on the exit.
+func TestHandleConnectShortHandshakeResponse(t *testing.T) {
+	for _, dual := range []bool{false, true} {
+		t.Run(map[bool]string{false: "v3", true: "v4"}[dual], func(t *testing.T) {
+			conn := &closeTrackingConn{
+				scriptedConn: scriptedConn{chunks: [][]byte{{0x00, 10, 8, 0}}}, // 4 of 9 bytes
+			}
+			cs := &ControlServer{
+				mtu:    1280,
+				config: &ControlConfig{DualStack: dual},
+			}
+			cs.config.ConnectFn = func(context.Context) (net.IP, net.IP, net.Conn, error) {
+				return net.IPv4(10, 9, 0, 2), net.IPv4(10, 9, 0, 1), conn, nil
+			}
+
+			resp := cs.handleConnect(context.Background())
+
+			if resp.Status != "error" {
+				t.Errorf("status = %q, want %q", resp.Status, "error")
+			}
+			if resp.Error == "" {
+				t.Error("error response must carry a reason")
+			}
+			if cs.serverConn != nil {
+				t.Error("failed handshake must not leave serverConn assigned")
+			}
+			if !conn.closed {
+				t.Error("failed handshake must close the server connection")
+			}
+			if cs.assignedIP != nil || cs.assignedIP6 != nil {
+				t.Errorf("failed handshake must not publish addresses: %s / %s", cs.assignedIP, cs.assignedIP6)
+			}
+		})
+	}
+}
+
+// TestControlResponseIPv6RemovedJSON pins the withdrawal signal: it is present
+// only when a reconnect actually ended a dual-stack session, so the JSON stays
+// byte-identical for every other response and old hosts are unaffected.
+func TestControlResponseIPv6RemovedJSON(t *testing.T) {
+	data, err := json.Marshal(ControlResponse{Status: "connected", IP: "10.8.0.2"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(data), "ipv6_removed") {
+		t.Errorf("unset withdrawal flag must be omitted: %s", data)
+	}
+
+	data, err = json.Marshal(ControlResponse{Status: "connected", IP: "10.8.0.2", IPv6Removed: true})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(data), `"ipv6_removed":true`) {
+		t.Errorf("withdrawal flag missing: %s", data)
+	}
 }
 
 // TestHandshakeFallbackNonDualServer is the client-side regression for a

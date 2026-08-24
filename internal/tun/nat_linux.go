@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 
 	"github.com/google/nftables"
 	"github.com/google/nftables/expr"
@@ -98,6 +99,10 @@ func SetupServerNAT6(pool string, wanOverride string) error {
 	}
 	log.Info("NAT66: using WAN interface %s for pool %s", wan, pool)
 
+	// Forwarding=1 makes the kernel stop honouring Router Advertisements
+	// unless accept_ra=2, so this has to run after the uplink is known.
+	ensureIPv6AcceptRA(wan)
+
 	_, ipnet, err := net.ParseCIDR(pool)
 	if err != nil {
 		return fmt.Errorf("invalid pool %q: %w", pool, err)
@@ -124,6 +129,45 @@ func enableIPForward() error {
 // sysctl, replacing the `sysctl -w net.ipv6.conf.all.forwarding=1` shell-out.
 func enableIPv6Forward() error {
 	return os.WriteFile("/proc/sys/net/ipv6/conf/all/forwarding", []byte("1\n"), 0644)
+}
+
+// ensureIPv6AcceptRA keeps an RA-learned IPv6 uplink alive once forwarding is
+// on. With net.ipv6.conf.all.forwarding=1 the kernel treats the box as a
+// router and ignores incoming Router Advertisements unless the interface has
+// accept_ra=2. On an exit whose IPv6 default route came from an RA — exactly
+// the setup warnIfNoGlobalIPv6Uplink probes for — that route silently expires
+// at the end of its RA lifetime and every client's IPv6 goes into a blackhole
+// while IPv4 keeps working.
+//
+// This writes host state that lives outside the VPN's own tables (the uplink
+// NIC's sysctl), so it is deliberately narrow: only the detected WAN
+// interface, only the 1 -> 2 transition (0 means RAs are off by policy and
+// forwarding changes nothing), and a warning rather than a failure when it
+// cannot be applied. Not reverted on shutdown: accept_ra=2 is harmless without
+// forwarding, and restoring 1 mid-lifetime would reintroduce the expiry.
+func ensureIPv6AcceptRA(iface string) {
+	ensureIPv6AcceptRAAt(fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/accept_ra", iface), iface)
+}
+
+// ensureIPv6AcceptRAAt is ensureIPv6AcceptRA with the sysctl path injected so
+// it can be exercised without /proc.
+func ensureIPv6AcceptRAAt(path, iface string) {
+	cur, err := os.ReadFile(path)
+	if err != nil {
+		log.Warn("NAT66: cannot read %s: %v (an RA-learned IPv6 default route may expire under forwarding=1)", path, err)
+		return
+	}
+	switch strings.TrimSpace(string(cur)) {
+	case "2":
+		return // already "accept RAs even as a router"
+	case "0":
+		return // RAs disabled by policy (static addressing); nothing to preserve
+	}
+	if err := os.WriteFile(path, []byte("2\n"), 0644); err != nil {
+		log.Warn("NAT66: %s is 1 with forwarding enabled, so the RA-learned IPv6 default route will expire; could not set it to 2: %v", path, err)
+		return
+	}
+	log.Info("NAT66: set net.ipv6.conf.%s.accept_ra=2 (host sysctl) so the RA-learned IPv6 default route survives forwarding=1", iface)
 }
 
 // installNAT6Rules is the ip6-family twin of installNATRules: a dedicated

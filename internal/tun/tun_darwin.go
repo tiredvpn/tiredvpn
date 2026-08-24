@@ -90,6 +90,14 @@ func (t *TUNDevice) SetDualStack(dual bool) {
 // The split default outranks RA-learned ::/0 on prefix length without
 // touching the host's real default route. Mirrors the v4
 // `ifconfig inet local remote` + `route add -net` pattern in Configure.
+//
+// Idempotent: the utun outlives a reconnect, so the routes are usually
+// already installed and `route add` fails with EEXIST ("File exists"). That
+// used to surface as an EnableDualStack error, whose caller responds with
+// DisableIPv6 — every reconnect tore down a perfectly good IPv6 and the next
+// one brought it back. `route change` refreshes an existing route in place,
+// with no window in which the route is missing (the v4 path solves the same
+// problem by ignoring route errors outright, and Linux by using RouteReplace).
 func (t *TUNDevice) EnableDualStack(clientIP6, serverIP6 net.IP) error {
 	if _, _, _, err := dualStackAddrPlan(clientIP6, serverIP6); err != nil {
 		return err
@@ -98,14 +106,25 @@ func (t *TUNDevice) EnableDualStack(clientIP6, serverIP6 net.IP) error {
 		"prefixlen", "128"); err != nil {
 		return fmt.Errorf("ifconfig inet6: %w", err)
 	}
-	for _, r := range dualStackRouteCIDRs {
-		if err := runRoute("add", "-inet6", r, "-iface", t.name); err != nil {
-			return fmt.Errorf("route add -inet6 %s: %w", r, err)
-		}
-	}
+
+	// Publish the state as soon as the address is on the link and before the
+	// routes go in. Everything below can fail, and the caller's fallback is
+	// DisableIPv6, whose guard is v6Enabled: recording late left a failed
+	// second route install with the address and the first half-default
+	// stranded on the interface.
 	t.localIP6 = clientIP6
 	t.remoteIP6 = serverIP6
 	t.v6Enabled = true
+
+	for _, r := range dualStackRouteCIDRs {
+		if err := runRoute("add", "-inet6", r, "-iface", t.name); err == nil {
+			continue
+		}
+		if err := runRoute("change", "-inet6", r, "-iface", t.name); err != nil {
+			return fmt.Errorf("route add/change -inet6 %s: %w", r, err)
+		}
+	}
+
 	log.Info("utun %s dual-stack enabled: local=%s, peer=%s, routes=%v",
 		t.name, clientIP6, serverIP6, dualStackRouteCIDRs)
 	return nil
@@ -278,6 +297,17 @@ func (t *TUNDevice) SetReadDeadline(deadline time.Time) error {
 // implemented for the utun/scutil path; provided so cross-platform callers
 // (vpn.go) compile.
 func (t *TUNDevice) SetServerBypassIP(net.IP) {}
+
+// SetServerBypassIP6 is a no-op on macOS, for the same reason as
+// SetServerBypassIP. Note the exposure this leaves: with -prefer-ipv6 and a
+// negotiated dual-stack tunnel, the ::/1 + 8000::/1 half-defaults installed by
+// EnableDualStack also cover the client's own IPv6 transport socket, so the
+// CLI/utun path on macOS loops its server traffic into the tunnel. Fixing it
+// needs the scutil/route bypass the v4 side does not have either, so both
+// families stay unimplemented together rather than half-done. The
+// NetworkExtension path is unaffected: the host owns routing there and
+// excludes the tunnel's own socket.
+func (t *TUNDevice) SetServerBypassIP6(net.IP) {}
 
 // EnsureServerBypass is a no-op on macOS; see SetServerBypassIP.
 func (t *TUNDevice) EnsureServerBypass() {}

@@ -73,7 +73,15 @@ type TUNDevice struct {
 	// so delRoutes does not cover it). Guarded by bypassMu: the watcher
 	// goroutine re-pins it while Close may be tearing it down.
 	bypassRoute *netlink.Route
-	bypassMu    sync.Mutex
+	// serverBypassIP6 / bypassRoute6 are the IPv6 twins of the pair above.
+	// They matter only for a dual-stack tunnel: the ::/1 + 8000::/1
+	// half-defaults installed by EnableDualStack cover every IPv6
+	// destination, so a client using the IPv6 transport (-server-v6 /
+	// -prefer-ipv6) would route its own transport socket into the tunnel.
+	// Set via SetServerBypassIP6 before EnableDualStack.
+	serverBypassIP6 net.IP
+	bypassRoute6    *netlink.Route
+	bypassMu        sync.Mutex
 
 	// deferRoutes, when true, makes Configure bring the interface up and assign
 	// the tunnel address but NOT install the route set (notably a 0.0.0.0/0
@@ -100,6 +108,13 @@ type TUNDevice struct {
 	localIP6  net.IP
 	remoteIP6 net.IP
 	routes6   []*net.IPNet
+	// v6PeerForm records which address form actually landed on the link:
+	// true for the point-to-point clientIP6/128 with peer serverIP6/128,
+	// false for the /64 fallback used on kernels that reject a v6 peer.
+	// Every later address operation has to use the same form — netlink
+	// matches on the whole address, so deleting the wrong form fails and
+	// leaves the stale address behind.
+	v6PeerForm bool
 }
 
 // SetDualStack records the client's intent to negotiate IPv6 inside the
@@ -129,12 +144,32 @@ func (t *TUNDevice) SetServerBypassIP(ip net.IP) {
 	t.bypassMu.Unlock()
 }
 
+// SetServerBypassIP6 records the VPN server's public IPv6 so that, once the
+// dual-stack half-default routes are installed, traffic to the server keeps
+// leaving via the physical interface instead of looping through the tunnel.
+// Linux only; on Android the server socket is protected via VpnService.protect().
+func (t *TUNDevice) SetServerBypassIP6(ip net.IP) {
+	if ip != nil && ip.To4() != nil {
+		return // not an IPv6 address; the v4 bypass covers it
+	}
+	t.bypassMu.Lock()
+	t.serverBypassIP6 = ip
+	t.bypassMu.Unlock()
+}
+
 // bypassIP returns the server IP to keep off the tunnel, or nil once the device
 // is torn down. Read under the lock because the watcher goroutine races Close.
 func (t *TUNDevice) bypassIP() net.IP {
 	t.bypassMu.Lock()
 	defer t.bypassMu.Unlock()
 	return t.serverBypassIP
+}
+
+// bypassIP6 is the IPv6 twin of bypassIP.
+func (t *TUNDevice) bypassIP6() net.IP {
+	t.bypassMu.Lock()
+	defer t.bypassMu.Unlock()
+	return t.serverBypassIP6
 }
 
 // mssTableName returns the per-interface nftables table name for MSS clamping.
@@ -233,14 +268,19 @@ func (t *TUNDevice) Close() error {
 	// Remove the server bypass host route (it lives on the physical link, not
 	// the TUN, so delRoutes does not cover it).
 	t.bypassMu.Lock()
-	if t.bypassRoute != nil {
-		if err := netlink.RouteDel(t.bypassRoute); err != nil {
+	for _, r := range []*netlink.Route{t.bypassRoute, t.bypassRoute6} {
+		if r == nil {
+			continue
+		}
+		if err := netlink.RouteDel(r); err != nil {
 			log.Debug("Failed to delete server bypass route: %v", err)
 		}
-		t.bypassRoute = nil
 	}
-	// Stop the watcher from re-pinning a route we just tore down.
+	t.bypassRoute = nil
+	t.bypassRoute6 = nil
+	// Stop the watcher from re-pinning routes we just tore down.
 	t.serverBypassIP = nil
+	t.serverBypassIP6 = nil
 	t.bypassMu.Unlock()
 
 	t.file.SetReadDeadline(time.Now())
@@ -422,22 +462,36 @@ func (t *TUNDevice) EnableDualStack(clientIP6, serverIP6 net.IP) error {
 	// rejects a v6 peer address.
 	if t.v6Enabled && !t.localIP6.Equal(clientIP6) {
 		// Reconnect assigned a new v6 (follows the v4 assignment): drop the
-		// stale address before adding the new one.
-		old := &netlink.Addr{
-			IPNet: &net.IPNet{IP: t.localIP6, Mask: net.CIDRMask(128, 128)},
-			Peer:  &net.IPNet{IP: t.remoteIP6, Mask: net.CIDRMask(128, 128)},
-		}
-		if err := netlink.AddrDel(link, old); err != nil {
-			log.Debug("Failed to delete old v6 addr %s: %v", old, err)
+		// stale address before adding the new one, in whichever form it was
+		// installed as.
+		if err := t.delV6Addr(link, t.localIP6); err != nil {
+			log.Debug("Failed to delete old v6 addr %s on %s: %v", t.localIP6, t.name, err)
 		}
 	}
-	addr := &netlink.Addr{IPNet: p2pLocal, Peer: p2pPeer}
-	if err := netlink.AddrReplace(link, addr); err != nil {
+	peerForm := true
+	if err := netlink.AddrReplace(link, &netlink.Addr{IPNet: p2pLocal, Peer: p2pPeer}); err != nil {
 		if err2 := netlink.AddrReplace(link, &netlink.Addr{IPNet: fallback}); err2 != nil {
 			return fmt.Errorf("failed to set IPv6 address: %w", err)
 		}
+		peerForm = false
 		log.Info("TUN device %s: v6 peer address unsupported, using %s", t.name, fallback)
 	}
+
+	// Publish the state as soon as the address is on the link and before the
+	// routes go in: everything below can fail, and the caller's fallback is
+	// DisableIPv6, whose guard is v6Enabled. Recording late used to make a
+	// failed route install leave the address (and possibly one half-default)
+	// stranded on the interface.
+	t.localIP6 = p2pLocal.IP
+	t.remoteIP6 = p2pPeer.IP
+	t.v6PeerForm = peerForm
+	t.routes6 = routes6
+	t.v6Enabled = true
+
+	// The tunnel's own IPv6 transport socket must keep leaving through the
+	// physical link. Pinned before the half-defaults below, which otherwise
+	// swallow it on the very next packet.
+	t.addServerBypass6()
 
 	// Routes: installed together with the address, idempotently. Tracking
 	// them in addedRoutes makes Close remove exactly these.
@@ -459,14 +513,58 @@ func (t *TUNDevice) EnableDualStack(clientIP6, serverIP6 net.IP) error {
 		}
 	}
 
-	t.localIP6 = p2pLocal.IP
-	t.remoteIP6 = p2pPeer.IP
-	t.routes6 = routes6
-	t.v6Enabled = true
-
 	log.Info("TUN device %s dual-stack enabled: local=%s, peer=%s, routes=%v",
 		t.name, clientIP6, serverIP6, dualStackRouteCIDRs)
 	return nil
+}
+
+// v6AddrForms returns the link address for ip in the form currently installed
+// (v6PeerForm) first and the other form second. Address operations retry
+// against the second form because netlink matches the whole address: a
+// mismatched delete does not fail loudly, it just leaves the stale address on
+// the interface, and the replacement add then collides with it.
+func (t *TUNDevice) v6AddrForms(ip net.IP) []*netlink.Addr {
+	peer := &netlink.Addr{
+		IPNet: &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)},
+		Peer:  &net.IPNet{IP: t.remoteIP6, Mask: net.CIDRMask(128, 128)},
+	}
+	fallback := &netlink.Addr{IPNet: &net.IPNet{IP: ip, Mask: net.CIDRMask(64, 128)}}
+	if t.v6PeerForm {
+		return []*netlink.Addr{peer, fallback}
+	}
+	return []*netlink.Addr{fallback, peer}
+}
+
+// delV6Addr removes ip from the link, trying the recorded form first.
+func (t *TUNDevice) delV6Addr(link netlink.Link, ip net.IP) error {
+	if ip == nil {
+		return nil
+	}
+	var lastErr error
+	for _, addr := range t.v6AddrForms(ip) {
+		err := netlink.AddrDel(link, addr)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+	}
+	return lastErr
+}
+
+// setV6Addr assigns ip to the link, trying the recorded form first and the
+// other one as a fallback. Returns the form that stuck so the caller can
+// update v6PeerForm.
+func (t *TUNDevice) setV6Addr(link netlink.Link, ip net.IP) (peerForm bool, err error) {
+	forms := t.v6AddrForms(ip)
+	for i, addr := range forms {
+		if err = netlink.AddrReplace(link, addr); err == nil {
+			if i == 0 {
+				return t.v6PeerForm, nil
+			}
+			return !t.v6PeerForm, nil
+		}
+	}
+	return t.v6PeerForm, err
 }
 
 // DisableIPv6 pins the interface back to the exact v4-only state: any v6
@@ -487,12 +585,8 @@ func (t *TUNDevice) DisableIPv6() {
 				}
 				t.untrackRoute(dst)
 			}
-			old := &netlink.Addr{
-				IPNet: &net.IPNet{IP: t.localIP6, Mask: net.CIDRMask(128, 128)},
-				Peer:  &net.IPNet{IP: t.remoteIP6, Mask: net.CIDRMask(128, 128)},
-			}
-			if err := netlink.AddrDel(link, old); err != nil {
-				log.Debug("Failed to delete v6 addr %s on %s: %v", old, t.name, err)
+			if err := t.delV6Addr(link, t.localIP6); err != nil {
+				log.Debug("Failed to delete v6 addr %s on %s: %v", t.localIP6, t.name, err)
 			}
 		}
 		if err := removeMSSClampingV6(t.name); err != nil {
@@ -502,6 +596,7 @@ func (t *TUNDevice) DisableIPv6() {
 		t.localIP6 = nil
 		t.remoteIP6 = nil
 		t.routes6 = nil
+		t.v6PeerForm = false
 	}
 
 	sysctlPath := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/disable_ipv6", t.name)
@@ -596,8 +691,18 @@ func (t *TUNDevice) physicalRouteTo(ip net.IP) (*netlink.Route, error) {
 // bypass that was wiped out from under us (e.g. a Wi-Fi reassociation takes the
 // link down and the kernel drops every route attached to it). No-op if no
 // server IP was set.
-func (t *TUNDevice) addServerBypass() {
-	ip := t.bypassIP()
+func (t *TUNDevice) addServerBypass() { t.pinBypass(t.bypassIP()) }
+
+// addServerBypass6 pins the same host route for the IPv6 transport address.
+// Called by EnableDualStack before the ::/1 + 8000::/1 half-defaults land, so
+// a client dialling its server over IPv6 never routes that socket into its own
+// tunnel. No-op when no v6 server address was configured.
+func (t *TUNDevice) addServerBypass6() { t.pinBypass(t.bypassIP6()) }
+
+// pinBypass installs the /32 (v4) or /128 (v6) host route to ip through the
+// current physical gateway and records it for teardown. Shared by the v4 and
+// v6 paths; physicalRouteTo already selects the right address family.
+func (t *TUNDevice) pinBypass(ip net.IP) {
 	if ip == nil {
 		return
 	}
@@ -606,8 +711,9 @@ func (t *TUNDevice) addServerBypass() {
 		log.Warn("Server bypass: cannot resolve physical route to %s: %v", ip, err)
 		return
 	}
+	v6 := ip.To4() == nil
 	bits := 32
-	if ip.To4() == nil {
+	if v6 {
 		bits = 128
 	}
 	bypass := &netlink.Route{
@@ -622,9 +728,13 @@ func (t *TUNDevice) addServerBypass() {
 	}
 	t.bypassMu.Lock()
 	// Close raced us and tore the device down: undo the pin instead of leaking it.
-	closed := t.serverBypassIP == nil
+	closed := (v6 && t.serverBypassIP6 == nil) || (!v6 && t.serverBypassIP == nil)
 	if !closed {
-		t.bypassRoute = bypass
+		if v6 {
+			t.bypassRoute6 = bypass
+		} else {
+			t.bypassRoute = bypass
+		}
 	}
 	t.bypassMu.Unlock()
 	if closed {
@@ -636,9 +746,13 @@ func (t *TUNDevice) addServerBypass() {
 
 // EnsureServerBypass re-pins the server bypass if traffic to the server would
 // currently go through the tunnel. Cheap enough to poll: the healthy path costs
-// one RouteGet and touches nothing.
+// one RouteGet per configured family and touches nothing.
 func (t *TUNDevice) EnsureServerBypass() {
-	ip := t.bypassIP()
+	t.ensureBypass(t.bypassIP())
+	t.ensureBypass(t.bypassIP6())
+}
+
+func (t *TUNDevice) ensureBypass(ip net.IP) {
 	if ip == nil {
 		return
 	}
@@ -655,7 +769,7 @@ func (t *TUNDevice) EnsureServerBypass() {
 	} else {
 		log.Warn("Server bypass: traffic to %s now routes via %s, re-pinning", ip, t.name)
 	}
-	t.addServerBypass()
+	t.pinBypass(ip)
 }
 
 // WatchServerBypass polls the bypass route and restores it when the host drops
@@ -665,7 +779,7 @@ func (t *TUNDevice) EnsureServerBypass() {
 // full-tunnel routes swallow the traffic to the server and every reconnect
 // attempt dials into the dead tunnel. Returns when stop is closed.
 func (t *TUNDevice) WatchServerBypass(stop <-chan struct{}) {
-	if t.bypassIP() == nil {
+	if t.bypassIP() == nil && t.bypassIP6() == nil {
 		return
 	}
 	ticker := time.NewTicker(bypassWatchInterval)
@@ -967,6 +1081,12 @@ func (t *TUNDevice) UpdateLocalIP(newLocalIP net.IP) error {
 // The exit assigns client v6 as pool-prefix | client-v4-uint32, so the new v6
 // is derived from the previous v6 address and the new v4 (deriveClientIP6).
 // No-op when dual-stack is not live or the derived address is unchanged.
+//
+// Both the delete and the add go through the recorded address form
+// (v6PeerForm) with the other form as a retry: on a kernel that rejected the
+// v6 peer, EnableDualStack installed the /64 fallback, and a peer-form delete
+// silently matches nothing — the stale address then survives the lease change
+// and the fresh add collides with it.
 func (t *TUNDevice) updateLocalIP6(link netlink.Link) {
 	if !t.v6Enabled {
 		return
@@ -975,21 +1095,20 @@ func (t *TUNDevice) updateLocalIP6(link netlink.Link) {
 	if newIP6 == nil || newIP6.Equal(t.localIP6) {
 		return
 	}
-	oldAddr := &netlink.Addr{
-		IPNet: &net.IPNet{IP: t.localIP6, Mask: net.CIDRMask(128, 128)},
-		Peer:  &net.IPNet{IP: t.remoteIP6, Mask: net.CIDRMask(128, 128)},
+	if err := t.delV6Addr(link, t.localIP6); err != nil {
+		log.Debug("Failed to delete old v6 addr %s: %v", t.localIP6, err)
 	}
-	if err := netlink.AddrDel(link, oldAddr); err != nil {
-		log.Debug("Failed to delete old v6 addr %s: %v", oldAddr, err)
-	}
-	newAddr := &netlink.Addr{
-		IPNet: &net.IPNet{IP: newIP6, Mask: net.CIDRMask(128, 128)},
-		Peer:  &net.IPNet{IP: t.remoteIP6, Mask: net.CIDRMask(128, 128)},
-	}
-	if err := netlink.AddrAdd(link, newAddr); err != nil {
-		log.Warn("Failed to update v6 local IP to %s: %v", newIP6, err)
+	peerForm, err := t.setV6Addr(link, newIP6)
+	if err != nil {
+		// Neither address form was accepted. The v6 half-defaults still point
+		// into the TUN, so leaving them up black-holes every IPv6 flow behind
+		// an interface with no usable address. Tear the v6 side down and keep
+		// the session IPv4-only instead.
+		log.Warn("Failed to update v6 local IP to %s: %v, disabling IPv6 on %s", newIP6, err, t.name)
+		t.DisableIPv6()
 		return
 	}
+	t.v6PeerForm = peerForm
 	t.localIP6 = newIP6
 	log.Info("TUN device %s local IPv6 updated to %s", t.name, newIP6)
 }

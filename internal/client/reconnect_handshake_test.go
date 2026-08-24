@@ -50,7 +50,7 @@ func TestSendReconnectHandshake(t *testing.T) {
 		verCh := make(chan byte, 1)
 		go func() { verCh <- scriptServer(t, srv, baseResp) }()
 
-		serverIP, assignedIP, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, false)
+		serverIP, assignedIP, serverIP6, assignedIP6, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, false)
 		if err != nil {
 			t.Fatalf("sendReconnectHandshake: %v", err)
 		}
@@ -59,6 +59,9 @@ func TestSendReconnectHandshake(t *testing.T) {
 		}
 		if !serverIP.Equal(net.IPv4(10, 8, 0, 1)) || !assignedIP.Equal(net.IPv4(10, 8, 0, 2)) {
 			t.Errorf("addrs = %s/%s, want 10.8.0.1/10.8.0.2", serverIP, assignedIP)
+		}
+		if serverIP6 != nil || assignedIP6 != nil {
+			t.Errorf("v4-only reconnect must report no v6, got %s/%s", serverIP6, assignedIP6)
 		}
 	})
 
@@ -70,7 +73,7 @@ func TestSendReconnectHandshake(t *testing.T) {
 		verCh := make(chan byte, 1)
 		go func() { verCh <- scriptServer(t, srv, flagsResp, dualBlock[:16], dualBlock[16:]) }()
 
-		serverIP, assignedIP, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, true)
+		serverIP, assignedIP, serverIP6, assignedIP6, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, true)
 		if err != nil {
 			t.Fatalf("sendReconnectHandshake: %v", err)
 		}
@@ -79,6 +82,12 @@ func TestSendReconnectHandshake(t *testing.T) {
 		}
 		if !serverIP.Equal(net.IPv4(10, 8, 0, 1)) || !assignedIP.Equal(net.IPv4(10, 8, 0, 2)) {
 			t.Errorf("addrs = %s/%s, want 10.8.0.1/10.8.0.2", serverIP, assignedIP)
+		}
+		// The renegotiated v6 pair has to reach the caller: a host-owned
+		// interface cannot recompute it, and the exit derives the client v6
+		// from the (possibly new) v4 lease.
+		if !serverIP6.Equal(net.IP(server6)) || !assignedIP6.Equal(net.IP(client6)) {
+			t.Errorf("v6 pair = %s/%s, want %s/%s", serverIP6, assignedIP6, net.IP(server6), net.IP(client6))
 		}
 		// The dual path must have consumed the whole response; nothing may be
 		// left for the relay to misparse. A write immediately after the
@@ -99,7 +108,7 @@ func TestSendReconnectHandshake(t *testing.T) {
 		verCh := make(chan byte, 1)
 		go func() { verCh <- scriptServer(t, srv, baseResp) }()
 
-		_, assignedIP, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, true)
+		_, assignedIP, serverIP6, assignedIP6, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, true)
 		if err != nil {
 			t.Fatalf("sendReconnectHandshake: %v", err)
 		}
@@ -108,6 +117,9 @@ func TestSendReconnectHandshake(t *testing.T) {
 		}
 		if !assignedIP.Equal(net.IPv4(10, 8, 0, 2)) {
 			t.Errorf("assigned = %s, want 10.8.0.2", assignedIP)
+		}
+		if serverIP6 != nil || assignedIP6 != nil {
+			t.Errorf("declined dual-stack must report no v6, got %s/%s", serverIP6, assignedIP6)
 		}
 	})
 
@@ -118,8 +130,49 @@ func TestSendReconnectHandshake(t *testing.T) {
 
 		go func() { scriptServer(t, srv, []byte{0x01, 0, 0, 0, 0, 0, 0, 0, 0}) }()
 
-		if _, _, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, false); err == nil {
+		if _, _, _, _, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, false); err == nil {
 			t.Fatal("expected error on status=0x01, got nil")
+		}
+	})
+
+	// A dual-stack response split at exactly the 9-byte legacy boundary used
+	// to end the read there: the flags byte was never seen, the v6 block was
+	// left in the stream and the relay that follows parsed it as [len][pkt].
+	t.Run("dual on, response split at the 9-byte boundary", func(t *testing.T) {
+		cli, srv := net.Pipe()
+		defer cli.Close()
+		defer srv.Close()
+
+		full := append(append([]byte{}, flagsResp...), dualBlock...)
+		go func() {
+			hs := make([]byte, 8)
+			if _, err := io.ReadFull(srv, hs); err != nil {
+				return
+			}
+			// One byte at a time: the worst case a TCP/TLS/stego transport can
+			// hand the reader.
+			for i := range full {
+				if _, err := srv.Write(full[i : i+1]); err != nil {
+					return
+				}
+			}
+		}()
+
+		_, assignedIP, serverIP6, assignedIP6, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, true)
+		if err != nil {
+			t.Fatalf("sendReconnectHandshake: %v", err)
+		}
+		if !assignedIP.Equal(net.IPv4(10, 8, 0, 2)) {
+			t.Errorf("assigned = %s, want 10.8.0.2", assignedIP)
+		}
+		if !serverIP6.Equal(net.IP(server6)) || !assignedIP6.Equal(net.IP(client6)) {
+			t.Errorf("v6 pair = %s/%s, want %s/%s", serverIP6, assignedIP6, net.IP(server6), net.IP(client6))
+		}
+		if err := cli.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+			t.Fatalf("SetReadDeadline: %v", err)
+		}
+		if _, err := cli.Read(make([]byte, 1)); err == nil {
+			t.Errorf("expected no leftover bytes after handshake, got a read")
 		}
 	})
 }
@@ -135,7 +188,7 @@ func TestControlSocketIPv6PolicyMapping(t *testing.T) {
 		wantDual  bool
 		wantErr   bool
 	}{
-		{"", false, false},   // flag never set: default off
+		{"", false, false},    // flag never set: default off
 		{"off", false, false}, // explicit off
 		{"dual", true, false},
 		{"block", false, true}, // reserved, rejected by the parser

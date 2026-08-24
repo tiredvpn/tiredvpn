@@ -5,6 +5,9 @@ package tun
 
 import (
 	"encoding/binary"
+	"net"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/google/nftables/expr"
@@ -59,4 +62,86 @@ func TestMSSRuleExprsUnchanged(t *testing.T) {
 	if meta, ok := in[0].(*expr.Meta); !ok || meta.Key != expr.MetaKeyIIFNAME {
 		t.Errorf("iif rule first expr = %#v, want Meta IIFNAME", in[0])
 	}
+}
+
+// TestV6AddrForms pins which address form later operations use. Nothing used
+// to record whether EnableDualStack landed the point-to-point peer form or the
+// /64 fallback, and every consumer assumed the peer form: on a kernel that
+// took the fallback, the delete matched nothing, the stale address survived a
+// lease change and the replacement add collided with it.
+func TestV6AddrForms(t *testing.T) {
+	client6 := net.ParseIP("fd00:10:8::a08:2")
+	server6 := net.ParseIP("fd00:10:8::1")
+
+	t.Run("peer form first", func(t *testing.T) {
+		td := &TUNDevice{remoteIP6: server6, v6PeerForm: true}
+		forms := td.v6AddrForms(client6)
+		if len(forms) != 2 {
+			t.Fatalf("got %d forms, want 2", len(forms))
+		}
+		if ones, _ := forms[0].Mask.Size(); ones != 128 || forms[0].Peer == nil {
+			t.Errorf("first form = %v (peer=%v), want /128 with a peer", forms[0].IPNet, forms[0].Peer)
+		}
+		if !forms[0].Peer.IP.Equal(server6) {
+			t.Errorf("peer = %s, want %s", forms[0].Peer.IP, server6)
+		}
+		if ones, _ := forms[1].Mask.Size(); ones != 64 || forms[1].Peer != nil {
+			t.Errorf("fallback form = %v (peer=%v), want /64 with no peer", forms[1].IPNet, forms[1].Peer)
+		}
+	})
+
+	t.Run("fallback form first", func(t *testing.T) {
+		td := &TUNDevice{remoteIP6: server6, v6PeerForm: false}
+		forms := td.v6AddrForms(client6)
+		if ones, _ := forms[0].Mask.Size(); ones != 64 || forms[0].Peer != nil {
+			t.Errorf("first form = %v (peer=%v), want the /64 fallback", forms[0].IPNet, forms[0].Peer)
+		}
+		if ones, _ := forms[1].Mask.Size(); ones != 128 || forms[1].Peer == nil {
+			t.Errorf("second form = %v, want the peer form as retry", forms[1].IPNet)
+		}
+	})
+
+	t.Run("both forms carry the address", func(t *testing.T) {
+		td := &TUNDevice{remoteIP6: server6, v6PeerForm: true}
+		for i, a := range td.v6AddrForms(client6) {
+			if !a.IP.Equal(client6) {
+				t.Errorf("form %d address = %s, want %s", i, a.IP, client6)
+			}
+		}
+	})
+}
+
+// TestEnsureIPv6AcceptRA covers the sysctl nudge that keeps an RA-learned IPv6
+// default route alive once forwarding is on: only 1 is rewritten (0 means RAs
+// are off by policy, 2 is already correct), and an unreadable path is a
+// warning rather than a failure.
+func TestEnsureIPv6AcceptRA(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cur  string
+		want string
+	}{
+		{"raises 1 to 2", "1\n", "2\n"},
+		{"leaves 2 alone", "2\n", "2\n"},
+		{"leaves 0 alone (RAs disabled by policy)", "0\n", "0\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "accept_ra")
+			if err := os.WriteFile(path, []byte(tc.cur), 0644); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+			ensureIPv6AcceptRAAt(path, "eth0")
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read back: %v", err)
+			}
+			if string(got) != tc.want {
+				t.Errorf("accept_ra = %q, want %q", got, tc.want)
+			}
+		})
+	}
+
+	t.Run("missing sysctl does not panic", func(t *testing.T) {
+		ensureIPv6AcceptRAAt(filepath.Join(t.TempDir(), "absent"), "eth0")
+	})
 }
