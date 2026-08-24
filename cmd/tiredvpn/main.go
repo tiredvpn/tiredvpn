@@ -421,6 +421,8 @@ func registerServerFlags(fs *flag.FlagSet, cfg *server.Config) *serverFlagOpts {
 	fs.IntVar(&cfg.REALITYMaxTimeDiff, "reality-max-time-diff", 300, "Client clock skew tolerated by B1 auth, seconds (0 = do not check)")
 	fs.StringVar(&cfg.REALITYMinClientVer, "reality-min-client-ver", "", "Lowest client version B1 accepts, X.Y.Z (empty = do not check)")
 	fs.StringVar(&cfg.REALITYMirrorMode, "reality-mirror", "off", "How much of the handshake to mirror to the real donor: off, adaptive, always. Only off is implemented until B1.5.")
+	fs.StringVar(&cfg.BurstReshape, "burst-reshape", "off", "Split the inner TLS handshake with a nudge/ack exchange so the nDPI burst heuristic stops matching: off, on. MUST match the client setting - a one-sided 'on' corrupts streams.")
+	fs.IntVar(&cfg.BurstReshapePadFlight, "burst-reshape-pad-flight", 0, "Extra bytes added to the server flight for margin (0 = off). Must match the client.")
 	fs.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
 	opts.tunIP = fs.String("tun-ip", "10.8.0.1", "TUN interface IP address for VPN server")
 	fs.StringVar(&cfg.TunName, "tun-name", "tiredvpn0", "TUN interface name")
@@ -598,6 +600,8 @@ func runClient(args []string) {
 	// Seqovl level-A packet overlap (Linux only, requires CAP_NET_ADMIN + OUTPUT NFQUEUE rule)
 	fs.BoolVar(&cfg.SeqovlPacketEnabled, "seqovl-packet", false, "Enable packet-level TCP sequence overlap for seqovl (Linux + CAP_NET_ADMIN; additive to the app-framing decoy)")
 	fs.BoolVar(&cfg.REALITYRequireDataV2, "reality-require-data-v2", false, "Refuse REALITY servers still on the v1 data layer instead of falling back (turn on once every server is upgraded)")
+	fs.StringVar(&cfg.BurstReshape, "burst-reshape", "off", "Split the inner TLS handshake with a nudge/ack exchange so the nDPI burst heuristic stops matching: off, on. MUST match the server setting - a one-sided 'on' corrupts streams.")
+	fs.IntVar(&cfg.BurstReshapePadFlight, "burst-reshape-pad-flight", 0, "Extra bytes the server adds to its flight (0 = off). Must match the server.")
 	registerClientREALITYFlags(fs, cfg)
 
 	// RTT Masking flags

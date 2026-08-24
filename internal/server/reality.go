@@ -407,7 +407,7 @@ func handleREALITYMuxSession(conn net.Conn, srvCtx *serverContext, logger *log.L
 			logger.Debug("REALITY: smux session closed: %v", err)
 			return
 		}
-		go handleRawTunnel(stream, srvCtx, logger, clientID)
+		go handleRawTunnel(strategy.ReshapeServerStream(stream, burstReshapeConfig(srvCtx.cfg)), srvCtx, logger, clientID)
 	}
 }
 
@@ -474,4 +474,3 @@ func sendTLSAlert(conn net.Conn, alertCode byte) {
 	}
 	conn.Write(alert)
 }
-

@@ -258,5 +258,8 @@ func (m *Metrics) Handler() http.HandlerFunc {
 		if m.relayMetrics != nil {
 			m.relayMetrics.ExportPrometheus(w)
 		}
+
+		// Burst reshaping (phase 3). Package-level counters, no instance.
+		writePhase3Metrics(w)
 	}
 }
