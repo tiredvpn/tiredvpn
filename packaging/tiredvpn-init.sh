@@ -19,6 +19,8 @@
 #   --ip-pool CIDR  client IP pool for TUN/full-VPN mode (default 10.8.0.0/24);
 #                   the service brings up ip_forward + NAT for it on start
 #   --proxy-only    disable TUN mode (empty pool, SOCKS proxy only, no NAT)
+#   --cert-cn NAME  common name for the self-signed cert (default localhost);
+#                   never put the product, operator or country in it
 #   --force         regenerate secret and certificate even if they exist
 #   --no-start      configure but do not enable/start the service
 
@@ -39,6 +41,7 @@ START=1
 POOL_ARG=""
 POOL_SET=0
 PROXY_ONLY=0
+CERT_CN_ARG=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -47,10 +50,12 @@ while [ $# -gt 0 ]; do
     --ip-pool) POOL_ARG="$2"; POOL_SET=1; shift 2 ;;
     --ip-pool=*) POOL_ARG="${1#*=}"; POOL_SET=1; shift ;;
     --proxy-only) PROXY_ONLY=1; shift ;;
+    --cert-cn) CERT_CN_ARG="$2"; shift 2 ;;
+    --cert-cn=*) CERT_CN_ARG="${1#*=}"; shift ;;
     --force) FORCE=1; shift ;;
     --no-start) START=0; shift ;;
     -h|--help)
-      sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *) echo "tiredvpn-init: unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -94,6 +99,20 @@ fi
 CERT="${TIREDVPN_CERT:-$CERT}"
 KEY="${TIREDVPN_KEY:-$KEY}"
 
+# Certificate common name: explicit flag > existing env > localhost.
+CERT_CN="${TIREDVPN_CERT_CN:-localhost}"
+if [ -n "$CERT_CN_ARG" ]; then
+  CERT_CN="$CERT_CN_ARG"
+fi
+case "$CERT_CN" in
+  ""|*/*|*=*)
+    err "invalid --cert-cn: ${CERT_CN}"
+    exit 2 ;;
+  *[Tt][Ii][Rr][Ee][Dd]*)
+    err "--cert-cn must not name the product: ${CERT_CN}"
+    exit 2 ;;
+esac
+
 # Resolve the client IP pool for TUN mode.
 #   default        -> 10.8.0.0/24 (TUN on by default; Android needs it)
 #   existing env   -> keep whatever is already in the env file, if non-empty
@@ -118,11 +137,26 @@ if [ -z "$SECRET" ] || [ "$FORCE" -eq 1 ]; then
 fi
 
 # Certificate: keep existing unless --force.
+#
+# The subject must not name the product, the operator or the country: this cert
+# is what an active scanner gets back, and anything recognisable in it links the
+# host to every other host running the same software. The shape below copies the
+# Debian ssl-cert "snakeoil" default (CN only, CA:FALSE, SAN for the same name),
+# which is the most common self-signed cert on the public internet.
+#
+# Override the name with --cert-cn / TIREDVPN_CERT_CN if the host has a domain
+# that makes a more plausible cover.
 if [ ! -f "$CERT" ] || [ ! -f "$KEY" ] || [ "$FORCE" -eq 1 ]; then
-  log "Generating self-signed certificate"
+  log "Generating self-signed certificate (CN=${CERT_CN})"
+  case "$CERT_CN" in
+    localhost) SAN="DNS:localhost,IP:127.0.0.1" ;;
+    *)         SAN="DNS:${CERT_CN}" ;;
+  esac
   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
     -days 3650 -nodes -keyout "$KEY" -out "$CERT" \
-    -subj "/CN=tiredvpn" >/dev/null 2>&1
+    -subj "/CN=${CERT_CN}" \
+    -addext "basicConstraints=critical,CA:FALSE" \
+    -addext "subjectAltName=${SAN}" >/dev/null 2>&1
   chmod 0600 "$KEY"
   chmod 0644 "$CERT"
 fi
@@ -150,6 +184,7 @@ cat > "$ENV_FILE" <<EOF
 TIREDVPN_LISTEN=${LISTEN}
 TIREDVPN_CERT=${CERT}
 TIREDVPN_KEY=${KEY}
+TIREDVPN_CERT_CN=${CERT_CN}
 TIREDVPN_SECRET=${SECRET}
 TIREDVPN_IP_POOL=${POOL}
 EOF
