@@ -504,3 +504,48 @@ func (c *clientReshaper) discard(n int) error {
 	c.mu.Unlock()
 	return nil
 }
+
+// ---------------------------------------------------------------------------
+// blocking the io.Copy fast paths
+// ---------------------------------------------------------------------------
+//
+// Both wrappers embed net.Conn, which promotes whatever ReadFrom and WriteTo
+// the underlying conn has. io.Copy and io.CopyBuffer prefer those over the
+// Read/Write pair, so with the promoted versions in place the relay would hand
+// the two file descriptors to each other and the exchange would never run - the
+// stream keeps working and nothing is reshaped, which is the worst kind of
+// failure because it looks like success.
+//
+// Defining them here shadows the promoted ones and routes the copy back through
+// Read and Write. The generic loop gives up whatever splice or sendfile path the
+// underlying conn had, but that path was already unavailable the moment we
+// wrapped: the exchange has to see the first write in each direction.
+
+func copyThrough(dst io.Writer, src io.Reader) (int64, error) {
+	buf := make([]byte, 32*1024)
+	var total int64
+	for {
+		n, rerr := src.Read(buf)
+		if n > 0 {
+			written, werr := dst.Write(buf[:n])
+			total += int64(written)
+			if werr != nil {
+				return total, werr
+			}
+			if written != n {
+				return total, io.ErrShortWrite
+			}
+		}
+		if rerr != nil {
+			if rerr == io.EOF {
+				return total, nil
+			}
+			return total, rerr
+		}
+	}
+}
+
+func (s *serverReshaper) ReadFrom(r io.Reader) (int64, error) { return copyThrough(s, r) }
+func (s *serverReshaper) WriteTo(w io.Writer) (int64, error)  { return copyThrough(w, s) }
+func (c *clientReshaper) ReadFrom(r io.Reader) (int64, error) { return copyThrough(c, r) }
+func (c *clientReshaper) WriteTo(w io.Writer) (int64, error)  { return copyThrough(w, c) }

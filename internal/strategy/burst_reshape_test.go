@@ -143,8 +143,31 @@ func (c *loggingConn) Write(p []byte) (int, error) {
 
 // newPair returns a server-side and client-side conn over net.Pipe, both logging
 // into the same log. net.Pipe is synchronous and unbuffered, which is what we
-// want: it makes ordering violations show up as deadlocks rather than hiding
-// behind kernel buffers.
+// want here: it makes ordering violations show up as deadlocks rather than
+// hiding behind kernel buffers.
+//
+// # WHAT THESE TESTS CANNOT SEE, BY CONSTRUCTION
+//
+// A net.Pipe carries nothing but what the test writes into it. A real tunnel
+// stream does not start empty: it opens with this tunnel's own control
+// preamble - the client sends a mode byte and a length-prefixed target address,
+// the server answers with a one-byte success ack - and only then is there any
+// application payload. None of that exists here.
+//
+// So every test in this file starts the exchange at a boundary the production
+// code does not have, and any defect that comes from wrapping the wrong side of
+// that boundary is invisible to all of them. That is not hypothetical: the
+// first version of this file passed every test below while the reshaper, wired
+// around the whole stream, mistook the server's one-byte mode read for the
+// client's first application burst and held the success ack behind a nudge.
+// Every connection failed with "server rejected target connection", and nothing
+// here went red.
+//
+// The consequence for anyone extending this file: adding a case here does not
+// extend coverage to where the wrapper is attached, only to what it does once
+// attached. Wiring is verified end to end - a real client against a real server
+// with -burst-reshape=on, see test-logs/reshape-e2e/stand.sh in the research
+// repository - and there is no way to move that check into this file.
 func newPair(l *writeLog) (srv net.Conn, cli net.Conn) {
 	a, b := net.Pipe()
 	return &loggingConn{Conn: a, dir: "s->c", log: l}, &loggingConn{Conn: b, dir: "c->s", log: l}
@@ -642,4 +665,72 @@ func TestNudgeRangeIsTheBestAvailable(t *testing.T) {
 		w, at := worstOver(r[0], r[1])
 		t.Logf("  %3d..%3d -> %.3f (binds at nudge=%d)", r[0], r[1], w, at)
 	}
+}
+
+// TestExchangeSurvivesIoCopy is the test that would have caught the second
+// wiring defect. The relay does not call Read and Write directly - it runs
+// io.CopyBuffer, which prefers a ReaderFrom on the destination or a WriterTo on
+// the source. Both wrappers embed net.Conn, so without the shadowing methods
+// those get promoted from the underlying conn and the copy goes around the
+// exchange entirely: the tunnel works, nothing is reshaped, and no test fails.
+//
+// That is what happened in the first fix of the wiring: streams carried data
+// end to end and the wire showed no nudge at all.
+func TestExchangeSurvivesIoCopy(t *testing.T) {
+	resetBurstReshapeStats()
+	l := &writeLog{}
+	srvRaw, cliRaw := newPair(l)
+	cfg := BurstReshapeConfig{Enabled: true}
+	srv := ReshapeServerStream(srvRaw, cfg)
+	cli := ReshapeClientStream(cliRaw, cfg)
+
+	// The wrappers must not expose the underlying conn's copy fast paths.
+	if _, ok := srv.(io.ReaderFrom); !ok {
+		t.Error("server wrapper must define ReadFrom itself")
+	}
+	if _, ok := cli.(io.WriterTo); !ok {
+		t.Error("client wrapper must define WriteTo itself")
+	}
+
+	reply := bytes.Repeat([]byte{0x33}, 2833)
+	upstream := bytes.NewReader(reply)
+
+	done := make(chan struct{})
+	got := make([]byte, 0, len(reply))
+	go func() {
+		defer close(done)
+		_, _ = cli.Write(bytes.Repeat([]byte{0x16}, 530))
+		buf := make([]byte, 4096)
+		for len(got) < len(reply) {
+			n, err := cli.Read(buf)
+			got = append(got, buf[:n]...)
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	hello := make([]byte, 4096)
+	if _, err := srv.Read(hello); err != nil {
+		t.Fatalf("server read: %v", err)
+	}
+	go func() {
+		buf := make([]byte, 4096)
+		_, _ = srv.Read(buf) // drains the ack
+	}()
+
+	// This is how the relay actually moves bytes.
+	if _, err := io.Copy(srv, upstream); err != nil {
+		t.Fatalf("io.Copy: %v", err)
+	}
+	<-done
+
+	if !bytes.Equal(got, reply) {
+		t.Fatalf("client got %d bytes, want %d identical", len(got), len(reply))
+	}
+	if st := ReadBurstReshapeStats(); st.ReshapedTotal != 1 {
+		t.Errorf("io.Copy bypassed the exchange: reshaped_total=%d, want 1", st.ReshapedTotal)
+	}
+	srvRaw.Close()
+	cliRaw.Close()
 }
