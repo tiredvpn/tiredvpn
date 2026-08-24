@@ -164,18 +164,13 @@ func EncodeREALITYKey(key [32]byte) string {
 // a JSON config should not turn into a startup failure that reads like a
 // corrupt key.
 func decodeREALITYKey(s string) ([]byte, error) {
-	encodings := []*base64.Encoding{
-		base64.RawURLEncoding,
-		base64.RawStdEncoding,
-		base64.URLEncoding,
-		base64.StdEncoding,
+	// Delegates to the shared implementation so the client, which reads the
+	// public half, accepts exactly the same alphabets.
+	raw, err := customtls.DecodeKeyBase64(s)
+	if err != nil {
+		return nil, errors.New("private key is not valid base64")
 	}
-	for _, enc := range encodings {
-		if raw, err := enc.DecodeString(s); err == nil {
-			return raw, nil
-		}
-	}
-	return nil, errors.New("private key is not valid base64")
+	return raw, nil
 }
 
 // ParseREALITYPrivateKey decodes a base64 private key and derives its public

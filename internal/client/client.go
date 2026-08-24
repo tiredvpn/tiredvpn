@@ -110,10 +110,6 @@ type Config struct {
 	RTTMaskingEnabled bool   // Enable RTT masking
 	RTTProfile        string // RTT profile name
 
-	// REALITYB1ServerKeyB64 is the server's static X25519 public key in base64.
-	// Non-empty enables the B1 transport on the REALITY strategy.
-	REALITYB1ServerKeyB64 string
-
 	// TLSFingerprint names the uTLS browser profile used for ClientHellos.
 	// Empty means the built-in default (see internal/tls.DefaultFingerprintName).
 	TLSFingerprint string
@@ -268,30 +264,30 @@ func buildManager(cfg *Config, secret string) (*strategy.Manager, error) {
 	portHoppingCfg := buildPortHoppingConfig(cfg)
 
 	mgrCfg := strategy.DefaultManagerConfig{
-		ServerAddr:            cfg.ServerAddr,
-		Secret:                []byte(secret),
-		CoverHost:             cfg.CoverHost,
-		ServerAddrV6:          cfg.ServerAddrV6,
-		PreferIPv6:            cfg.PreferIPv6,
-		FallbackToV4:          cfg.FallbackToV4,
-		RTTMaskingEnabled:     cfg.RTTMaskingEnabled,
-		RTTProfile:            rttProfile,
-		QUICEnabled:           cfg.QUICEnabled,
-		QUICPort:              cfg.QUICPort,
-		ICMPTunnelEnabled:     cfg.ICMPTunnelEnabled,
-		SeqovlPacketEnabled:   cfg.SeqovlPacketEnabled,
-		TLSFingerprint:        cfg.TLSFingerprint,
-		REALITYB1ServerKeyB64: cfg.REALITYB1ServerKeyB64,
-		ECHEnabled:            cfg.ECHEnabled,
-		ECHConfigList:         echConfigList,
-		ECHPublicName:         cfg.ECHPublicName,
-		QUICSNIFragEnabled:    cfg.QUICSNIFragEnabled,
-		PQEnabled:             cfg.PQEnabled,
-		PQServerKemPubB64:     cfg.PQServerKemPubB64,
-		AndroidMode:           cfg.AndroidMode || cfg.MacOSMode,
-		PortHopping:           portHoppingCfg,
-		Shaper:                cfg.Shaper,
-		ShaperID:              cfg.ShaperID,
+		ServerAddr:             cfg.ServerAddr,
+		Secret:                 []byte(secret),
+		CoverHost:              cfg.CoverHost,
+		ServerAddrV6:           cfg.ServerAddrV6,
+		PreferIPv6:             cfg.PreferIPv6,
+		FallbackToV4:           cfg.FallbackToV4,
+		RTTMaskingEnabled:      cfg.RTTMaskingEnabled,
+		RTTProfile:             rttProfile,
+		QUICEnabled:            cfg.QUICEnabled,
+		QUICPort:               cfg.QUICPort,
+		ICMPTunnelEnabled:      cfg.ICMPTunnelEnabled,
+		SeqovlPacketEnabled:    cfg.SeqovlPacketEnabled,
+		TLSFingerprint:         cfg.TLSFingerprint,
+		REALITYServerPubKeyB64: cfg.REALITYServerPubKey,
+		ECHEnabled:             cfg.ECHEnabled,
+		ECHConfigList:          echConfigList,
+		ECHPublicName:          cfg.ECHPublicName,
+		QUICSNIFragEnabled:     cfg.QUICSNIFragEnabled,
+		PQEnabled:              cfg.PQEnabled,
+		PQServerKemPubB64:      cfg.PQServerKemPubB64,
+		AndroidMode:            cfg.AndroidMode || cfg.MacOSMode,
+		PortHopping:            portHoppingCfg,
+		Shaper:                 cfg.Shaper,
+		ShaperID:               cfg.ShaperID,
 
 		REALITYRequireDataV2: cfg.REALITYRequireDataV2,
 	}

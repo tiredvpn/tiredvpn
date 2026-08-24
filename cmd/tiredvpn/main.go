@@ -604,8 +604,6 @@ func runClient(args []string) {
 	fs.BoolVar(&cfg.RTTMaskingEnabled, "rtt-masking", false, "Enable RTT masking (hides proxy timing signature)")
 	fs.StringVar(&cfg.RTTProfile, "rtt-profile", "moscow-yandex", "RTT profile (moscow-yandex, moscow-vk, regional-russia, siberia, cdn, beijing-baidu, tehran-aparat)")
 
-	fs.StringVar(&cfg.REALITYB1ServerKeyB64, "reality-b1-key", "",
-		"Server's static X25519 public key (base64). Enables the REALITY B1 transport.")
 	fs.StringVar(&cfg.TLSFingerprint, "tls-fingerprint", "",
 		"uTLS browser profile for ClientHello ("+strings.Join(customtls.FingerprintNames(), ", ")+"); empty uses "+customtls.DefaultFingerprintName)
 

@@ -8,6 +8,7 @@ import (
 	"crypto/hmac"
 	"crypto/mlkem"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -520,4 +521,30 @@ func walkExtensions(block []byte, fn func(offset int, extType uint16, body []byt
 		pos += 4 + bodyLen
 	}
 	return nil
+}
+
+// DecodeKeyBase64 accepts any of the four base64 alphabets an operator might
+// paste for a REALITY key.
+//
+// We emit raw-url (that is what `tiredvpn reality-keygen` prints), but a key
+// copied out of a JSON config arrives padded, and one pasted from a shell
+// history may have been re-encoded. A startup failure that reads like a corrupt
+// key, when the bytes are fine and only the alphabet differs, is a bad hour for
+// whoever hits it.
+//
+// Shared between the server, which reads its private key, and the client, which
+// reads the server's public key — the two must accept exactly the same set, or
+// a key pair that works on one end fails on the other.
+func DecodeKeyBase64(s string) ([]byte, error) {
+	for _, enc := range []*base64.Encoding{
+		base64.RawURLEncoding,
+		base64.RawStdEncoding,
+		base64.URLEncoding,
+		base64.StdEncoding,
+	} {
+		if raw, err := enc.DecodeString(s); err == nil {
+			return raw, nil
+		}
+	}
+	return nil, errors.New("reality auth: key is not valid base64")
 }
