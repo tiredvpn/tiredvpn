@@ -205,12 +205,20 @@ func HandleREALITYConnection(conn net.Conn, srvCtx *serverContext, logger *log.L
 	// after its 64-byte core; a v1 client leaves random bytes there, which fail
 	// the MAC. Nothing on the wire changes size either way.
 	clientSalt, dataV2 := customtls.ParseClientDataV2(usedSecret, realityExt.PubKey, realityExt.Extra)
-	if !dataV2 && srvCtx.cfg.REALITYRequireDataV2 {
-		logger.Info("REALITY: rejecting legacy v1 data layer (REALITYRequireDataV2 set)")
-		if srvCtx.cfg.REALITYCoverDomain != "" {
-			handleREALITYUnauthorized(conn, clientHello, srvCtx.cfg.REALITYCoverDomain, logger)
+	if !dataV2 {
+		// Logged at Info, not Debug, so the rollout is observable without
+		// turning on -debug on a production exit: once no client reports v1 for
+		// a full day, -reality-require-data-v2 is safe to switch on. Silence
+		// means everyone is on v2. The v2 case stays at Debug to keep a busy
+		// exit's log quiet.
+		if srvCtx.cfg.REALITYRequireDataV2 {
+			logger.Info("REALITY: rejecting legacy v1 data layer from %s (client: %s)", conn.RemoteAddr(), authClientID)
+			if srvCtx.cfg.REALITYCoverDomain != "" {
+				handleREALITYUnauthorized(conn, clientHello, srvCtx.cfg.REALITYCoverDomain, logger)
+			}
+			return
 		}
-		return
+		logger.Info("REALITY: accepting legacy v1 data layer from %s (client: %s)", conn.RemoteAddr(), authClientID)
 	}
 
 	// Extract SNI to determine destination
