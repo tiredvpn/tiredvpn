@@ -238,6 +238,19 @@ func resolveServerBypassIP6(serverAddr string) net.IP {
 	return nil
 }
 
+// serverBypassIP6 picks the IPv6 transport address a /128 bypass has to be
+// pinned for before the dual-stack half-defaults go in. -server-v6 wins when
+// set, but -server is checked too: an exit reachable only over IPv6 is
+// addressed by putting the v6 literal straight into -server, with no v4 flag at
+// all. Missing that case would drop the client's own transport socket into its
+// own tunnel the moment dual-stack is negotiated.
+func serverBypassIP6(cfg VPNConfig) net.IP {
+	if ip := resolveServerBypassIP6(cfg.ServerAddrV6); ip != nil {
+		return ip
+	}
+	return resolveServerBypassIP6(cfg.ServerAddr)
+}
+
 // NewVPNClient creates a new VPN client
 func NewVPNClient(cfg VPNConfig) (*VPNClient, error) {
 	if cfg.MTU == 0 {
@@ -295,7 +308,7 @@ func NewVPNClient(cfg VPNConfig) (*VPNClient, error) {
 		// server address is configured — a /128 host route to an address the
 		// manager ends up not dialling costs nothing, and -prefer-ipv6 can
 		// flip between reconnects.
-		if bypassIP6 := resolveServerBypassIP6(cfg.ServerAddrV6); bypassIP6 != nil {
+		if bypassIP6 := serverBypassIP6(cfg); bypassIP6 != nil {
 			tunDev.SetServerBypassIP6(bypassIP6)
 		}
 		// Defer route installation (notably the 0.0.0.0/0 default route) until a
