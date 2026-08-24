@@ -95,6 +95,14 @@ type Config struct {
 	// instead of falling back to it. Off until every server is upgraded.
 	REALITYRequireDataV2 bool
 
+	// BurstReshape turns on the nudge/ack exchange that splits the inner TLS
+	// handshake. Must match the server's -burst-reshape, and the pad value must
+	// match too; a one-sided setting corrupts streams.
+	BurstReshape string
+
+	// BurstReshapePadFlight must equal the server's -burst-reshape-pad-flight.
+	BurstReshapePadFlight int
+
 	// REALITYServerPubKey is the server's static X25519 public key, base64.
 	// A non-empty value means "speak B1 to this server" - there is no probing
 	// and no downgrade on error, because a transport that falls back when the
@@ -289,6 +297,10 @@ func buildManager(cfg *Config, secret string) (*strategy.Manager, error) {
 		ShaperID:            cfg.ShaperID,
 
 		REALITYRequireDataV2: cfg.REALITYRequireDataV2,
+		BurstReshape: strategy.BurstReshapeConfig{
+			Enabled:   cfg.BurstReshape == "on",
+			PadFlight: cfg.BurstReshapePadFlight,
+		},
 	}
 	mgr := strategy.NewDefaultManager(mgrCfg)
 
