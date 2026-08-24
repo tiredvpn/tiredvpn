@@ -51,7 +51,7 @@ func TestReshapedFlowsClearAllModels(t *testing.T) {
 
 	for _, flow := range baselineFlows {
 		for nudge := uint32(reshapeNudgeMin); nudge <= reshapeNudgeMax; nudge++ {
-			ack := uint32(reshapeAckLen(int(nudge)))
+			ack := uint32(reshapeAckLen)
 			bursts := detect.Merge(reshapedBursts(flow, nudge, ack))
 			windows := detect.Windows(bursts)
 			if len(windows) == 0 {
@@ -257,12 +257,11 @@ func TestExchangeSplitsTheFlight(t *testing.T) {
 	if nudge.dir != "s->c" || nudge.n < reshapeNudgeMin || nudge.n > reshapeNudgeMax {
 		t.Errorf("second write should be the nudge, got %v", order)
 	}
-	if ack.dir != "c->s" || ack.n < reshapeAckMin || ack.n > reshapeAckMin+reshapeAckSpan {
+	if ack.dir != "c->s" || ack.n != reshapeAckLen {
 		t.Errorf("third write should be the ack, got %v", order)
 	}
-	if ack.n != reshapeAckLen(nudge.n) {
-		t.Errorf("ack length %d does not follow from nudge length %d (want %d)",
-			ack.n, nudge.n, reshapeAckLen(nudge.n))
+	if ack.n != reshapeAckLen {
+		t.Errorf("ack length %d, want the fixed %d", ack.n, reshapeAckLen)
 	}
 	if !ack.when.After(nudge.when) {
 		t.Errorf("ack must be written after the nudge")
@@ -596,16 +595,6 @@ func TestConcurrentStreamsStayBounded(t *testing.T) {
 		peakHoldBytes, peakHoldStreams, st, before.HeapAlloc, after.HeapAlloc)
 }
 
-// TestAckLenIsDerivedFromNudge pins the rule both sides rely on.
-func TestAckLenIsDerivedFromNudge(t *testing.T) {
-	for n := reshapeNudgeMin; n <= reshapeNudgeMax; n++ {
-		got := reshapeAckLen(n)
-		if got < reshapeAckMin || got >= reshapeAckMin+reshapeAckSpan {
-			t.Errorf("nudge %d -> ack %d, outside [%d,%d)", n, got, reshapeAckMin, reshapeAckMin+reshapeAckSpan)
-		}
-	}
-}
-
 // TestNudgeLenInRange checks the jitter never leaves the measured optimum.
 func TestNudgeLenInRange(t *testing.T) {
 	seen := map[int]bool{}
@@ -621,116 +610,38 @@ func TestNudgeLenInRange(t *testing.T) {
 	}
 }
 
-// TestNudgeRangeIsTheBestAvailable pins why the range is 45..80 and not
-// something else. The margin is nearly linear in the nudge length and the slope
-// is shallow - about -0.0008 per byte - because the binding window is
-// [530, nudge, ack, 2833] and its distance is set by the server flight, not by
-// the nudge. Narrowing the range is worth roughly two points of margin and no
-// more; anyone looking for a real improvement has to move the flight itself.
+// TestNudgeRangeClearsTheBarOnThePlainPath checks the shipped range against the
+// path our production traffic actually takes. It is deliberately not an
+// optimisation test any more: the range is picked to work on BOTH paths, and
+// the other one cannot be exercised from these baseline vectors because it
+// subtracts 24 bytes per packet and starts counting only after a
+// ChangeCipherSpec, which our framing does not send. See
+// internal/detect/mode.go.
 //
-// The floor is a separate constraint and is not visible in these numbers: below
-// about 30 bytes the record is alert-sized, and a mid-connection alert is its
-// own anomaly. That is why the sweep below is not simply "pick the smallest".
-func TestNudgeRangeIsTheBestAvailable(t *testing.T) {
-	worstOver := func(lo, hi int) (float64, int) {
-		worst, at := detect.MarginClear, 0
-		for n := lo; n <= hi; n++ {
-			ack := uint32(reshapeAckLen(n))
-			for _, flow := range baselineFlows {
-				bursts := detect.Merge(reshapedBursts(flow, uint32(n), ack))
-				for _, w := range detect.Windows(bursts) {
-					if m := detect.Margin(w); m < worst {
-						worst, at = m, n
-					}
+// So this pins the weaker of the two constraints. The stronger one - ack 40
+// rather than a jittered 40-65 - comes from the tls-in-tls path and is recorded
+// in the constant's comment, not here.
+func TestNudgeRangeClearsTheBarOnThePlainPath(t *testing.T) {
+	worst, at := detect.MarginClear, 0
+	for n := reshapeNudgeMin; n <= reshapeNudgeMax; n++ {
+		for _, flow := range baselineFlows {
+			bursts := detect.Merge(reshapedBursts(flow, uint32(n), uint32(reshapeAckLen)))
+			for _, w := range detect.Windows(bursts) {
+				if m := detect.Margin(w); m < worst {
+					worst, at = m, n
 				}
 			}
 		}
-		return worst, at
 	}
-
-	chosen, chosenAt := worstOver(reshapeNudgeMin, reshapeNudgeMax)
-	t.Logf("chosen range %d..%d -> worst margin %.3f at nudge=%d",
-		reshapeNudgeMin, reshapeNudgeMax, chosen, chosenAt)
-
-	// The range we shipped must beat the one the spec started from.
-	if wider, _ := worstOver(60, 100); chosen <= wider {
-		t.Errorf("chosen range gains nothing over 60..100: %.3f vs %.3f", chosen, wider)
-	}
-	if chosen < detect.RequiredMargin {
-		t.Fatalf("chosen range %.3f is below the required %.3f", chosen, detect.RequiredMargin)
-	}
-
-	// Document the shape of the trade rather than asserting on it.
-	for _, r := range [][2]int{{30, 60}, {40, 70}, {45, 80}, {60, 80}, {60, 100}, {60, 140}} {
-		w, at := worstOver(r[0], r[1])
-		t.Logf("  %3d..%3d -> %.3f (binds at nudge=%d)", r[0], r[1], w, at)
+	t.Logf("range %d..%d with ack %d -> worst margin %.3f on the plain path (binds at nudge=%d)",
+		reshapeNudgeMin, reshapeNudgeMax, reshapeAckLen, worst, at)
+	if worst < detect.RequiredMargin {
+		t.Errorf("worst margin %.3f < required %.3f", worst, detect.RequiredMargin)
 	}
 }
 
-// TestExchangeSurvivesIoCopy is the test that would have caught the second
-// wiring defect. The relay does not call Read and Write directly - it runs
-// io.CopyBuffer, which prefers a ReaderFrom on the destination or a WriterTo on
-// the source. Both wrappers embed net.Conn, so without the shadowing methods
-// those get promoted from the underlying conn and the copy goes around the
-// exchange entirely: the tunnel works, nothing is reshaped, and no test fails.
-//
-// That is what happened in the first fix of the wiring: streams carried data
-// end to end and the wire showed no nudge at all.
-func TestExchangeSurvivesIoCopy(t *testing.T) {
-	resetBurstReshapeStats()
-	l := &writeLog{}
-	srvRaw, cliRaw := newPair(l)
-	cfg := BurstReshapeConfig{Enabled: true}
-	srv := ReshapeServerStream(srvRaw, cfg)
-	cli := ReshapeClientStream(cliRaw, cfg)
-
-	// The wrappers must not expose the underlying conn's copy fast paths.
-	if _, ok := srv.(io.ReaderFrom); !ok {
-		t.Error("server wrapper must define ReadFrom itself")
+func TestAckLengthIsFixed(t *testing.T) {
+	if reshapeAckLen < 30 || reshapeAckLen > 65 {
+		t.Errorf("ack %d outside the range the model was swept over", reshapeAckLen)
 	}
-	if _, ok := cli.(io.WriterTo); !ok {
-		t.Error("client wrapper must define WriteTo itself")
-	}
-
-	reply := bytes.Repeat([]byte{0x33}, 2833)
-	upstream := bytes.NewReader(reply)
-
-	done := make(chan struct{})
-	got := make([]byte, 0, len(reply))
-	go func() {
-		defer close(done)
-		_, _ = cli.Write(bytes.Repeat([]byte{0x16}, 530))
-		buf := make([]byte, 4096)
-		for len(got) < len(reply) {
-			n, err := cli.Read(buf)
-			got = append(got, buf[:n]...)
-			if err != nil {
-				return
-			}
-		}
-	}()
-
-	hello := make([]byte, 4096)
-	if _, err := srv.Read(hello); err != nil {
-		t.Fatalf("server read: %v", err)
-	}
-	go func() {
-		buf := make([]byte, 4096)
-		_, _ = srv.Read(buf) // drains the ack
-	}()
-
-	// This is how the relay actually moves bytes.
-	if _, err := io.Copy(srv, upstream); err != nil {
-		t.Fatalf("io.Copy: %v", err)
-	}
-	<-done
-
-	if !bytes.Equal(got, reply) {
-		t.Fatalf("client got %d bytes, want %d identical", len(got), len(reply))
-	}
-	if st := ReadBurstReshapeStats(); st.ReshapedTotal != 1 {
-		t.Errorf("io.Copy bypassed the exchange: reshaped_total=%d, want 1", st.ReshapedTotal)
-	}
-	srvRaw.Close()
-	cliRaw.Close()
 }

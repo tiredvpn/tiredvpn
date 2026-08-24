@@ -82,27 +82,37 @@ const (
 	// On expiry the reply goes out unreshaped rather than being held longer.
 	reshapeAckTimeout = 200 * time.Millisecond
 
-	// Nudge and ack sizes, jittered per stream.
+	// Nudge and ack sizes.
 	//
-	// The margin is almost flat in the nudge length - across 45..100 bytes the
-	// distance to the binding model moves by 0.045 - because the window that
-	// binds is [530, nudge, ack, 2833] and its distance is dominated by the
-	// server flight, not by the nudge. Still, the whole range costs nothing to
-	// move, so it sits at the low end of what stays plausible:
+	// These cover BOTH paths through the heuristic, which is the reason they are
+	// what they are - see internal/detect/mode.go for what the two paths are.
+	// Model numbers on the corrected mechanics:
 	//
-	//   nudge 45..80  -> worst margin 0.945
-	//   nudge 60..100 -> worst margin 0.927
+	//	plain path (port 995):     without a nudge -2.19;
+	//	                           nudge 60-120 with ack 40-100 gives +0.91..+0.96;
+	//	                           from nudge 200 it drops back under +0.9.
+	//	tls-in-tls path (port 443, after B1):
+	//	                           without a nudge +0.59;
+	//	                           nudge 60-400 with ack 40 gives +1.59.
 	//
-	// The floor is not free. A TLS 1.3 record cannot be shorter than about 22
-	// bytes (one content byte, a 16-byte tag, a 5-byte header), and records down
-	// near that size are alerts, which mid-connection are themselves worth
-	// noticing. At 45..80 the record lands where real HTTP/2 control frames land
-	// - SETTINGS and WINDOW_UPDATE, 9 to 30 bytes of payload - which is the most
-	// common small record on a live h2 connection.
-	reshapeNudgeMin = 45
-	reshapeNudgeMax = 80
-	reshapeAckMin   = 40
-	reshapeAckSpan  = 26 // ack length lands in [40, 65]
+	// The ack is fixed rather than jittered because its size barely matters on
+	// the plain path and matters a lot on the other one: ack 40 gives +1.59,
+	// ack 60 already +1.34, ack 100 collapses to +0.89. That path subtracts 24
+	// bytes per packet, so small bursts cost proportionally more there. An
+	// earlier revision jittered the ack up to 65 and would have been sitting in
+	// that decline.
+	//
+	// Floor: a TLS 1.3 record bottoms out around 22 bytes and records near that
+	// size are alerts, which mid-connection are their own anomaly. At 60-120 the
+	// record sits where real HTTP/2 control frames sit.
+	//
+	// These are model numbers on corrected mechanics, not measurements. They are
+	// due for a recount against a real capture with B1 in place.
+	reshapeNudgeMin = 60
+	reshapeNudgeMax = 120
+
+	// reshapeAckLen is fixed: both sides know it without a wire field.
+	reshapeAckLen = 40
 
 	// reshapeDefaultMaxStreams caps how many streams may sit in the holding
 	// state at once. Past it, new streams run unreshaped - they are never
@@ -194,13 +204,6 @@ func reshapeRandomLen(min, span int) int {
 		return min + span/2
 	}
 	return min + int(binary.BigEndian.Uint64(b[:])%uint64(span))
-}
-
-// reshapeAckLen derives the ack length from the nudge length. Both sides compute
-// it from the same observed number, which keeps the jitter without putting a
-// length field on the wire.
-func reshapeAckLen(nudgeLen int) int {
-	return reshapeAckMin + nudgeLen%reshapeAckSpan
 }
 
 // randomBytes fills a fresh slice with CSPRNG output.
@@ -362,7 +365,7 @@ func (s *serverReshaper) holdAndRelease(p []byte) (int, error) {
 	// Arm the read path before the nudge goes out, otherwise the ack can arrive
 	// while we are still deciding what to do with it.
 	s.mu.Lock()
-	s.swallowLeft = reshapeAckLen(nudgeLen)
+	s.swallowLeft = reshapeAckLen
 	s.swallowArmed = true
 	s.mu.Unlock()
 
@@ -467,7 +470,7 @@ func (c *clientReshaper) Read(p []byte) (int, error) {
 		return n, err
 	}
 
-	ack, aerr := randomBytes(reshapeAckLen(n))
+	ack, aerr := randomBytes(reshapeAckLen)
 	if aerr != nil {
 		return n, err
 	}
