@@ -17,6 +17,7 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/mux"
 	"github.com/tiredvpn/tiredvpn/internal/porthopping"
 	"github.com/tiredvpn/tiredvpn/internal/shaper"
+	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 )
 
 // clientSocketBufferBytes is the SO_RCVBUF/SO_SNDBUF size applied to client TCP
@@ -1144,10 +1145,10 @@ type DefaultManagerConfig struct {
 	// REALITY configuration
 	REALITYEnabled bool // Enable REALITY protocol (99.5% success rate)
 
-	// REALITYB1ServerKeyB64 is the server's static X25519 public key, base64.
+	// REALITYServerPubKeyB64 is the server's static X25519 public key, base64.
 	// Non-empty switches the REALITY client onto the B1 transport: a real TLS
 	// 1.3 handshake with authentication in session_id.
-	REALITYB1ServerKeyB64 string
+	REALITYServerPubKeyB64 string
 
 	// TLSFingerprint names the uTLS browser profile used for ClientHellos
 	// (see internal/tls.FingerprintMap). Empty selects the default profile.
@@ -1392,8 +1393,8 @@ func registerTLSStrategies(m *Manager, cfg DefaultManagerConfig, hasServer, hasS
 
 	reality := NewREALITYStrategy(m, cfg.Secret)
 	reality.SetFingerprint(cfg.TLSFingerprint)
-	if cfg.REALITYB1ServerKeyB64 != "" {
-		key, err := base64.StdEncoding.DecodeString(cfg.REALITYB1ServerKeyB64)
+	if cfg.REALITYServerPubKeyB64 != "" {
+		key, err := customtls.DecodeKeyBase64(cfg.REALITYServerPubKeyB64)
 		if err != nil {
 			log.Warn("REALITY: B1 server key is not valid base64: %v; B1 stays off", err)
 		} else {
