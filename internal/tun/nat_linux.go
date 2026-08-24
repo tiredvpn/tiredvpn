@@ -84,7 +84,47 @@ func SetupServerNAT(pool string, wanOverride string) error {
 	}
 
 	log.Info("NAT: installed MASQUERADE %s -> %s and FORWARD accept via nftables", pool, wan)
+	warnIfForeignForwardDrop(nftables.TableFamilyIPv4, "NAT")
 	return nil
+}
+
+// warnIfForeignForwardDrop reports a base forward chain owned by somebody else
+// (an iptables-nft FORWARD with policy drop, a firewall's own table, Docker)
+// that will drop the traffic our accept rules let through.
+//
+// nftables evaluates every base chain registered on a hook: an accept verdict
+// in ours does not overrule a drop policy in theirs. So on such a host the
+// tunnel comes up, the NAT rules read as correct, and packets still vanish
+// until an explicit rule is added over there. That is a five-minute fix and an
+// hour-long diagnosis, hence the loud warning; we deliberately do not edit a
+// table we do not own.
+func warnIfForeignForwardDrop(family nftables.TableFamily, logPrefix string) {
+	conn, err := nftables.New()
+	if err != nil {
+		return
+	}
+	chains, err := conn.ListChains()
+	if err != nil {
+		return
+	}
+	for _, ch := range chains {
+		if ch.Table == nil || ch.Table.Family != family {
+			continue
+		}
+		if ch.Hooknum == nil || *ch.Hooknum != *nftables.ChainHookForward {
+			continue
+		}
+		if strings.HasPrefix(ch.Table.Name, "tiredvpn-") {
+			continue // one of ours
+		}
+		if ch.Policy != nil && *ch.Policy == nftables.ChainPolicyDrop {
+			log.Warn("%s: chain %s/%s on the forward hook has policy drop and is not ours; "+
+				"our accept does not override it, so client traffic may be dropped there. "+
+				"Add an explicit rule for the tunnel interface if forwarding does not work.",
+				logPrefix, ch.Table.Name, ch.Name)
+			return
+		}
+	}
 }
 
 // SetupServerNAT6 installs IPv6 forwarding, MASQUERADE (NAT66) and
@@ -142,6 +182,7 @@ func SetupServerNAT6(pool string, wanOverride string) error {
 	}
 
 	log.Info("NAT66: installed MASQUERADE %s -> %s and FORWARD accept via nftables (ip6)", pool, wan)
+	warnIfForeignForwardDrop(nftables.TableFamilyIPv6, "NAT66")
 	return nil
 }
 
