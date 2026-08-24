@@ -4,6 +4,8 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 
 	"golang.org/x/crypto/curve25519"
@@ -106,7 +108,39 @@ func validateREALITYConfig(cfg *Config) error {
 		return fmt.Errorf("-reality-max-time-diff must not be negative, got %d", cfg.REALITYMaxTimeDiff)
 	}
 
+	if cfg.REALITYMinClientVer != "" {
+		if _, err := parseClientVersion(cfg.REALITYMinClientVer); err != nil {
+			return fmt.Errorf("-reality-min-client-ver %q: %w", cfg.REALITYMinClientVer, err)
+		}
+	}
+
 	return nil
+}
+
+// parseClientVersion turns "X.Y.Z" into the three bytes a client puts in its
+// authentication payload.
+//
+// Checked at startup rather than per connection: a version the server cannot
+// parse would otherwise be applied as "no minimum" on every connection, so a
+// typo in the flag would look exactly like the check working and passing
+// everyone.
+func parseClientVersion(s string) ([3]byte, error) {
+	var out [3]byte
+	parts := strings.Split(s, ".")
+	if len(parts) != 3 {
+		return out, errors.New("want three dot-separated numbers, X.Y.Z")
+	}
+	for i, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return out, fmt.Errorf("component %q is not a number", p)
+		}
+		if n < 0 || n > 255 {
+			return out, fmt.Errorf("component %d is out of range 0-255", n)
+		}
+		out[i] = byte(n)
+	}
+	return out, nil
 }
 
 // realityStaticKeys returns the loaded key pair. Callers on the accept path use

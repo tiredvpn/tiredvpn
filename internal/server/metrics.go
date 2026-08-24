@@ -139,6 +139,8 @@ func (m *Metrics) Handler() http.HandlerFunc {
 		fmt.Fprintf(w, "tiredvpn_bytes_received_total %d\n", atomic.LoadInt64(&m.totalBytesUp))
 		fmt.Fprintf(w, "\n")
 
+		writeREALITYAuthMetrics(w)
+
 		// Errors
 		fmt.Fprintf(w, "# HELP tiredvpn_auth_failures_total Total authentication failures\n")
 		fmt.Fprintf(w, "# TYPE tiredvpn_auth_failures_total counter\n")

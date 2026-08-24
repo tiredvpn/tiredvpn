@@ -175,6 +175,7 @@ func HandleREALITYConnection(conn net.Conn, srvCtx *serverContext, logger *log.L
 	}
 
 	logger.Debug("REALITY: Using secret from %s", authClientID)
+	realityAuthLegacyTotal.Add(1)
 
 	// Data layer version. A v2 client appends [salt][MAC] to the padding block
 	// after its 64-byte core; a v1 client leaves random bytes there, which fail
