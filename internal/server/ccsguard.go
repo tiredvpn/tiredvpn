@@ -27,10 +27,27 @@ import (
 //     handshake time instead, around 9.5 seconds. sberbank.ru, gosuslugi.ru and
 //     vtb.ru behave this way - at 40ms pacing they accept 240 records and at
 //     10ms they accept 400 without reaching a limit.
+//   - none: no limit of either kind. Both githubusercontent hosts took 1200
+//     records over 48 seconds in silence.
 //
 // Against a timeout donor any finite count is wrong: a patient prober sending
 // one record per second sees us cut at N while the real site holds until its
 // deadline. That is why the mechanism travels with the number.
+//
+// Why this filters rather than only counts. crypto/tls has its own limit of 16
+// consecutive useless records, below every count donor we measured (33 to 36),
+// so left alone it fires first and we cut earlier than the site we claim to be.
+// The guard therefore swallows ChangeCipherSpec records beyond the first
+// instead of passing them up: TLS 1.3 ignores them anyway (RFC 8446 D.4), and
+// crypto/tls never counts what it never sees. The first one is passed through
+// untouched, because in TLS 1.2 it is a real handshake message and dropping it
+// would break those profiles.
+//
+// Measured on a local reproduction rather than reasoned about: our own front
+// answers a flood by failing the handshake at record 17 and then handing the
+// socket to the fake website, which keeps it open. That is why the probe
+// recorded us as having no limit at all - it was measuring its own ability to
+// keep writing, not our tolerance.
 
 type ccsMechanism uint8
 
@@ -41,6 +58,10 @@ const (
 	ccsUnmeasured ccsMechanism = iota
 	ccsCount
 	ccsTimeout
+	// ccsNone is a donor with no limit of either kind: raw.githubusercontent.com
+	// and objects.githubusercontent.com accepted 1200 records over 48 seconds
+	// without a word. Under those names we do not cut either.
+	ccsNone
 )
 
 // ccsPolicy is one donor's tolerance.
@@ -135,19 +156,26 @@ var errCCSFlood = errors.New("reality: changecipherspec tolerance exhausted")
 type ccsGuard struct {
 	net.Conn
 
-	mu        sync.Mutex
-	policy    ccsPolicy
-	count     int
-	remaining int    // bytes left in the record body being skipped
-	carry     []byte // partial record header held across reads
-	done      bool   // handshake finished; stop looking
-	tripped   bool
-	timer     *time.Timer
+	mu      sync.Mutex
+	policy  ccsPolicy
+	count   int
+	done    bool // handshake finished; stop filtering
+	tripped bool
+	timer   *time.Timer
+
+	// Record framing state, carried across reads because a peer chooses how the
+	// stream is chopped up.
+	hdr      []byte // partial record header, held back until the type is known
+	bodyLeft int    // bytes of the current record body still to come
+	dropBody bool   // the current record is being swallowed
+
+	scratch []byte // read buffer
+	pending []byte // filtered bytes not yet handed to the caller
 }
 
 // newCCSGuard wraps conn with the tolerance of the donor named by sni.
 func newCCSGuard(conn net.Conn, sni string) *ccsGuard {
-	g := &ccsGuard{Conn: conn, policy: ccsPolicyFor(sni)}
+	g := &ccsGuard{Conn: conn, policy: ccsPolicyFor(sni), scratch: make([]byte, 4096)}
 	if g.policy.Mechanism == ccsTimeout && g.policy.Timeout > 0 {
 		// A timeout donor does not count records; it gives the handshake a
 		// budget of wall-clock time. Arm it now, at the first byte, and stop it
@@ -158,12 +186,19 @@ func newCCSGuard(conn net.Conn, sni string) *ccsGuard {
 }
 
 // handshakeDone stops the guard. Call it once tls.Handshake returns, whatever
-// the outcome.
+// the outcome. After this the connection is pure ApplicationData, where a 0x14
+// is a byte of ciphertext and filtering it would corrupt the stream.
 func (g *ccsGuard) handshakeDone() {
 	g.mu.Lock()
 	g.done = true
 	timer := g.timer
 	g.timer = nil
+	held := g.hdr
+	g.hdr = nil
+	// Anything still held back as a partial header belongs to the caller now.
+	if len(held) > 0 {
+		g.pending = append(g.pending, held...)
+	}
 	g.mu.Unlock()
 
 	if timer != nil {
@@ -186,64 +221,120 @@ func (g *ccsGuard) trip() {
 }
 
 func (g *ccsGuard) Read(b []byte) (int, error) {
-	g.mu.Lock()
-	if g.tripped {
+	for {
+		g.mu.Lock()
+		if g.tripped {
+			g.mu.Unlock()
+			return 0, errCCSFlood
+		}
+		if n := g.drainLocked(b); n > 0 {
+			g.mu.Unlock()
+			return n, nil
+		}
+		done := g.done
 		g.mu.Unlock()
-		return 0, errCCSFlood
-	}
-	g.mu.Unlock()
 
-	n, err := g.Conn.Read(b)
-	if n > 0 && g.inspect(b[:n]) {
-		g.trip()
-		return 0, errCCSFlood
+		// Past the handshake there is nothing to filter, so read straight
+		// through and keep the hot path free of this.
+		if done {
+			return g.Conn.Read(b)
+		}
+
+		n, err := g.Conn.Read(g.scratch)
+		if n > 0 {
+			g.mu.Lock()
+			flood := g.filterLocked(g.scratch[:n])
+			out := g.drainLocked(b)
+			g.mu.Unlock()
+
+			if flood {
+				g.trip()
+				return 0, errCCSFlood
+			}
+			if out > 0 {
+				return out, nil
+			}
+			// Everything read was swallowed. Returning 0 with a nil error is
+			// not allowed to mean anything, so go round again.
+			if err == nil {
+				continue
+			}
+		}
+		if err != nil {
+			return 0, err
+		}
 	}
-	return n, err
 }
 
-// inspect walks record headers in a freshly read chunk and reports whether the
-// budget is spent. Only headers matter, so record bodies are skipped by their
-// declared length - which is also what keeps a 0x14 byte inside a record body
-// from being counted as a record.
-func (g *ccsGuard) inspect(chunk []byte) bool {
+// drainLocked moves buffered filtered bytes into b.
+func (g *ccsGuard) drainLocked(b []byte) int {
+	if len(g.pending) == 0 {
+		return 0
+	}
+	n := copy(b, g.pending)
+	g.pending = g.pending[n:]
+	if len(g.pending) == 0 {
+		g.pending = nil
+	}
+	return n
+}
+
+// filterLocked walks records in a freshly read chunk, appending everything the
+// caller should see to pending and swallowing surplus ChangeCipherSpec records.
+// It reports whether the donor's tolerance has been spent.
+//
+// Header bytes are held back rather than passed through, because a record's
+// type is not known until all five are in hand and a header already delivered
+// cannot be taken back.
+func (g *ccsGuard) filterLocked(chunk []byte) bool {
 	const recordHeaderLen = 5
 
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	if g.done || g.policy.Mechanism != ccsCount {
-		return false
-	}
-
 	for len(chunk) > 0 {
-		if g.remaining > 0 {
-			skip := min(g.remaining, len(chunk))
-			g.remaining -= skip
-			chunk = chunk[skip:]
+		if g.bodyLeft > 0 {
+			take := min(g.bodyLeft, len(chunk))
+			if !g.dropBody {
+				g.pending = append(g.pending, chunk[:take]...)
+			}
+			g.bodyLeft -= take
+			chunk = chunk[take:]
 			continue
 		}
 
-		need := recordHeaderLen - len(g.carry)
+		need := recordHeaderLen - len(g.hdr)
 		if len(chunk) < need {
-			g.carry = append(g.carry, chunk...)
+			g.hdr = append(g.hdr, chunk...)
 			return false
 		}
-		g.carry = append(g.carry, chunk[:need]...)
+		g.hdr = append(g.hdr, chunk[:need]...)
 		chunk = chunk[need:]
 
-		hdr := g.carry
-		g.remaining = int(hdr[3])<<8 | int(hdr[4])
-		isCCS := hdr[0] == 0x14
-		g.carry = g.carry[:0]
+		g.bodyLeft = int(g.hdr[3])<<8 | int(g.hdr[4])
+		g.dropBody = false
 
-		if isCCS {
+		if g.hdr[0] == 0x14 {
 			g.count++
-			if g.count > g.policy.Limit {
+			// The first one is a real message under TLS 1.2 and harmless under
+			// TLS 1.3, so it goes through. Every one after it is padding.
+			if g.count > 1 {
+				g.dropBody = true
+			}
+			if g.overBudgetLocked() {
+				g.hdr = g.hdr[:0]
 				return true
 			}
 		}
+
+		if !g.dropBody {
+			g.pending = append(g.pending, g.hdr...)
+		}
+		g.hdr = g.hdr[:0]
 	}
 	return false
+}
+
+// overBudgetLocked reports whether the count has passed what this donor allows.
+func (g *ccsGuard) overBudgetLocked() bool {
+	return g.policy.Mechanism == ccsCount && g.count > g.policy.Limit
 }
 
 var _ net.Conn = (*ccsGuard)(nil)

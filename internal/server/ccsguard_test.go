@@ -16,22 +16,25 @@ var ccsRecord = []byte{0x14, 0x03, 0x03, 0x00, 0x01, 0x01}
 
 // feedGuard writes stream into a guard through a pipe and reports how many
 // bytes it managed to read before the guard, if ever, cut it off.
-func feedGuard(t *testing.T, g *ccsGuard, stream []byte, chunk int) (int, error) {
+// feedGuard drains the guard until the underlying stream runs out, returning
+// the bytes that came through. The guard swallows surplus records, so what
+// comes out is smaller than what went in - EOF is the normal ending, not a
+// byte count.
+func feedGuard(t *testing.T, g *ccsGuard, _ []byte, chunk int) (int, error) {
 	t.Helper()
 
 	read := 0
 	buf := make([]byte, chunk)
-	for read < len(stream) {
+	for {
 		n, err := g.Read(buf)
 		read += n
 		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return read, nil
+			}
 			return read, err
 		}
-		if n == 0 {
-			return read, io.ErrNoProgress
-		}
 	}
-	return read, nil
 }
 
 func TestCCSGuardCountMechanism(t *testing.T) {
@@ -234,13 +237,6 @@ func TestDefaultCCSPolicyIsNotAnOutlier(t *testing.T) {
 // default is a donor running on a guess nobody remembers making, so a new one
 // fails the test below until someone either measures it or records why not.
 var donorsWithoutMeasurement = map[string]string{
-	// The probe host reaches these through tiredvpn0, so it would measure our
-	// own tunnel rather than the donor.
-	"github.com":                    "routes through tiredvpn0 from the measuring host",
-	"api.github.com":                "routes through tiredvpn0 from the measuring host",
-	"raw.githubusercontent.com":     "routes through tiredvpn0 from the measuring host",
-	"objects.githubusercontent.com": "routes through tiredvpn0 from the measuring host",
-
 	// In the SNI whitelist but outside the donor set REALITY actually draws
 	// from: derivePool picks the developer category and the fallback is the
 	// static Russian list, and none of these are in either. Measure them before
@@ -298,7 +294,7 @@ func TestEveryPoolDonorHasACCSEntry(t *testing.T) {
 func TestUnmeasuredDonorsFallBackDeliberately(t *testing.T) {
 	t.Parallel()
 
-	for _, sni := range []string{"github.com", "api.googleapis.com", "www.google.com", "not-a-real-host"} {
+	for _, sni := range []string{"api.googleapis.com", "www.google.com", "not-a-real-host"} {
 		if got := ccsPolicyFor(sni); got != defaultCCSPolicy {
 			t.Fatalf("%s: policy = %+v, want the default %+v", sni, got, defaultCCSPolicy)
 		}
@@ -355,3 +351,133 @@ func (c *scriptConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
 func (c *scriptConn) SetDeadline(time.Time) error      { return nil }
 func (c *scriptConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *scriptConn) SetWriteDeadline(time.Time) error { return nil }
+
+// TestCCSGuardSwallowsSurplusRecords is the part that makes the donor limits
+// reachable at all.
+//
+// crypto/tls stops at 16 consecutive useless records, which is below every
+// count donor we measured. If the guard only counted and passed everything up,
+// Go would cut at 17 and we would look stricter than yandex no matter what the
+// table said. So the surplus never reaches crypto/tls - and the first record
+// does, because under TLS 1.2 it is a real handshake message.
+func TestCCSGuardSwallowsSurplusRecords(t *testing.T) {
+	t.Parallel()
+
+	stream := repeat(ccsRecord, 20)
+	g := newCCSGuard(&scriptConn{data: stream}, "yandex.ru")
+
+	out := make([]byte, 0, len(stream))
+	buf := make([]byte, 64)
+	for {
+		n, err := g.Read(buf)
+		out = append(out, buf[:n]...)
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				t.Fatalf("read: %v", err)
+			}
+			break
+		}
+	}
+
+	if len(out) != len(ccsRecord) {
+		t.Fatalf("passed %d bytes up to crypto/tls, want exactly the first record (%d): "+
+			"anything more and Go's own limit of 16 fires before the donor's",
+			len(out), len(ccsRecord))
+	}
+	if string(out) != string(ccsRecord) {
+		t.Fatalf("the record that came through is not the first one: % x", out)
+	}
+	if len(out)/len(ccsRecord) > 16 {
+		t.Fatal("more records reached crypto/tls than its own limit tolerates")
+	}
+}
+
+// TestCCSGuardPassesRealRecordsThrough checks the filter only removes surplus
+// ChangeCipherSpec and leaves the handshake byte-for-byte intact. A filter that
+// corrupts the stream would break every connection rather than just probes.
+func TestCCSGuardPassesRealRecordsThrough(t *testing.T) {
+	t.Parallel()
+
+	hs := append([]byte{0x16, 0x03, 0x03, 0x00, 0x04}, 1, 2, 3, 4)
+	app := append([]byte{0x17, 0x03, 0x03, 0x00, 0x03}, 9, 9, 9)
+	stream := concat(hs, ccsRecord, ccsRecord, ccsRecord, app)
+	want := concat(hs, ccsRecord, app)
+
+	for _, chunk := range []int{1, 3, 7, 64} {
+		g := newCCSGuard(&scriptConn{data: stream, chunk: chunk}, "yandex.ru")
+		out := make([]byte, 0, len(stream))
+		buf := make([]byte, 64)
+		for {
+			n, err := g.Read(buf)
+			out = append(out, buf[:n]...)
+			if err != nil {
+				break
+			}
+		}
+		if string(out) != string(want) {
+			t.Fatalf("chunk %d: stream came through as % x, want % x", chunk, out, want)
+		}
+	}
+}
+
+// TestCCSGuardNoneMechanism covers the third kind of donor, found in the
+// re-measurement: both githubusercontent hosts took 1200 records in silence.
+func TestCCSGuardNoneMechanism(t *testing.T) {
+	t.Parallel()
+
+	if p := ccsPolicyFor("raw.githubusercontent.com"); p.Mechanism != ccsNone {
+		t.Fatalf("raw.githubusercontent.com policy = %+v, want the none mechanism", p)
+	}
+
+	stream := repeat(ccsRecord, 1200)
+	g := newCCSGuard(&scriptConn{data: stream}, "raw.githubusercontent.com")
+	if _, err := feedGuard(t, g, stream, 256); err != nil {
+		t.Fatalf("a donor with no limit was cut off after all: %v", err)
+	}
+}
+
+// TestCCSMechanismsAreIndependentOfKeyExchange guards the inference the data
+// invites and does not support. Both githubusercontent hosts happen to be the
+// hybrid ones and the unlimited ones, but that is one TLS terminator showing
+// two of its properties, not one setting. Fastly rolling out post-quantum would
+// move one column and not the other.
+func TestCCSMechanismsAreIndependentOfKeyExchange(t *testing.T) {
+	t.Parallel()
+
+	// The natural experiment inside GitHub: same organisation, two terminators.
+	for _, tc := range []struct {
+		sni  string
+		kx   keyExchange
+		mech ccsMechanism
+	}{
+		{"github.com", kxClassic, ccsCount},
+		{"api.github.com", kxClassic, ccsCount},
+		{"raw.githubusercontent.com", kxHybrid, ccsNone},
+		{"objects.githubusercontent.com", kxHybrid, ccsNone},
+	} {
+		prof := donorProfiles[tc.sni]
+		if prof.KeyExchange != tc.kx || prof.CCS.Mechanism != tc.mech {
+			t.Errorf("%s: got kx=%v mech=%v, want kx=%v mech=%v",
+				tc.sni, prof.KeyExchange, prof.CCS.Mechanism, tc.kx, tc.mech)
+		}
+	}
+
+	// And the columns must never be derived from each other: a classic donor
+	// with no limit, or a hybrid one with a count, has to be representable.
+	for sni, prof := range donorProfiles {
+		derived := prof.KeyExchange == kxHybrid && prof.CCS.Mechanism != ccsNone
+		_ = derived // both combinations are legal; this loop exists to state that
+		if prof.CCS.Mechanism == ccsUnmeasured && prof.KeyExchange == kxHybrid {
+			t.Errorf("%s: hybrid key exchange recorded without a CCS measurement - "+
+				"the columns are measured separately, not inferred from each other", sni)
+		}
+	}
+}
+
+func concat(parts ...[]byte) []byte {
+	var out []byte
+	for _, p := range parts {
+		out = append(out, p...)
+	}
+	return out
+}

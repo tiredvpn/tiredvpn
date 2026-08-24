@@ -29,6 +29,7 @@ type row struct {
 	timeoutMS  int
 	keyEx      string
 	confidence string
+	path       string
 	measuredAt string
 	note       string
 }
@@ -48,19 +49,28 @@ func main() {
 		fail(fmt.Errorf("donor-profiles.csv has no data rows"))
 	}
 
-	var rows []row
+	var rows, ourFronts []row
 	measuredAt := ""
 	for _, rec := range records[1:] {
-		if len(rec) < 8 {
-			fail(fmt.Errorf("row %q has %d fields, want 8", rec, len(rec)))
+		if len(rec) < 9 {
+			fail(fmt.Errorf("row %q has %d fields, want 9", rec, len(rec)))
 		}
 		r := row{
 			sni:        rec[0],
 			mechanism:  rec[1],
 			keyEx:      rec[4],
 			confidence: rec[5],
-			measuredAt: rec[6],
-			note:       rec[7],
+			path:       rec[6],
+			measuredAt: rec[7],
+			note:       rec[8],
+		}
+		// Rows naming an address rather than a hostname are measurements of our
+		// own fronts, kept in the same file as evidence. They are not donors -
+		// nobody sends SNI=90.156.221.98:995 - so they never enter the table
+		// the server looks names up in.
+		if strings.Contains(r.sni, ":") {
+			ourFronts = append(ourFronts, r)
+			continue
 		}
 		if r.ccsLimit, err = strconv.Atoi(rec[2]); err != nil {
 			fail(fmt.Errorf("%s: ccs_limit: %w", r.sni, err))
@@ -69,7 +79,7 @@ func main() {
 			fail(fmt.Errorf("%s: timeout_ms: %w", r.sni, err))
 		}
 		switch r.mechanism {
-		case "count", "timeout", "unmeasured":
+		case "count", "timeout", "none", "unmeasured":
 		default:
 			fail(fmt.Errorf("%s: unknown mechanism %q", r.sni, r.mechanism))
 		}
@@ -107,8 +117,19 @@ func main() {
 	fmt.Fprintf(&b, "// exchange it negotiates.\n")
 	fmt.Fprintf(&b, "var donorProfiles = map[string]donorProfile{\n")
 	for _, r := range rows {
-		fmt.Fprintf(&b, "\t// %s (confidence %s): %s\n", r.sni, r.confidence, r.note)
+		fmt.Fprintf(&b, "\t// %s (%s, confidence %s): %s\n", r.sni, r.path, r.confidence, r.note)
 		fmt.Fprintf(&b, "\t%q: {CCS: %s, KeyExchange: %s},\n", r.sni, ccsExpr(r), kxExpr(r.keyEx))
+	}
+	fmt.Fprintf(&b, "}\n\n")
+
+	// Our own fronts travel with the table as the "before" picture: what a
+	// prober saw of us at the same time it measured the donors.
+	fmt.Fprintf(&b, "// ourFrontCCSObserved is what the probe saw of our own fronts in the same\n")
+	fmt.Fprintf(&b, "// run. Not a lookup table - the server never matches on these - but the\n")
+	fmt.Fprintf(&b, "// record of what we looked like before the guard existed.\n")
+	fmt.Fprintf(&b, "var ourFrontCCSObserved = map[string]string{\n")
+	for _, r := range ourFronts {
+		fmt.Fprintf(&b, "\t%q: %q,\n", r.sni, r.note)
 	}
 	fmt.Fprintf(&b, "}\n")
 
@@ -127,6 +148,8 @@ func ccsExpr(r row) string {
 		return fmt.Sprintf("ccsPolicy{Mechanism: ccsCount, Limit: %d}", r.ccsLimit)
 	case "timeout":
 		return fmt.Sprintf("ccsPolicy{Mechanism: ccsTimeout, Timeout: %d * time.Millisecond}", r.timeoutMS)
+	case "none":
+		return "ccsPolicy{Mechanism: ccsNone}"
 	default:
 		return "ccsPolicy{Mechanism: ccsUnmeasured}"
 	}

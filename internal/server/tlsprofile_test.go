@@ -14,6 +14,7 @@ import (
 	"os"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -398,6 +399,11 @@ func readDonorCSV(path string) (map[string]donorProfile, error) {
 	}
 	out := map[string]donorProfile{}
 	for _, rec := range records[1:] {
+		// Rows naming an address are measurements of our own fronts, kept as
+		// evidence; the generator leaves them out of the donor table.
+		if strings.Contains(rec[0], ":") {
+			continue
+		}
 		limit, err := strconv.Atoi(rec[2])
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", rec[0], err)
@@ -412,6 +418,8 @@ func readDonorCSV(path string) (map[string]donorProfile, error) {
 			ccs = ccsPolicy{Mechanism: ccsCount, Limit: limit}
 		case "timeout":
 			ccs = ccsPolicy{Mechanism: ccsTimeout, Timeout: time.Duration(timeoutMS) * time.Millisecond}
+		case "none":
+			ccs = ccsPolicy{Mechanism: ccsNone}
 		case "unmeasured":
 			ccs = ccsPolicy{Mechanism: ccsUnmeasured}
 		default:

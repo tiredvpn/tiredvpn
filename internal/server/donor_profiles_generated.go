@@ -18,30 +18,40 @@ var donorProfilesMeasuredAt = time.Date(2026, time.August, 25, 0, 0, 0, 0, time.
 // ourselves as: how much ChangeCipherSpec it tolerates, and which key
 // exchange it negotiates.
 var donorProfiles = map[string]donorProfile{
-	// alfabank.ru (confidence medium): 34/38/34 at 40ms, 35 at 10ms - one outlier at 38, floor taken
+	// alfabank.ru (direct, confidence medium): 34/38/34 at 40ms, 35 at 10ms - one outlier at 38, floor taken
 	"alfabank.ru": {CCS: ccsPolicy{Mechanism: ccsCount, Limit: 34}, KeyExchange: kxClassic},
-	// api.github.com (confidence none): routes through tiredvpn0 - not measurable from this host
-	"api.github.com": {CCS: ccsPolicy{Mechanism: ccsUnmeasured}, KeyExchange: kxClassic},
-	// github.com (confidence none): routes through tiredvpn0 from the measuring host - probe measures our own tunnel, not the donor
-	"github.com": {CCS: ccsPolicy{Mechanism: ccsUnmeasured}, KeyExchange: kxClassic},
-	// gosuslugi.ru (confidence high): no count limit: 247 at 40ms (9.9s) but 400 at 10ms - time-based
+	// api.github.com (routing-bypass, confidence high): 36/36/36 at 40ms, 42 at 10ms - count-based; temporary /32 route around tiredvpn0
+	"api.github.com": {CCS: ccsPolicy{Mechanism: ccsCount, Limit: 36}, KeyExchange: kxClassic},
+	// github.com (routing-bypass, confidence high): 36/36/36 at 40ms, 42 at 10ms - count-based; measured with a temporary /32 route around tiredvpn0
+	"github.com": {CCS: ccsPolicy{Mechanism: ccsCount, Limit: 36}, KeyExchange: kxClassic},
+	// gosuslugi.ru (direct, confidence high): no count limit: 247 at 40ms (9.9s) but 400 at 10ms - time-based
 	"gosuslugi.ru": {CCS: ccsPolicy{Mechanism: ccsTimeout, Timeout: 9500 * time.Millisecond}, KeyExchange: kxClassic},
-	// mail.ru (confidence high): 2 on four consecutive runs, 3 at 10ms; TLS 1.2 donor, CCS is a real protocol message there not middlebox compat
+	// mail.ru (direct, confidence high): 2 on four consecutive runs, 3 at 10ms; TLS 1.2 donor, CCS is a real protocol message there not middlebox compat
 	"mail.ru": {CCS: ccsPolicy{Mechanism: ccsCount, Limit: 2}, KeyExchange: kxClassic},
-	// objects.githubusercontent.com (confidence none): routes through tiredvpn0 - not measurable from this host
-	"objects.githubusercontent.com": {CCS: ccsPolicy{Mechanism: ccsUnmeasured}, KeyExchange: kxHybrid},
-	// raw.githubusercontent.com (confidence none): routes through tiredvpn0 - not measurable from this host
-	"raw.githubusercontent.com": {CCS: ccsPolicy{Mechanism: ccsUnmeasured}, KeyExchange: kxHybrid},
-	// sberbank.ru (confidence high): no count limit: 240 at 40ms (9.6s) but 400 at 10ms (4.0s) - cuts on elapsed handshake time near 10s
+	// objects.githubusercontent.com (routing-bypass, confidence high): no limit of either kind: 400 at both 40ms and 10ms; Fastly, same infrastructure as raw
+	"objects.githubusercontent.com": {CCS: ccsPolicy{Mechanism: ccsNone}, KeyExchange: kxHybrid},
+	// raw.githubusercontent.com (routing-bypass, confidence high): no limit of either kind: 1200 records over 48s accepted without an alert; Fastly
+	"raw.githubusercontent.com": {CCS: ccsPolicy{Mechanism: ccsNone}, KeyExchange: kxHybrid},
+	// sberbank.ru (direct, confidence high): no count limit: 240 at 40ms (9.6s) but 400 at 10ms (4.0s) - cuts on elapsed handshake time near 10s
 	"sberbank.ru": {CCS: ccsPolicy{Mechanism: ccsTimeout, Timeout: 9500 * time.Millisecond}, KeyExchange: kxClassic},
-	// tinkoff.ru (confidence high): 34/34/34 at 40ms and 10ms - count-based
+	// tinkoff.ru (direct, confidence high): 34/34/34 at 40ms and 10ms - count-based
 	"tinkoff.ru": {CCS: ccsPolicy{Mechanism: ccsCount, Limit: 34}, KeyExchange: kxClassic},
-	// vk.com (confidence high): 34/34/35 at 40ms, 36 at 10ms - count-based
+	// vk.com (direct, confidence high): 34/34/35 at 40ms, 36 at 10ms - count-based
 	"vk.com": {CCS: ccsPolicy{Mechanism: ccsCount, Limit: 34}, KeyExchange: kxClassic},
-	// vtb.ru (confidence high): no count limit: 248/249 at 40ms but 400 at 10ms - time-based
+	// vtb.ru (direct, confidence high): no count limit: 248/249 at 40ms but 400 at 10ms - time-based
 	"vtb.ru": {CCS: ccsPolicy{Mechanism: ccsTimeout, Timeout: 9500 * time.Millisecond}, KeyExchange: kxClassic},
-	// ya.ru (confidence high): stable 33/33/33 at 40ms, 34 at 10ms - count-based
+	// ya.ru (direct, confidence high): 33/33/33 at 40ms, 34 at 10ms - count-based
 	"ya.ru": {CCS: ccsPolicy{Mechanism: ccsCount, Limit: 33}, KeyExchange: kxClassic},
-	// yandex.ru (confidence high): stable 33/33/33 at 40ms and 33/34 at 10ms - count-based
+	// yandex.ru (direct, confidence high): 33/33/33 at 40ms and 33/34 at 10ms - count-based
 	"yandex.ru": {CCS: ccsPolicy{Mechanism: ccsCount, Limit: 33}, KeyExchange: kxClassic},
+}
+
+// ourFrontCCSObserved is what the probe saw of our own fronts in the same
+// run. Not a lookup table - the server never matches on these - but the
+// record of what we looked like before the guard existed.
+var ourFrontCCSObserved = map[string]string{
+	"90.156.221.98:995": "OUR FRONT Dubai - no limit of either kind: 1200 records over 48s accepted",
+	"38.54.6.76:443":    "OUR FRONT USA - 400 at both pauses, no limit found",
+	"38.54.6.152:995":   "OUR FRONT USA2 - 400 at both pauses, no limit found",
+	"31.44.3.165:995":   "OUR FRONT AMS - no direct path from the measuring host; SOCKS would route through our own tunnel and reproduce the confound that invalidated the first GitHub numbers",
 }
