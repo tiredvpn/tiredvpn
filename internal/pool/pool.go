@@ -153,6 +153,18 @@ func (p *TunnelPool) DialTarget(ctx context.Context, targetAddr string) (*Pooled
 			return nil, ErrServerRejected
 		}
 
+		// The preamble is over: target address sent, ack received. Everything
+		// from here is payload, which is the only part burst reshaping may
+		// touch - see internal/strategy/burst_reshape.go. Off by default, in
+		// which case this returns the conn unchanged.
+		// Asked for as a capability rather than widened into Connector, so the
+		// test fakes that implement Connector keep compiling.
+		if bc, ok := p.manager.(interface {
+			BurstReshape() strategy.BurstReshapeConfig
+		}); ok {
+			serverConn.Conn = strategy.ReshapeClientStream(serverConn.Conn, bc.BurstReshape())
+		}
+
 		serverConn.SetReadDeadline(time.Time{})
 		serverConn.SetWriteDeadline(time.Time{})
 		if attempt > 1 {

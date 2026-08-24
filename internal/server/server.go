@@ -2820,6 +2820,17 @@ func handleProtocolConfusion(conn net.Conn, srvCtx *serverContext, logger *log.L
 	// the ack synchronously to the kernel send buffer.
 	conn = ktls.TryEnable(conn, "tired-confusion")
 
+	// Burst reshaping wraps the payload phase only: the mode byte, the target
+	// address and the success ack above are this tunnel's own control preamble,
+	// and a reshaper that sees them mistakes the one-byte mode read for the
+	// client's first application burst and holds the ack behind a nudge.
+	//
+	// With the feature off this returns conn unchanged, so the kTLS/splice fast
+	// path below is untouched in the default configuration. With it on the
+	// wrapper stays in the path and that fast path is given up - the exchange
+	// needs to see the first write in each direction, which splice would hide.
+	conn = strategy.ReshapeServerStream(conn, burstReshapeConfig(srvCtx.cfg))
+
 	// Relay data
 	var wg sync.WaitGroup
 	var bytesUp, bytesDown int64
