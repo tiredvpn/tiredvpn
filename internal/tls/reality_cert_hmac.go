@@ -1,25 +1,18 @@
 package tls
 
 import (
-	"crypto"
-	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/hkdf"
 	"crypto/hmac"
-	"crypto/rand"
 	"crypto/sha512"
+	stdtls "crypto/tls"
 	"crypto/x509"
-	"crypto/x509/pkix"
 	"errors"
 	"fmt"
-	"math/big"
-	"sync"
-	"time"
 )
 
 // cert-HMAC: proving the server to the client for zero extra packets.
 //
-// Our certificate is self-signed and no client builds a chain for it, so the
+// The certificate is self-signed and no client builds a chain for it, so the
 // signature field is dead weight — nobody reads it. We put a MAC there instead,
 // keyed with the connection's authKey, which only the holder of the server's
 // static X25519 key can derive. The client checks it inside
@@ -46,12 +39,19 @@ import (
 // still checks it against the SPKI in the certificate, so the key pair has to be
 // genuine. Only the signature field is ours to use.
 //
-// # Why ECDSA P-256 and not Ed25519
+// # Why the signature field and not an extension
+//
+// An X.509 extension carrying 64 opaque bytes under a private OID is a thing no
+// real certificate has. It rides inside the encrypted flight so no passive
+// observer sees it, but anything that terminates TLS does, and it costs bytes.
+// The signature field costs nothing and is already 64-ish bytes of
+// high-entropy data in every certificate ever issued.
+//
+// # Why ECDSA and not Ed25519
 //
 // The reference implementation uses Ed25519, and the obvious reason to copy it
 // is that an Ed25519 signature is a fixed 64-byte tail, trivial to overwrite.
-// It does not work here, and the reason is worth writing down because it is
-// invisible until you run it.
+// It does not work here, and the reason is invisible until you run it.
 //
 // No browser advertises Ed25519 in signature_algorithms — not Chrome, not
 // Firefox, not Safari, and so not any uTLS profile that parrots them. A
@@ -63,29 +63,14 @@ import (
 // (.ref/REALITY/handshake_server_tls13.go:164), skipping the check.
 //
 // Making our client advertise Ed25519 would fix the handshake and break the
-// point of the client: signature_algorithms is part of JA3 and JA4, so we would
-// no longer match the browser we are imitating.
+// point of the client: signature_algorithms is part of JA3 and JA4.
 //
 // ECDSA P-256 is advertised by every profile we ship. Its signature is
-// variable-length DER rather than a fixed tail, which costs us nothing: the
-// signature is still the last field of the certificate, so the blank records
-// its length at mint time and the overlay writes exactly that many bytes.
+// variable-length DER rather than a fixed tail, which costs us only that the
+// length has to be read rather than assumed.
 
-const (
-	// certMACInfo separates the certificate MAC from every other use of authKey.
-	certMACInfo = "tiredvpn-reality-cert-v1"
-
-	// certBlankTTL bounds how long a cached blank is reused. The certificate
-	// carries validity dates, so a blank that lived for months would start
-	// handing out a NotBefore far in the past — harmless for us, since nobody
-	// validates the chain, but a needless oddity for anyone looking.
-	certBlankTTL = 12 * time.Hour
-
-	// certBlankCacheMax bounds the cache. The donor pool is a handful of
-	// domains, so this is hygiene rather than a real limit: it keeps a peer that
-	// can drive SNI variety from growing the map without bound.
-	certBlankCacheMax = 64
-)
+// certMACInfo separates the certificate MAC from every other use of authKey.
+const certMACInfo = "tiredvpn-reality-cert-v1"
 
 var (
 	// ErrCertNone reports an empty certificate list.
@@ -94,96 +79,11 @@ var (
 	// ErrCertHMACMismatch reports a peer certificate whose signature field does
 	// not carry our MAC. The peer does not hold the server's static key.
 	ErrCertHMACMismatch = errors.New("reality cert: certificate HMAC mismatch")
+
+	// ErrCertNoLeaf reports a certificate handed to the overlay without its
+	// parsed leaf, which the overlay needs to locate the signature.
+	ErrCertNoLeaf = errors.New("reality cert: certificate has no parsed leaf")
 )
-
-// CertBlank is a minted certificate template for one SNI, reusable across
-// connections. Everything in it is fixed except the signature field, which each
-// connection overwrites with its own MAC.
-//
-// Minting costs a key generation and a DER encode, so blanks are cached; the
-// per-connection work is one HMAC and one copy.
-type CertBlank struct {
-	// der holds the full certificate with its genuine signature. Connections
-	// never see this copy.
-	der []byte
-
-	// spki is the certificate's SubjectPublicKeyInfo, the MAC message. Taken
-	// from the parsed certificate rather than re-marshalled from the key, so
-	// the server and the client are provably hashing the same bytes.
-	spki []byte
-
-	// sigLen is the length of the signature field, which for ECDSA varies.
-	sigLen int
-
-	// priv signs CertificateVerify during the handshake. This one has to be
-	// genuine — the client checks it against the SPKI above.
-	priv crypto.Signer
-
-	mintedAt time.Time
-}
-
-// PrivateKey returns the key that signs CertificateVerify. It belongs in the
-// tls.Certificate handed back from GetCertificate.
-func (b *CertBlank) PrivateKey() crypto.Signer { return b.priv }
-
-// NewCertBlank mints a self-signed ECDSA P-256 leaf for sni.
-//
-// The certificate is deliberately unremarkable: a leaf with the SNI as its
-// common name and SAN, a random serial, and a validity window that looks like
-// something an automated issuer would produce.
-func NewCertBlank(sni string) (*CertBlank, error) {
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, fmt.Errorf("reality cert: generate key: %w", err)
-	}
-
-	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
-	if err != nil {
-		return nil, fmt.Errorf("reality cert: serial: %w", err)
-	}
-
-	now := time.Now()
-	tmpl := &x509.Certificate{
-		SerialNumber:          serial,
-		Subject:               pkix.Name{CommonName: sni},
-		DNSNames:              []string{sni},
-		NotBefore:             now.Add(-24 * time.Hour),
-		NotAfter:              now.Add(90 * 24 * time.Hour),
-		KeyUsage:              x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-	}
-
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, priv.Public(), priv)
-	if err != nil {
-		return nil, fmt.Errorf("reality cert: create certificate: %w", err)
-	}
-
-	parsed, err := x509.ParseCertificate(der)
-	if err != nil {
-		return nil, fmt.Errorf("reality cert: reparse minted certificate: %w", err)
-	}
-
-	// signatureValue is the last field of the Certificate SEQUENCE, so it is
-	// the tail of the DER. Check it rather than assume it: if a future Go
-	// changes the encoding, this fails at mint time instead of producing
-	// certificates that silently fail to authenticate.
-	sigLen := len(parsed.Signature)
-	if sigLen == 0 || sigLen > len(der) {
-		return nil, fmt.Errorf("reality cert: implausible signature length %d", sigLen)
-	}
-	if !hmac.Equal(parsed.Signature, der[len(der)-sigLen:]) {
-		return nil, errors.New("reality cert: signature is not the DER tail, cannot overwrite in place")
-	}
-
-	return &CertBlank{
-		der:      der,
-		spki:     parsed.RawSubjectPublicKeyInfo,
-		sigLen:   sigLen,
-		priv:     priv,
-		mintedAt: now,
-	}, nil
-}
 
 // certMAC derives the bytes that go in the signature field: HMAC-SHA512 over
 // the certificate's SubjectPublicKeyInfo, expanded to the signature's length.
@@ -203,21 +103,73 @@ func certMAC(authKey, spki []byte, n int) ([]byte, error) {
 	return out, nil
 }
 
-// WithAuthHMAC returns a fresh DER for one connection, with the signature field
-// replaced by the connection's MAC.
+// CertHMACOverlay returns a per-connection copy of cert with the signature
+// field replaced by the connection's MAC.
 //
-// The blank is never mutated: two connections to the same SNI must get
-// certificates that differ in the signature and match everywhere else, and a
-// shared buffer would make them race instead.
-func (b *CertBlank) WithAuthHMAC(authKey []byte) ([]byte, error) {
-	mac, err := certMAC(authKey, b.spki, b.sigLen)
+// It takes a minted certificate rather than minting one, so the expensive part
+// — key generation and DER encoding — stays cached per SNI by whoever owns the
+// minting, and the per-connection cost is one HMAC and one copy.
+//
+// cert.Leaf must be set. The server's minter parses the certificate back after
+// creating it anyway, so this costs nothing there, and it saves a parse on
+// every single connection.
+//
+// The input is never mutated: two connections to one SNI share a cached
+// certificate, and writing into it would both race and make their signatures
+// identical.
+func CertHMACOverlay(cert *stdtls.Certificate, authKey []byte) (*stdtls.Certificate, error) {
+	if cert == nil || len(cert.Certificate) == 0 {
+		return nil, ErrCertNone
+	}
+	if cert.Leaf == nil {
+		return nil, ErrCertNoLeaf
+	}
+
+	der := cert.Certificate[0]
+	sigLen := len(cert.Leaf.Signature)
+	if sigLen == 0 || sigLen > len(der) {
+		return nil, fmt.Errorf("reality cert: implausible signature length %d", sigLen)
+	}
+	// signatureValue is the last field of the Certificate SEQUENCE, so it is the
+	// tail of the DER. Checked rather than assumed: if this ever stops holding,
+	// it fails here instead of producing certificates that silently fail to
+	// authenticate.
+	if !hmac.Equal(cert.Leaf.Signature, der[len(der)-sigLen:]) {
+		return nil, errors.New("reality cert: signature is not the DER tail, cannot overwrite in place")
+	}
+
+	mac, err := certMAC(authKey, cert.Leaf.RawSubjectPublicKeyInfo, sigLen)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]byte, len(b.der))
-	copy(out, b.der)
-	copy(out[len(out)-b.sigLen:], mac)
-	return out, nil
+
+	out := make([]byte, len(der))
+	copy(out, der)
+	copy(out[len(out)-sigLen:], mac)
+
+	// Only the leaf is replaced; the private key and any chain carry over.
+	chain := make([][]byte, len(cert.Certificate))
+	copy(chain, cert.Certificate)
+	chain[0] = out
+
+	// Re-parse rather than carrying the original leaf over. Carrying it would
+	// leave a Leaf whose Signature disagrees with the bytes on the wire — a trap
+	// for anyone who later compares the two, in exchange for saving a parse that
+	// costs microseconds against the key generation this whole function exists
+	// to avoid repeating.
+	leaf, err := x509.ParseCertificate(out)
+	if err != nil {
+		return nil, fmt.Errorf("reality cert: reparse after overlay: %w", err)
+	}
+
+	return &stdtls.Certificate{
+		Certificate:                  chain,
+		PrivateKey:                   cert.PrivateKey,
+		Leaf:                         leaf,
+		SupportedSignatureAlgorithms: cert.SupportedSignatureAlgorithms,
+		OCSPStaple:                   cert.OCSPStaple,
+		SignedCertificateTimestamps:  cert.SignedCertificateTimestamps,
+	}, nil
 }
 
 // VerifyCertHMAC is the client's check, for use inside
@@ -250,80 +202,4 @@ func VerifyCertHMAC(rawCerts [][]byte, authKey []byte) error {
 		return ErrCertHMACMismatch
 	}
 	return nil
-}
-
-// CertBlankCache hands out blanks by SNI, minting on miss.
-//
-// The certificate now depends on the connection's authKey, not only on the SNI,
-// so a cache of finished certificates is no longer possible. What stays
-// cacheable is the blank — the expensive part, a key generation plus a DER
-// encode — while the per-connection work drops to one HMAC.
-//
-// Safe for concurrent use.
-type CertBlankCache struct {
-	ttl int64 // nanoseconds; 0 selects certBlankTTL
-
-	mu     sync.Mutex
-	blanks map[string]*CertBlank
-	mints  int64
-}
-
-// NewCertBlankCache returns an empty cache.
-func NewCertBlankCache() *CertBlankCache {
-	return &CertBlankCache{blanks: make(map[string]*CertBlank)}
-}
-
-// Get returns the blank for sni, minting one if there is no live entry.
-func (c *CertBlankCache) Get(sni string) (*CertBlank, error) {
-	ttl := certBlankTTL
-	if c.ttl > 0 {
-		ttl = time.Duration(c.ttl)
-	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if b, ok := c.blanks[sni]; ok && time.Since(b.mintedAt) < ttl {
-		return b, nil
-	}
-
-	// Minting happens under the lock. It costs a key generation, so two
-	// concurrent first connections to one SNI would otherwise mint twice and
-	// hand out certificates that differ in more than the signature — which is
-	// exactly the property the client and any observer can check.
-	b, err := NewCertBlank(sni)
-	if err != nil {
-		return nil, err
-	}
-
-	if len(c.blanks) >= certBlankCacheMax {
-		c.evictOldestLocked()
-	}
-	c.blanks[sni] = b
-	c.mints++
-	return b, nil
-}
-
-// Mints reports how many certificates have been minted. Exposed for tests and
-// for a metric: mints should track distinct SNIs, not connections.
-func (c *CertBlankCache) Mints() int64 {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.mints
-}
-
-// evictOldestLocked drops the least recently minted entry. Callers hold mu.
-func (c *CertBlankCache) evictOldestLocked() {
-	var (
-		oldestKey string
-		oldest    time.Time
-	)
-	for sni, b := range c.blanks {
-		if oldestKey == "" || b.mintedAt.Before(oldest) {
-			oldestKey, oldest = sni, b.mintedAt
-		}
-	}
-	if oldestKey != "" {
-		delete(c.blanks, oldestKey)
-	}
 }

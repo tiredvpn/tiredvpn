@@ -5,9 +5,12 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"fmt"
+	"net"
 	"slices"
 	"testing"
 	"time"
+
+	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 )
 
 func TestMintLeafCertificateShape(t *testing.T) {
@@ -162,13 +165,27 @@ func TestCertMinterEvictsOldest(t *testing.T) {
 	}
 }
 
+// gatedHello builds a ClientHelloInfo whose connection carries an auth key, the
+// way handleREALITYB1 does. Without one the certificate has no MAC key and
+// GetCertificate refuses — which is the point: only a client that passed the
+// gate gets a certificate.
+func gatedHello(t *testing.T, sni string) *tls.ClientHelloInfo {
+	t.Helper()
+	local, remote := net.Pipe()
+	t.Cleanup(func() { _ = local.Close(); _ = remote.Close() })
+	return &tls.ClientHelloInfo{
+		ServerName: sni,
+		Conn:       customtls.NewAuthConn(local, testB1AuthKey),
+	}
+}
+
 func TestCertForSNIFallsBackToCoverDomain(t *testing.T) {
 	t.Parallel()
 
 	m := newCertMinter()
 	cfg := b1TLSConfig(m, "www.microsoft.com")
 
-	cert, err := cfg.GetCertificate(&tls.ClientHelloInfo{ServerName: ""})
+	cert, err := cfg.GetCertificate(gatedHello(t, ""))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +195,7 @@ func TestCertForSNIFallsBackToCoverDomain(t *testing.T) {
 
 	// With no cover domain configured we still have to answer with something:
 	// failing the handshake would itself be a behaviour worth noticing.
-	cert, err = b1TLSConfig(newCertMinter(), "").GetCertificate(&tls.ClientHelloInfo{ServerName: ""})
+	cert, err = b1TLSConfig(newCertMinter(), "").GetCertificate(gatedHello(t, ""))
 	if err != nil {
 		t.Fatal(err)
 	}

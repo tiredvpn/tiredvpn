@@ -75,37 +75,25 @@ func AuthKeyFromConn(c net.Conn) ([]byte, error) {
 	return nil, ErrNoConnAuthKey
 }
 
-// CertificateForHello mints the certificate for one connection, for use as the
-// body of tls.Config.GetCertificate.
+// CertificateForHello applies the per-connection MAC to a minted certificate,
+// for use as the body of tls.Config.GetCertificate.
 //
-// It takes the SNI and the blank cache, and recovers the authKey from
-// chi.Conn. Both fields of the returned certificate matter: the DER carries our
-// MAC in its signature field, and the private key signs CertificateVerify,
-// which the client does check against the certificate's public key.
+// mint supplies the certificate for the name — normally a cache keyed by SNI,
+// since the expensive part is key generation and DER encoding and none of it
+// depends on the connection. Only the signature field does, and that is what
+// the overlay replaces.
 //
-// Certificate selection policy — which SNI to mint for when the client's is not
-// one we serve — is deliberately not decided here. That is the server's call
-// and it interacts with the donor fallback.
-func CertificateForHello(cache *CertBlankCache, chi *stdtls.ClientHelloInfo, sni string) (*stdtls.Certificate, error) {
+// Certificate selection policy — which name to mint for when the client's SNI
+// is not one we serve — stays with the caller. It interacts with the donor
+// fallback and is not this layer's call.
+func CertificateForHello(chi *stdtls.ClientHelloInfo, sni string, mint func(string) (*stdtls.Certificate, error)) (*stdtls.Certificate, error) {
 	authKey, err := AuthKeyFromConn(chi.Conn)
 	if err != nil {
 		return nil, err
 	}
-	return CertificateFor(cache, sni, authKey)
-}
-
-// CertificateFor assembles the per-connection certificate from a cached blank.
-func CertificateFor(cache *CertBlankCache, sni string, authKey []byte) (*stdtls.Certificate, error) {
-	blank, err := cache.Get(sni)
+	cert, err := mint(sni)
 	if err != nil {
 		return nil, err
 	}
-	der, err := blank.WithAuthHMAC(authKey)
-	if err != nil {
-		return nil, err
-	}
-	return &stdtls.Certificate{
-		Certificate: [][]byte{der},
-		PrivateKey:  blank.PrivateKey(),
-	}, nil
+	return CertHMACOverlay(cert, authKey)
 }

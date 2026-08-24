@@ -53,7 +53,11 @@ func b1TLSConfig(minter *certMinter, coverDomain string) *tls.Config {
 					name = defaultCertName
 				}
 			}
-			return minter.certForSNI(name)
+			// The certificate's signature field carries the MAC that proves this
+			// server to the client (cert-HMAC, task 011). The minted certificate
+			// stays cached per SNI; only the signature is per connection, and the
+			// key for it rides on the connection from the gate.
+			return customtls.CertificateForHello(chi, name, minter.certForSNI)
 		},
 		// Session tickets stay on: a real server issues them, and a server that
 		// never does is a server that stands out.
@@ -89,11 +93,27 @@ func b1TLSFor(srvCtx *serverContext) (*tls.Config, *certMinter) {
 // crypto/tls reads the same bytes the gate already inspected - the same
 // mechanism the plain TLS path uses.
 func handleREALITYB1(conn net.Conn, peekBuf []byte, clientID string, secret []byte, srvCtx *serverContext, logger *log.Logger) {
-	_ = peekBuf // replayed through conn; kept in the signature for stream B
-
 	cfg, _ := b1TLSFor(srvCtx)
 
-	tlsConn := tls.Server(conn, cfg)
+	// Derive the connection's auth key and carry it on the connection so
+	// GetCertificate can reach it. It cannot derive the key itself: the callback
+	// receives a *tls.ClientHelloInfo, which has the parsed SNI but neither the
+	// raw ClientHello nor the client's key share.
+	//
+	// This repeats the X25519 the gate already did. One curve operation against
+	// a full TLS handshake is not worth threading the value out of the gate and
+	// widening its signature for.
+	authKey, err := b1AuthKey(peekBuf)
+	if err != nil {
+		// The gate accepted this ClientHello moments ago, so failing here means
+		// the buffer changed under us. Close without a reply, like every other
+		// rejection on this path.
+		logger.Debug("REALITY B1: auth key derivation failed for %s: %v", clientID, err)
+		_ = conn.Close()
+		return
+	}
+
+	tlsConn := tls.Server(customtls.NewAuthConn(conn, authKey), cfg)
 	if err := tlsConn.Handshake(); err != nil {
 		// No alert, no reset with a distinguishing shape: just close. A failed
 		// handshake here is either a broken client or someone who stole a
@@ -129,8 +149,12 @@ func handleREALITYB1(conn net.Conn, peekBuf []byte, clientID string, secret []by
 		return
 	}
 
-	if err := customtls.WriteServerBinding(tlsConn, secret, ekm, time.Now()); err != nil {
-		logger.Debug("REALITY B1: binding write failed: %v", err)
+	// One-way clock hint. The client does not wait for it: proving this server
+	// to the client is cert-HMAC's job and it already happened inside the
+	// handshake, so making this synchronous would cost a round trip on every
+	// CONNECT for a value that only matters to the client's next connection.
+	if err := customtls.WriteServerTime(tlsConn, time.Now()); err != nil {
+		logger.Debug("REALITY B1: server time write failed: %v", err)
 		return
 	}
 
@@ -158,4 +182,26 @@ func handleREALITYB1(conn net.Conn, peekBuf []byte, clientID string, secret []by
 		}
 		go handleRawTunnel(stream, srvCtx, logger, clientID)
 	}
+}
+
+// b1AuthKey derives the connection's authentication key from the peeked
+// ClientHello: X25519 between the server's static key and the client's key
+// share, then HKDF salted with the ClientHello random. It is the same value the
+// gate derived to open session_id, and the same one the client holds.
+func b1AuthKey(peekBuf []byte) ([]byte, error) {
+	if len(peekBuf) <= tlsRecordHeaderLen {
+		return nil, customtls.ErrHelloTruncated
+	}
+	helloRaw := peekBuf[tlsRecordHeaderLen:]
+
+	peerPub, err := customtls.ExtractPeerX25519(helloRaw)
+	if err != nil {
+		return nil, err
+	}
+	random, err := helloRandom(helloRaw)
+	if err != nil {
+		return nil, err
+	}
+	serverPriv, _ := realityStaticKeys()
+	return customtls.ServerAuthKey(serverPriv[:], peerPub, random)
 }

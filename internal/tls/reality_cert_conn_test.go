@@ -105,12 +105,20 @@ type cyclicConn struct {
 
 func (c *cyclicConn) Unwrap() net.Conn { return c.next }
 
-// TestCertificateForHelloEndToEnd runs the server side the way task 006 will
-// wire it: the gate wraps the connection with the authKey, GetCertificate
-// recovers it, and a client verifies the resulting certificate.
+// TestCertificateForHelloEndToEnd runs the server side the way task 006 wires
+// it: the gate wraps the connection with the authKey, GetCertificate recovers
+// it and applies the MAC to a cached certificate, and a client verifies it.
 func TestCertificateForHelloEndToEnd(t *testing.T) {
-	cache := NewCertBlankCache()
 	authKey := testAuthKey(t)
+	cert := mintTestCert(t, "github.com")
+
+	// Stands in for the server's per-SNI cache: minting happens once, the
+	// overlay happens per connection.
+	mints := 0
+	mint := func(string) (*stdtls.Certificate, error) {
+		mints++
+		return cert, nil
+	}
 
 	clientConn, serverConn := connPair(t)
 
@@ -120,7 +128,7 @@ func TestCertificateForHelloEndToEnd(t *testing.T) {
 	serverCfg := &stdtls.Config{
 		MinVersion: stdtls.VersionTLS13,
 		GetCertificate: func(chi *stdtls.ClientHelloInfo) (*stdtls.Certificate, error) {
-			return CertificateForHello(cache, chi, chi.ServerName)
+			return CertificateForHello(chi, chi.ServerName, mint)
 		},
 	}
 
@@ -145,57 +153,67 @@ func TestCertificateForHelloEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handshake through the conn-carried auth key: %v", err)
 	}
-	if cache.Mints() != 1 {
-		t.Fatalf("minted %d certificates for one SNI, want 1", cache.Mints())
+	if mints != 1 {
+		t.Fatalf("minted %d times for one connection, want 1", mints)
 	}
 }
 
 // TestCertificateForHelloRefusesUngatedConnection is the property worth having:
-// a connection that never passed the session_id gate must not get a
-// certificate at all, rather than one minted under some default key.
+// a connection that never passed the session_id gate must not get a certificate
+// at all, rather than one minted under some default key.
 func TestCertificateForHelloRefusesUngatedConnection(t *testing.T) {
-	cache := NewCertBlankCache()
 	base, other := net.Pipe()
 	defer base.Close()
 	defer other.Close()
 
-	_, err := CertificateForHello(cache, &stdtls.ClientHelloInfo{Conn: base}, "github.com")
+	minted := false
+	mint := func(string) (*stdtls.Certificate, error) {
+		minted = true
+		return mintTestCert(t, "github.com"), nil
+	}
+
+	_, err := CertificateForHello(&stdtls.ClientHelloInfo{Conn: base}, "github.com", mint)
 	if !errors.Is(err, ErrNoConnAuthKey) {
 		t.Fatalf("err = %v, want ErrNoConnAuthKey", err)
 	}
-	if cache.Mints() != 0 {
+	if minted {
 		t.Fatal("minted a certificate for a connection that never authenticated")
 	}
 }
 
-func TestCertificateForSetsBothFields(t *testing.T) {
-	cache := NewCertBlankCache()
-	cert, err := CertificateFor(cache, "github.com", testAuthKey(t))
+// TestCertHMACOverlayKeepsThePrivateKey guards the mistake that would look fine
+// and then fail at CertificateVerify: dropping the key while replacing the DER.
+func TestCertHMACOverlayKeepsThePrivateKey(t *testing.T) {
+	cert := mintTestCert(t, "github.com")
+	out, err := CertHMACOverlay(cert, testAuthKey(t))
 	if err != nil {
-		t.Fatalf("CertificateFor: %v", err)
+		t.Fatalf("CertHMACOverlay: %v", err)
 	}
-	if len(cert.Certificate) != 1 || len(cert.Certificate[0]) == 0 {
-		t.Fatal("certificate DER missing")
-	}
-	if cert.PrivateKey == nil {
-		t.Fatal("private key missing; CertificateVerify would fail and the handshake with it")
+	if out.PrivateKey == nil {
+		t.Fatal("private key dropped; the handshake would die at CertificateVerify")
 	}
 
-	// The private key must match the certificate, or the client's
-	// CertificateVerify check fails and takes the handshake with it.
-	parsed, err := x509.ParseCertificate(cert.Certificate[0])
+	signer, ok := out.PrivateKey.(crypto.Signer)
+	if !ok {
+		t.Fatalf("private key is not a crypto.Signer: %T", out.PrivateKey)
+	}
+	parsed, err := x509.ParseCertificate(out.Certificate[0])
 	if err != nil {
 		t.Fatalf("ParseCertificate: %v", err)
-	}
-	signer, ok := cert.PrivateKey.(crypto.Signer)
-	if !ok {
-		t.Fatalf("private key is not a crypto.Signer: %T", cert.PrivateKey)
 	}
 	certPub, ok := parsed.PublicKey.(*ecdsa.PublicKey)
 	if !ok {
 		t.Fatalf("certificate public key is %T, want *ecdsa.PublicKey", parsed.PublicKey)
 	}
 	if !certPub.Equal(signer.Public()) {
-		t.Fatal("private key does not match the certificate")
+		t.Fatal("private key does not match the certificate after the overlay")
+	}
+}
+
+func TestCertHMACOverlayRequiresLeaf(t *testing.T) {
+	cert := mintTestCert(t, "github.com")
+	cert.Leaf = nil
+	if _, err := CertHMACOverlay(cert, testAuthKey(t)); !errors.Is(err, ErrCertNoLeaf) {
+		t.Fatalf("err = %v, want ErrCertNoLeaf", err)
 	}
 }

@@ -13,21 +13,49 @@ import (
 	"errors"
 	"math/big"
 	"net"
-	"sync"
 	"testing"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
 )
 
-// mustCert is WithAuthHMAC with the test's error handling.
-func mustCert(t *testing.T, b *CertBlank, authKey []byte) []byte {
+// mintTestCert produces the kind of certificate the server's minter caches: a
+// self-signed ECDSA P-256 leaf with Leaf populated.
+func mintTestCert(t *testing.T, sni string) *stdtls.Certificate {
 	t.Helper()
-	der, err := b.WithAuthHMAC(authKey)
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		t.Fatalf("WithAuthHMAC: %v", err)
+		t.Fatalf("GenerateKey: %v", err)
 	}
-	return der
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: sni},
+		DNSNames:     []string{sni},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, key.Public(), key)
+	if err != nil {
+		t.Fatalf("CreateCertificate: %v", err)
+	}
+	leaf, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("ParseCertificate: %v", err)
+	}
+	return &stdtls.Certificate{Certificate: [][]byte{der}, PrivateKey: key, Leaf: leaf}
+}
+
+// mustOverlay is CertHMACOverlay with the test's error handling.
+func mustOverlay(t *testing.T, cert *stdtls.Certificate, authKey []byte) []byte {
+	t.Helper()
+	out, err := CertHMACOverlay(cert, authKey)
+	if err != nil {
+		t.Fatalf("CertHMACOverlay: %v", err)
+	}
+	return out.Certificate[0]
 }
 
 func testAuthKey(t *testing.T) []byte {
@@ -40,13 +68,10 @@ func testAuthKey(t *testing.T) []byte {
 }
 
 func TestCertHMACRoundTrip(t *testing.T) {
-	blank, err := NewCertBlank("github.com")
-	if err != nil {
-		t.Fatalf("NewCertBlank: %v", err)
-	}
+	cert := mintTestCert(t, "github.com")
 	authKey := testAuthKey(t)
 
-	der := mustCert(t, blank, authKey)
+	der := mustOverlay(t, cert, authKey)
 	if err := VerifyCertHMAC([][]byte{der}, authKey); err != nil {
 		t.Fatalf("VerifyCertHMAC on our own certificate: %v", err)
 	}
@@ -56,16 +81,13 @@ func TestCertHMACRoundTrip(t *testing.T) {
 // well-formed certificate carrying a MAC under a different key must be refused,
 // which aborts the handshake.
 func TestCertHMACRejectsForeignCertificate(t *testing.T) {
-	blank, err := NewCertBlank("github.com")
-	if err != nil {
-		t.Fatalf("NewCertBlank: %v", err)
-	}
+	cert := mintTestCert(t, "github.com")
 
 	ours := testAuthKey(t)
 	theirs := testAuthKey(t)
 
 	// A well-formed certificate, minted the same way, MAC'd with the wrong key.
-	forged := mustCert(t, blank, theirs)
+	forged := mustOverlay(t, cert, theirs)
 	if err := VerifyCertHMAC([][]byte{forged}, ours); !errors.Is(err, ErrCertHMACMismatch) {
 		t.Fatalf("err = %v, want ErrCertHMACMismatch", err)
 	}
@@ -73,17 +95,14 @@ func TestCertHMACRejectsForeignCertificate(t *testing.T) {
 	// A one-bit change in the key must also fail.
 	near := bytes.Clone(ours)
 	near[0] ^= 0x01
-	if err := VerifyCertHMAC([][]byte{mustCert(t, blank, ours)}, near); !errors.Is(err, ErrCertHMACMismatch) {
+	if err := VerifyCertHMAC([][]byte{mustOverlay(t, cert, ours)}, near); !errors.Is(err, ErrCertHMACMismatch) {
 		t.Fatalf("one-bit key change: err = %v, want ErrCertHMACMismatch", err)
 	}
 
 	// An entirely independent certificate — different key pair, different
 	// issuer — must fail too, not merely differ.
-	other, err := NewCertBlank("github.com")
-	if err != nil {
-		t.Fatalf("NewCertBlank: %v", err)
-	}
-	if err := VerifyCertHMAC([][]byte{mustCert(t, other, theirs)}, ours); !errors.Is(err, ErrCertHMACMismatch) {
+	other := mintTestCert(t, "github.com")
+	if err := VerifyCertHMAC([][]byte{mustOverlay(t, other, theirs)}, ours); !errors.Is(err, ErrCertHMACMismatch) {
 		t.Fatalf("independent certificate: err = %v, want ErrCertHMACMismatch", err)
 	}
 }
@@ -92,11 +111,8 @@ func TestCertHMACRejectsForeignCertificate(t *testing.T) {
 // the scheme: an unmodified self-signed certificate, whose signature field still
 // holds the real signature rather than our MAC.
 func TestCertHMACRejectsGenuineSignature(t *testing.T) {
-	blank, err := NewCertBlank("github.com")
-	if err != nil {
-		t.Fatalf("NewCertBlank: %v", err)
-	}
-	if err := VerifyCertHMAC([][]byte{blank.der}, testAuthKey(t)); !errors.Is(err, ErrCertHMACMismatch) {
+	cert := mintTestCert(t, "github.com")
+	if err := VerifyCertHMAC([][]byte{cert.Certificate[0]}, testAuthKey(t)); !errors.Is(err, ErrCertHMACMismatch) {
 		t.Fatalf("an unmodified certificate verified: err = %v", err)
 	}
 }
@@ -130,18 +146,15 @@ func TestVerifyCertHMACRejectsMalformed(t *testing.T) {
 // check: two connections to one SNI get certificates that are byte-identical
 // apart from the signature field.
 func TestCertsDifferOnlyInTheSignature(t *testing.T) {
-	blank, err := NewCertBlank("github.com")
-	if err != nil {
-		t.Fatalf("NewCertBlank: %v", err)
-	}
+	cert := mintTestCert(t, "github.com")
 
-	first := mustCert(t, blank, testAuthKey(t))
-	second := mustCert(t, blank, testAuthKey(t))
+	first := mustOverlay(t, cert, testAuthKey(t))
+	second := mustOverlay(t, cert, testAuthKey(t))
 
 	if len(first) != len(second) {
 		t.Fatalf("certificate lengths differ: %d vs %d", len(first), len(second))
 	}
-	body := len(first) - blank.sigLen
+	body := len(first) - len(cert.Leaf.Signature)
 	if !bytes.Equal(first[:body], second[:body]) {
 		t.Fatal("certificates differ outside the signature field")
 	}
@@ -150,8 +163,8 @@ func TestCertsDifferOnlyInTheSignature(t *testing.T) {
 	}
 
 	// And the blank itself must be untouched, or the two would race.
-	if !bytes.Equal(blank.der[:body], first[:body]) {
-		t.Fatal("WithAuthHMAC mutated the cached blank")
+	if !bytes.Equal(cert.Certificate[0][:body], first[:body]) {
+		t.Fatal("the overlay mutated the cached certificate")
 	}
 }
 
@@ -160,136 +173,43 @@ func TestCertsDifferOnlyInTheSignature(t *testing.T) {
 // tail of the DER and can be replaced in place. ECDSA makes its length vary,
 // which is why the blank records the length instead of assuming one.
 func TestCertBlankSignatureIsTheDERTail(t *testing.T) {
-	blank, err := NewCertBlank("api.github.com")
-	if err != nil {
-		t.Fatalf("NewCertBlank: %v", err)
+	cert := mintTestCert(t, "api.github.com")
+	parsed := cert.Leaf
+	der := cert.Certificate[0]
+	sigLen := len(parsed.Signature)
+	if sigLen == 0 {
+		t.Fatal("certificate has no signature")
 	}
-	parsed, err := x509.ParseCertificate(blank.der)
-	if err != nil {
-		t.Fatalf("ParseCertificate: %v", err)
-	}
-	if len(parsed.Signature) != blank.sigLen {
-		t.Fatalf("blank recorded signature length %d, certificate has %d", blank.sigLen, len(parsed.Signature))
-	}
-	if !bytes.Equal(parsed.Signature, blank.der[len(blank.der)-blank.sigLen:]) {
+	if !bytes.Equal(parsed.Signature, der[len(der)-sigLen:]) {
 		t.Fatal("signature is not the DER tail")
 	}
 
 	// After the overlay, the parsed signature must be our MAC — i.e. the
 	// certificate still parses and the field we replaced is the one x509 reads.
 	authKey := testAuthKey(t)
-	withMAC, err := x509.ParseCertificate(mustCert(t, blank, authKey))
+	withMAC, err := x509.ParseCertificate(mustOverlay(t, cert, authKey))
 	if err != nil {
 		t.Fatalf("ParseCertificate after overlay: %v", err)
 	}
 	if bytes.Equal(withMAC.Signature, parsed.Signature) {
 		t.Fatal("the overlay did not change the signature field x509 reads")
 	}
-	if !bytes.Equal(withMAC.RawSubjectPublicKeyInfo, blank.spki) {
+	if !bytes.Equal(withMAC.RawSubjectPublicKeyInfo, parsed.RawSubjectPublicKeyInfo) {
 		t.Fatal("the overlay disturbed the public key")
 	}
-	if len(withMAC.Signature) != blank.sigLen {
+	if len(withMAC.Signature) != sigLen {
 		t.Fatalf("the overlay changed the signature length to %d", len(withMAC.Signature))
-	}
-}
-
-// TestCertBlankCacheMintsPerSNI is the acceptance criterion on cost: 100
-// connections across 5 SNIs must mint 5 times.
-func TestCertBlankCacheMintsPerSNI(t *testing.T) {
-	cache := NewCertBlankCache()
-	snis := []string{"github.com", "api.github.com", "raw.githubusercontent.com", "objects.githubusercontent.com", "codeload.github.com"}
-
-	for i := range 100 {
-		sni := snis[i%len(snis)]
-		blank, err := cache.Get(sni)
-		if err != nil {
-			t.Fatalf("Get(%s): %v", sni, err)
-		}
-		if got := mustCert(t, blank, testAuthKey(t)); len(got) == 0 {
-			t.Fatal("empty certificate")
-		}
-	}
-
-	if got := cache.Mints(); got != int64(len(snis)) {
-		t.Fatalf("minted %d times for %d SNIs over 100 connections, want %d", got, len(snis), len(snis))
-	}
-}
-
-func TestCertBlankCacheIsConcurrencySafe(t *testing.T) {
-	cache := NewCertBlankCache()
-	snis := []string{"github.com", "api.github.com", "raw.githubusercontent.com"}
-
-	var wg sync.WaitGroup
-	for range 8 {
-		wg.Go(func() {
-			for i := range 50 {
-				sni := snis[i%len(snis)]
-				blank, err := cache.Get(sni)
-				if err != nil {
-					t.Errorf("Get(%s): %v", sni, err)
-					return
-				}
-				_ = mustCert(t, blank, testAuthKey(t))
-			}
-		})
-	}
-	wg.Wait()
-
-	// Every goroutine must have seen the same blank per SNI, or certificates
-	// for one SNI would differ in more than the signature.
-	if got := cache.Mints(); got != int64(len(snis)) {
-		t.Fatalf("minted %d times, want %d; concurrent first connections raced", got, len(snis))
-	}
-}
-
-func TestCertBlankCacheRemintsAfterTTL(t *testing.T) {
-	cache := NewCertBlankCache()
-	cache.ttl = int64(10 * time.Millisecond)
-
-	first, err := cache.Get("github.com")
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	time.Sleep(20 * time.Millisecond)
-	second, err := cache.Get("github.com")
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	if first == second {
-		t.Fatal("blank was reused past its TTL")
-	}
-	if cache.Mints() != 2 {
-		t.Fatalf("minted %d times, want 2", cache.Mints())
-	}
-}
-
-func TestCertBlankCacheIsBounded(t *testing.T) {
-	cache := NewCertBlankCache()
-	for i := range certBlankCacheMax + 20 {
-		if _, err := cache.Get(string(rune('a'+i%26)) + string(rune('a'+i/26)) + ".example"); err != nil {
-			t.Fatalf("Get: %v", err)
-		}
-	}
-	cache.mu.Lock()
-	size := len(cache.blanks)
-	cache.mu.Unlock()
-	if size > certBlankCacheMax {
-		t.Fatalf("cache holds %d entries, cap is %d", size, certBlankCacheMax)
 	}
 }
 
 // certHMACServer returns a stdlib TLS 1.3 server config that hands out our
 // MAC-bearing certificate.
-func certHMACServer(t *testing.T, blank *CertBlank, authKey []byte) *stdtls.Config {
+func certHMACServer(t *testing.T, cert *stdtls.Certificate, authKey []byte) *stdtls.Config {
 	t.Helper()
 	return &stdtls.Config{
 		MinVersion: stdtls.VersionTLS13,
 		GetCertificate: func(*stdtls.ClientHelloInfo) (*stdtls.Certificate, error) {
-			der, err := blank.WithAuthHMAC(authKey)
-			if err != nil {
-				return nil, err
-			}
-			return &stdtls.Certificate{Certificate: [][]byte{der}, PrivateKey: blank.PrivateKey()}, nil
+			return CertHMACOverlay(cert, authKey)
 		},
 	}
 }
@@ -344,12 +264,9 @@ func connPair(t *testing.T) (client, server net.Conn) {
 // certificate whose signature field is a MAC, never noticing, and the client
 // accepts it from VerifyPeerCertificate.
 func TestCertHMACOverRealTLSHandshake(t *testing.T) {
-	blank, err := NewCertBlank("github.com")
-	if err != nil {
-		t.Fatalf("NewCertBlank: %v", err)
-	}
+	cert := mintTestCert(t, "github.com")
 	authKey := testAuthKey(t)
-	serverCfg := certHMACServer(t, blank, authKey)
+	serverCfg := certHMACServer(t, cert, authKey)
 
 	run := func(t *testing.T, clientKey []byte) error {
 		t.Helper()
@@ -406,12 +323,9 @@ func TestCertHMACOverRealTLSHandshake(t *testing.T) {
 // handshake_failure. That failure is invisible to the unit tests above, which
 // never run a handshake.
 func TestCertHMACOverUTLSHandshake(t *testing.T) {
-	blank, err := NewCertBlank("github.com")
-	if err != nil {
-		t.Fatalf("NewCertBlank: %v", err)
-	}
+	cert := mintTestCert(t, "github.com")
 	authKey := testAuthKey(t)
-	serverCfg := certHMACServer(t, blank, authKey)
+	serverCfg := certHMACServer(t, cert, authKey)
 
 	run := func(t *testing.T, profile string, clientKey []byte) error {
 		t.Helper()
@@ -560,11 +474,8 @@ func TestCertHMACKeyMatchesSessionIDAuthKey(t *testing.T) {
 	}
 
 	// And that key works end to end for the certificate.
-	blank, err := NewCertBlank("github.com")
-	if err != nil {
-		t.Fatalf("NewCertBlank: %v", err)
-	}
-	if err := VerifyCertHMAC([][]byte{mustCert(t, blank, serverKey)}, clientKey); err != nil {
+	cert := mintTestCert(t, "github.com")
+	if err := VerifyCertHMAC([][]byte{mustOverlay(t, cert, serverKey)}, clientKey); err != nil {
 		t.Fatalf("cert-HMAC under the session_id auth key: %v", err)
 	}
 }

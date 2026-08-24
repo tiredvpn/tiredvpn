@@ -17,6 +17,9 @@ import (
 
 // b1TLSPair runs our server-side TLS config against a crypto/tls client over a
 // loopback connection, and hands both completed sides back.
+// testB1AuthKey stands in for the key the gate derives per connection.
+var testB1AuthKey = []byte("test-connection-auth-key-32bytes")
+
 func b1TLSPair(t *testing.T, serverCfg *tls.Config, clientCfg *tls.Config) (client, server *tls.Conn) {
 	t.Helper()
 
@@ -37,7 +40,10 @@ func b1TLSPair(t *testing.T, serverCfg *tls.Config, clientCfg *tls.Config) (clie
 			accepted <- result{err: err}
 			return
 		}
-		sc := tls.Server(raw, serverCfg)
+		// Wrap the way handleREALITYB1 does: the certificate's signature field
+		// carries a MAC keyed with the connection's auth key, so a connection
+		// that never passed the gate gets no certificate at all.
+		sc := tls.Server(customtls.NewAuthConn(raw, testB1AuthKey), serverCfg)
 		accepted <- result{conn: sc, err: sc.Handshake()}
 	}()
 
@@ -158,11 +164,19 @@ func TestB1BindingFlow(t *testing.T) {
 			t.Fatalf("dispatch = %d, want TypeMux", dispatch)
 		}
 
+		// The server's answer is one-way now: no proof, and the client does not
+		// block on it. Proving the server happens inside the handshake through
+		// the certificate MAC.
+		want := time.Now().Truncate(time.Second)
 		go func() {
-			_ = customtls.WriteServerBinding(server, secret, serverEKM, time.Now())
+			_ = customtls.WriteServerTime(server, want)
 		}()
-		if _, err := customtls.ReadServerBinding(client, secret, clientEKM); err != nil {
-			t.Fatalf("client rejected the server binding: %v", err)
+		got, err := customtls.ReadServerTime(client)
+		if err != nil {
+			t.Fatalf("client could not read the server time: %v", err)
+		}
+		if !got.Equal(want) {
+			t.Fatalf("server time = %v, want %v", got, want)
 		}
 	})
 
