@@ -58,6 +58,8 @@ func main() {
 		runClient(os.Args[2:])
 	case "admin":
 		runAdmin(os.Args[2:])
+	case "reality-keygen":
+		runREALITYKeygen()
 	case "version", "-version", "--version":
 		fmt.Printf("tiredvpn %s (built %s)\n", version, buildTime)
 	case "help", "-help", "--help", "-h":
@@ -84,6 +86,8 @@ Commands:
   server    Run VPN server (exit node)
   client    Run VPN client (SOCKS5 proxy or TUN mode)
   admin     Manage clients (add, list, delete, qr)
+
+  reality-keygen  Generate the server's static REALITY key pair
   version   Show version
   help      Show this help
 
@@ -185,13 +189,27 @@ ICMP TUNNEL:
   -enable-icmp
         Enable ICMP tunnel listener (requires CAP_NET_RAW)
 
+REALITY OPTIONS:
+  -reality-cover-domain string
+        Operator-set hostname to transparently proxy unauthorized REALITY probes to (empty = drop)
+  -reality-b1
+        Accept the B1 transport: real TLS 1.3 with auth in session_id. Needs -reality-private-key.
+  -reality-private-key string
+        Server's static X25519 key, base64 (or TIREDVPN_REALITY_PRIVATE_KEY). Generate with: tiredvpn reality-keygen
+  -reality-legacy
+        Accept the legacy transport, credentials in padding extension 0x0015 (default true)
+  -reality-max-time-diff int
+        Client clock skew tolerated by B1 auth, seconds; 0 = do not check (default 300)
+  -reality-min-client-ver string
+        Lowest client version B1 accepts, X.Y.Z (empty = do not check)
+  -reality-mirror string
+        Mirror the handshake to the real donor: off, adaptive, always. Only off is implemented until B1.5. (default "off")
+  -reality-require-data-v2
+        Reject REALITY clients still on the v1 data layer (turn on after every client is upgraded)
+
 ADVANCED OPTIONS:
   -fake-root string
         Fake website root directory (default "./www")
-  -reality-cover-domain string
-        Operator-set hostname to transparently proxy unauthorized REALITY probes to (empty = drop)
-  -reality-require-data-v2
-        Reject REALITY clients still on the v1 data layer (turn on after every client is upgraded)
   -tun-ip string
         TUN interface IP address for VPN server (default "10.8.0.1")
   -tun-name string
@@ -301,6 +319,8 @@ ADVANCED EVASION:
         Cover host for traffic mimicry (default "api.googleapis.com")
   -reality-require-data-v2
         Refuse REALITY servers still on the v1 data layer instead of falling back
+  -reality-server-pubkey string
+        Server's static REALITY public key, base64. Set it to speak the B1 transport; empty uses the legacy one.
 
 ICMP TUNNEL (backup transport):
   -icmp-tunnel
@@ -357,6 +377,18 @@ type serverFlagOpts struct {
 	showVersion     *bool
 }
 
+// registerClientREALITYFlags binds the client-side REALITY flags.
+//
+// Split out for the same reason registerServerFlags exists: a config field
+// bound to no flag is dead and nothing notices. That matters more than usual
+// here, because the B1 fields land before the code that reads them - until the
+// transport itself is written, "does nothing" is indistinguishable from "never
+// wired up". It also gives streams A and B somewhere to add client flags
+// without editing runClient, which everyone shares.
+func registerClientREALITYFlags(fs *flag.FlagSet, cfg *client.Config) {
+	fs.StringVar(&cfg.REALITYServerPubKey, "reality-server-pubkey", "", "Server's static REALITY public key, base64. Set it to speak the B1 transport; empty uses the legacy one. No probing, no downgrade on error.")
+}
+
 // registerServerFlags binds every server flag onto fs and cfg. It is split out
 // of runServer so the flag surface is unit-testable (guards against config keys
 // silently going dead, e.g. -reality-cover-domain).
@@ -378,6 +410,17 @@ func registerServerFlags(fs *flag.FlagSet, cfg *server.Config) *serverFlagOpts {
 	// Transition switch for the data-layer rewrite: leave off while old clients
 	// are still around, turn on afterwards to remove the v1 downgrade path.
 	fs.BoolVar(&cfg.REALITYRequireDataV2, "reality-require-data-v2", false, "Reject REALITY clients that do not negotiate the v2 data layer (per-connection keys + AEAD). Turn on only after every client is upgraded.")
+	// B1 transport. -reality-b1 defaults to off while the B1 handler is still
+	// a stub: with it on, a server without a static key refuses to start, and
+	// that is not a thing to hand every existing deployment in exchange for a
+	// code path that does nothing yet. Flip the default in the release that
+	// ships the handler (task 005).
+	fs.StringVar(&cfg.REALITYPrivateKey, "reality-private-key", "", "Server's static X25519 key for REALITY B1, base64 (falls back to TIREDVPN_REALITY_PRIVATE_KEY). Generate with `tiredvpn reality-keygen`. Required with -reality-b1.")
+	fs.BoolVar(&cfg.REALITYB1Enabled, "reality-b1", false, "Accept the REALITY B1 transport (real TLS 1.3, auth in session_id). Requires -reality-private-key.")
+	fs.BoolVar(&cfg.REALITYLegacyEnabled, "reality-legacy", true, "Accept the legacy REALITY transport (credentials in padding extension 0x0015). Turn off once no client uses it.")
+	fs.IntVar(&cfg.REALITYMaxTimeDiff, "reality-max-time-diff", 300, "Client clock skew tolerated by B1 auth, seconds (0 = do not check)")
+	fs.StringVar(&cfg.REALITYMinClientVer, "reality-min-client-ver", "", "Lowest client version B1 accepts, X.Y.Z (empty = do not check)")
+	fs.StringVar(&cfg.REALITYMirrorMode, "reality-mirror", "off", "How much of the handshake to mirror to the real donor: off, adaptive, always. Only off is implemented until B1.5.")
 	fs.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
 	opts.tunIP = fs.String("tun-ip", "10.8.0.1", "TUN interface IP address for VPN server")
 	fs.StringVar(&cfg.TunName, "tun-name", "tiredvpn0", "TUN interface name")
@@ -466,6 +509,11 @@ func runServer(args []string) {
 	if cfg.APIToken == "" {
 		cfg.APIToken = os.Getenv("TIREDVPN_API_TOKEN")
 	}
+	// Same for the REALITY static key: a private key passed as an argument is
+	// readable by any local user through /proc.
+	if cfg.REALITYPrivateKey == "" {
+		cfg.REALITYPrivateKey = os.Getenv("TIREDVPN_REALITY_PRIVATE_KEY")
+	}
 	cfg.QUICEnabled = !*opts.noQUIC // QUIC enabled by default
 	cfg.IPPoolLeaseTime = *opts.ipPoolLease
 	cfg.PortHopInterval = *opts.portHopInterval
@@ -550,6 +598,7 @@ func runClient(args []string) {
 	// Seqovl level-A packet overlap (Linux only, requires CAP_NET_ADMIN + OUTPUT NFQUEUE rule)
 	fs.BoolVar(&cfg.SeqovlPacketEnabled, "seqovl-packet", false, "Enable packet-level TCP sequence overlap for seqovl (Linux + CAP_NET_ADMIN; additive to the app-framing decoy)")
 	fs.BoolVar(&cfg.REALITYRequireDataV2, "reality-require-data-v2", false, "Refuse REALITY servers still on the v1 data layer instead of falling back (turn on once every server is upgraded)")
+	registerClientREALITYFlags(fs, cfg)
 
 	// RTT Masking flags
 	fs.BoolVar(&cfg.RTTMaskingEnabled, "rtt-masking", false, "Enable RTT masking (hides proxy timing signature)")
@@ -638,6 +687,25 @@ func runClient(args []string) {
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// runREALITYKeygen prints a fresh static REALITY key pair.
+//
+// The two halves go to opposite ends of the deployment, so they are labelled by
+// where they belong rather than by what they are: the private key is server
+// configuration, the public key is client configuration. Getting that backwards
+// is the one mistake this command exists to prevent.
+func runREALITYKeygen() {
+	priv, pub, err := server.GenerateREALITYKeyPair()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "reality-keygen: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Private key: %s\n", priv)
+	fmt.Printf("Public  key: %s\n", pub)
+	fmt.Println()
+	fmt.Println("Server: -reality-private-key <private> (or TIREDVPN_REALITY_PRIVATE_KEY)")
+	fmt.Println("Client: -reality-server-pubkey <public>")
 }
 
 // runAdmin handles admin commands for client management

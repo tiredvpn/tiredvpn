@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"sync"
 	"time"
 
 	"github.com/xtaci/smux"
@@ -17,30 +16,6 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
 	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 )
-
-var (
-	// Server's X25519 key pair (loaded from config or generated at startup)
-	serverREALITYPrivKey [32]byte
-	serverREALITYPubKey  [32]byte
-	realityKeyMu         sync.RWMutex
-)
-
-// InitREALITYKeys initializes the server's X25519 key pair
-func InitREALITYKeys() error {
-	realityKeyMu.Lock()
-	defer realityKeyMu.Unlock()
-
-	privKey, pubKey, err := customtls.GenerateX25519KeyPair()
-	if err != nil {
-		return fmt.Errorf("failed to generate reality keys: %w", err)
-	}
-
-	serverREALITYPrivKey = privKey
-	serverREALITYPubKey = pubKey
-
-	log.Info("REALITY server keys initialized")
-	return nil
-}
 
 // DetectREALITYExtension checks if the data contains a REALITY extension
 // Properly parses TLS ClientHello structure to find padding extension (0x0015)
@@ -309,9 +284,7 @@ func HandleREALITYConnection(conn net.Conn, srvCtx *serverContext, logger *log.L
 			ServerSalt:   serverSalt,
 		}
 	} else {
-		realityKeyMu.RLock()
-		privKey := serverREALITYPrivKey
-		realityKeyMu.RUnlock()
+		privKey, _ := realityStaticKeys()
 		serverExt, err = customtls.NewServerREALITYExtension(usedSecret, privKey, realityExt.PubKey)
 	}
 	if err != nil {
