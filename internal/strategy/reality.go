@@ -670,7 +670,8 @@ func (r *REALITYStrategy) buildClientHello(dest string) ([]byte, error) {
 		return nil, fmt.Errorf("uTLS clientHello build failed: %w", err)
 	}
 
-	log.Info("REALITY-BUILD: uTLS ClientHello built (%d bytes, record_len=%d)", len(clientHello), int(clientHello[3])<<8|int(clientHello[4]))
+	log.Info("REALITY-BUILD: uTLS ClientHello built (profile=%s, %d bytes, record_len=%d)",
+		fp.Name, len(clientHello), int(clientHello[3])<<8|int(clientHello[4]))
 
 	// Create REALITY extension
 	realityExt, err := customtls.NewClientREALITYExtension(r.secret, r.clientPrivKey)

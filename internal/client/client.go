@@ -23,6 +23,7 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/porthopping"
 	"github.com/tiredvpn/tiredvpn/internal/shaper"
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
+	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 	"github.com/tiredvpn/tiredvpn/internal/tun"
 )
 
@@ -336,6 +337,12 @@ func buildPortHoppingConfig(cfg *Config) *porthopping.Config {
 
 // logEnabledFeatures logs info lines for each optional feature that is active.
 func logEnabledFeatures(cfg *Config, mgr *strategy.Manager) {
+	// Always logged, not gated on a flag: which browser we are pretending to be
+	// is the single most consequential thing about how we look on the wire, and
+	// an operator debugging a block needs it in the log without extra verbosity.
+	if fp, ok := customtls.LookupFingerprint(cfg.TLSFingerprint); ok {
+		log.Info("TLS fingerprint: %s", fp.Name)
+	}
 	if cfg.RTTMaskingEnabled {
 		log.Info("RTT masking enabled (profile=%s)", cfg.RTTProfile)
 	}
