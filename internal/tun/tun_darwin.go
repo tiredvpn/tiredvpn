@@ -265,7 +265,7 @@ func (t *TUNDevice) Configure(localIP, remoteIP net.IP, routes []string) error {
 
 // ConfigureSubnet — point-to-multipoint mode. Used by the server flow; the
 // macOS client never runs as a server so we just refuse loudly to catch misuse.
-func (t *TUNDevice) ConfigureSubnet(localIP net.IP, network *net.IPNet) error {
+func (t *TUNDevice) ConfigureSubnet(localIP net.IP, network *net.IPNet, serverIP6 *net.IPNet) error {
 	return fmt.Errorf("ConfigureSubnet not supported on darwin (server-only API)")
 }
 

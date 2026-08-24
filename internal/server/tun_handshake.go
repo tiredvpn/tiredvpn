@@ -19,38 +19,21 @@ type dualStackAddrs struct {
 	ClientIP6 net.IP
 }
 
-// deriveDualStackAddrs builds placeholder IPv6 tunnel addresses from the
-// configured -ip-pool-v6 prefix: the server takes prefix::1 and the client
-// takes the prefix with its assigned IPv4 address in the low 32 bits. Returns
-// nil when no (valid) IPv6 pool is configured, which keeps the response
-// byte-identical to a non-dual-stack server. Phase 2 replaces this derivation
-// with the real IPv6 address pool; only the address source changes.
+// deriveDualStackAddrs builds the IPv6 tunnel addresses from the configured
+// -ip-pool-v6 prefix using the pool's authoritative derivation rule (see
+// deriveServerIP6/deriveClientIP6 in ippool.go): the server takes prefix::1
+// and the client takes the prefix with its assigned IPv4 address in the low
+// 32 bits. Returns nil when no (valid) IPv6 pool is configured, which keeps
+// the response byte-identical to a non-dual-stack server.
 func deriveDualStackAddrs(poolV6 string, clientIP net.IP) *dualStackAddrs {
-	if poolV6 == "" {
+	prefix, err := parsePoolV6(poolV6)
+	if err != nil || prefix == nil {
 		return nil
 	}
-	ip, network, err := net.ParseCIDR(poolV6)
-	if err != nil || ip.To4() != nil {
-		return nil
+	return &dualStackAddrs{
+		ServerIP6: deriveServerIP6(prefix),
+		ClientIP6: deriveClientIP6(prefix, clientIP),
 	}
-	base := network.IP.To16()
-	if base == nil {
-		return nil
-	}
-
-	server6 := make(net.IP, net.IPv6len)
-	copy(server6, base)
-	server6[net.IPv6len-1] = 1 // prefix::1
-
-	client6 := make(net.IP, net.IPv6len)
-	copy(client6, base)
-	if v4 := clientIP.To4(); v4 != nil {
-		copy(client6[12:], v4) // prefix | client-v4-uint32
-	} else {
-		client6[net.IPv6len-1] = 2
-	}
-
-	return &dualStackAddrs{ServerIP6: server6, ClientIP6: client6}
 }
 
 // tunHandshakeCaps describes the optional capabilities an exit advertises in

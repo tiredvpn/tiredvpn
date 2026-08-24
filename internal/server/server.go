@@ -321,10 +321,12 @@ type Config struct {
 	IPPoolLeaseTime time.Duration // Lease duration (0 = permanent)
 
 	// IPPoolV6 is the IPv6 prefix for TUN dual-stack clients, e.g.
-	// "fd00:10:8::/64". When set, a client handshaking with version >= 0x04
-	// gets the dual-stack flag and a trailing [serverIP6:16][clientIP6:16]
-	// block in its handshake response. Phase 1 derives placeholder addresses
-	// from the prefix (see deriveDualStackAddrs); Phase 2 wires the real pool.
+	// "fd00:10:8::/64". When set, the pool derives per-client v6 addresses
+	// (prefix with the client v4 in the low 32 bits, server at prefix::1),
+	// the shared TUN and dispatcher route v6 downlink traffic, and NAT66
+	// masquerades the prefix on the WAN. A client handshaking with version
+	// >= 0x04 gets the dual-stack flag and a trailing
+	// [serverIP6:16][clientIP6:16] block in its handshake response.
 	IPPoolV6 string
 
 	// Port hopping (multi-port listening)
@@ -577,6 +579,7 @@ func initIPPool(cfg *Config, srvCtx *serverContext) error {
 		Network:   cfg.IPPoolNetwork,
 		ServerIP:  cfg.TunIP.String(),
 		LeaseTime: cfg.IPPoolLeaseTime,
+		NetworkV6: cfg.IPPoolV6,
 	}, redisClient)
 	if err != nil {
 		return fmt.Errorf("IP pool initialization failed: %w", err)
@@ -594,7 +597,11 @@ func initIPPool(cfg *Config, srvCtx *serverContext) error {
 	if tunName == "" {
 		tunName = "tiredvpn0"
 	}
-	sharedTUN, err := NewSharedTUN(tunName, cfg.TunIP, network, resolveTunMTU(cfg), 0)
+	var v6m *IPv6Metrics
+	if srvCtx.metrics != nil {
+		v6m = srvCtx.metrics.ipv6Metrics
+	}
+	sharedTUN, err := NewSharedTUN(tunName, cfg.TunIP, network, resolveTunMTU(cfg), 0, pool, v6m)
 	if err != nil {
 		return fmt.Errorf("failed to create shared TUN: %w", err)
 	}
@@ -608,6 +615,15 @@ func initIPPool(cfg *Config, srvCtx *serverContext) error {
 	// Docker entrypoint warn-and-continue behavior this replaces.
 	if err := tun.SetupServerNAT(cfg.IPPoolNetwork, os.Getenv("TIREDVPN_WAN_IFACE")); err != nil {
 		log.Warn("NAT auto-config failed: %v", err)
+	}
+
+	// Dual-stack: NAT66 for the ULA pool plus a sanity check that the box can
+	// actually reach the v6 internet. Both warn-and-continue, same as v4 NAT.
+	if pool.DualStack() {
+		if err := tun.SetupServerNAT6(cfg.IPPoolV6, os.Getenv("TIREDVPN_WAN_IFACE")); err != nil {
+			log.Warn("NAT66 auto-config failed: %v", err)
+		}
+		warnIfNoGlobalIPv6Uplink()
 	}
 
 	return nil

@@ -48,6 +48,12 @@ type IPPoolConfig struct {
 
 	// ReservedIPs are IPs that should not be allocated (besides ServerIP)
 	ReservedIPs []string
+
+	// NetworkV6 is the optional IPv6 ULA prefix for dual-stack TUN clients
+	// (e.g., "fd00:10:8::/64"). Empty = IPv4-only pool. No leases are ever
+	// stored for v6: a client's v6 address is derived deterministically from
+	// its v4 lease (see ClientIP6), so the Redis schema stays untouched.
+	NetworkV6 string
 }
 
 // IPPool manages IP address allocation for TUN clients
@@ -59,6 +65,10 @@ type IPPool struct {
 	endIP    uint32 // Last allocatable IP
 	reserved map[uint32]bool
 	mu       sync.RWMutex
+
+	// networkV6 is the parsed dual-stack prefix, nil when the pool is
+	// IPv4-only. Immutable after construction.
+	networkV6 *net.IPNet
 
 	// Backend storage
 	redis    *redis.Client
@@ -88,6 +98,14 @@ func NewIPPool(cfg IPPoolConfig, redisClient *redis.Client) (*IPPool, error) {
 		return nil, fmt.Errorf("only IPv4 supported")
 	}
 
+	// Optional dual-stack prefix. Validated here (fails server startup via
+	// initIPPool) rather than per-client so a bad -ip-pool-v6 is caught at
+	// boot instead of silently degrading to IPv4-only handshakes.
+	networkV6, err := parsePoolV6(cfg.NetworkV6)
+	if err != nil {
+		return nil, err
+	}
+
 	networkIP := binary.BigEndian.Uint32(network.IP.To4())
 	broadcastIP := networkIP | (0xFFFFFFFF >> ones)
 
@@ -109,15 +127,16 @@ func NewIPPool(cfg IPPoolConfig, redisClient *redis.Client) (*IPPool, error) {
 	}
 
 	pool := &IPPool{
-		config:   cfg,
-		network:  network,
-		serverIP: serverIP,
-		startIP:  startIP,
-		endIP:    endIP,
-		reserved: reserved,
-		redis:    redisClient,
-		leases:   make(map[string]*IPLease),
-		byClient: make(map[string]string),
+		config:    cfg,
+		network:   network,
+		serverIP:  serverIP,
+		startIP:   startIP,
+		endIP:     endIP,
+		reserved:  reserved,
+		networkV6: networkV6,
+		redis:     redisClient,
+		leases:    make(map[string]*IPLease),
+		byClient:  make(map[string]string),
 	}
 
 	// Load existing leases
@@ -126,9 +145,97 @@ func NewIPPool(cfg IPPoolConfig, redisClient *redis.Client) (*IPPool, error) {
 	}
 
 	poolSize := int(endIP-startIP+1) - len(reserved)
-	log.Info("IP Pool initialized: %s (size=%d, server=%s)", cfg.Network, poolSize, cfg.ServerIP)
+	if networkV6 != nil {
+		log.Info("IP Pool initialized: %s (size=%d, server=%s) + dual-stack %s (server=%s)",
+			cfg.Network, poolSize, cfg.ServerIP, networkV6, pool.ServerIP6())
+	} else {
+		log.Info("IP Pool initialized: %s (size=%d, server=%s)", cfg.Network, poolSize, cfg.ServerIP)
+	}
 
 	return pool, nil
+}
+
+// parsePoolV6 parses and validates the optional dual-stack prefix. Returns
+// (nil, nil) for an empty pool. The prefix must be an IPv6 CIDR with a host
+// part of at least 32 bits (prefix length <= 96) so a client's IPv4 address
+// can be embedded losslessly in the low 32 bits of its derived IPv6 address.
+func parsePoolV6(cidr string) (*net.IPNet, error) {
+	if cidr == "" {
+		return nil, nil
+	}
+	ip, network, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid IPv6 pool %q: %w", cidr, err)
+	}
+	if ip.To4() != nil {
+		return nil, fmt.Errorf("IPv6 pool %q is not an IPv6 CIDR", cidr)
+	}
+	ones, bits := network.Mask.Size()
+	if bits != 128 {
+		return nil, fmt.Errorf("IPv6 pool %q is not an IPv6 CIDR", cidr)
+	}
+	if ones > 96 {
+		return nil, fmt.Errorf("IPv6 pool %q prefix length /%d leaves <32 host bits; need /96 or shorter to embed client IPv4 addresses", cidr, ones)
+	}
+	return &net.IPNet{IP: network.IP.To16(), Mask: network.Mask}, nil
+}
+
+// deriveServerIP6 returns the server's address inside the dual-stack prefix:
+// prefix::1. This is THE single derivation rule for the whole server — the
+// pool, the handshake and the TUN setup all go through here.
+func deriveServerIP6(prefix *net.IPNet) net.IP {
+	ip := make(net.IP, net.IPv6len)
+	copy(ip, prefix.IP.To16())
+	ip[net.IPv6len-1] = 1
+	return ip
+}
+
+// deriveClientIP6 returns a client's address inside the dual-stack prefix:
+// the prefix with the client's IPv4 address embedded in the low 32 bits
+// (prefix | v4-uint32). The mapping is injective, so the packet dispatcher
+// can recover the v4 lease key (and thus the client registry entry) from the
+// low 32 bits of any pool-v6 destination. A nil/non-v4 clientIP yields
+// prefix::2 as a safe fallback.
+func deriveClientIP6(prefix *net.IPNet, clientIP net.IP) net.IP {
+	ip := make(net.IP, net.IPv6len)
+	copy(ip, prefix.IP.To16())
+	if v4 := clientIP.To4(); v4 != nil {
+		copy(ip[12:], v4)
+	} else {
+		ip[net.IPv6len-1] = 2
+	}
+	return ip
+}
+
+// DualStack reports whether the pool hands out derived IPv6 tunnel addresses
+// in addition to IPv4 leases.
+func (p *IPPool) DualStack() bool {
+	return p.networkV6 != nil
+}
+
+// V6Prefix returns the dual-stack prefix (masked network), or nil for an
+// IPv4-only pool. Callers must not mutate the returned value.
+func (p *IPPool) V6Prefix() *net.IPNet {
+	return p.networkV6
+}
+
+// ServerIP6 returns the server's tunnel IPv6 address (prefix::1), or nil for
+// an IPv4-only pool.
+func (p *IPPool) ServerIP6() net.IP {
+	if p.networkV6 == nil {
+		return nil
+	}
+	return deriveServerIP6(p.networkV6)
+}
+
+// ClientIP6 derives the tunnel IPv6 address for the client holding the given
+// IPv4 lease (prefix with the v4 address in the low 32 bits), or nil for an
+// IPv4-only pool.
+func (p *IPPool) ClientIP6(clientIPv4 net.IP) net.IP {
+	if p.networkV6 == nil {
+		return nil
+	}
+	return deriveClientIP6(p.networkV6, clientIPv4)
 }
 
 // redisKey returns Redis key for IP lease

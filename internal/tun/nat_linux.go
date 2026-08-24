@@ -62,10 +62,162 @@ func SetupServerNAT(pool string, wanOverride string) error {
 	return nil
 }
 
+// nat6TableName is the nftables ip6 table for NAT66 of the dual-stack tunnel
+// prefix. Kept separate from the IPv4 natTableName so flushing/replacing one
+// family never touches the other.
+const nat6TableName = "tiredvpn-nat6"
+
+// SetupServerNAT6 installs IPv6 forwarding, MASQUERADE (NAT66) and
+// FORWARD-accept rules for the dual-stack tunnel prefix (a ULA such as
+// fd00:10:8::/64) egressing via the WAN interface. It mirrors SetupServerNAT
+// exactly, just in the ip6 family: same table structure, same idempotent
+// flush-and-replace semantics, same wanOverride escape hatch.
+//
+// A no-op if pool is empty (dual-stack disabled). Every other failure is
+// returned so the caller can warn-and-continue, matching SetupServerNAT.
+func SetupServerNAT6(pool string, wanOverride string) error {
+	if pool == "" {
+		return nil
+	}
+
+	if err := enableIPv6Forward(); err != nil {
+		log.Warn("could not enable net.ipv6.conf.all.forwarding: %v", err)
+	}
+
+	wan := wanOverride
+	if wan == "" {
+		var err error
+		// The v4 uplink route is reused for interface detection: NAT66
+		// masquerades onto the same physical uplink the v4 pool uses, and the
+		// box is guaranteed to have a v4 route (the VPN transport runs over
+		// it). TIREDVPN_WAN_IFACE overrides when v6 egresses elsewhere.
+		wan, err = detectWANInterface()
+		if err != nil {
+			return fmt.Errorf("detect WAN interface (set TIREDVPN_WAN_IFACE to override): %w", err)
+		}
+	}
+	log.Info("NAT66: using WAN interface %s for pool %s", wan, pool)
+
+	_, ipnet, err := net.ParseCIDR(pool)
+	if err != nil {
+		return fmt.Errorf("invalid pool %q: %w", pool, err)
+	}
+	if ipnet.IP.To4() != nil {
+		return fmt.Errorf("invalid pool %q: not an IPv6 CIDR", pool)
+	}
+
+	if err := installNAT6Rules(ipnet, wan); err != nil {
+		return fmt.Errorf("install nftables NAT66 rules: %w", err)
+	}
+
+	log.Info("NAT66: installed MASQUERADE %s -> %s and FORWARD accept via nftables (ip6)", pool, wan)
+	return nil
+}
+
 // enableIPForward turns on IPv4 forwarding by writing directly to the proc
 // sysctl, replacing the `sysctl -w net.ipv4.ip_forward=1` shell-out.
 func enableIPForward() error {
 	return os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1\n"), 0644)
+}
+
+// enableIPv6Forward turns on IPv6 forwarding by writing directly to the proc
+// sysctl, replacing the `sysctl -w net.ipv6.conf.all.forwarding=1` shell-out.
+func enableIPv6Forward() error {
+	return os.WriteFile("/proc/sys/net/ipv6/conf/all/forwarding", []byte("1\n"), 0644)
+}
+
+// installNAT6Rules is the ip6-family twin of installNATRules: a dedicated
+// tiredvpn-nat6 table with postrouting MASQUERADE for pool traffic leaving
+// wan and forward-accept rules for traffic to/from the pool. Re-running
+// replaces the table wholesale, same as the v4 path.
+func installNAT6Rules(pool *net.IPNet, wan string) error {
+	// See installNATRules for why the delete runs in its own flush.
+	if delConn, err := nftables.New(); err == nil {
+		delConn.DelTable(&nftables.Table{Family: nftables.TableFamilyIPv6, Name: nat6TableName})
+		_ = delConn.Flush()
+	}
+
+	conn, err := nftables.New()
+	if err != nil {
+		return fmt.Errorf("nftables unavailable: %w", err)
+	}
+
+	natTbl := conn.AddTable(&nftables.Table{
+		Family: nftables.TableFamilyIPv6,
+		Name:   nat6TableName,
+	})
+
+	postrouting := conn.AddChain(&nftables.Chain{
+		Name:     "postrouting",
+		Table:    natTbl,
+		Type:     nftables.ChainTypeNAT,
+		Hooknum:  nftables.ChainHookPostrouting,
+		Priority: nftables.ChainPriorityNATSource,
+		Policy:   chainPolicyAcceptPtr(),
+	})
+	conn.AddRule(&nftables.Rule{
+		Table: natTbl,
+		Chain: postrouting,
+		Exprs: masqRule6(pool, wan),
+	})
+
+	forward := conn.AddChain(&nftables.Chain{
+		Name:     "forward",
+		Table:    natTbl,
+		Type:     nftables.ChainTypeFilter,
+		Hooknum:  nftables.ChainHookForward,
+		Priority: nftables.ChainPriorityFilter,
+		Policy:   chainPolicyAcceptPtr(),
+	})
+	conn.AddRule(&nftables.Rule{
+		Table: natTbl,
+		Chain: forward,
+		Exprs: poolMatchAcceptRule6(pool, true), // ip6 saddr in pool
+	})
+	conn.AddRule(&nftables.Rule{
+		Table: natTbl,
+		Chain: forward,
+		Exprs: poolMatchAcceptRule6(pool, false), // ip6 daddr in pool
+	})
+
+	return conn.Flush()
+}
+
+// masqRule6 is the ip6 twin of masqRule: packets leaving via wan whose source
+// address is in pool get masqueraded (NAT66).
+func masqRule6(pool *net.IPNet, wan string) []expr.Any {
+	exprs := []expr.Any{
+		// oifname == wan
+		&expr.Meta{Key: expr.MetaKeyOIFNAME, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifnamePad(wan)},
+	}
+	exprs = append(exprs, ip6InPoolExprs(pool, 8)...) // ip6 saddr in pool
+	return append(exprs, &expr.Masq{})
+}
+
+// poolMatchAcceptRule6 is the ip6 twin of poolMatchAcceptRule: match ip6
+// saddr (src=true) or daddr (src=false) against pool with an ACCEPT verdict.
+func poolMatchAcceptRule6(pool *net.IPNet, src bool) []expr.Any {
+	offset := uint32(24) // daddr
+	if src {
+		offset = 8 // saddr
+	}
+	exprs := ip6InPoolExprs(pool, offset)
+	return append(exprs, &expr.Verdict{Kind: expr.VerdictAccept})
+}
+
+// ip6InPoolExprs loads the 16-byte IPv6 address at the given network-header
+// offset (8=saddr, 24=daddr) and compares it, masked by pool's netmask,
+// against pool's network address.
+func ip6InPoolExprs(pool *net.IPNet, offset uint32) []expr.Any {
+	network := pool.IP.To16()
+	mask := net.IP(pool.Mask)
+
+	return []expr.Any{
+		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: offset, Len: 16},
+		&expr.Bitwise{DestRegister: 1, SourceRegister: 1, Len: 16, Mask: mask, Xor: make([]byte, 16)},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: network},
+	}
 }
 
 // detectWANInterface returns the name of the interface the kernel would use

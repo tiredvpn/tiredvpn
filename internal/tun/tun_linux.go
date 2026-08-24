@@ -621,12 +621,22 @@ func (t *TUNDevice) reAddRoutes(link netlink.Link, reason string) {
 	}
 }
 
-func (t *TUNDevice) ConfigureSubnet(localIP net.IP, network *net.IPNet) error {
+// ConfigureSubnet sets up the server-side TUN with subnet routing. serverIP6,
+// when non-nil, enables dual-stack on the link: IPv6 stays enabled (instead
+// of the historical disable_ipv6=1) and the server's tunnel v6 address is
+// assigned with the full pool prefix so the kernel routes the whole ULA
+// prefix back into the TUN. A nil serverIP6 keeps the exact IPv4-only
+// behavior, including disable_ipv6=1.
+func (t *TUNDevice) ConfigureSubnet(localIP net.IP, network *net.IPNet, serverIP6 *net.IPNet) error {
 	t.localIP = localIP
 
 	sysctlPath := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/disable_ipv6", t.name)
-	if err := os.WriteFile(sysctlPath, []byte("1"), 0644); err != nil {
-		log.Warn("Failed to disable IPv6 on %s: %v", t.name, err)
+	disableV6 := "1"
+	if serverIP6 != nil {
+		disableV6 = "0"
+	}
+	if err := os.WriteFile(sysctlPath, []byte(disableV6), 0644); err != nil {
+		log.Warn("Failed to set disable_ipv6=%s on %s: %v", disableV6, t.name, err)
 	}
 
 	link, err := netlink.LinkByName(t.name)
@@ -650,6 +660,17 @@ func (t *TUNDevice) ConfigureSubnet(localIP net.IP, network *net.IPNet) error {
 	addr := fmt.Sprintf("%s/%d", localIP.String(), ones)
 	if err := netlink.AddrAdd(link, &netlink.Addr{IPNet: ipNet}); err != nil {
 		return fmt.Errorf("failed to set IP address: %w", err)
+	}
+
+	// Dual-stack: assign the server's tunnel v6 address with the full pool
+	// prefix (e.g. fd00:10:8::1/64). The connected route this installs is what
+	// makes the kernel hand replies for any client v6 address in the prefix
+	// back to the TUN for the dispatcher to route.
+	if serverIP6 != nil {
+		if err := netlink.AddrAdd(link, &netlink.Addr{IPNet: serverIP6}); err != nil {
+			return fmt.Errorf("failed to set IPv6 address: %w", err)
+		}
+		log.Info("TUN device %s dual-stack enabled: %s", t.name, serverIP6)
 	}
 
 	mss := t.mtu - 40

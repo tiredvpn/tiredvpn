@@ -170,3 +170,124 @@ func TestRequestedIPOutOfNetworkFallsBack(t *testing.T) {
 		t.Fatalf("out-of-network IP %s honored; expected in-network auto-allocation", got)
 	}
 }
+
+func newDualStackTestPool(t *testing.T) *IPPool {
+	t.Helper()
+	p, err := NewIPPool(IPPoolConfig{
+		Network:   "10.8.0.0/24",
+		ServerIP:  "10.8.0.1",
+		NetworkV6: "fd00:10:8::/64",
+	}, nil)
+	if err != nil {
+		t.Fatalf("NewIPPool dual-stack: %v", err)
+	}
+	return p
+}
+
+// A pool without -ip-pool-v6 must stay strictly IPv4: no v6 methods return
+// anything and behavior is unchanged.
+func TestPoolV4OnlyNoDualStack(t *testing.T) {
+	p := newTestPool(t)
+	if p.DualStack() {
+		t.Fatal("v4-only pool reports DualStack()")
+	}
+	if p.V6Prefix() != nil || p.ServerIP6() != nil || p.ClientIP6(net.IPv4(10, 8, 0, 2)) != nil {
+		t.Fatal("v4-only pool returned v6 addresses")
+	}
+}
+
+// The derivation rule: server = prefix::1, client = prefix with its v4 lease
+// embedded in the low 32 bits.
+func TestDualStackDerivation(t *testing.T) {
+	p := newDualStackTestPool(t)
+	if !p.DualStack() {
+		t.Fatal("dual-stack pool reports !DualStack()")
+	}
+
+	if got := p.ServerIP6().String(); got != "fd00:10:8::1" {
+		t.Errorf("ServerIP6 = %s, want fd00:10:8::1", got)
+	}
+
+	client4 := net.IPv4(10, 8, 0, 2)
+	c6 := p.ClientIP6(client4)
+	if got, want := c6.String(), "fd00:10:8::a08:2"; got != want {
+		t.Errorf("ClientIP6 = %s, want %s", got, want)
+	}
+
+	// Round-trip: the dispatcher recovers the v4 lease key from the low 32
+	// bits of the derived v6 address.
+	if got := net.IP(c6[12:16]); !got.Equal(client4.To4()) {
+		t.Errorf("round-trip v4 = %s, want %s", got, client4)
+	}
+
+	// Prefix membership and injectivity across distinct v4 leases.
+	other := p.ClientIP6(net.IPv4(10, 8, 0, 99))
+	if !p.V6Prefix().Contains(c6) || !p.V6Prefix().Contains(other) {
+		t.Error("derived client addresses must lie inside the pool prefix")
+	}
+	if c6.Equal(other) {
+		t.Error("distinct v4 leases must derive distinct v6 addresses")
+	}
+}
+
+// The handshake seam (deriveDualStackAddrs) and the pool must agree
+// bit-for-bit — one derivation rule, two entry points.
+func TestDualStackPoolMatchesHandshakeDerivation(t *testing.T) {
+	p := newDualStackTestPool(t)
+	d := deriveDualStackAddrs("fd00:10:8::/64", hsClientIP)
+	if d == nil {
+		t.Fatal("deriveDualStackAddrs returned nil for a valid pool")
+	}
+	if !d.ServerIP6.Equal(p.ServerIP6()) {
+		t.Errorf("server6 mismatch: handshake=%s pool=%s", d.ServerIP6, p.ServerIP6())
+	}
+	if !d.ClientIP6.Equal(p.ClientIP6(hsClientIP)) {
+		t.Errorf("client6 mismatch: handshake=%s pool=%s", d.ClientIP6, p.ClientIP6(hsClientIP))
+	}
+}
+
+// Prefixes whose host part cannot hold a 32-bit v4 address, non-CIDRs and
+// IPv4 CIDRs must be rejected at pool construction (fails server startup).
+func TestDualStackInvalidPrefixRejected(t *testing.T) {
+	for _, bad := range []string{
+		"fd00:10:8::/97",  // <32 host bits
+		"fd00:10:8::/128", // <32 host bits
+		"not-a-cidr",
+		"10.8.0.0/24", // IPv4 CIDR
+	} {
+		_, err := NewIPPool(IPPoolConfig{
+			Network:   "10.8.0.0/24",
+			ServerIP:  "10.8.0.1",
+			NetworkV6: bad,
+		}, nil)
+		if err == nil {
+			t.Errorf("NetworkV6 %q: expected error, got nil", bad)
+		}
+	}
+
+	// /96 is the longest valid prefix (exactly 32 host bits).
+	if _, err := NewIPPool(IPPoolConfig{
+		Network:   "10.8.0.0/24",
+		ServerIP:  "10.8.0.1",
+		NetworkV6: "fd00:10:8:1:2:3::/96",
+	}, nil); err != nil {
+		t.Errorf("/96 prefix should be accepted: %v", err)
+	}
+}
+
+// Adding a v6 prefix must not perturb v4 allocation: sticky leases and
+// auto-allocation behave exactly as in a v4-only pool.
+func TestDualStackDoesNotChangeV4Allocation(t *testing.T) {
+	p := newDualStackTestPool(t)
+	ip, err := p.Allocate("dual-client", net.IPv4zero, "")
+	if err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
+	if !p.network.Contains(ip) {
+		t.Fatalf("allocated %s outside %s", ip, p.network)
+	}
+	again, err := p.Allocate("dual-client", net.IPv4zero, "")
+	if err != nil || !again.Equal(ip) {
+		t.Fatalf("sticky lease flapped: %s -> %s (err=%v)", ip, again, err)
+	}
+}
