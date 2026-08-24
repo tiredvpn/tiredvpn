@@ -68,36 +68,48 @@ func b1ClientConfig(sni string, curves []tls.CurveID) *tls.Config {
 	}
 }
 
-// TestB1TLSNegotiation pins what the handshake settles on: TLS 1.3, h2, and the
-// hybrid group when the client offers it, which is what the task specifies and
-// what a client would see at a modern donor.
+// TestB1TLSNegotiation pins what the B1 handshake settles on: TLS 1.3, h2, and
+// the key exchange the donor being imitated uses.
 //
-// The group choice is contested. The donor measurements found eleven of
-// thirteen donors answering with classic X25519 in 133 bytes, against 1221 when
-// the hybrid is picked, and that 1088-byte difference is visible in the first
-// response packet under a donor SNI. That is being settled for the plain TLS
-// branch in its own task; when it is, this expectation is the one to revisit,
-// because the two paths must not answer differently on the same port.
+// This deliberately contradicts the group named in the task 006 acceptance
+// criteria, which predate the donor measurements. Eleven of thirteen donors
+// answer with classic X25519 in a 133-byte plaintext ServerHello, against 1221
+// when the hybrid is chosen, and B1 presents itself under a donor's SNI - so
+// the 1088 extra bytes would ride in every real connection. The group comes
+// from the same donor table the shared listener uses, so the two paths cannot
+// answer differently on one port.
 func TestB1TLSNegotiation(t *testing.T) {
 	t.Parallel()
 
 	serverCfg := b1TLSConfig(newCertMinter(), "www.microsoft.com")
 
 	// The client offers the hybrid first, exactly as a current browser does.
-	clientCfg := b1ClientConfig("yandex.ru", []tls.CurveID{tls.X25519MLKEM768, tls.X25519})
-	client, server := b1TLSPair(t, serverCfg, clientCfg)
+	// What we answer is decided by the donor, not by what was offered.
+	clientCurves := []tls.CurveID{tls.X25519MLKEM768, tls.X25519}
 
-	for name, st := range map[string]tls.ConnectionState{"client": client.ConnectionState(), "server": server.ConnectionState()} {
-		if st.CurveID != tls.X25519MLKEM768 {
-			t.Fatalf("%s: negotiated %v, want X25519MLKEM768", name, st.CurveID)
+	t.Run("classic donor", func(t *testing.T) {
+		client, server := b1TLSPair(t, serverCfg, b1ClientConfig("yandex.ru", clientCurves))
+		for name, st := range map[string]tls.ConnectionState{"client": client.ConnectionState(), "server": server.ConnectionState()} {
+			if st.CurveID != tls.X25519 {
+				t.Fatalf("%s: negotiated %v under a classic donor, want X25519", name, st.CurveID)
+			}
+			if st.Version != tls.VersionTLS13 {
+				t.Fatalf("%s: version = %x, want TLS 1.3", name, st.Version)
+			}
+			if st.NegotiatedProtocol != "h2" {
+				t.Fatalf("%s: ALPN = %q, want h2", name, st.NegotiatedProtocol)
+			}
 		}
-		if st.Version != tls.VersionTLS13 {
-			t.Fatalf("%s: version = %x, want TLS 1.3", name, st.Version)
+	})
+
+	t.Run("hybrid donor", func(t *testing.T) {
+		// raw.githubusercontent.com really does negotiate ML-KEM, so under its
+		// name we do too - reproducing a measured difference, not inventing one.
+		client, _ := b1TLSPair(t, serverCfg, b1ClientConfig("raw.githubusercontent.com", clientCurves))
+		if got := client.ConnectionState().CurveID; got != tls.X25519MLKEM768 {
+			t.Fatalf("negotiated %v under a hybrid donor, want X25519MLKEM768", got)
 		}
-		if st.NegotiatedProtocol != "h2" {
-			t.Fatalf("%s: ALPN = %q, want h2", name, st.NegotiatedProtocol)
-		}
-	}
+	})
 }
 
 // TestB1TLSCertificateMatchesSNI covers the criterion across several names from

@@ -14,32 +14,32 @@ import (
 	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 )
 
-// b1CurvePreferences is the key-exchange group list for the B1 server.
+// The B1 server answers with the same key exchange the shared listener does,
+// from the same donor table (curvePreferencesFor). Classic by default, hybrid
+// under the two donors that genuinely negotiate ML-KEM.
 //
-// Hybrid first, because a client on a current browser profile offers both
-// X25519MLKEM768 and X25519, and a modern site picks the hybrid. Choosing plain
-// X25519 when the hybrid was offered would differ from what the client would
-// have seen at the donor.
+// Both branches on classic is one decision, not two. Eleven of thirteen donors
+// send a 133-byte plaintext ServerHello where the hybrid makes ours 1221, and
+// B1 presents itself under a donor's SNI, so the 1088 extra bytes would ride in
+// the ServerHello of every real B1 connection. Two paths answering differently
+// on one port would be a signal in itself, and a worse one than what we started
+// with - so if the group ever moves, it moves in both.
 //
-// Note for whoever owns the group choice next: the donor measurements
-// (research/donor-profiles-2026-08-25.md) found eleven of thirteen donors
-// answering with classic X25519 and a 133-byte plaintext ServerHello, against
-// 1221 bytes when the hybrid is selected. Those measurements were taken against
-// the plain TLS branch rather than this one, so they are that branch's problem
-// to fix - but the same 1088 bytes ride in the ServerHello of every real B1
-// connection, under a donor SNI. Whatever is decided for initTLSConfig has to
-// be decided here too, or the two paths answer differently on one port.
-var b1CurvePreferences = []tls.CurveID{tls.X25519MLKEM768, tls.X25519}
+// Worth recording for whoever revisits this: the cost is lower here than on the
+// shared listener. For stego, morph, websocket-padded, http-polling and
+// anti-probe the outer TLS is the only confidentiality they have, so dropping
+// the hybrid is a real trade. Under B1 it is not the only layer - the client's
+// X25519 in session_id and the AEAD channel underneath both stand on their own.
 
 // b1TLSConfig builds the TLS 1.3 configuration for the B1 transport.
 //
 // Separate from srvCtx.tlsConfig on purpose: that one allows TLS 1.2 and serves
 // one fixed certificate, both of which would be wrong here.
 func b1TLSConfig(minter *certMinter, coverDomain string) *tls.Config {
-	return &tls.Config{
+	base := &tls.Config{
 		MinVersion:       tls.VersionTLS13,
 		MaxVersion:       tls.VersionTLS13,
-		CurvePreferences: b1CurvePreferences,
+		CurvePreferences: classicCurves,
 		NextProtos:       []string{"h2", "http/1.1"},
 		GetCertificate: func(chi *tls.ClientHelloInfo) (*tls.Certificate, error) {
 			name := chi.ServerName
@@ -58,6 +58,17 @@ func b1TLSConfig(minter *certMinter, coverDomain string) *tls.Config {
 		// Session tickets stay on: a real server issues them, and a server that
 		// never does is a server that stands out.
 	}
+
+	hybrid := base.Clone()
+	hybrid.CurvePreferences = hybridCurves
+
+	base.GetConfigForClient = func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
+		if keyExchangeFor(chi.ServerName) == kxHybrid {
+			return hybrid, nil
+		}
+		return nil, nil
+	}
+	return base
 }
 
 // defaultCertName is used when a client sends no SNI and no cover domain is

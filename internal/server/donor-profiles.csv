@@ -1,0 +1,14 @@
+sni,mechanism,ccs_limit,timeout_ms,key_exchange,confidence,measured_at,note
+yandex.ru,count,33,0,classic,high,2026-08-25,stable 33/33/33 at 40ms and 33/34 at 10ms - count-based
+ya.ru,count,33,0,classic,high,2026-08-25,"stable 33/33/33 at 40ms, 34 at 10ms - count-based"
+vk.com,count,34,0,classic,high,2026-08-25,"34/34/35 at 40ms, 36 at 10ms - count-based"
+mail.ru,count,2,0,classic,high,2026-08-25; key exchange recorded as classic: the donor is TLS 1.2 and has no TLS 1.3 group to match,"2 on four consecutive runs, 3 at 10ms; TLS 1.2 donor, CCS is a real protocol message there not middlebox compat"
+sberbank.ru,timeout,0,9500,classic,high,2026-08-25,no count limit: 240 at 40ms (9.6s) but 400 at 10ms (4.0s) - cuts on elapsed handshake time near 10s
+gosuslugi.ru,timeout,0,9500,classic,high,2026-08-25,no count limit: 247 at 40ms (9.9s) but 400 at 10ms - time-based
+tinkoff.ru,count,34,0,classic,high,2026-08-25,34/34/34 at 40ms and 10ms - count-based
+alfabank.ru,count,34,0,classic,medium,2026-08-25,"34/38/34 at 40ms, 35 at 10ms - one outlier at 38, floor taken"
+vtb.ru,timeout,0,9500,classic,high,2026-08-25,no count limit: 248/249 at 40ms but 400 at 10ms - time-based
+github.com,unmeasured,1,0,classic,none,2026-08-25,"routes through tiredvpn0 from the measuring host - probe measures our own tunnel, not the donor"
+api.github.com,unmeasured,1,0,classic,none,2026-08-25,routes through tiredvpn0 - not measurable from this host
+raw.githubusercontent.com,unmeasured,1,0,hybrid,none,2026-08-25,routes through tiredvpn0 - not measurable from this host
+objects.githubusercontent.com,unmeasured,1,0,hybrid,none,2026-08-25,routes through tiredvpn0 - not measurable from this host
