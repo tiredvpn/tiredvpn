@@ -158,14 +158,14 @@ func TestValidateREALITYConfig(t *testing.T) {
 		wantErr bool
 		wantMod string // expected REALITYMirrorMode after validation
 	}{
-		{"empty mirror defaults to off", Config{REALITYLegacyEnabled: true}, false, MirrorOff},
+		{"empty mirror defaults to adaptive", Config{REALITYLegacyEnabled: true}, false, MirrorAdaptive},
 		{"off", Config{REALITYLegacyEnabled: true, REALITYMirrorMode: MirrorOff}, false, MirrorOff},
 		{"adaptive accepted early", Config{REALITYLegacyEnabled: true, REALITYMirrorMode: MirrorAdaptive}, false, MirrorAdaptive},
 		{"always accepted early", Config{REALITYLegacyEnabled: true, REALITYMirrorMode: MirrorAlways}, false, MirrorAlways},
 		{"typo rejected", Config{REALITYLegacyEnabled: true, REALITYMirrorMode: "adaptative"}, true, ""},
 		{"both transports off", Config{}, true, ""},
 		{"negative time diff", Config{REALITYLegacyEnabled: true, REALITYMaxTimeDiff: -1}, true, ""},
-		{"b1 only is fine", Config{REALITYB1Enabled: true}, false, MirrorOff},
+		{"b1 only is fine", Config{REALITYB1Enabled: true}, false, MirrorAdaptive},
 	}
 
 	for _, tt := range tests {

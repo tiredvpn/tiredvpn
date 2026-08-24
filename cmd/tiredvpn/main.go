@@ -203,7 +203,7 @@ REALITY OPTIONS:
   -reality-min-client-ver string
         Lowest client version B1 accepts, X.Y.Z (empty = do not check)
   -reality-mirror string
-        Mirror the handshake to the real donor: off, adaptive, always. Only off is implemented until B1.5. (default "off")
+        Mirror the handshake to the real donor for sources that have not authenticated: off, adaptive, always (default "adaptive")
   -reality-require-data-v2
         Reject REALITY clients still on the v1 data layer (turn on after every client is upgraded)
 
@@ -420,7 +420,7 @@ func registerServerFlags(fs *flag.FlagSet, cfg *server.Config) *serverFlagOpts {
 	fs.BoolVar(&cfg.REALITYLegacyEnabled, "reality-legacy", true, "Accept the legacy REALITY transport (credentials in padding extension 0x0015). Turn off once no client uses it.")
 	fs.IntVar(&cfg.REALITYMaxTimeDiff, "reality-max-time-diff", 300, "Client clock skew tolerated by B1 auth, seconds (0 = do not check)")
 	fs.StringVar(&cfg.REALITYMinClientVer, "reality-min-client-ver", "", "Lowest client version B1 accepts, X.Y.Z (empty = do not check)")
-	fs.StringVar(&cfg.REALITYMirrorMode, "reality-mirror", "off", "How much of the handshake to mirror to the real donor: off, adaptive, always. Only off is implemented until B1.5.")
+	fs.StringVar(&cfg.REALITYMirrorMode, "reality-mirror", "adaptive", "Mirror the handshake to the real donor for unauthenticated sources: off, adaptive (default), always. 'always' dials a donor for every connection including users - measurement only.")
 	fs.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
 	opts.tunIP = fs.String("tun-ip", "10.8.0.1", "TUN interface IP address for VPN server")
 	fs.StringVar(&cfg.TunName, "tun-name", "tiredvpn0", "TUN interface name")

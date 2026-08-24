@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -80,9 +81,21 @@ func tryREALITYB1(conn net.Conn, peekBuf []byte, srvCtx *serverContext, logger *
 	}
 	helloRaw := peekBuf[tlsRecordHeaderLen:]
 
+	now := time.Now()
+
+	// Open the donor connection alongside the gate rather than after it, for
+	// sources we have no reason to trust yet. A prober always arrives from such
+	// a source; a user's address is vouched for by its last successful
+	// handshake and costs no donor traffic at all. See reality_mirror.go.
+	var donor <-chan donorHandoff
+	if shouldMirror(srvCtx.cfg.REALITYMirrorMode, conn.RemoteAddr(), now) {
+		donor = dialDonorEagerly(peekBuf, srvCtx)
+	}
+
 	gate := gateFor(srvCtx)
-	verdict, err := gate.evaluate(srvCtx, helloRaw, time.Now())
+	verdict, err := gate.evaluate(srvCtx, helloRaw, now)
 	if err != nil {
+		releaseDonor(donor)
 		// Structurally not a ClientHello we can read. Hand it back rather than
 		// consume it: this is the only path that must not claim the connection.
 		return false
@@ -104,6 +117,7 @@ func tryREALITYB1(conn net.Conn, peekBuf []byte, srvCtx *serverContext, logger *
 		// end state of the rollout.
 		if srvCtx.cfg.REALITYLegacyEnabled && DetectREALITYExtension(peekBuf) {
 			logger.Debug("REALITY B1: no match (%s), deferring to the legacy transport", verdict.reason)
+			releaseDonor(donor)
 			return false
 		}
 
@@ -111,9 +125,13 @@ func tryREALITYB1(conn net.Conn, peekBuf []byte, srvCtx *serverContext, logger *
 		// The reason is logged locally and never signalled to the peer: same
 		// destination, same bytes, same delay.
 		logger.Debug("REALITY B1: no match (%s), serving donor", verdict.reason)
-		realityDonorFallback(conn, peekBuf, srvCtx, logger)
+		realityDonorFallback(conn, peekBuf, donor, srvCtx, logger)
 		return true
 	}
+
+	// Authenticated: this source needs no donor now and none next time either.
+	releaseDonor(donor)
+	reputation.remember(conn.RemoteAddr(), now)
 
 	// The counter moves in handleREALITYB1, after the binding proves the client
 	// holds the secret. Counting here would count anyone who got a short ID
@@ -282,18 +300,14 @@ func versionAtLeast(version [3]byte, minVer string) bool {
 //
 // peekBuf goes to the donor byte for byte. B1 carries no padding extension, so
 // unlike the legacy path there is nothing to strip.
-func realityDonorFallback(conn net.Conn, peekBuf []byte, srvCtx *serverContext, logger *log.Logger) {
-	dest := donorDestination(peekBuf, srvCtx.cfg.REALITYCoverDomain)
-	if dest == "" {
-		// No allowlisted SNI and no cover domain: close without a word, which
-		// is what the legacy path does and the only option that does not
-		// confirm anything.
-		return
-	}
-
-	destConn, err := net.DialTimeout("tcp", net.JoinHostPort(dest, "443"), 10*time.Second)
+func realityDonorFallback(conn net.Conn, peekBuf []byte, donor <-chan donorHandoff, srvCtx *serverContext, logger *log.Logger) {
+	destConn, dest, err := awaitDonor(donor, peekBuf, srvCtx)
 	if err != nil {
-		logger.Debug("REALITY B1: donor %s unreachable: %v", dest, err)
+		if !errors.Is(err, errNoDonor) {
+			logger.Debug("REALITY B1: donor %s unreachable: %v", dest, err)
+		}
+		// No donor to hand this to: close without a word, which is what the
+		// legacy path does and the only answer that confirms nothing.
 		return
 	}
 	defer destConn.Close()
@@ -305,6 +319,37 @@ func realityDonorFallback(conn net.Conn, peekBuf []byte, srvCtx *serverContext, 
 
 	logger.Debug("REALITY B1: proxying %s to donor %s", conn.RemoteAddr(), dest)
 	proxyBothWays(conn, destConn)
+}
+
+// awaitDonor takes the eagerly dialled connection if there is one, and dials on
+// the spot if there is not. The lazy dial is what an address we already trust
+// gets when its handshake turns out to be broken after all.
+func awaitDonor(donor <-chan donorHandoff, peekBuf []byte, srvCtx *serverContext) (net.Conn, string, error) {
+	if donor != nil {
+		h := <-donor
+		return h.conn, h.dest, h.err
+	}
+
+	dest := donorDestination(peekBuf, srvCtx.cfg.REALITYCoverDomain)
+	if dest == "" {
+		return nil, "", errNoDonor
+	}
+	realityDonorDialsLazy.Add(1)
+	c, err := net.DialTimeout("tcp", net.JoinHostPort(dest, "443"), 10*time.Second)
+	return c, dest, err
+}
+
+// releaseDonor closes an eagerly dialled connection nobody needs. Waiting for
+// the dial in a goroutine keeps the caller off the donor's round trip.
+func releaseDonor(donor <-chan donorHandoff) {
+	if donor == nil {
+		return
+	}
+	go func() {
+		if h := <-donor; h.conn != nil {
+			_ = h.conn.Close()
+		}
+	}()
 }
 
 // donorDestination applies the destination policy to a ClientHello.

@@ -156,8 +156,12 @@ func TestRegisterServerFlags_REALITYB1(t *testing.T) {
 	if cfg.REALITYMaxTimeDiff != 300 {
 		t.Errorf("default -reality-max-time-diff = %d, want 300", cfg.REALITYMaxTimeDiff)
 	}
-	if cfg.REALITYMirrorMode != "off" {
-		t.Errorf("default -reality-mirror = %q, want off", cfg.REALITYMirrorMode)
+	// Adaptive: a donor is dialled only for sources that have not
+	// authenticated recently, so donor traffic tracks probing rather than
+	// users. It costs nothing until -reality-b1 is on, since the mirror lives
+	// on that path.
+	if cfg.REALITYMirrorMode != "adaptive" {
+		t.Errorf("default -reality-mirror = %q, want adaptive", cfg.REALITYMirrorMode)
 	}
 	if cfg.REALITYPrivateKey != "" || cfg.REALITYMinClientVer != "" {
 		t.Error("key and min-version must default to empty")

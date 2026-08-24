@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -258,4 +259,132 @@ func TestB1BadBindingGetsAWebsite(t *testing.T) {
 
 func writeTestIndex(dir string) error {
 	return os.WriteFile(filepath.Join(dir, "index.html"), []byte("<html><body>hello</body></html>"), 0o600)
+}
+
+// deadlineRecorder records the deadlines set on a connection, so a test can
+// assert the handshake is bounded and the tunnel is not.
+type deadlineRecorder struct {
+	net.Conn
+	mu    sync.Mutex
+	calls []time.Time
+}
+
+func (d *deadlineRecorder) SetDeadline(t time.Time) error {
+	d.mu.Lock()
+	d.calls = append(d.calls, t)
+	d.mu.Unlock()
+	return d.Conn.SetDeadline(t)
+}
+
+func (d *deadlineRecorder) seen() []time.Time {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]time.Time(nil), d.calls...)
+}
+
+// TestB1HandshakeIsBoundedAndTheTunnelIsNot covers both halves of the same
+// mistake.
+//
+// A handshake with no deadline of its own is a handshake an authenticated
+// client can hold open: crypto/tls resets its useless-record counter on any
+// record that advances things, so alternating ChangeCipherSpec with encrypted
+// fragments never trips it. And a deadline that survives into the tunnel is
+// worse than none, because it would cut every real connection at whatever
+// absolute time the peek loop happened to pick.
+func TestB1HandshakeIsBoundedAndTheTunnelIsNot(t *testing.T) {
+	secret := []byte("shared-secret")
+	dir := t.TempDir()
+	if err := writeTestIndex(dir); err != nil {
+		t.Fatal(err)
+	}
+	srvCtx := &serverContext{cfg: &Config{FakeWebRoot: dir}}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	recorded := make(chan []time.Time, 1)
+	go func() {
+		raw, err := ln.Accept()
+		if err != nil {
+			recorded <- nil
+			return
+		}
+		rec := &deadlineRecorder{Conn: raw}
+		handleREALITYB1(rec, nil, "test-client", secret, srvCtx, log.WithPrefix("test"))
+		recorded <- rec.seen()
+	}()
+
+	raw, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := tls.Client(raw, b1ClientConfig("yandex.ru", nil))
+	if err := client.Handshake(); err != nil {
+		t.Fatalf("client handshake: %v", err)
+	}
+	state := client.ConnectionState()
+	ekm, err := customtls.ExportBindingKey(&state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := customtls.WriteClientBinding(client, secret, ekm, protocol.TypeMux); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := customtls.ReadServerBinding(client, secret, ekm); err != nil {
+		t.Fatalf("server binding: %v", err)
+	}
+	_ = client.Close()
+
+	var calls []time.Time
+	select {
+	case calls = <-recorded:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the server never finished with the connection")
+	}
+
+	if len(calls) < 2 {
+		t.Fatalf("saw %d deadline calls, want a bound before the handshake and a clear after", len(calls))
+	}
+	if calls[0].IsZero() {
+		t.Fatal("the handshake ran with no deadline of its own")
+	}
+	if within := time.Until(calls[0]); within > b1HandshakeTimeout+time.Second {
+		t.Fatalf("handshake deadline is %v out, want about %v", within, b1HandshakeTimeout)
+	}
+	if !calls[len(calls)-1].IsZero() {
+		t.Fatal("the tunnel inherited the handshake deadline, so it would die when the handshake would have")
+	}
+}
+
+// TestB1SafetyPolicyIsNotADonorNumber states the distinction the limit exists
+// for: donor tolerances make a prober see the site we claim to be, and a client
+// past the gate is no longer someone to convince.
+func TestB1SafetyPolicyIsNotADonorNumber(t *testing.T) {
+	t.Parallel()
+
+	if b1HandshakeSafetyPolicy.Mechanism != ccsCount {
+		t.Fatal("the safety bound must be a count, not a donor mechanism")
+	}
+	if b1HandshakeSafetyPolicy.Limit < 2 {
+		t.Fatal("a real client sends one ChangeCipherSpec; the bound must leave room for it")
+	}
+	if b1HandshakeSafetyPolicy.Limit > 16 {
+		t.Fatalf("bound is %d: above crypto/tls's own 16 it never governs anything",
+			b1HandshakeSafetyPolicy.Limit)
+	}
+
+	// Deliberately not compared against the donor table. The two limits never
+	// meet: donor tolerances govern the shared listener, where a prober is
+	// being shown a site, and this one governs the B1 path, where the client
+	// has already authenticated and there is nobody left to convince.
+
+	// And it closes when spent.
+	stream := repeat(ccsRecord, b1HandshakeSafetyPolicy.Limit+4)
+	g := newCCSGuardWithPolicy(&scriptConn{data: stream}, b1HandshakeSafetyPolicy)
+	if _, err := feedGuard(t, g, stream, 64); !errors.Is(err, errCCSFlood) {
+		t.Fatalf("err = %v, want the flood to be cut off", err)
+	}
 }

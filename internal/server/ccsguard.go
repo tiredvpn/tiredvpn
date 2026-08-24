@@ -175,7 +175,13 @@ type ccsGuard struct {
 
 // newCCSGuard wraps conn with the tolerance of the donor named by sni.
 func newCCSGuard(conn net.Conn, sni string) *ccsGuard {
-	g := &ccsGuard{Conn: conn, policy: ccsPolicyFor(sni), scratch: make([]byte, 4096)}
+	return newCCSGuardWithPolicy(conn, ccsPolicyFor(sni))
+}
+
+// newCCSGuardWithPolicy wraps conn with an explicit policy. Used where the
+// limit is a safety bound rather than an imitation of a donor.
+func newCCSGuardWithPolicy(conn net.Conn, policy ccsPolicy) *ccsGuard {
+	g := &ccsGuard{Conn: conn, policy: policy, scratch: make([]byte, 4096)}
 	if g.policy.Mechanism == ccsTimeout && g.policy.Timeout > 0 {
 		// A timeout donor does not count records; it gives the handshake a
 		// budget of wall-clock time. Arm it now, at the first byte, and stop it

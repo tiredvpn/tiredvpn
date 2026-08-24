@@ -75,6 +75,20 @@ func b1TLSConfig(minter *certMinter, coverDomain string) *tls.Config {
 // configured.
 const defaultCertName = "www.microsoft.com"
 
+// b1HandshakeTimeout bounds the TLS handshake for an authenticated client. A
+// real handshake takes milliseconds; this is wide enough for a bad link and
+// narrow enough that holding one open costs an attacker a connection per ten
+// seconds rather than being free.
+const b1HandshakeTimeout = 10 * time.Second
+
+// b1HandshakeSafetyPolicy caps ChangeCipherSpec records during that handshake.
+//
+// Deliberately not a donor number. Donor tolerances exist to make a prober see
+// the site we claim to be, and a client that got this far is past the point
+// where that matters. Eight is far more than the one a real client sends and
+// far less than the thirty-odd a donor would swallow.
+var b1HandshakeSafetyPolicy = ccsPolicy{Mechanism: ccsCount, Limit: 8}
+
 // b1TLS holds the per-server TLS state for the B1 transport.
 type b1TLS struct {
 	once   sync.Once
@@ -104,8 +118,24 @@ func handleREALITYB1(conn net.Conn, peekBuf []byte, clientID string, secret []by
 
 	cfg, _ := b1TLSFor(srvCtx)
 
-	tlsConn := tls.Server(conn, cfg)
-	if err := tlsConn.Handshake(); err != nil {
+	// Bound the handshake explicitly. Until now the only thing stopping a
+	// client from holding one open was a 30-second read deadline inherited
+	// from the peek loop, which is neither a chosen number nor a guarantee:
+	// crypto/tls resets its own useless-record counter on any record that
+	// advances the handshake, so a client holding the handshake keys can
+	// alternate ChangeCipherSpec with encrypted fragments and never trip it.
+	//
+	// This is a safety bound, not imitation. A client that reaches here has
+	// authenticated; there is nobody left to convince that we are yandex, and
+	// the donor tolerances have no business governing what our own users may
+	// do to us.
+	_ = conn.SetDeadline(time.Now().Add(b1HandshakeTimeout))
+	guard := newCCSGuardWithPolicy(conn, b1HandshakeSafetyPolicy)
+
+	tlsConn := tls.Server(guard, cfg)
+	err := tlsConn.Handshake()
+	guard.handshakeDone()
+	if err != nil {
 		// No alert, no reset with a distinguishing shape: just close. A failed
 		// handshake here is either a broken client or someone who stole a
 		// session_id, and neither deserves a reply that confirms anything.
@@ -114,6 +144,13 @@ func handleREALITYB1(conn net.Conn, peekBuf []byte, clientID string, secret []by
 		return
 	}
 	defer tlsConn.Close()
+
+	// The tunnel is not a handshake and must not inherit its deadline. Without
+	// this the connection stops reading at whatever absolute time the peek loop
+	// picked, which would have killed every B1 tunnel 30 seconds in.
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		logger.Debug("REALITY B1: clearing the handshake deadline failed: %v", err)
+	}
 
 	state := tlsConn.ConnectionState()
 	logger.Debug("REALITY B1: TLS up (client: %s, alpn: %q, sni: %q)", clientID, state.NegotiatedProtocol, state.ServerName)
