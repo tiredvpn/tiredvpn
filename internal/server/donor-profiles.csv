@@ -1,0 +1,18 @@
+sni,mechanism,ccs_limit,timeout_ms,key_exchange,confidence,path,measured_at,note
+yandex.ru,count,33,0,classic,high,direct,2026-08-25,33/33/33 at 40ms and 33/34 at 10ms - count-based
+ya.ru,count,33,0,classic,high,direct,2026-08-25,"33/33/33 at 40ms, 34 at 10ms - count-based"
+vk.com,count,34,0,classic,high,direct,2026-08-25,"34/34/35 at 40ms, 36 at 10ms - count-based"
+mail.ru,count,2,0,classic,high,direct,2026-08-25,"2 on four consecutive runs, 3 at 10ms; TLS 1.2 donor, CCS is a real protocol message there not middlebox compat"
+sberbank.ru,timeout,0,9500,classic,high,direct,2026-08-25,no count limit: 240 at 40ms (9.6s) but 400 at 10ms (4.0s) - cuts on elapsed handshake time near 10s
+gosuslugi.ru,timeout,0,9500,classic,high,direct,2026-08-25,no count limit: 247 at 40ms (9.9s) but 400 at 10ms - time-based
+tinkoff.ru,count,34,0,classic,high,direct,2026-08-25,34/34/34 at 40ms and 10ms - count-based
+alfabank.ru,count,34,0,classic,medium,direct,2026-08-25,"34/38/34 at 40ms, 35 at 10ms - one outlier at 38, floor taken"
+vtb.ru,timeout,0,9500,classic,high,direct,2026-08-25,no count limit: 248/249 at 40ms but 400 at 10ms - time-based
+github.com,count,36,0,classic,high,routing-bypass,2026-08-25,"36/36/36 at 40ms, 42 at 10ms - count-based; measured with a temporary /32 route around tiredvpn0"
+api.github.com,count,36,0,classic,high,routing-bypass,2026-08-25,"36/36/36 at 40ms, 42 at 10ms - count-based; temporary /32 route around tiredvpn0"
+raw.githubusercontent.com,none,0,0,hybrid,high,routing-bypass,2026-08-25,no limit of either kind: 1200 records over 48s accepted without an alert; Fastly
+objects.githubusercontent.com,none,0,0,hybrid,high,routing-bypass,2026-08-25,"no limit of either kind: 400 at both 40ms and 10ms; Fastly, same infrastructure as raw"
+90.156.221.98:995,none,0,0,classic,high,direct,2026-08-25,OUR FRONT Dubai - no limit of either kind: 1200 records over 48s accepted
+38.54.6.76:443,none,0,0,classic,high,direct,2026-08-25,"OUR FRONT USA - 400 at both pauses, no limit found"
+38.54.6.152:995,none,0,0,classic,high,direct,2026-08-25,"OUR FRONT USA2 - 400 at both pauses, no limit found"
+31.44.3.165:995,unmeasured,0,0,classic,none,none,2026-08-25,OUR FRONT AMS - no direct path from the measuring host; SOCKS would route through our own tunnel and reproduce the confound that invalidated the first GitHub numbers

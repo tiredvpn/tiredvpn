@@ -661,14 +661,10 @@ func initTLSConfig(cfg *Config, srvCtx *serverContext) error {
 	if err != nil {
 		return fmt.Errorf("failed to load certificate: %w", err)
 	}
-	srvCtx.tlsConfig = &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		NextProtos: []string{
-			"h2",
-			"http/1.1",
-		},
-		MinVersion: tls.VersionTLS12,
-	}
+	// Built in tlsprofile.go: it drops the ML-KEM hybrids that made our
+	// ServerHello 1088 bytes larger than every donor's, and varies the rest per
+	// node so one JARM query stops tying the fleet together.
+	srvCtx.tlsConfig = buildTLSProfile(cfg, cert)
 	return nil
 }
 
@@ -1173,9 +1169,18 @@ func handleConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 	if len(peekBuf) > 0 && peekBuf[0] == 0x16 {
 		logger.Debug("TLS ClientHello detected (no REALITY extension), performing TLS handshake")
 
+		// Imitate the donor's tolerance for ChangeCipherSpec floods before the
+		// handshake starts, so a prober measuring us measures the site we claim
+		// to be. See ccsguard.go; the name comes from the peek buffer we
+		// already parsed.
+		sni, _ := ExtractSNI(peekBuf)
+		guard := newCCSGuard(buffConn, sni)
+
 		// Wrap buffered connection with TLS
-		tlsConn := tls.Server(buffConn, srvCtx.tlsConfig)
-		if err := tlsConn.Handshake(); err != nil {
+		tlsConn := tls.Server(guard, srvCtx.tlsConfig)
+		err := tlsConn.Handshake()
+		guard.handshakeDone()
+		if err != nil {
 			logger.Debug("TLS handshake failed: %v", err)
 			serveFakeWebsite(conn, cfg, logger)
 			return
