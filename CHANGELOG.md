@@ -7,6 +7,12 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.27] - 2026-08-07
+
+### Added
+
+- **`-redis-db` and `-redis-prefix`: several server instances can now share one Redis without sharing a client registry.** The Redis database index and the `tiredvpn:` key prefix were both hardcoded, so any instance pointed at a given Redis saw the same client list, the same secret index and the same IP-pool namespace as every other one. That is the normal layout on a multi-role box — an entry node and two relays on the same host all talk to `127.0.0.1:6379` — and there was no way to keep their registries apart. Both are now configurable per instance (`-redis-db 0..15`, `-redis-prefix`, or `TIREDVPN_REDIS_DB` / `TIREDVPN_REDIS_PREFIX` for systemd `EnvironmentFile` setups; the flag wins over the env var). The prefix now also covers the IP-pool lease keys and the keyspace-notification channel, which previously pinned `__keyspace@0__:tiredvpn:` regardless of configuration, so an instance on its own database no longer misses its own client-change events. A prefix without a trailing `:` gets one appended so keys cannot run together. Defaults are unchanged (db 0, prefix `tiredvpn:`), so existing deployments keep their exact key layout.
+
 ## [1.3.26] - 2026-08-04
 
 ### Fixed

@@ -41,7 +41,7 @@ import (
 )
 
 var (
-	Version     = "1.3.26"
+	Version     = "1.3.27"
 	connCounter uint64
 )
 
@@ -293,8 +293,15 @@ type Config struct {
 
 	// Multi-client mode (Redis)
 	RedisAddr string // e.g., "localhost:6379"
-	APIAddr   string // e.g., "127.0.0.1:8080"
-	APIToken  string // optional bearer token for the management API ("" = no auth)
+	// RedisDB is the logical Redis database (0..15). Together with RedisPrefix
+	// it isolates instances that share one Redis: on AMS the mux, usa-relay and
+	// usa2-relay all point at 127.0.0.1:6379 and would otherwise share one
+	// client registry and one IP pool namespace.
+	RedisDB int
+	// RedisPrefix is the key namespace. Empty = DefaultRedisPrefix.
+	RedisPrefix string
+	APIAddr     string // e.g., "127.0.0.1:8080"
+	APIToken    string // optional bearer token for the management API ("" = no auth)
 
 	// Upstream (multi-hop) mode
 	UpstreamAddr   string // e.g., "exit-server.com:443"
@@ -491,7 +498,7 @@ func initClientMode(cfg *Config, srvCtx *serverContext) error {
 
 // initRedisMode initialises Redis store, client registry, API server and stats flush.
 func initRedisMode(cfg *Config, srvCtx *serverContext) error {
-	store, err := NewRedisStore(cfg.RedisAddr)
+	store, err := NewRedisStore(cfg.RedisAddr, cfg.RedisDB, cfg.RedisPrefix)
 	if err != nil {
 		return fmt.Errorf("redis connection failed: %w", err)
 	}
@@ -504,7 +511,7 @@ func initRedisMode(cfg *Config, srvCtx *serverContext) error {
 	}
 	srvCtx.registry = registry
 
-	log.Info("Multi-client mode enabled with Redis at %s", cfg.RedisAddr)
+	log.Info("Multi-client mode enabled with Redis at %s (db=%d, prefix=%q)", cfg.RedisAddr, store.DB(), store.Prefix())
 
 	if cfg.APIAddr == "" {
 		cfg.APIAddr = "127.0.0.1:8080"
@@ -580,6 +587,7 @@ func initIPPool(cfg *Config, srvCtx *serverContext) error {
 		ServerIP:  cfg.TunIP.String(),
 		LeaseTime: cfg.IPPoolLeaseTime,
 		NetworkV6: cfg.IPPoolV6,
+		KeyPrefix: cfg.RedisPrefix,
 	}, redisClient)
 	if err != nil {
 		return fmt.Errorf("IP pool initialization failed: %w", err)

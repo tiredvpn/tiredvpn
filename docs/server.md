@@ -64,9 +64,13 @@ Dual-stack lets clients choose the transport independently. Disable with `-dual-
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-redis` | | Redis address (e.g., `localhost:6379`). Enables multi-client mode. |
+| `-redis-db` | `0` | Redis logical database, `0`-`15`. Env: `TIREDVPN_REDIS_DB` |
+| `-redis-prefix` | `tiredvpn:` | Redis key namespace; a trailing `:` is appended if missing. Env: `TIREDVPN_REDIS_PREFIX` |
 | `-api-addr` | `127.0.0.1:8080` | HTTP API for client management (only used with Redis) |
 | `-ip-pool` | | CIDR block for TUN client IP assignment (e.g., `10.8.0.0/24`) |
 | `-ip-pool-lease` | `24h` | Duration of IP lease per client |
+
+Running more than one server instance against the same Redis (an entry node plus relays on one host, for example) requires giving each its own `-redis-db` or `-redis-prefix`. Instances that share both also share the client registry, the secret index and the IP-pool lease namespace, so they hand out the same tunnel addresses and see each other's clients. The flags take precedence over the env vars, which exist so a systemd `EnvironmentFile` can set them per unit.
 
 The `-ip-pool` flag is required when clients connect in TUN mode (`tiredvpn client -tun`), including the Android app. The server assigns each client a unique IP from this pool.
 
