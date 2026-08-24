@@ -201,8 +201,8 @@ func TestRoundTripSplitClears(t *testing.T) {
 	for _, f := range flights {
 		bursts := []Burst{
 			{ToServer: true, Bytes: 530, Pkts: 1},
-			{ToServer: false, Bytes: 80, Pkts: 1},  // nudge
-			{ToServer: true, Bytes: 50, Pkts: 1},   // ack
+			{ToServer: false, Bytes: 80, Pkts: 1}, // nudge
+			{ToServer: true, Bytes: 50, Pkts: 1},  // ack
 			{ToServer: false, Bytes: f[0], Pkts: 3},
 			{ToServer: true, Bytes: f[1], Pkts: 1},
 			{ToServer: false, Bytes: f[2], Pkts: 1},
