@@ -158,32 +158,68 @@ func GenerateX25519KeyPair() (privKey, pubKey [32]byte, err error) {
 	return privKey, pubKey, nil
 }
 
+// findPaddingExtension locates the padding extension (0x0015) in a full
+// ClientHello TLS record, returning the offset of its 4-byte header and its
+// body length.
+//
+// It walks the ClientHello structure rather than scanning for the bytes 00 15.
+// The scan was safe only while it never found anything: uTLS used to discard
+// the padding extension before marshalling, so this path always failed and the
+// caller fell back to appending one by hand. Now that the padding is real, a
+// scan matches the first 00 15 anywhere in the message — and a post-quantum
+// key_share puts more than a kilobyte of effectively random bytes ahead of
+// every other extension, so a false match is likely and wins, because the real
+// padding is appended last.
+func findPaddingExtension(record []byte) (hdrOffset, bodyLen int, err error) {
+	const recordHeaderLen = 5
+	if len(record) < recordHeaderLen || record[0] != 0x16 {
+		return 0, 0, errors.New("not a TLS handshake record")
+	}
+	hello := record[recordHeaderLen:]
+
+	start, length, err := helloExtensionsAt(hello)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	found := false
+	if err := walkExtensions(hello[start:start+length], func(offset int, extType uint16, body []byte) bool {
+		if extType != extensionPadding {
+			return false
+		}
+		hdrOffset = recordHeaderLen + start + offset
+		bodyLen = len(body)
+		found = true
+		return true
+	}); err != nil {
+		return 0, 0, err
+	}
+	if !found {
+		return 0, 0, errPaddingNotFound
+	}
+	return hdrOffset, bodyLen, nil
+}
+
+// extensionPadding is the RFC 7685 padding extension type.
+const extensionPadding = 0x0015
+
+var errPaddingNotFound = errors.New("padding extension not found in clientHello")
+
 // InjectREALITYIntoPadding finds padding extension in ClientHello and injects REALITY data
-// The padding extension content is replaced with: [REALITY data (69 bytes)][random padding]
+// The padding extension content is replaced with: [REALITY data][random padding]
 func InjectREALITYIntoPadding(clientHello []byte, ext *REALITYExtension) ([]byte, error) {
 	if len(clientHello) < 50 {
 		return nil, errors.New("clientHello too short")
 	}
 
-	// Find padding extension (0x00 0x15)
-	paddingOffset := -1
-	for i := 0; i < len(clientHello)-4; i++ {
-		if clientHello[i] == 0x00 && clientHello[i+1] == 0x15 {
-			// Check extension length
-			extLen := int(clientHello[i+2])<<8 | int(clientHello[i+3])
-			if extLen >= REALITYExtensionLength && i+4+extLen <= len(clientHello) {
-				paddingOffset = i
-				break
-			}
-		}
+	paddingOffset, extLen, err := findPaddingExtension(clientHello)
+	if err != nil {
+		return nil, err
+	}
+	if extLen < REALITYExtensionLength {
+		return nil, fmt.Errorf("padding extension is %d bytes, need at least %d", extLen, REALITYExtensionLength)
 	}
 
-	if paddingOffset < 0 {
-		return nil, errors.New("padding extension not found in clientHello")
-	}
-
-	// Get padding extension bounds
-	extLen := int(clientHello[paddingOffset+2])<<8 | int(clientHello[paddingOffset+3])
 	dataStart := paddingOffset + 4
 
 	// Make a copy
@@ -238,24 +274,14 @@ func AddPaddingWithREALITY(clientHello []byte, ext *REALITYExtension, totalPaddi
 	origRecordLen := int(clientHello[3])<<8 | int(clientHello[4])
 	debugLog("AddPaddingWithREALITY: input len=%d, record_len=%d (0x%02x%02x)", len(clientHello), origRecordLen, clientHello[3], clientHello[4])
 
-	// First, check if there's an existing padding extension (any size)
-	// If found, we need to REPLACE it, not add a duplicate
-	existingPaddingOffset := -1
-	existingPaddingLen := 0
-	for i := 0; i < len(clientHello)-4; i++ {
-		if clientHello[i] == 0x00 && clientHello[i+1] == 0x15 {
-			existingPaddingLen = int(clientHello[i+2])<<8 | int(clientHello[i+3])
-			if i+4+existingPaddingLen <= len(clientHello) {
-				existingPaddingOffset = i
-				debugLog("AddPaddingWithREALITY: found existing padding at offset=%d, len=%d", i, existingPaddingLen)
-				break
-			}
-		}
-	}
-
-	// If existing padding found, replace it instead of adding duplicate
-	if existingPaddingOffset >= 0 {
+	// If a padding extension is already present, replace it rather than adding a
+	// second one. Located by walking the ClientHello, not by scanning for the
+	// bytes 00 15 — see findPaddingExtension for why the scan was wrong.
+	if existingPaddingOffset, existingPaddingLen, err := findPaddingExtension(clientHello); err == nil {
+		debugLog("AddPaddingWithREALITY: found existing padding at offset=%d, len=%d", existingPaddingOffset, existingPaddingLen)
 		return replacePaddingExtension(clientHello, existingPaddingOffset, existingPaddingLen, ext, totalPaddingLen)
+	} else if !errors.Is(err, errPaddingNotFound) {
+		return nil, err
 	}
 
 	// Parse to find extensions offset

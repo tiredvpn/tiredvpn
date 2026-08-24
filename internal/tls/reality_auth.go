@@ -11,6 +11,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+
+	utls "github.com/refraction-networking/utls"
 )
 
 // REALITY client authentication carried in the TLS session_id.
@@ -87,6 +89,7 @@ var (
 	ErrAuthOpen          = errors.New("reality auth: session_id did not open")
 	ErrRandomLen         = errors.New("reality auth: ClientHello.Random must be 32 bytes")
 	ErrShortSharedSecret = errors.New("reality auth: X25519 shared secret rejected")
+	ErrNoClientEphemeral = errors.New("reality auth: profile offers no X25519 key share, cannot do REALITY")
 )
 
 // AuthPayload is the 16-byte plaintext sealed into session_id.
@@ -358,75 +361,148 @@ func ExtractPeerX25519(helloRaw []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	var hybrid []byte
-	for len(exts) >= 4 {
-		extType := binary.BigEndian.Uint16(exts)
-		extLen := int(binary.BigEndian.Uint16(exts[2:]))
-		if len(exts) < 4+extLen {
-			return nil, ErrHelloTruncated
-		}
-		body := exts[4 : 4+extLen]
-		exts = exts[4+extLen:]
-
+	var classical, hybrid []byte
+	var walkErr error
+	if err := walkExtensions(exts, func(_ int, extType uint16, body []byte) bool {
 		if extType != extensionKeyShare {
-			continue
+			return false
 		}
-		if len(body) < 2 {
-			return nil, ErrHelloTruncated
+		if len(body) < 2 || int(binary.BigEndian.Uint16(body)) != len(body)-2 {
+			walkErr = ErrHelloTruncated
+			return true
 		}
-		shares := body[2:]
-		if int(binary.BigEndian.Uint16(body)) != len(shares) {
-			return nil, ErrHelloTruncated
-		}
-		for len(shares) >= 4 {
+		for shares := body[2:]; len(shares) >= 4; {
 			group := binary.BigEndian.Uint16(shares)
 			keyLen := int(binary.BigEndian.Uint16(shares[2:]))
 			if len(shares) < 4+keyLen {
-				return nil, ErrHelloTruncated
+				walkErr = ErrHelloTruncated
+				return true
 			}
 			key := shares[4 : 4+keyLen]
 			shares = shares[4+keyLen:]
 
 			switch {
 			case group == groupX25519 && keyLen == 32:
-				// Plain X25519 is preferred: no ambiguity about layout.
-				return append([]byte(nil), key...), nil
+				classical = key
 			case group == groupX25519MLKEM768 && keyLen == mlkem.EncapsulationKeySize768+32:
 				hybrid = key[mlkem.EncapsulationKeySize768:]
 			}
 		}
+		return true
+	}); err != nil {
+		return nil, err
+	}
+	if walkErr != nil {
+		return nil, walkErr
 	}
 
+	// Preference order: plain X25519, then the hybrid group's X25519 half. This
+	// MUST mirror the client's choice of which private key to seal with (see
+	// SelectClientEphemeral) — if the two disagree, the server derives a
+	// different shared secret and every open fails.
+	if classical != nil {
+		return append([]byte(nil), classical...), nil
+	}
 	if hybrid != nil {
 		return append([]byte(nil), hybrid...), nil
 	}
 	return nil, ErrNoPeerKeyShare
 }
 
+// SelectClientEphemeral picks the private key a client must seal with. It is
+// the exact mirror of ExtractPeerX25519 and the two must never diverge: the
+// server derives its half of the shared secret from whichever public key
+// ExtractPeerX25519 picks off the wire, so the client has to seal with the
+// matching private key.
+//
+// Order: the plain X25519 key first, then the X25519 half of the hybrid group.
+//
+// The distinction is not academic. Firefox is built with
+// ReuseHybridAndClassicalKeyShares, so its Ecdhe and MlkemEcdhe are the same
+// key and either choice works. Chrome offers both groups with different keys,
+// so choosing the hybrid half there while the server reads the classical share
+// produces two different secrets and a handshake that fails every time.
+//
+// keys comes from uconn.HandshakeState.State13.KeyShareKeys. A nil result means
+// the profile does not do TLS 1.3 and cannot be used for REALITY at all — the
+// Android OkHttp profile is the one we ship that falls in this bucket.
+func SelectClientEphemeral(keys *utls.KeySharePrivateKeys) (*ecdh.PrivateKey, error) {
+	if keys == nil {
+		return nil, ErrNoClientEphemeral
+	}
+	// Ecdhe is the classical share's key; it is only the X25519 one when the
+	// profile's classical group is X25519. A profile offering, say, P-256 as
+	// its classical group must fall through to the hybrid half.
+	if keys.Ecdhe != nil && keys.Ecdhe.Curve() == ecdh.X25519() {
+		return keys.Ecdhe, nil
+	}
+	if keys.MlkemEcdhe != nil && keys.MlkemEcdhe.Curve() == ecdh.X25519() {
+		return keys.MlkemEcdhe, nil
+	}
+	return nil, ErrNoClientEphemeral
+}
+
 // helloExtensions returns the extensions block of a ClientHello, skipping past
 // session_id, cipher_suites and compression_methods.
 func helloExtensions(helloRaw []byte) ([]byte, error) {
-	offset, err := SessionIDOffset(helloRaw)
+	start, length, err := helloExtensionsAt(helloRaw)
 	if err != nil {
 		return nil, err
+	}
+	return helloRaw[start : start+length], nil
+}
+
+// helloExtensionsAt locates the extensions block of a ClientHello handshake
+// message and returns its offset and length.
+//
+// Everything in this package that needs to find an extension goes through here.
+// Scanning the raw bytes for an extension type instead — which is what the
+// legacy padding helpers used to do — matches inside key_share data, where a
+// post-quantum share puts over a kilobyte of effectively random bytes in front
+// of every other extension.
+func helloExtensionsAt(helloRaw []byte) (start, length int, err error) {
+	offset, err := SessionIDOffset(helloRaw)
+	if err != nil {
+		return 0, 0, err
 	}
 	pos := offset + AuthSessionIDLen
 
 	if len(helloRaw) < pos+2 {
-		return nil, ErrHelloTruncated
+		return 0, 0, ErrHelloTruncated
 	}
 	pos += 2 + int(binary.BigEndian.Uint16(helloRaw[pos:])) // cipher_suites
 	if len(helloRaw) < pos+1 {
-		return nil, ErrHelloTruncated
+		return 0, 0, ErrHelloTruncated
 	}
 	pos += 1 + int(helloRaw[pos]) // compression_methods
 	if len(helloRaw) < pos+2 {
-		return nil, ErrHelloTruncated
+		return 0, 0, ErrHelloTruncated
 	}
 	extLen := int(binary.BigEndian.Uint16(helloRaw[pos:]))
 	pos += 2
 	if len(helloRaw) < pos+extLen {
-		return nil, ErrHelloTruncated
+		return 0, 0, ErrHelloTruncated
 	}
-	return helloRaw[pos : pos+extLen], nil
+	return pos, extLen, nil
+}
+
+// walkExtensions calls fn for each extension in an extensions block, passing the
+// offset of the extension's 4-byte header relative to the block start, its type
+// and its body. fn returns true to stop the walk.
+func walkExtensions(block []byte, fn func(offset int, extType uint16, body []byte) bool) error {
+	for pos := 0; pos < len(block); {
+		if len(block)-pos < 4 {
+			return ErrHelloTruncated
+		}
+		extType := binary.BigEndian.Uint16(block[pos:])
+		bodyLen := int(binary.BigEndian.Uint16(block[pos+2:]))
+		if len(block)-pos-4 < bodyLen {
+			return ErrHelloTruncated
+		}
+		if fn(pos, extType, block[pos+4:pos+4+bodyLen]) {
+			return nil
+		}
+		pos += 4 + bodyLen
+	}
+	return nil
 }
