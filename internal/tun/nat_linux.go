@@ -88,13 +88,20 @@ func SetupServerNAT6(pool string, wanOverride string) error {
 	wan := wanOverride
 	if wan == "" {
 		var err error
-		// The v4 uplink route is reused for interface detection: NAT66
-		// masquerades onto the same physical uplink the v4 pool uses, and the
-		// box is guaranteed to have a v4 route (the VPN transport runs over
-		// it). TIREDVPN_WAN_IFACE overrides when v6 egresses elsewhere.
-		wan, err = detectWANInterface()
+		// Detection follows the IPv6 route, not the IPv4 one: an exit whose v6
+		// arrives over a tunnel broker (HE sit device, wireguard, ...) egresses
+		// v6 on a different interface than v4, and masquerading on the v4
+		// uplink would push pool addresses out unmasqueraded - they are ULA, so
+		// nothing comes back. Falls back to the v4 uplink when the box has no
+		// v6 route at all, which keeps the previous behaviour for a plain
+		// dual-stacked NIC. TIREDVPN_WAN_IFACE overrides both.
+		wan, err = detectWANInterface6()
 		if err != nil {
-			return fmt.Errorf("detect WAN interface (set TIREDVPN_WAN_IFACE to override): %w", err)
+			log.Warn("NAT66: no IPv6 uplink route (%v), falling back to the IPv4 uplink interface", err)
+			wan, err = detectWANInterface()
+			if err != nil {
+				return fmt.Errorf("detect WAN interface (set TIREDVPN_WAN_IFACE to override): %w", err)
+			}
 		}
 	}
 	log.Info("NAT66: using WAN interface %s for pool %s", wan, pool)
@@ -273,6 +280,25 @@ func detectWANInterface() (string, error) {
 	}
 	if len(routes) == 0 || routes[0].LinkIndex == 0 {
 		return "", fmt.Errorf("no route to 1.1.1.1")
+	}
+	link, err := netlink.LinkByIndex(routes[0].LinkIndex)
+	if err != nil {
+		return "", fmt.Errorf("resolve link %d: %w", routes[0].LinkIndex, err)
+	}
+	return link.Attrs().Name, nil
+}
+
+// detectWANInterface6 is the IPv6 twin of detectWANInterface, mirroring
+// `ip -6 route get 2606:4700:4700::1111 | ... dev`. The probe address is only a
+// route lookup target - nothing is sent to it - and any global v6 address
+// resolves the same default route.
+func detectWANInterface6() (string, error) {
+	routes, err := netlink.RouteGet(net.ParseIP("2606:4700:4700::1111"))
+	if err != nil {
+		return "", fmt.Errorf("v6 route lookup: %w", err)
+	}
+	if len(routes) == 0 || routes[0].LinkIndex == 0 {
+		return "", fmt.Errorf("no IPv6 route to the internet")
 	}
 	link, err := netlink.LinkByIndex(routes[0].LinkIndex)
 	if err != nil {
