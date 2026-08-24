@@ -400,6 +400,19 @@ type Config struct {
 	// an older binary instead of quietly mirroring nothing.
 	REALITYMirrorMode string
 
+	// BurstReshape turns on the nudge/ack exchange that splits the inner TLS
+	// handshake so the nDPI burst heuristic stops matching. "off" or "on".
+	//
+	// It must be set the same way on the client: a server that reshapes while
+	// the client does not will prepend noise to the client's data. There is no
+	// negotiation for it at that layer, so the rollout has to flip both ends.
+	BurstReshape string
+
+	// BurstReshapePadFlight adds this many bytes to the server flight for extra
+	// margin. Zero, i.e. off. Costs bytes on every connection and, like
+	// BurstReshape, has to match the client.
+	BurstReshapePadFlight int
+
 	// Shaper, when non-nil, is built from TOML [shaper]. The server-side
 	// pipeline does not yet consume it — server morph processing lives
 	// outside internal/strategy.MorphedConn — so this field is reserved for

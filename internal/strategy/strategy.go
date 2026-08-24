@@ -83,6 +83,11 @@ type Manager struct {
 	parallelProbes int
 	adaptiveOrder  bool // Reorder strategies based on success rate
 
+	// burstReshape configures the nudge/ack exchange that splits the inner
+	// handshake. Off unless the operator turns it on, and it must be on at both
+	// ends - see internal/strategy/burst_reshape.go.
+	burstReshape BurstReshapeConfig
+
 	// Circuit breaker
 	circuitBreakers *CircuitBreakerManager
 
@@ -1182,6 +1187,10 @@ type DefaultManagerConfig struct {
 	// NoopShaper behaviour (wire-format unchanged).
 	Shaper shaper.Shaper
 
+	// BurstReshape configures the nudge/ack exchange. It has to match the
+	// server: see internal/strategy/burst_reshape.go.
+	BurstReshape BurstReshapeConfig
+
 	// ShaperID is the 1-byte value advertised to the server in the MRPH
 	// handshake so it can rebuild the matching framing. 0 (noop) keeps the
 	// legacy wire format. Ignored when Shaper is nil.
@@ -1191,6 +1200,9 @@ type DefaultManagerConfig struct {
 // NewDefaultManager creates a manager with all strategies pre-registered
 func NewDefaultManager(cfg DefaultManagerConfig) *Manager {
 	m := NewManager()
+
+	// Set before registering: strategies copy this at construction.
+	m.SetBurstReshape(cfg.BurstReshape)
 
 	initManagerTransport(m, cfg)
 	initManagerPortHopping(m, cfg)
@@ -2528,4 +2540,19 @@ func (m *Manager) ResetIPv6Check() {
 	defer m.ipv6Mu.Unlock()
 	m.ipv6CheckedOnce = false
 	log.Debug("IPv6 connectivity check reset, will re-check on next connection")
+}
+
+// SetBurstReshape configures burst reshaping for strategies created afterwards.
+// Call it before building strategies: the setting is copied at construction.
+func (m *Manager) SetBurstReshape(cfg BurstReshapeConfig) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.burstReshape = cfg
+}
+
+// BurstReshape returns the configured reshaping settings.
+func (m *Manager) BurstReshape() BurstReshapeConfig {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.burstReshape
 }
