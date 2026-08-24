@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/vishvananda/netlink"
+
 	"github.com/google/nftables/expr"
 )
 
@@ -144,4 +146,40 @@ func TestEnsureIPv6AcceptRA(t *testing.T) {
 	t.Run("missing sysctl does not panic", func(t *testing.T) {
 		ensureIPv6AcceptRAAt(filepath.Join(t.TempDir(), "absent"), "eth0")
 	})
+}
+
+// TestHostRouteExists checks the probe that tells an operator-installed host
+// route apart from one we pinned ourselves. Teardown deletes only its own, so
+// a wrong answer here either strands the next client start (deleting the
+// operator's only path to the server) or leaks a route.
+//
+// Needs root to add a route, so it self-skips when run unprivileged; the
+// negative case runs either way.
+func TestHostRouteExists(t *testing.T) {
+	// Nothing routes to this documentation-range host on a test machine.
+	absent := &net.IPNet{
+		IP:   net.ParseIP("2001:db8:dead:beef::1"),
+		Mask: net.CIDRMask(128, 128),
+	}
+	if hostRouteExists(absent, true) {
+		t.Errorf("hostRouteExists(%s) = true, want false", absent)
+	}
+
+	if os.Geteuid() != 0 {
+		t.Skip("adding a route needs root")
+	}
+
+	lo, err := netlink.LinkByName("lo")
+	if err != nil {
+		t.Skipf("no loopback link: %v", err)
+	}
+	route := &netlink.Route{LinkIndex: lo.Attrs().Index, Dst: absent}
+	if err := netlink.RouteAdd(route); err != nil {
+		t.Skipf("cannot add test route: %v", err)
+	}
+	defer func() { _ = netlink.RouteDel(route) }()
+
+	if !hostRouteExists(absent, true) {
+		t.Errorf("hostRouteExists(%s) = false after adding it, want true", absent)
+	}
 }

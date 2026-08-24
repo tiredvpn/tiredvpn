@@ -81,7 +81,15 @@ type TUNDevice struct {
 	// Set via SetServerBypassIP6 before EnableDualStack.
 	serverBypassIP6 net.IP
 	bypassRoute6    *netlink.Route
-	bypassMu        sync.Mutex
+	// bypassPreexisted records that a host route to the server was already in
+	// the table before we pinned ours. Such a route belongs to the operator
+	// (NetworkManager profile, a boot script, a hand-typed `ip route add`), and
+	// on a host with no default route for that family it is the only way the
+	// server is reachable at all. Deleting it on teardown left the next client
+	// start with no path to the server, so teardown skips it.
+	bypassPreexisted  bool
+	bypass6Preexisted bool
+	bypassMu          sync.Mutex
 
 	// deferRoutes, when true, makes Configure bring the interface up and assign
 	// the tunnel address but NOT install the route set (notably a 0.0.0.0/0
@@ -268,16 +276,31 @@ func (t *TUNDevice) Close() error {
 	// Remove the server bypass host route (it lives on the physical link, not
 	// the TUN, so delRoutes does not cover it).
 	t.bypassMu.Lock()
-	for _, r := range []*netlink.Route{t.bypassRoute, t.bypassRoute6} {
-		if r == nil {
+	for _, b := range []struct {
+		route       *netlink.Route
+		preexisting bool
+	}{
+		{t.bypassRoute, t.bypassPreexisted},
+		{t.bypassRoute6, t.bypass6Preexisted},
+	} {
+		if b.route == nil {
 			continue
 		}
-		if err := netlink.RouteDel(r); err != nil {
+		if b.preexisting {
+			// The operator's own host route to the server. On a host with no
+			// default route for that family it is the only path there, so
+			// deleting it would strand the next client start.
+			log.Debug("Server bypass: leaving pre-existing route to %s in place", b.route.Dst)
+			continue
+		}
+		if err := netlink.RouteDel(b.route); err != nil {
 			log.Debug("Failed to delete server bypass route: %v", err)
 		}
 	}
 	t.bypassRoute = nil
 	t.bypassRoute6 = nil
+	t.bypassPreexisted = false
+	t.bypass6Preexisted = false
 	// Stop the watcher from re-pinning routes we just tore down.
 	t.serverBypassIP = nil
 	t.serverBypassIP6 = nil
@@ -699,6 +722,25 @@ func (t *TUNDevice) addServerBypass() { t.pinBypass(t.bypassIP()) }
 // tunnel. No-op when no v6 server address was configured.
 func (t *TUNDevice) addServerBypass6() { t.pinBypass(t.bypassIP6()) }
 
+// hostRouteExists reports whether the routing table already holds a route for
+// exactly dst. Used to tell an operator-installed host route to the server
+// apart from one we pinned ourselves, so teardown does not delete somebody
+// else's. A listing failure answers false: re-pinning and removing our own
+// route is the pre-existing behaviour and the safer default.
+func hostRouteExists(dst *net.IPNet, v6 bool) bool {
+	family := netlink.FAMILY_V4
+	if v6 {
+		family = netlink.FAMILY_V6
+	}
+	routes, err := netlink.RouteListFiltered(family,
+		&netlink.Route{Dst: dst}, netlink.RT_FILTER_DST)
+	if err != nil {
+		log.Debug("Server bypass: cannot list routes for %s: %v", dst, err)
+		return false
+	}
+	return len(routes) > 0
+}
+
 // pinBypass installs the /32 (v4) or /128 (v6) host route to ip through the
 // current physical gateway and records it for teardown. Shared by the v4 and
 // v6 paths; physicalRouteTo already selects the right address family.
@@ -716,9 +758,11 @@ func (t *TUNDevice) pinBypass(ip net.IP) {
 	if v6 {
 		bits = 128
 	}
+	dst := &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)}
+	preexisting := hostRouteExists(dst, v6)
 	bypass := &netlink.Route{
 		LinkIndex: r.LinkIndex,
-		Dst:       &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)},
+		Dst:       dst,
 		Gw:        r.Gw,
 		Src:       r.Src,
 	}
@@ -732,8 +776,10 @@ func (t *TUNDevice) pinBypass(ip net.IP) {
 	if !closed {
 		if v6 {
 			t.bypassRoute6 = bypass
+			t.bypass6Preexisted = t.bypass6Preexisted || preexisting
 		} else {
 			t.bypassRoute = bypass
+			t.bypassPreexisted = t.bypassPreexisted || preexisting
 		}
 	}
 	t.bypassMu.Unlock()
