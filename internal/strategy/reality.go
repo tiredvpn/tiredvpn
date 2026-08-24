@@ -31,10 +31,6 @@ type REALITYStrategy struct {
 	secret     []byte
 	sniRotator *evasion.SNIRotator
 
-	// burstReshape is copied from the manager at construction; see
-	// burst_reshape.go for why it has to match the server's setting.
-	burstReshape BurstReshapeConfig
-
 	// Destination tracking
 	destPool    []string // the derived donor pool, in rotator order
 	recentDests map[string]time.Time
@@ -132,12 +128,6 @@ func NewREALITYStrategy(manager *Manager, secret []byte) *REALITYStrategy {
 		recentDests: make(map[string]time.Time),
 		fingerprint: customtls.DefaultFingerprintName,
 		gate:        newHandshakeGate(),
-		burstReshape: func() BurstReshapeConfig {
-			if manager == nil {
-				return BurstReshapeConfig{}
-			}
-			return manager.BurstReshape()
-		}(),
 	}
 }
 
@@ -550,7 +540,7 @@ func (r *REALITYStrategy) connect(ctx context.Context, target string, wrapFirstF
 	}
 
 	log.Info("REALITY: Mux session established to %s via %s", target, dest)
-	return &realityConn{Conn: ReshapeClientStream(stream, r.burstReshape), sess: newSess, tcpConn: tcpConn}, nil
+	return &realityConn{Conn: stream, sess: newSess, tcpConn: tcpConn}, nil
 }
 
 // selectDestination chooses a legitimate destination from the SNI whitelist
