@@ -6,6 +6,7 @@ package tun
 import (
 	"bytes"
 	"net"
+	"strings"
 	"testing"
 
 	"github.com/google/nftables/expr"
@@ -128,5 +129,30 @@ func TestIP4ExprsUnchanged(t *testing.T) {
 	dst := poolMatchAcceptRule(pool, false)
 	if p, ok := dst[0].(*expr.Payload); !ok || p.Offset != 16 || p.Len != 4 {
 		t.Errorf("v4 daddr rule = %+v, want Payload offset 16 len 4", dst[0])
+	}
+}
+
+// TestNATTableNamesArePerPool pins the property that keeps multiple server
+// instances on one host from wiping each other's NAT: installNATRules replaces
+// its table wholesale, so two pools must never share a table name.
+func TestNATTableNamesArePerPool(t *testing.T) {
+	a := natTableNameFor("10.8.0.0/24")
+	b := natTableNameFor("10.8.9.0/24")
+	if a == b {
+		t.Fatalf("two pools share one NAT table name: %q", a)
+	}
+	if a6, b6 := nat6TableNameFor("fd00:10:8::/64"), nat6TableNameFor("fd00:10:9::/64"); a6 == b6 {
+		t.Fatalf("two v6 pools share one NAT66 table name: %q", a6)
+	}
+	if got := natTableNameFor("10.8.9.0/24"); got != "tiredvpn-nat-10-8-9-0-24" {
+		t.Errorf("natTableNameFor = %q, want tiredvpn-nat-10-8-9-0-24", got)
+	}
+	// The v4 and v6 families must not collide either, even for equal input.
+	if natTableNameFor("x") == nat6TableNameFor("x") {
+		t.Error("v4 and v6 table names collide")
+	}
+	// nftables names allow a limited charset; anything outside it is mapped.
+	if strings.ContainsAny(nat6TableNameFor("fd00:10:9::/64"), ":/.") {
+		t.Errorf("unsanitized characters left in %q", nat6TableNameFor("fd00:10:9::/64"))
 	}
 }

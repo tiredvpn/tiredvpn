@@ -15,11 +15,35 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
-// natTableName is the nftables table used for the server's TUN-mode NAT
-// bootstrap (MASQUERADE + FORWARD accept for the client IP pool). Kept
-// separate from the per-interface MSS clamping tables (nftablesTableName)
-// so the two subsystems never collide.
-const natTableName = "tiredvpn-nat"
+// natTableNameFor returns the nftables table used for the server's TUN-mode
+// NAT bootstrap (MASQUERADE + FORWARD accept for the client IP pool). Kept
+// separate from the per-interface MSS clamping tables (nftablesTableName) so
+// the two subsystems never collide.
+//
+// The pool is part of the name because installNATRules replaces its table
+// wholesale: with one shared name, every instance on a multi-instance host
+// wiped the NAT of all the others each time it started. Instances that predate
+// this still use the old flat "tiredvpn-nat" table, which is deliberately left
+// alone so a half-upgraded host keeps working.
+func natTableNameFor(pool string) string {
+	return "tiredvpn-nat-" + sanitizeNftName(pool)
+}
+
+// nat6TableNameFor is the IPv6 twin of natTableNameFor.
+func nat6TableNameFor(pool string) string {
+	return "tiredvpn-nat6-" + sanitizeNftName(pool)
+}
+
+// sanitizeNftName turns a CIDR into something usable as an nftables table name
+// ("10.8.9.0/24" -> "10-8-9-0-24", "fd00:10:9::/64" -> "fd00-10-9---64").
+func sanitizeNftName(s string) string {
+	return strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			return r
+		}
+		return '-'
+	}, s)
+}
 
 // SetupServerNAT installs IPv4 forwarding, MASQUERADE and FORWARD-accept
 // rules for pool egressing via the WAN interface, replacing the iptables
@@ -62,11 +86,6 @@ func SetupServerNAT(pool string, wanOverride string) error {
 	log.Info("NAT: installed MASQUERADE %s -> %s and FORWARD accept via nftables", pool, wan)
 	return nil
 }
-
-// nat6TableName is the nftables ip6 table for NAT66 of the dual-stack tunnel
-// prefix. Kept separate from the IPv4 natTableName so flushing/replacing one
-// family never touches the other.
-const nat6TableName = "tiredvpn-nat6"
 
 // SetupServerNAT6 installs IPv6 forwarding, MASQUERADE (NAT66) and
 // FORWARD-accept rules for the dual-stack tunnel prefix (a ULA such as
@@ -184,7 +203,7 @@ func ensureIPv6AcceptRAAt(path, iface string) {
 func installNAT6Rules(pool *net.IPNet, wan string) error {
 	// See installNATRules for why the delete runs in its own flush.
 	if delConn, err := nftables.New(); err == nil {
-		delConn.DelTable(&nftables.Table{Family: nftables.TableFamilyIPv6, Name: nat6TableName})
+		delConn.DelTable(&nftables.Table{Family: nftables.TableFamilyIPv6, Name: nat6TableNameFor(pool.String())})
 		_ = delConn.Flush()
 	}
 
@@ -195,7 +214,7 @@ func installNAT6Rules(pool *net.IPNet, wan string) error {
 
 	natTbl := conn.AddTable(&nftables.Table{
 		Family: nftables.TableFamilyIPv6,
-		Name:   nat6TableName,
+		Name:   nat6TableNameFor(pool.String()),
 	})
 
 	postrouting := conn.AddChain(&nftables.Chain{
@@ -321,7 +340,7 @@ func installNATRules(pool *net.IPNet, wan string) error {
 	// doesn't exist yet (first run) would otherwise abort that batch too.
 	// Best-effort: ignore the error either way.
 	if delConn, err := nftables.New(); err == nil {
-		delConn.DelTable(&nftables.Table{Family: nftables.TableFamilyIPv4, Name: natTableName})
+		delConn.DelTable(&nftables.Table{Family: nftables.TableFamilyIPv4, Name: natTableNameFor(pool.String())})
 		_ = delConn.Flush()
 	}
 
@@ -332,7 +351,7 @@ func installNATRules(pool *net.IPNet, wan string) error {
 
 	natTbl := conn.AddTable(&nftables.Table{
 		Family: nftables.TableFamilyIPv4,
-		Name:   natTableName,
+		Name:   natTableNameFor(pool.String()),
 	})
 
 	postrouting := conn.AddChain(&nftables.Chain{
