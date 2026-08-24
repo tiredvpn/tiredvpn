@@ -82,10 +82,25 @@ const (
 	// On expiry the reply goes out unreshaped rather than being held longer.
 	reshapeAckTimeout = 200 * time.Millisecond
 
-	// Nudge and ack sizes, jittered per stream. See the package comment for why
-	// they are this small.
-	reshapeNudgeMin = 60
-	reshapeNudgeMax = 100
+	// Nudge and ack sizes, jittered per stream.
+	//
+	// The margin is almost flat in the nudge length - across 45..100 bytes the
+	// distance to the binding model moves by 0.045 - because the window that
+	// binds is [530, nudge, ack, 2833] and its distance is dominated by the
+	// server flight, not by the nudge. Still, the whole range costs nothing to
+	// move, so it sits at the low end of what stays plausible:
+	//
+	//   nudge 45..80  -> worst margin 0.945
+	//   nudge 60..100 -> worst margin 0.927
+	//
+	// The floor is not free. A TLS 1.3 record cannot be shorter than about 22
+	// bytes (one content byte, a 16-byte tag, a 5-byte header), and records down
+	// near that size are alerts, which mid-connection are themselves worth
+	// noticing. At 45..80 the record lands where real HTTP/2 control frames land
+	// - SETTINGS and WINDOW_UPDATE, 9 to 30 bytes of payload - which is the most
+	// common small record on a live h2 connection.
+	reshapeNudgeMin = 45
+	reshapeNudgeMax = 80
 	reshapeAckMin   = 40
 	reshapeAckSpan  = 26 // ack length lands in [40, 65]
 

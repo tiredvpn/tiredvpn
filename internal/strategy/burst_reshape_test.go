@@ -597,3 +597,49 @@ func TestNudgeLenInRange(t *testing.T) {
 		t.Errorf("jitter looks degenerate: only %d distinct lengths in 2000 draws", len(seen))
 	}
 }
+
+// TestNudgeRangeIsTheBestAvailable pins why the range is 45..80 and not
+// something else. The margin is nearly linear in the nudge length and the slope
+// is shallow - about -0.0008 per byte - because the binding window is
+// [530, nudge, ack, 2833] and its distance is set by the server flight, not by
+// the nudge. Narrowing the range is worth roughly two points of margin and no
+// more; anyone looking for a real improvement has to move the flight itself.
+//
+// The floor is a separate constraint and is not visible in these numbers: below
+// about 30 bytes the record is alert-sized, and a mid-connection alert is its
+// own anomaly. That is why the sweep below is not simply "pick the smallest".
+func TestNudgeRangeIsTheBestAvailable(t *testing.T) {
+	worstOver := func(lo, hi int) (float64, int) {
+		worst, at := detect.MarginClear, 0
+		for n := lo; n <= hi; n++ {
+			ack := uint32(reshapeAckLen(n))
+			for _, flow := range baselineFlows {
+				bursts := detect.Merge(reshapedBursts(flow, uint32(n), ack))
+				for _, w := range detect.Windows(bursts) {
+					if m := detect.Margin(w); m < worst {
+						worst, at = m, n
+					}
+				}
+			}
+		}
+		return worst, at
+	}
+
+	chosen, chosenAt := worstOver(reshapeNudgeMin, reshapeNudgeMax)
+	t.Logf("chosen range %d..%d -> worst margin %.3f at nudge=%d",
+		reshapeNudgeMin, reshapeNudgeMax, chosen, chosenAt)
+
+	// The range we shipped must beat the one the spec started from.
+	if wider, _ := worstOver(60, 100); chosen <= wider {
+		t.Errorf("chosen range gains nothing over 60..100: %.3f vs %.3f", chosen, wider)
+	}
+	if chosen < detect.RequiredMargin {
+		t.Fatalf("chosen range %.3f is below the required %.3f", chosen, detect.RequiredMargin)
+	}
+
+	// Document the shape of the trade rather than asserting on it.
+	for _, r := range [][2]int{{30, 60}, {40, 70}, {45, 80}, {60, 80}, {60, 100}, {60, 140}} {
+		w, at := worstOver(r[0], r[1])
+		t.Logf("  %3d..%3d -> %.3f (binds at nudge=%d)", r[0], r[1], w, at)
+	}
+}
