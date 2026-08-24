@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/log"
+	"github.com/tiredvpn/tiredvpn/internal/tun"
 )
 
 // tunPacketSink is where the IP packets a downstream TUN client sends go.
@@ -65,9 +66,25 @@ type relayTUNSink struct {
 	up     net.Conn
 	logger *log.Logger
 
+	// serverIP6/clientIP6 are the IPv6 tunnel addresses the exit assigned in
+	// its handshake response, when it negotiated dual-stack (nil otherwise).
+	// The relay answers its downstream client with these so the v6 addresses,
+	// like the v4 ones, always come from the exit, never from the relay's pool.
+	serverIP6 net.IP
+	clientIP6 net.IP
+
 	writeMu sync.Mutex
 	done    chan struct{}
 	once    sync.Once
+}
+
+// dualAddrs returns the exit-assigned IPv6 tunnel addresses for the downstream
+// handshake response, or nil when the exit did not negotiate dual-stack.
+func (s *relayTUNSink) dualAddrs() *dualStackAddrs {
+	if len(s.serverIP6) == 0 || len(s.clientIP6) == 0 {
+		return nil
+	}
+	return &dualStackAddrs{ServerIP6: s.serverIP6, ClientIP6: s.clientIP6}
 }
 
 // relayTUNIdleTimeout bounds a silent upstream leg. Clients keepalive every 30s
@@ -149,6 +166,8 @@ func (s *relayTUNSink) pump(deliver func(pkt []byte) error) {
 // so the exit can tell two clients on one secret apart. Returns the sink plus
 // the server/client IPs the exit assigned - the caller answers its client with
 // those, so the address always comes from the exit, never from the relay's pool.
+// When the exit negotiated dual-stack, its IPv6 tunnel addresses ride on the
+// sink (see relayTUNSink.dualAddrs).
 func dialRelayTUN(srvCtx *serverContext, logger *log.Logger, handshake []byte, origin string,
 	deliver func(pkt []byte) error) (*relayTUNSink, net.IP, net.IP, error) {
 
@@ -171,6 +190,17 @@ func dialRelayTUN(srvCtx *serverContext, logger *log.Logger, handshake []byte, o
 	sink := &relayTUNSink{up: upConn, logger: logger, done: make(chan struct{})}
 	serverIP := append(net.IP(nil), resp[1:5]...)
 	clientIP := append(net.IP(nil), resp[5:9]...)
+
+	// Dual-stack: when the exit's response carries the v6 address block, carry
+	// the addresses on the sink so the transport can forward them to its
+	// downstream client. An exit that did not negotiate dual-stack leaves them
+	// nil and the downstream response degrades to v4-only naturally.
+	if caps, ok := tun.ParseTUNHandshakeCapabilities(resp); ok && caps.DualStackEnabled {
+		sink.serverIP6 = caps.ServerIP6
+		sink.clientIP6 = caps.ClientIP6
+		logger.Info("Relay TUN: upstream assigned dual-stack (server6=%s, client6=%s)",
+			caps.ServerIP6, caps.ClientIP6)
+	}
 
 	go sink.pump(deliver)
 

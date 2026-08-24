@@ -18,6 +18,10 @@ type IPv6Metrics struct {
 	tunnelV6Routed        uint64
 	tunnelV6DropNotInPool uint64
 	tunnelV6DropShortHdr  uint64
+
+	// Dual-stack TUN sessions negotiated (handshake response carried the v6
+	// address block to a v0x04+ client, local or relayed).
+	tunnelDualStackSessions uint64
 }
 
 func NewIPv6Metrics() *IPv6Metrics {
@@ -54,6 +58,13 @@ func (im *IPv6Metrics) RecordTunnelV6DropNotInPool() {
 // because it is shorter than the 40-byte IPv6 header.
 func (im *IPv6Metrics) RecordTunnelV6DropShortHeader() {
 	atomic.AddUint64(&im.tunnelV6DropShortHdr, 1)
+}
+
+// RecordTunnelDualStackSession counts a TUN session that negotiated
+// dual-stack: the handshake response carried the IPv6 address block to a
+// v0x04+ client, whether terminated locally or relayed from the exit.
+func (im *IPv6Metrics) RecordTunnelDualStackSession() {
+	atomic.AddUint64(&im.tunnelDualStackSessions, 1)
 }
 
 func (im *IPv6Metrics) updatePreference() {
@@ -93,6 +104,11 @@ func (im *IPv6Metrics) ExportPrometheus(w http.ResponseWriter) {
 	fmt.Fprintf(w, "# TYPE tiredvpn_tunnel_ipv6_packets_dropped_total counter\n")
 	fmt.Fprintf(w, "tiredvpn_tunnel_ipv6_packets_dropped_total{reason=\"not_in_pool\"} %d\n", atomic.LoadUint64(&im.tunnelV6DropNotInPool))
 	fmt.Fprintf(w, "tiredvpn_tunnel_ipv6_packets_dropped_total{reason=\"short_header\"} %d\n", atomic.LoadUint64(&im.tunnelV6DropShortHdr))
+	fmt.Fprintf(w, "\n")
+
+	fmt.Fprintf(w, "# HELP tiredvpn_tunnel_dualstack_sessions_total TUN sessions that negotiated in-tunnel IPv6 dual-stack\n")
+	fmt.Fprintf(w, "# TYPE tiredvpn_tunnel_dualstack_sessions_total counter\n")
+	fmt.Fprintf(w, "tiredvpn_tunnel_dualstack_sessions_total %d\n", atomic.LoadUint64(&im.tunnelDualStackSessions))
 	fmt.Fprintf(w, "\n")
 
 	bits := atomic.LoadUint64((*uint64)(unsafe.Pointer(&im.ipv6Preference)))

@@ -2283,13 +2283,11 @@ func handleMorphTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverConte
 	}
 
 	// Send success response via morph packet: [dataLen:4][paddingLen:2][payload][padding]
-	// The payload comes from the shared constructor; a relay keeps its
-	// historical byte shape (no v6 block) in this phase.
-	var dual *dualStackAddrs
-	if srvCtx.upstreamDialer == nil {
-		dual = deriveDualStackAddrs(cfg.IPPoolV6, clientIP)
-	}
+	// Local exit: v6 addrs from our pool. Relay: v6 addrs assigned by the
+	// upstream exit (absent when the exit did not negotiate dual-stack).
+	dual := downstreamDualStackAddrs(sink, cfg.IPPoolV6, clientIP)
 	respData := buildTUNHandshakeResponse(clientVersion, serverIP, clientIP, tunHandshakeCaps{}, dual)
+	recordDualStackSession(srvCtx, clientVersion, dual)
 
 	padLen := 30
 	resp := make([]byte, 6+len(respData)+padLen)
@@ -2947,13 +2945,11 @@ func handleConfusionTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverC
 
 	// Send success response with length prefix: [length:4][payload]
 	// Confusion protocol uses length-prefixed frames for all data after "TIRED" magic.
-	// The payload comes from the shared constructor; a relay keeps its
-	// historical byte shape (no v6 block) in this phase.
-	var dual *dualStackAddrs
-	if srvCtx.upstreamDialer == nil {
-		dual = deriveDualStackAddrs(cfg.IPPoolV6, clientIP)
-	}
+	// Local exit: v6 addrs from our pool. Relay: v6 addrs assigned by the
+	// upstream exit (absent when the exit did not negotiate dual-stack).
+	dual := downstreamDualStackAddrs(sink, cfg.IPPoolV6, clientIP)
 	resp := frameConfusionTUNResponse(buildTUNHandshakeResponse(clientVersion, serverIP, clientIP, tunHandshakeCaps{}, dual))
+	recordDualStackSession(srvCtx, clientVersion, dual)
 	if err := writeConfusionFrame(resp); err != nil {
 		logger.Debug("Confusion TUN handshake response write failed: %v", err)
 		return
@@ -3322,6 +3318,7 @@ func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger
 	}
 	dual := deriveDualStackAddrs(cfg.IPPoolV6, clientIP)
 	resp := buildTUNHandshakeResponse(clientVersion, serverIP, clientIP, caps, dual)
+	recordDualStackSession(srvCtx, clientVersion, dual)
 	if dual != nil && clientVersion >= tunClientVersionDualStack {
 		logger.Info("Advertising dual-stack: server6=%s client6=%s", dual.ServerIP6, dual.ClientIP6)
 	}
@@ -3783,12 +3780,11 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 	tunnel.targetConn = h2Conn // Mark as TUN mode
 
 	// Send success response: shared-constructor payload sent as raw stego data.
-	// A relay keeps its historical byte shape (no v6 block) in this phase.
-	var dual *dualStackAddrs
-	if srvCtx.upstreamDialer == nil {
-		dual = deriveDualStackAddrs(cfg.IPPoolV6, clientIP)
-	}
+	// Local exit: v6 addrs from our pool. Relay: v6 addrs assigned by the
+	// upstream exit (absent when the exit did not negotiate dual-stack).
+	dual := downstreamDualStackAddrs(tunnel.sink, cfg.IPPoolV6, clientIP)
 	resp := buildTUNHandshakeResponse(clientVersion, serverIP, clientIP, tunHandshakeCaps{}, dual)
+	recordDualStackSession(srvCtx, clientVersion, dual)
 	sendStegoResponse(framer, tunnel.streamID, resp, cfg)
 
 	logger.Info("H2 TUN mode established (client=%s, server=%s)", clientIP, serverIP)
@@ -4983,12 +4979,11 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 	}
 
 	// Send success response: shared-constructor payload written to the polling
-	// buffer. A relay keeps its historical byte shape (no v6 block) here.
-	var dual *dualStackAddrs
-	if srvCtx.upstreamDialer == nil {
-		dual = deriveDualStackAddrs(cfg.IPPoolV6, clientIP)
-	}
+	// buffer. Local exit: v6 addrs from our pool. Relay: v6 addrs assigned by
+	// the upstream exit (absent when the exit did not negotiate dual-stack).
+	dual := downstreamDualStackAddrs(sink, cfg.IPPoolV6, clientIP)
 	resp := buildTUNHandshakeResponse(clientVersion, serverIP, clientIP, tunHandshakeCaps{}, dual)
+	recordDualStackSession(srvCtx, clientVersion, dual)
 	sess.WriteToClient(resp)
 
 	logger.Info("HTTP Polling TUN mode established (client=%s, server=%s)", clientIP, serverIP)

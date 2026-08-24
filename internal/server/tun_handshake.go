@@ -134,6 +134,30 @@ func portHopStrategyByte(strategy string) byte {
 	}
 }
 
+// downstreamDualStackAddrs picks the IPv6 tunnel addresses for the handshake
+// response a transport sends to its client: on a relay they come from the
+// upstream exit (carried on the relay sink, nil when the exit did not
+// negotiate dual-stack, which degrades the downstream client to v4-only);
+// on a terminating exit they are derived from the local -ip-pool-v6 prefix.
+func downstreamDualStackAddrs(sink tunPacketSink, poolV6 string, clientIP net.IP) *dualStackAddrs {
+	if rs, ok := sink.(*relayTUNSink); ok {
+		return rs.dualAddrs()
+	}
+	return deriveDualStackAddrs(poolV6, clientIP)
+}
+
+// recordDualStackSession counts a negotiated dual-stack TUN session: the
+// response being built carries v6 addresses for a dual-capable (v0x04+)
+// client. Called by every TUN transport at the point it builds the handshake
+// response, both on the terminating exit (pool-derived addrs) and on a relay
+// (exit-assigned addrs forwarded downstream).
+func recordDualStackSession(srvCtx *serverContext, clientVersion uint8, dual *dualStackAddrs) {
+	if dual == nil || clientVersion < tunClientVersionDualStack || srvCtx == nil || srvCtx.metrics == nil {
+		return
+	}
+	srvCtx.metrics.ipv6Metrics.RecordTunnelDualStackSession()
+}
+
 // frameConfusionTUNResponse wraps a handshake response payload in the
 // confusion transport's length-prefixed frame: [len:4][payload]. On the wire
 // the payload offsets shift by 4 (status@4, serverIP@5:9, clientIP@9:13) —

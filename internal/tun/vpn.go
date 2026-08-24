@@ -806,6 +806,27 @@ func (v *VPNClient) doHandshake(conn net.Conn, localIP net.IP) ([]byte, int, err
 // with a max-length seed (20+32) plus the 32-byte dual-stack block.
 const handshakeRespBufSize = 96
 
+// ReadTUNHandshakeResponse reads a TUN handshake response from conn and
+// returns the raw response bytes: the version-dependent base layout plus the
+// trailing 32-byte dual-stack block when the flags byte advertises it.
+// Exported for the multi-hop relay (internal/server), which must forward the
+// exit's response to the downstream client verbatim.
+func ReadTUNHandshakeResponse(conn net.Conn) ([]byte, error) {
+	resp, n, err := readHandshakeResponse(conn)
+	if err != nil {
+		return nil, err
+	}
+	return resp[:n], nil
+}
+
+// ParseTUNHandshakeCapabilities decodes the capabilities of a raw TUN
+// handshake response (as returned by ReadTUNHandshakeResponse), including the
+// dual-stack address block. Exported for the multi-hop relay, which sources
+// the downstream client's IPv6 tunnel addresses from the exit's response.
+func ParseTUNHandshakeCapabilities(resp []byte) (ServerCapabilities, bool) {
+	return parseServerCapabilities(resp, len(resp))
+}
+
 // readHandshakeResponse reads the server's TUN handshake response. The first
 // read returns whatever arrived in one segment (unchanged legacy behaviour);
 // when the response flags advertise dual-stack, the trailing 32-byte
