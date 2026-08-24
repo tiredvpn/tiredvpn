@@ -2,6 +2,7 @@ package server
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
 	"io"
@@ -200,6 +201,18 @@ func HandleREALITYConnection(conn net.Conn, srvCtx *serverContext, logger *log.L
 
 	logger.Debug("REALITY: Using secret from %s", authClientID)
 
+	// Data layer version. A v2 client appends [salt][MAC] to the padding block
+	// after its 64-byte core; a v1 client leaves random bytes there, which fail
+	// the MAC. Nothing on the wire changes size either way.
+	clientSalt, dataV2 := customtls.ParseClientDataV2(usedSecret, realityExt.PubKey, realityExt.Extra)
+	if !dataV2 && srvCtx.cfg.REALITYRequireDataV2 {
+		logger.Info("REALITY: rejecting legacy v1 data layer (REALITYRequireDataV2 set)")
+		if srvCtx.cfg.REALITYCoverDomain != "" {
+			handleREALITYUnauthorized(conn, clientHello, srvCtx.cfg.REALITYCoverDomain, logger)
+		}
+		return
+	}
+
 	// Extract SNI to determine destination
 	sni, err := ExtractSNI(clientHello)
 	if err != nil {
@@ -250,16 +263,49 @@ func HandleREALITYConnection(conn net.Conn, srvCtx *serverContext, logger *log.L
 
 	logger.Debug("REALITY: Received ServerHello from dest (%d bytes): %s", len(serverHello), log.HexDump(serverHello, 32))
 
-	// Generate server auth token
-	realityKeyMu.RLock()
-	privKey := serverREALITYPrivKey
-	realityKeyMu.RUnlock()
-
-	serverExt, err := customtls.NewServerREALITYExtension(
-		usedSecret,
-		privKey,
-		realityExt.PubKey,
+	// Generate server auth token. For a v2 client the key pair is ephemeral for
+	// this connection, so the data keys survive a later leak of the password;
+	// for v1 we keep using the process-wide key, which that client ignores anyway.
+	var (
+		serverExt  *customtls.REALITYExtension
+		dataParams *strategy.RealityV2Params
 	)
+	if dataV2 {
+		serverPriv, serverPub, kerr := customtls.GenerateX25519KeyPair()
+		if kerr != nil {
+			logger.Error("REALITY: Failed to generate ephemeral key: %v", kerr)
+			destConn.Close()
+			return
+		}
+		var serverSalt [32]byte
+		if _, rerr := rand.Read(serverSalt[:]); rerr != nil {
+			logger.Error("REALITY: Failed to generate salt: %v", rerr)
+			destConn.Close()
+			return
+		}
+		ecdh, eerr := strategy.RealityV2ECDH(serverPriv, realityExt.PubKey)
+		if eerr != nil {
+			logger.Error("REALITY: ECDH failed: %v", eerr)
+			destConn.Close()
+			return
+		}
+		serverExt, err = customtls.NewServerREALITYExtensionDataV2(
+			usedSecret, serverPriv, realityExt.PubKey, clientSalt, serverSalt,
+		)
+		dataParams = &strategy.RealityV2Params{
+			SharedSecret: usedSecret,
+			ECDH:         ecdh,
+			ClientPub:    realityExt.PubKey,
+			ServerPub:    serverPub,
+			ClientSalt:   clientSalt,
+			ServerSalt:   serverSalt,
+		}
+	} else {
+		realityKeyMu.RLock()
+		privKey := serverREALITYPrivKey
+		realityKeyMu.RUnlock()
+		serverExt, err = customtls.NewServerREALITYExtension(usedSecret, privKey, realityExt.PubKey)
+	}
 	if err != nil {
 		logger.Error("REALITY: Failed to create server extension: %v", err)
 		destConn.Close()
@@ -307,8 +353,8 @@ func HandleREALITYConnection(conn net.Conn, srvCtx *serverContext, logger *log.L
 	}
 
 	if negBuf[0] == protocol.TypeMux {
-		logger.Debug("REALITY: Client requested smux multiplexing")
-		handleREALITYMuxSession(conn, srvCtx, logger, clientID, usedSecret, realityExt.PubKey)
+		logger.Debug("REALITY: Client requested smux multiplexing (data layer v%d)", dataLayerVersion(dataV2))
+		handleREALITYMuxSession(conn, srvCtx, logger, clientID, usedSecret, realityExt.PubKey, dataParams)
 		return
 	}
 
@@ -335,13 +381,32 @@ func (c *realityPrependConn) Read(b []byte) (int, error) {
 	return c.Conn.Read(b)
 }
 
+// dataLayerVersion maps the negotiated flag to the version number used in logs.
+func dataLayerVersion(v2 bool) int {
+	if v2 {
+		return 2
+	}
+	return 1
+}
+
 // handleREALITYMuxSession runs a smux server over the post-auth REALITY connection.
 // Each stream is handled as an independent raw tunnel request.
-// usedSecret and clientPubKey are used to wrap the connection in the same
-// chacha20-over-TLS-record framing that the client uses after its TypeMux write.
-func handleREALITYMuxSession(conn net.Conn, srvCtx *serverContext, logger *log.Logger, clientID string, usedSecret []byte, clientPubKey [32]byte) {
+//
+// The connection is wrapped in the same TLS-record framing the client applies
+// after its TypeMux write. params non-nil selects the v2 AEAD layer keyed by
+// this connection's X25519 exchange; nil is a v1 client, still keyed by
+// HKDF(secret, salt=clientPubKey).
+func handleREALITYMuxSession(conn net.Conn, srvCtx *serverContext, logger *log.Logger, clientID string, usedSecret []byte, clientPubKey [32]byte, params *strategy.RealityV2Params) {
 	// Mirror the client-side wrap: server is !isClient so write/read keys are reversed.
-	dataConn, err := strategy.NewRealityDataConn(conn, usedSecret, clientPubKey[:], false)
+	var (
+		dataConn net.Conn
+		err      error
+	)
+	if params != nil {
+		dataConn, err = strategy.NewRealityDataConnV2(conn, *params, false)
+	} else {
+		dataConn, err = strategy.NewRealityDataConn(conn, usedSecret, clientPubKey[:], false)
+	}
 	if err != nil {
 		logger.Error("REALITY: data conn init failed: %v", err)
 		return

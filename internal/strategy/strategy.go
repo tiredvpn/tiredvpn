@@ -1139,6 +1139,11 @@ type DefaultManagerConfig struct {
 	// REALITY configuration
 	REALITYEnabled bool // Enable REALITY protocol (99.5% success rate)
 
+	// REALITYRequireDataV2 refuses servers that do not confirm the v2 data
+	// layer (per-connection X25519 keys + ChaCha20-Poly1305) instead of falling
+	// back to v1. Off during the rollout, since clients are upgraded last.
+	REALITYRequireDataV2 bool
+
 	// WebSocket Padded configuration
 	WebSocketPaddedEnabled bool // Enable WebSocket with Salamander padding
 
@@ -1284,7 +1289,11 @@ func registerSeqovlStrategy(m *Manager, cfg DefaultManagerConfig, hasServer, has
 	if !hasServer || !hasSecret {
 		return
 	}
-	m.Register(NewSeqovlStrategy(m, cfg.Secret, cfg.SeqovlPacketEnabled))
+	seqovl := NewSeqovlStrategy(m, cfg.Secret, cfg.SeqovlPacketEnabled)
+	// Seqovl rides its own REALITY handshake, so it needs the same data-layer
+	// policy as the plain REALITY strategy.
+	seqovl.reality.SetRequireDataV2(cfg.REALITYRequireDataV2)
+	m.Register(seqovl)
 }
 
 // registerICMPStrategy registers the ICMP tunnel backup strategy.
@@ -1360,6 +1369,7 @@ func registerTLSStrategies(m *Manager, cfg DefaultManagerConfig, hasServer, hasS
 	}
 
 	reality := NewREALITYStrategy(m, cfg.Secret)
+	reality.SetRequireDataV2(cfg.REALITYRequireDataV2)
 	if cfg.PQEnabled && cfg.PQServerKemPubB64 != "" {
 		kemPub, err := base64.StdEncoding.DecodeString(cfg.PQServerKemPubB64)
 		if err == nil && len(kemPub) > 0 {

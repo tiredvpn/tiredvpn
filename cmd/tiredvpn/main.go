@@ -189,6 +189,8 @@ ADVANCED OPTIONS:
         Fake website root directory (default "./www")
   -reality-cover-domain string
         Operator-set hostname to transparently proxy unauthorized REALITY probes to (empty = drop)
+  -reality-require-data-v2
+        Reject REALITY clients still on the v1 data layer (turn on after every client is upgraded)
   -tun-ip string
         TUN interface IP address for VPN server (default "10.8.0.1")
   -tun-name string
@@ -294,6 +296,8 @@ ADVANCED EVASION:
         RTT profile: moscow-yandex, moscow-vk, regional-russia, siberia, cdn, beijing-baidu, tehran-aparat (default "moscow-yandex")
   -cover string
         Cover host for traffic mimicry (default "api.googleapis.com")
+  -reality-require-data-v2
+        Refuse REALITY servers still on the v1 data layer instead of falling back
 
 ICMP TUNNEL (backup transport):
   -icmp-tunnel
@@ -368,6 +372,9 @@ func registerServerFlags(fs *flag.FlagSet, cfg *server.Config) *serverFlagOpts {
 	// drop. Never sourced from the client's SNI, so there is no SSRF via a
 	// client-controlled hostname.
 	fs.StringVar(&cfg.REALITYCoverDomain, "reality-cover-domain", "", "Hostname to transparently proxy unauthorized REALITY probes to (operator-set, e.g. 'www.microsoft.com'); empty = silently drop. Never derived from client SNI.")
+	// Transition switch for the data-layer rewrite: leave off while old clients
+	// are still around, turn on afterwards to remove the v1 downgrade path.
+	fs.BoolVar(&cfg.REALITYRequireDataV2, "reality-require-data-v2", false, "Reject REALITY clients that do not negotiate the v2 data layer (per-connection keys + AEAD). Turn on only after every client is upgraded.")
 	fs.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
 	opts.tunIP = fs.String("tun-ip", "10.8.0.1", "TUN interface IP address for VPN server")
 	fs.StringVar(&cfg.TunName, "tun-name", "tiredvpn0", "TUN interface name")
@@ -539,6 +546,7 @@ func runClient(args []string) {
 
 	// Seqovl level-A packet overlap (Linux only, requires CAP_NET_ADMIN + OUTPUT NFQUEUE rule)
 	fs.BoolVar(&cfg.SeqovlPacketEnabled, "seqovl-packet", false, "Enable packet-level TCP sequence overlap for seqovl (Linux + CAP_NET_ADMIN; additive to the app-framing decoy)")
+	fs.BoolVar(&cfg.REALITYRequireDataV2, "reality-require-data-v2", false, "Refuse REALITY servers still on the v1 data layer instead of falling back (turn on once every server is upgraded)")
 
 	// RTT Masking flags
 	fs.BoolVar(&cfg.RTTMaskingEnabled, "rtt-masking", false, "Enable RTT masking (hides proxy timing signature)")
