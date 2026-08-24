@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -156,9 +157,19 @@ func NewIPPool(cfg IPPoolConfig, redisClient *redis.Client) (*IPPool, error) {
 }
 
 // parsePoolV6 parses and validates the optional dual-stack prefix. Returns
-// (nil, nil) for an empty pool. The prefix must be an IPv6 CIDR with a host
-// part of at least 32 bits (prefix length <= 96) so a client's IPv4 address
-// can be embedded losslessly in the low 32 bits of its derived IPv6 address.
+// (nil, nil) for an empty pool. The prefix must be:
+//
+//   - an IPv6 CIDR;
+//   - a Unique Local Address prefix (fc00::/7). The in-tunnel v6 space is
+//     NAT66'd out of the exit exactly like the RFC1918 v4 pool is NAT44'd, so
+//     it must be private. Anything else is a misconfiguration that either
+//     hijacks somebody else's address space (global unicast), is unroutable
+//     off-link (link-local), is not a unicast address at all (multicast), or
+//     collides with the loopback/unspecified block (::/N, whose derived server
+//     address would be ::1);
+//   - short enough to leave a 32-bit host part (prefix length <= 96) so a
+//     client's IPv4 address can be embedded losslessly in the low 32 bits of
+//     its derived IPv6 address.
 func parsePoolV6(cidr string) (*net.IPNet, error) {
 	if cidr == "" {
 		return nil, nil
@@ -177,8 +188,36 @@ func parsePoolV6(cidr string) (*net.IPNet, error) {
 	if ones > 96 {
 		return nil, fmt.Errorf("IPv6 pool %q prefix length /%d leaves <32 host bits; need /96 or shorter to embed client IPv4 addresses", cidr, ones)
 	}
+	if !isULAPrefix(network.IP) {
+		return nil, fmt.Errorf("IPv6 pool %q is not a Unique Local Address prefix (fc00::/7); the in-tunnel pool is NAT66'd and must be private, e.g. fd00:10:8::/64", cidr)
+	}
 	return &net.IPNet{IP: network.IP.To16(), Mask: network.Mask}, nil
 }
+
+// ValidateIPPoolV6 checks an -ip-pool-v6 value against the same rules the pool
+// itself applies, so a misconfigured prefix is rejected at flag-parsing time
+// with the exact reason rather than later, from inside NewIPPool. An empty
+// value is valid and means "no dual-stack".
+func ValidateIPPoolV6(cidr string) error {
+	_, err := parsePoolV6(cidr)
+	return err
+}
+
+// isULAPrefix reports whether ip falls in fc00::/7 — the Unique Local Address
+// block (RFC 4193), whose first seven bits are 1111110.
+func isULAPrefix(ip net.IP) bool {
+	v6 := ip.To16()
+	if v6 == nil || ip.To4() != nil {
+		return false
+	}
+	return v6[0]&0xfe == 0xfc
+}
+
+// errReservedTunnelIP6 is returned by deriveClientIP6 when the address a
+// client's IPv4 lease would derive is one of the prefix's reserved addresses
+// (see reservedClientV4 below). Exported to callers as a wrapped error so a
+// collision surfaces in logs instead of two peers silently sharing an address.
+var errReservedTunnelIP6 = errors.New("derived tunnel IPv6 is reserved")
 
 // deriveServerIP6 returns the server's address inside the dual-stack prefix:
 // prefix::1. This is THE single derivation rule for the whole server — the
@@ -190,20 +229,44 @@ func deriveServerIP6(prefix *net.IPNet) net.IP {
 	return ip
 }
 
+// reservedClientV4 reports whether a v4 lease would derive a reserved address
+// inside the prefix. Since the prefix comes back masked from net.ParseCIDR,
+// the only non-zero host bits are the embedded v4 address, so exactly two v4
+// values are unusable: 0.0.0.0 derives the prefix's subnet-router anycast
+// address (prefix::) and 0.0.0.1 derives the server's own prefix::1
+// (deriveServerIP6). Neither can appear in a sane -ip-pool, but the v4 pool
+// bounds are configurable, so the collision is rejected rather than assumed
+// away.
+func reservedClientV4(v4 net.IP) bool {
+	return v4.Equal(net.IPv4zero) || v4.Equal(net.IPv4(0, 0, 0, 1))
+}
+
 // deriveClientIP6 returns a client's address inside the dual-stack prefix:
 // the prefix with the client's IPv4 address embedded in the low 32 bits
 // (prefix | v4-uint32). The mapping is injective, so the packet dispatcher
 // can recover the v4 lease key (and thus the client registry entry) from the
-// low 32 bits of any pool-v6 destination. A nil/non-v4 clientIP yields
-// prefix::2 as a safe fallback.
-func deriveClientIP6(prefix *net.IPNet, clientIP net.IP) net.IP {
+// low 32 bits of any pool-v6 destination.
+//
+// An error (rather than a fallback address) is returned for a nil/non-v4
+// lease and for the reserved derivations: any fallback would be shared by
+// every client that hits it, breaking both injectivity and the reverse
+// dispatch lookup.
+func deriveClientIP6(prefix *net.IPNet, clientIP net.IP) (net.IP, error) {
+	v4 := clientIP.To4()
+	if v4 == nil {
+		return nil, fmt.Errorf("cannot derive tunnel IPv6: client lease %v is not IPv4", clientIP)
+	}
+	if reservedClientV4(v4) {
+		return nil, fmt.Errorf("client lease %v derives %s: %w", v4, prefixWithV4(prefix, v4), errReservedTunnelIP6)
+	}
+	return prefixWithV4(prefix, v4), nil
+}
+
+// prefixWithV4 embeds a 4-byte IPv4 address in the low 32 bits of the prefix.
+func prefixWithV4(prefix *net.IPNet, v4 net.IP) net.IP {
 	ip := make(net.IP, net.IPv6len)
 	copy(ip, prefix.IP.To16())
-	if v4 := clientIP.To4(); v4 != nil {
-		copy(ip[12:], v4)
-	} else {
-		ip[net.IPv6len-1] = 2
-	}
+	copy(ip[12:], v4)
 	return ip
 }
 
@@ -229,11 +292,13 @@ func (p *IPPool) ServerIP6() net.IP {
 }
 
 // ClientIP6 derives the tunnel IPv6 address for the client holding the given
-// IPv4 lease (prefix with the v4 address in the low 32 bits), or nil for an
-// IPv4-only pool.
-func (p *IPPool) ClientIP6(clientIPv4 net.IP) net.IP {
+// IPv4 lease (prefix with the v4 address in the low 32 bits). Returns
+// (nil, nil) for an IPv4-only pool; a non-nil error means the lease has no
+// usable v6 address (reserved derivation or non-IPv4 lease) and the client
+// must stay IPv4-only.
+func (p *IPPool) ClientIP6(clientIPv4 net.IP) (net.IP, error) {
 	if p.networkV6 == nil {
-		return nil
+		return nil, nil
 	}
 	return deriveClientIP6(p.networkV6, clientIPv4)
 }

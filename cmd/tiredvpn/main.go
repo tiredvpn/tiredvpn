@@ -449,16 +449,14 @@ func runServer(args []string) {
 		os.Exit(1)
 	}
 
-	if cfg.IPPoolV6 != "" {
-		ip, _, err := net.ParseCIDR(cfg.IPPoolV6)
-		if err != nil || ip.To4() != nil {
-			fmt.Printf("Error: invalid -ip-pool-v6 %q: must be an IPv6 CIDR (e.g., 'fd00:10:8::/64')\n", cfg.IPPoolV6)
-			os.Exit(1)
-		}
+	if err := server.ValidateIPPoolV6(cfg.IPPoolV6); err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
 	}
 
 	cfg.Secret = []byte(*opts.secret)
-	// Fall back to the TIREDVPN_SECRET env var when -secret is not given, so a	// systemd unit can pass the secret via EnvironmentFile instead of putting it
+	// Fall back to the TIREDVPN_SECRET env var when -secret is not given, so a
+	// systemd unit can pass the secret via EnvironmentFile instead of putting it
 	// on the command line (where it would show up in ps/cmdline). The error in
 	// server.go already documents this env var.
 	if len(cfg.Secret) == 0 {

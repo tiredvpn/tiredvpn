@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"net"
 
+	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/tun"
 )
 
@@ -25,14 +26,23 @@ type dualStackAddrs struct {
 // and the client takes the prefix with its assigned IPv4 address in the low
 // 32 bits. Returns nil when no (valid) IPv6 pool is configured, which keeps
 // the response byte-identical to a non-dual-stack server.
+//
+// A lease with no usable v6 derivation (reserved address, non-IPv4 lease)
+// also yields nil — the session degrades to IPv4-only — but is logged, since
+// it means the v4 pool bounds overlap the reserved space.
 func deriveDualStackAddrs(poolV6 string, clientIP net.IP) *dualStackAddrs {
 	prefix, err := parsePoolV6(poolV6)
 	if err != nil || prefix == nil {
 		return nil
 	}
+	clientIP6, err := deriveClientIP6(prefix, clientIP)
+	if err != nil {
+		log.Warn("Dual-stack: no tunnel IPv6 for lease %s: %v; session stays IPv4-only", clientIP, err)
+		return nil
+	}
 	return &dualStackAddrs{
 		ServerIP6: deriveServerIP6(prefix),
-		ClientIP6: deriveClientIP6(prefix, clientIP),
+		ClientIP6: clientIP6,
 	}
 }
 
@@ -99,9 +109,17 @@ func buildTUNHandshakeResponse(clientVersion byte, serverIP, clientIP net.IP, ca
 		resp = make([]byte, 14)
 		binary.BigEndian.PutUint16(resp[10:12], uint16(caps.portStart))
 		binary.BigEndian.PutUint16(resp[12:14], uint16(caps.portEnd))
-	case flags != 0:
+	case flags != 0 || clientVersion >= tunClientVersionDualStack:
 		// Flags-only form: carries the auto-MTU probe (v3) and/or dual-stack
 		// (v4) bits when no port-hop range is advertised.
+		//
+		// A v0x04 client always gets this form even when every flag is clear,
+		// so the flags byte is unconditionally present on the wire for it. That
+		// lets the client read a fixed 10-byte prefix instead of stopping at 9
+		// and waiting to see whether a tenth byte shows up: that wait would add
+		// an observable pause to every connect and, worse, could consume the
+		// first byte of downstream tunnel traffic and desync the packet loop.
+		// Versions below 0x04 are unaffected — their bytes are unchanged.
 		resp = make([]byte, 10)
 	default:
 		resp = make([]byte, 9)
@@ -146,16 +164,34 @@ func downstreamDualStackAddrs(sink tunPacketSink, poolV6 string, clientIP net.IP
 	return deriveDualStackAddrs(poolV6, clientIP)
 }
 
-// recordDualStackSession counts a negotiated dual-stack TUN session: the
-// response being built carries v6 addresses for a dual-capable (v0x04+)
-// client. Called by every TUN transport at the point it builds the handshake
-// response, both on the terminating exit (pool-derived addrs) and on a relay
-// (exit-assigned addrs forwarded downstream).
+// recordDualStackSession counts one dual-stack negotiation: the response being
+// built carries v6 addresses for a dual-capable (v0x04+) client. Called by
+// every TUN transport at the point it answers a client, both on the
+// terminating exit (pool-derived addrs) and on a relay (exit-assigned addrs
+// forwarded downstream), so one session setup counts exactly once and a
+// reconnect — which is a new session — counts again.
 func recordDualStackSession(srvCtx *serverContext, clientVersion uint8, dual *dualStackAddrs) {
 	if dual == nil || clientVersion < tunClientVersionDualStack || srvCtx == nil || srvCtx.metrics == nil {
 		return
 	}
 	srvCtx.metrics.ipv6Metrics.RecordTunnelDualStackSession()
+}
+
+// recordRelayedDualStackSession counts a dual-stack negotiation on the plain
+// relay path, which forwards the exit's handshake response to the downstream
+// client verbatim instead of building one of its own. The exit's response is
+// the only authority there, so the addresses are read back out of it; a
+// response without the dual-stack flag counts nothing, exactly as a nil
+// dualStackAddrs would.
+func recordRelayedDualStackSession(srvCtx *serverContext, clientVersion uint8, resp []byte) {
+	caps, ok := tun.ParseTUNHandshakeCapabilities(resp)
+	if !ok || !caps.DualStackEnabled {
+		return
+	}
+	recordDualStackSession(srvCtx, clientVersion, &dualStackAddrs{
+		ServerIP6: caps.ServerIP6,
+		ClientIP6: caps.ClientIP6,
+	})
 }
 
 // frameConfusionTUNResponse wraps a handshake response payload in the

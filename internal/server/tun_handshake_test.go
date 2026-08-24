@@ -214,6 +214,31 @@ func TestBuildTUNHandshakeResponseDualStack(t *testing.T) {
 	}
 }
 
+// TestBuildTUNHandshakeResponseV4AlwaysHasFlags pins the rule the client's
+// fixed 10-byte prefix read depends on: a v0x04 client always gets the flags
+// byte, even on a server with no IPv6 pool and no other capability, so the
+// client never has to stop at 9 bytes and wait to see whether a tenth arrives.
+// Clients below 0x04 keep the bare 9-byte form.
+func TestBuildTUNHandshakeResponseV4AlwaysHasFlags(t *testing.T) {
+	got := buildTUNHandshakeResponse(0x04, hsServerIP, hsClientIP, tunHandshakeCaps{}, nil)
+	if len(got) != 10 {
+		t.Fatalf("v0x04 with no caps and no pool: len = %d, want 10 (%x)", len(got), got)
+	}
+	if got[9] != 0x00 {
+		t.Errorf("flags = 0x%02x, want 0x00", got[9])
+	}
+	if !bytes.Equal(got[:9], []byte{0x00, 10, 8, 0, 1, 10, 8, 0, 2}) {
+		t.Errorf("base = %x, want the unchanged 9-byte prefix", got[:9])
+	}
+
+	for _, version := range []byte{0x00, 0x01, 0x02, 0x03} {
+		bare := buildTUNHandshakeResponse(version, hsServerIP, hsClientIP, tunHandshakeCaps{}, nil)
+		if len(bare) != 9 {
+			t.Errorf("version 0x%02x: len = %d, want 9 (%x)", version, len(bare), bare)
+		}
+	}
+}
+
 // TestDeriveDualStackAddrs covers the Phase-1 placeholder address derivation
 // from the -ip-pool-v6 prefix.
 func TestDeriveDualStackAddrs(t *testing.T) {
@@ -236,6 +261,25 @@ func TestDeriveDualStackAddrs(t *testing.T) {
 	}
 	if d := deriveDualStackAddrs("10.8.0.0/24", hsClientIP); d != nil {
 		t.Errorf("IPv4 CIDR should yield nil, got %+v", d)
+	}
+
+	// Non-ULA prefixes are rejected by the pool parser, so the handshake seam
+	// must degrade the session to IPv4-only rather than advertise addresses
+	// out of somebody else's space.
+	for _, bad := range []string{"2001:db8:1::/64", "fe80::/64", "ff00::/8", "::/64"} {
+		if d := deriveDualStackAddrs(bad, hsClientIP); d != nil {
+			t.Errorf("non-ULA pool %q should yield nil, got %+v", bad, d)
+		}
+	}
+
+	// A lease whose derivation is reserved (prefix::1 is the server's own
+	// address) yields no block either: better IPv4-only than two peers on one
+	// address.
+	if d := deriveDualStackAddrs("fd00:10:8::/64", net.IPv4(0, 0, 0, 1)); d != nil {
+		t.Errorf("reserved derivation should yield nil, got %+v", d)
+	}
+	if d := deriveDualStackAddrs("fd00:10:8::/64", nil); d != nil {
+		t.Errorf("nil lease should yield nil, got %+v", d)
 	}
 }
 

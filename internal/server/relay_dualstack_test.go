@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -363,6 +364,106 @@ func TestDownstreamDualStackAddrs(t *testing.T) {
 	d := downstreamDualStackAddrs(localSink, "fd00:10:8::/64", hsClientIP)
 	if d == nil || d.ServerIP6.String() != "fd00:10:8::1" {
 		t.Errorf("local sink: got %+v, want pool-derived addrs", d)
+	}
+}
+
+// dualStackSessionCount reads the negotiated-session counter.
+func dualStackSessionCount(srvCtx *serverContext) uint64 {
+	return atomic.LoadUint64(&srvCtx.metrics.ipv6Metrics.tunnelDualStackSessions)
+}
+
+// TestRecordRelayedDualStackSession covers the plain relay path's accounting,
+// which has to read the negotiated addresses back out of the exit's response
+// because that path never builds one itself.
+func TestRecordRelayedDualStackSession(t *testing.T) {
+	dual := &dualStackAddrs{ServerIP6: exitServerIP6, ClientIP6: exitClientIP6}
+	dualResp := buildTUNHandshakeResponse(0x04, exitServerIP, exitClientIP, tunHandshakeCaps{mtuProbe: true}, dual)
+	plainResp := buildTUNHandshakeResponse(0x04, exitServerIP, exitClientIP, tunHandshakeCaps{mtuProbe: true}, nil)
+	legacyResp := buildTUNHandshakeResponse(0x00, exitServerIP, exitClientIP, tunHandshakeCaps{}, nil)
+
+	tests := []struct {
+		name    string
+		version byte
+		resp    []byte
+		want    uint64
+	}{
+		{"exit negotiated dual-stack", 0x04, dualResp, 1},
+		{"exit answered without the block", 0x04, plainResp, 0},
+		{"legacy exit", 0x04, legacyResp, 0},
+		{"pre-dual client", 0x03, dualResp, 0},
+		{"truncated response", 0x04, dualResp[:5], 0},
+		{"empty response", 0x04, nil, 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srvCtx := newTestServerContext(t)
+			srvCtx.metrics = NewMetrics(nil)
+			recordRelayedDualStackSession(srvCtx, tt.version, tt.resp)
+			if got := dualStackSessionCount(srvCtx); got != tt.want {
+				t.Errorf("sessions = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestRelayTUNToUpstreamRecordsDualStack is the wiring check: the plain
+// hop-to-hop relay path (relayTUNToUpstream, used by raw TLS/QUIC downstream
+// clients) forwards the exit's response verbatim AND counts the session.
+func TestRelayTUNToUpstreamRecordsDualStack(t *testing.T) {
+	secret := []byte("relay-dualstack-test-secret-32b!")
+	dual := &dualStackAddrs{ServerIP6: exitServerIP6, ClientIP6: exitClientIP6}
+
+	exit := startFakeTUNExit(t, secret, func(handshake []byte) []byte {
+		hs, _ := splitTUNOrigin(handshake)
+		version := byte(0)
+		if len(hs) >= 7 {
+			version = hs[6]
+		}
+		return buildTUNHandshakeResponse(version, exitServerIP, exitClientIP, tunHandshakeCaps{mtuProbe: true}, dual)
+	})
+
+	srvCtx := newTestServerContext(t)
+	srvCtx.metrics = NewMetrics(nil)
+	srvCtx.upstreamDialer = NewUpstreamDialer(exit.ln.Addr().String(), secret)
+
+	relaySide, clientSide := net.Pipe()
+	defer clientSide.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		relayTUNToUpstream(relaySide, srvCtx, testLogger(t), dialTUNHandshake())
+	}()
+
+	clientSide.SetReadDeadline(time.Now().Add(10 * time.Second))
+	resp, err := tun.ReadTUNHandshakeResponse(clientSide)
+	if err != nil {
+		t.Fatalf("read relayed handshake response: %v", err)
+	}
+	caps, ok := tun.ParseTUNHandshakeCapabilities(resp)
+	if !ok || !caps.DualStackEnabled {
+		t.Fatalf("relayed response carries no dual-stack block: %x", resp)
+	}
+	if !caps.ServerIP6.Equal(exitServerIP6) || !caps.ClientIP6.Equal(exitClientIP6) {
+		t.Errorf("v6 addrs = %s/%s, want exit-assigned %s/%s",
+			caps.ServerIP6, caps.ClientIP6, exitServerIP6, exitClientIP6)
+	}
+
+	// The counter is bumped right after the response reaches the client, so
+	// poll briefly instead of racing the relay goroutine.
+	deadline := time.Now().Add(5 * time.Second)
+	for dualStackSessionCount(srvCtx) == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := dualStackSessionCount(srvCtx); got != 1 {
+		t.Errorf("dualstack sessions = %d, want 1 (plain relay path must count too)", got)
+	}
+
+	clientSide.Close()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("relayTUNToUpstream did not return after the client went away")
 	}
 }
 

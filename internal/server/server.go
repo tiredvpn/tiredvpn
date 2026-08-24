@@ -3445,6 +3445,13 @@ func relayTUNToUpstream(conn net.Conn, srvCtx *serverContext, logger *log.Logger
 		origin = originOf(conn.RemoteAddr())
 	}
 
+	// The client's handshake version travels upstream verbatim, so it is also
+	// what the exit answered; keep it for the dual-stack accounting below.
+	clientVersion := byte(0x00)
+	if len(handshake) >= 7 {
+		clientVersion = handshake[6]
+	}
+
 	dialCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	upstreamConn, resp, err := srvCtx.upstreamDialer.DialTUN(dialCtx, handshake, origin)
 	cancel()
@@ -3463,6 +3470,14 @@ func relayTUNToUpstream(conn net.Conn, srvCtx *serverContext, logger *log.Logger
 		logger.Debug("Relay: failed to send handshake response to client: %v", err)
 		return
 	}
+
+	// Account the dual-stack session here too. Unlike the morph/confusion/h2/
+	// polling relay paths, this one never builds a response of its own (it is
+	// the plain hop-to-hop path and forwards the exit's bytes verbatim), so
+	// without this call the counter misses exactly the path that carries most
+	// relayed traffic. Counted after the write succeeded: the session only
+	// exists once the client has the addresses.
+	recordRelayedDualStackSession(srvCtx, clientVersion, resp)
 
 	logger.Info("Relay TUN bridge established (client=%s, upstream-assigned=%s)",
 		conn.RemoteAddr(), net.IP(resp[5:9]))

@@ -251,11 +251,27 @@ func (d *UpstreamDialer) DialTUN(ctx context.Context, tunHandshake []byte, origi
 	// read). This also fixes a latent desync: the previous fixed 9-byte read
 	// left the tail of an extended (port-hop) response in the stream.
 	//
-	// Deployment-order note: the relay forwards the CLIENT's handshake version
-	// upstream verbatim, so a v0x04 (dual-stack) client behind an old relay
-	// works only if the exit and every relay are upgraded first — the old
-	// relay's 9-byte read would strip the v6 block. Upgrade exits and relays
-	// before enabling `-tun-ipv6 dual` on clients.
+	// Deployment-order note — an old relay in the chain CORRUPTS the session,
+	// it does not degrade it. The relay forwards the CLIENT's handshake
+	// version upstream verbatim, so a new exit answers a v0x04 client with the
+	// dual-stack flag and the 32-byte v6 block even when the hop in between is
+	// old. That hop reads a fixed 9 bytes, hands those nine to the client and
+	// then starts a transparent byte bridge, so the unread flags byte and the
+	// v6 block travel downstream as tunnel payload: the client either misses
+	// the flag (and the 33 stray bytes are parsed as a [len:4] frame header,
+	// desyncing the stream) or picks it up out of a coalesced read — the
+	// outcome depends on segmentation, not on any fallback path. The same is
+	// true of every extended response shape (port-hop v1/v2, MTU-probe flags),
+	// which is what the full-response read above fixes for NEW relays.
+	//
+	// There is no in-band way for the exit to detect an old hop while keeping
+	// the request format backward compatible: an old relay copies everything
+	// ahead of the TRO1 origin trailer verbatim and rewrites only the trailer
+	// itself, so a capability marker in the prefix gets replayed unchanged
+	// (false "chain is new"), and a marker that replaces the trailer costs an
+	// old exit the origin it needs for per-client lease keys. Only deployment
+	// order protects the chain: upgrade every exit and every relay BEFORE
+	// enabling `-tun-ipv6 dual` on clients.
 	resp, err := tun.ReadTUNHandshakeResponse(stegoConn)
 	if err != nil {
 		tlsConn.Close()
