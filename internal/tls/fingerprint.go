@@ -219,7 +219,7 @@ func ClientWithConn(conn net.Conn, config *Config, fp *BrowserFingerprint) (*TLS
 		NextProtos:         config.ALPN,
 	}
 
-	uconn, err := newUConn(conn, tlsConfig, fp, config.PaddingLen)
+	uconn, err := NewUConn(conn, tlsConfig, fp, config.PaddingLen)
 	if err != nil {
 		conn.Close()
 		return nil, err
@@ -238,9 +238,11 @@ func ClientWithConn(conn net.Conn, config *Config, fp *BrowserFingerprint) (*TLS
 	}, nil
 }
 
-// newUConn builds a uTLS client for the given profile, optionally with a
+// NewUConn builds a uTLS client for the given profile, optionally with a
 // padding extension of paddingLen bytes appended to the profile's extension
-// list.
+// list. Pass paddingLen <= 0 for a plain profile — that is what the B1 path
+// wants, since its authentication lives in session_id and the padding
+// extension goes away entirely.
 //
 // The padding has to go in through HelloCustom, not through the profile ID.
 // uTLS resolves a profile ID lazily inside BuildHandshakeState: if
@@ -254,7 +256,7 @@ func ClientWithConn(conn net.Conn, config *Config, fp *BrowserFingerprint) (*TLS
 // This matters because REALITY hides its credentials in that padding extension.
 // With the padding lost, callers fell through to AddPaddingWithREALITY, which
 // splices the extension into the marshalled bytes after the fact.
-func newUConn(conn net.Conn, tlsConfig *utls.Config, fp *BrowserFingerprint, paddingLen int) (*utls.UConn, error) {
+func NewUConn(conn net.Conn, tlsConfig *utls.Config, fp *BrowserFingerprint, paddingLen int) (*utls.UConn, error) {
 	if paddingLen <= 0 {
 		return utls.UClient(conn, tlsConfig, *fp.ClientHello), nil
 	}
@@ -336,7 +338,7 @@ func BuildClientHelloBytes(config *Config, fp *BrowserFingerprint) ([]byte, erro
 		NextProtos:         config.ALPN,
 	}
 
-	uconn, err := newUConn(client, tlsConfig, fp, config.PaddingLen)
+	uconn, err := NewUConn(client, tlsConfig, fp, config.PaddingLen)
 	if err != nil {
 		client.Close()
 		return nil, err

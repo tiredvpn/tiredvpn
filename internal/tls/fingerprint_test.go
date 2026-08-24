@@ -80,7 +80,7 @@ func TestVersionSuffixedNamesArePinned(t *testing.T) {
 // TestBuildClientHelloCarriesPaddingForEveryProfile is the regression test for
 // the default switch. REALITY hides its credentials in the padding extension
 // (0x0015), and neither the Chrome 133 nor the Firefox 148 parrot emits one on
-// its own — the padding comes from newUConn. If that ever stops working for a
+// its own — the padding comes from NewUConn. If that ever stops working for a
 // profile, the handshake silently loses its auth material.
 func TestBuildClientHelloCarriesPaddingForEveryProfile(t *testing.T) {
 	for _, name := range FingerprintNames() {

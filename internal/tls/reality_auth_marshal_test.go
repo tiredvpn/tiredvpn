@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ecdh"
 	"crypto/rand"
+	"errors"
 	"net"
 	"slices"
 	"testing"
@@ -44,7 +45,7 @@ func newTestUConn(t *testing.T, profile string) (*utls.UConn, func()) {
 
 	// B1 drops the padding extension entirely: the auth moves into session_id,
 	// so paddingLen is 0 here on purpose.
-	uconn, err := newUConn(client, &utls.Config{
+	uconn, err := NewUConn(client, &utls.Config{
 		ServerName:         "github.com",
 		InsecureSkipVerify: true,
 		NextProtos:         []string{"h2", "http/1.1"},
@@ -52,7 +53,7 @@ func newTestUConn(t *testing.T, profile string) (*utls.UConn, func()) {
 	if err != nil {
 		client.Close()
 		server.Close()
-		t.Fatalf("newUConn: %v", err)
+		t.Fatalf("NewUConn: %v", err)
 	}
 	return uconn, func() { client.Close(); server.Close() }
 }
@@ -126,11 +127,18 @@ func TestMarshalClientHelloIsDeterministic(t *testing.T) {
 	}
 }
 
-// TestMarshalledHelloCarriesTheEphemeralKey closes the loop between the two
-// halves: the private key we seal with must be the one whose public half is in
-// the marshalled key_share. A mismatch would make every server-side open fail.
-func TestMarshalledHelloCarriesTheEphemeralKey(t *testing.T) {
-	for _, profile := range []string{"firefox", "chrome"} {
+// TestClientAndServerAgreeOnTheEphemeralKey is the mirroring invariant between
+// SelectClientEphemeral (client) and ExtractPeerX25519 (server). If the two ever
+// pick different shares, the server derives a different secret and every open
+// fails — for one profile and not another, which is the worst way to find out.
+//
+// The profiles differ in a way that makes this load-bearing rather than
+// theoretical. Firefox is built with ReuseHybridAndClassicalKeyShares, so its
+// Ecdhe and MlkemEcdhe are the same key and either choice happens to work.
+// Chrome offers both groups with genuinely different keys, so a mismatched
+// preference order breaks Chrome only.
+func TestClientAndServerAgreeOnTheEphemeralKey(t *testing.T) {
+	for _, profile := range []string{"firefox", "chrome", "safari", "chrome120"} {
 		t.Run(profile, func(t *testing.T) {
 			uconn, cleanup := newTestUConn(t, profile)
 			defer cleanup()
@@ -144,16 +152,96 @@ func TestMarshalledHelloCarriesTheEphemeralKey(t *testing.T) {
 				t.Fatalf("MarshalClientHello: %v", err)
 			}
 
-			eph := clientEphemeral(t, uconn)
+			eph, err := SelectClientEphemeral(uconn.HandshakeState.State13.KeyShareKeys)
+			if err != nil {
+				t.Skipf("profile %s cannot do REALITY: %v", profile, err)
+			}
 			onWire, err := ExtractPeerX25519(hello.Raw)
 			if err != nil {
 				t.Fatalf("ExtractPeerX25519: %v", err)
 			}
 			if !bytes.Equal(eph.PublicKey().Bytes(), onWire) {
-				t.Fatal("the key_share on the wire does not match KeyShareKeys; " +
+				t.Fatal("client and server disagree on which key share to use; " +
 					"sealing with this key would never open on the server")
 			}
 		})
+	}
+}
+
+// TestKeyShareReuseDiffersByProfile records the upstream behaviour the mirroring
+// invariant has to survive, so a uTLS bump that changes it is visible here
+// rather than as a profile-specific auth failure in production.
+func TestKeyShareReuseDiffersByProfile(t *testing.T) {
+	sameKey := func(t *testing.T, profile string) bool {
+		t.Helper()
+		uconn, cleanup := newTestUConn(t, profile)
+		defer cleanup()
+		if err := uconn.BuildHandshakeState(); err != nil {
+			t.Fatalf("BuildHandshakeState: %v", err)
+		}
+		keys := uconn.HandshakeState.State13.KeyShareKeys
+		if keys == nil || keys.Ecdhe == nil || keys.MlkemEcdhe == nil {
+			t.Skipf("profile %s does not offer both key shares", profile)
+		}
+		return bytes.Equal(keys.Ecdhe.Bytes(), keys.MlkemEcdhe.Bytes())
+	}
+
+	if !sameKey(t, "firefox") {
+		t.Error("firefox no longer reuses one key for the classical and hybrid shares; " +
+			"ReuseHybridAndClassicalKeyShares appears to be off, re-check SelectClientEphemeral")
+	}
+	if sameKey(t, "chrome") {
+		t.Error("chrome now reuses one key across shares; the mirroring test just got weaker, " +
+			"find another profile that keeps them distinct")
+	}
+}
+
+// TestSelectClientEphemeralRejectsUnusableProfiles pins the failure mode for
+// profiles with no X25519 key share at all. The Android OkHttp profile we ship
+// is one, and the client has to refuse it up front rather than fail mid-dial.
+func TestSelectClientEphemeralRejectsUnusableProfiles(t *testing.T) {
+	if _, err := SelectClientEphemeral(nil); !errors.Is(err, ErrNoClientEphemeral) {
+		t.Fatalf("nil keys: err = %v, want ErrNoClientEphemeral", err)
+	}
+	if _, err := SelectClientEphemeral(&utls.KeySharePrivateKeys{}); !errors.Is(err, ErrNoClientEphemeral) {
+		t.Fatalf("empty keys: err = %v, want ErrNoClientEphemeral", err)
+	}
+
+	// A profile whose classical group is not X25519 must fall through to the
+	// hybrid half rather than seal with a P-256 key.
+	p256, err := ecdh.P256().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	x25519, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	got, err := SelectClientEphemeral(&utls.KeySharePrivateKeys{Ecdhe: p256, MlkemEcdhe: x25519})
+	if err != nil {
+		t.Fatalf("SelectClientEphemeral: %v", err)
+	}
+	if !got.Equal(x25519) {
+		t.Fatal("picked the non-X25519 classical key instead of the hybrid X25519 half")
+	}
+
+	if _, err := SelectClientEphemeral(&utls.KeySharePrivateKeys{Ecdhe: p256}); !errors.Is(err, ErrNoClientEphemeral) {
+		t.Fatal("accepted a profile with no X25519 key at all")
+	}
+}
+
+// TestAndroidProfileCannotDoREALITY documents a concrete consequence for the
+// client integration: one of the profiles we advertise is unusable for B1.
+func TestAndroidProfileCannotDoREALITY(t *testing.T) {
+	uconn, cleanup := newTestUConn(t, "android")
+	defer cleanup()
+
+	if err := uconn.BuildHandshakeState(); err != nil {
+		t.Fatalf("BuildHandshakeState: %v", err)
+	}
+	if _, err := SelectClientEphemeral(uconn.HandshakeState.State13.KeyShareKeys); !errors.Is(err, ErrNoClientEphemeral) {
+		t.Fatalf("the android profile now offers an X25519 key share (err = %v); "+
+			"if that is real, it can be allowed for REALITY", err)
 	}
 }
 
@@ -180,7 +268,7 @@ func TestSealAgainstRealClientHello(t *testing.T) {
 	}
 	want := samplePayload()
 
-	sid, err := SealSessionID(clientEphemeral(t, uconn), serverStatic.PublicKey().Bytes(), aad, hello.Random, want)
+	sid, err := SealSessionID(mustSelectEphemeral(t, uconn), serverStatic.PublicKey().Bytes(), aad, hello.Random, want)
 	if err != nil {
 		t.Fatalf("SealSessionID: %v", err)
 	}
@@ -216,22 +304,14 @@ func TestSealAgainstRealClientHello(t *testing.T) {
 	}
 }
 
-// clientEphemeral mirrors what the client code will do: prefer the plain X25519
-// private key, fall back to the hybrid group's X25519 half.
-func clientEphemeral(t *testing.T, uconn *utls.UConn) *ecdh.PrivateKey {
+// mustSelectEphemeral is SelectClientEphemeral with the test's error handling.
+func mustSelectEphemeral(t *testing.T, uconn *utls.UConn) *ecdh.PrivateKey {
 	t.Helper()
-	keys := uconn.HandshakeState.State13.KeyShareKeys
-	if keys == nil {
-		t.Fatal("no key share keys; the profile does not offer TLS 1.3")
+	key, err := SelectClientEphemeral(uconn.HandshakeState.State13.KeyShareKeys)
+	if err != nil {
+		t.Fatalf("SelectClientEphemeral: %v", err)
 	}
-	if keys.Ecdhe != nil {
-		return keys.Ecdhe
-	}
-	if keys.MlkemEcdhe != nil {
-		return keys.MlkemEcdhe
-	}
-	t.Fatal("neither Ecdhe nor MlkemEcdhe is set")
-	return nil
+	return key
 }
 
 func firstDiff(a, b []byte) int {
