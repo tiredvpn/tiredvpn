@@ -51,6 +51,17 @@ type REALITYStrategy struct {
 	// gate serialises TLS handshakes per donor SNI. See handshake_gate.go.
 	gate *handshakeGate
 
+	// B1 transport: a real TLS 1.3 handshake with authentication in session_id.
+	// Off unless the server's static public key is configured, because without
+	// it there is nothing to seal against.
+	b1Enabled       bool
+	serverStaticPub []byte
+
+	// clockOffset carries the correction learned from the server's one-way time
+	// record. One per strategy, so a device with a drifting clock stops failing
+	// the server's time check after its first successful connection.
+	clockOffset customtls.ClockOffset
+
 	// Post-Quantum crypto (optional)
 	pqEnabled      bool
 	pqKeyExchange  *customtls.HybridKeyExchange
@@ -65,12 +76,20 @@ type REALITYStrategy struct {
 type realityConn struct {
 	net.Conn               // the smux stream (Read/Write/Deadlines)
 	sess     *smux.Session // owns the smux session over the data conn
+	tlsConn  net.Conn      // B1 only: the TLS connection smux runs over
 	tcpConn  net.Conn      // underlying TCP, closed last
 }
 
+// Close tears the stack down from the top: stream, session, TLS, TCP. Closing
+// the TLS connection before the TCP one lets it send its close_notify, which is
+// what a real client does — dropping the TCP underneath it instead would leave
+// a truncated session, and truncation is visible.
 func (c *realityConn) Close() error {
 	streamErr := c.Conn.Close()
 	c.sess.Close()
+	if c.tlsConn != nil {
+		c.tlsConn.Close()
+	}
 	c.tcpConn.Close()
 	return streamErr
 }
@@ -110,6 +129,23 @@ func NewREALITYStrategy(manager *Manager, secret []byte) *REALITYStrategy {
 		fingerprint: customtls.DefaultFingerprintName,
 		gate:        newHandshakeGate(),
 	}
+}
+
+// SetB1 enables the B1 transport with the server's static X25519 public key.
+//
+// An empty or wrong-sized key leaves B1 off rather than failing: the legacy
+// path still works, and a client that silently refused to connect because of a
+// malformed config field would be worse than one that connects the old way.
+func (r *REALITYStrategy) SetB1(serverStaticPub []byte) {
+	if len(serverStaticPub) != 32 {
+		if len(serverStaticPub) != 0 {
+			log.Warn("REALITY: B1 server key is %d bytes, want 32; B1 stays off", len(serverStaticPub))
+		}
+		return
+	}
+	r.serverStaticPub = append([]byte(nil), serverStaticPub...)
+	r.b1Enabled = true
+	log.Info("REALITY: B1 transport enabled")
 }
 
 // SetFingerprint selects the uTLS browser profile used for the ClientHello.
@@ -365,6 +401,23 @@ func (r *REALITYStrategy) connect(ctx context.Context, target string, wrapFirstF
 		case <-handshakeDone:
 		}
 	}()
+
+	// B1: a real TLS 1.3 handshake instead of everything below. The legacy path
+	// stays until the rollout finishes (epic task 010), which is why this is a
+	// branch rather than a replacement.
+	//
+	// seqovl's decoy prefix has no place on this path: it prepends a record to
+	// the first flight, and the first flight is now a genuine ClientHello whose
+	// bytes are authenticated by session_id.
+	if r.b1Enabled && wrapFirstFlight == nil {
+		conn, err := r.connectB1(ctx, tcpConn, dest, deadline)
+		if err != nil {
+			tcpConn.Close()
+			return nil, err
+		}
+		log.Info("REALITY B1: tunnel established to %s via %s", target, dest)
+		return conn, nil
+	}
 
 	clientHello, err := r.buildClientHello(dest, clientPrivKey, clientSalt)
 	if err != nil {

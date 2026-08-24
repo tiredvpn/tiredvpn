@@ -1139,6 +1139,11 @@ type DefaultManagerConfig struct {
 	// REALITY configuration
 	REALITYEnabled bool // Enable REALITY protocol (99.5% success rate)
 
+	// REALITYB1ServerKeyB64 is the server's static X25519 public key, base64.
+	// Non-empty switches the REALITY client onto the B1 transport: a real TLS
+	// 1.3 handshake with authentication in session_id.
+	REALITYB1ServerKeyB64 string
+
 	// TLSFingerprint names the uTLS browser profile used for ClientHellos
 	// (see internal/tls.FingerprintMap). Empty selects the default profile.
 	// It is fixed for the process lifetime on purpose — rotating fingerprints
@@ -1375,6 +1380,14 @@ func registerTLSStrategies(m *Manager, cfg DefaultManagerConfig, hasServer, hasS
 
 	reality := NewREALITYStrategy(m, cfg.Secret)
 	reality.SetFingerprint(cfg.TLSFingerprint)
+	if cfg.REALITYB1ServerKeyB64 != "" {
+		key, err := base64.StdEncoding.DecodeString(cfg.REALITYB1ServerKeyB64)
+		if err != nil {
+			log.Warn("REALITY: B1 server key is not valid base64: %v; B1 stays off", err)
+		} else {
+			reality.SetB1(key)
+		}
+	}
 	reality.SetRequireDataV2(cfg.REALITYRequireDataV2)
 	if cfg.PQEnabled && cfg.PQServerKemPubB64 != "" {
 		kemPub, err := base64.StdEncoding.DecodeString(cfg.PQServerKemPubB64)

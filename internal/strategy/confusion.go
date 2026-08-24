@@ -311,8 +311,8 @@ func (c *ConfusedConn) buildSSHConfusion(realData []byte) []byte {
 	for i := 0; i < 10; i++ {
 		payload.Write(emptyList)
 	}
-	payload.WriteByte(0x00)             // first_kex_packet_follows = false
-	payload.Write(emptyList)            // reserved uint32 = 0
+	payload.WriteByte(0x00)  // first_kex_packet_follows = false
+	payload.Write(emptyList) // reserved uint32 = 0
 
 	payloadBytes := payload.Bytes()
 

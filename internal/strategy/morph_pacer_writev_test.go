@@ -134,7 +134,7 @@ func TestPacer_Coalesce_BatchesFrames(t *testing.T) {
 func TestPacer_Coalesce_FlushOnSleepBoundary(t *testing.T) {
 	c := &batchConn{}
 	sh := &scriptedShaper{script: []time.Duration{
-		50 * time.Microsecond, // frame 1: sub-tick, may coalesce
+		50 * time.Microsecond,  // frame 1: sub-tick, may coalesce
 		200 * time.Microsecond, // frame 2: above floor, flush before sleep
 	}}
 	p := newBatchPacer(c, sh)

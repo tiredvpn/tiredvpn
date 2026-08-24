@@ -19,7 +19,7 @@ import (
 const (
 	defaultProbeInterval = 250 * time.Millisecond  // first retry after a failed check
 	maxProbeInterval     = 2500 * time.Millisecond // backoff ceiling
-	probeBackoffFactor   = 2                        // interval multiplier per miss
+	probeBackoffFactor   = 2                       // interval multiplier per miss
 )
 
 // ConnectivityResult holds the result of a connectivity check

@@ -15,10 +15,10 @@ import (
 // fakeConn captures writes and serves canned reads so tests can inspect
 // the exact bytes Morph emits without going through a real socket.
 type fakeConn struct {
-	mu        sync.Mutex
-	writeBuf  bytes.Buffer
-	readBuf   bytes.Buffer
-	closed    bool
+	mu       sync.Mutex
+	writeBuf bytes.Buffer
+	readBuf  bytes.Buffer
+	closed   bool
 }
 
 func (f *fakeConn) Read(b []byte) (int, error) {
@@ -103,7 +103,7 @@ type mockShaper struct {
 	fragmentInto int // split payload into N equal-ish chunks; 0 => single frame
 }
 
-func (m *mockShaper) NextPacketSize(_ shaper.Direction) int    { return m.nextSize }
+func (m *mockShaper) NextPacketSize(_ shaper.Direction) int      { return m.nextSize }
 func (m *mockShaper) NextDelay(_ shaper.Direction) time.Duration { return m.nextDelay }
 func (m *mockShaper) Wrap(p []byte) [][]byte {
 	m.wrapCalls = append(m.wrapCalls, append([]byte(nil), p...))

@@ -146,6 +146,51 @@ func ShortIDFor(secret []byte) [AuthShortIDLen]byte {
 	return out
 }
 
+// ClientAuthKey derives the connection's authentication key from the client's
+// side: ECDH between its ephemeral key share and the server's static public key.
+//
+// SealSessionID derives the same value internally, so a client that only seals
+// need not call this. It is exported because the key is also the HMAC key for
+// cert-HMAC (see VerifyCertHMAC), and a client doing both should derive once and
+// pass the result to each.
+func ClientAuthKey(clientEphemeral *ecdh.PrivateKey, serverStaticPub, random []byte) ([]byte, error) {
+	if clientEphemeral == nil {
+		return nil, ErrNoClientEphemeral
+	}
+	if clientEphemeral.Curve() != ecdh.X25519() {
+		return nil, errors.New("reality auth: client ephemeral key is not X25519")
+	}
+	serverPub, err := ecdh.X25519().NewPublicKey(serverStaticPub)
+	if err != nil {
+		return nil, fmt.Errorf("reality auth: server static key: %w", err)
+	}
+	shared, err := clientEphemeral.ECDH(serverPub)
+	if err != nil {
+		// X25519 rejects low-order points, which is what an all-zero shared
+		// secret would come from.
+		return nil, fmt.Errorf("%w: %w", ErrShortSharedSecret, err)
+	}
+	return deriveAuthKey(shared, random)
+}
+
+// ServerAuthKey is the server-side counterpart of ClientAuthKey: ECDH between
+// the server's static private key and the client's key share.
+func ServerAuthKey(serverStaticPriv, peerPub, random []byte) ([]byte, error) {
+	priv, err := ecdh.X25519().NewPrivateKey(serverStaticPriv)
+	if err != nil {
+		return nil, fmt.Errorf("reality auth: server static key: %w", err)
+	}
+	pub, err := ecdh.X25519().NewPublicKey(peerPub)
+	if err != nil {
+		return nil, fmt.Errorf("reality auth: peer key: %w", err)
+	}
+	shared, err := priv.ECDH(pub)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrShortSharedSecret, err)
+	}
+	return deriveAuthKey(shared, random)
+}
+
 // deriveAuthKey performs the shared half of seal and open: X25519 followed by
 // HKDF-SHA256 salted with the first 20 bytes of ClientHello.Random.
 //
@@ -195,28 +240,11 @@ func SealSessionID(clientEphemeral *ecdh.PrivateKey, serverStaticPub []byte,
 ) ([AuthSessionIDLen]byte, error) {
 	var out [AuthSessionIDLen]byte
 
-	if clientEphemeral == nil {
-		return out, errors.New("reality auth: nil client ephemeral key")
-	}
-	if clientEphemeral.Curve() != ecdh.X25519() {
-		return out, errors.New("reality auth: client ephemeral key is not X25519")
-	}
 	if err := requireZeroedSessionID(helloRaw); err != nil {
 		return out, err
 	}
 
-	serverPub, err := ecdh.X25519().NewPublicKey(serverStaticPub)
-	if err != nil {
-		return out, fmt.Errorf("reality auth: server static key: %w", err)
-	}
-	shared, err := clientEphemeral.ECDH(serverPub)
-	if err != nil {
-		// X25519 rejects low-order points, which is what an all-zero shared
-		// secret would come from.
-		return out, fmt.Errorf("%w: %w", ErrShortSharedSecret, err)
-	}
-
-	authKey, err := deriveAuthKey(shared, random)
+	authKey, err := ClientAuthKey(clientEphemeral, serverStaticPub, random)
 	if err != nil {
 		return out, err
 	}
@@ -249,20 +277,7 @@ func OpenSessionID(serverStaticPriv, peerPub []byte,
 		return AuthPayload{}, err
 	}
 
-	priv, err := ecdh.X25519().NewPrivateKey(serverStaticPriv)
-	if err != nil {
-		return AuthPayload{}, fmt.Errorf("reality auth: server static key: %w", err)
-	}
-	pub, err := ecdh.X25519().NewPublicKey(peerPub)
-	if err != nil {
-		return AuthPayload{}, fmt.Errorf("reality auth: peer key: %w", err)
-	}
-	shared, err := priv.ECDH(pub)
-	if err != nil {
-		return AuthPayload{}, fmt.Errorf("%w: %w", ErrShortSharedSecret, err)
-	}
-
-	authKey, err := deriveAuthKey(shared, random)
+	authKey, err := ServerAuthKey(serverStaticPriv, peerPub, random)
 	if err != nil {
 		return AuthPayload{}, err
 	}

@@ -52,7 +52,7 @@ func (mc *MorphedConn) writeShaped(p []byte) (int, error) {
 		packet, bucket, _ := buildFrame(frame, padLen)
 
 		if err := mc.pacer.enqueue(pacedFrame{packet: packet, bucket: bucket}); err != nil {
-				mc.shaper.Release(frames)
+			mc.shaper.Release(frames)
 			return 0, err
 		}
 		mc.packetsSent++

@@ -18,6 +18,9 @@ import (
 
 // b1TLSPair runs our server-side TLS config against a crypto/tls client over a
 // loopback connection, and hands both completed sides back.
+// testB1AuthKey stands in for the key the gate derives per connection.
+var testB1AuthKey = []byte("test-connection-auth-key-32bytes")
+
 func b1TLSPair(t *testing.T, serverCfg *tls.Config, clientCfg *tls.Config) (client, server *tls.Conn) {
 	t.Helper()
 
@@ -38,7 +41,10 @@ func b1TLSPair(t *testing.T, serverCfg *tls.Config, clientCfg *tls.Config) (clie
 			accepted <- result{err: err}
 			return
 		}
-		sc := tls.Server(raw, serverCfg)
+		// Wrap the way handleREALITYB1 does: the certificate's signature field
+		// carries a MAC keyed with the connection's auth key, so a connection
+		// that never passed the gate gets no certificate at all.
+		sc := tls.Server(customtls.NewAuthConn(raw, testB1AuthKey), serverCfg)
 		accepted <- result{conn: sc, err: sc.Handshake()}
 	}()
 
@@ -171,11 +177,19 @@ func TestB1BindingFlow(t *testing.T) {
 			t.Fatalf("dispatch = %d, want TypeMux", dispatch)
 		}
 
+		// The server's answer is one-way now: no proof, and the client does not
+		// block on it. Proving the server happens inside the handshake through
+		// the certificate MAC.
+		want := time.Now().Truncate(time.Second)
 		go func() {
-			_ = customtls.WriteServerBinding(server, secret, serverEKM, time.Now())
+			_ = customtls.WriteServerTime(server, want)
 		}()
-		if _, err := customtls.ReadServerBinding(client, secret, clientEKM); err != nil {
-			t.Fatalf("client rejected the server binding: %v", err)
+		got, err := customtls.ReadServerTime(client)
+		if err != nil {
+			t.Fatalf("client could not read the server time: %v", err)
+		}
+		if !got.Equal(want) {
+			t.Fatalf("server time = %v, want %v", got, want)
 		}
 	})
 
@@ -305,6 +319,12 @@ func TestB1HandshakeIsBoundedAndTheTunnelIsNot(t *testing.T) {
 	}
 	defer ln.Close()
 
+	// A real peek buffer: the certificate HMAC derives this connection's auth
+	// key from the ClientHello's key share, so nil no longer gets past the door.
+	f := newB1Fixture(t, 0)
+	hello := f.buildB1Hello(t, f.payload(t, time.Now()))
+	peek := append([]byte{0x16, 0x03, 0x01, byte(len(hello) >> 8), byte(len(hello))}, hello...)
+
 	recorded := make(chan []time.Time, 1)
 	go func() {
 		raw, err := ln.Accept()
@@ -313,7 +333,7 @@ func TestB1HandshakeIsBoundedAndTheTunnelIsNot(t *testing.T) {
 			return
 		}
 		rec := &deadlineRecorder{Conn: raw}
-		handleREALITYB1(rec, nil, "test-client", secret, srvCtx, log.WithPrefix("test"))
+		handleREALITYB1(rec, peek, "test-client", secret, srvCtx, log.WithPrefix("test"))
 		recorded <- rec.seen()
 	}()
 
@@ -333,8 +353,10 @@ func TestB1HandshakeIsBoundedAndTheTunnelIsNot(t *testing.T) {
 	if err := customtls.WriteClientBinding(client, secret, ekm, protocol.TypeMux); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := customtls.ReadServerBinding(client, secret, ekm); err != nil {
-		t.Fatalf("server binding: %v", err)
+	// The server answers with its own clock, one-way: proof_s was dropped once
+	// cert-HMAC took over authenticating the server inside the handshake.
+	if _, err := customtls.ReadServerTime(client); err != nil {
+		t.Fatalf("server time record: %v", err)
 	}
 	_ = client.Close()
 
