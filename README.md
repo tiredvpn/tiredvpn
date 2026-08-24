@@ -169,8 +169,16 @@ For testing, create a self-signed certificate:
 ```bash
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
   -days 365 -nodes -keyout server.key -out server.crt \
-  -subj "/CN=your-server.com"
+  -subj "/CN=your-server.com" \
+  -addext "basicConstraints=critical,CA:FALSE" \
+  -addext "subjectAltName=DNS:your-server.com"
 ```
+
+Keep the subject boring. Anyone who opens a TLS connection to the server gets
+this certificate back, so a subject naming the software, the operator or the
+country ties the host to every other host running the same setup. `tiredvpn-init`
+defaults to `CN=localhost` for that reason; override it with `--cert-cn` only if
+the host has a domain that makes a more plausible cover.
 
 For production, use [Let's Encrypt](https://letsencrypt.org/) with certbot:
 
