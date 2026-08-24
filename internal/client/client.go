@@ -275,8 +275,13 @@ func buildManager(cfg *Config, secret string) (*strategy.Manager, error) {
 	mgr := strategy.NewDefaultManager(mgrCfg)
 
 	connectivityChecker := strategy.NewConnectivityChecker(cfg.ServerAddr, 3*time.Second, cfg.AndroidMode || cfg.MacOSMode)
+	// With both families configured the gate must accept either, or a client
+	// whose IPv4 is blocked (and whose IPv6 transport works fine) never gets
+	// past "waiting for network" - the manager dials v6 while the gate probes
+	// the dead v4.
+	connectivityChecker.SetAltAddr(cfg.ServerAddrV6)
 	mgr.SetConnectivityChecker(connectivityChecker)
-	log.Debug("Connectivity checker initialized for %s", cfg.ServerAddr)
+	log.Debug("Connectivity checker initialized for %s (alt=%q)", cfg.ServerAddr, cfg.ServerAddrV6)
 
 	if cfg.StrategyName != "" {
 		log.Info("Forcing strategy: %s", cfg.StrategyName)
@@ -439,7 +444,11 @@ func runProbeAndServe(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal
 	log.Info("Available strategies: %d/%d", available, len(results))
 
 	reprobeCtx, reprobeCancel := context.WithCancel(context.Background())
-	mgr.StartPeriodicReprobe(reprobeCtx, cfg.ServerAddr)
+	// Reprobe the address the manager actually dials. Passing cfg.ServerAddr
+	// blindly re-probed IPv4 every interval on a client running over IPv6, so
+	// each round measured a path the tunnel does not use - and on a host whose
+	// IPv4 is blocked, measured nothing at all.
+	mgr.StartPeriodicReprobe(reprobeCtx, mgr.GetServerAddr(reprobeCtx))
 
 	if cfg.PortHoppingEnabled {
 		mgr.StartPortHopChecker(reprobeCtx)
