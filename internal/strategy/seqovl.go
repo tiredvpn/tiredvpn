@@ -144,6 +144,13 @@ func NewSeqovlStrategy(manager *Manager, secret []byte, packetEnabled bool) *Seq
 	}
 }
 
+// Seqovl does not run on the B1 transport, and that is deliberate rather than
+// unfinished. Its decoy prefix prepends a record to the first flight, but on B1
+// the first flight is a genuine ClientHello whose every byte is authenticated by
+// session_id — a prefix in front of it makes the server's AAD differ from the
+// client's and the connection fails to authenticate. See the branch in
+// REALITYStrategy.connect.
+
 // SetFingerprint forwards the configured uTLS profile to the REALITY handshake
 // seqovl rides on, so both strategies present the same ClientHello. Two
 // strategies from one client showing different fingerprints to the same donor

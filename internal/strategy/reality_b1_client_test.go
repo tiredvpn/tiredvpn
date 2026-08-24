@@ -42,6 +42,10 @@ type b1TestServer struct {
 
 	// wrongBindingSecret makes the server read proof_c with a different secret.
 	wrongBindingSecret bool
+
+	// tuneTLS, when set, adjusts the server's TLS config before the handshake.
+	// Used to force a HelloRetryRequest.
+	tuneTLS func(*stdtls.Config)
 }
 
 func newB1TestServer(t *testing.T) *b1TestServer {
@@ -106,12 +110,16 @@ func (s *b1TestServer) serve(t *testing.T, raw net.Conn) error {
 	}
 	cert := b1TestCert(t, "github.com")
 
-	tlsConn := stdtls.Server(buffered, &stdtls.Config{
+	tlsCfg := &stdtls.Config{
 		MinVersion: stdtls.VersionTLS13,
 		GetCertificate: func(*stdtls.ClientHelloInfo) (*stdtls.Certificate, error) {
 			return customtls.CertHMACOverlay(cert, certKey)
 		},
-	})
+	}
+	if s.tuneTLS != nil {
+		s.tuneTLS(tlsCfg)
+	}
+	tlsConn := stdtls.Server(buffered, tlsCfg)
 	if err := tlsConn.Handshake(); err != nil {
 		return err
 	}
