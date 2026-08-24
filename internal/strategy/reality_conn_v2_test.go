@@ -597,3 +597,67 @@ func BenchmarkRealityDataConnV2Write(b *testing.B) {
 		}
 	}
 }
+
+// TestRealityV2TunnelPacketFitsOneSegment pins the on-wire cost of one
+// MTU-sized tunnel packet, because the Poly1305 tag makes every record 16 bytes
+// longer than it was under v1.
+//
+// The REALITY data layer is a byte stream under smux, so the tag cannot cause a
+// blackhole the way an oversized frame can on a datagram-shaped transport - TCP
+// segments and reassembles whatever it is handed. What the tag does eat is the
+// headroom that keeps one tunnel packet inside one TCP segment. Crossing that
+// boundary costs a second segment per packet, which is a throughput and latency
+// regression, not a drop. This test makes the remaining headroom explicit so a
+// later change that eats it fails here instead of on a relay.
+//
+// Chain per packet: IP packet (<= inner MTU) -> tunnel frame [len:4] ->
+// smux frame header (8) -> one TLS record (5 header + body + 16 tag).
+func TestRealityV2TunnelPacketFitsOneSegment(t *testing.T) {
+	t.Parallel()
+
+	const (
+		tunnelLenPrefix = 4  // [length:4][data:N], internal/tun/vpn.go
+		smuxHeader      = 8  // smux v1 rawHeader
+		tlsHeader       = 5  // TLS record header
+		tag             = 16 // chacha20poly1305.Overhead
+		// TCP payload budget on a plain 1500-byte IPv4 path with timestamps:
+		// 1500 - 20 (IP) - 20 (TCP) - 12 (timestamp option).
+		mssWithTimestamps = 1448
+	)
+
+	cp, _ := negotiate(t, []byte("shared-secret"))
+
+	tests := []struct {
+		name     string
+		innerMTU int
+		wantWire int
+	}{
+		{"default 1280", 1280, 1280 + tunnelLenPrefix + smuxHeader + tlsHeader + tag},
+		{"production 1400", 1400, 1400 + tunnelLenPrefix + smuxHeader + tlsHeader + tag},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var wire bytes.Buffer
+			conn, err := NewRealityDataConnV2(writeOnlyConn{Writer: &wire}, cp, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// What smux hands the record layer for one full-MTU packet.
+			smuxFrame := make([]byte, smuxHeader+tunnelLenPrefix+tt.innerMTU)
+			if _, err := conn.Write(smuxFrame); err != nil {
+				t.Fatal(err)
+			}
+
+			if wire.Len() != tt.wantWire {
+				t.Fatalf("on-wire bytes = %d, want %d", wire.Len(), tt.wantWire)
+			}
+			if wire.Len() > mssWithTimestamps {
+				t.Fatalf("one tunnel packet needs %d bytes, over the %d-byte TCP segment budget: "+
+					"every packet now costs two segments", wire.Len(), mssWithTimestamps)
+			}
+			t.Logf("inner MTU %d: %d bytes on the wire, %d bytes of headroom left in one segment",
+				tt.innerMTU, wire.Len(), mssWithTimestamps-wire.Len())
+		})
+	}
+}
