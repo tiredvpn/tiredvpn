@@ -115,8 +115,10 @@ func tryREALITYB1(conn net.Conn, peekBuf []byte, srvCtx *serverContext, logger *
 		return true
 	}
 
-	realityAuthB1Total.Add(1)
-	logger.Info("REALITY B1: authenticated (client: %s)", verdict.entry.clientID)
+	// The counter moves in handleREALITYB1, after the binding proves the client
+	// holds the secret. Counting here would count anyone who got a short ID
+	// right, which is not the same thing.
+	logger.Debug("REALITY B1: session_id accepted (client: %s)", verdict.entry.clientID)
 	handleREALITYB1(conn, peekBuf, verdict.entry.clientID, verdict.entry.secret, srvCtx, logger)
 	return true
 }
@@ -358,18 +360,8 @@ func closeWrite(c net.Conn) {
 	_ = c.Close()
 }
 
-// handleREALITYB1 serves an authenticated B1 connection.
-//
-// Stub until task 006 lands the TLS termination. It closes rather than falling
-// through to the donor on purpose: the client authenticated, so sending it a
-// donor's certificate would be a lie it cannot make sense of, and it would show
-// up as a certificate error rather than a connection failure. Nothing reaches
-// here in production yet - -reality-b1 defaults to off.
-func handleREALITYB1(conn net.Conn, peekBuf []byte, clientID string, secret []byte, srvCtx *serverContext, logger *log.Logger) {
-	_, _, _ = peekBuf, secret, srvCtx
-	logger.Warn("REALITY B1: client %s authenticated but the B1 transport is not implemented yet (task 006)", clientID)
-	_ = conn.Close()
-}
+// handleREALITYB1 lives in reality_b1_tls.go: it terminates TLS 1.3, checks the
+// exporter binding and runs the tunnel over it.
 
 // writeREALITYAuthMetrics renders the per-transport authentication counters.
 // They exist to answer one operational question - is anyone still on the legacy
