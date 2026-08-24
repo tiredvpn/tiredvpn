@@ -470,6 +470,14 @@ func runControlSocketMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Si
 		}
 	}
 
+	// IPv6 inside the tunnel: -tun-ipv6 dual opts the control-socket path into
+	// the v0x04 dual-stack handshake, same policy parser as desktop TUN mode.
+	// Default off keeps the handshake byte-identical to pre-dual-stack cores.
+	dualStack, err := parseTunIPv6Policy(cfg.TunIPv6Policy)
+	if err != nil {
+		return err
+	}
+
 	// Create control server with connect function
 	ctrlCfg := &tun.ControlConfig{
 		ServerAddr: cfg.ServerAddr,
@@ -477,6 +485,7 @@ func runControlSocketMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Si
 		MTU:        cfg.TunMTU,
 		DNS:        "8.8.8.8", // Default DNS
 		Routes:     cfg.TunRoutes,
+		DualStack:  dualStack,
 
 		// ReconnectFn - called on network change (WiFi→LTE, cell handoff)
 		// Resets circuit breakers and uses optimized fast reconnect
@@ -503,34 +512,11 @@ func runControlSocketMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Si
 
 			// Send TUN mode handshake with our current IP
 			// Server will recognize us and restore the session
-			handshake := make([]byte, 8)
-			handshake[0] = 0x02 // TUN mode
-			copy(handshake[1:5], currentIP.To4())
-			binary.BigEndian.PutUint16(handshake[5:7], uint16(mtu))
-			handshake[7] = 0x03 // Version 3: full port hopping config + auto-MTU probe
-
-			if _, err := conn.Write(handshake); err != nil {
-				conn.Close()
-				return nil, nil, nil, fmt.Errorf("handshake write failed: %w", err)
-			}
-
-			// Read response (up to 64 bytes for extended v2 with port hopping config)
-			// Minimum 9 bytes: [status:1][serverIP:4][clientIP:4]
-			resp := make([]byte, 64)
-			n, err := io.ReadAtLeast(conn, resp, 9)
+			serverIP, assignedIP, err := sendReconnectHandshake(conn, currentIP, mtu, dualStack)
 			if err != nil {
 				conn.Close()
-				return nil, nil, nil, fmt.Errorf("handshake read failed: %w", err)
+				return nil, nil, nil, err
 			}
-			resp = resp[:n] // Trim to actual response size
-
-			if resp[0] != 0x00 {
-				conn.Close()
-				return nil, nil, nil, fmt.Errorf("server rejected reconnect: status=%d", resp[0])
-			}
-
-			serverIP := net.IP(resp[1:5])
-			assignedIP := net.IP(resp[5:9])
 
 			log.Info("Reconnect handshake complete (server: %s, assigned: %s)", serverIP, assignedIP)
 
@@ -599,6 +585,81 @@ func runControlSocketMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Si
 	cancel()
 
 	return nil
+}
+
+// parseTunIPv6Policy resolves the -tun-ipv6 flag value ("", "off", "dual")
+// to whether the dual-stack TUN handshake is enabled. An empty value means
+// the flag was never set and behaves like "off"; anything the shared policy
+// parser rejects is an error here too.
+func parseTunIPv6Policy(flagValue string) (bool, error) {
+	if flagValue == "" {
+		flagValue = "off"
+	}
+	policy, err := tun.ParseIPv6Policy(flagValue)
+	if err != nil {
+		return false, err
+	}
+	return policy == tun.IPv6PolicyDual, nil
+}
+
+// sendReconnectHandshake performs the TUN mode handshake on a fresh reconnect
+// connection, sending the client's current IP so the server can restore the
+// session. dualStack selects the version byte: v0x04 when -tun-ipv6 dual is
+// active (re-negotiating IPv6 on reconnect too), otherwise the historical
+// v0x03.
+func sendReconnectHandshake(conn net.Conn, currentIP net.IP, mtu int, dualStack bool) (serverIP, assignedIP net.IP, err error) {
+	version := byte(0x03) // Version 3: full port hopping config + auto-MTU probe
+	if dualStack {
+		version = 0x04 // Version 4: + dual-stack IPv6 negotiation
+	}
+	handshake := make([]byte, 8)
+	handshake[0] = 0x02 // TUN mode
+	copy(handshake[1:5], currentIP.To4())
+	binary.BigEndian.PutUint16(handshake[5:7], uint16(mtu))
+	handshake[7] = version
+
+	if _, err := conn.Write(handshake); err != nil {
+		return nil, nil, fmt.Errorf("handshake write failed: %w", err)
+	}
+
+	// Read response (up to 64 bytes for extended v2 with port hopping config)
+	// Minimum 9 bytes: [status:1][serverIP:4][clientIP:4]
+	// The dual-stack path uses ReadTUNHandshakeResponse, which additionally
+	// drains the trailing 32-byte [serverIP6:16][clientIP6:16] block so the
+	// stream stays frame-aligned for the relay that follows.
+	var resp []byte
+	var n int
+	if dualStack {
+		resp, err = tun.ReadTUNHandshakeResponse(conn)
+		n = len(resp)
+	} else {
+		buf := make([]byte, 64)
+		n, err = io.ReadAtLeast(conn, buf, 9)
+		resp = buf[:n]
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("handshake read failed: %w", err)
+	}
+	if n < 9 {
+		return nil, nil, fmt.Errorf("handshake response too short: %d bytes", n)
+	}
+
+	if resp[0] != 0x00 {
+		return nil, nil, fmt.Errorf("server rejected reconnect: status=%d", resp[0])
+	}
+
+	serverIP = net.IP(resp[1:5])
+	assignedIP = net.IP(resp[5:9])
+
+	if dualStack {
+		if caps, ok := tun.ParseTUNHandshakeCapabilities(resp[:n]); ok && caps.DualStackEnabled {
+			log.Info("Reconnect re-negotiated dual-stack: client=%s server=%s", caps.ClientIP6, caps.ServerIP6)
+		} else {
+			log.Warn("Dual-stack requested but the exit did not negotiate IPv6 on reconnect; continuing IPv4-only")
+		}
+	}
+
+	return serverIP, assignedIP, nil
 }
 
 func runTUNMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) error {

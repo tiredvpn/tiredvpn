@@ -571,6 +571,13 @@ func parseClientArgs(args []string) (*client.Config, error) {
 				i++
 			}
 
+		// IPv6 inside the tunnel (dual-stack)
+		case "-tun-ipv6":
+			if i+1 < len(args) {
+				cfg.TunIPv6Policy = args[i+1]
+				i++
+			}
+
 		// IPv6 transport
 		case "-server-v6":
 			if i+1 < len(args) {
