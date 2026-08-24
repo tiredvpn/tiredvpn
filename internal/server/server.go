@@ -355,6 +355,51 @@ type Config struct {
 	// If empty, unauthorized REALITY connections are silently dropped.
 	REALITYCoverDomain string
 
+	// REALITYRequireDataV2 rejects clients that do not negotiate the v2 data
+	// layer (per-connection X25519 keys + ChaCha20-Poly1305). Off during the
+	// rollout so upgraded exits keep serving older clients; turn it on once
+	// every client in the deployment is upgraded, to close the downgrade path
+	// an active attacker could otherwise force by mangling the padding block.
+	REALITYRequireDataV2 bool
+
+	// REALITYPrivateKey is the server's static X25519 key, base64 (raw url).
+	// The B1 session_id authentication key is derived from it, and so is the
+	// certificate HMAC that lets a client authenticate the server without a CA
+	// once B1.5 lands - one key, both directions. Required when REALITYB1Enabled
+	// is set; the server refuses to start without it rather than generating a
+	// throwaway that would drop every client on the next restart.
+	//
+	// Falls back to TIREDVPN_REALITY_PRIVATE_KEY so it need not sit in the
+	// process command line where any local user can read it.
+	REALITYPrivateKey string
+
+	// REALITYB1Enabled accepts the B1 transport: a real TLS 1.3 handshake with
+	// authentication carried in session_id.
+	REALITYB1Enabled bool
+
+	// REALITYLegacyEnabled accepts the old transport, the one that hides
+	// credentials in padding extension 0x0015. Switch it off once
+	// reality_auth_legacy_total stops growing.
+	REALITYLegacyEnabled bool
+
+	// REALITYMaxTimeDiff is the client clock skew tolerated by B1
+	// authentication, in seconds. 0 disables the check.
+	REALITYMaxTimeDiff int
+
+	// REALITYMinClientVer is the lowest client version accepted, "X.Y.Z".
+	// Empty disables the check, which is where the first B1 release leaves it.
+	REALITYMinClientVer string
+
+	// REALITYMirrorMode selects how much of the handshake is mirrored to the
+	// real donor site: "off" mirrors nothing, "adaptive" opens a donor
+	// connection only for sources we have not seen before, "always" mirrors
+	// every connection the way the upstream reference does.
+	//
+	// B1 implements "off" only; the other two arrive with B1.5 and are
+	// validated here so a config written against that release fails loudly on
+	// an older binary instead of quietly mirroring nothing.
+	REALITYMirrorMode string
+
 	// Shaper, when non-nil, is built from TOML [shaper]. The server-side
 	// pipeline does not yet consume it — server morph processing lives
 	// outside internal/strategy.MorphedConn — so this field is reserved for
@@ -382,7 +427,11 @@ func Run(cfg *Config) error {
 
 	initAdmissionControl(cfg)
 
-	if err := InitREALITYKeys(); err != nil {
+	if err := validateREALITYConfig(cfg); err != nil {
+		return fmt.Errorf("reality configuration: %w", err)
+	}
+
+	if err := InitREALITYKeys(cfg); err != nil {
 		return fmt.Errorf("reality initialization failed: %w", err)
 	}
 
@@ -1103,8 +1152,17 @@ func handleConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 		return
 	}
 
-	// Check for REALITY protocol (TLS with REALITY extension)
-	if DetectREALITYExtension(peekBuf) {
+	// REALITY, newest transport first. B1 claims a connection by parsing the
+	// authentication out of session_id; only if it declines do we look for the
+	// legacy padding extension. Order matters: a B1 ClientHello carries no
+	// padding-ext credentials, so the legacy detector would misfile it as an
+	// ordinary TLS handshake and serve the fake website.
+	if srvCtx.cfg.REALITYB1Enabled {
+		if tryREALITYB1(buffConn, peekBuf, srvCtx, logger) {
+			return
+		}
+	}
+	if srvCtx.cfg.REALITYLegacyEnabled && DetectREALITYExtension(peekBuf) {
 		logger.Info("Detected REALITY protocol")
 		HandleREALITYConnection(buffConn, srvCtx, logger)
 		return

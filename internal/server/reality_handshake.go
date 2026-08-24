@@ -2,8 +2,10 @@ package server
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 
 	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
@@ -348,13 +350,13 @@ func InjectREALITYExtension(serverHello []byte, realityExt *customtls.REALITYExt
 	// Write REALITY data at start of padding
 	copy(paddingExtension[4:], extData)
 
-	// Fill rest with random bytes
+	// Fill rest with CSPRNG bytes. This used to be byte(i*7%256): 192 bytes of a
+	// fixed ramp in every ServerHello we ever sent, which is a single DPI rule
+	// matching every server we run regardless of IP or SNI.
 	if paddingLen > len(extData) {
-		randomPadding := make([]byte, paddingLen-len(extData))
-		for i := range randomPadding {
-			randomPadding[i] = byte(i * 7 % 256) // Pseudo-random but deterministic for debugging
+		if _, err := rand.Read(paddingExtension[4+len(extData):]); err != nil {
+			return nil, fmt.Errorf("reality: padding randomness: %w", err)
 		}
-		copy(paddingExtension[4+len(extData):], randomPadding)
 	}
 
 	// Rebuild payload with injected extension

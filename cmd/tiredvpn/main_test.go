@@ -132,3 +132,82 @@ func TestApplyClientTOMLConfig_InvalidTOML(t *testing.T) {
 		t.Fatal("expected error for malformed TOML, got nil")
 	}
 }
+
+// TestRegisterServerFlags_REALITYB1 guards the same failure mode as the
+// cover-domain test above: a config field consumed by the server but bound to
+// no flag is dead weight nobody notices. These five are the whole operator
+// surface of B1, so each is checked for both its default and a set value.
+func TestRegisterServerFlags_REALITYB1(t *testing.T) {
+	cfg := &server.Config{}
+	fs := flag.NewFlagSet("server", flag.ContinueOnError)
+	registerServerFlags(fs, cfg)
+	if err := fs.Parse(nil); err != nil {
+		t.Fatalf("parse (defaults): %v", err)
+	}
+
+	// B1 defaults off while its handler is a stub: on would make a server
+	// without a static key refuse to start, for a code path that does nothing.
+	if cfg.REALITYB1Enabled {
+		t.Error("default -reality-b1 = true; turning it on brings the static-key requirement with it")
+	}
+	if !cfg.REALITYLegacyEnabled {
+		t.Error("default -reality-legacy = false; every existing client speaks the legacy transport")
+	}
+	if cfg.REALITYMaxTimeDiff != 300 {
+		t.Errorf("default -reality-max-time-diff = %d, want 300", cfg.REALITYMaxTimeDiff)
+	}
+	if cfg.REALITYMirrorMode != "off" {
+		t.Errorf("default -reality-mirror = %q, want off", cfg.REALITYMirrorMode)
+	}
+	if cfg.REALITYPrivateKey != "" || cfg.REALITYMinClientVer != "" {
+		t.Error("key and min-version must default to empty")
+	}
+
+	cfg = &server.Config{}
+	fs = flag.NewFlagSet("server", flag.ContinueOnError)
+	registerServerFlags(fs, cfg)
+	err := fs.Parse([]string{
+		"-reality-b1",
+		"-reality-legacy=false",
+		"-reality-private-key", "dGVzdA",
+		"-reality-max-time-diff", "60",
+		"-reality-min-client-ver", "1.4.0",
+		"-reality-mirror", "adaptive",
+	})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !cfg.REALITYB1Enabled || cfg.REALITYLegacyEnabled {
+		t.Error("transport switches did not take")
+	}
+	if cfg.REALITYPrivateKey != "dGVzdA" || cfg.REALITYMinClientVer != "1.4.0" {
+		t.Errorf("string flags did not take: %+v", cfg)
+	}
+	if cfg.REALITYMaxTimeDiff != 60 || cfg.REALITYMirrorMode != "adaptive" {
+		t.Errorf("skew/mirror flags did not take: %+v", cfg)
+	}
+}
+
+// TestRegisterClientFlags_REALITYServerPubKey checks the client half of the
+// pair. Empty means the legacy transport, so the default carries meaning.
+func TestRegisterClientFlags_REALITYServerPubKey(t *testing.T) {
+	cfg := &client.Config{}
+	fs := flag.NewFlagSet("client", flag.ContinueOnError)
+	registerClientREALITYFlags(fs, cfg)
+	if err := fs.Parse(nil); err != nil {
+		t.Fatalf("parse (defaults): %v", err)
+	}
+	if cfg.REALITYServerPubKey != "" {
+		t.Fatalf("default = %q, want empty (legacy transport)", cfg.REALITYServerPubKey)
+	}
+
+	cfg = &client.Config{}
+	fs = flag.NewFlagSet("client", flag.ContinueOnError)
+	registerClientREALITYFlags(fs, cfg)
+	if err := fs.Parse([]string{"-reality-server-pubkey", "cHVia2V5"}); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.REALITYServerPubKey != "cHVia2V5" {
+		t.Fatalf("REALITYServerPubKey = %q, want %q", cfg.REALITYServerPubKey, "cHVia2V5")
+	}
+}

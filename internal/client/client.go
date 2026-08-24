@@ -91,6 +91,21 @@ type Config struct {
 	// Seqovl level-A packet overlap (Linux + CAP_NET_ADMIN, off by default)
 	SeqovlPacketEnabled bool // Enable packet-level TCP sequence overlap
 
+	// REALITYRequireDataV2 refuses servers still on the v1 REALITY data layer
+	// instead of falling back to it. Off until every server is upgraded.
+	REALITYRequireDataV2 bool
+
+	// REALITYServerPubKey is the server's static X25519 public key, base64.
+	// A non-empty value means "speak B1 to this server" - there is no probing
+	// and no downgrade on error, because a transport that falls back when the
+	// handshake fails is a transport a censor can force back to the old one.
+	// It also anchors the certificate HMAC check that authenticates the server
+	// without a CA once B1.5 lands.
+	//
+	// The key is public: it ships alongside the secret because that channel
+	// already exists, not because it needs protecting.
+	REALITYServerPubKey string
+
 	// RTT Masking
 	RTTMaskingEnabled bool   // Enable RTT masking
 	RTTProfile        string // RTT profile name
@@ -272,6 +287,8 @@ func buildManager(cfg *Config, secret string) (*strategy.Manager, error) {
 		PortHopping:         portHoppingCfg,
 		Shaper:              cfg.Shaper,
 		ShaperID:            cfg.ShaperID,
+
+		REALITYRequireDataV2: cfg.REALITYRequireDataV2,
 	}
 	mgr := strategy.NewDefaultManager(mgrCfg)
 

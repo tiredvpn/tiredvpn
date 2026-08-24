@@ -150,6 +150,11 @@ func NewSeqovlStrategy(manager *Manager, secret []byte, packetEnabled bool) *Seq
 // SNI would be a signal in itself.
 func (s *SeqovlStrategy) SetFingerprint(name string) { s.reality.SetFingerprint(name) }
 
+// SetRequireDataV2 forwards the data-layer policy to the REALITY handshake
+// seqovl rides on. Same reason as SetFingerprint: the two strategies must not
+// end up on different terms with the same server.
+func (s *SeqovlStrategy) SetRequireDataV2(v bool) { s.reality.SetRequireDataV2(v) }
+
 // Name returns the human-readable strategy name.
 func (s *SeqovlStrategy) Name() string { return "Seqovl" }
 
