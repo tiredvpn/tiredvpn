@@ -61,12 +61,18 @@ func TestFingerprintNamesAreResolvable(t *testing.T) {
 	}
 }
 
-// TestLegacyFingerprintAliasesStillResolve protects operator configs written
-// against the old names.
-func TestLegacyFingerprintAliasesStillResolve(t *testing.T) {
-	for _, name := range []string{"chrome", "chrome120", "chrome124", "firefox", "safari", "edge", "ios", "android", "randomized"} {
-		if _, ok := LookupFingerprint(name); !ok {
-			t.Errorf("legacy profile name %q no longer resolves", name)
+// TestVersionSuffixedNamesArePinned enforces the naming rule for what is now
+// operator-facing config: a name ending in a version must resolve to exactly
+// that parrot, never to an _Auto alias that moves on the next uTLS bump. This
+// package already shipped that bug once as FingerprintChrome124 -> Chrome 133.
+func TestVersionSuffixedNamesArePinned(t *testing.T) {
+	for name, fp := range FingerprintMap {
+		suffix := strings.TrimLeft(name, "abcdefghijklmnopqrstuvwxyz")
+		if suffix == "" {
+			continue // bare browser name, tracking upstream is the contract
+		}
+		if got := fp.ClientHello.Version; got != suffix {
+			t.Errorf("profile %q resolves to version %q; a version-suffixed name must be pinned to the version it names", name, got)
 		}
 	}
 }

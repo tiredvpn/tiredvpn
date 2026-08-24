@@ -46,6 +46,13 @@ var (
 		ClientHello: &utls.HelloChrome_Auto,
 	}
 
+	// Chrome 133 - pinned. Same bytes as FingerprintChromeAuto today, but it
+	// stays on 133 when uTLS moves Auto forward.
+	FingerprintChrome133 = &BrowserFingerprint{
+		Name:        "Chrome 133",
+		ClientHello: &utls.HelloChrome_133,
+	}
+
 	// Newest Firefox uTLS can parrot. Currently Firefox 148 — matches shipping
 	// Firefox, which is why this is the default profile.
 	FingerprintFirefoxAuto = &BrowserFingerprint{
@@ -57,6 +64,13 @@ var (
 	FingerprintFirefox120 = &BrowserFingerprint{
 		Name:        "Firefox 120",
 		ClientHello: &utls.HelloFirefox_120,
+	}
+
+	// Firefox 148 - pinned. Same bytes as FingerprintFirefoxAuto today; pick
+	// this one when a capture has to stay reproducible across a uTLS bump.
+	FingerprintFirefox148 = &BrowserFingerprint{
+		Name:        "Firefox 148",
+		ClientHello: &utls.HelloFirefox_148,
 	}
 
 	// Newest Safari uTLS can parrot. Currently Safari 26.3.
@@ -106,16 +120,19 @@ var (
 //     at a current version — the Edge/iOS/Android parrots are all from 2020.
 const DefaultFingerprintName = "firefox"
 
-// FingerprintMap maps configuration names to fingerprints. The version-suffixed
-// aliases pin a specific parrot; the bare browser names track uTLS upstream.
+// FingerprintMap maps configuration names to fingerprints. These names are
+// operator-facing config (-tls-fingerprint, tls.fingerprint), so the rule is
+// strict and worth stating: a bare browser name tracks whatever uTLS parrots
+// as newest and will change under you on a uTLS bump; a version-suffixed name
+// is pinned to that exact parrot forever. A name must never mean a version
+// other than the one it says — that is the whole bug this package had.
 var FingerprintMap = map[string]*BrowserFingerprint{
 	"chrome":     FingerprintChromeAuto,
 	"chrome120":  FingerprintChrome120,
-	"chrome124":  FingerprintChromeAuto, // legacy alias, never was Chrome 124
-	"chrome133":  FingerprintChromeAuto,
+	"chrome133":  FingerprintChrome133,
 	"firefox":    FingerprintFirefoxAuto,
 	"firefox120": FingerprintFirefox120,
-	"firefox148": FingerprintFirefoxAuto,
+	"firefox148": FingerprintFirefox148,
 	"safari":     FingerprintSafariAuto,
 	"edge":       FingerprintEdge,
 	"ios":        FingerprintiOS,
