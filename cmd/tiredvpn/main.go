@@ -248,6 +248,9 @@ TUN MODE (Full VPN):
         TUN device MTU (default 1280)
   -tun-routes string
         Routes to add (comma-separated, e.g. '0.0.0.0/0' for full tunnel)
+  -tun-ipv6 string
+        IPv6 inside the tunnel: off (v4-only, default), dual (route IPv6 through
+        the tunnel when the exit negotiates dual-stack; v4-only fallback otherwise)
   -tun-fd int
         Use existing TUN file descriptor - for Android VpnService (default -1)
 
@@ -521,6 +524,7 @@ func runClient(args []string) {
 	fs.IntVar(&cfg.TunMTU, "tun-mtu", 1280, "TUN device MTU (with -auto-mtu this is the upper bound/cap)")
 	fs.BoolVar(&cfg.AutoMTU, "auto-mtu", true, "Actively probe the real end-to-end MTU and apply min(probed, -tun-mtu); floor 1280")
 	fs.StringVar(&cfg.TunRoutes, "tun-routes", "", "Routes to add (comma-separated, e.g. '0.0.0.0/0' for full tunnel)")
+	fs.StringVar(&cfg.TunIPv6Policy, "tun-ipv6", "off", "IPv6 inside the tunnel: off (v4-only), dual (route IPv6 through the tunnel when the exit supports it)")
 
 	// Android VpnService flags
 	fs.IntVar(&cfg.TunFd, "tun-fd", -1, "Use existing TUN file descriptor (for Android VpnService)")

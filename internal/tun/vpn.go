@@ -242,6 +242,9 @@ func NewVPNClient(cfg VPNConfig) (*VPNClient, error) {
 		if err != nil {
 			return nil, err
 		}
+		// Record dual-stack intent before Configure so the interface keeps
+		// IPv6 enabled for the post-handshake EnableDualStack.
+		tunDev.SetDualStack(cfg.DualStack)
 		// Pin a server bypass route before configuring routes, so a full-tunnel
 		// default route does not loop the client's own server traffic.
 		if bypassIP := resolveServerBypassIP(cfg.ServerAddr); bypassIP != nil {
@@ -720,6 +723,24 @@ func (v *VPNClient) connect(parent context.Context) error {
 		}
 	}
 	v.mu.Unlock()
+
+	// Dual-stack: bring up the v6 side of the tunnel only when the exit
+	// actually negotiated it. A declined negotiation (old server, no
+	// -ip-pool-v6) restores the exact v4-only interface state — no v6
+	// address, no v6 routes, disable_ipv6=1 — so nothing leaks or blackholes.
+	// Host-owned interfaces (Android VpnService / macOS NE fd) are configured
+	// by the host, which consumes the negotiated addresses out of band.
+	if v.dualStack && v.ownsInterface {
+		if hasCaps && caps.DualStackEnabled {
+			if err := v.tun.EnableDualStack(caps.ClientIP6, caps.ServerIP6); err != nil {
+				log.Warn("Dual-stack: failed to configure IPv6 on the tunnel: %v (continuing IPv4-only)", err)
+				v.tun.DisableIPv6()
+			}
+		} else {
+			log.Warn("Dual-stack requested but the exit did not negotiate IPv6; continuing IPv4-only")
+			v.tun.DisableIPv6()
+		}
+	}
 
 	// Mark the start of this session for storm detection. If the DPI tears the
 	// session down within seconds, handleDisconnect's RecordSessionEnd will see

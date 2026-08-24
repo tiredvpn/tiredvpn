@@ -31,6 +31,8 @@ type ControlResponse struct {
 	Error     string `json:"error,omitempty"`
 	IP        string `json:"ip,omitempty"`         // Assigned TUN IP
 	ServerIP  string `json:"server_ip,omitempty"`  // Server's TUN IP
+	IP6       string `json:"ip6,omitempty"`        // Assigned TUN IPv6 (dual-stack only)
+	ServerIP6 string `json:"server_ip6,omitempty"` // Server's TUN IPv6 (dual-stack only)
 	DNS       string `json:"dns,omitempty"`        // DNS server
 	MTU       int    `json:"mtu,omitempty"`        // MTU value
 	Routes    string `json:"routes,omitempty"`     // Suggested routes
@@ -59,6 +61,8 @@ type ControlServer struct {
 	serverConn      net.Conn // Connection to VPN server
 	assignedIP      net.IP   // IP assigned by server
 	serverIP        net.IP   // Server's TUN IP
+	assignedIP6     net.IP   // IPv6 assigned by server (dual-stack only)
+	serverIP6       net.IP   // Server's TUN IPv6 (dual-stack only)
 	mtu             int
 	waitingForFd    bool
 	tunFdCh         chan int      // Channel to receive TUN fd
@@ -96,6 +100,13 @@ type ControlConfig struct {
 	MTU        int
 	DNS        string
 	Routes     string
+
+	// DualStack opts the TUN handshake into IPv6 dual-stack negotiation
+	// (version 0x04 instead of 0x03). Default false preserves the historical
+	// behavior byte-for-byte; when the exit does not negotiate dual-stack the
+	// response simply carries no IPv6 fields.
+	DualStack bool
+
 	ConnectFn  func(ctx context.Context) (assignedIP, serverIP net.IP, conn net.Conn, err error)
 	StartVPNFn func(tunFd int, localIP, remoteIP net.IP, conn net.Conn) error
 
@@ -253,12 +264,14 @@ func (cs *ControlServer) handleConnect(ctx context.Context) ControlResponse {
 	if cs.assignedIP != nil {
 		// Already connected, return existing config
 		return ControlResponse{
-			Status:   "waiting_fd",
-			IP:       cs.assignedIP.String(),
-			ServerIP: cs.serverIP.String(),
-			DNS:      cs.config.DNS,
-			MTU:      cs.mtu,
-			Routes:   cs.config.Routes,
+			Status:    "waiting_fd",
+			IP:        cs.assignedIP.String(),
+			ServerIP:  cs.serverIP.String(),
+			IP6:       ipString(cs.assignedIP6),
+			ServerIP6: ipString(cs.serverIP6),
+			DNS:       cs.config.DNS,
+			MTU:       cs.mtu,
+			Routes:    cs.config.Routes,
 		}
 	}
 
@@ -293,13 +306,24 @@ func (cs *ControlServer) handleConnect(ctx context.Context) ControlResponse {
 	log.Info("Connected to server, real IP: %s (placeholder was: %s), waiting for TUN fd", realAssignedIP, placeholderIP)
 
 	return ControlResponse{
-		Status:   "waiting_fd",
-		IP:       realAssignedIP.String(),
-		ServerIP: realServerIP.String(),
-		DNS:      cs.config.DNS,
-		MTU:      cs.mtu,
-		Routes:   cs.config.Routes,
+		Status:    "waiting_fd",
+		IP:        realAssignedIP.String(),
+		ServerIP:  realServerIP.String(),
+		IP6:       ipString(cs.assignedIP6),
+		ServerIP6: ipString(cs.serverIP6),
+		DNS:       cs.config.DNS,
+		MTU:       cs.mtu,
+		Routes:    cs.config.Routes,
 	}
+}
+
+// ipString renders an IP for a ControlResponse, mapping nil to "" so the
+// omitempty JSON field stays absent when dual-stack was not negotiated.
+func ipString(ip net.IP) string {
+	if ip == nil {
+		return ""
+	}
+	return ip.String()
 }
 
 // handleSetFdWithReceivedFd starts VPN with fd received via SCM_RIGHTS
@@ -1172,21 +1196,35 @@ func (cs *ControlServer) performTUNHandshake() (assignedIP, serverIP net.IP, err
 	// Send TUN mode handshake
 	// Format: [mode:1][localIP:4][mtu:2][version:1]
 	// Send 0.0.0.0 to request auto IP assignment
+	version := byte(tunHandshakeVersion)
+	if cs.config.DualStack {
+		version = tunHandshakeVersionDualStack
+	}
 	handshake := make([]byte, 8)
 	handshake[0] = 0x02 // TUN mode
 	// localIP = 0.0.0.0 (bytes 1:5 remain zero to request auto assignment)
 	binary.BigEndian.PutUint16(handshake[5:7], uint16(mtu))
-	handshake[7] = tunHandshakeVersion // v3: also signals auto-MTU probe support
+	handshake[7] = version // v3: auto-MTU probe; v4: + dual-stack
 
-	log.Debug("Sending TUN handshake: mode=0x02, mtu=%d, version=0x%02x", mtu, tunHandshakeVersion)
+	log.Debug("Sending TUN handshake: mode=0x02, mtu=%d, version=0x%02x", mtu, version)
 	if _, err := cs.serverConn.Write(handshake); err != nil {
 		return nil, nil, fmt.Errorf("handshake write failed: %w", err)
 	}
 
 	// Read response (up to 64 bytes for extended v2 with port hopping config)
 	// Minimum 9 bytes: [status:1][serverIP:4][clientIP:4]
-	resp := make([]byte, 64)
-	n, err := io.ReadAtLeast(cs.serverConn, resp, 9)
+	// The dual-stack path reuses readHandshakeResponse, which additionally
+	// drains the trailing 32-byte [serverIP6:16][clientIP6:16] block so the
+	// stream stays frame-aligned for the relay that follows.
+	var resp []byte
+	var n int
+	if cs.config.DualStack {
+		resp, n, err = readHandshakeResponse(cs.serverConn)
+	} else {
+		buf := make([]byte, 64)
+		n, err = io.ReadAtLeast(cs.serverConn, buf, 9)
+		resp = buf
+	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("handshake read failed: %w", err)
 	}
@@ -1207,6 +1245,23 @@ func (cs *ControlServer) performTUNHandshake() (assignedIP, serverIP net.IP, err
 
 	serverIP = net.IP(resp[1:5])
 	assignedIP = net.IP(resp[5:9])
+
+	// Dual-stack: when the exit answered the v0x04 handshake with the
+	// dual-stack flag, record the negotiated v6 addresses so the next
+	// ControlResponse can hand them to Android (which configures them on the
+	// VpnService interface). A declined negotiation leaves both nil and the
+	// session is plain v4 — identical to a 0x03 handshake.
+	cs.assignedIP6 = nil
+	cs.serverIP6 = nil
+	if cs.config.DualStack {
+		if caps, ok := parseServerCapabilities(resp, n); ok && caps.DualStackEnabled {
+			cs.assignedIP6 = caps.ClientIP6
+			cs.serverIP6 = caps.ServerIP6
+			log.Info("Dual-stack negotiated: client=%s server=%s", caps.ClientIP6, caps.ServerIP6)
+		} else {
+			log.Warn("Dual-stack requested but the exit did not negotiate IPv6; continuing IPv4-only")
+		}
+	}
 
 	log.Debug("TUN handshake successful: assigned=%s, server=%s", assignedIP, serverIP)
 	return assignedIP, serverIP, nil

@@ -66,8 +66,72 @@ type TUNDevice struct {
 	remoteIP  net.IP
 	routes    []string
 
+	// Dual-stack state: dualStack is the client's intent (SetDualStack);
+	// v6Enabled/localIP6/remoteIP6 are set once EnableDualStack installed the
+	// negotiated v6 address and half-default routes.
+	dualStack bool
+	v6Enabled bool
+	localIP6  net.IP
+	remoteIP6 net.IP
+
 	writeMu sync.Mutex
 	readBuf []byte
+}
+
+// SetDualStack records the client's intent to negotiate IPv6 inside the
+// tunnel. On macOS there is no disable_ipv6 sysctl to flip in Configure, so
+// this only gates the post-handshake EnableDualStack.
+func (t *TUNDevice) SetDualStack(dual bool) {
+	t.dualStack = dual
+}
+
+// EnableDualStack assigns the negotiated v6 point-to-point address and
+// installs the two v6 half-default routes (::/1, 8000::/1) into the utun.
+// The split default outranks RA-learned ::/0 on prefix length without
+// touching the host's real default route. Mirrors the v4
+// `ifconfig inet local remote` + `route add -net` pattern in Configure.
+func (t *TUNDevice) EnableDualStack(clientIP6, serverIP6 net.IP) error {
+	if _, _, _, err := dualStackAddrPlan(clientIP6, serverIP6); err != nil {
+		return err
+	}
+	if err := runIfconfig(t.name, "inet6", clientIP6.String(), serverIP6.String(),
+		"prefixlen", "128"); err != nil {
+		return fmt.Errorf("ifconfig inet6: %w", err)
+	}
+	for _, r := range dualStackRouteCIDRs {
+		if err := runRoute("add", "-inet6", r, "-iface", t.name); err != nil {
+			return fmt.Errorf("route add -inet6 %s: %w", r, err)
+		}
+	}
+	t.localIP6 = clientIP6
+	t.remoteIP6 = serverIP6
+	t.v6Enabled = true
+	log.Info("utun %s dual-stack enabled: local=%s, peer=%s, routes=%v",
+		t.name, clientIP6, serverIP6, dualStackRouteCIDRs)
+	return nil
+}
+
+// DisableIPv6 undoes EnableDualStack (v6 routes and address) when the exit
+// declined dual-stack. macOS has no per-interface disable_ipv6 sysctl; a utun
+// without an inet6 address carries no IPv6, so removing what we added is
+// sufficient.
+func (t *TUNDevice) DisableIPv6() {
+	if !t.v6Enabled {
+		return
+	}
+	for _, r := range dualStackRouteCIDRs {
+		if err := runRoute("delete", "-inet6", r, "-iface", t.name); err != nil {
+			log.Debug("route delete -inet6 %s failed: %v", r, err)
+		}
+	}
+	if t.localIP6 != nil {
+		if err := runIfconfig(t.name, "inet6", t.localIP6.String(), "-alias"); err != nil {
+			log.Debug("ifconfig inet6 -alias failed: %v", err)
+		}
+	}
+	t.localIP6 = nil
+	t.remoteIP6 = nil
+	t.v6Enabled = false
 }
 
 // MTU returns the current effective interface MTU (atomic read).

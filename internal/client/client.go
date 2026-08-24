@@ -58,6 +58,11 @@ type Config struct {
 	TunRoutes string
 	AutoMTU   bool // active end-to-end MTU probe; TunMTU becomes the upper bound (cap)
 
+	// TunIPv6Policy is the -tun-ipv6 value ("off" default, "dual" to route
+	// IPv6 through the tunnel when the exit negotiates dual-stack). Parsed
+	// via tun.ParseIPv6Policy in runTUNMode.
+	TunIPv6Policy string
+
 	// Host-supplied TUN integration (Android VpnService / macOS NetworkExtension).
 	// In both modes the TUN fd is created by the host and passed in via TunFd;
 	// the host (not Go) also owns route/DNS/firewall setup.
@@ -599,6 +604,17 @@ func runControlSocketMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Si
 func runTUNMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) error {
 	log.Info("Starting TUN mode")
 
+	// IPv6 policy: off (default) keeps the tunnel v4-only; dual opts into the
+	// v0x04 dual-stack handshake. Empty means the flag was never set.
+	ipv6Policy := "off"
+	if cfg.TunIPv6Policy != "" {
+		ipv6Policy = cfg.TunIPv6Policy
+	}
+	policy, err := tun.ParseIPv6Policy(ipv6Policy)
+	if err != nil {
+		return err
+	}
+
 	// Parse routes
 	var routes []string
 	if cfg.TunRoutes != "" {
@@ -620,7 +636,8 @@ func runTUNMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) erro
 		Routes:      routes,
 		ServerAddr:  cfg.ServerAddr,
 		Manager:     mgr,
-		AutoMTU:     cfg.AutoMTU,     // active end-to-end MTU probe
+		AutoMTU:     cfg.AutoMTU, // active end-to-end MTU probe
+		DualStack:   policy == tun.IPv6PolicyDual,
 		TunFd:       cfg.TunFd,       // Android VpnService TUN fd
 		ProtectPath: cfg.ProtectPath, // Android socket protection path
 	}
