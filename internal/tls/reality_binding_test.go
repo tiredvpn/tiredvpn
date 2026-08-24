@@ -2,7 +2,9 @@ package tls
 
 import (
 	"bytes"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	stdtls "crypto/tls"
 	"encoding/binary"
 	"errors"
@@ -81,25 +83,6 @@ func TestClientBindingRoundTrip(t *testing.T) {
 	}
 }
 
-func TestServerBindingRoundTrip(t *testing.T) {
-	secret := []byte("shared-secret")
-	ekm := testEKM(t)
-	want := time.Now().Truncate(time.Second)
-
-	var got time.Time
-	pipeRoundTrip(t,
-		func(w io.Writer) error { return WriteServerBinding(w, secret, ekm, want) },
-		func(r io.Reader) error {
-			ts, err := ReadServerBinding(r, secret, ekm)
-			got = ts
-			return err
-		})
-
-	if !got.Equal(want) {
-		t.Fatalf("server time = %v, want %v", got, want)
-	}
-}
-
 // TestBindingRejectsDivergentInputs is the property the whole exchange exists
 // for: a peer that did not complete the same handshake, or does not hold the
 // same secret, cannot produce the proof.
@@ -123,7 +106,7 @@ func TestBindingRejectsDivergentInputs(t *testing.T) {
 		{"different secret", otherSecret, ekm},
 		{"both different", otherSecret, otherEKM},
 	} {
-		t.Run(tc.name+"/client record", func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			var readErr error
 			pipeRoundTrip(t,
 				func(w io.Writer) error { return WriteClientBinding(w, secret, ekm, 0x08) },
@@ -135,59 +118,76 @@ func TestBindingRejectsDivergentInputs(t *testing.T) {
 				t.Fatalf("err = %v, want ErrBindingMismatch", readErr)
 			}
 		})
-
-		t.Run(tc.name+"/server record", func(t *testing.T) {
-			var readErr error
-			pipeRoundTrip(t,
-				func(w io.Writer) error { return WriteServerBinding(w, secret, ekm, time.Now()) },
-				func(r io.Reader) error {
-					_, readErr = ReadServerBinding(r, tc.readSecret, tc.readEKM)
-					return nil
-				})
-			if !errors.Is(readErr, ErrBindingMismatch) {
-				t.Fatalf("err = %v, want ErrBindingMismatch", readErr)
-			}
-		})
 	}
 }
 
-// TestProofsAreDirectional guards against a reflection attack: without distinct
-// direction tags, a MITM could bounce the client's own proof back and pass as
-// the server.
-func TestProofsAreDirectional(t *testing.T) {
+// TestServerTimeRoundTrip covers the one-way clock hint. It carries no proof:
+// authentication of the server is cert-HMAC's job, during the handshake.
+func TestServerTimeRoundTrip(t *testing.T) {
+	want := time.Now().Truncate(time.Second)
+
+	var got time.Time
+	pipeRoundTrip(t,
+		func(w io.Writer) error { return WriteServerTime(w, want) },
+		func(r io.Reader) error {
+			ts, err := ReadServerTime(r)
+			got = ts
+			return err
+		})
+
+	if !got.Equal(want) {
+		t.Fatalf("server time = %v, want %v", got, want)
+	}
+}
+
+// TestServerTimeIsPadded checks the record varies in size like the client's,
+// and lands in a single write.
+func TestServerTimeIsPadded(t *testing.T) {
+	sizes := make(map[int]bool)
+	for range 32 {
+		w := &countingWriter{}
+		if err := WriteServerTime(w, time.Now()); err != nil {
+			t.Fatalf("WriteServerTime: %v", err)
+		}
+		if w.writes != 1 {
+			t.Fatalf("frame took %d writes, want 1", w.writes)
+		}
+		pad := w.buf.Len() - 8 - 2
+		if pad < minBindingPad || pad > maxBindingPad {
+			t.Fatalf("padding %d outside [%d, %d]", pad, minBindingPad, maxBindingPad)
+		}
+		sizes[w.buf.Len()] = true
+	}
+	if len(sizes) < 8 {
+		t.Fatalf("only %d distinct sizes over 32 writes; padding is not varying", len(sizes))
+	}
+}
+
+// TestClientProofIsDomainSeparated checks that the direction tag actually
+// participates in the HMAC. It is the only proof left now that the server side
+// moved to cert-HMAC, so nothing else would catch the tag being dropped — and a
+// bare HMAC over the exporter would collide with any other use of the same
+// secret and exporter pair.
+func TestClientProofIsDomainSeparated(t *testing.T) {
 	secret := []byte("shared-secret")
 	ekm := testEKM(t)
 
-	if ClientProof(secret, ekm) == ServerProof(secret, ekm) {
-		t.Fatal("client and server proofs are identical; a reflected proof would authenticate")
+	bare := hmac.New(sha256.New, secret)
+	bare.Write(ekm)
+
+	got := ClientProof(secret, ekm)
+	if bytes.Equal(got[:], bare.Sum(nil)) {
+		t.Fatal("ClientProof is a bare HMAC over the exporter; the direction tag is not mixed in")
 	}
 
-	// The concrete attack: replay the server's proof in a client-shaped record.
-	// Built by hand rather than by piping a real server record through the
-	// client reader, because the field layouts differ and the outcome would
-	// then depend on whichever bytes of srvtime landed under padLen.
-	t.Run("server proof replayed as a client record", func(t *testing.T) {
-		proof := ServerProof(secret, ekm)
-		frame := append(bytes.Clone(proof[:]), 0x08)
-		frame = binary.BigEndian.AppendUint16(frame, 64)
-		frame = append(frame, make([]byte, 64)...)
-
-		if _, err := ReadClientBinding(bytes.NewReader(frame), secret, ekm); !errors.Is(err, ErrBindingMismatch) {
-			t.Fatalf("err = %v, want ErrBindingMismatch", err)
-		}
-	})
-
-	t.Run("client proof replayed as a server record", func(t *testing.T) {
-		proof := ClientProof(secret, ekm)
-		frame := bytes.Clone(proof[:])
-		frame = binary.BigEndian.AppendUint64(frame, uint64(time.Now().Unix()))
-		frame = binary.BigEndian.AppendUint16(frame, 64)
-		frame = append(frame, make([]byte, 64)...)
-
-		if _, err := ReadServerBinding(bytes.NewReader(frame), secret, ekm); !errors.Is(err, ErrBindingMismatch) {
-			t.Fatalf("err = %v, want ErrBindingMismatch", err)
-		}
-	})
+	// And the tag must be prefixed, not appended: prefixing is what makes the
+	// tag unambiguous when the exporter length is fixed by the protocol.
+	tagged := hmac.New(sha256.New, secret)
+	tagged.Write([]byte(dirClientToServer))
+	tagged.Write(ekm)
+	if !bytes.Equal(got[:], tagged.Sum(nil)) {
+		t.Fatal("ClientProof does not match HMAC(secret, \"c2s\" || ekm)")
+	}
 }
 
 // TestBindingRejectsOversizedPadding covers the resource-exhaustion path: a
@@ -207,13 +207,11 @@ func TestBindingRejectsOversizedPadding(t *testing.T) {
 		}
 	})
 
-	t.Run("server record", func(t *testing.T) {
-		proof := ServerProof(secret, ekm)
-		frame := bytes.Clone(proof[:])
-		frame = binary.BigEndian.AppendUint64(frame, uint64(time.Now().Unix()))
+	t.Run("server time record", func(t *testing.T) {
+		frame := binary.BigEndian.AppendUint64(nil, uint64(time.Now().Unix()))
 		frame = binary.BigEndian.AppendUint16(frame, 0xFFFF)
 
-		_, err := ReadServerBinding(bytes.NewReader(frame), secret, ekm)
+		_, err := ReadServerTime(bytes.NewReader(frame))
 		if !errors.Is(err, ErrBindingPadTooLarge) {
 			t.Fatalf("err = %v, want ErrBindingPadTooLarge", err)
 		}

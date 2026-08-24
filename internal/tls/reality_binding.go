@@ -13,24 +13,34 @@ import (
 	"time"
 )
 
-// Exporter binding: proving the peer is ours over a certificate nobody checks.
+// Exporter binding: proving the client is ours, at zero extra round trips.
 //
-// Our server's certificate is self-signed and the client does not validate it,
-// so the certificate proves nothing. What does prove something is the TLS
-// exporter (RFC 8446 §7.5): both endpoints can derive the same keying material
+// The TLS exporter (RFC 8446 §7.5) yields the same keying material on both ends
 // only if they completed the same handshake with the same keys. A MITM that
-// terminates TLS gets a different exporter on each side and cannot produce the
-// HMAC, whatever certificate it presents.
+// terminates TLS gets different material on each side and cannot produce the
+// HMAC over it, whatever certificate it presents.
 //
-// The exchange carries three riders that each remove a separate problem:
+// Direction matters here. proof_c authenticates the client to the server, and
+// it stays: it is the only thing standing between a leaked server static key
+// and an attacker impersonating any client, and it costs nothing because the
+// client speaks first anyway.
+//
+// The other direction — proving the server to the client — is NOT done here.
+// It is cert-HMAC (epic B1.5, task 011): the server signs its certificate and
+// the client checks it inside VerifyPeerCertificate, during the handshake, for
+// zero extra packets. A synchronous proof_s would have forced the client to
+// wait a full round trip before passing user traffic, on every CONNECT, and the
+// pool does not currently reuse connections, so that is a per-request cost.
+//
+// Ordering consequence worth stating plainly: until cert-HMAC lands, nothing in
+// this package authenticates the server to the client. B1 must not reach
+// production ahead of B1.5 task 011 without something else filling that gap.
+//
+// Two riders come along with the client record:
 //
 //   - The dispatch byte moves inside an encrypted record. Today it goes out as
 //     a bare 0x08 in its own TCP segment — signature #1 from the improvement
 //     plan, and the single most obvious thing about our flow.
-//   - The server tells the client its clock, which lets a device with drifting
-//     time (Android, mostly) correct the unixtime in future session_ids instead
-//     of being locked out by MaxTimeDiff. It is not an oracle: the server only
-//     answers a client that has already authenticated.
 //   - The padding gives a place for Vision-style shaping later without another
 //     format change.
 const (
@@ -50,10 +60,12 @@ const (
 	minBindingPad = 64
 	maxBindingPad = 512
 
-	// Direction tags keep the two proofs from being interchangeable — without
-	// them a reflected client proof would authenticate the server.
+	// dirClientToServer is mixed into the proof for domain separation. There is
+	// only one proof now that the server side moved to cert-HMAC, but the tag
+	// stays: it keeps this HMAC from colliding with any other use of the same
+	// secret and exporter, and removing it would be a wire format change for no
+	// gain.
 	dirClientToServer = "c2s"
-	dirServerToClient = "s2c"
 )
 
 // ErrBindingMismatch reports that the peer's proof did not verify.
@@ -93,12 +105,6 @@ func ExportBindingKey(e Exporter) ([]byte, error) {
 // and the TLS handshake.
 func ClientProof(secret, ekm []byte) [proofLen]byte {
 	return bindingProof(secret, dirClientToServer, ekm)
-}
-
-// ServerProof is the server's answer, over the same exporter with the opposite
-// direction tag.
-func ServerProof(secret, ekm []byte) [proofLen]byte {
-	return bindingProof(secret, dirServerToClient, ekm)
 }
 
 func bindingProof(secret []byte, dir string, ekm []byte) [proofLen]byte {
@@ -163,17 +169,19 @@ func ReadClientBinding(r io.Reader, secret, ekm []byte) (dispatch byte, err erro
 	return head[proofLen], nil
 }
 
-// WriteServerBinding sends the server's answer:
+// WriteServerTime sends the server's one-way clock hint:
 //
-//	[proof_s:32][srvtime:8][padLen:2][pad:padLen]
+//	[srvtime:8][padLen:2][pad:padLen]
+//
+// There is no proof here and the client does not wait for this record. The
+// clock correction is a hint for the client's *next* connection — this one has
+// already passed the gate — so making it synchronous would buy nothing and cost
+// a round trip on every CONNECT.
 //
 // srvTime is truncated to whole seconds, which is all the client needs and all
 // the session_id timestamp can carry.
-func WriteServerBinding(w io.Writer, secret, ekm []byte, srvTime time.Time) error {
-	proof := ServerProof(secret, ekm)
-
-	frame := make([]byte, 0, proofLen+8+2+maxBindingPad)
-	frame = append(frame, proof[:]...)
+func WriteServerTime(w io.Writer, srvTime time.Time) error {
+	frame := make([]byte, 0, 8+2+maxBindingPad)
 	frame = binary.BigEndian.AppendUint64(frame, uint64(srvTime.Unix()))
 
 	frame, err := appendPadding(frame)
@@ -181,28 +189,30 @@ func WriteServerBinding(w io.Writer, secret, ekm []byte, srvTime time.Time) erro
 		return err
 	}
 	if _, err := w.Write(frame); err != nil {
-		return fmt.Errorf("reality binding: write server record: %w", err)
+		return fmt.Errorf("reality binding: write server time: %w", err)
 	}
 	return nil
 }
 
-// ReadServerBinding reads and verifies the server's answer, returning the
-// server's clock. A mismatch here means the peer is not our server — a MITM
-// terminating TLS, most likely — and the client must abandon the connection.
-func ReadServerBinding(r io.Reader, secret, ekm []byte) (srvTime time.Time, err error) {
-	head := make([]byte, proofLen+8+2)
+// ReadServerTime reads the server's clock hint.
+//
+// The record carries no proof of its own: it arrives inside a TLS session the
+// client has already authenticated via cert-HMAC during the handshake. That
+// makes cert-HMAC a precondition, not an optimisation — feeding ClockOffset
+// from an unauthenticated session would let anyone push the client's clock far
+// enough to lock it out of its own server through MaxTimeDiff.
+//
+// Callers must treat this as optional. A client that never receives it keeps
+// using its own clock, which is the status quo.
+func ReadServerTime(r io.Reader) (srvTime time.Time, err error) {
+	head := make([]byte, 8+2)
 	if _, err := io.ReadFull(r, head); err != nil {
-		return time.Time{}, fmt.Errorf("reality binding: read server record: %w", err)
+		return time.Time{}, fmt.Errorf("reality binding: read server time: %w", err)
 	}
-	if err := discardPadding(r, head[proofLen+8:]); err != nil {
+	if err := discardPadding(r, head[8:]); err != nil {
 		return time.Time{}, err
 	}
-
-	want := ServerProof(secret, ekm)
-	if !hmac.Equal(head[:proofLen], want[:]) {
-		return time.Time{}, ErrBindingMismatch
-	}
-	return time.Unix(int64(binary.BigEndian.Uint64(head[proofLen:proofLen+8])), 0), nil
+	return time.Unix(int64(binary.BigEndian.Uint64(head[:8])), 0), nil
 }
 
 // appendPadding appends [padLen:2][pad] with padLen drawn uniformly from
@@ -240,14 +250,14 @@ func discardPadding(r io.Reader, lenBytes []byte) error {
 }
 
 // ClockOffset holds the difference between our clock and the server's, learned
-// from the binding exchange and applied to the unixtime in future session_ids.
+// from the server's one-way time record and applied to the unixtime in future
+// session_ids.
 //
 // Held in memory for the process lifetime; persisting it across restarts is out
 // of scope and probably unnecessary, since one connection re-learns it.
 //
-// Only feed this from an already-verified server record. An unauthenticated
-// value would let anyone push our clock far enough to lock us out of our own
-// server through MaxTimeDiff.
+// Only feed this from a session authenticated by cert-HMAC — see ReadServerTime
+// for why that is a precondition rather than a nicety.
 type ClockOffset struct {
 	seconds atomic.Int64
 }
