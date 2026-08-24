@@ -153,6 +153,8 @@ MULTI-CLIENT OPTIONS:
         IP pool CIDR for TUN clients (e.g., '10.8.0.0/24')
   -ip-pool-lease duration
         IP lease duration (default 24h)
+  -ip-pool-v6 string
+        IPv6 prefix for TUN dual-stack clients (e.g., 'fd00:10:8::/64')
 
 PORT HOPPING OPTIONS:
   -port-range string
@@ -401,6 +403,7 @@ func registerServerFlags(fs *flag.FlagSet, cfg *server.Config) *serverFlagOpts {
 	// IP Pool flags for TUN mode
 	fs.StringVar(&cfg.IPPoolNetwork, "ip-pool", "", "IP pool CIDR for TUN clients (e.g., '10.8.0.0/24'). Enables auto IP assignment.")
 	opts.ipPoolLease = fs.Duration("ip-pool-lease", 24*time.Hour, "IP lease duration (0 = permanent)")
+	fs.StringVar(&cfg.IPPoolV6, "ip-pool-v6", "", "IPv6 prefix for TUN dual-stack clients (e.g., 'fd00:10:8::/64'). Enables IPv6 inside the tunnel for v0x04 clients.")
 
 	// IPv6 Transport flags
 	fs.StringVar(&cfg.ListenAddrV6, "listen-v6", "[::]:995", "IPv6 listen address")
@@ -443,9 +446,16 @@ func runServer(args []string) {
 		os.Exit(1)
 	}
 
+	if cfg.IPPoolV6 != "" {
+		ip, _, err := net.ParseCIDR(cfg.IPPoolV6)
+		if err != nil || ip.To4() != nil {
+			fmt.Printf("Error: invalid -ip-pool-v6 %q: must be an IPv6 CIDR (e.g., 'fd00:10:8::/64')\n", cfg.IPPoolV6)
+			os.Exit(1)
+		}
+	}
+
 	cfg.Secret = []byte(*opts.secret)
-	// Fall back to the TIREDVPN_SECRET env var when -secret is not given, so a
-	// systemd unit can pass the secret via EnvironmentFile instead of putting it
+	// Fall back to the TIREDVPN_SECRET env var when -secret is not given, so a	// systemd unit can pass the secret via EnvironmentFile instead of putting it
 	// on the command line (where it would show up in ps/cmdline). The error in
 	// server.go already documents this env var.
 	if len(cfg.Secret) == 0 {

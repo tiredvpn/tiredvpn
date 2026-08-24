@@ -58,16 +58,29 @@ const (
 )
 
 // VPNClient manages the TUN-based VPN connection
-// tunHandshakeVersion is the TUN handshake version byte sent by this client.
-// v3 is additive over v2 (full port-hop config) and additionally advertises that
-// the client understands the auto-MTU active probe. Older servers treat >=0x02
-// identically, so the bump is backward-compatible.
+// tunHandshakeVersion is the default TUN handshake version byte sent by this
+// client. v3 is additive over v2 (full port-hop config) and additionally
+// advertises that the client understands the auto-MTU active probe. Older
+// servers treat >=0x02 identically, so the bump is backward-compatible.
 const tunHandshakeVersion = 0x03
+
+// tunHandshakeVersionDualStack advertises IPv6 dual-stack support inside the
+// tunnel. Sent only when the client is built with dual-stack enabled
+// (VPNConfig.DualStack); the request format is unchanged, so old servers
+// ReadFull the same 8 bytes and simply ignore the unknown version.
+const tunHandshakeVersionDualStack = 0x04
+
+// DualStackCapFlag is the handshake-response flag bit (resp[9]) by which an
+// exit advertises IPv6 dual-stack inside the tunnel. When set, the response
+// carries a trailing 32-byte block [serverIP6:16][clientIP6:16] after the
+// version-dependent layout.
+const DualStackCapFlag = 0x04
 
 // Handshake-response flag bits (resp[9]).
 const (
-	tunFlagPortHopping = 0x01         // server advertises port hopping
-	tunFlagMTUProbe    = ProbeCapFlag // server supports the auto-MTU echo (exit only)
+	tunFlagPortHopping = 0x01             // server advertises port hopping
+	tunFlagMTUProbe    = ProbeCapFlag     // server supports the auto-MTU echo (exit only)
+	tunFlagDualStack   = DualStackCapFlag // server assigned IPv6 tunnel addresses
 )
 
 // ServerCapabilities contains optional features advertised by server
@@ -79,6 +92,13 @@ type ServerCapabilities struct {
 	HopStrategy        string // "random", "sequential", "fibonacci" (empty = "random")
 	HopSeed            []byte // Optional seed for deterministic hopping
 	MTUProbeSupported  bool   // exit echoes auto-MTU probe frames
+
+	// DualStackEnabled reports that the exit assigned IPv6 tunnel addresses
+	// (server answered a v0x04 handshake with the dual-stack flag and the
+	// trailing 32-byte address block).
+	DualStackEnabled bool
+	ServerIP6        net.IP // exit's IPv6 tunnel address (16 bytes)
+	ClientIP6        net.IP // assigned client IPv6 tunnel address (16 bytes)
 }
 
 type VPNClient struct {
@@ -118,6 +138,9 @@ type VPNClient struct {
 	// Server capabilities (received during handshake)
 	serverCaps ServerCapabilities
 
+	// dualStack selects handshake version 0x04 (IPv6 dual-stack negotiation).
+	// Set from VPNConfig.DualStack.
+	dualStack bool
 	// Auto-MTU active probe state.
 	autoMTU       bool                   // -auto-mtu enabled
 	ownsInterface bool                   // we created the TUN (can change MTU live)
@@ -146,6 +169,12 @@ type VPNConfig struct {
 	// (cap) and the client measures the real end-to-end ceiling, applying
 	// min(probed, cap). Only effective on interfaces we own (non-fd Linux/macOS).
 	AutoMTU bool
+
+	// DualStack opts the client into IPv6 inside the tunnel: the handshake
+	// version byte becomes 0x04 (instead of 0x03), asking a dual-stack exit to
+	// assign IPv6 tunnel addresses. The request format is unchanged, so this
+	// is safe against old servers (they ignore the unknown version).
+	DualStack bool
 
 	// Android VpnService support
 	TunFd       int    // Use existing TUN file descriptor (from VpnService.establish())
@@ -239,7 +268,19 @@ func NewVPNClient(cfg VPNConfig) (*VPNClient, error) {
 		stopCh:        make(chan struct{}),
 		autoMTU:       cfg.AutoMTU,
 		ownsInterface: cfg.TunFd <= 0,
+		dualStack:     cfg.DualStack,
 	}, nil
+}
+
+// handshakeVersion returns the TUN handshake version byte this client sends:
+// 0x04 when dual-stack was opted into (VPNConfig.DualStack), else the default
+// 0x03. The request layout is identical either way, so this is the only
+// on-wire difference.
+func (v *VPNClient) handshakeVersion() byte {
+	if v.dualStack {
+		return tunHandshakeVersionDualStack
+	}
+	return tunHandshakeVersion
 }
 
 // Start starts the VPN tunnel
@@ -546,17 +587,17 @@ func (v *VPNClient) performHandshake(conn net.Conn) error {
 	handshake[0] = 0x02 // TUN mode
 	copy(handshake[1:5], v.localIP.To4())
 	binary.BigEndian.PutUint16(handshake[5:7], uint16(v.tun.mtu))
-	handshake[7] = tunHandshakeVersion // v3: also signals auto-MTU probe support
+	handshake[7] = v.handshakeVersion() // v3: auto-MTU probe; v4: + dual-stack
 
 	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	if _, err := conn.Write(handshake); err != nil {
 		return fmt.Errorf("handshake write failed: %w", err)
 	}
 
-	// Read server response
-	resp := make([]byte, 64)
+	// Read server response (drains the dual-stack block when advertised, so
+	// the stream stays frame-aligned for the packet loop that follows).
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	n, err := conn.Read(resp)
+	resp, n, err := readHandshakeResponse(conn)
 	if err != nil {
 		return fmt.Errorf("handshake read failed: %w", err)
 	}
@@ -707,7 +748,7 @@ func (v *VPNClient) doHandshake(conn net.Conn, localIP net.IP) ([]byte, int, err
 	handshake[0] = 0x02 // TUN mode
 	copy(handshake[1:5], localIP.To4())
 	binary.BigEndian.PutUint16(handshake[5:7], uint16(v.tun.mtu))
-	handshake[7] = tunHandshakeVersion // v3: also signals auto-MTU probe support
+	handshake[7] = v.handshakeVersion() // v3: auto-MTU probe; v4: + dual-stack
 
 	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	if _, err := conn.Write(handshake); err != nil {
@@ -718,9 +759,9 @@ func (v *VPNClient) doHandshake(conn net.Conn, localIP net.IP) ([]byte, int, err
 	// Legacy (9 bytes): [status:1][serverIP:4][clientIP:4]
 	// Extended v1 (14 bytes): [status:1][serverIP:4][clientIP:4][flags:1][portStart:2][portEnd:2]
 	// Extended v2 (20+ bytes): [status:1][serverIP:4][clientIP:4][flags:1][portStart:2][portEnd:2][hopInterval:4][strategy:1][seedLen:1][seed:0-32]
-	resp := make([]byte, 64) // Large enough for v2 with max seed
+	// Dual-stack (v4): the version-dependent layout followed by [serverIP6:16][clientIP6:16]
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	n, err := conn.Read(resp)
+	resp, n, err := readHandshakeResponse(conn)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -740,6 +781,74 @@ func (v *VPNClient) doHandshake(conn net.Conn, localIP net.IP) ([]byte, int, err
 	return resp, n, nil
 }
 
+// handshakeRespBufSize fits the largest handshake response: the v2 layout
+// with a max-length seed (20+32) plus the 32-byte dual-stack block.
+const handshakeRespBufSize = 96
+
+// readHandshakeResponse reads the server's TUN handshake response. The first
+// read returns whatever arrived in one segment (unchanged legacy behaviour);
+// when the response flags advertise dual-stack, the trailing 32-byte
+// [serverIP6:16][clientIP6:16] block is read to completion so the stream
+// stays frame-aligned for the packet loop that follows.
+func readHandshakeResponse(conn net.Conn) ([]byte, int, error) {
+	resp := make([]byte, handshakeRespBufSize)
+	n, err := conn.Read(resp)
+	if err != nil {
+		return nil, 0, err
+	}
+	n, err = readDualStackBlock(conn, resp, n)
+	if err != nil {
+		return nil, 0, err
+	}
+	return resp, n, nil
+}
+
+// readDualStackBlock consumes the trailing dual-stack address block when the
+// response flags byte advertises it. n is the number of valid bytes in resp.
+// Responses without the flag are returned untouched, so an old server never
+// triggers an extra read.
+func readDualStackBlock(conn net.Conn, resp []byte, n int) (int, error) {
+	if n < 10 || resp[9]&tunFlagDualStack == 0 {
+		return n, nil
+	}
+	need := handshakeResponseBaseLen(resp, n) + 32
+	if need > len(resp) {
+		return n, fmt.Errorf("dual-stack handshake response too large: need %d bytes", need)
+	}
+	for n < need {
+		m, err := conn.Read(resp[n:need])
+		if err != nil {
+			return n, fmt.Errorf("dual-stack block read failed: %w", err)
+		}
+		n += m
+	}
+	return n, nil
+}
+
+// handshakeResponseBaseLen returns the length of the version-dependent base
+// layout of a handshake response, excluding the optional 32-byte dual-stack
+// block. A dual-capable client (version 0x04) only ever receives the v2
+// (20+seed) or 10-byte flags-only extended forms — never the 14-byte v1
+// form — so for responses carrying the dual-stack flag the base length is
+// unambiguous.
+func handshakeResponseBaseLen(resp []byte, n int) int {
+	if n < 10 {
+		return n // legacy 9-byte form (or an error response)
+	}
+	if resp[9]&tunFlagPortHopping == 0 {
+		return 10 // flags-only form (v3 probe / v4 dual-stack)
+	}
+	if n >= 20 {
+		if seedLen := int(resp[19]); seedLen <= 32 {
+			return 20 + seedLen // v2 form
+		}
+	}
+	if n >= 14 {
+		return 14 // v1 form
+	}
+	return n
+}
+
 // parseServerCapabilities decodes the optional port-hopping capabilities from a
 // handshake response. The second return value reports whether any capabilities
 // were present.
@@ -756,15 +865,28 @@ func parseServerCapabilities(resp []byte, n int) (ServerCapabilities, bool) {
 		MTUProbeSupported: flags&tunFlagMTUProbe != 0,
 	}
 
+	// Dual-stack: the v6 address block trails the version-dependent layout.
+	caps.DualStackEnabled = flags&tunFlagDualStack != 0
+	if caps.DualStackEnabled {
+		base := handshakeResponseBaseLen(resp, n)
+		if n >= base+32 {
+			caps.ServerIP6 = append(net.IP(nil), resp[base:base+16]...)
+			caps.ClientIP6 = append(net.IP(nil), resp[base+16:base+32]...)
+		} else {
+			// Flag set but block missing/truncated: treat as v4-only.
+			caps.DualStackEnabled = false
+		}
+	}
+
 	// Port-hopping fields need the full 14-byte form.
 	if n < 14 || flags&tunFlagPortHopping == 0 {
-		return caps, caps.MTUProbeSupported
+		return caps, caps.MTUProbeSupported || caps.DualStackEnabled
 	}
 
 	portStart := int(binary.BigEndian.Uint16(resp[10:12]))
 	portEnd := int(binary.BigEndian.Uint16(resp[12:14]))
 	if portStart <= 0 || portEnd <= portStart {
-		return caps, caps.MTUProbeSupported
+		return caps, caps.MTUProbeSupported || caps.DualStackEnabled
 	}
 
 	caps.PortHoppingEnabled = true
