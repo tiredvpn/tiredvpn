@@ -195,10 +195,12 @@ func TestPaddingCarriesV2WithoutGrowing(t *testing.T) {
 func syntheticClientHello(t *testing.T) []byte {
 	t.Helper()
 
-	body := make([]byte, 0, 64)
-	body = append(body, 0x03, 0x03)             // legacy version
-	body = append(body, make([]byte, 32)...)    // random
-	body = append(body, 0x00)                   // session id len
+	body := make([]byte, 0, 96)
+	body = append(body, 0x03, 0x03)          // legacy version
+	body = append(body, make([]byte, 32)...) // random
+	// 32-byte session id, as in every real TLS 1.3 ClientHello.
+	body = append(body, 32)
+	body = append(body, make([]byte, 32)...)
 	body = append(body, 0x00, 0x02, 0x13, 0x01) // cipher suites
 	body = append(body, 0x01, 0x00)             // compression methods
 	body = append(body, 0x00, 0x00)             // extensions len = 0
