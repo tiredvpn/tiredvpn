@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tiredvpn/tiredvpn/internal/endpoint"
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/mux"
 	"github.com/tiredvpn/tiredvpn/internal/porthopping"
@@ -102,9 +103,10 @@ type Manager struct {
 	// In forced mode storms are logged loudly but never trigger a switch.
 	forced bool
 
-	// Periodic re-probe
+	// Periodic re-probe. There is deliberately no cached target here: the
+	// reprobe must follow whichever candidate is pinned right now, and a copy
+	// written once at start-up cannot. All four consumers call GetServerAddr.
 	reprobeInterval time.Duration
-	reprobeTarget   string
 	stopReprobe     chan struct{}
 	reprobeRunning  bool
 
@@ -173,14 +175,12 @@ type Manager struct {
 	portHopCallback   func(oldPort, newPort int) // External callback for port hop events (e.g., VPN reconnect)
 	portHopCallbackMu sync.Mutex
 
-	// IPv6 Transport Layer
-	serverAddrV6    string // IPv6 server address
-	serverAddrV4    string // IPv4 server address
-	preferIPv6      bool   // Prefer IPv6 if available
-	fallbackToV4    bool   // Fallback to IPv4 if IPv6 fails
-	ipv6Available   bool   // Cached IPv6 availability
-	ipv6CheckedOnce bool   // Whether we've checked IPv6 availability
-	ipv6Mu          sync.Mutex
+	// Endpoint selection: which server, on which address family, we currently
+	// dial. Replaces the old serverAddrV4/serverAddrV6 pair together with the
+	// one-shot ipv6CheckedOnce verdict, which was decided once per process and
+	// never revisited outside the Android control socket. Guarded by m.mu; the
+	// selector itself is safe for concurrent use.
+	endpoints *endpoint.Selector
 
 	// Shared TLS client session cache for resumption across reconnects.
 	// The adaptive manager reconnects frequently (fallback, reprobe); without a
@@ -196,6 +196,13 @@ const (
 	fastReconnectLimit  = 3               // fast reconnects of one strategy allowed before forcing a full scan
 	fastReconnectWindow = 5 * time.Minute // window over which fast reconnects are counted
 )
+
+// errStrategyScanFailed marks the one failure mode that says something about
+// the ENDPOINT rather than about a strategy: every eligible transport was tried
+// against this address and every one of them died. dialEndpoints keys its
+// candidate switch on it, so it must not be attached to "context cancelled" or
+// "nothing was eligible", which say nothing about the address.
+var errStrategyScanFailed = errors.New("all strategies failed")
 
 // preflightFailThreshold is how many consecutive failed connects must pile up
 // before Connect re-arms the blocking pre-flight connectivity check. See
@@ -436,9 +443,12 @@ func (m *Manager) ListStrategyIDs() string {
 
 // ProbeAll tests all strategies in parallel
 func (m *Manager) ProbeAll(ctx context.Context, target string) []Result {
-	// IPv6 Transport Layer: select IPv6 or IPv4 address for probing
-	if m.serverAddrV6 != "" && m.preferIPv6 {
-		target = m.GetServerAddr(ctx)
+	// Probe the pinned candidate and only the pinned candidate. Sweeping every
+	// configured endpoint on a timer would multiply this client's traffic by the
+	// size of its server list and hand an observer a periodic fan-out pattern
+	// that nothing else on the wire produces.
+	if addr := m.GetServerAddr(ctx); addr != "" {
+		target = addr
 		log.Debug("Probing with effective server address: %s", target)
 	}
 
@@ -659,20 +669,14 @@ func (m *Manager) RecordSessionEnd(strategyID string) (storming bool) {
 	return true
 }
 
+// maxEndpointAttempts caps how many endpoint candidates a single Connect may
+// try. Two, and no more: handleDisconnect gives the whole reconnect 15 seconds,
+// and each candidate costs a full strategy scan. A deeper walk would blow that
+// budget and turn one dead family into a minutes-long outage.
+const maxEndpointAttempts = 2
+
 // Connect tries strategies in order until one succeeds
 func (m *Manager) Connect(ctx context.Context, target string) (net.Conn, Strategy, error) {
-	// IPv6 Transport Layer: select IPv6 or IPv4 address
-	// This overrides the target parameter if IPv6 is configured and available
-	if m.serverAddrV6 != "" && m.preferIPv6 {
-		target = m.GetServerAddr(ctx)
-		log.Debug("Using effective server address: %s", target)
-	}
-
-	// Apply port hopping if enabled
-	if m.portHopper != nil {
-		target = m.replacePort(target, m.portHopper.CurrentPort())
-	}
-
 	// Mux fast-path: if mux is enabled and a live session already exists, open a
 	// new stream on it and return immediately - do NOT dial a fresh transport.
 	// Without this, every call (e.g. every proxy CONNECT routed through
@@ -685,43 +689,7 @@ func (m *Manager) Connect(ctx context.Context, target string) (net.Conn, Strateg
 		return stream, strat, nil
 	}
 
-	// Pre-flight connectivity check
-	m.mu.RLock()
-	checker := m.connectivityChecker
-	m.mu.RUnlock()
-
-	if checker != nil {
-		m.mu.RLock()
-		connectedBefore := m.lastSuccessfulStrategy != nil
-		fails := m.consecutiveConnectFailures
-		m.mu.RUnlock()
-
-		// Skip the blocking pre-flight on the hot reconnect path: the real
-		// connect below has its own 15s timeout and would reach a briefly-reset
-		// server itself, so checking first only adds latency to recovery. Run
-		// the pre-flight (and the connectivity wait loop) only on the very first
-		// connect, or once several connects in a row have failed - the signal
-		// that the network is genuinely down rather than a one-off server RST.
-		if !connectedBefore || fails >= preflightFailThreshold {
-			result := checker.Check(ctx)
-
-			if !result.TCP {
-				// No TCP connectivity - wait in loop until it's restored
-				log.Warn("No TCP connectivity to server, waiting for network...")
-				result = checker.WaitForConnectivity(ctx, defaultProbeInterval)
-
-				if !result.TCP {
-					m.recordConnectResult(false)
-					return nil, nil, fmt.Errorf("no connectivity to server: %w", result.Error)
-				}
-			}
-
-			m.applyUDPGate(result.UDP)
-		}
-	}
-
-	// Connect through strategy
-	conn, strategy, err := m.ConnectExcluding(ctx, target, nil)
+	conn, strategy, err := m.dialEndpoints(ctx, target)
 	if err != nil {
 		m.recordConnectResult(false)
 		return nil, nil, err
@@ -747,6 +715,152 @@ func (m *Manager) Connect(ctx context.Context, target string) (net.Conn, Strateg
 	}
 
 	return conn, strategy, nil
+}
+
+// dialEndpoints walks the endpoint candidates until one of them yields a
+// connection.
+//
+// The loop only ever advances on errStrategyScanFailed - every transport on
+// that address was tried and every one of them died. That signal is the useful
+// one precisely because it arrives on the hot reconnect path, where the
+// pre-flight gate is skipped. A pre-flight that fails outright means the whole
+// network is down, not this endpoint, so it stops the loop without touching
+// anyone's health: otherwise closing a laptop lid would park every candidate.
+func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, Strategy, error) {
+	sel := m.selector()
+	if sel == nil {
+		if _, err := m.preflightCandidate(ctx, nil, endpoint.Candidate{Addr: target}); err != nil {
+			return nil, nil, err
+		}
+		return m.ConnectExcluding(ctx, m.withHoppedPort(target), nil)
+	}
+
+	cand, ok := sel.Reconsider(sel.Now())
+	if !ok {
+		return nil, nil, fmt.Errorf("no endpoint candidates configured")
+	}
+
+	budget := min(maxEndpointAttempts, len(sel.Candidates()))
+	var lastErr error
+
+	for attempt := range budget {
+		if attempt > 0 {
+			next, ok := sel.Next(sel.Now())
+			if !ok {
+				break
+			}
+			log.Warn("Endpoint %s failed a full strategy scan, switching to %s", cand, next)
+			sel.Pin(next)
+			cand = next
+		}
+
+		gated, err := m.preflightCandidate(ctx, sel, cand)
+		if err != nil {
+			// The gate found no network at all. That is not this endpoint's
+			// fault and nobody has been charged for it - see the comment above.
+			return nil, nil, err
+		}
+		cand = gated
+
+		// Family probe: one dial, at most once per candidate, and only when
+		// there is somewhere to fall back to (see Selector.ProbeCurrent). It
+		// runs AFTER the gate on purpose. The gate answers the same question
+		// for free when it runs at all, and it marks the candidates it resolved
+		// as probed, so this is a no-op then. On the hot reconnect path, where
+		// the gate is skipped, this is the only thing that notices a dead
+		// family - which is exactly what the old one-shot IPv6 check did.
+		cand, _ = sel.ProbeCurrent(ctx)
+
+		start := time.Now()
+		conn, strategy, err := m.ConnectExcluding(ctx, m.withHoppedPort(cand.Addr), nil)
+		if err == nil {
+			sel.Report(cand, true, time.Since(start))
+			return conn, strategy, nil
+		}
+		lastErr = err
+
+		if !errors.Is(err, errStrategyScanFailed) {
+			// Context cancelled, or no strategy was even eligible. Neither says
+			// anything about this endpoint.
+			break
+		}
+		sel.Report(cand, false, 0)
+	}
+
+	return nil, nil, lastErr
+}
+
+// withHoppedPort rewrites the port when port hopping is active.
+func (m *Manager) withHoppedPort(target string) string {
+	if m.portHopper == nil {
+		return target
+	}
+	return m.replacePort(target, m.portHopper.CurrentPort())
+}
+
+// preflightCandidate runs the pre-flight connectivity gate for cand and returns
+// the candidate to dial - which may differ from the one passed in when the gate
+// found the sibling address answering instead.
+//
+// The skip condition is unchanged: on the hot reconnect path the real connect
+// below has its own timeout and would reach a briefly-reset server itself, so
+// checking first only adds latency to recovery. The gate runs on the very first
+// connect, or once several connects in a row have failed - the signal that the
+// network is genuinely down rather than a one-off server RST.
+func (m *Manager) preflightCandidate(ctx context.Context, sel *endpoint.Selector, cand endpoint.Candidate) (endpoint.Candidate, error) {
+	m.mu.RLock()
+	checker := m.connectivityChecker
+	connectedBefore := m.lastSuccessfulStrategy != nil
+	fails := m.consecutiveConnectFailures
+	m.mu.RUnlock()
+
+	if checker == nil {
+		return cand, nil
+	}
+	if connectedBefore && fails < preflightFailThreshold {
+		return cand, nil
+	}
+
+	if sel != nil {
+		checker.SetAddrs(cand.Addr, sel.Siblings(cand)...)
+	}
+
+	result := checker.Check(ctx)
+	if !result.TCP {
+		// No TCP connectivity - wait in loop until it's restored
+		log.Warn("No TCP connectivity to server, waiting for network...")
+		result = checker.WaitForConnectivity(ctx, defaultProbeInterval)
+		if !result.TCP {
+			return cand, fmt.Errorf("no connectivity to server: %w", result.Error)
+		}
+	}
+
+	m.applyUDPGate(result.UDP)
+
+	if sel == nil || result.Addr == "" {
+		return cand, nil
+	}
+	if result.Addr == cand.Addr {
+		// The pinned address answered. Record it as a probe, not as a connect:
+		// a completed TCP handshake is not evidence that the transport works,
+		// so this lifts a cooldown but deliberately leaves the failure streak
+		// alone (see Selector.ReportProbe).
+		sel.ReportProbe(cand, true, result.Latency)
+		return cand, nil
+	}
+	other, ok := sel.CandidateForAddr(result.Addr)
+	if !ok {
+		return cand, nil
+	}
+
+	// The gate dialled both addresses of this server and only the sibling
+	// answered. That is a free verdict - the packets went out either way - so
+	// act on it instead of dialling the dead family through every strategy.
+	log.Info("Pre-flight: %s silent, %s answered - switching endpoint", cand, other)
+	sel.ReportProbe(cand, false, 0)
+	sel.ReportProbe(other, true, result.Latency)
+	sel.Pin(other)
+	return other, nil
 }
 
 // ConnectExcluding tries strategies excluding specified ones (for fallback)
@@ -1051,7 +1165,7 @@ func (m *Manager) connectWithRTT(ctx context.Context, target string, excludeIDs 
 	// Trigger emergency reprobe to recover from network outage
 	go m.TriggerEmergencyReprobe(context.Background())
 
-	return nil, nil, fmt.Errorf("all strategies failed, last error: %w", lastErr)
+	return nil, nil, fmt.Errorf("%w, last error: %w", errStrategyScanFailed, lastErr)
 }
 
 // GetStats returns current strategy statistics
@@ -1121,6 +1235,12 @@ type DefaultManagerConfig struct {
 	ServerAddrV6 string // IPv6 server address (e.g., "[2001:db8::100]:995")
 	PreferIPv6   bool   // Prefer IPv6 transport if available (default: false)
 	FallbackToV4 bool   // Fallback to IPv4 if IPv6 fails (default: true)
+
+	// Endpoints, when non-empty, replaces the single ServerAddr/ServerAddrV6
+	// pair above. The legacy fields stay: they are what ControlConfig,
+	// tun.VPNConfig, the pool, JNI, macOS and the benchmarks read, and they
+	// still describe the first endpoint.
+	Endpoints []endpoint.Endpoint
 
 	// RTT Masking configuration
 	RTTMaskingEnabled bool        // Enable RTT masking on connections
@@ -1215,16 +1335,53 @@ func NewDefaultManager(cfg DefaultManagerConfig) *Manager {
 	return m
 }
 
-// initManagerTransport sets the IPv4/IPv6 address fields on the manager.
+// initManagerTransport builds the endpoint selector.
+//
+// With no explicit Endpoints list it synthesises the single dual-addressed
+// server the legacy flags describe, so a unit started with nothing but -server
+// keeps working and keeps dialling exactly the same address.
 func initManagerTransport(m *Manager, cfg DefaultManagerConfig) {
-	m.serverAddrV4 = cfg.ServerAddr
-	m.serverAddrV6 = cfg.ServerAddrV6
-	m.preferIPv6 = cfg.PreferIPv6
-	m.fallbackToV4 = cfg.FallbackToV4
+	eps := cfg.Endpoints
+	if len(eps) == 0 {
+		if cfg.ServerAddr == "" && cfg.ServerAddrV6 == "" {
+			return
+		}
+		eps = []endpoint.Endpoint{{Name: "server", V4: cfg.ServerAddr, V6: cfg.ServerAddrV6}}
+	}
+
+	policy := endpoint.FamilyPolicyFromLegacy(cfg.PreferIPv6, cfg.FallbackToV4)
+	sel, err := endpoint.NewSelector(endpoint.Config{Endpoints: eps, Family: policy})
+	if err != nil {
+		log.Warn("Endpoint selector not configured: %v", err)
+		return
+	}
+	m.endpoints = sel
+
 	if cfg.ServerAddrV6 != "" && cfg.PreferIPv6 {
 		log.Info("IPv6 transport enabled (IPv6=%s, IPv4=%s, fallback=%v)",
 			cfg.ServerAddrV6, cfg.ServerAddr, cfg.FallbackToV4)
 	}
+}
+
+// SetEndpoints replaces the endpoint list and the family policy, discarding all
+// accumulated candidate health.
+func (m *Manager) SetEndpoints(eps []endpoint.Endpoint, policy endpoint.FamilyPolicy) error {
+	sel, err := endpoint.NewSelector(endpoint.Config{Endpoints: eps, Family: policy})
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.endpoints = sel
+	m.mu.Unlock()
+	return nil
+}
+
+// selector returns the endpoint selector, or nil when the manager was built
+// without one (NewManager, benchmarks, strategy unit tests).
+func (m *Manager) selector() *endpoint.Selector {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.endpoints
 }
 
 // initManagerPortHopping configures the port hopper if enabled.
@@ -1517,8 +1674,12 @@ func (m *Manager) PrintStrategySummary() string {
 	return result
 }
 
-// StartPeriodicReprobe starts background re-probing of strategies
-func (m *Manager) StartPeriodicReprobe(ctx context.Context, target string) {
+// StartPeriodicReprobe starts background re-probing of strategies.
+//
+// It takes no target: each cycle asks for the pinned candidate, so a reprobe
+// started before a family fallback still measures the path the tunnel actually
+// uses afterwards.
+func (m *Manager) StartPeriodicReprobe(ctx context.Context) {
 	m.mu.Lock()
 	if m.reprobeRunning {
 		m.mu.Unlock()
@@ -1526,11 +1687,10 @@ func (m *Manager) StartPeriodicReprobe(ctx context.Context, target string) {
 		return
 	}
 	m.reprobeRunning = true
-	m.reprobeTarget = target
 	m.stopReprobe = make(chan struct{})
 	m.mu.Unlock()
 
-	log.Info("Starting periodic reprobe (interval=%v, target=%s)", m.reprobeInterval, target)
+	log.Info("Starting periodic reprobe (interval=%v, target=%s)", m.reprobeInterval, m.GetServerAddr(ctx))
 
 	go func() {
 		ticker := time.NewTicker(m.reprobeInterval)
@@ -1564,10 +1724,7 @@ func (m *Manager) StopPeriodicReprobe() {
 
 // doPeriodicReprobe performs a single reprobe cycle
 func (m *Manager) doPeriodicReprobe(ctx context.Context) {
-	m.mu.RLock()
-	target := m.reprobeTarget
-	m.mu.RUnlock()
-
+	target := m.GetServerAddr(ctx)
 	if target == "" {
 		log.Warn("No reprobe target set")
 		return
@@ -1865,6 +2022,10 @@ func optimizeTCPConn(conn net.Conn) {
 // TriggerEmergencyReprobe starts aggressive re-probing when all strategies fail
 // This helps recover from network outages by periodically retrying with short intervals
 func (m *Manager) TriggerEmergencyReprobe(ctx context.Context) {
+	// Read the pinned candidate BEFORE taking m.mu: GetServerAddr takes the
+	// same lock to reach the selector.
+	target := m.GetServerAddr(ctx)
+
 	m.mu.Lock()
 
 	// Check if already running
@@ -1883,7 +2044,6 @@ func (m *Manager) TriggerEmergencyReprobe(ctx context.Context) {
 	m.emergencyReprobeRunning = true
 	m.lastEmergencyReprobe = time.Now()
 	m.emergencyReprobeStop = make(chan struct{})
-	target := m.reprobeTarget
 	m.mu.Unlock()
 
 	log.Warn("EMERGENCY REPROBE: All strategies failed, entering aggressive recovery mode")
@@ -1972,6 +2132,12 @@ func (m *Manager) StopEmergencyReprobe() {
 // This is called when Android detects a network change (WiFi→LTE, cell handoff)
 // After a network change, old connection state is meaningless - we need fresh start
 func (m *Manager) ResetForNetworkChange() {
+	// Endpoint health describes the OLD network: which family was up, which
+	// server was reachable, which one is parked. None of that survives a
+	// handover, and until now none of it was cleared either - the family
+	// verdict outlived every network change on desktop.
+	m.ResetHealth()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -2008,12 +2174,17 @@ func (m *Manager) ResetForNetworkChange() {
 // and uses shorter timeouts for faster reconnection
 // For Android: first tries the last successful strategy multiple times before fallback
 func (m *Manager) ConnectForReconnect(ctx context.Context, target string) (net.Conn, Strategy, error) {
-	// IPv6 Transport Layer: select IPv6 or IPv4 address
-	// Network change might affect IPv6 availability, so re-check
-	if m.serverAddrV6 != "" && m.preferIPv6 {
-		m.ResetIPv6Check() // Force re-check after network change
-		target = m.GetServerAddr(ctx)
-		log.Debug("Reconnect: using effective server address: %s", target)
+	// A network change can flip which family works, so drop the cached verdict
+	// and re-probe. Deliberately NO outer loop over candidates here: this path
+	// already retries the last strategy five times and then walks the whole
+	// list, and a second level of retries turns a WiFi/LTE handover into a
+	// minute-long stall.
+	if sel := m.selector(); sel != nil {
+		sel.ResetHealth()
+		if cand, _ := sel.ProbeCurrent(ctx); cand.Addr != "" {
+			target = cand.Addr
+			log.Debug("Reconnect: using effective server address: %s", target)
+		}
 	}
 
 	m.mu.RLock()
@@ -2187,8 +2358,8 @@ func (m *Manager) performMakeBeforeBreak(newPort int) {
 	defer cancel()
 
 	// Get target address for reconnect
+	target := m.GetServerAddr(ctx)
 	m.mu.Lock()
-	target := m.reprobeTarget // This contains the server address
 	lastStrategy := m.lastSuccessfulStrategy
 	m.mu.Unlock()
 
@@ -2289,8 +2460,8 @@ func (m *Manager) performBudgetRecycling() {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
+	target := m.GetServerAddr(ctx)
 	m.mu.Lock()
-	target := m.reprobeTarget
 	lastStrategy := m.lastSuccessfulStrategy
 	m.mu.Unlock()
 
@@ -2474,73 +2645,70 @@ func (m *Manager) TLSSessionCache() tls.ClientSessionCache {
 	return m.tlsSessionCache
 }
 
-// GetServerAddr returns the effective server address considering IPv6/IPv4 preferences
-// This method implements IPv6 Transport Layer with automatic fallback
-func (m *Manager) GetServerAddr(ctx context.Context) string {
-	m.ipv6Mu.Lock()
-	defer m.ipv6Mu.Unlock()
-
-	// If IPv6 is not configured, return IPv4
-	if m.serverAddrV6 == "" || !m.preferIPv6 {
-		return m.serverAddrV4
+// GetServerAddr returns the address of the currently pinned endpoint candidate.
+//
+// It is a pure read and never touches the network. It used to hold a mutex
+// across a 3-second DialContext while roughly fifteen call sites - including
+// every strategy in a scan - went through it. The probe now lives in one
+// explicit step per connect cycle (see dialEndpoints); this returns whatever
+// that step decided, so a whole scan sees one and the same address.
+//
+// The ctx parameter is retained for the fifteen existing call sites.
+func (m *Manager) GetServerAddr(_ context.Context) string {
+	sel := m.selector()
+	if sel == nil {
+		return ""
 	}
-
-	// Check IPv6 availability on first call
-	if !m.ipv6CheckedOnce {
-		m.ipv6CheckedOnce = true
-		m.ipv6Available = m.checkIPv6Connectivity(ctx)
-		if m.ipv6Available {
-			log.Info("IPv6 connectivity check passed, using IPv6 transport")
-		} else {
-			log.Warn("IPv6 connectivity check failed, falling back to IPv4")
-		}
+	c, ok := sel.Current()
+	if !ok {
+		return ""
 	}
-
-	// Return IPv6 if available, otherwise fallback to IPv4
-	if m.ipv6Available {
-		return m.serverAddrV6
-	}
-
-	if m.fallbackToV4 {
-		return m.serverAddrV4
-	}
-
-	// IPv6 preferred but not available, fallback disabled
-	// Return IPv6 anyway and let it fail
-	return m.serverAddrV6
+	return c.Addr
 }
 
-// checkIPv6Connectivity performs a quick check if IPv6 is available
-func (m *Manager) checkIPv6Connectivity(ctx context.Context) bool {
-	if m.serverAddrV6 == "" {
-		return false
+// ProbeEndpointFamily runs the one-shot transport-family probe for the pinned
+// candidate and returns the address that came out of it.
+//
+// This is the explicit step that replaced the dial GetServerAddr used to hide.
+// Connect calls it once per cycle; it is exported so the wiring around the
+// manager can drive it too.
+func (m *Manager) ProbeEndpointFamily(ctx context.Context) string {
+	sel := m.selector()
+	if sel == nil {
+		return ""
 	}
-
-	// Try to dial IPv6 server with short timeout
-	checkCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-
-	dialer := &net.Dialer{
-		Timeout: 3 * time.Second,
-	}
-
-	conn, err := dialer.DialContext(checkCtx, "tcp6", m.serverAddrV6)
-	if err != nil {
-		log.Debug("IPv6 connectivity check failed: %v", err)
-		return false
-	}
-
-	conn.Close()
-	return true
+	c, _ := sel.ProbeCurrent(ctx)
+	return c.Addr
 }
 
-// ResetIPv6Check forces a re-check of IPv6 connectivity on next GetServerAddr call
-// Useful after network changes (WiFi -> LTE, etc.)
+// EndpointStates returns the current endpoint candidates and their health, for
+// logging and diagnostics.
+func (m *Manager) EndpointStates() []endpoint.CandidateState {
+	sel := m.selector()
+	if sel == nil {
+		return nil
+	}
+	return sel.Snapshot()
+}
+
+// ResetHealth discards every cached endpoint verdict and re-pins the most
+// preferred candidate. Call it when the network underneath changed and old
+// observations describe a network that no longer exists.
+func (m *Manager) ResetHealth() {
+	sel := m.selector()
+	if sel == nil {
+		return
+	}
+	sel.ResetHealth()
+	log.Debug("Endpoint health reset, family will be re-probed on next connection")
+}
+
+// ResetIPv6Check forces a re-check of the transport family on the next connect.
+//
+// Deprecated: use ResetHealth. Kept because the Android control-socket path
+// calls it by this name.
 func (m *Manager) ResetIPv6Check() {
-	m.ipv6Mu.Lock()
-	defer m.ipv6Mu.Unlock()
-	m.ipv6CheckedOnce = false
-	log.Debug("IPv6 connectivity check reset, will re-check on next connection")
+	m.ResetHealth()
 }
 
 // SetBurstReshape configures burst reshaping for strategies created afterwards.

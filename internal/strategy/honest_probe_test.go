@@ -59,7 +59,7 @@ func TestHonestProbe_UnreachableServer(t *testing.T) {
 	for _, name := range []string{"REALITY", "WebSocketPadded", "HTTPPolling"} {
 		t.Run(name, func(t *testing.T) {
 			mgr := NewManager()
-			mgr.serverAddrV4 = closedTCPAddr(t)
+			setTestEndpoint(mgr, closedTCPAddr(t))
 			p := honestProbeCases(mgr)[name]
 
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -78,7 +78,7 @@ func TestHonestProbe_ReachableServer(t *testing.T) {
 	mgr := NewManager()
 	addr, closer := liveTCPAddr(t)
 	defer closer()
-	mgr.serverAddrV4 = addr
+	setTestEndpoint(mgr, addr)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

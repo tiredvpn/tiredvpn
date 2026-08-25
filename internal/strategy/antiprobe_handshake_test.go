@@ -110,7 +110,7 @@ func TestAntiProbeEndToEndHandshake(t *testing.T) {
 	}()
 
 	mgr := NewManager()
-	mgr.serverAddrV4 = ln.Addr().String()
+	setTestEndpoint(mgr, ln.Addr().String())
 	strat := NewAntiProbeStrategy(mgr, secret)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

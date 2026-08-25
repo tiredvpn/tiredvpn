@@ -56,7 +56,7 @@ func TestCheckTCPAnyProbeOrder(t *testing.T) {
 	if got := c.addrsToTry(); len(got) != 2 || got[0] != primary || got[1] != alt {
 		t.Fatalf("addrsToTry = %v, want [%s %s] (primary first)", got, primary, alt)
 	}
-	if err := c.checkTCPAny(context.Background()); err != nil {
+	if _, err := c.checkTCPAny(context.Background()); err != nil {
 		t.Fatalf("checkTCPAny = %v, want nil", err)
 	}
 	if n := altHits.Load(); n != 0 {
@@ -78,7 +78,7 @@ func TestCheckTCPAnyReturnsLastError(t *testing.T) {
 	c := NewConnectivityChecker(deadPrimary, 500*time.Millisecond, true)
 	c.SetAltAddr(deadAlt)
 
-	err := c.checkTCPAny(context.Background())
+	_, err := c.checkTCPAny(context.Background())
 	if err == nil {
 		t.Fatal("checkTCPAny = nil, want an error when neither address answers")
 	}

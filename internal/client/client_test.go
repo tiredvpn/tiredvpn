@@ -11,6 +11,16 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
 )
 
+// These tests cover the wiring, not the policy: that NewDefaultManager turns the
+// legacy -server / -server-v6 / -prefer-ipv6 / -fallback-v4 flags into the same
+// dial target the old one-shot IPv6 check produced. The policy itself is
+// exercised in internal/endpoint and internal/strategy.
+//
+// The family verdict is no longer computed inside GetServerAddr - that getter
+// sits on the path of every strategy in a scan and must not dial. It is
+// computed once per connect cycle by ProbeEndpointFamily, which is what these
+// tests call.
+
 func TestIPv6Dial(t *testing.T) {
 	// Try to create IPv6 server
 	listener, err := net.Listen("tcp6", "[::1]:0")
@@ -47,8 +57,9 @@ func TestIPv6Dial(t *testing.T) {
 	defer cancel()
 
 	// Get effective server address - should be IPv6
-	effectiveAddr := mgr.GetServerAddr(ctx)
+	effectiveAddr := mgr.ProbeEndpointFamily(ctx)
 	assert.Equal(t, addr, effectiveAddr, "Should return IPv6 address")
+	assert.Equal(t, addr, mgr.GetServerAddr(ctx), "Pinned address must match the probe verdict")
 
 	// Verify it's actually IPv6 by parsing
 	host, _, err := net.SplitHostPort(effectiveAddr)
@@ -75,11 +86,11 @@ func TestIPv4Fallback(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Get effective server address - should fallback to IPv4 due to failed connectivity check
-	effectiveAddr := mgr.GetServerAddr(ctx)
-
-	// Should fallback to IPv4 address
-	assert.Equal(t, "127.0.0.1:443", effectiveAddr, "Should fallback to IPv4 address when IPv6 check fails")
+	// Should fall back to IPv4 once the probe finds the v6 address unreachable.
+	assert.Equal(t, "127.0.0.1:443", mgr.ProbeEndpointFamily(ctx),
+		"Should fallback to IPv4 address when IPv6 check fails")
+	assert.Equal(t, "127.0.0.1:443", mgr.GetServerAddr(ctx),
+		"The fallback must be pinned, not recomputed per call")
 }
 
 func TestIPv6PreferenceDisabled(t *testing.T) {
@@ -95,9 +106,10 @@ func TestIPv6PreferenceDisabled(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Get effective server address - should be IPv4 even though IPv6 is configured
-	effectiveAddr := mgr.GetServerAddr(ctx)
-	assert.Equal(t, "127.0.0.1:443", effectiveAddr, "Should use IPv4 when PreferIPv6=false")
+	// -prefer-ipv6=false is a "keep this client off IPv6" knob: IPv4 is the only
+	// candidate, so neither the probe nor the getter may surface the v6 address.
+	assert.Equal(t, "127.0.0.1:443", mgr.ProbeEndpointFamily(ctx), "Should use IPv4 when PreferIPv6=false")
+	assert.Equal(t, "127.0.0.1:443", mgr.GetServerAddr(ctx), "Should use IPv4 when PreferIPv6=false")
 }
 
 func TestIPv6NoFallback(t *testing.T) {
@@ -114,16 +126,20 @@ func TestIPv6NoFallback(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	// Get effective server address - should still return IPv6 even though it will fail
-	effectiveAddr := mgr.GetServerAddr(ctx)
-	assert.Equal(t, "[::1]:99999", effectiveAddr, "Should return IPv6 address even when fallback disabled")
+	// -fallback-v4=false is an explicit "never touch IPv4" knob; silently
+	// dropping to v4 here would defeat it and leak onto the blocked family.
+	assert.Equal(t, "[::1]:99999", mgr.ProbeEndpointFamily(ctx),
+		"Should return IPv6 address even when fallback disabled")
+	assert.Equal(t, "[::1]:99999", mgr.GetServerAddr(ctx),
+		"Should return IPv6 address even when fallback disabled")
 }
 
+// TestIPv6ResetCheck covers the network-change path: after a reset the verdict
+// is recomputed instead of surviving into a network where it is meaningless.
 func TestIPv6ResetCheck(t *testing.T) {
-	// Create manager
 	mgrCfg := strategy.DefaultManagerConfig{
 		ServerAddr:   "127.0.0.1:443",
-		ServerAddrV6: "[::1]:443",
+		ServerAddrV6: "[::1]:99999", // unreachable, so the probe falls back
 		PreferIPv6:   true,
 		FallbackToV4: true,
 		Secret:       []byte("test-secret"),
@@ -132,14 +148,11 @@ func TestIPv6ResetCheck(t *testing.T) {
 
 	ctx := context.Background()
 
-	// First call - will check IPv6 connectivity
-	_ = mgr.GetServerAddr(ctx)
+	assert.Equal(t, "127.0.0.1:443", mgr.ProbeEndpointFamily(ctx), "unreachable v6 must fall back")
 
-	// Reset check
 	mgr.ResetIPv6Check()
-
-	// Next call should re-check IPv6 connectivity
-	_ = mgr.GetServerAddr(ctx)
-
-	// Test passes if no panic/error occurs
+	assert.Equal(t, "[::1]:99999", mgr.GetServerAddr(ctx),
+		"reset must put the preferred family back before the next probe")
+	assert.Equal(t, "127.0.0.1:443", mgr.ProbeEndpointFamily(ctx),
+		"the re-probe must reach the same verdict, not a cached one")
 }

@@ -314,8 +314,9 @@ func buildManager(cfg *Config, secret string) (*strategy.Manager, error) {
 	// With both families configured the gate must accept either, or a client
 	// whose IPv4 is blocked (and whose IPv6 transport works fine) never gets
 	// past "waiting for network" - the manager dials v6 while the gate probes
-	// the dead v4.
-	connectivityChecker.SetAltAddr(cfg.ServerAddrV6)
+	// the dead v4. Connect re-points the gate at the pinned candidate on every
+	// cycle; this is the starting position.
+	connectivityChecker.SetAddrs(cfg.ServerAddr, cfg.ServerAddrV6)
 	mgr.SetConnectivityChecker(connectivityChecker)
 	log.Debug("Connectivity checker initialized for %s (alt=%q)", cfg.ServerAddr, cfg.ServerAddrV6)
 
@@ -486,11 +487,12 @@ func runProbeAndServe(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal
 	log.Info("Available strategies: %d/%d", available, len(results))
 
 	reprobeCtx, reprobeCancel := context.WithCancel(context.Background())
-	// Reprobe the address the manager actually dials. Passing cfg.ServerAddr
+	// The reprobe resolves the address itself, per cycle. Passing cfg.ServerAddr
 	// blindly re-probed IPv4 every interval on a client running over IPv6, so
-	// each round measured a path the tunnel does not use - and on a host whose
-	// IPv4 is blocked, measured nothing at all.
-	mgr.StartPeriodicReprobe(reprobeCtx, mgr.GetServerAddr(reprobeCtx))
+	// each round measured a path the tunnel does not use - and a value captured
+	// once at start-up goes stale the moment the client falls back to the other
+	// family.
+	mgr.StartPeriodicReprobe(reprobeCtx)
 
 	if cfg.PortHoppingEnabled {
 		mgr.StartPortHopChecker(reprobeCtx)
@@ -728,9 +730,12 @@ func sendReconnectHandshake(conn net.Conn, currentIP net.IP, mtu int, dualStack 
 func runTUNMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) error {
 	log.Info("Starting TUN mode")
 
-	// IPv6 policy: off (default) keeps the tunnel v4-only; dual opts into the
-	// v0x04 dual-stack handshake. Empty means the flag was never set.
-	ipv6Policy := "off"
+	// IPv6 policy: dual (the default) opts into the v0x04 dual-stack handshake
+	// and blocks outbound IPv6 when the exit declines it; off keeps the tunnel
+	// v4-only and leaves host IPv6 alone. Empty means the flag was never set -
+	// which is the case for a client configured purely through TOML, since the
+	// schema has no key for this yet, so the default has to be named here too.
+	ipv6Policy := tun.DefaultIPv6Policy
 	if cfg.TunIPv6Policy != "" {
 		ipv6Policy = cfg.TunIPv6Policy
 	}
@@ -765,7 +770,10 @@ func runTUNMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) erro
 		ServerAddrV6: cfg.ServerAddrV6,
 		Manager:      mgr,
 		AutoMTU:      cfg.AutoMTU, // active end-to-end MTU probe
-		DualStack:    policy == tun.IPv6PolicyDual,
+		// Pass the whole policy, not a bool: collapsing it to
+		// "dual or not" silently turns -tun-ipv6 block into off, since block
+		// negotiates nothing and would be indistinguishable from it.
+		IPv6Policy: policy,
 		TunFd:        cfg.TunFd,       // Android VpnService TUN fd
 		ProtectPath:  cfg.ProtectPath, // Android socket protection path
 	}

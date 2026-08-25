@@ -332,10 +332,13 @@ func TestControlSocketIPv6PolicyMapping(t *testing.T) {
 		wantDual  bool
 		wantErr   bool
 	}{
-		{"", false, false},    // flag never set: default off
+		{"", false, false},    // flag never set: default off on this path
 		{"off", false, false}, // explicit off
 		{"dual", true, false},
-		{"block", false, true}, // reserved, rejected by the parser
+		// block is a real policy now: it never negotiates dual-stack, so the
+		// handshake stays at v0x03 exactly like off. The leak blocking it adds
+		// is a Linux-only interface concern and does not reach this parser.
+		{"block", false, false},
 	} {
 		dual, err := parseTunIPv6Policy(tc.flagValue)
 		if tc.wantErr {
