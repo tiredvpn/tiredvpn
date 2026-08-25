@@ -1194,8 +1194,18 @@ func handleConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 		err := tlsConn.Handshake()
 		guard.handshakeDone()
 		if err != nil {
+			// Close, the way the B1 path does. Handing the raw socket to the
+			// fake website here answered a peer that had opened a TLS handshake
+			// with a plaintext HTTP response on the same connection - measured,
+			// not supposed: break the handshake with a bogus record, then send
+			// "GET / HTTP/1.1" and our server replied "HTTP/1.1 200 OK, Server:
+			// nginx". No HTTPS server on earth does that, so it identified us in
+			// one connection with no statistics and no timing.
+			//
+			// crypto/tls has already sent whatever alert the failure warrants,
+			// so closing leaves exactly the behaviour a real server shows.
 			logger.Debug("TLS handshake failed: %v", err)
-			serveFakeWebsite(conn, cfg, logger)
+			_ = tlsConn.Close()
 			return
 		}
 

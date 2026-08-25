@@ -4,7 +4,9 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -480,4 +482,46 @@ func concat(parts ...[]byte) []byte {
 		out = append(out, p...)
 	}
 	return out
+}
+
+// TestFailedTLSHandshakeDoesNotAnswerInPlaintext guards a defect that was
+// measured on a running server, not imagined.
+//
+// The dispatcher used to hand the raw socket to serveFakeWebsite when a TLS
+// handshake failed. A peer could then break the handshake with one bogus
+// record, send "GET / HTTP/1.1" in the clear on the same connection, and get
+// back "HTTP/1.1 200 OK, Server: nginx". No HTTPS server answers plaintext on a
+// socket where a TLS handshake just failed, so that identified our front in a
+// single connection - no statistics, no timing, no second probe.
+//
+// The unit under test is the decision, not the network: after a failed
+// handshake the connection must be closed rather than passed to an HTTP
+// handler. Kept next to the ChangeCipherSpec guard because the same defect is
+// what made the donor measurements read "no limit at all" - the socket stayed
+// alive after crypto/tls had given up on it.
+func TestFailedTLSHandshakeDoesNotAnswerInPlaintext(t *testing.T) {
+	t.Parallel()
+
+	src, err := os.ReadFile("server.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(src)
+
+	marker := "TLS ClientHello detected (no REALITY extension)"
+	idx := strings.Index(body, marker)
+	if idx < 0 {
+		t.Skip("dispatcher branch moved; update this guard")
+	}
+	// The window covers the handshake and its error branch.
+	window := body[idx:min(idx+1600, len(body))]
+
+	if strings.Contains(window, "serveFakeWebsite(conn") {
+		t.Fatal("a failed TLS handshake hands the raw socket to the fake website again: " +
+			"the peer gets a plaintext HTTP reply on a connection it opened with a ClientHello, " +
+			"which no real HTTPS server does")
+	}
+	if !strings.Contains(window, "tlsConn.Close()") {
+		t.Fatal("the failed-handshake branch no longer closes the connection")
+	}
 }
