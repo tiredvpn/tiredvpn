@@ -4313,6 +4313,13 @@ func (bc *bufferedConn) Read(p []byte) (int, error) {
 	return bc.reader.Read(p)
 }
 
+// Unwrap returns the connection this one buffers, so a caller can reach the
+// *tls.Conn underneath and read the handshake result off it. It deliberately
+// does not forward ConnectionState: a bufferedConn that claimed to be a TLS
+// connection would be handed to code that then reads bytes past the replay
+// buffer straight off the socket.
+func (bc *bufferedConn) Unwrap() net.Conn { return bc.Conn }
+
 // Ensure interface compliance
 var _ net.Conn = (*bufferedConn)(nil)
 

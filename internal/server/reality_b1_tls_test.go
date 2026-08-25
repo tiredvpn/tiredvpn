@@ -3,13 +3,17 @@ package server
 import (
 	"crypto/tls"
 	"errors"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/net/http2"
 
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/protocol"
@@ -215,9 +219,15 @@ func TestB1BindingFlow(t *testing.T) {
 }
 
 // TestB1BadBindingGetsAWebsite is the criterion that a client failing the
-// binding sees an HTTP response rather than a reset or an alert: it
-// authenticated its session_id, so from its point of view it is talking to a
-// web server, and a web server answers.
+// binding sees a served page rather than a reset or an alert: it authenticated
+// its session_id, so from its point of view it is talking to a web server, and
+// a web server answers.
+//
+// The client speaks HTTP/2 because that is what this handshake agreed on. It
+// used to send an HTTP/1.1 request line over an h2 connection and the test
+// accepted an "HTTP/" prefix back, which passed while the decoy answered every
+// browser with a protocol error - the request the criterion is about was never
+// one a browser makes. It now checks the page arrives, not that some bytes did.
 func TestB1BadBindingGetsAWebsite(t *testing.T) {
 	dir := t.TempDir()
 	if err := writeTestIndex(dir); err != nil {
@@ -228,15 +238,12 @@ func TestB1BadBindingGetsAWebsite(t *testing.T) {
 	serverCfg := b1TLSConfig(newCertMinter(), "")
 	client, server := b1TLSPair(t, serverCfg, b1ClientConfig("yandex.ru", nil))
 
+	if got := client.ConnectionState().NegotiatedProtocol; got != "h2" {
+		t.Fatalf("ALPN = %q, want h2 - this test is about what an h2 peer gets", got)
+	}
+
 	clientState := client.ConnectionState()
 	clientEKM, _ := customtls.ExportBindingKey(&clientState)
-
-	// The client sends a proof under a secret the server does not know, then
-	// behaves like a browser.
-	go func() {
-		_ = customtls.WriteClientBinding(client, []byte("stolen-session-id-holder"), clientEKM, protocol.TypeMux)
-		_, _ = client.Write([]byte("GET / HTTP/1.1\r\nHost: yandex.ru\r\n\r\n"))
-	}()
 
 	serverState := server.ConnectionState()
 	serverEKM, _ := customtls.ExportBindingKey(&serverState)
@@ -250,14 +257,37 @@ func TestB1BadBindingGetsAWebsite(t *testing.T) {
 		}
 	}()
 
-	_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
-	buf := make([]byte, 256)
-	n, err := client.Read(buf)
+	// The client sends a proof under a secret the server does not know, then
+	// behaves like the browser its ALPN says it is.
+	if err := customtls.WriteClientBinding(client, []byte("stolen-session-id-holder"), clientEKM, protocol.TypeMux); err != nil {
+		t.Fatalf("write binding: %v", err)
+	}
+
+	_ = client.SetDeadline(time.Now().Add(10 * time.Second))
+	tr := &http2.Transport{}
+	cc, err := tr.NewClientConn(client)
+	if err != nil {
+		t.Fatalf("client got no HTTP/2 connection at all: %v", err)
+	}
+	req, err := http.NewRequest(http.MethodGet, "https://yandex.ru/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := cc.RoundTrip(req)
 	if err != nil {
 		t.Fatalf("client got no reply at all: %v", err)
 	}
-	if !strings.HasPrefix(string(buf[:n]), "HTTP/") {
-		t.Fatalf("client got %q, want an HTTP response", buf[:n])
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d, want 200", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if !strings.Contains(string(body), "hello") {
+		t.Fatalf("client got %.80q, want the page under FakeWebRoot", body)
 	}
 
 	// The reply is what this test is about. serveFakeWebsite then keeps the
