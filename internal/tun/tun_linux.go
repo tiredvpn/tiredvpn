@@ -89,7 +89,11 @@ type TUNDevice struct {
 	// start with no path to the server, so teardown skips it.
 	bypassPreexisted  bool
 	bypass6Preexisted bool
-	bypassMu          sync.Mutex
+	// v6BlockAllow are the IPv6 addresses punched through the leak block (the
+	// server's own transport addresses). Guarded by bypassMu, like the bypass
+	// state it mirrors.
+	v6BlockAllow []net.IP
+	bypassMu     sync.Mutex
 
 	// deferRoutes, when true, makes Configure bring the interface up and assign
 	// the tunnel address but NOT install the route set (notably a 0.0.0.0/0
@@ -105,9 +109,17 @@ type TUNDevice struct {
 	// dualStack records that the client wants IPv6 inside the tunnel
 	// (handshake v0x04). It only relaxes the historical disable_ipv6=1 in
 	// Configure; the v6 address/routes are installed by EnableDualStack once
-	// the exit has actually negotiated dual-stack. Set via SetDualStack before
-	// Configure.
+	// the exit has actually negotiated dual-stack. Derived from the policy by
+	// SetIPv6Policy, which must be called before Configure.
 	dualStack bool
+	// ipv6Policy is the full -tun-ipv6 policy. Beyond dualStack it decides
+	// whether outbound IPv6 that did not make it into the tunnel is rejected;
+	// see ipv6block_linux.go. Left at IPv6PolicyOff on host-owned interfaces
+	// (Android), where filtering belongs to VpnService.
+	ipv6Policy IPv6Policy
+	// v6BlockInstalled reports that the leak-block table exists, so teardown
+	// removes exactly what it created and re-installs are logged as such.
+	v6BlockInstalled bool
 	// v6Enabled reports that EnableDualStack ran to completion: the link
 	// carries localIP6/remoteIP6, the v6 half-default routes in routes6 are
 	// installed, and the ip6 MSS clamp table exists. Drives v6-aware teardown
@@ -123,16 +135,6 @@ type TUNDevice struct {
 	// matches on the whole address, so deleting the wrong form fails and
 	// leaves the stale address behind.
 	v6PeerForm bool
-}
-
-// SetDualStack records the client's intent to negotiate IPv6 inside the
-// tunnel. When set before Configure, the interface keeps IPv6 enabled
-// (disable_ipv6=0, mirroring the server-side ConfigureSubnet) so a later
-// EnableDualStack can assign the negotiated v6 address. When the exit
-// declines dual-stack, DisableIPv6 restores the exact v4-only state.
-// Linux only; on Android the host owns interface configuration.
-func (t *TUNDevice) SetDualStack(dual bool) {
-	t.dualStack = dual
 }
 
 // SetDeferRoutes requests that Configure NOT install routes immediately, leaving
@@ -265,6 +267,11 @@ func (t *TUNDevice) Close() error {
 			}
 		}
 	}
+
+	// The leak block outlives the interface unless it is taken down here: it
+	// is keyed on the interface name, not its index, so a stale table would
+	// keep rejecting the host's IPv6 long after the tunnel is gone.
+	t.RemoveIPv6LeakBlock()
 
 	// Remove only the routes this device installed, before deleting the link.
 	// This avoids relying on LinkDel's cascade delete and guarantees teardown
@@ -536,6 +543,12 @@ func (t *TUNDevice) EnableDualStack(clientIP6, serverIP6 net.IP) error {
 		}
 	}
 
+	// IPv6 is now inside the tunnel, so the leak block has nothing left to
+	// protect against. Relevant on a reconnect that lands on a dual-stack exit
+	// after a previous one declined: leaving the block up would reject the
+	// tunnel's own v6 the moment it started working.
+	t.RemoveIPv6LeakBlock()
+
 	log.Info("TUN device %s dual-stack enabled: local=%s, peer=%s, routes=%v",
 		t.name, clientIP6, serverIP6, dualStackRouteCIDRs)
 	return nil
@@ -595,6 +608,11 @@ func (t *TUNDevice) setV6Addr(link netlink.Link, ip net.IP) (peerForm bool, err 
 // disable_ipv6=1 is restored. Called when dual-stack was requested but the
 // exit did not negotiate it, so a declined negotiation never leaves a
 // half-configured v6 path behind.
+//
+// The tunnel not carrying IPv6 is precisely the condition the leak block
+// exists for, so it goes in here — including on the mid-session path where a
+// live dual-stack tunnel loses its v6 address (updateLocalIP6). Under
+// -tun-ipv6=off the policy declines and this stays a pure v4-only restore.
 func (t *TUNDevice) DisableIPv6() {
 	if t.name == "" {
 		return
@@ -626,6 +644,8 @@ func (t *TUNDevice) DisableIPv6() {
 	if err := os.WriteFile(sysctlPath, []byte("1"), 0644); err != nil {
 		log.Warn("Failed to disable IPv6 on %s: %v", t.name, err)
 	}
+
+	t.ApplyIPv6LeakBlock()
 }
 
 // addRoutes installs the given routes on the link, normalizing bare IPs to

@@ -9,14 +9,34 @@ import (
 	"time"
 )
 
-// TestHandshakeVersionSelection pins the opt-in version knob: a dual-stack
-// client sends 0x04, everyone else keeps sending 0x03.
-func TestHandshakeVersionSelection(t *testing.T) {
-	if got := (&VPNClient{}).handshakeVersion(); got != tunHandshakeVersion {
-		t.Errorf("default handshake version = 0x%02x, want 0x%02x", got, tunHandshakeVersion)
+// dualPolicy maps the "is this the dual-stack case" boolean the older table
+// tests are written around onto the policy the client now carries.
+func dualPolicy(dual bool) IPv6Policy {
+	if dual {
+		return IPv6PolicyDual
 	}
-	if got := (&VPNClient{dualStack: true}).handshakeVersion(); got != tunHandshakeVersionDualStack {
-		t.Errorf("dual-stack handshake version = 0x%02x, want 0x%02x", got, tunHandshakeVersionDualStack)
+	return IPv6PolicyOff
+}
+
+// TestHandshakeVersionSelection pins the version knob: only the dual policy
+// sends 0x04. off keeps 0x03, and so does block — it wants the host's IPv6
+// stopped, not carried, so it has nothing to ask the exit for and stays
+// byte-identical to a v4-only client on the wire.
+func TestHandshakeVersionSelection(t *testing.T) {
+	for _, tc := range []struct {
+		policy IPv6Policy
+		want   byte
+	}{
+		{IPv6PolicyOff, tunHandshakeVersion},
+		{IPv6PolicyBlock, tunHandshakeVersion},
+		{IPv6PolicyDual, tunHandshakeVersionDualStack},
+	} {
+		if got := (&VPNClient{ipv6Policy: tc.policy}).handshakeVersion(); got != tc.want {
+			t.Errorf("handshake version for %s = 0x%02x, want 0x%02x", tc.policy, got, tc.want)
+		}
+	}
+	if got := (&VPNClient{}).handshakeVersion(); got != tunHandshakeVersion {
+		t.Errorf("zero-value handshake version = 0x%02x, want 0x%02x", got, tunHandshakeVersion)
 	}
 }
 
@@ -237,7 +257,7 @@ func TestDoHandshakeEndToEndDualStack(t *testing.T) {
 			}
 			conn := &scriptedConn{chunks: [][]byte{serverResp}}
 
-			v := &VPNClient{tun: &TUNDevice{mtu: 1280}, dualStack: dual}
+			v := &VPNClient{tun: &TUNDevice{mtu: 1280}, ipv6Policy: dualPolicy(dual)}
 			resp, n, err := v.doHandshake(conn, net.IPv4zero)
 			if err != nil {
 				t.Fatalf("doHandshake: %v", err)
@@ -457,7 +477,7 @@ func TestServerBypassIP6Source(t *testing.T) {
 func TestHandshakeRequestVersionByte(t *testing.T) {
 	for _, dual := range []bool{false, true} {
 		conn := &scriptedConn{chunks: [][]byte{{0x00, 10, 8, 0, 1, 10, 8, 0, 2}}}
-		v := &VPNClient{tun: &TUNDevice{mtu: 1280}, dualStack: dual}
+		v := &VPNClient{tun: &TUNDevice{mtu: 1280}, ipv6Policy: dualPolicy(dual)}
 		if _, _, err := v.doHandshake(conn, net.IPv4(10, 8, 0, 2)); err != nil {
 			t.Fatalf("doHandshake: %v", err)
 		}

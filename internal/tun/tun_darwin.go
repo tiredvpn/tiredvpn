@@ -66,7 +66,7 @@ type TUNDevice struct {
 	remoteIP  net.IP
 	routes    []string
 
-	// Dual-stack state: dualStack is the client's intent (SetDualStack);
+	// Dual-stack state: dualStack is the client's intent (SetIPv6Policy);
 	// v6Enabled/localIP6/remoteIP6 are set once EnableDualStack installed the
 	// negotiated v6 address and half-default routes.
 	dualStack bool
@@ -74,15 +74,50 @@ type TUNDevice struct {
 	localIP6  net.IP
 	remoteIP6 net.IP
 
+	// ipv6Policy is the full -tun-ipv6 policy. Its blocking half is not
+	// implemented on macOS (see ApplyIPv6LeakBlock); v6BlockWarned keeps that
+	// gap to one warning per session instead of one per reconnect.
+	ipv6Policy    IPv6Policy
+	v6BlockWarned bool
+
 	writeMu sync.Mutex
 	readBuf []byte
 }
 
-// SetDualStack records the client's intent to negotiate IPv6 inside the
-// tunnel. On macOS there is no disable_ipv6 sysctl to flip in Configure, so
-// this only gates the post-handshake EnableDualStack.
-func (t *TUNDevice) SetDualStack(dual bool) {
-	t.dualStack = dual
+// SetIPv6Policy records the -tun-ipv6 policy for this tunnel. On macOS there
+// is no disable_ipv6 sysctl to flip in Configure, so the dual-stack half only
+// gates the post-handshake EnableDualStack; the blocking half is not
+// implemented at all (ApplyIPv6LeakBlock).
+func (t *TUNDevice) SetIPv6Policy(p IPv6Policy) {
+	t.ipv6Policy = p
+	t.dualStack = p.NegotiatesDualStack()
+}
+
+// SetIPv6BlockAllow is a no-op on macOS: there is no leak block to punch holes
+// in. Present so the platform-independent caller in vpn.go needs no build tag.
+func (t *TUNDevice) SetIPv6BlockAllow([]net.IP) {}
+
+// ApplyIPv6LeakBlock is not implemented on macOS. The Linux block is an
+// nftables chain, which has no counterpart here — the equivalent would be a
+// pf anchor, which means owning /etc/pf.conf state that the OS and other VPN
+// software also write to. Until that exists the gap is reported rather than
+// hidden: on a dual-stack Mac whose exit cannot carry IPv6, applications keep
+// reaching the internet over IPv6 outside the tunnel.
+func (t *TUNDevice) ApplyIPv6LeakBlock() {
+	if !t.ipv6Policy.BlocksLeakedIPv6() || t.v6BlockWarned {
+		return
+	}
+	t.v6BlockWarned = true
+	log.Warn("IPv6 leak block (-tun-ipv6=%s) is not implemented on macOS: the tunnel is not "+
+		"carrying IPv6 and outbound IPv6 is NOT blocked, so applications with a working IPv6 "+
+		"default route will reach the internet outside the VPN. Disable IPv6 on the active "+
+		"network service (System Settings > Network > Details > TCP/IP > Configure IPv6: Off) "+
+		"to close it by hand.", t.ipv6Policy)
+}
+
+// RemoveIPv6LeakBlock is a no-op on macOS: nothing was installed.
+func (t *TUNDevice) RemoveIPv6LeakBlock() {
+	t.v6BlockWarned = false
 }
 
 // EnableDualStack assigns the negotiated v6 point-to-point address and
@@ -135,6 +170,9 @@ func (t *TUNDevice) EnableDualStack(clientIP6, serverIP6 net.IP) error {
 // without an inet6 address carries no IPv6, so removing what we added is
 // sufficient.
 func (t *TUNDevice) DisableIPv6() {
+	// Warn about the missing leak block on every path that leaves the tunnel
+	// without IPv6, including the one that returns right below.
+	t.ApplyIPv6LeakBlock()
 	if !t.v6Enabled {
 		return
 	}

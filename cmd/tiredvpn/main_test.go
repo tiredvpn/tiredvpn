@@ -2,12 +2,15 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/tiredvpn/tiredvpn/internal/client"
 	"github.com/tiredvpn/tiredvpn/internal/server"
+	"github.com/tiredvpn/tiredvpn/internal/tun"
 )
 
 // TestVersion_DefaultIsDev guards against accidental hardcoding of a release
@@ -213,5 +216,27 @@ func TestRegisterClientFlags_REALITYServerPubKey(t *testing.T) {
 	}
 	if cfg.REALITYServerPubKey != "cHVia2V5" {
 		t.Fatalf("REALITYServerPubKey = %q, want %q", cfg.REALITYServerPubKey, "cHVia2V5")
+	}
+}
+
+// TestClientHelpIPv6Default keeps the hand-written client help in step with
+// the -tun-ipv6 default. The help is a raw string literal that nothing else
+// reads, so a default change lands in the flag registration and leaves the
+// help advertising the old one — which is how a user comes to believe IPv6 is
+// "off" while the client is quietly tunnelling it.
+func TestClientHelpIPv6Default(t *testing.T) {
+	if !strings.Contains(clientHelpText, "-tun-ipv6 string") {
+		t.Fatal("client help does not document -tun-ipv6 at all")
+	}
+	want := fmt.Sprintf("(default %q)", tun.DefaultIPv6Policy)
+	if !strings.Contains(clientHelpText, want) {
+		t.Errorf("client help does not state the -tun-ipv6 default %s", want)
+	}
+	// Every accepted value has to be listed, otherwise the closed flag set is
+	// undiscoverable from the help.
+	for _, v := range []string{"dual", "block", "off"} {
+		if !strings.Contains(clientHelpText, "\n          "+v) {
+			t.Errorf("client help does not describe -tun-ipv6 value %q", v)
+		}
 	}
 }

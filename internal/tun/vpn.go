@@ -138,9 +138,11 @@ type VPNClient struct {
 	// Server capabilities (received during handshake)
 	serverCaps ServerCapabilities
 
-	// dualStack selects handshake version 0x04 (IPv6 dual-stack negotiation).
-	// Set from VPNConfig.DualStack.
-	dualStack bool
+	// ipv6Policy is what the client does with IPv6 for the life of this
+	// tunnel: negotiate it into the tunnel (handshake version 0x04), block it
+	// when the tunnel cannot carry it, or leave the host alone. Resolved from
+	// VPNConfig by VPNConfig.ipv6PolicyOrLegacy.
+	ipv6Policy IPv6Policy
 	// Auto-MTU active probe state.
 	autoMTU       bool                   // -auto-mtu enabled
 	ownsInterface bool                   // we created the TUN (can change MTU live)
@@ -177,10 +179,20 @@ type VPNConfig struct {
 	// min(probed, cap). Only effective on interfaces we own (non-fd Linux/macOS).
 	AutoMTU bool
 
-	// DualStack opts the client into IPv6 inside the tunnel: the handshake
-	// version byte becomes 0x04 (instead of 0x03), asking a dual-stack exit to
-	// assign IPv6 tunnel addresses. The request format is unchanged, so this
-	// is safe against old servers (they ignore the unknown version).
+	// IPv6Policy selects what happens to IPv6 while the tunnel is up:
+	// IPv6PolicyDual (the -tun-ipv6 default) asks the exit for IPv6 tunnel
+	// addresses with handshake version 0x04 instead of 0x03 and blocks
+	// outbound IPv6 if it declines; IPv6PolicyBlock blocks without asking;
+	// IPv6PolicyOff is the historical v4-only tunnel with host IPv6 untouched.
+	// The handshake request format is identical either way, so asking is safe
+	// against old exits — they ignore the unknown version.
+	IPv6Policy IPv6Policy
+
+	// DualStack is the pre-policy spelling of IPv6Policy == IPv6PolicyDual,
+	// kept for callers that have not moved over (macOS, benchmarks). Ignored
+	// when IPv6Policy is set to anything but its zero value.
+	//
+	// Deprecated: set IPv6Policy instead.
 	DualStack bool
 
 	// Android VpnService support
@@ -245,10 +257,48 @@ func resolveServerBypassIP6(serverAddr string) net.IP {
 // all. Missing that case would drop the client's own transport socket into its
 // own tunnel the moment dual-stack is negotiated.
 func serverBypassIP6(cfg VPNConfig) net.IP {
-	if ip := resolveServerBypassIP6(cfg.ServerAddrV6); ip != nil {
-		return ip
+	if ips := serverIP6s(cfg); len(ips) > 0 {
+		return ips[0]
 	}
-	return resolveServerBypassIP6(cfg.ServerAddr)
+	return nil
+}
+
+// serverIP6s lists every IPv6 transport address this client might dial, in
+// preference order (-server-v6 first, then -server). serverBypassIP6 pins a
+// route for the first one; the IPv6 leak block has to punch a hole for all of
+// them, since the strategy manager can switch between them across reconnects
+// and a hole for an address that is never dialled costs nothing.
+func serverIP6s(cfg VPNConfig) []net.IP {
+	var out []net.IP
+	for _, addr := range []string{cfg.ServerAddrV6, cfg.ServerAddr} {
+		ip := resolveServerBypassIP6(addr)
+		if ip == nil {
+			continue
+		}
+		dup := false
+		for _, seen := range out {
+			if seen.Equal(ip) {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			out = append(out, ip)
+		}
+	}
+	return out
+}
+
+// ipv6PolicyOrLegacy resolves the effective policy: IPv6Policy when set,
+// otherwise the deprecated DualStack bool.
+func (cfg VPNConfig) ipv6PolicyOrLegacy() IPv6Policy {
+	if cfg.IPv6Policy != IPv6PolicyOff {
+		return cfg.IPv6Policy
+	}
+	if cfg.DualStack {
+		return IPv6PolicyDual
+	}
+	return IPv6PolicyOff
 }
 
 // NewVPNClient creates a new VPN client
@@ -294,9 +344,13 @@ func NewVPNClient(cfg VPNConfig) (*VPNClient, error) {
 		if err != nil {
 			return nil, err
 		}
-		// Record dual-stack intent before Configure so the interface keeps
-		// IPv6 enabled for the post-handshake EnableDualStack.
-		tunDev.SetDualStack(cfg.DualStack)
+		// Record the IPv6 policy before Configure: it keeps IPv6 enabled on
+		// the interface for the post-handshake EnableDualStack, and decides
+		// whether outbound IPv6 gets blocked once the tunnel's IPv6 fate is
+		// known. Only on interfaces we own — the fd branch above leaves the
+		// device at IPv6PolicyOff, because on Android VpnService owns both
+		// routing and filtering.
+		tunDev.SetIPv6Policy(cfg.ipv6PolicyOrLegacy())
 		// Pin a server bypass route before configuring routes, so a full-tunnel
 		// default route does not loop the client's own server traffic.
 		if bypassIP := resolveServerBypassIP(cfg.ServerAddr); bypassIP != nil {
@@ -311,6 +365,9 @@ func NewVPNClient(cfg VPNConfig) (*VPNClient, error) {
 		if bypassIP6 := serverBypassIP6(cfg); bypassIP6 != nil {
 			tunDev.SetServerBypassIP6(bypassIP6)
 		}
+		// Same addresses, one layer down: the IPv6 leak block rejects outbound
+		// v6, and the client's own transport must not be caught by it.
+		tunDev.SetIPv6BlockAllow(serverIP6s(cfg))
 		// Defer route installation (notably the 0.0.0.0/0 default route) until a
 		// real connection + handshake to the server succeeds. Configure brings
 		// the interface up and assigns its address, but leaves the host's normal
@@ -332,16 +389,17 @@ func NewVPNClient(cfg VPNConfig) (*VPNClient, error) {
 		stopCh:        make(chan struct{}),
 		autoMTU:       cfg.AutoMTU,
 		ownsInterface: cfg.TunFd <= 0,
-		dualStack:     cfg.DualStack,
+		ipv6Policy:    cfg.ipv6PolicyOrLegacy(),
 	}, nil
 }
 
 // handshakeVersion returns the TUN handshake version byte this client sends:
-// 0x04 when dual-stack was opted into (VPNConfig.DualStack), else the default
-// 0x03. The request layout is identical either way, so this is the only
-// on-wire difference.
+// 0x04 when the policy negotiates dual-stack, else the default 0x03. The
+// request layout is identical either way, so this is the only on-wire
+// difference the IPv6 policy makes. -tun-ipv6=block keeps 0x03: it wants the
+// host's IPv6 stopped, not carried, so there is nothing to ask the exit for.
 func (v *VPNClient) handshakeVersion() byte {
-	if v.dualStack {
+	if v.ipv6Policy.NegotiatesDualStack() {
 		return tunHandshakeVersionDualStack
 	}
 	return tunHandshakeVersion
@@ -785,22 +843,36 @@ func (v *VPNClient) connect(parent context.Context) error {
 	}
 	v.mu.Unlock()
 
-	// Dual-stack: bring up the v6 side of the tunnel only when the exit
-	// actually negotiated it. A declined negotiation (old server, no
-	// -ip-pool-v6) restores the exact v4-only interface state — no v6
-	// address, no v6 routes, disable_ipv6=1 — so nothing leaks or blackholes.
-	// Host-owned interfaces (Android VpnService / macOS NE fd) are configured
-	// by the host, which consumes the negotiated addresses out of band.
-	if v.dualStack && v.ownsInterface {
-		if hasCaps && caps.DualStackEnabled {
-			if err := v.tun.EnableDualStack(caps.ClientIP6, caps.ServerIP6); err != nil {
-				log.Warn("Dual-stack: failed to configure IPv6 on the tunnel: %v (continuing IPv4-only)", err)
-				v.tun.DisableIPv6()
-			}
-		} else {
-			log.Warn("Dual-stack requested but the exit did not negotiate IPv6; continuing IPv4-only")
+	// IPv6: bring up the v6 side of the tunnel only when the exit actually
+	// negotiated it. A declined negotiation (old server, no -ip-pool-v6)
+	// restores the exact v4-only interface state — no v6 address, no v6
+	// routes, disable_ipv6=1 — and then blocks outbound IPv6, so it neither
+	// blackholes nor escapes the tunnel. Host-owned interfaces (Android
+	// VpnService / macOS NE fd) are configured by the host, which consumes the
+	// negotiated addresses and owns its own filtering.
+	//
+	// Done here rather than at Configure time on purpose: routes are deferred
+	// until a connect succeeds, so until this point the host still relies on
+	// its own routing and cutting its IPv6 would take away connectivity the
+	// tunnel is not yet replacing.
+	switch ipv6ActionFor(v.ipv6Policy, v.ownsInterface, hasCaps && caps.DualStackEnabled) {
+	case ipv6ActionNone:
+		// Historical behavior: the tunnel is v4-only, host IPv6 untouched.
+	case ipv6ActionEnableDual:
+		if err := v.tun.EnableDualStack(caps.ClientIP6, caps.ServerIP6); err != nil {
+			log.Warn("Dual-stack: failed to configure IPv6 on the tunnel: %v (continuing IPv4-only)", err)
+			// DisableIPv6 restores the v4-only interface and, since the
+			// tunnel ends up not carrying IPv6, applies the leak block.
 			v.tun.DisableIPv6()
 		}
+	case ipv6ActionBlock:
+		if v.ipv6Policy == IPv6PolicyDual {
+			log.Warn("Dual-stack requested but the exit did not negotiate IPv6; " +
+				"continuing IPv4-only and blocking outbound IPv6 so it cannot leave outside the tunnel")
+			v.tun.DisableIPv6()
+			break
+		}
+		v.tun.ApplyIPv6LeakBlock()
 	}
 
 	// Mark the start of this session for storm detection. If the DPI tears the
