@@ -217,6 +217,17 @@ REALITY OPTIONS:
   -reality-require-data-v2
         Reject REALITY clients still on the v1 data layer (turn on after every client is upgraded)
 
+NODE CEILINGS (address reputation):
+  -node-max-clients int
+        Cap distinct authenticated clients on this node, 0 = off (default 0).
+        Transports authenticating against a single shared secret carry no client id
+        and are NOT counted, so the real number here can exceed the cap.
+  -node-max-bytes int
+        Cap bytes carried per window, 0 = off. The ceiling that means something on
+        a relay, where peers are downstream nodes rather than people.
+  -node-window duration
+        Sliding window the traffic ceiling is measured over (default 1h)
+
 ADVANCED OPTIONS:
   -fake-root string
         Fake website root directory (default "./www")
@@ -423,7 +434,7 @@ func registerServerFlags(fs *flag.FlagSet, cfg *server.Config) *serverFlagOpts {
 	// refusing users on deployments running fine today, and a refused client
 	// has nowhere to go yet. The metrics are on regardless, so an operator can
 	// read their real numbers before choosing a limit.
-	fs.IntVar(&cfg.NodeMaxClients, "node-max-clients", 0, "Cap distinct authenticated clients on this node (0 = off). Address reputation is the one blocking vector that ignores traffic shape; 200 users on one address bought two hours in the Iranian experiment, 5-7 bought two days.")
+	fs.IntVar(&cfg.NodeMaxClients, "node-max-clients", 0, "Cap distinct authenticated clients on this node (0 = off). Address reputation is the one blocking vector that ignores traffic shape; 200 users on one address bought two hours in the Iranian experiment, 5-7 bought two days. NOTE: transports that authenticate against a single shared secret carry no client id and are not counted, so the real number on this node can exceed the cap.")
 	fs.Int64Var(&cfg.NodeMaxBytesPerWindow, "node-max-bytes", 0, "Cap bytes carried per window on this node (0 = off). This is the ceiling that means something on a relay, where peers are downstream nodes rather than people.")
 	fs.DurationVar(&cfg.NodeWindow, "node-window", time.Hour, "Sliding window the traffic ceiling is measured over")
 	fs.BoolVar(&cfg.REALITYRequireDataV2, "reality-require-data-v2", false, "Reject REALITY clients that do not negotiate the v2 data layer (per-connection keys + AEAD). Turn on only after every client is upgraded.")
