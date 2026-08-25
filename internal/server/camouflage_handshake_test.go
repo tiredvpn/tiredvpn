@@ -209,8 +209,11 @@ func TestVerifyIMAPAuth(t *testing.T) {
 		if !ok {
 			t.Fatal("a token minted from a registered client's secret was rejected")
 		}
-		if id != "c1" {
-			t.Errorf("clientID = %q, want c1", id)
+		if id.id != "c1" {
+			t.Errorf("clientID = %q, want c1", id.id)
+		}
+		if !id.perClient {
+			t.Error("a registry client must be marked per-client, or its lease gets qualified and it loses its stable IP")
 		}
 		if string(secret) != perClient {
 			t.Errorf("returned secret = %q, want the client's own", secret)
@@ -222,8 +225,11 @@ func TestVerifyIMAPAuth(t *testing.T) {
 		if !ok {
 			t.Fatal("a token minted from the global secret was rejected")
 		}
-		if id != "global" {
-			t.Errorf("clientID = %q, want global", id)
+		if id.id != "global" {
+			t.Errorf("clientID = %q, want global", id.id)
+		}
+		if id.perClient {
+			t.Error("the global secret identifies nobody; marking it per-client is what lets two clients share one lease")
 		}
 		if string(secret) != string(global) {
 			t.Errorf("returned secret = %q, want the global secret", secret)
@@ -263,11 +269,11 @@ func TestVerifySSHAuth(t *testing.T) {
 	r.byID["c1"] = &ClientConfig{ID: "c1", Secret: perClient, Enabled: true}
 	srvCtx.registry = r
 
-	if id, _, ok := verifySSHAuth(strategy.GenerateSSHAuthToken([]byte(perClient)), srvCtx); !ok || id != "c1" {
-		t.Errorf("per-client token: id=%q ok=%v, want c1/true", id, ok)
+	if id, _, ok := verifySSHAuth(strategy.GenerateSSHAuthToken([]byte(perClient)), srvCtx); !ok || id.id != "c1" || !id.perClient {
+		t.Errorf("per-client token: id=%q perClient=%v ok=%v, want c1/true/true", id.id, id.perClient, ok)
 	}
-	if id, _, ok := verifySSHAuth(strategy.GenerateSSHAuthToken(global), srvCtx); !ok || id != "global" {
-		t.Errorf("global token: id=%q ok=%v, want global/true", id, ok)
+	if id, _, ok := verifySSHAuth(strategy.GenerateSSHAuthToken(global), srvCtx); !ok || id.id != "global" || id.perClient {
+		t.Errorf("global token: id=%q perClient=%v ok=%v, want global/false/true", id.id, id.perClient, ok)
 	}
 	if _, _, ok := verifySSHAuth(strategy.GenerateSSHAuthToken([]byte("nope-nope-nope-nope-nope-nope!!")), srvCtx); ok {
 		t.Error("an unknown secret authenticated")
@@ -338,7 +344,7 @@ func TestIMAPServerHandshakeSuccess(t *testing.T) {
 	defer clientConn.Close()
 
 	type result struct {
-		clientID string
+		clientID clientIdentity
 		err      error
 	}
 	done := make(chan result, 1)
@@ -359,8 +365,11 @@ func TestIMAPServerHandshakeSuccess(t *testing.T) {
 		if res.err != nil {
 			t.Fatalf("imapServerHandshake: %v", res.err)
 		}
-		if res.clientID != "global" {
-			t.Errorf("clientID = %q, want global", res.clientID)
+		if res.clientID.id != "global" {
+			t.Errorf("clientID = %q, want global", res.clientID.id)
+		}
+		if res.clientID.perClient {
+			t.Error("the global secret must not come back marked per-client")
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("imapServerHandshake did not return")
@@ -499,7 +508,7 @@ func TestSSHServerHandshakeSuccess(t *testing.T) {
 	defer clientConn.Close()
 
 	type result struct {
-		clientID string
+		clientID clientIdentity
 		err      error
 	}
 	done := make(chan result, 1)
@@ -551,8 +560,11 @@ func TestSSHServerHandshakeSuccess(t *testing.T) {
 		if res.err != nil {
 			t.Fatalf("sshServerHandshake: %v", res.err)
 		}
-		if res.clientID != "global" {
-			t.Errorf("clientID = %q, want global", res.clientID)
+		if res.clientID.id != "global" {
+			t.Errorf("clientID = %q, want global", res.clientID.id)
+		}
+		if res.clientID.perClient {
+			t.Error("the global secret must not come back marked per-client")
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("sshServerHandshake did not return")

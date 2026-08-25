@@ -118,7 +118,7 @@ func b1TLSFor(srvCtx *serverContext) (*tls.Config, *certMinter) {
 // conn is the buffered connection that still replays the ClientHello, so
 // crypto/tls reads the same bytes the gate already inspected - the same
 // mechanism the plain TLS path uses.
-func handleREALITYB1(conn net.Conn, peekBuf []byte, clientID string, secret []byte, clientFlags byte, srvCtx *serverContext, logger *log.Logger) {
+func handleREALITYB1(conn net.Conn, peekBuf []byte, clientID clientIdentity, secret []byte, clientFlags byte, srvCtx *serverContext, logger *log.Logger) {
 	cfg, _ := b1TLSFor(srvCtx)
 
 	// Bound the handshake explicitly. Until now the only thing stopping a

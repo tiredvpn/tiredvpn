@@ -1,6 +1,9 @@
 package server
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"fmt"
 	"sync"
 	"time"
 
@@ -10,7 +13,7 @@ import (
 // shortIDEntry is what a successful short-ID lookup yields: which client sent
 // the ClientHello, and the secret the rest of the session is keyed with.
 type shortIDEntry struct {
-	clientID string
+	clientID clientIdentity
 	secret   []byte
 }
 
@@ -65,7 +68,7 @@ func (i *shortIDIndex) Rebuild(clients []*ClientConfig, globalSecret []byte) {
 			continue
 		}
 		secret := []byte(c.Secret)
-		next[customtls.ShortIDFor(secret)] = shortIDEntry{clientID: c.ID, secret: secret}
+		next[customtls.ShortIDFor(secret)] = shortIDEntry{clientID: registryIdentity(c.ID), secret: secret}
 	}
 
 	if len(globalSecret) > 0 {
@@ -74,7 +77,7 @@ func (i *shortIDIndex) Rebuild(clients []*ClientConfig, globalSecret []byte) {
 		// being silently merged into "global".
 		id := customtls.ShortIDFor(globalSecret)
 		if _, taken := next[id]; !taken {
-			next[id] = shortIDEntry{clientID: "global", secret: globalSecret}
+			next[id] = shortIDEntry{clientID: sharedIdentity(globalClientID), secret: globalSecret}
 		}
 	}
 
@@ -220,4 +223,18 @@ func (c *replayCache) sweepLocked(now time.Time) {
 			delete(c.seen, id)
 		}
 	}
+}
+
+// realityClientIdentity derives the identity a REALITY client is known by from
+// the secret it authenticated with.
+//
+// The value depends on the secret and on nothing else, which is the point: one
+// user reconnecting is recognised across sessions. The consequence is that it
+// says nothing about WHICH client is holding that secret - on the global secret
+// every client in the world produces this same string. It is therefore shared,
+// and a lease keyed on it alone collides. See clientIdentity.
+func realityClientIdentity(secret []byte) clientIdentity {
+	mac := hmac.New(sha256.New, secret)
+	mac.Write([]byte("tiredvpn-client-id-v1"))
+	return sharedIdentity(fmt.Sprintf("reality:%x", mac.Sum(nil)[:8]))
 }

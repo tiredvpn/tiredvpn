@@ -51,7 +51,7 @@ func TestH2StegoHandshakeEndToEnd(t *testing.T) {
 		}
 		hpackDec := hpack.NewDecoder(4096, nil)
 		authenticated := false
-		var authClientID string
+		var authClientID clientIdentity
 		var tunnel *h2TunnelState
 		var connTracked bool
 		serverErr <- nil
