@@ -3119,18 +3119,26 @@ func handleConfusionTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverC
 	}
 }
 
-// tunnelIdentity is what the node ceiling counts. A client id where we have
-// one, so several sessions from one person count once; otherwise the peer
-// address, which over-counts a shared NAT but never under-counts, and a ceiling
-// that errs strict is the safe direction here.
-func tunnelIdentity(conn net.Conn, clientID string) string {
-	if clientID != "" {
-		return clientID
-	}
-	if addr := conn.RemoteAddr(); addr != nil {
-		return "addr:" + addr.String()
-	}
-	return "anonymous"
+// tunnelIdentity is what the node ceiling counts, and an empty result means
+// "do not count this session at all".
+//
+// It used to fall back to the peer address when no client id was supplied. That
+// was wrong, and wrong in the direction that matters: handleTLSConnection
+// reaches this funnel with an empty id after nothing but a plain TLS handshake,
+// which anyone can complete because we serve a certificate to everyone. A peer
+// that never authenticated could therefore both measure the ceiling by opening
+// connections until refused - the exact fingerprint the placement was chosen to
+// avoid - and exhaust it, denying service to real users with no credential at
+// all.
+//
+// So only a session that arrives with an identity is counted. The cost is that
+// transports which authenticate against a single shared secret pass no id and
+// go uncounted, so the ceiling under-counts on those. That is the safe error:
+// it protects less than configured, rather than handing an unauthenticated peer
+// a lever. Closing it properly means each call site stating whether its peer
+// authenticated, which is a signature change across every transport.
+func tunnelIdentity(clientID string) string {
+	return clientID
 }
 
 // handleRawTunnel handles raw tunnel connections
@@ -3145,7 +3153,7 @@ func handleRawTunnel(conn net.Conn, srvCtx *serverContext, logger *log.Logger, c
 	//
 	// A refused client currently has nowhere to go - see nodeCapNoFailover - so
 	// this only fires when an operator has deliberately set a ceiling.
-	release, admitted := nodeCapacity.admit(tunnelIdentity(conn, clientID), time.Now())
+	release, admitted := nodeCapacity.admit(tunnelIdentity(clientID), time.Now())
 	if !admitted {
 		logger.Warn("Node ceiling reached, refusing a new session (client: %s)", clientID)
 		return

@@ -238,3 +238,44 @@ func TestNodeCapFractionWithoutCeiling(t *testing.T) {
 		t.Fatalf("fraction = %v, want 0.25", got)
 	}
 }
+
+// TestNodeCapIgnoresUnauthenticatedSessions is the fix for a hole in the first
+// version of this ceiling, found by asking the question the task asked: can an
+// unauthenticated peer observe it?
+//
+// It could. handleTLSConnection reaches handleRawTunnel with an empty client id
+// after nothing but a plain TLS handshake, which anyone completes because we
+// serve a certificate to everyone. The ceiling therefore counted peers that had
+// proved nothing - so a prober could open connections until refused and read
+// the limit off, and could then hold those slots and lock real users out with
+// no credential at all. Placing the ceiling after "authentication" is only
+// worth anything if every path into it has actually authenticated.
+func TestNodeCapIgnoresUnauthenticatedSessions(t *testing.T) {
+	t.Parallel()
+
+	c := newNodeCap(2, 0, time.Hour)
+	now := time.Now()
+
+	// A hundred sessions that could not say who they are must neither fill the
+	// ceiling nor ever be refused: refusing them would leak the limit just as
+	// surely as admitting them would let it be exhausted.
+	for i := range 100 {
+		if _, ok := c.admit("", now); !ok {
+			t.Fatalf("session %d without an identity was refused, which tells a prober the limit exists", i)
+		}
+	}
+	if got := c.stats(now).Clients; got != 0 {
+		t.Fatalf("%d unauthenticated sessions occupy ceiling slots", got)
+	}
+
+	// And the ceiling still works for the peers it is meant to count.
+	if _, ok := c.admit("alice", now); !ok {
+		t.Fatal("a real client was refused on an empty node")
+	}
+	if _, ok := c.admit("bob", now); !ok {
+		t.Fatal("a second real client was refused below the ceiling")
+	}
+	if _, ok := c.admit("carol", now); ok {
+		t.Fatal("a third real client was admitted past a ceiling of two")
+	}
+}

@@ -111,11 +111,12 @@ func initNodeCap(cfg *Config) {
 
 // admit reserves a slot for an authenticated session and returns the release.
 //
-// identity is the client id where we have one. Sessions that arrive without one
-// are counted individually, which can only make the ceiling stricter than the
-// truth, never looser.
+// An empty identity means the caller could not say who this is, which on this
+// funnel means the peer did not authenticate - see tunnelIdentity. Those are
+// not counted and never refused: counting them would let anyone who can
+// complete a plain TLS handshake measure the ceiling and then fill it.
 func (c *nodeCap) admit(identity string, now time.Time) (release func(), ok bool) {
-	if c == nil {
+	if c == nil || identity == "" {
 		return func() {}, true
 	}
 
