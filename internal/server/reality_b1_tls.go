@@ -10,6 +10,7 @@ import (
 	"github.com/xtaci/smux"
 
 	"github.com/tiredvpn/tiredvpn/internal/log"
+	"github.com/tiredvpn/tiredvpn/internal/mux"
 	"github.com/tiredvpn/tiredvpn/internal/protocol"
 	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 )
@@ -219,7 +220,16 @@ func handleREALITYB1(conn net.Conn, peekBuf []byte, clientID string, secret []by
 		return
 	}
 
-	sess, err := smux.Server(tlsConn, smux.DefaultConfig())
+	// No keepalive on either side of a B1 session. smux's default NOP every ten
+	// seconds is a perfectly periodic pulse that identifies the session from
+	// timestamps alone - see mux.SmuxSilentConfig.
+	//
+	// This needs no version negotiation, which is why it lands here and not on
+	// the legacy path. B1 has never shipped, so every peer that ever speaks it
+	// has this build's behaviour by construction; the legacy transport has
+	// deployed clients that would kill an idle session after thirty seconds of
+	// the silence, and it keeps its keepalive until it is retired.
+	sess, err := smux.Server(tlsConn, mux.SmuxSilentConfig())
 	if err != nil {
 		logger.Error("REALITY B1: smux server: %v", err)
 		return

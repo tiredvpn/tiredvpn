@@ -279,10 +279,26 @@ func (r *REALITYStrategy) Probe(ctx context.Context, target string) error {
 // self-contained conn (see realityConn): the returned conn owns its own TCP,
 // framing and smux session, and closing it tears down only that stack.
 //
-// Smux session reuse is intentionally disabled: TSPU (Russian DPI) throttles
-// the underlying TCP after the first stream finishes, so any subsequent stream
-// on the same TCP arrives after an idle gap and gets dropped. A fresh TCP per
-// request avoids this — at the cost of one REALITY handshake (~200ms) each time.
+// Smux session reuse is disabled here, and the reason on record needs
+// qualifying rather than repeating.
+//
+// What was observed, around early 2025: TSPU throttled the underlying TCP after
+// the first stream finished, so a later stream on the same connection arrived
+// after an idle gap and was dropped. The conclusion drawn was that reuse is
+// unusable, and a fresh TCP per request has been the behaviour since, at the
+// cost of a REALITY handshake of roughly 200 ms each time.
+//
+// What is different now: the mechanism needs an idle gap of some length, and in
+// this configuration no such gap occurs. smux keeps the session busy with a NOP
+// every ten seconds (see mux.SmuxSilentConfig for why that is its own problem),
+// so a reused connection is never quiet for long enough to be throttled by it.
+// The original measurement predates that, and was never repeated afterwards.
+//
+// So this is not "the old note was wrong". It is: the observation stands for
+// the configuration it was made in, the configuration has since changed, and
+// nobody has re-measured. Turning reuse back on is a decision that needs a
+// fresh measurement first - against a live TSPU path, watching for a throttle
+// after an idle gap - not an argument from either of these comments.
 //
 // The strategy holds NO shared session state: multiple callers (TUN tunnel,
 // proxy pool, health checker) dial concurrently, and one caller closing its
