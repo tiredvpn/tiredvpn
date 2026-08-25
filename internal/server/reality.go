@@ -485,8 +485,13 @@ func handleREALITYMuxSession(conn net.Conn, srvCtx *serverContext, logger *log.L
 // handleREALITYUnauthorized proxies unauthorized REALITY clients to the configured
 // cover domain. coverDomain is admin-controlled (Config.REALITYCoverDomain), not
 // client-provided SNI, so there is no SSRF via attacker-controlled hostname.
+// realityDonorPort is the port unauthenticated connections are forwarded to.
+// A variable rather than a constant so a test can point it at a local listener;
+// production never changes it.
+var realityDonorPort = "443"
+
 func handleREALITYUnauthorized(conn net.Conn, clientHello []byte, coverDomain string, logger *log.Logger) {
-	dest := net.JoinHostPort(coverDomain, "443")
+	dest := net.JoinHostPort(coverDomain, realityDonorPort)
 
 	logger.Info("REALITY-UNAUTH: Proxying to %s", dest)
 
@@ -499,16 +504,22 @@ func handleREALITYUnauthorized(conn net.Conn, clientHello []byte, coverDomain st
 	}
 	defer destConn.Close()
 
-	// Remove REALITY extension from ClientHello
-	strippedClientHello, err := RemoveREALITYExtension(clientHello)
-	if err != nil {
-		// If stripping fails, forward original (less safe but functional)
-		logger.Warn("REALITY-UNAUTH: Failed to strip extension, forwarding original")
-		strippedClientHello = clientHello
-	}
-
-	// Forward ClientHello to destination
-	if _, err := destConn.Write(strippedClientHello); err != nil {
+	// Forward the ClientHello byte for byte. Not stripped - stripping it here
+	// is what turned this cover into a second failure.
+	//
+	// The transcript hash covers the ClientHello as sent. Remove the padding
+	// extension on the way to the donor and the donor hashes one message while
+	// the client hashes another, so Finished never verifies and the client ends
+	// the handshake with a decrypt error instead of a page. The cover was
+	// breaking exactly the clients it exists to serve.
+	//
+	// Stripping made sense on the assumption that the extension is ours and
+	// carries credentials. Reaching this function means authentication did not
+	// succeed, so that assumption is the one thing we know to be doubtful: the
+	// extension is most likely a real padding extension from a real client. And
+	// RFC 7685 requires the receiver to ignore its content, so even our own
+	// credentials sitting in it are just bytes the donor discards.
+	if _, err := destConn.Write(clientHello); err != nil {
 		logger.Error("REALITY-UNAUTH: Failed to send ClientHello: %v", err)
 		return
 	}
