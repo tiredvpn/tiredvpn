@@ -81,13 +81,99 @@ func helloNoPadding(t *testing.T, total int) []byte {
 // the extension and not to the length.
 func TestNoPaddingExtensionAnswersAtEverySize(t *testing.T) {
 	srvCtx := b1PaddingCtx(t, true, true)
+	requireNoCoverDomain(t, srvCtx)
 
-	for _, size := range []int{200, 238, 249, 253, 255, 256, 257, 259, 263, 279, 361, 495, 512, 700, 1012, 1500} {
+	// A stepped range, not a handful of points. Three points misled this
+	// investigation twice: once into a length hypothesis, once into a second
+	// failure point that does not exist.
+	for size := 200; size <= 2000; size += 7 {
 		hello := helloNoPadding(t, size)
 		if answered, _ := answersClientHello(t, srvCtx, hello); !answered {
-			t.Errorf("CH %d bytes without a padding extension got no answer", size)
+			t.Fatalf("CH %d bytes without a padding extension got no answer", size)
 		}
 	}
+}
+
+// requireNoCoverDomain is the acceptance criterion that keeps this suite honest.
+//
+// The defect only exists when REALITYCoverDomain is unset: with a cover domain
+// the server proxies unauthenticated hellos to a donor and everything looks
+// fine. Every test that configures one would pass over a broken server, which
+// is precisely why the defect survived - it lived only in the configuration
+// production runs and tests do not.
+func requireNoCoverDomain(t *testing.T, srvCtx *serverContext) {
+	t.Helper()
+	if srvCtx.cfg.REALITYCoverDomain != "" {
+		t.Fatalf("this test must run without a cover domain, got %q: with one set it "+
+			"cannot observe the behaviour it exists to check", srvCtx.cfg.REALITYCoverDomain)
+	}
+}
+
+// TestPaddingLengthDecidesRouting pins the single condition that explains the
+// whole picture: DetectREALITYExtension routes a ClientHello into the REALITY
+// handler when its padding extension is at least REALITYExtensionLength bytes,
+// and not otherwise. The cutoff is on the padding, not on the hello.
+//
+// Measured against the pre-fix code, padding of 63 bytes passed and 64 bytes
+// was dropped, at hello sizes from 121 to 521 - which is what rules the length
+// hypothesis out rather than merely arguing against it.
+func TestPaddingLengthDecidesRouting(t *testing.T) {
+	srvCtx := b1PaddingCtx(t, true, true)
+	requireNoCoverDomain(t, srvCtx)
+
+	for padLen := 0; padLen <= 300; padLen++ {
+		hello := helloWithPaddingLen(t, "www.microsoft.com", padLen)
+
+		detected := DetectREALITYExtension(hello)
+		wantDetected := padLen >= customtls.REALITYExtensionLength
+		if detected != wantDetected {
+			t.Fatalf("padLen %d: DetectREALITYExtension = %v, want %v", padLen, detected, wantDetected)
+		}
+
+		// Routed or not, the answer must be the same: something comes back.
+		if answered, _ := answersClientHello(t, srvCtx, hello); !answered {
+			t.Fatalf("padLen %d (CH %d bytes): no answer", padLen, len(hello))
+		}
+	}
+}
+
+// helloWithPaddingLen builds a ClientHello with a padding extension of exactly
+// padLen bytes.
+func helloWithPaddingLen(t *testing.T, sni string, padLen int) []byte {
+	t.Helper()
+
+	var exts []byte
+	name := []byte(sni)
+	sniBody := []byte{0x00}
+	sniBody = binary.BigEndian.AppendUint16(sniBody, uint16(len(name)))
+	sniBody = append(sniBody, name...)
+	list := binary.BigEndian.AppendUint16(nil, uint16(len(sniBody)))
+	list = append(list, sniBody...)
+	exts = binary.BigEndian.AppendUint16(exts, 0x0000)
+	exts = binary.BigEndian.AppendUint16(exts, uint16(len(list)))
+	exts = append(exts, list...)
+
+	sv := []byte{0x02, 0x03, 0x04}
+	exts = binary.BigEndian.AppendUint16(exts, 0x002b)
+	exts = binary.BigEndian.AppendUint16(exts, uint16(len(sv)))
+	exts = append(exts, sv...)
+
+	exts = binary.BigEndian.AppendUint16(exts, 0x0015)
+	exts = binary.BigEndian.AppendUint16(exts, uint16(padLen))
+	exts = append(exts, make([]byte, padLen)...)
+
+	b := []byte{0x03, 0x03}
+	b = append(b, bytes.Repeat([]byte{0x42}, 32)...)
+	b = append(b, 32)
+	b = append(b, bytes.Repeat([]byte{0x43}, 32)...)
+	b = binary.BigEndian.AppendUint16(b, 2)
+	b = binary.BigEndian.AppendUint16(b, 0x1301)
+	b = append(b, 1, 0)
+	b = binary.BigEndian.AppendUint16(b, uint16(len(exts)))
+	b = append(b, exts...)
+
+	hs := append([]byte{0x01, byte(len(b) >> 16), byte(len(b) >> 8), byte(len(b))}, b...)
+	return append([]byte{0x16, 0x03, 0x01, byte(len(hs) >> 8), byte(len(hs))}, hs...)
 }
 
 // TestRealClientHellosGetServerHello is the strongest form of the check: the
@@ -101,6 +187,7 @@ func TestNoPaddingExtensionAnswersAtEverySize(t *testing.T) {
 // problem.
 func TestRealClientHellosGetServerHello(t *testing.T) {
 	srvCtx := b1PaddingCtx(t, true, true)
+	requireNoCoverDomain(t, srvCtx)
 
 	for _, profile := range []string{"edge", "ios", "chrome120", "firefox120", "safari", "chrome", "firefox"} {
 		fp, ok := customtls.LookupFingerprint(profile)

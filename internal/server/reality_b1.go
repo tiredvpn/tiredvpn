@@ -19,6 +19,16 @@ import (
 var (
 	realityAuthB1Total     atomic.Uint64
 	realityAuthLegacyTotal atomic.Uint64
+
+	// realityDonorDialFailTotal counts unauthenticated connections we could not
+	// hand to a donor because the dial failed.
+	//
+	// It exists because that failure is otherwise invisible. Where an operator
+	// relies on -reality-cover-domain to cover the padding-extension behaviour
+	// on a server that has not been updated, a donor that stops being reachable
+	// silently takes the cover with it: the connection ends up closed, which is
+	// the shape the cover was meant to avoid, and nothing in the log says so.
+	realityDonorDialFailTotal atomic.Uint64
 )
 
 // realityB1Gate holds the state the gate needs across connections.
@@ -297,6 +307,7 @@ func realityDonorFallback(conn net.Conn, peekBuf []byte, srvCtx *serverContext, 
 	destConn, err := net.DialTimeout("tcp", net.JoinHostPort(dest, "443"), 10*time.Second)
 	if err != nil {
 		logger.Debug("REALITY B1: donor %s unreachable: %v", dest, err)
+		realityDonorDialFailTotal.Add(1)
 		return false
 	}
 	defer destConn.Close()
@@ -375,6 +386,11 @@ func writeREALITYAuthMetrics(w io.Writer) {
 	fmt.Fprintf(w, "# HELP reality_auth_b1_total REALITY clients authenticated via the B1 transport\n")
 	fmt.Fprintf(w, "# TYPE reality_auth_b1_total counter\n")
 	fmt.Fprintf(w, "reality_auth_b1_total %d\n", realityAuthB1Total.Load())
+	fmt.Fprintf(w, "\n")
+
+	fmt.Fprintf(w, "# HELP reality_donor_dial_fail_total Unauthenticated connections that could not be handed to a donor because the dial failed\n")
+	fmt.Fprintf(w, "# TYPE reality_donor_dial_fail_total counter\n")
+	fmt.Fprintf(w, "reality_donor_dial_fail_total %d\n", realityDonorDialFailTotal.Load())
 	fmt.Fprintf(w, "\n")
 
 	fmt.Fprintf(w, "# HELP reality_auth_legacy_total REALITY clients authenticated via the legacy padding-extension transport\n")

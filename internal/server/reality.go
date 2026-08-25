@@ -89,6 +89,19 @@ func DetectREALITYExtension(data []byte) bool {
 		// Padding extension type: 0x0015 with enough data for PubKey+AuthToken.
 		// Handle truncated extension body: DPI may drop the trailing random padding
 		// while the REALITY auth bytes (first 64 bytes of extension body) are still present.
+		// The >=64 test below is what decides everything about this behaviour,
+		// so it is worth stating plainly: a padding extension of 64 bytes or
+		// more routes the connection into the REALITY handler, and anything
+		// smaller does not. Measured, not assumed - padLen 63 goes down the
+		// ordinary path, padLen 64 goes to REALITY, at any ClientHello size.
+		//
+		// That one condition explains the whole picture that looked like a
+		// length problem. BoringSSL and OpenSSL add this extension to hellos
+		// that would otherwise be 256 to 511 bytes, which is why failures
+		// appeared to start at 256; and when the padding needed is small the
+		// extension falls under 64 bytes and the connection passes again, which
+		// is why the failures appeared to stop further up. Neither boundary is
+		// ours, and there is no second failure point to look for.
 		if extType == customtls.PaddingExtensionType {
 			availableBody := extEnd - extDataStart
 			if availableBody > extLen {
@@ -481,6 +494,7 @@ func handleREALITYUnauthorized(conn net.Conn, clientHello []byte, coverDomain st
 	destConn, err := net.DialTimeout("tcp", dest, 10*time.Second)
 	if err != nil {
 		logger.Error("REALITY-UNAUTH: Failed to connect to %s: %v", dest, err)
+		realityDonorDialFailTotal.Add(1)
 		return
 	}
 	defer destConn.Close()
