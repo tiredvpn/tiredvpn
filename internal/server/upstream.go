@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
-	"io"
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -13,6 +13,7 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/protocol"
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
+	"github.com/tiredvpn/tiredvpn/internal/tun"
 )
 
 // defaultUpstreamSockBuf is the SO_RCVBUF/SO_SNDBUF size set on the TCP
@@ -217,7 +218,9 @@ func (d *UpstreamDialer) Dial(ctx context.Context, targetAddr string) (net.Conn,
 //
 // Returns the live stego conn (a transparent byte stream over which [len:4][pkt:N]
 // frames flow in both directions, exactly as between a native client and exit) and
-// the [status:1][serverIP:4][clientIP:4] response the upstream assigned.
+// the upstream's full raw handshake response — the version-dependent base layout
+// [status:1][serverIP:4][clientIP:4][flags:1]... plus the trailing 32-byte
+// dual-stack block [serverIP6:16][clientIP6:16] when the exit negotiated it.
 func (d *UpstreamDialer) DialTUN(ctx context.Context, tunHandshake []byte, origin string) (net.Conn, []byte, error) {
 	log.Debug("Upstream TUN dial via %s", d.upstreamAddr)
 
@@ -238,12 +241,45 @@ func (d *UpstreamDialer) DialTUN(ctx context.Context, tunHandshake []byte, origi
 		return nil, nil, err
 	}
 
-	// Read the handshake response: [status:1][serverIP:4][clientIP:4]. The upstream
-	// frames it as a single stego payload; reassemble up to 9 bytes.
-	resp := make([]byte, 9)
-	if _, err := io.ReadFull(stegoConn, resp); err != nil {
+	// Read the handshake response. The upstream frames it as a single stego
+	// payload, so one Read returns the version-dependent base layout; when the
+	// flags byte advertises dual-stack, ReadTUNHandshakeResponse additionally
+	// consumes the trailing 32-byte [serverIP6:16][clientIP6:16] block. The
+	// full raw response (base + block) is returned so callers can forward it
+	// to the downstream client verbatim. An old exit never sets the dual-stack
+	// flag, so its response is read exactly as before (base only, no extra
+	// read). This also fixes a latent desync: the previous fixed 9-byte read
+	// left the tail of an extended (port-hop) response in the stream.
+	//
+	// Deployment-order note — an old relay in the chain CORRUPTS the session,
+	// it does not degrade it. The relay forwards the CLIENT's handshake
+	// version upstream verbatim, so a new exit answers a v0x04 client with the
+	// dual-stack flag and the 32-byte v6 block even when the hop in between is
+	// old. That hop reads a fixed 9 bytes, hands those nine to the client and
+	// then starts a transparent byte bridge, so the unread flags byte and the
+	// v6 block travel downstream as tunnel payload: the client either misses
+	// the flag (and the 33 stray bytes are parsed as a [len:4] frame header,
+	// desyncing the stream) or picks it up out of a coalesced read — the
+	// outcome depends on segmentation, not on any fallback path. The same is
+	// true of every extended response shape (port-hop v1/v2, MTU-probe flags),
+	// which is what the full-response read above fixes for NEW relays.
+	//
+	// There is no in-band way for the exit to detect an old hop while keeping
+	// the request format backward compatible: an old relay copies everything
+	// ahead of the TRO1 origin trailer verbatim and rewrites only the trailer
+	// itself, so a capability marker in the prefix gets replayed unchanged
+	// (false "chain is new"), and a marker that replaces the trailer costs an
+	// old exit the origin it needs for per-client lease keys. Only deployment
+	// order protects the chain: upgrade every exit and every relay BEFORE
+	// enabling `-tun-ipv6 dual` on clients.
+	resp, err := tun.ReadTUNHandshakeResponse(stegoConn)
+	if err != nil {
 		tlsConn.Close()
 		return nil, nil, err
+	}
+	if len(resp) < 9 {
+		tlsConn.Close()
+		return nil, nil, fmt.Errorf("short upstream TUN handshake response: %d bytes", len(resp))
 	}
 
 	if resp[0] != 0x00 {

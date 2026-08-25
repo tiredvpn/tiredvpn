@@ -202,3 +202,49 @@ func TestApplyUDPGate(t *testing.T) {
 		t.Fatal("UDP up should re-enable QUIC strategies")
 	}
 }
+
+// TestCheckerAltAddrGate covers the dual-address gate: with one family dead and
+// the other alive the checker must report connectivity, because the manager
+// will dial the live one. Before this a client with both addresses configured
+// and a blocked IPv4 stayed in "waiting for network" forever.
+func TestCheckerAltAddrGate(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	live := ln.Addr().String()
+
+	// A port nothing listens on: closed immediately, so the dial fails fast.
+	dead, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	deadAddr := dead.Addr().String()
+	dead.Close()
+
+	t.Run("primary dead, alt live", func(t *testing.T) {
+		c := NewConnectivityChecker(deadAddr, 2*time.Second, false)
+		c.SetAltAddr(live)
+		if err := c.checkTCPAny(context.Background()); err != nil {
+			t.Fatalf("checkTCPAny = %v, want nil (alt is reachable)", err)
+		}
+	})
+
+	t.Run("both dead", func(t *testing.T) {
+		c := NewConnectivityChecker(deadAddr, 500*time.Millisecond, false)
+		c.SetAltAddr(deadAddr + "0")
+		if err := c.checkTCPAny(context.Background()); err == nil {
+			t.Fatal("checkTCPAny = nil, want an error when neither address answers")
+		}
+	})
+
+	t.Run("no alt configured", func(t *testing.T) {
+		c := NewConnectivityChecker(live, 2*time.Second, false)
+		c.SetAltAddr("")
+		c.SetAltAddr(live) // duplicate of the primary, must be ignored
+		if got := c.addrsToTry(); len(got) != 1 || got[0] != live {
+			t.Fatalf("addrsToTry = %v, want just the primary", got)
+		}
+	})
+}

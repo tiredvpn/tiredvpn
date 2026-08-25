@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -49,6 +50,12 @@ type IPPoolConfig struct {
 	// ReservedIPs are IPs that should not be allocated (besides ServerIP)
 	ReservedIPs []string
 
+	// NetworkV6 is the optional IPv6 ULA prefix for dual-stack TUN clients
+	// (e.g., "fd00:10:8::/64"). Empty = IPv4-only pool. No leases are ever
+	// stored for v6: a client's v6 address is derived deterministically from
+	// its v4 lease (see ClientIP6), so the Redis schema stays untouched.
+	NetworkV6 string
+
 	// KeyPrefix is the Redis key namespace for lease keys. Empty =
 	// DefaultRedisPrefix. It must match the RedisStore prefix, otherwise two
 	// server instances sharing one Redis would hand out the same tunnel IPs.
@@ -65,6 +72,10 @@ type IPPool struct {
 	endIP    uint32 // Last allocatable IP
 	reserved map[uint32]bool
 	mu       sync.RWMutex
+
+	// networkV6 is the parsed dual-stack prefix, nil when the pool is
+	// IPv4-only. Immutable after construction.
+	networkV6 *net.IPNet
 
 	// Backend storage
 	redis    *redis.Client
@@ -94,6 +105,14 @@ func NewIPPool(cfg IPPoolConfig, redisClient *redis.Client) (*IPPool, error) {
 		return nil, fmt.Errorf("only IPv4 supported")
 	}
 
+	// Optional dual-stack prefix. Validated here (fails server startup via
+	// initIPPool) rather than per-client so a bad -ip-pool-v6 is caught at
+	// boot instead of silently degrading to IPv4-only handshakes.
+	networkV6, err := parsePoolV6(cfg.NetworkV6)
+	if err != nil {
+		return nil, err
+	}
+
 	networkIP := binary.BigEndian.Uint32(network.IP.To4())
 	broadcastIP := networkIP | (0xFFFFFFFF >> ones)
 
@@ -117,16 +136,17 @@ func NewIPPool(cfg IPPoolConfig, redisClient *redis.Client) (*IPPool, error) {
 	cfg.KeyPrefix = NormalizeRedisPrefix(cfg.KeyPrefix)
 
 	pool := &IPPool{
-		config:   cfg,
-		network:  network,
-		serverIP: serverIP,
-		prefix:   cfg.KeyPrefix,
-		startIP:  startIP,
-		endIP:    endIP,
-		reserved: reserved,
-		redis:    redisClient,
-		leases:   make(map[string]*IPLease),
-		byClient: make(map[string]string),
+		config:    cfg,
+		network:   network,
+		serverIP:  serverIP,
+		prefix:    cfg.KeyPrefix,
+		startIP:   startIP,
+		endIP:     endIP,
+		reserved:  reserved,
+		networkV6: networkV6,
+		redis:     redisClient,
+		leases:    make(map[string]*IPLease),
+		byClient:  make(map[string]string),
 	}
 
 	// Load existing leases
@@ -135,9 +155,161 @@ func NewIPPool(cfg IPPoolConfig, redisClient *redis.Client) (*IPPool, error) {
 	}
 
 	poolSize := int(endIP-startIP+1) - len(reserved)
-	log.Info("IP Pool initialized: %s (size=%d, server=%s)", cfg.Network, poolSize, cfg.ServerIP)
+	if networkV6 != nil {
+		log.Info("IP Pool initialized: %s (size=%d, server=%s) + dual-stack %s (server=%s)",
+			cfg.Network, poolSize, cfg.ServerIP, networkV6, pool.ServerIP6())
+	} else {
+		log.Info("IP Pool initialized: %s (size=%d, server=%s)", cfg.Network, poolSize, cfg.ServerIP)
+	}
 
 	return pool, nil
+}
+
+// parsePoolV6 parses and validates the optional dual-stack prefix. Returns
+// (nil, nil) for an empty pool. The prefix must be:
+//
+//   - an IPv6 CIDR;
+//   - a Unique Local Address prefix (fc00::/7). The in-tunnel v6 space is
+//     NAT66'd out of the exit exactly like the RFC1918 v4 pool is NAT44'd, so
+//     it must be private. Anything else is a misconfiguration that either
+//     hijacks somebody else's address space (global unicast), is unroutable
+//     off-link (link-local), is not a unicast address at all (multicast), or
+//     collides with the loopback/unspecified block (::/N, whose derived server
+//     address would be ::1);
+//   - short enough to leave a 32-bit host part (prefix length <= 96) so a
+//     client's IPv4 address can be embedded losslessly in the low 32 bits of
+//     its derived IPv6 address.
+func parsePoolV6(cidr string) (*net.IPNet, error) {
+	if cidr == "" {
+		return nil, nil
+	}
+	ip, network, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid IPv6 pool %q: %w", cidr, err)
+	}
+	if ip.To4() != nil {
+		return nil, fmt.Errorf("IPv6 pool %q is not an IPv6 CIDR", cidr)
+	}
+	ones, bits := network.Mask.Size()
+	if bits != 128 {
+		return nil, fmt.Errorf("IPv6 pool %q is not an IPv6 CIDR", cidr)
+	}
+	if ones > 96 {
+		return nil, fmt.Errorf("IPv6 pool %q prefix length /%d leaves <32 host bits; need /96 or shorter to embed client IPv4 addresses", cidr, ones)
+	}
+	if !isULAPrefix(network.IP) {
+		return nil, fmt.Errorf("IPv6 pool %q is not a Unique Local Address prefix (fc00::/7); the in-tunnel pool is NAT66'd and must be private, e.g. fd00:10:8::/64", cidr)
+	}
+	return &net.IPNet{IP: network.IP.To16(), Mask: network.Mask}, nil
+}
+
+// ValidateIPPoolV6 checks an -ip-pool-v6 value against the same rules the pool
+// itself applies, so a misconfigured prefix is rejected at flag-parsing time
+// with the exact reason rather than later, from inside NewIPPool. An empty
+// value is valid and means "no dual-stack".
+func ValidateIPPoolV6(cidr string) error {
+	_, err := parsePoolV6(cidr)
+	return err
+}
+
+// isULAPrefix reports whether ip falls in fc00::/7 — the Unique Local Address
+// block (RFC 4193), whose first seven bits are 1111110.
+func isULAPrefix(ip net.IP) bool {
+	v6 := ip.To16()
+	if v6 == nil || ip.To4() != nil {
+		return false
+	}
+	return v6[0]&0xfe == 0xfc
+}
+
+// errReservedTunnelIP6 is returned by deriveClientIP6 when the address a
+// client's IPv4 lease would derive is one of the prefix's reserved addresses
+// (see reservedClientV4 below). Exported to callers as a wrapped error so a
+// collision surfaces in logs instead of two peers silently sharing an address.
+var errReservedTunnelIP6 = errors.New("derived tunnel IPv6 is reserved")
+
+// deriveServerIP6 returns the server's address inside the dual-stack prefix:
+// prefix::1. This is THE single derivation rule for the whole server — the
+// pool, the handshake and the TUN setup all go through here.
+func deriveServerIP6(prefix *net.IPNet) net.IP {
+	ip := make(net.IP, net.IPv6len)
+	copy(ip, prefix.IP.To16())
+	ip[net.IPv6len-1] = 1
+	return ip
+}
+
+// reservedClientV4 reports whether a v4 lease would derive a reserved address
+// inside the prefix. Since the prefix comes back masked from net.ParseCIDR,
+// the only non-zero host bits are the embedded v4 address, so exactly two v4
+// values are unusable: 0.0.0.0 derives the prefix's subnet-router anycast
+// address (prefix::) and 0.0.0.1 derives the server's own prefix::1
+// (deriveServerIP6). Neither can appear in a sane -ip-pool, but the v4 pool
+// bounds are configurable, so the collision is rejected rather than assumed
+// away.
+func reservedClientV4(v4 net.IP) bool {
+	return v4.Equal(net.IPv4zero) || v4.Equal(net.IPv4(0, 0, 0, 1))
+}
+
+// deriveClientIP6 returns a client's address inside the dual-stack prefix:
+// the prefix with the client's IPv4 address embedded in the low 32 bits
+// (prefix | v4-uint32). The mapping is injective, so the packet dispatcher
+// can recover the v4 lease key (and thus the client registry entry) from the
+// low 32 bits of any pool-v6 destination.
+//
+// An error (rather than a fallback address) is returned for a nil/non-v4
+// lease and for the reserved derivations: any fallback would be shared by
+// every client that hits it, breaking both injectivity and the reverse
+// dispatch lookup.
+func deriveClientIP6(prefix *net.IPNet, clientIP net.IP) (net.IP, error) {
+	v4 := clientIP.To4()
+	if v4 == nil {
+		return nil, fmt.Errorf("cannot derive tunnel IPv6: client lease %v is not IPv4", clientIP)
+	}
+	if reservedClientV4(v4) {
+		return nil, fmt.Errorf("client lease %v derives %s: %w", v4, prefixWithV4(prefix, v4), errReservedTunnelIP6)
+	}
+	return prefixWithV4(prefix, v4), nil
+}
+
+// prefixWithV4 embeds a 4-byte IPv4 address in the low 32 bits of the prefix.
+func prefixWithV4(prefix *net.IPNet, v4 net.IP) net.IP {
+	ip := make(net.IP, net.IPv6len)
+	copy(ip, prefix.IP.To16())
+	copy(ip[12:], v4)
+	return ip
+}
+
+// DualStack reports whether the pool hands out derived IPv6 tunnel addresses
+// in addition to IPv4 leases.
+func (p *IPPool) DualStack() bool {
+	return p.networkV6 != nil
+}
+
+// V6Prefix returns the dual-stack prefix (masked network), or nil for an
+// IPv4-only pool. Callers must not mutate the returned value.
+func (p *IPPool) V6Prefix() *net.IPNet {
+	return p.networkV6
+}
+
+// ServerIP6 returns the server's tunnel IPv6 address (prefix::1), or nil for
+// an IPv4-only pool.
+func (p *IPPool) ServerIP6() net.IP {
+	if p.networkV6 == nil {
+		return nil
+	}
+	return deriveServerIP6(p.networkV6)
+}
+
+// ClientIP6 derives the tunnel IPv6 address for the client holding the given
+// IPv4 lease (prefix with the v4 address in the low 32 bits). Returns
+// (nil, nil) for an IPv4-only pool; a non-nil error means the lease has no
+// usable v6 address (reserved derivation or non-IPv4 lease) and the client
+// must stay IPv4-only.
+func (p *IPPool) ClientIP6(clientIPv4 net.IP) (net.IP, error) {
+	if p.networkV6 == nil {
+		return nil, nil
+	}
+	return deriveClientIP6(p.networkV6, clientIPv4)
 }
 
 // redisKey returns Redis key for IP lease
