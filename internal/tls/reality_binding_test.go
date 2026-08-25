@@ -253,9 +253,10 @@ func TestBindingRejectsTruncatedRecords(t *testing.T) {
 	})
 }
 
-// TestBindingIsOneWriteAndOneRecordSized checks two things the wire shape
+// TestBindingIsOneWriteAndOneRecordSized checks three things the wire shape
 // depends on: the frame goes out in a single Write (so it becomes one TLS
-// record), and its size varies between connections.
+// record), its size varies between connections, and it never lands small
+// enough to stand out on its own.
 func TestBindingIsOneWriteAndOneRecordSized(t *testing.T) {
 	secret := []byte("shared-secret")
 	ekm := testEKM(t)
@@ -273,6 +274,13 @@ func TestBindingIsOneWriteAndOneRecordSized(t *testing.T) {
 		payload := total - proofLen - 1 - 2
 		if payload < minBindingPad || payload > maxBindingPad {
 			t.Fatalf("padding %d outside [%d, %d]", payload, minBindingPad, maxBindingPad)
+		}
+		// The floor exists because the first application record's size is a
+		// signal in itself: measured on a real capture it is the only thing in
+		// that position, every connection, so a 99-byte version of it is a
+		// distinctive small record right after the handshake.
+		if total < 200 {
+			t.Fatalf("frame is %d bytes; the floor on padding is meant to keep it clear of that", total)
 		}
 		sizes[total] = true
 	}

@@ -57,7 +57,13 @@ const (
 	// minBindingPad and maxBindingPad bound the random padding on each record.
 	// The maximum is also enforced on read: a peer that lies about padLen must
 	// not be able to make us allocate an arbitrary buffer.
-	minBindingPad = 64
+	//
+	// The floor is 200 rather than a token 64: at the bottom of the old range
+	// the whole record came to 99 bytes, which is small enough to stand out on
+	// its own. Raising the floor costs nothing - the padding is discarded on
+	// arrival either way - and it is the one part of this record's shape we can
+	// fix without touching the protocol.
+	minBindingPad = 200
 	maxBindingPad = 512
 
 	// dirClientToServer is mixed into the proof for domain separation. There is
