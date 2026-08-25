@@ -177,6 +177,150 @@ func TestSendReconnectHandshake(t *testing.T) {
 	})
 }
 
+// TestSendReconnectHandshakeRequestFrame pins the 8 bytes put on the wire. The
+// server restores the session from them, so a wrong IP offset or a
+// little-endian MTU silently hands the client a new lease (or a bogus MTU) on
+// every reconnect.
+func TestSendReconnectHandshakeRequestFrame(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		ip       net.IP
+		mtu      int
+		wantIP   [4]byte
+		wantMTU  [2]byte
+		wantVers byte
+	}{
+		{"v4 lease", net.IPv4(10, 8, 0, 7), 1400, [4]byte{10, 8, 0, 7}, [2]byte{0x05, 0x78}, 0x03},
+		{"16-byte v4-mapped form", net.ParseIP("10.8.0.9"), 1280, [4]byte{10, 8, 0, 9}, [2]byte{0x05, 0x00}, 0x03},
+		{"no lease yet", nil, 1500, [4]byte{0, 0, 0, 0}, [2]byte{0x05, 0xdc}, 0x03},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cli, srv := net.Pipe()
+			defer cli.Close()
+			defer srv.Close()
+
+			frameCh := make(chan []byte, 1)
+			go func() {
+				hs := make([]byte, 8)
+				if _, err := io.ReadFull(srv, hs); err != nil {
+					frameCh <- nil
+					return
+				}
+				frameCh <- hs
+				srv.Write([]byte{0x00, 10, 8, 0, 1, 10, 8, 0, 2})
+			}()
+
+			if _, _, _, _, err := sendReconnectHandshake(cli, tc.ip, tc.mtu, false); err != nil {
+				t.Fatalf("sendReconnectHandshake: %v", err)
+			}
+			hs := <-frameCh
+			if hs == nil {
+				t.Fatal("server never received the handshake")
+			}
+			if hs[0] != 0x02 {
+				t.Errorf("mode = 0x%02x, want 0x02 (TUN)", hs[0])
+			}
+			if [4]byte(hs[1:5]) != tc.wantIP {
+				t.Errorf("current IP = %v, want %v", hs[1:5], tc.wantIP)
+			}
+			if [2]byte(hs[5:7]) != tc.wantMTU {
+				t.Errorf("MTU bytes = % x, want % x (big-endian %d)", hs[5:7], tc.wantMTU, tc.mtu)
+			}
+			if hs[7] != tc.wantVers {
+				t.Errorf("version = 0x%02x, want 0x%02x", hs[7], tc.wantVers)
+			}
+		})
+	}
+}
+
+// TestSendReconnectHandshakeFailures covers the paths where the peer misbehaves.
+// Each one must surface an error: returning a zero IP with err==nil would have
+// the caller reconfigure the TUN device to 0.0.0.0 and blackhole the tunnel.
+func TestSendReconnectHandshakeFailures(t *testing.T) {
+	// serveThen reads the handshake, runs fn, and always ends by closing its
+	// side so no client read can hang.
+	serveThen := func(srv net.Conn, fn func(net.Conn)) {
+		go func() {
+			defer srv.Close()
+			hs := make([]byte, 8)
+			if _, err := io.ReadFull(srv, hs); err != nil {
+				return
+			}
+			if fn != nil {
+				fn(srv)
+			}
+		}()
+	}
+
+	t.Run("write to a closed conn", func(t *testing.T) {
+		cli, srv := net.Pipe()
+		cli.Close()
+		srv.Close()
+		if _, _, _, _, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, false); err == nil {
+			t.Fatal("expected a write error on a closed connection")
+		}
+	})
+
+	t.Run("peer hangs up before answering", func(t *testing.T) {
+		cli, srv := net.Pipe()
+		defer cli.Close()
+		serveThen(srv, nil)
+		if _, _, _, _, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, false); err == nil {
+			t.Fatal("expected a read error when the peer hangs up")
+		}
+	})
+
+	t.Run("response shorter than the 9-byte base", func(t *testing.T) {
+		cli, srv := net.Pipe()
+		defer cli.Close()
+		serveThen(srv, func(c net.Conn) { c.Write([]byte{0x00, 10, 8, 0, 1}) })
+		if _, _, _, _, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, false); err == nil {
+			t.Fatal("expected an error on a truncated response")
+		}
+	})
+
+	t.Run("dual-stack block truncated mid-address", func(t *testing.T) {
+		cli, srv := net.Pipe()
+		defer cli.Close()
+		serveThen(srv, func(c net.Conn) {
+			// Flags advertise the 32-byte block, only 16 bytes arrive.
+			c.Write([]byte{0x00, 10, 8, 0, 1, 10, 8, 0, 2, 0x04})
+			c.Write(make([]byte, 16))
+		})
+		if _, _, _, _, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, true); err == nil {
+			t.Fatal("expected an error when the advertised v6 block is short")
+		}
+	})
+
+	t.Run("non-zero status with a full response", func(t *testing.T) {
+		cli, srv := net.Pipe()
+		defer cli.Close()
+		serveThen(srv, func(c net.Conn) { c.Write([]byte{0x7f, 10, 8, 0, 1, 10, 8, 0, 2}) })
+		if _, _, _, _, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, false); err == nil {
+			t.Fatal("expected an error on a non-zero status byte")
+		}
+	})
+
+	t.Run("dual requested, flags byte without the dual bit", func(t *testing.T) {
+		cli, srv := net.Pipe()
+		defer cli.Close()
+		// 0x02 is some other capability: the client must accept the v4 lease
+		// and report no v6 rather than trying to read a block that isn't there.
+		serveThen(srv, func(c net.Conn) { c.Write([]byte{0x00, 10, 8, 0, 1, 10, 8, 0, 2, 0x02}) })
+
+		_, assignedIP, serverIP6, assignedIP6, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, true)
+		if err != nil {
+			t.Fatalf("sendReconnectHandshake: %v", err)
+		}
+		if !assignedIP.Equal(net.IPv4(10, 8, 0, 2)) {
+			t.Errorf("assigned = %s, want 10.8.0.2", assignedIP)
+		}
+		if serverIP6 != nil || assignedIP6 != nil {
+			t.Errorf("got v6 %s/%s, want none when the dual bit is clear", serverIP6, assignedIP6)
+		}
+	})
+}
+
 // TestControlSocketIPv6PolicyMapping pins the mapping the control-socket mode
 // applies: only an explicit "dual" opts into the dual-stack handshake; unset
 // and "off" keep the historical v0x03 path. parseClientArgs coverage lives on

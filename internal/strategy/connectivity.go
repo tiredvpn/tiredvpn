@@ -339,16 +339,25 @@ func (c *ConnectivityChecker) WaitForConnectivity(ctx context.Context, interval 
 				log.Info("Connectivity restored to %s", c.serverAddr)
 				return result
 			}
-			if backoff < maxProbeInterval {
-				backoff *= probeBackoffFactor
-				if backoff > maxProbeInterval {
-					backoff = maxProbeInterval
-				}
-			}
+			backoff = nextProbeBackoff(backoff)
 			timer.Reset(backoff)
 			log.Debug("Still no connectivity to %s, retrying in %v...", c.serverAddr, backoff)
 		}
 	}
+}
+
+// nextProbeBackoff advances the WaitForConnectivity retry delay: multiply by
+// probeBackoffFactor, clamped at maxProbeInterval. A caller-supplied interval
+// already at or above the ceiling is left alone rather than pulled down to it.
+func nextProbeBackoff(cur time.Duration) time.Duration {
+	if cur >= maxProbeInterval {
+		return cur
+	}
+	next := cur * probeBackoffFactor
+	if next > maxProbeInterval {
+		next = maxProbeInterval
+	}
+	return next
 }
 
 // LastResult returns the last cached connectivity result
