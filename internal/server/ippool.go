@@ -48,6 +48,11 @@ type IPPoolConfig struct {
 
 	// ReservedIPs are IPs that should not be allocated (besides ServerIP)
 	ReservedIPs []string
+
+	// KeyPrefix is the Redis key namespace for lease keys. Empty =
+	// DefaultRedisPrefix. It must match the RedisStore prefix, otherwise two
+	// server instances sharing one Redis would hand out the same tunnel IPs.
+	KeyPrefix string
 }
 
 // IPPool manages IP address allocation for TUN clients
@@ -55,6 +60,7 @@ type IPPool struct {
 	config   IPPoolConfig
 	network  *net.IPNet
 	serverIP net.IP
+	prefix   string // Redis key namespace, always ends with ":"
 	startIP  uint32 // First allocatable IP
 	endIP    uint32 // Last allocatable IP
 	reserved map[uint32]bool
@@ -108,10 +114,13 @@ func NewIPPool(cfg IPPoolConfig, redisClient *redis.Client) (*IPPool, error) {
 		}
 	}
 
+	cfg.KeyPrefix = NormalizeRedisPrefix(cfg.KeyPrefix)
+
 	pool := &IPPool{
 		config:   cfg,
 		network:  network,
 		serverIP: serverIP,
+		prefix:   cfg.KeyPrefix,
 		startIP:  startIP,
 		endIP:    endIP,
 		reserved: reserved,
@@ -133,12 +142,20 @@ func NewIPPool(cfg IPPoolConfig, redisClient *redis.Client) (*IPPool, error) {
 
 // redisKey returns Redis key for IP lease
 func (p *IPPool) redisKey(ip string) string {
-	return "tiredvpn:ippool:" + ip
+	return p.prefix + "ippool:" + ip
 }
 
 // redisClientKey returns Redis key for client->IP mapping
 func (p *IPPool) redisClientKey(clientID string) string {
-	return "tiredvpn:ippool:client:" + clientID
+	return p.prefix + "ippool:client:" + clientID
+}
+
+// leaseKeyPattern matches lease keys only. The "10.*" tail is what keeps the
+// client->IP mapping keys ("ippool:client:<id>") out of the scan; it is also
+// why pools outside 10.0.0.0/8 do not reload their leases (pre-existing
+// behaviour, left untouched here).
+func (p *IPPool) leaseKeyPattern() string {
+	return p.prefix + "ippool:10.*"
 }
 
 // loadLeases loads existing leases from Redis or initializes empty
@@ -148,8 +165,7 @@ func (p *IPPool) loadLeases() error {
 	}
 
 	ctx := context.Background()
-	pattern := "tiredvpn:ippool:10.*"
-	keys, err := p.redis.Keys(ctx, pattern).Result()
+	keys, err := p.redis.Keys(ctx, p.leaseKeyPattern()).Result()
 	if err != nil {
 		return err
 	}

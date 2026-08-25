@@ -99,6 +99,9 @@ Examples:
   Server (multi-client with Redis):
     tiredvpn server -listen :443 -cert server.crt -key server.key -redis localhost:6379 -api-addr :8080
 
+  Server (second instance on the same Redis, isolated namespace):
+    tiredvpn server -listen :994 -redis localhost:6379 -redis-db 1 -redis-prefix tiredvpn-relay:
+
   Server (dual-stack IPv4 + IPv6):
     tiredvpn server -listen :443 -listen-v6 [::]:995 -dual-stack -cert server.crt -key server.key
 
@@ -152,6 +155,13 @@ IPv6 OPTIONS:
 MULTI-CLIENT OPTIONS:
   -redis string
         Redis address for multi-client mode (e.g., localhost:6379)
+  -redis-db int
+        Redis logical database, 0-15 (default 0, or TIREDVPN_REDIS_DB)
+  -redis-prefix string
+        Redis key namespace (default "tiredvpn:", or TIREDVPN_REDIS_PREFIX).
+        A trailing ':' is appended if missing. Give each instance sharing one
+        Redis its own -redis-db or -redis-prefix to keep client registries and
+        IP pools apart.
   -api-addr string
         HTTP API address for client management (default "127.0.0.1:8080")
   -ip-pool string
@@ -435,6 +445,8 @@ func registerServerFlags(fs *flag.FlagSet, cfg *server.Config) *serverFlagOpts {
 	fs.StringVar(&cfg.TunName, "tun-name", "tiredvpn0", "TUN interface name")
 	fs.IntVar(&cfg.TunMTU, "tun-mtu", 1280, "TUN interface MTU (1280-9000)")
 	fs.StringVar(&cfg.RedisAddr, "redis", "", "Redis address for multi-client mode (e.g., localhost:6379)")
+	fs.IntVar(&cfg.RedisDB, "redis-db", 0, "Redis logical database 0-15 (falls back to TIREDVPN_REDIS_DB); use distinct values to isolate instances sharing one Redis")
+	fs.StringVar(&cfg.RedisPrefix, "redis-prefix", server.DefaultRedisPrefix, "Redis key namespace (falls back to TIREDVPN_REDIS_PREFIX); a trailing ':' is added if missing")
 	fs.StringVar(&cfg.APIAddr, "api-addr", "127.0.0.1:8080", "HTTP API address for client management")
 	fs.StringVar(&cfg.APIToken, "api-token", "", "Bearer token required for the management API (falls back to TIREDVPN_API_TOKEN; empty = no auth)")
 	fs.StringVar(&cfg.UpstreamAddr, "upstream", "", "Upstream TiredVPN server for multi-hop (e.g., exit-server.com:443)")
@@ -523,6 +535,11 @@ func runServer(args []string) {
 	if cfg.REALITYPrivateKey == "" {
 		cfg.REALITYPrivateKey = os.Getenv("TIREDVPN_REALITY_PRIVATE_KEY")
 	}
+
+	if err := applyRedisNamespaceEnv(cfg, fs); err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
+	}
 	cfg.QUICEnabled = !*opts.noQUIC // QUIC enabled by default
 	cfg.IPPoolLeaseTime = *opts.ipPoolLease
 	cfg.PortHopInterval = *opts.portHopInterval
@@ -542,10 +559,13 @@ func runServer(args []string) {
 		}()
 	}
 
-	if err := server.Run(cfg); err != nil {
-		fmt.Printf("Error: %v\n", err)
-		os.Exit(1)
-	}
+	// server.Run does not return on success, because it has no success: its
+	// last statement is the accept loop, so every way out of it is an error.
+	// Testing the result for nil reads like a safety check and is a tautology -
+	// staticcheck proves it, which is what SA4023 was reporting.
+	err := server.Run(cfg)
+	fmt.Printf("Error: %v\n", err)
+	os.Exit(1)
 }
 
 func runClient(args []string) {
