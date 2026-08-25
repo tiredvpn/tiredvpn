@@ -28,7 +28,7 @@ import (
 )
 
 var (
-	Version   = "1.3.26"
+	Version   = "1.3.27"
 	BuildTime = "unknown"
 
 	// Global metrics instance (nil if metrics disabled)
@@ -94,6 +94,14 @@ type Config struct {
 	// REALITYRequireDataV2 refuses servers still on the v1 REALITY data layer
 	// instead of falling back to it. Off until every server is upgraded.
 	REALITYRequireDataV2 bool
+
+	// BurstReshape turns on the nudge/ack exchange that splits the inner TLS
+	// handshake. Must match the server's -burst-reshape, and the pad value must
+	// match too; a one-sided setting corrupts streams.
+	BurstReshape string
+
+	// BurstReshapePadFlight must equal the server's -burst-reshape-pad-flight.
+	BurstReshapePadFlight int
 
 	// REALITYServerPubKey is the server's static X25519 public key, base64.
 	// A non-empty value means "speak B1 to this server" - there is no probing
@@ -290,6 +298,10 @@ func buildManager(cfg *Config, secret string) (*strategy.Manager, error) {
 		ShaperID:               cfg.ShaperID,
 
 		REALITYRequireDataV2: cfg.REALITYRequireDataV2,
+		BurstReshape: strategy.BurstReshapeConfig{
+			Enabled:   cfg.BurstReshape == "on",
+			PadFlight: cfg.BurstReshapePadFlight,
+		},
 	}
 	mgr := strategy.NewDefaultManager(mgrCfg)
 

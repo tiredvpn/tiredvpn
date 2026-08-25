@@ -11,6 +11,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	mrand "math/rand/v2"
@@ -41,7 +42,7 @@ import (
 )
 
 var (
-	Version     = "1.3.26"
+	Version     = "1.3.27"
 	connCounter uint64
 )
 
@@ -293,8 +294,15 @@ type Config struct {
 
 	// Multi-client mode (Redis)
 	RedisAddr string // e.g., "localhost:6379"
-	APIAddr   string // e.g., "127.0.0.1:8080"
-	APIToken  string // optional bearer token for the management API ("" = no auth)
+	// RedisDB is the logical Redis database (0..15). Together with RedisPrefix
+	// it isolates instances that share one Redis: on AMS the mux, usa-relay and
+	// usa2-relay all point at 127.0.0.1:6379 and would otherwise share one
+	// client registry and one IP pool namespace.
+	RedisDB int
+	// RedisPrefix is the key namespace. Empty = DefaultRedisPrefix.
+	RedisPrefix string
+	APIAddr     string // e.g., "127.0.0.1:8080"
+	APIToken    string // optional bearer token for the management API ("" = no auth)
 
 	// Upstream (multi-hop) mode
 	UpstreamAddr   string // e.g., "exit-server.com:443"
@@ -355,6 +363,27 @@ type Config struct {
 	// If empty, unauthorized REALITY connections are silently dropped.
 	REALITYCoverDomain string
 
+	// NodeMaxClients caps distinct authenticated clients on this node. 0 = off.
+	//
+	// The vector is address reputation, and it is the only confirmed one that
+	// ignores what our traffic looks like: on 2026-08-04 one of two identical
+	// servers inside a /24 was banned and the other was not. The Iranian
+	// numbers are the ones to hold in mind - 200 users on an address bought two
+	// hours, 5 to 7 bought two days.
+	//
+	// Enforced only after a client authenticates, so a prober can never observe
+	// it. See nodecap.go.
+	NodeMaxClients int
+
+	// NodeMaxBytesPerWindow caps traffic carried in one window. 0 = off.
+	// This is the ceiling that carries meaning on a relay, where the peers are
+	// downstream nodes rather than people.
+	NodeMaxBytesPerWindow int64
+
+	// NodeWindow is the sliding window the traffic ceiling is measured over.
+	// 0 = one hour.
+	NodeWindow time.Duration
+
 	// REALITYRequireDataV2 rejects clients that do not negotiate the v2 data
 	// layer (per-connection X25519 keys + ChaCha20-Poly1305). Off during the
 	// rollout so upgraded exits keep serving older clients; turn it on once
@@ -400,6 +429,19 @@ type Config struct {
 	// an older binary instead of quietly mirroring nothing.
 	REALITYMirrorMode string
 
+	// BurstReshape turns on the nudge/ack exchange that splits the inner TLS
+	// handshake so the nDPI burst heuristic stops matching. "off" or "on".
+	//
+	// It must be set the same way on the client: a server that reshapes while
+	// the client does not will prepend noise to the client's data. There is no
+	// negotiation for it at that layer, so the rollout has to flip both ends.
+	BurstReshape string
+
+	// BurstReshapePadFlight adds this many bytes to the server flight for extra
+	// margin. Zero, i.e. off. Costs bytes on every connection and, like
+	// BurstReshape, has to match the client.
+	BurstReshapePadFlight int
+
 	// Shaper, when non-nil, is built from TOML [shaper]. The server-side
 	// pipeline does not yet consume it — server morph processing lives
 	// outside internal/strategy.MorphedConn — so this field is reserved for
@@ -426,6 +468,7 @@ func Run(cfg *Config) error {
 	}
 
 	initAdmissionControl(cfg)
+	initNodeCap(cfg)
 
 	if err := validateREALITYConfig(cfg); err != nil {
 		return fmt.Errorf("reality configuration: %w", err)
@@ -508,6 +551,15 @@ func Run(cfg *Config) error {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
+			// handleShutdownSignal closes the listener, after which Accept
+			// fails forever: without this the loop would spin on continue at
+			// full CPU until the process is killed. A closed listener is the
+			// only clean way out of Run, so it is also the only path that
+			// returns nil.
+			if errors.Is(err, net.ErrClosed) {
+				log.Info("Listener closed, server stopped accepting connections")
+				return nil
+			}
 			log.Debug("Accept error: %v", err)
 			continue
 		}
@@ -531,7 +583,7 @@ func initClientMode(cfg *Config, srvCtx *serverContext) error {
 
 // initRedisMode initialises Redis store, client registry, API server and stats flush.
 func initRedisMode(cfg *Config, srvCtx *serverContext) error {
-	store, err := NewRedisStore(cfg.RedisAddr)
+	store, err := NewRedisStore(cfg.RedisAddr, cfg.RedisDB, cfg.RedisPrefix)
 	if err != nil {
 		return fmt.Errorf("redis connection failed: %w", err)
 	}
@@ -544,7 +596,7 @@ func initRedisMode(cfg *Config, srvCtx *serverContext) error {
 	}
 	srvCtx.registry = registry
 
-	log.Info("Multi-client mode enabled with Redis at %s", cfg.RedisAddr)
+	log.Info("Multi-client mode enabled with Redis at %s (db=%d, prefix=%q)", cfg.RedisAddr, store.DB(), store.Prefix())
 
 	if cfg.APIAddr == "" {
 		cfg.APIAddr = "127.0.0.1:8080"
@@ -619,6 +671,7 @@ func initIPPool(cfg *Config, srvCtx *serverContext) error {
 		Network:   cfg.IPPoolNetwork,
 		ServerIP:  cfg.TunIP.String(),
 		LeaseTime: cfg.IPPoolLeaseTime,
+		KeyPrefix: cfg.RedisPrefix,
 	}, redisClient)
 	if err != nil {
 		return fmt.Errorf("IP pool initialization failed: %w", err)
@@ -1193,8 +1246,18 @@ func handleConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 		err := tlsConn.Handshake()
 		guard.handshakeDone()
 		if err != nil {
+			// Close, the way the B1 path does. Handing the raw socket to the
+			// fake website here answered a peer that had opened a TLS handshake
+			// with a plaintext HTTP response on the same connection - measured,
+			// not supposed: break the handshake with a bogus record, then send
+			// "GET / HTTP/1.1" and our server replied "HTTP/1.1 200 OK, Server:
+			// nginx". No HTTPS server on earth does that, so it identified us in
+			// one connection with no statistics and no timing.
+			//
+			// crypto/tls has already sent whatever alert the failure warrants,
+			// so closing leaves exactly the behaviour a real server shows.
 			logger.Debug("TLS handshake failed: %v", err)
-			serveFakeWebsite(conn, cfg, logger)
+			_ = tlsConn.Close()
 			return
 		}
 
@@ -2824,6 +2887,17 @@ func handleProtocolConfusion(conn net.Conn, srvCtx *serverContext, logger *log.L
 	// the ack synchronously to the kernel send buffer.
 	conn = ktls.TryEnable(conn, "tired-confusion")
 
+	// Burst reshaping wraps the payload phase only: the mode byte, the target
+	// address and the success ack above are this tunnel's own control preamble,
+	// and a reshaper that sees them mistakes the one-byte mode read for the
+	// client's first application burst and holds the ack behind a nudge.
+	//
+	// With the feature off this returns conn unchanged, so the kTLS/splice fast
+	// path below is untouched in the default configuration. With it on the
+	// wrapper stays in the path and that fast path is given up - the exchange
+	// needs to see the first write in each direction, which splice would hide.
+	conn = strategy.ReshapeServerStream(conn, burstReshapeConfig(srvCtx.cfg))
+
 	// Relay data
 	var wg sync.WaitGroup
 	var bytesUp, bytesDown int64
@@ -3075,10 +3149,46 @@ func handleConfusionTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverC
 	}
 }
 
+// tunnelIdentity is what the node ceiling counts, and an empty result means
+// "do not count this session at all".
+//
+// It used to fall back to the peer address when no client id was supplied. That
+// was wrong, and wrong in the direction that matters: handleTLSConnection
+// reaches this funnel with an empty id after nothing but a plain TLS handshake,
+// which anyone can complete because we serve a certificate to everyone. A peer
+// that never authenticated could therefore both measure the ceiling by opening
+// connections until refused - the exact fingerprint the placement was chosen to
+// avoid - and exhaust it, denying service to real users with no credential at
+// all.
+//
+// So only a session that arrives with an identity is counted. The cost is that
+// transports which authenticate against a single shared secret pass no id and
+// go uncounted, so the ceiling under-counts on those. That is the safe error:
+// it protects less than configured, rather than handing an unauthenticated peer
+// a lever. Closing it properly means each call site stating whether its peer
+// authenticated, which is a signature change across every transport.
+func tunnelIdentity(clientID string) string {
+	return clientID
+}
+
 // handleRawTunnel handles raw tunnel connections
 // clientID is used for TUN mode to track IP allocation (e.g. "reality:abcd1234")
 func handleRawTunnel(conn net.Conn, srvCtx *serverContext, logger *log.Logger, clientID string) {
 	logger.Debug("Starting raw tunnel mode")
+
+	// Node ceiling. Here rather than at accept on purpose: every transport
+	// funnels through this function once its client has authenticated, so a
+	// peer that cannot authenticate never reaches the ceiling and cannot
+	// measure it. See nodecap.go for why that placement is the whole design.
+	//
+	// A refused client currently has nowhere to go - see nodeCapNoFailover - so
+	// this only fires when an operator has deliberately set a ceiling.
+	release, admitted := nodeCapacity.admit(tunnelIdentity(clientID), time.Now())
+	if !admitted {
+		logger.Warn("Node ceiling reached, refusing a new session (client: %s)", clientID)
+		return
+	}
+	defer release()
 
 	// Track per-client connection for metrics. Use a closure on the conn
 	// variable so the defer picks up the kTLS-wrapped value if we hand

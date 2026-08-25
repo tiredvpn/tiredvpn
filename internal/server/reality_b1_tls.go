@@ -10,6 +10,7 @@ import (
 	"github.com/xtaci/smux"
 
 	"github.com/tiredvpn/tiredvpn/internal/log"
+	"github.com/tiredvpn/tiredvpn/internal/mux"
 	"github.com/tiredvpn/tiredvpn/internal/protocol"
 	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 )
@@ -79,6 +80,20 @@ func b1TLSConfig(minter *certMinter, coverDomain string) *tls.Config {
 // configured.
 const defaultCertName = "www.microsoft.com"
 
+// b1HandshakeTimeout bounds the TLS handshake for an authenticated client. A
+// real handshake takes milliseconds; this is wide enough for a bad link and
+// narrow enough that holding one open costs an attacker a connection per ten
+// seconds rather than being free.
+const b1HandshakeTimeout = 10 * time.Second
+
+// b1HandshakeSafetyPolicy caps ChangeCipherSpec records during that handshake.
+//
+// Deliberately not a donor number. Donor tolerances exist to make a prober see
+// the site we claim to be, and a client that got this far is past the point
+// where that matters. Eight is far more than the one a real client sends and
+// far less than the thirty-odd a donor would swallow.
+var b1HandshakeSafetyPolicy = ccsPolicy{Mechanism: ccsCount, Limit: 8}
+
 // b1TLS holds the per-server TLS state for the B1 transport.
 type b1TLS struct {
 	once   sync.Once
@@ -106,6 +121,20 @@ func b1TLSFor(srvCtx *serverContext) (*tls.Config, *certMinter) {
 func handleREALITYB1(conn net.Conn, peekBuf []byte, clientID string, secret []byte, clientFlags byte, srvCtx *serverContext, logger *log.Logger) {
 	cfg, _ := b1TLSFor(srvCtx)
 
+	// Bound the handshake explicitly. Until now the only thing stopping a
+	// client from holding one open was a 30-second read deadline inherited
+	// from the peek loop, which is neither a chosen number nor a guarantee:
+	// crypto/tls resets its own useless-record counter on any record that
+	// advances the handshake, so a client holding the handshake keys can
+	// alternate ChangeCipherSpec with encrypted fragments and never trip it.
+	//
+	// This is a safety bound, not imitation. A client that reaches here has
+	// authenticated; there is nobody left to convince that we are yandex, and
+	// the donor tolerances have no business governing what our own users may
+	// do to us.
+	_ = conn.SetDeadline(time.Now().Add(b1HandshakeTimeout))
+	guard := newCCSGuardWithPolicy(conn, b1HandshakeSafetyPolicy)
+
 	// Derive the connection's auth key and carry it on the connection so
 	// GetCertificate can reach it. It cannot derive the key itself: the callback
 	// receives a *tls.ClientHelloInfo, which has the parsed SNI but neither the
@@ -124,8 +153,14 @@ func handleREALITYB1(conn net.Conn, peekBuf []byte, clientID string, secret []by
 		return
 	}
 
-	tlsConn := tls.Server(customtls.NewAuthConn(conn, authKey), cfg)
-	if err := tlsConn.Handshake(); err != nil {
+	// Nesting order is load-bearing in both directions. The record guard sits
+	// innermost, against the socket, or it would be counting bytes crypto/tls
+	// had already consumed. The auth conn sits outermost, because it is what
+	// GetCertificate reaches through ClientHelloInfo.Conn.
+	tlsConn := tls.Server(customtls.NewAuthConn(guard, authKey), cfg)
+	err = tlsConn.Handshake()
+	guard.handshakeDone()
+	if err != nil {
 		// No alert, no reset with a distinguishing shape: just close. A failed
 		// handshake here is either a broken client or someone who stole a
 		// session_id, and neither deserves a reply that confirms anything.
@@ -134,6 +169,13 @@ func handleREALITYB1(conn net.Conn, peekBuf []byte, clientID string, secret []by
 		return
 	}
 	defer tlsConn.Close()
+
+	// The tunnel is not a handshake and must not inherit its deadline. Without
+	// this the connection stops reading at whatever absolute time the peek loop
+	// picked, which would have killed every B1 tunnel 30 seconds in.
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		logger.Debug("REALITY B1: clearing the handshake deadline failed: %v", err)
+	}
 
 	state := tlsConn.ConnectionState()
 	logger.Debug("REALITY B1: TLS up (client: %s, alpn: %q, sni: %q)", clientID, state.NegotiatedProtocol, state.ServerName)
@@ -192,7 +234,16 @@ func handleREALITYB1(conn net.Conn, peekBuf []byte, clientID string, secret []by
 		return
 	}
 
-	sess, err := smux.Server(tlsConn, smux.DefaultConfig())
+	// No keepalive on either side of a B1 session. smux's default NOP every ten
+	// seconds is a perfectly periodic pulse that identifies the session from
+	// timestamps alone - see mux.SmuxSilentConfig.
+	//
+	// This needs no version negotiation, which is why it lands here and not on
+	// the legacy path. B1 has never shipped, so every peer that ever speaks it
+	// has this build's behaviour by construction; the legacy transport has
+	// deployed clients that would kill an idle session after thirty seconds of
+	// the silence, and it keeps its keepalive until it is retired.
+	sess, err := smux.Server(tlsConn, mux.SmuxSilentConfig())
 	if err != nil {
 		logger.Error("REALITY B1: smux server: %v", err)
 		return

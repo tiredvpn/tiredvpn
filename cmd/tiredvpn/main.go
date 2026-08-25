@@ -99,6 +99,9 @@ Examples:
   Server (multi-client with Redis):
     tiredvpn server -listen :443 -cert server.crt -key server.key -redis localhost:6379 -api-addr :8080
 
+  Server (second instance on the same Redis, isolated namespace):
+    tiredvpn server -listen :994 -redis localhost:6379 -redis-db 1 -redis-prefix tiredvpn-relay:
+
   Server (dual-stack IPv4 + IPv6):
     tiredvpn server -listen :443 -listen-v6 [::]:995 -dual-stack -cert server.crt -key server.key
 
@@ -152,6 +155,13 @@ IPv6 OPTIONS:
 MULTI-CLIENT OPTIONS:
   -redis string
         Redis address for multi-client mode (e.g., localhost:6379)
+  -redis-db int
+        Redis logical database, 0-15 (default 0, or TIREDVPN_REDIS_DB)
+  -redis-prefix string
+        Redis key namespace (default "tiredvpn:", or TIREDVPN_REDIS_PREFIX).
+        A trailing ':' is appended if missing. Give each instance sharing one
+        Redis its own -redis-db or -redis-prefix to keep client registries and
+        IP pools apart.
   -api-addr string
         HTTP API address for client management (default "127.0.0.1:8080")
   -ip-pool string
@@ -203,9 +213,20 @@ REALITY OPTIONS:
   -reality-min-client-ver string
         Lowest client version B1 accepts, X.Y.Z (empty = do not check)
   -reality-mirror string
-        Mirror the handshake to the real donor: off, adaptive, always. Only off is implemented until B1.5. (default "off")
+        Mirror the handshake to the real donor for sources that have not authenticated: off, adaptive, always (default "adaptive")
   -reality-require-data-v2
         Reject REALITY clients still on the v1 data layer (turn on after every client is upgraded)
+
+NODE CEILINGS (address reputation):
+  -node-max-clients int
+        Cap distinct authenticated clients on this node, 0 = off (default 0).
+        Transports authenticating against a single shared secret carry no client id
+        and are NOT counted, so the real number here can exceed the cap.
+  -node-max-bytes int
+        Cap bytes carried per window, 0 = off. The ceiling that means something on
+        a relay, where peers are downstream nodes rather than people.
+  -node-window duration
+        Sliding window the traffic ceiling is measured over (default 1h)
 
 ADVANCED OPTIONS:
   -fake-root string
@@ -409,6 +430,13 @@ func registerServerFlags(fs *flag.FlagSet, cfg *server.Config) *serverFlagOpts {
 	fs.StringVar(&cfg.REALITYCoverDomain, "reality-cover-domain", "", "Hostname to transparently proxy unauthorized REALITY probes to (operator-set, e.g. 'www.microsoft.com'); empty = silently drop. Never derived from client SNI.")
 	// Transition switch for the data-layer rewrite: leave off while old clients
 	// are still around, turn on afterwards to remove the v1 downgrade path.
+	// Node ceilings. Both default to off: a non-zero default would start
+	// refusing users on deployments running fine today, and a refused client
+	// has nowhere to go yet. The metrics are on regardless, so an operator can
+	// read their real numbers before choosing a limit.
+	fs.IntVar(&cfg.NodeMaxClients, "node-max-clients", 0, "Cap distinct authenticated clients on this node (0 = off). Address reputation is the one blocking vector that ignores traffic shape; 200 users on one address bought two hours in the Iranian experiment, 5-7 bought two days. NOTE: transports that authenticate against a single shared secret carry no client id and are not counted, so the real number on this node can exceed the cap.")
+	fs.Int64Var(&cfg.NodeMaxBytesPerWindow, "node-max-bytes", 0, "Cap bytes carried per window on this node (0 = off). This is the ceiling that means something on a relay, where peers are downstream nodes rather than people.")
+	fs.DurationVar(&cfg.NodeWindow, "node-window", time.Hour, "Sliding window the traffic ceiling is measured over")
 	fs.BoolVar(&cfg.REALITYRequireDataV2, "reality-require-data-v2", false, "Reject REALITY clients that do not negotiate the v2 data layer (per-connection keys + AEAD). Turn on only after every client is upgraded.")
 	// B1 transport. -reality-b1 defaults to off while the B1 handler is still
 	// a stub: with it on, a server without a static key refuses to start, and
@@ -420,12 +448,16 @@ func registerServerFlags(fs *flag.FlagSet, cfg *server.Config) *serverFlagOpts {
 	fs.BoolVar(&cfg.REALITYLegacyEnabled, "reality-legacy", true, "Accept the legacy REALITY transport (credentials in padding extension 0x0015). Turn off once no client uses it.")
 	fs.IntVar(&cfg.REALITYMaxTimeDiff, "reality-max-time-diff", 300, "Client clock skew tolerated by B1 auth, seconds (0 = do not check)")
 	fs.StringVar(&cfg.REALITYMinClientVer, "reality-min-client-ver", "", "Lowest client version B1 accepts, X.Y.Z (empty = do not check)")
-	fs.StringVar(&cfg.REALITYMirrorMode, "reality-mirror", "off", "How much of the handshake to mirror to the real donor: off, adaptive, always. Only off is implemented until B1.5.")
+	fs.StringVar(&cfg.REALITYMirrorMode, "reality-mirror", "adaptive", "Mirror the handshake to the real donor for unauthenticated sources: off, adaptive (default), always. 'always' dials a donor for every connection including users - measurement only.")
+	fs.StringVar(&cfg.BurstReshape, "burst-reshape", "off", "Split the inner TLS handshake with a nudge/ack exchange so the nDPI burst heuristic stops matching: off, on. MUST match the client setting - a one-sided 'on' corrupts streams.")
+	fs.IntVar(&cfg.BurstReshapePadFlight, "burst-reshape-pad-flight", 0, "Extra bytes added to the server flight for margin (0 = off). Must match the client.")
 	fs.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
 	opts.tunIP = fs.String("tun-ip", "10.8.0.1", "TUN interface IP address for VPN server")
 	fs.StringVar(&cfg.TunName, "tun-name", "tiredvpn0", "TUN interface name")
 	fs.IntVar(&cfg.TunMTU, "tun-mtu", 1280, "TUN interface MTU (1280-9000)")
 	fs.StringVar(&cfg.RedisAddr, "redis", "", "Redis address for multi-client mode (e.g., localhost:6379)")
+	fs.IntVar(&cfg.RedisDB, "redis-db", 0, "Redis logical database 0-15 (falls back to TIREDVPN_REDIS_DB); use distinct values to isolate instances sharing one Redis")
+	fs.StringVar(&cfg.RedisPrefix, "redis-prefix", server.DefaultRedisPrefix, "Redis key namespace (falls back to TIREDVPN_REDIS_PREFIX); a trailing ':' is added if missing")
 	fs.StringVar(&cfg.APIAddr, "api-addr", "127.0.0.1:8080", "HTTP API address for client management")
 	fs.StringVar(&cfg.APIToken, "api-token", "", "Bearer token required for the management API (falls back to TIREDVPN_API_TOKEN; empty = no auth)")
 	fs.StringVar(&cfg.UpstreamAddr, "upstream", "", "Upstream TiredVPN server for multi-hop (e.g., exit-server.com:443)")
@@ -514,6 +546,11 @@ func runServer(args []string) {
 	if cfg.REALITYPrivateKey == "" {
 		cfg.REALITYPrivateKey = os.Getenv("TIREDVPN_REALITY_PRIVATE_KEY")
 	}
+
+	if err := applyRedisNamespaceEnv(cfg, fs); err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
+	}
 	cfg.QUICEnabled = !*opts.noQUIC // QUIC enabled by default
 	cfg.IPPoolLeaseTime = *opts.ipPoolLease
 	cfg.PortHopInterval = *opts.portHopInterval
@@ -598,6 +635,8 @@ func runClient(args []string) {
 	// Seqovl level-A packet overlap (Linux only, requires CAP_NET_ADMIN + OUTPUT NFQUEUE rule)
 	fs.BoolVar(&cfg.SeqovlPacketEnabled, "seqovl-packet", false, "Enable packet-level TCP sequence overlap for seqovl (Linux + CAP_NET_ADMIN; additive to the app-framing decoy)")
 	fs.BoolVar(&cfg.REALITYRequireDataV2, "reality-require-data-v2", false, "Refuse REALITY servers still on the v1 data layer instead of falling back (turn on once every server is upgraded)")
+	fs.StringVar(&cfg.BurstReshape, "burst-reshape", "off", "Split the inner TLS handshake with a nudge/ack exchange so the nDPI burst heuristic stops matching: off, on. MUST match the server setting - a one-sided 'on' corrupts streams.")
+	fs.IntVar(&cfg.BurstReshapePadFlight, "burst-reshape-pad-flight", 0, "Extra bytes the server adds to its flight (0 = off). Must match the server.")
 	registerClientREALITYFlags(fs, cfg)
 
 	// RTT Masking flags

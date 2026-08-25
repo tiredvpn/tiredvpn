@@ -12,6 +12,7 @@ import (
 	"github.com/xtaci/smux"
 
 	"github.com/tiredvpn/tiredvpn/internal/log"
+	"github.com/tiredvpn/tiredvpn/internal/mux"
 	"github.com/tiredvpn/tiredvpn/internal/protocol"
 	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 )
@@ -142,7 +143,12 @@ func (r *REALITYStrategy) connectB1(ctx context.Context, tcpConn net.Conn, dest 
 		log.Debug("REALITY B1: clock offset now %v", r.clockOffset.Offset())
 	}
 
-	sess, err := smux.Client(uconn, smux.DefaultConfig())
+	// Silent session: no keepalive sent, none expected. See
+	// mux.SmuxSilentConfig for why the ten-second NOP is a signal and why
+	// jittering it would only move that signal rather than remove it. Safe
+	// without negotiation because B1 has never shipped - both ends of any B1
+	// session are this build.
+	sess, err := smux.Client(uconn, mux.SmuxSilentConfig())
 	if err != nil {
 		return nil, fmt.Errorf("reality b1: smux client: %w", err)
 	}

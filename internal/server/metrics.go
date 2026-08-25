@@ -76,6 +76,11 @@ func (m *Metrics) DecConnections() {
 
 // AddBytes adds to byte counters
 func (m *Metrics) AddBytes(up, down int64) {
+	// Node traffic ceiling shares this funnel: every relay loop reports here,
+	// so hooking it once means no transport can carry bytes the ceiling does
+	// not see.
+	nodeCapacity.recordBytes(up+down, time.Now())
+
 	atomic.AddInt64(&m.totalBytesUp, up)
 	atomic.AddInt64(&m.totalBytesDown, down)
 }
@@ -140,6 +145,8 @@ func (m *Metrics) Handler() http.HandlerFunc {
 		fmt.Fprintf(w, "\n")
 
 		writeREALITYAuthMetrics(w)
+		writeREALITYDonorMetrics(w)
+		writeNodeCapMetrics(w)
 
 		// Errors
 		fmt.Fprintf(w, "# HELP tiredvpn_auth_failures_total Total authentication failures\n")
@@ -260,5 +267,8 @@ func (m *Metrics) Handler() http.HandlerFunc {
 		if m.relayMetrics != nil {
 			m.relayMetrics.ExportPrometheus(w)
 		}
+
+		// Burst reshaping (phase 3). Package-level counters, no instance.
+		writePhase3Metrics(w)
 	}
 }

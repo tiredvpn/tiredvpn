@@ -76,9 +76,9 @@ func InitREALITYKeys(cfg *Config) error {
 	return nil
 }
 
-// REALITY donor-mirroring modes. Only mirrorOff does anything in B1; the other
-// two are accepted so a B1.5 config does not have to be rewritten to run here,
-// and rejected values fail at startup rather than at the first connection.
+// REALITY donor-mirroring modes. See reality_mirror.go for what each one costs:
+// "always" dials a donor for every connection including users, "adaptive" only
+// for sources that have not authenticated recently, "off" never.
 const (
 	MirrorOff      = "off"
 	MirrorAdaptive = "adaptive"
@@ -90,11 +90,9 @@ const (
 // the first client fails to connect.
 func validateREALITYConfig(cfg *Config) error {
 	switch cfg.REALITYMirrorMode {
-	case "", MirrorOff:
-		cfg.REALITYMirrorMode = MirrorOff
-	case MirrorAdaptive, MirrorAlways:
-		log.Warn("REALITY: -reality-mirror=%s is not implemented yet, mirroring nothing (arrives with B1.5)",
-			cfg.REALITYMirrorMode)
+	case "":
+		cfg.REALITYMirrorMode = MirrorAdaptive
+	case MirrorOff, MirrorAdaptive, MirrorAlways:
 	default:
 		return fmt.Errorf("unknown -reality-mirror %q, want %s, %s or %s",
 			cfg.REALITYMirrorMode, MirrorOff, MirrorAdaptive, MirrorAlways)
@@ -107,6 +105,8 @@ func validateREALITYConfig(cfg *Config) error {
 	if cfg.REALITYMaxTimeDiff < 0 {
 		return fmt.Errorf("-reality-max-time-diff must not be negative, got %d", cfg.REALITYMaxTimeDiff)
 	}
+
+	logMirrorMode(cfg.REALITYMirrorMode)
 
 	if cfg.REALITYMinClientVer != "" {
 		if _, err := parseClientVersion(cfg.REALITYMinClientVer); err != nil {

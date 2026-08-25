@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"net"
+	"os"
 	"strconv"
 
 	"github.com/tiredvpn/tiredvpn/internal/client"
@@ -118,6 +119,45 @@ func applyServerTOMLConfig(cfg *server.Config, path string, fs *flag.FlagSet) er
 		}
 		cfg.Shaper = sh
 	}
+	return nil
+}
+
+// flagWasSet reports whether name was given explicitly on the command line,
+// as opposed to sitting at its default value.
+func flagWasSet(fs *flag.FlagSet, name string) bool {
+	set := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	return set
+}
+
+// applyRedisNamespaceEnv resolves the Redis namespace settings with the same
+// precedence as the other secrets-friendly options: flag > env > default. The
+// env vars let a systemd unit give each instance on a shared Redis its own
+// database and key prefix via EnvironmentFile.
+func applyRedisNamespaceEnv(cfg *server.Config, fs *flag.FlagSet) error {
+	if !flagWasSet(fs, "redis-db") {
+		if v := os.Getenv("TIREDVPN_REDIS_DB"); v != "" {
+			db, err := strconv.Atoi(v)
+			if err != nil {
+				return fmt.Errorf("TIREDVPN_REDIS_DB: %q is not a number", v)
+			}
+			cfg.RedisDB = db
+		}
+	}
+	if !flagWasSet(fs, "redis-prefix") {
+		if v := os.Getenv("TIREDVPN_REDIS_PREFIX"); v != "" {
+			cfg.RedisPrefix = v
+		}
+	}
+
+	if err := server.ValidateRedisDB(cfg.RedisDB); err != nil {
+		return err
+	}
+	cfg.RedisPrefix = server.NormalizeRedisPrefix(cfg.RedisPrefix)
 	return nil
 }
 

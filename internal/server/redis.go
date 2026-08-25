@@ -47,19 +47,58 @@ type ClientStats struct {
 	LastSeen    time.Time `json:"last_seen"`
 }
 
+// DefaultRedisPrefix is the key namespace used when none is configured.
+// Keeping it as the default preserves the layout of pre-existing deployments.
+const DefaultRedisPrefix = "tiredvpn:"
+
+// maxRedisDB is the highest logical database index a stock Redis accepts
+// (databases 0..15 unless `databases` is raised in redis.conf).
+const maxRedisDB = 15
+
 // RedisStore manages client data in Redis
 type RedisStore struct {
 	client *redis.Client
-	prefix string // default: "tiredvpn:"
+	db     int    // logical Redis database, needed for keyspace notification channels
+	prefix string // default: DefaultRedisPrefix
 }
 
-// NewRedisStore creates a new Redis store.
+// NormalizeRedisPrefix returns a usable key namespace: an empty prefix falls
+// back to DefaultRedisPrefix, and a prefix without a trailing ":" gets one so
+// that keys from different instances cannot run into each other
+// ("relay" + "clients:x" would otherwise be "relayclients:x").
+func NormalizeRedisPrefix(prefix string) string {
+	if prefix == "" {
+		return DefaultRedisPrefix
+	}
+	if !strings.HasSuffix(prefix, ":") {
+		return prefix + ":"
+	}
+	return prefix
+}
+
+// ValidateRedisDB checks that db is a logical database index Redis will accept.
+func ValidateRedisDB(db int) error {
+	if db < 0 || db > maxRedisDB {
+		return fmt.Errorf("redis db must be between 0 and %d, got %d", maxRedisDB, db)
+	}
+	return nil
+}
+
+// NewRedisStore creates a new Redis store on logical database db, namespacing
+// every key under prefix. db 0 and prefix DefaultRedisPrefix reproduce the
+// historical layout; distinct values let several server instances share one
+// Redis without seeing each other's clients.
 // Set REDIS_PASSWORD env variable to authenticate with Redis.
-func NewRedisStore(addr string) (*RedisStore, error) {
+func NewRedisStore(addr string, db int, prefix string) (*RedisStore, error) {
+	if err := ValidateRedisDB(db); err != nil {
+		return nil, err
+	}
+	prefix = NormalizeRedisPrefix(prefix)
+
 	client := redis.NewClient(&redis.Options{
 		Addr:         addr,
 		Password:     os.Getenv("REDIS_PASSWORD"),
-		DB:           0,
+		DB:           db,
 		DialTimeout:  5 * time.Second,
 		ReadTimeout:  3 * time.Second,
 		WriteTimeout: 3 * time.Second,
@@ -73,12 +112,24 @@ func NewRedisStore(addr string) (*RedisStore, error) {
 		return nil, fmt.Errorf("redis connection failed: %w", err)
 	}
 
-	log.Info("Connected to Redis at %s", addr)
+	log.Info("Connected to Redis at %s (db=%d, prefix=%q)", addr, db, prefix)
 
 	return &RedisStore{
 		client: client,
-		prefix: "tiredvpn:",
+		db:     db,
+		prefix: prefix,
 	}, nil
+}
+
+// Prefix returns the key namespace this store writes under, so that other
+// Redis-backed components (the IP pool) can stay inside the same namespace.
+func (r *RedisStore) Prefix() string {
+	return r.prefix
+}
+
+// DB returns the logical Redis database this store is bound to.
+func (r *RedisStore) DB() int {
+	return r.db
 }
 
 // Close closes the Redis connection
@@ -98,6 +149,33 @@ func (r *RedisStore) secretIndexKey(secret string) string {
 
 func (r *RedisStore) statsKey(clientID string) string {
 	return r.prefix + "stats:" + clientID
+}
+
+func (r *RedisStore) versionKey() string {
+	return r.prefix + "version"
+}
+
+func (r *RedisStore) clientKeyPattern() string {
+	return r.prefix + "clients:*"
+}
+
+// keyspaceChannelPattern is the pub/sub pattern for keyspace notifications on
+// this store's client keys. Both the database index and the key namespace are
+// part of the channel name, so an instance on db 1 / prefix "relay:" only ever
+// hears about its own clients.
+func (r *RedisStore) keyspaceChannelPattern() string {
+	return fmt.Sprintf("__keyspace@%d__:%s", r.db, r.clientKeyPattern())
+}
+
+// clientIDFromKeyspaceChannel extracts the client ID from a keyspace
+// notification channel such as "__keyspace@0__:tiredvpn:clients:<uuid>".
+// It returns "" when the channel does not belong to this store's namespace.
+func (r *RedisStore) clientIDFromKeyspaceChannel(channel string) string {
+	head := fmt.Sprintf("__keyspace@%d__:%sclients:", r.db, r.prefix)
+	if !strings.HasPrefix(channel, head) {
+		return ""
+	}
+	return channel[len(head):]
 }
 
 // GenerateSecret creates a cryptographically secure 64-char hex secret
@@ -148,7 +226,7 @@ func (r *RedisStore) SaveClient(ctx context.Context, cfg *ClientConfig) error {
 	pipe.Set(ctx, r.secretIndexKey(cfg.Secret), cfg.ID, 0)
 
 	// Increment version for hot-reload detection
-	pipe.Incr(ctx, r.prefix+"version")
+	pipe.Incr(ctx, r.versionKey())
 
 	_, err = pipe.Exec(ctx)
 	if err != nil {
@@ -213,7 +291,7 @@ func (r *RedisStore) DeleteClient(ctx context.Context, id string) error {
 	pipe.Del(ctx, r.statsKey(id))
 
 	// Increment version
-	pipe.Incr(ctx, r.prefix+"version")
+	pipe.Incr(ctx, r.versionKey())
 
 	_, err = pipe.Exec(ctx)
 	if err != nil {
@@ -226,8 +304,7 @@ func (r *RedisStore) DeleteClient(ctx context.Context, id string) error {
 
 // ListClients returns all clients
 func (r *RedisStore) ListClients(ctx context.Context) ([]*ClientConfig, error) {
-	pattern := r.prefix + "clients:*"
-	keys, err := r.client.Keys(ctx, pattern).Result()
+	keys, err := r.client.Keys(ctx, r.clientKeyPattern()).Result()
 	if err != nil {
 		return nil, fmt.Errorf("list clients: %w", err)
 	}
@@ -288,7 +365,7 @@ func (r *RedisStore) GetStats(ctx context.Context, clientID string) (*ClientStat
 
 // GetVersion returns current data version (for hot-reload detection)
 func (r *RedisStore) GetVersion(ctx context.Context) (int64, error) {
-	return r.client.Get(ctx, r.prefix+"version").Int64()
+	return r.client.Get(ctx, r.versionKey()).Int64()
 }
 
 // Subscribe subscribes to client changes via Redis keyspace notifications
@@ -296,7 +373,7 @@ func (r *RedisStore) Subscribe(ctx context.Context, onChange func(event, clientI
 	// Enable keyspace notifications if not already enabled
 	r.client.ConfigSet(ctx, "notify-keyspace-events", "KEA")
 
-	pattern := "__keyspace@0__:" + r.prefix + "clients:*"
+	pattern := r.keyspaceChannelPattern()
 	pubsub := r.client.PSubscribe(ctx, pattern)
 
 	go func() {
@@ -310,20 +387,19 @@ func (r *RedisStore) Subscribe(ctx context.Context, onChange func(event, clientI
 				if msg == nil {
 					continue
 				}
-				// Extract client ID from channel name
-				// Channel: __keyspace@0__:tiredvpn:clients:uuid
-				parts := strings.Split(msg.Channel, ":")
-				if len(parts) >= 4 {
-					clientID := parts[len(parts)-1]
-					event := msg.Payload // "set", "del", etc.
-					log.Debug("Redis notification: %s on client %s", event, clientID)
-					onChange(event, clientID)
+				// Channel: __keyspace@<db>__:<prefix>clients:<uuid>
+				clientID := r.clientIDFromKeyspaceChannel(msg.Channel)
+				if clientID == "" {
+					continue
 				}
+				event := msg.Payload // "set", "del", etc.
+				log.Debug("Redis notification: %s on client %s", event, clientID)
+				onChange(event, clientID)
 			}
 		}
 	}()
 
-	log.Info("Subscribed to Redis keyspace notifications")
+	log.Info("Subscribed to Redis keyspace notifications on %s", pattern)
 	return nil
 }
 

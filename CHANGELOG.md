@@ -13,6 +13,12 @@ Versions follow [Semantic Versioning](https://semver.org/).
 - **REALITY data records are now authenticated and forward-secret (data layer v2).** Records are sealed with ChaCha20-Poly1305 under a key derived from an X25519 exchange between two ephemeral per-connection keys, salted with fresh random values from both sides, with an explicit record counter in the nonce. Previously the tunnel was bare ChaCha20: an active middlebox could flip bits inside it unnoticed, a leaked password decrypted any recorded traffic, and the record body was exactly the plaintext length, unlike a real TLS 1.3 record. Version negotiation rides inside the existing 256-byte padding block as a MAC over per-connection randomness, so the ClientHello and ServerHello are byte-for-byte the same size as before and an unupgraded peer keeps working. Rollout order is exits, then relays, then clients; `-reality-require-data-v2` (server and client) closes the v1 downgrade path once the fleet is upgraded.
 - **The server's ServerHello padding was a fixed byte ramp.** 192 bytes of `byte(i*7%256)` went out in every REALITY ServerHello, which is one DPI signature matching every server we run regardless of IP or cover domain. It is now CSPRNG output.
 
+## [1.3.27] - 2026-08-07
+
+### Added
+
+- **`-redis-db` and `-redis-prefix`: several server instances can now share one Redis without sharing a client registry.** The Redis database index and the `tiredvpn:` key prefix were both hardcoded, so any instance pointed at a given Redis saw the same client list, the same secret index and the same IP-pool namespace as every other one. That is the normal layout on a multi-role box — an entry node and two relays on the same host all talk to `127.0.0.1:6379` — and there was no way to keep their registries apart. Both are now configurable per instance (`-redis-db 0..15`, `-redis-prefix`, or `TIREDVPN_REDIS_DB` / `TIREDVPN_REDIS_PREFIX` for systemd `EnvironmentFile` setups; the flag wins over the env var). The prefix now also covers the IP-pool lease keys and the keyspace-notification channel, which previously pinned `__keyspace@0__:tiredvpn:` regardless of configuration, so an instance on its own database no longer misses its own client-change events. A prefix without a trailing `:` gets one appended so keys cannot run together. Defaults are unchanged (db 0, prefix `tiredvpn:`), so existing deployments keep their exact key layout.
+
 ## [1.3.26] - 2026-08-04
 
 ### Fixed
