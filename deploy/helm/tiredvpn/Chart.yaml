@@ -2,7 +2,7 @@ apiVersion: v2
 name: tiredvpn
 description: DPI-resistant VPN — server (exit node) and/or client (SOCKS5 proxy or TUN tunnel).
 type: application
-version: 0.2.0
+version: 0.2.1
 appVersion: "1.4.0"
 kubeVersion: ">=1.25.0-0"
 home: https://github.com/tiredvpn/tiredvpn-oss
