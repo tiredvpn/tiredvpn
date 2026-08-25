@@ -661,7 +661,7 @@ func (v *VPNClient) performHandshake(conn net.Conn) error {
 	// Read server response (drains the dual-stack block when advertised, so
 	// the stream stays frame-aligned for the packet loop that follows).
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	resp, n, err := readHandshakeResponse(conn, v.dualStack)
+	resp, n, err := readHandshakeResponse(conn, v.handshakeVersion())
 	if err != nil {
 		return fmt.Errorf("handshake read failed: %w", err)
 	}
@@ -843,7 +843,7 @@ func (v *VPNClient) doHandshake(conn net.Conn, localIP net.IP) ([]byte, int, err
 	// Extended v2 (20+ bytes): [status:1][serverIP:4][clientIP:4][flags:1][portStart:2][portEnd:2][hopInterval:4][strategy:1][seedLen:1][seed:0-32]
 	// Dual-stack (v4): the version-dependent layout followed by [serverIP6:16][clientIP6:16]
 	conn.SetReadDeadline(time.Now().Add(handshakeReadTimeout))
-	resp, n, err := readHandshakeResponse(conn, v.dualStack)
+	resp, n, err := readHandshakeResponse(conn, v.handshakeVersion())
 	if err != nil {
 		return nil, 0, err
 	}
@@ -879,7 +879,7 @@ const handshakeRespBufSize = 96
 // every exit since the auto-MTU probe sets a flags byte on the stego path, so
 // in practice the peek never fires.
 func ReadTUNHandshakeResponse(conn net.Conn) ([]byte, error) {
-	resp, n, err := readHandshakeResponse(conn, true)
+	resp, n, err := readHandshakeResponse(conn, 0) // 0: the relay cannot see the client's version
 	if err != nil {
 		return nil, err
 	}
@@ -928,7 +928,7 @@ const handshakeFlagsGrace = 300 * time.Millisecond
 // expectDual=false keeps the read behaviour byte-for-byte as it was: a v0x03
 // client is never sent the dual-stack flag, so nothing beyond the first read
 // can be pending.
-func readHandshakeResponse(conn net.Conn, expectDual bool) ([]byte, int, error) {
+func readHandshakeResponse(conn net.Conn, clientVersion byte) ([]byte, int, error) {
 	resp := make([]byte, handshakeRespBufSize)
 	n, err := conn.Read(resp)
 	if err != nil {
@@ -941,14 +941,14 @@ func readHandshakeResponse(conn net.Conn, expectDual bool) ([]byte, int, error) 
 		}
 		n += m
 	}
-	if n == 9 && expectDual {
+	if n == 9 {
 		n = peekHandshakeFlags(conn, resp, n)
-		if n == 9 {
+		if n == 9 && clientVersion >= tunHandshakeVersionDualStack {
 			log.Warn("Dual-stack requested but the exit answered without a flags byte: " +
 				"it predates dual-stack, continuing IPv4-only (upgrade exits and relays before clients)")
 		}
 	}
-	n, err = readDualStackBlock(conn, resp, n)
+	n, err = readResponseTail(conn, resp, n, clientVersion)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -974,35 +974,63 @@ func peekHandshakeFlags(conn net.Conn, resp []byte, n int) int {
 	return n + m
 }
 
-// readDualStackBlock consumes the trailing dual-stack address block when the
-// response flags byte advertises it. n is the number of valid bytes in resp.
-// Responses without the flag are returned untouched, so an old server never
-// triggers an extra read.
+// readResponseTail completes the handshake response beyond the mandatory
+// 9-byte prefix: the version-dependent extended layout and, when the flags
+// byte advertises it, the trailing 32-byte dual-stack block. n is the number
+// of valid bytes already in resp.
 //
-// The dual-stack flag implies a v0x04 client, and the server only ever pairs
-// that with the 10-byte flags-only or the 20+seed v2 base layout — never the
-// 14-byte v1 form. The v2 seed length lives at resp[19], so when port hopping
-// is advertised as well the base has to be completed to 20 bytes before the
-// block's offset is knowable.
-func readDualStackBlock(conn net.Conn, resp []byte, n int) (int, error) {
-	if n < 10 || resp[9]&tunFlagDualStack == 0 {
-		return n, nil
+// This runs for every client version, not just the dual-stack one. A v0x03
+// client can be sent the 20+seed port-hop layout, and reading only what the
+// first Read happened to return left the rest of it in the stream for the
+// packet loop to parse as [len:4][pkt:N] - the same silent desync the
+// dual-stack path was fixed for.
+//
+// clientVersion disambiguates the two port-hop layouts, which are otherwise
+// indistinguishable by content: a v0x01 client gets the 14-byte v1 form, and
+// anything above it gets the 20+seed v2 form. Version 0 means "unknown"
+// (the relay, which forwards a response whose client it cannot see) and is
+// treated as v2, matching what the exit sends every client this code speaks
+// for.
+func readResponseTail(conn net.Conn, resp []byte, n int, clientVersion byte) (int, error) {
+	if n < 10 {
+		return n, nil // legacy 9-byte form, nothing follows
 	}
-	if resp[9]&tunFlagPortHopping != 0 && n < 20 {
-		m, err := io.ReadFull(conn, resp[n:20])
-		if err != nil {
-			return n, fmt.Errorf("dual-stack handshake base read failed: %w", err)
+	flags := resp[9]
+
+	base := 10
+	switch {
+	case flags&tunFlagPortHopping == 0:
+		// flags-only form
+	case clientVersion == 0x01:
+		base = 14 // v1: port range only
+	default:
+		// v2: the seed length lives at resp[19], so the base has to be
+		// completed that far before its own length is knowable.
+		if n < 20 {
+			m, err := io.ReadFull(conn, resp[n:20])
+			if err != nil {
+				return n, fmt.Errorf("handshake base read failed: %w", err)
+			}
+			n += m
 		}
-		n += m
+		seedLen := int(resp[19])
+		if seedLen > 32 {
+			return n, fmt.Errorf("handshake response declares a %d-byte hop seed, max 32", seedLen)
+		}
+		base = 20 + seedLen
 	}
-	need := handshakeResponseBaseLen(resp, n) + 32
+
+	need := base
+	if flags&tunFlagDualStack != 0 {
+		need += 32
+	}
 	if need > len(resp) {
-		return n, fmt.Errorf("dual-stack handshake response too large: need %d bytes", need)
+		return n, fmt.Errorf("handshake response too large: need %d bytes", need)
 	}
 	if n < need {
 		m, err := io.ReadFull(conn, resp[n:need])
 		if err != nil {
-			return n, fmt.Errorf("dual-stack block read failed: %w", err)
+			return n, fmt.Errorf("handshake tail read failed: %w", err)
 		}
 		n += m
 	}

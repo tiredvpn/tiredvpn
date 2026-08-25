@@ -99,7 +99,7 @@ func TestReadHandshakeResponseSplitAtEveryBoundary(t *testing.T) {
 				if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 					t.Fatalf("split %d: set deadline: %v", k, err)
 				}
-				resp, n, err := readHandshakeResponse(conn, true)
+				resp, n, err := readHandshakeResponse(conn, tunHandshakeVersionDualStack)
 				if err != nil {
 					t.Fatalf("split at %d: %v", k, err)
 				}
@@ -124,7 +124,7 @@ func TestReadHandshakeResponseShapesSingleRead(t *testing.T) {
 	for name, payload := range dualResponses() {
 		t.Run(name, func(t *testing.T) {
 			conn := &scriptedConn{chunks: [][]byte{payload}}
-			resp, n, err := readHandshakeResponse(conn, true)
+			resp, n, err := readHandshakeResponse(conn, tunHandshakeVersionDualStack)
 			if err != nil {
 				t.Fatalf("readHandshakeResponse: %v", err)
 			}
@@ -142,48 +142,53 @@ func TestReadHandshakeResponseShapesSingleRead(t *testing.T) {
 	}
 }
 
-// TestReadHandshakeResponseV4OnlyShapes pins the guarantee for a v0x03 client,
-// which is deliberately narrower: only the 9-byte prefix is read to
-// completion. Anything past it is optional and is never waited for, so a v1 or
-// v2 response split above the prefix returns short by design. Pinning it keeps
-// a future change from quietly widening the read on the legacy path, where an
-// extra round trip against a legacy exit would hang the connect.
+// TestReadHandshakeResponseV4OnlyShapes checks that a response is read to
+// completion for every client version and every split, not just for the
+// dual-stack one. Reading only what the first Read happened to return left the
+// rest of an extended response in the stream, and the packet loop then parsed
+// it as [len:4][pkt:N] - a silent desync of the tunnel.
+//
+// The client's own version picks the layout: the 14-byte v1 form goes to a
+// v0x01 client, the 20+seed v2 form to anything above it. The two are
+// indistinguishable by content, which is why the reader is told the version
+// rather than guessing.
 func TestReadHandshakeResponseV4OnlyShapes(t *testing.T) {
 	v1 := append(append([]byte{}, handshakeBase...),
 		tunFlagPortHopping, 0xb7, 0x98, 0xb7, 0xfc)
 	v2 := append(append([]byte{}, handshakeBase...),
 		tunFlagPortHopping, 0xb7, 0x98, 0xb7, 0xfc, 0, 0, 0, 60, 0x01, 0x00)
 
-	for name, payload := range map[string][]byte{
-		"legacy 9-byte": handshakeBase,
-		"v1 14-byte":    v1,
-		"v2 20-byte":    v2,
+	for name, tc := range map[string]struct {
+		payload []byte
+		version byte
+	}{
+		"legacy 9-byte":         {handshakeBase, tunHandshakeVersion},
+		"v1 14-byte":            {v1, 0x01},
+		"v2 20-byte":            {v2, tunHandshakeVersion},
+		"v2 20-byte, v4 client": {v2, tunHandshakeVersionDualStack},
 	} {
 		t.Run(name, func(t *testing.T) {
-			for k := 1; k < len(payload); k++ {
-				conn := chunkedConn(t, payload, k)
+			for k := 1; k < len(tc.payload); k++ {
+				conn := chunkedConn(t, tc.payload, k)
 				if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 					t.Fatalf("split %d: set deadline: %v", k, err)
 				}
-				resp, n, err := readHandshakeResponse(conn, false)
+				resp, n, err := readHandshakeResponse(conn, tc.version)
 				if err != nil {
 					t.Fatalf("split at %d: %v", k, err)
 				}
-				if n < 9 {
-					t.Fatalf("split at %d: n = %d, want at least the 9-byte prefix", k, n)
+				if n != len(tc.payload) {
+					t.Fatalf("split at %d: n = %d, want the whole %d-byte response",
+						k, n, len(tc.payload))
 				}
-				if !bytes.Equal(resp[:9], handshakeBase) {
-					t.Fatalf("split at %d: prefix = %x, want %x", k, resp[:9], handshakeBase)
+				if !bytes.Equal(resp[:n], tc.payload) {
+					t.Fatalf("split at %d: response = %x, want %x", k, resp[:n], tc.payload)
 				}
 			}
 		})
 	}
 }
 
-// TestReadHandshakeResponseTruncatedMidResponse covers a server that dies
-// partway through. Every cut must surface as an error rather than as a short
-// success: a caller that got (resp, n, nil) goes on to parse resp[:n] and to
-// run the packet loop on a stream that is missing bytes.
 func TestReadHandshakeResponseTruncatedMidResponse(t *testing.T) {
 	block, _, _ := dualBlock()
 	full := append(append(append([]byte{}, handshakeBase...), tunFlagDualStack), block...)
@@ -196,7 +201,7 @@ func TestReadHandshakeResponseTruncatedMidResponse(t *testing.T) {
 		if err := conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
 			t.Fatalf("set deadline: %v", err)
 		}
-		if _, n, err := readHandshakeResponse(conn, true); err == nil {
+		if _, n, err := readHandshakeResponse(conn, tunHandshakeVersionDualStack); err == nil {
 			t.Errorf("truncated at %d bytes: got n=%d and no error, want an error", k, n)
 		}
 	}
@@ -204,39 +209,41 @@ func TestReadHandshakeResponseTruncatedMidResponse(t *testing.T) {
 	// The exit that hangs up before answering at all: a refused or reset
 	// connection has to propagate, not come back as an empty response that the
 	// caller then parses as a legacy one and treats as a successful connect.
-	for _, dual := range []bool{false, true} {
+	for _, version := range []byte{tunHandshakeVersion, tunHandshakeVersionDualStack} {
 		conn := &scriptedConn{} // any read fails
-		resp, n, err := readHandshakeResponse(conn, dual)
+		resp, n, err := readHandshakeResponse(conn, version)
 		if err == nil {
-			t.Errorf("dual=%v: silent server accepted, got n=%d", dual, n)
+			t.Errorf("version 0x%02x: silent server accepted, got n=%d", version, n)
 		}
 		if resp != nil || n != 0 {
-			t.Errorf("dual=%v: error path returned resp=%v n=%d, want nil/0", dual, resp, n)
+			t.Errorf("version 0x%02x: error path returned resp=%v n=%d, want nil/0", version, resp, n)
 		}
 	}
 }
 
-// TestReadHandshakeResponseNoExtraReadOnV3Response pins that a response
-// carrying no dual-stack flag costs exactly one read, whatever the client
-// asked for. scriptedConn errors on any read past its script, so a second read
-// fails the test outright. The legacy path has to stay free of extra round
-// trips: an exit that predates dual-stack sends nothing more, and a blind read
-// would either hang the connect or eat the first byte of tunnel traffic.
+// TestReadHandshakeResponseNoExtraReadOnV3Response pins that a complete
+// response costs exactly one read, whatever version the client announced.
+// scriptedConn errors on any read past its script, so a second read fails the
+// test outright.
+//
+// A response that already carries its flags byte tells the reader everything
+// it needs, so nothing further is fetched. The bare 9-byte form is a different
+// case and is covered by the peek tests: there the reader cannot know whether
+// a tenth byte is coming and pays a bounded grace period to find out.
 func TestReadHandshakeResponseNoExtraReadOnV3Response(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		payload    []byte
-		expectDual bool
+		name    string
+		payload []byte
+		version byte
 	}{
-		{"legacy, dual not requested", handshakeBase, false},
-		{"v3 probe-only, dual not requested",
-			append(append([]byte{}, handshakeBase...), tunFlagMTUProbe), false},
-		{"v3 probe-only, dual requested",
-			append(append([]byte{}, handshakeBase...), tunFlagMTUProbe), true},
+		{"v3 probe-only, v3 client",
+			append(append([]byte{}, handshakeBase...), tunFlagMTUProbe), tunHandshakeVersion},
+		{"v3 probe-only, v4 client",
+			append(append([]byte{}, handshakeBase...), tunFlagMTUProbe), tunHandshakeVersionDualStack},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			conn := &scriptedConn{chunks: [][]byte{tc.payload}}
-			_, n, err := readHandshakeResponse(conn, tc.expectDual)
+			_, n, err := readHandshakeResponse(conn, tc.version)
 			if err != nil {
 				t.Fatalf("readHandshakeResponse: %v", err)
 			}
@@ -316,7 +323,7 @@ func TestReadDualStackBlockBufferTooSmall(t *testing.T) {
 	resp[9] = tunFlagDualStack
 
 	conn := &scriptedConn{} // must not be read: the size check comes first
-	n, err := readDualStackBlock(conn, resp, 10)
+	n, err := readResponseTail(conn, resp, 10, tunHandshakeVersionDualStack)
 	if err == nil {
 		t.Fatalf("undersized buffer accepted: n=%d", n)
 	}
@@ -339,7 +346,7 @@ func TestReadDualStackBlockBaseReadFailure(t *testing.T) {
 	resp[9] = tunFlagPortHopping | tunFlagDualStack
 
 	conn := &scriptedConn{} // read fails immediately
-	if _, err := readDualStackBlock(conn, resp, 10); err == nil {
+	if _, err := readResponseTail(conn, resp, 10, tunHandshakeVersionDualStack); err == nil {
 		t.Fatal("expected an error when the port-hop base never completes")
 	} else if !strings.Contains(err.Error(), "base read failed") {
 		t.Errorf("error = %v, want it to name the base read", err)

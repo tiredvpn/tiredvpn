@@ -145,13 +145,13 @@ func TestReadDualStackBlock(t *testing.T) {
 	t.Run("no flag: no extra read", func(t *testing.T) {
 		legacy := []byte{0x00, 10, 8, 0, 1, 10, 8, 0, 2}
 		conn := &scriptedConn{} // any read fails
-		n, err := readDualStackBlock(conn, legacy, len(legacy))
+		n, err := readResponseTail(conn, legacy, len(legacy), tunHandshakeVersionDualStack)
 		if err != nil || n != len(legacy) {
 			t.Errorf("legacy: n=%d err=%v", n, err)
 		}
 
 		probe := append(append([]byte{}, legacy...), tunFlagMTUProbe)
-		n, err = readDualStackBlock(conn, probe, len(probe))
+		n, err = readResponseTail(conn, probe, len(probe), tunHandshakeVersionDualStack)
 		if err != nil || n != len(probe) {
 			t.Errorf("v3 probe-only: n=%d err=%v", n, err)
 		}
@@ -162,7 +162,7 @@ func TestReadDualStackBlock(t *testing.T) {
 		full := append([]byte{0x00, 10, 8, 0, 1, 10, 8, 0, 2, tunFlagDualStack}, block...)
 		copy(resp, full)
 		conn := &scriptedConn{} // must not be read again
-		n, err := readDualStackBlock(conn, resp, len(full))
+		n, err := readResponseTail(conn, resp, len(full), tunHandshakeVersionDualStack)
 		if err != nil || n != len(full) {
 			t.Errorf("n=%d err=%v, want n=%d", n, err, len(full))
 		}
@@ -173,7 +173,7 @@ func TestReadDualStackBlock(t *testing.T) {
 		head := []byte{0x00, 10, 8, 0, 1, 10, 8, 0, 2, tunFlagMTUProbe | tunFlagDualStack}
 		copy(resp, head)
 		conn := &scriptedConn{chunks: [][]byte{block[:13], block[13:]}}
-		n, err := readDualStackBlock(conn, resp, len(head))
+		n, err := readResponseTail(conn, resp, len(head), tunHandshakeVersionDualStack)
 		if err != nil {
 			t.Fatalf("err=%v", err)
 		}
@@ -190,7 +190,7 @@ func TestReadDualStackBlock(t *testing.T) {
 		head := []byte{0x00, 10, 8, 0, 1, 10, 8, 0, 2, tunFlagDualStack}
 		copy(resp, head)
 		conn := &scriptedConn{} // read fails immediately
-		if _, err := readDualStackBlock(conn, resp, len(head)); err == nil {
+		if _, err := readResponseTail(conn, resp, len(head), tunHandshakeVersionDualStack); err == nil {
 			t.Error("expected an error when the advertised block is missing")
 		}
 	})
@@ -289,7 +289,7 @@ func TestReadHandshakeResponseFragmented(t *testing.T) {
 		conn := dripConn(t, base)
 		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 		start := time.Now()
-		resp, n, err := readHandshakeResponse(conn, true)
+		resp, n, err := readHandshakeResponse(conn, tunHandshakeVersionDualStack)
 		if err != nil {
 			t.Fatalf("readHandshakeResponse: %v", err)
 		}
@@ -308,7 +308,7 @@ func TestReadHandshakeResponseFragmented(t *testing.T) {
 		full := append(append(append([]byte{}, base...), tunFlagMTUProbe|tunFlagDualStack), block...)
 		conn := dripConn(t, full)
 		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		resp, n, err := readHandshakeResponse(conn, true)
+		resp, n, err := readHandshakeResponse(conn, tunHandshakeVersionDualStack)
 		if err != nil {
 			t.Fatalf("readHandshakeResponse: %v", err)
 		}
@@ -332,7 +332,7 @@ func TestReadHandshakeResponseFragmented(t *testing.T) {
 			tunFlagPortHopping|tunFlagMTUProbe|tunFlagDualStack), mid...), block...)
 		conn := dripConn(t, full)
 		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		resp, n, err := readHandshakeResponse(conn, true)
+		resp, n, err := readHandshakeResponse(conn, tunHandshakeVersionDualStack)
 		if err != nil {
 			t.Fatalf("readHandshakeResponse: %v", err)
 		}
@@ -357,7 +357,7 @@ func TestReadHandshakeResponseFragmented(t *testing.T) {
 	t.Run("prefix split below 9 bytes still completes", func(t *testing.T) {
 		conn := dripConn(t, base)
 		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		_, n, err := readHandshakeResponse(conn, false)
+		_, n, err := readHandshakeResponse(conn, tunHandshakeVersion)
 		if err != nil {
 			t.Fatalf("readHandshakeResponse: %v", err)
 		}
@@ -369,7 +369,7 @@ func TestReadHandshakeResponseFragmented(t *testing.T) {
 	t.Run("truncated prefix is an error, not a short read", func(t *testing.T) {
 		conn := dripConn(t, base[:5])
 		conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
-		if _, n, err := readHandshakeResponse(conn, false); err == nil {
+		if _, n, err := readHandshakeResponse(conn, tunHandshakeVersion); err == nil {
 			t.Errorf("expected an error for a 5-byte response, got n=%d", n)
 		}
 	})
@@ -381,7 +381,7 @@ func TestReadHandshakeResponseFragmented(t *testing.T) {
 // first one, which is what proves it.
 func TestReadHandshakeResponseNoPeekWithoutDual(t *testing.T) {
 	conn := &scriptedConn{chunks: [][]byte{{0x00, 10, 8, 0, 1, 10, 8, 0, 2}}}
-	_, n, err := readHandshakeResponse(conn, false)
+	_, n, err := readHandshakeResponse(conn, tunHandshakeVersion)
 	if err != nil {
 		t.Fatalf("readHandshakeResponse: %v", err)
 	}

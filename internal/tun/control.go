@@ -1300,7 +1300,7 @@ func (cs *ControlServer) performTUNHandshake() (assignedIP, serverIP net.IP, err
 	var resp []byte
 	var n int
 	if cs.config.DualStack {
-		resp, n, err = readHandshakeResponse(cs.serverConn, true)
+		resp, n, err = readHandshakeResponse(cs.serverConn, tunHandshakeVersionDualStack)
 	} else {
 		buf := make([]byte, 64)
 		n, err = io.ReadAtLeast(cs.serverConn, buf, 9)
