@@ -75,9 +75,9 @@ func TestRemoveExtensionByTypeOverrunPanics(t *testing.T) {
 // Not remotely reachable — the only callers are server.go:697 and server.go:801,
 // both reading operator config — so this is a usability bug, not a security one.
 //
-// Fix: strconv.Atoi on the trimmed string, which rejects trailing input.
+// Fixed: strconv.Atoi on the trimmed string rejects trailing input. This test
+// is now the regression guard.
 func TestParsePortRejectsTrailingGarbage(t *testing.T) {
-	t.Skip("KNOWN DEFECT: parsePort uses fmt.Sscanf and silently ignores trailing garbage")
 
 	for _, bad := range []string{"995abc", "443 junk", "80;rm -rf", "1.5", "0x1bb"} {
 		if got, err := parsePort(bad); err == nil {

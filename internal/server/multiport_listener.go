@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -377,10 +378,13 @@ func ParsePortRange(portRange string, maxPorts int) ([]int, error) {
 // parsePort parses and validates a single port number
 func parsePort(s string) (int, error) {
 	s = strings.TrimSpace(s)
-	var port int
-	_, err := fmt.Sscanf(s, "%d", &port)
+	// strconv.Atoi rather than fmt.Sscanf("%d"): Sscanf stops at the first
+	// non-digit and reports no error for the rest, so "995abc" parsed as 995
+	// and a typo in -port-range became a different, valid port. The operator
+	// then found out from clients that could not connect.
+	port, err := strconv.Atoi(s)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("invalid port %q: %w", s, err)
 	}
 
 	if port < 1 || port > 65535 {
