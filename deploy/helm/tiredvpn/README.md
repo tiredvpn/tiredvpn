@@ -158,7 +158,7 @@ helm template my-release deploy/helm/tiredvpn -f ci/server-minimal-values.yaml |
 
 - Helm: 3.8+
 - Kubernetes: 1.25+ (uses `policy/v1` PDB, `autoscaling/v2` HPA, `networking.k8s.io/v1` NetworkPolicy)
-- tiredvpn: matches `appVersion` in Chart.yaml (default `1.3.23`)
+- tiredvpn: matches `appVersion` in Chart.yaml (default `1.4.2`)
 
 ## License
 

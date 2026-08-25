@@ -1,6 +1,10 @@
 package mux
 
-import "time"
+import (
+	"time"
+
+	"github.com/xtaci/smux"
+)
 
 // Config holds configuration for the mux layer
 type Config struct {
@@ -113,3 +117,41 @@ func (c *Config) Clone() *Config {
 		CarrierBudgetJitter: c.CarrierBudgetJitter,
 	}
 }
+
+// SmuxSilentConfig returns an smux configuration that neither sends keepalives
+// nor kills a session for the lack of them.
+//
+// smux's default sends a NOP every ten seconds from a plain time.Ticker with no
+// jitter (session.go, keepalive). On the wire that is a perfectly periodic
+// pulse repeating without end: of 772 idle gaps longer than five seconds in one
+// capture, 706 were exactly ten. Recovering it needs an autocorrelation over
+// packet timestamps and nothing else - no model, no centroids, no payload. A
+// browser's PING follows events; only a metronome ticks.
+//
+// Jitter is the wrong fix and we have already made that mistake once today, on
+// the binding record's padding: uniform jitter produces a uniform distribution
+// of intervals, which is its own signature moved into the time axis. Silence
+// has no distribution.
+//
+// It is safe because the pings were never load-bearing. Measurement showed
+// sessions surviving sixty seconds of idleness without a single packet; the
+// pings exist to notice a dead peer, and noticing a dead peer belongs to an
+// active health check rather than to a metronome on every connection.
+//
+// smux rejects a zero interval outright and requires the timeout to be at least
+// the interval, so "disabled" is expressed as durations no session will ever
+// reach. Both matter: silencing the sender alone would leave the receiver
+// killing the session after thirty seconds of the quiet we just created.
+func SmuxSilentConfig() *smux.Config {
+	c := smux.DefaultConfig()
+	c.KeepAliveInterval = smuxSilentInterval
+	c.KeepAliveTimeout = smuxSilentTimeout
+	return c
+}
+
+const (
+	// smuxSilentInterval is far beyond any session's life, which is how a
+	// library that refuses to be told "never" is told never.
+	smuxSilentInterval = 24 * time.Hour
+	smuxSilentTimeout  = 48 * time.Hour
+)

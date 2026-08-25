@@ -557,6 +557,12 @@ func parseClientArgs(args []string) (*client.Config, error) {
 				i++
 			}
 
+		case "-tls-fingerprint":
+			if i+1 < len(args) {
+				cfg.TLSFingerprint = args[i+1]
+				i++
+			}
+
 		// ECH (Encrypted Client Hello)
 		case "-ech":
 			cfg.ECHEnabled = true

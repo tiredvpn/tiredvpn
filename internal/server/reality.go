@@ -2,11 +2,11 @@ package server
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
 	"io"
 	"net"
-	"sync"
 	"time"
 
 	"github.com/xtaci/smux"
@@ -16,30 +16,6 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
 	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 )
-
-var (
-	// Server's X25519 key pair (loaded from config or generated at startup)
-	serverREALITYPrivKey [32]byte
-	serverREALITYPubKey  [32]byte
-	realityKeyMu         sync.RWMutex
-)
-
-// InitREALITYKeys initializes the server's X25519 key pair
-func InitREALITYKeys() error {
-	realityKeyMu.Lock()
-	defer realityKeyMu.Unlock()
-
-	privKey, pubKey, err := customtls.GenerateX25519KeyPair()
-	if err != nil {
-		return fmt.Errorf("failed to generate reality keys: %w", err)
-	}
-
-	serverREALITYPrivKey = privKey
-	serverREALITYPubKey = pubKey
-
-	log.Info("REALITY server keys initialized")
-	return nil
-}
 
 // DetectREALITYExtension checks if the data contains a REALITY extension
 // Properly parses TLS ClientHello structure to find padding extension (0x0015)
@@ -113,6 +89,19 @@ func DetectREALITYExtension(data []byte) bool {
 		// Padding extension type: 0x0015 with enough data for PubKey+AuthToken.
 		// Handle truncated extension body: DPI may drop the trailing random padding
 		// while the REALITY auth bytes (first 64 bytes of extension body) are still present.
+		// The >=64 test below is what decides everything about this behaviour,
+		// so it is worth stating plainly: a padding extension of 64 bytes or
+		// more routes the connection into the REALITY handler, and anything
+		// smaller does not. Measured, not assumed - padLen 63 goes down the
+		// ordinary path, padLen 64 goes to REALITY, at any ClientHello size.
+		//
+		// That one condition explains the whole picture that looked like a
+		// length problem. BoringSSL and OpenSSL add this extension to hellos
+		// that would otherwise be 256 to 511 bytes, which is why failures
+		// appeared to start at 256; and when the padding needed is small the
+		// extension falls under 64 bytes and the connection passes again, which
+		// is why the failures appeared to stop further up. Neither boundary is
+		// ours, and there is no second failure point to look for.
 		if extType == customtls.PaddingExtensionType {
 			availableBody := extEnd - extDataStart
 			if availableBody > extLen {
@@ -137,24 +126,68 @@ func DetectREALITYExtension(data []byte) bool {
 	return false
 }
 
-// HandleREALITYConnection processes a REALITY protocol connection
-func HandleREALITYConnection(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
-	defer conn.Close()
+// HandleREALITYConnection processes a REALITY protocol connection.
+//
+// It reports whether it claimed the connection. A false return means the
+// ClientHello was not one of ours after all, and the caller must carry on with
+// the ordinary TLS path using the returned bytes to replay the hello.
+//
+// That distinction is the whole point of the signature. DetectREALITYExtension
+// cannot be precise: REALITY hides its credentials in the padding extension and
+// the wire format carries no magic, so any ClientHello with a padding extension
+// of at least 64 bytes looks like a candidate. Real clients send that
+// extension - OpenSSL pads any ClientHello between 256 and 511 bytes up to 512,
+// a workaround for an old F5 bug - so ordinary traffic lands here routinely.
+//
+// Dropping those connections is what this signature exists to prevent. It broke
+// two things at once: any client whose ClientHello falls in that size range
+// could not reach the server at all, and a prober could tell our servers from
+// every other host on the internet with one packet, because we answered a
+// padding extension with a FIN and nothing else.
+// HandleREALITYConnection processes a REALITY protocol connection.
+//
+// It reports whether it claimed the connection. A false return means the
+// ClientHello was not one of ours after all, and the caller must carry on with
+// the ordinary TLS path using the returned bytes to replay the hello.
+//
+// That distinction is the whole point of the signature. DetectREALITYExtension
+// cannot be precise: REALITY hides its credentials in the padding extension and
+// the wire format carries no magic, so any ClientHello with a padding extension
+// of at least 64 bytes looks like a candidate. Real clients send that
+// extension - OpenSSL pads any ClientHello between 256 and 511 bytes up to 512,
+// a workaround for an old F5 bug - so ordinary traffic lands here routinely.
+//
+// Dropping those connections is what this signature exists to prevent. It broke
+// two things at once: any client whose ClientHello falls in that size range
+// could not reach the server at all, and a prober could tell our servers from
+// every other host on the internet with one packet, because we answered a
+// padding extension with a FIN and nothing else.
+func HandleREALITYConnection(conn net.Conn, srvCtx *serverContext, logger *log.Logger) (claimed bool, hello []byte) {
+	claimed, hello = handleREALITYAuthenticated(conn, srvCtx, logger)
+	if claimed {
+		conn.Close()
+	}
+	return claimed, hello
+}
 
+func handleREALITYAuthenticated(conn net.Conn, srvCtx *serverContext, logger *log.Logger) (claimed bool, hello []byte) {
 	logger.Debug("REALITY: Processing connection from %s", conn.RemoteAddr())
 
 	// Read ClientHello
 	clientHello, err := ReadTLSRecord(conn)
 	if err != nil {
 		logger.Error("REALITY: Failed to read ClientHello: %v", err)
-		return
+		conn.Close()
+		return true, nil
 	}
 
 	// Extract REALITY extension
 	realityExt, err := ExtractREALITYExtensionFromClientHello(clientHello)
 	if err != nil {
-		logger.Error("REALITY: Failed to extract extension: %v", err)
-		return
+		// Shaped like a padding extension to the detector, not parseable as
+		// ours. An ordinary client, not a failed one.
+		logger.Debug("REALITY: no usable extension (%v), handing back to the ordinary path", err)
+		return false, clientHello
 	}
 
 	logger.Debug("REALITY: Extension extracted, pubkey=%x", realityExt.PubKey[:8])
@@ -190,21 +223,54 @@ func HandleREALITYConnection(conn net.Conn, srvCtx *serverContext, logger *log.L
 	}
 
 	if !authenticated {
-		logger.Info("REALITY: Auth failed")
+		// Either a prober, or - far more likely - an ordinary client whose
+		// ClientHello happens to carry a real padding extension.
 		if srvCtx.cfg.REALITYCoverDomain != "" {
+			logger.Info("REALITY: Auth failed, proxying to the cover domain")
 			handleREALITYUnauthorized(conn, clientHello, srvCtx.cfg.REALITYCoverDomain, logger)
+			conn.Close()
+			return true, nil
 		}
-		// No cover domain configured: silently drop to avoid SSRF via client-controlled SNI.
-		return
+		// No cover domain configured. Hand the connection back rather than
+		// dropping it: the ordinary path terminates TLS and serves the fake
+		// website, which is what every other unrecognised connection gets and
+		// therefore the only answer that does not single us out.
+		//
+		// This is not the SSRF the old comment worried about. That risk came
+		// from forwarding to a client-controlled SNI; serving our own site
+		// forwards nothing.
+		logger.Debug("REALITY: Auth failed, handing back to the ordinary path")
+		return false, clientHello
 	}
 
 	logger.Debug("REALITY: Using secret from %s", authClientID)
+	realityAuthLegacyTotal.Add(1)
+
+	// Data layer version. A v2 client appends [salt][MAC] to the padding block
+	// after its 64-byte core; a v1 client leaves random bytes there, which fail
+	// the MAC. Nothing on the wire changes size either way.
+	clientSalt, dataV2 := customtls.ParseClientDataV2(usedSecret, realityExt.PubKey, realityExt.Extra)
+	if !dataV2 {
+		// Logged at Info, not Debug, so the rollout is observable without
+		// turning on -debug on a production exit: once no client reports v1 for
+		// a full day, -reality-require-data-v2 is safe to switch on. Silence
+		// means everyone is on v2. The v2 case stays at Debug to keep a busy
+		// exit's log quiet.
+		if srvCtx.cfg.REALITYRequireDataV2 {
+			logger.Info("REALITY: rejecting legacy v1 data layer from %s (client: %s)", conn.RemoteAddr(), authClientID)
+			if srvCtx.cfg.REALITYCoverDomain != "" {
+				handleREALITYUnauthorized(conn, clientHello, srvCtx.cfg.REALITYCoverDomain, logger)
+			}
+			return true, nil
+		}
+		logger.Info("REALITY: accepting legacy v1 data layer from %s (client: %s)", conn.RemoteAddr(), authClientID)
+	}
 
 	// Extract SNI to determine destination
 	sni, err := ExtractSNI(clientHello)
 	if err != nil {
 		logger.Error("REALITY: Failed to extract SNI: %v", err)
-		return
+		return true, nil
 	}
 
 	// Default to port 443 if not specified
@@ -220,7 +286,7 @@ func HandleREALITYConnection(conn net.Conn, srvCtx *serverContext, logger *log.L
 	if err != nil {
 		logger.Error("REALITY: Failed to connect to %s: %v", dest, err)
 		sendTLSAlert(conn, 0x50) // internal_error
-		return
+		return true, nil
 	}
 
 	// Remove REALITY extension from ClientHello
@@ -228,7 +294,7 @@ func HandleREALITYConnection(conn net.Conn, srvCtx *serverContext, logger *log.L
 	if err != nil {
 		logger.Error("REALITY: Failed to strip extension: %v", err)
 		destConn.Close()
-		return
+		return true, nil
 	}
 
 	logger.Debug("REALITY: Stripped ClientHello (%d bytes): %s", len(strippedClientHello), log.HexDump(strippedClientHello, 256))
@@ -237,7 +303,7 @@ func HandleREALITYConnection(conn net.Conn, srvCtx *serverContext, logger *log.L
 	if _, err := destConn.Write(strippedClientHello); err != nil {
 		logger.Error("REALITY: Failed to send ClientHello to dest: %v", err)
 		destConn.Close()
-		return
+		return true, nil
 	}
 
 	// Read ServerHello from destination
@@ -245,25 +311,56 @@ func HandleREALITYConnection(conn net.Conn, srvCtx *serverContext, logger *log.L
 	if err != nil {
 		logger.Error("REALITY: Failed to read ServerHello from dest: %v", err)
 		destConn.Close()
-		return
+		return true, nil
 	}
 
 	logger.Debug("REALITY: Received ServerHello from dest (%d bytes): %s", len(serverHello), log.HexDump(serverHello, 32))
 
-	// Generate server auth token
-	realityKeyMu.RLock()
-	privKey := serverREALITYPrivKey
-	realityKeyMu.RUnlock()
-
-	serverExt, err := customtls.NewServerREALITYExtension(
-		usedSecret,
-		privKey,
-		realityExt.PubKey,
+	// Generate server auth token. For a v2 client the key pair is ephemeral for
+	// this connection, so the data keys survive a later leak of the password;
+	// for v1 we keep using the process-wide key, which that client ignores anyway.
+	var (
+		serverExt  *customtls.REALITYExtension
+		dataParams *strategy.RealityV2Params
 	)
+	if dataV2 {
+		serverPriv, serverPub, kerr := customtls.GenerateX25519KeyPair()
+		if kerr != nil {
+			logger.Error("REALITY: Failed to generate ephemeral key: %v", kerr)
+			destConn.Close()
+			return true, nil
+		}
+		var serverSalt [32]byte
+		if _, rerr := rand.Read(serverSalt[:]); rerr != nil {
+			logger.Error("REALITY: Failed to generate salt: %v", rerr)
+			destConn.Close()
+			return true, nil
+		}
+		ecdh, eerr := strategy.RealityV2ECDH(serverPriv, realityExt.PubKey)
+		if eerr != nil {
+			logger.Error("REALITY: ECDH failed: %v", eerr)
+			destConn.Close()
+			return true, nil
+		}
+		serverExt, err = customtls.NewServerREALITYExtensionDataV2(
+			usedSecret, serverPriv, realityExt.PubKey, clientSalt, serverSalt,
+		)
+		dataParams = &strategy.RealityV2Params{
+			SharedSecret: usedSecret,
+			ECDH:         ecdh,
+			ClientPub:    realityExt.PubKey,
+			ServerPub:    serverPub,
+			ClientSalt:   clientSalt,
+			ServerSalt:   serverSalt,
+		}
+	} else {
+		privKey, _ := realityStaticKeys()
+		serverExt, err = customtls.NewServerREALITYExtension(usedSecret, privKey, realityExt.PubKey)
+	}
 	if err != nil {
 		logger.Error("REALITY: Failed to create server extension: %v", err)
 		destConn.Close()
-		return
+		return true, nil
 	}
 
 	// Inject REALITY extension into ServerHello
@@ -271,7 +368,7 @@ func HandleREALITYConnection(conn net.Conn, srvCtx *serverContext, logger *log.L
 	if err != nil {
 		logger.Error("REALITY: Failed to inject extension: %v", err)
 		destConn.Close()
-		return
+		return true, nil
 	}
 
 	logger.Debug("REALITY: Modified ServerHello (%d bytes, was %d)", len(modifiedServerHello), len(serverHello))
@@ -280,7 +377,7 @@ func HandleREALITYConnection(conn net.Conn, srvCtx *serverContext, logger *log.L
 	if _, err := conn.Write(modifiedServerHello); err != nil {
 		logger.Error("REALITY: Failed to send ServerHello to client: %v", err)
 		destConn.Close()
-		return
+		return true, nil
 	}
 
 	logger.Debug("REALITY: ServerHello sent to client")
@@ -303,17 +400,18 @@ func HandleREALITYConnection(conn net.Conn, srvCtx *serverContext, logger *log.L
 	conn.SetReadDeadline(time.Time{})
 	if err != nil {
 		logger.Debug("REALITY: Failed to read negotiation byte: %v", err)
-		return
+		return true, nil
 	}
 
 	if negBuf[0] == protocol.TypeMux {
-		logger.Debug("REALITY: Client requested smux multiplexing")
-		handleREALITYMuxSession(conn, srvCtx, logger, clientID, usedSecret, realityExt.PubKey)
-		return
+		logger.Debug("REALITY: Client requested smux multiplexing (data layer v%d)", dataLayerVersion(dataV2))
+		handleREALITYMuxSession(conn, srvCtx, logger, clientID, usedSecret, realityExt.PubKey, dataParams)
+		return true, nil
 	}
 
 	// Legacy mode: prepend the peeked byte and handle as raw tunnel.
 	handleRawTunnel(&realityPrependConn{Conn: conn, first: negBuf[0]}, srvCtx, logger, clientID)
+	return true, nil
 }
 
 // realityPrependConn is a net.Conn that prepends a single already-read byte to the first Read call.
@@ -335,13 +433,32 @@ func (c *realityPrependConn) Read(b []byte) (int, error) {
 	return c.Conn.Read(b)
 }
 
+// dataLayerVersion maps the negotiated flag to the version number used in logs.
+func dataLayerVersion(v2 bool) int {
+	if v2 {
+		return 2
+	}
+	return 1
+}
+
 // handleREALITYMuxSession runs a smux server over the post-auth REALITY connection.
 // Each stream is handled as an independent raw tunnel request.
-// usedSecret and clientPubKey are used to wrap the connection in the same
-// chacha20-over-TLS-record framing that the client uses after its TypeMux write.
-func handleREALITYMuxSession(conn net.Conn, srvCtx *serverContext, logger *log.Logger, clientID string, usedSecret []byte, clientPubKey [32]byte) {
+//
+// The connection is wrapped in the same TLS-record framing the client applies
+// after its TypeMux write. params non-nil selects the v2 AEAD layer keyed by
+// this connection's X25519 exchange; nil is a v1 client, still keyed by
+// HKDF(secret, salt=clientPubKey).
+func handleREALITYMuxSession(conn net.Conn, srvCtx *serverContext, logger *log.Logger, clientID string, usedSecret []byte, clientPubKey [32]byte, params *strategy.RealityV2Params) {
 	// Mirror the client-side wrap: server is !isClient so write/read keys are reversed.
-	dataConn, err := strategy.NewRealityDataConn(conn, usedSecret, clientPubKey[:], false)
+	var (
+		dataConn net.Conn
+		err      error
+	)
+	if params != nil {
+		dataConn, err = strategy.NewRealityDataConnV2(conn, *params, false)
+	} else {
+		dataConn, err = strategy.NewRealityDataConn(conn, usedSecret, clientPubKey[:], false)
+	}
 	if err != nil {
 		logger.Error("REALITY: data conn init failed: %v", err)
 		return
@@ -368,8 +485,13 @@ func handleREALITYMuxSession(conn net.Conn, srvCtx *serverContext, logger *log.L
 // handleREALITYUnauthorized proxies unauthorized REALITY clients to the configured
 // cover domain. coverDomain is admin-controlled (Config.REALITYCoverDomain), not
 // client-provided SNI, so there is no SSRF via attacker-controlled hostname.
+// realityDonorPort is the port unauthenticated connections are forwarded to.
+// A variable rather than a constant so a test can point it at a local listener;
+// production never changes it.
+var realityDonorPort = "443"
+
 func handleREALITYUnauthorized(conn net.Conn, clientHello []byte, coverDomain string, logger *log.Logger) {
-	dest := net.JoinHostPort(coverDomain, "443")
+	dest := net.JoinHostPort(coverDomain, realityDonorPort)
 
 	logger.Info("REALITY-UNAUTH: Proxying to %s", dest)
 
@@ -377,20 +499,27 @@ func handleREALITYUnauthorized(conn net.Conn, clientHello []byte, coverDomain st
 	destConn, err := net.DialTimeout("tcp", dest, 10*time.Second)
 	if err != nil {
 		logger.Error("REALITY-UNAUTH: Failed to connect to %s: %v", dest, err)
+		realityDonorDialFailTotal.Add(1)
 		return
 	}
 	defer destConn.Close()
 
-	// Remove REALITY extension from ClientHello
-	strippedClientHello, err := RemoveREALITYExtension(clientHello)
-	if err != nil {
-		// If stripping fails, forward original (less safe but functional)
-		logger.Warn("REALITY-UNAUTH: Failed to strip extension, forwarding original")
-		strippedClientHello = clientHello
-	}
-
-	// Forward ClientHello to destination
-	if _, err := destConn.Write(strippedClientHello); err != nil {
+	// Forward the ClientHello byte for byte. Not stripped - stripping it here
+	// is what turned this cover into a second failure.
+	//
+	// The transcript hash covers the ClientHello as sent. Remove the padding
+	// extension on the way to the donor and the donor hashes one message while
+	// the client hashes another, so Finished never verifies and the client ends
+	// the handshake with a decrypt error instead of a page. The cover was
+	// breaking exactly the clients it exists to serve.
+	//
+	// Stripping made sense on the assumption that the extension is ours and
+	// carries credentials. Reaching this function means authentication did not
+	// succeed, so that assumption is the one thing we know to be doubtful: the
+	// extension is most likely a real padding extension from a real client. And
+	// RFC 7685 requires the receiver to ignore its content, so even our own
+	// credentials sitting in it are just bytes the donor discards.
+	if _, err := destConn.Write(clientHello); err != nil {
 		logger.Error("REALITY-UNAUTH: Failed to send ClientHello: %v", err)
 		return
 	}
@@ -428,4 +557,3 @@ func sendTLSAlert(conn net.Conn, alertCode byte) {
 	}
 	conn.Write(alert)
 }
-

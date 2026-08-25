@@ -358,8 +358,13 @@ func TestRelayTUNSinkWritePacketRejectsOversize(t *testing.T) {
 // different key pairs, and the public key must be derived from the private one
 // each time: a stale or zero public key would make every REALITY handshake fail
 // with no obvious cause.
+//
+// This is the B1-disabled path, which is the one that generates. With B1 on the
+// key comes from configuration and is deliberately stable across restarts -
+// covered separately in reality_keys_test.go.
 func TestInitREALITYKeys(t *testing.T) {
-	if err := InitREALITYKeys(); err != nil {
+	cfg := &Config{}
+	if err := InitREALITYKeys(cfg); err != nil {
 		t.Fatalf("InitREALITYKeys: %v", err)
 	}
 
@@ -375,7 +380,7 @@ func TestInitREALITYKeys(t *testing.T) {
 		t.Error("public key is all zeroes")
 	}
 
-	if err := InitREALITYKeys(); err != nil {
+	if err := InitREALITYKeys(cfg); err != nil {
 		t.Fatalf("second InitREALITYKeys: %v", err)
 	}
 	realityKeyMu.RLock()

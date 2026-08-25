@@ -23,10 +23,11 @@ import (
 // Mapped fields:
 //   - server.address + server.port → cfg.ServerAddr (joined host:port)
 //   - strategy.mode                → cfg.StrategyName
+//   - tls.fingerprint              → cfg.TLSFingerprint
 //   - shaper.{preset|custom}       → cfg.Shaper (built via presets.FromConfig)
 //   - logging.level                → log.SetDebug when "debug"
 //
-// Unmapped TOML fields (TLS server_name/fingerprint/ALPN, strategy.options,
+// Unmapped TOML fields (TLS server_name/ALPN, strategy.options,
 // logging.format/output) are accepted by the schema but not yet wired into the
 // runtime client.Config — these are gaps tracked separately and ignored here.
 func applyClientTOMLConfig(cfg *client.Config, path string, fs *flag.FlagSet) error {
@@ -41,6 +42,9 @@ func applyClientTOMLConfig(cfg *client.Config, path string, fs *flag.FlagSet) er
 	cfg.ServerAddr = joinHostPort(tcfg.Server.Address, tcfg.Server.Port)
 	if tcfg.Strategy.Mode != "" {
 		cfg.StrategyName = tcfg.Strategy.Mode
+	}
+	if tcfg.TLS.Fingerprint != "" {
+		cfg.TLSFingerprint = tcfg.TLS.Fingerprint
 	}
 	if tcfg.Logging.Level == "debug" {
 		log.SetDebug(true)

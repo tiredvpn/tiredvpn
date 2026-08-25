@@ -30,16 +30,28 @@ const (
 	REALITYExtensionLength = 32 + 32 // pubkey + auth token (no magic, no version)
 	MinPaddingSize         = 256     // minimum padding size for REALITY data + random
 
+	// DataV2ExtraLength is the size of the optional block that follows the core
+	// [PubKey][AuthToken] and signals the v2 data layer: [salt:32][mac:32].
+	DataV2ExtraLength = 32 + 32
+
 	// authTokenGraceBuckets is the number of adjacent 5-minute buckets accepted
 	// on each side of the current one in VerifyClientAuth, to tolerate clock skew.
 	authTokenGraceBuckets = 1
 )
 
 // REALITYExtension carries client credentials hidden inside TLS padding extension.
-// Wire format: [PubKey:32][AuthToken:32] — looks like random bytes to an observer.
+// Wire format: [PubKey:32][AuthToken:32][Extra:n] — looks like random bytes to an
+// observer, because Extra is either a MAC over per-connection randomness (data
+// layer v2) or the random padding a v1 peer writes there.
 type REALITYExtension struct {
 	PubKey    [32]byte
 	AuthToken [32]byte
+
+	// Extra holds bytes carried inside the same padding block, right after the
+	// 64-byte core. A v1 peer leaves random bytes here and never reads them, so
+	// this is the version-negotiation channel: see ClientDataV2Extra /
+	// ParseClientDataV2. Nil means "nothing to carry" (v1 behaviour).
+	Extra []byte
 }
 
 // NewClientREALITYExtension creates a client-side REALITY extension with auth token.
@@ -78,16 +90,19 @@ func NewServerREALITYExtension(secret []byte, serverPrivKey, clientPubKey [32]by
 	}, nil
 }
 
-// Marshal serializes the extension to bytes: [PubKey:32][AuthToken:32].
+// Marshal serializes the extension to bytes: [PubKey:32][AuthToken:32][Extra:n].
 // No magic or version bytes — indistinguishable from random padding to an observer.
 func (e *REALITYExtension) Marshal() []byte {
-	buf := make([]byte, REALITYExtensionLength)
+	buf := make([]byte, REALITYExtensionLength+len(e.Extra))
 	copy(buf[0:32], e.PubKey[:])
 	copy(buf[32:64], e.AuthToken[:])
+	copy(buf[64:], e.Extra)
 	return buf
 }
 
-// Unmarshal parses [PubKey:32][AuthToken:32] from the start of data.
+// Unmarshal parses [PubKey:32][AuthToken:32] from the start of data. Anything
+// beyond the core is left to the caller (see ExtractREALITYFromPadding, which
+// fills Extra).
 func (e *REALITYExtension) Unmarshal(data []byte) error {
 	if len(data) < REALITYExtensionLength {
 		return errors.New("reality extension too short")
@@ -148,6 +163,129 @@ func generateAuthToken(secret []byte, clientPubKey [32]byte) [32]byte {
 	return generateAuthTokenAtBucket(secret, clientPubKey, 0)
 }
 
+// --- Data layer v2 negotiation ---------------------------------------------
+//
+// The v1 data layer derived its ChaCha20 key and nonce from HKDF(secret,
+// salt=clientPubKey). With a process-wide client key that meant one keystream
+// for every connection of a client. v2 derives from an X25519 exchange plus
+// fresh per-connection salts, and switches the record layer to AEAD.
+//
+// Both sides must agree on the version without a new wire field, because a v1
+// peer on the other end must keep working during the rollout. The signal is
+// carried in the padding block that already exists: right after the 64-byte
+// core we place [salt:32][mac:32]. A v1 peer fills that area with random bytes
+// and never looks at it, so:
+//   - v2 peer sees a valid MAC (needs the shared secret to forge) → v2;
+//   - v1 peer's random bytes fail the MAC with probability 1-2^-256 → v1;
+//   - a v1 peer receiving a v2 block ignores it entirely.
+//
+// To an observer both cases are 256 bytes of uniformly random padding.
+
+const (
+	dataV2ClientLabel = "tiredvpn-reality-data-v2/client"
+	dataV2ServerLabel = "tiredvpn-reality-data-v2/server"
+)
+
+// clientDataV2MAC binds the client's salt to its ephemeral public key.
+func clientDataV2MAC(secret []byte, clientPub, clientSalt [32]byte) [32]byte {
+	h := hmac.New(sha256.New, secret)
+	h.Write([]byte(dataV2ClientLabel))
+	h.Write(clientPub[:])
+	h.Write(clientSalt[:])
+	var mac [32]byte
+	copy(mac[:], h.Sum(nil))
+	return mac
+}
+
+// serverDataV2MAC binds the server's salt AND its ephemeral public key to the
+// client's. Covering serverPub is what stops an active middlebox from swapping
+// in its own key while replaying the server's auth token: forging this MAC
+// requires the shared secret.
+func serverDataV2MAC(secret []byte, clientPub, serverPub, clientSalt, serverSalt [32]byte) [32]byte {
+	h := hmac.New(sha256.New, secret)
+	h.Write([]byte(dataV2ServerLabel))
+	h.Write(clientPub[:])
+	h.Write(serverPub[:])
+	h.Write(clientSalt[:])
+	h.Write(serverSalt[:])
+	var mac [32]byte
+	copy(mac[:], h.Sum(nil))
+	return mac
+}
+
+// ClientDataV2Extra builds the 64-byte block a v2 client appends to its
+// REALITY extension: [clientSalt:32][MAC:32].
+func ClientDataV2Extra(secret []byte, clientPub, clientSalt [32]byte) []byte {
+	mac := clientDataV2MAC(secret, clientPub, clientSalt)
+	out := make([]byte, DataV2ExtraLength)
+	copy(out[0:32], clientSalt[:])
+	copy(out[32:64], mac[:])
+	return out
+}
+
+// ParseClientDataV2 checks whether extra carries a valid v2 signal from a client
+// holding secret, and returns the client's salt if so.
+func ParseClientDataV2(secret []byte, clientPub [32]byte, extra []byte) (clientSalt [32]byte, ok bool) {
+	if len(extra) < DataV2ExtraLength {
+		return clientSalt, false
+	}
+	copy(clientSalt[:], extra[0:32])
+	want := clientDataV2MAC(secret, clientPub, clientSalt)
+	if !hmac.Equal(want[:], extra[32:64]) {
+		return [32]byte{}, false
+	}
+	return clientSalt, true
+}
+
+// ServerDataV2Extra builds the 64-byte block a v2 server appends to its REALITY
+// extension: [serverSalt:32][MAC:32].
+func ServerDataV2Extra(secret []byte, clientPub, serverPub, clientSalt, serverSalt [32]byte) []byte {
+	mac := serverDataV2MAC(secret, clientPub, serverPub, clientSalt, serverSalt)
+	out := make([]byte, DataV2ExtraLength)
+	copy(out[0:32], serverSalt[:])
+	copy(out[32:64], mac[:])
+	return out
+}
+
+// ParseServerDataV2 checks whether extra carries a valid v2 confirmation from a
+// server holding secret, and returns the server's salt if so.
+func ParseServerDataV2(secret []byte, clientPub, serverPub, clientSalt [32]byte, extra []byte) (serverSalt [32]byte, ok bool) {
+	if len(extra) < DataV2ExtraLength {
+		return serverSalt, false
+	}
+	copy(serverSalt[:], extra[0:32])
+	want := serverDataV2MAC(secret, clientPub, serverPub, clientSalt, serverSalt)
+	if !hmac.Equal(want[:], extra[32:64]) {
+		return [32]byte{}, false
+	}
+	return serverSalt, true
+}
+
+// NewClientREALITYExtensionDataV2 is NewClientREALITYExtension plus the v2
+// data-layer signal. Unrelated to REALITYExtensionV2, which is the
+// post-quantum extension format in postquantum.go.
+func NewClientREALITYExtensionDataV2(secret []byte, clientPrivKey, clientSalt [32]byte) (*REALITYExtension, error) {
+	ext, err := NewClientREALITYExtension(secret, clientPrivKey)
+	if err != nil {
+		return nil, err
+	}
+	ext.Extra = ClientDataV2Extra(secret, ext.PubKey, clientSalt)
+	return ext, nil
+}
+
+// NewServerREALITYExtensionDataV2 is NewServerREALITYExtension plus the v2
+// data-layer confirmation. serverPrivKey is expected to be ephemeral (per connection):
+// together with the client's ephemeral key that is what gives the data layer
+// forward secrecy against a later compromise of the shared password.
+func NewServerREALITYExtensionDataV2(secret []byte, serverPrivKey, clientPubKey, clientSalt, serverSalt [32]byte) (*REALITYExtension, error) {
+	ext, err := NewServerREALITYExtension(secret, serverPrivKey, clientPubKey)
+	if err != nil {
+		return nil, err
+	}
+	ext.Extra = ServerDataV2Extra(secret, clientPubKey, ext.PubKey, clientSalt, serverSalt)
+	return ext, nil
+}
+
 // GenerateX25519KeyPair generates a new X25519 key pair
 func GenerateX25519KeyPair() (privKey, pubKey [32]byte, err error) {
 	if _, err := rand.Read(privKey[:]); err != nil {
@@ -158,32 +296,72 @@ func GenerateX25519KeyPair() (privKey, pubKey [32]byte, err error) {
 	return privKey, pubKey, nil
 }
 
+// findPaddingExtension locates the padding extension (0x0015) in a full
+// ClientHello TLS record, returning the offset of its 4-byte header and its
+// body length.
+//
+// It walks the ClientHello structure rather than scanning for the bytes 00 15.
+// The scan was safe only while it never found anything: uTLS used to discard
+// the padding extension before marshalling, so this path always failed and the
+// caller fell back to appending one by hand. Now that the padding is real, a
+// scan matches the first 00 15 anywhere in the message — and a post-quantum
+// key_share puts more than a kilobyte of effectively random bytes ahead of
+// every other extension, so a false match is likely and wins, because the real
+// padding is appended last.
+func findPaddingExtension(record []byte) (hdrOffset, bodyLen int, err error) {
+	const recordHeaderLen = 5
+	if len(record) < recordHeaderLen || record[0] != 0x16 {
+		return 0, 0, errors.New("not a TLS handshake record")
+	}
+	hello := record[recordHeaderLen:]
+
+	start, length, err := helloExtensionsAt(hello)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	found := false
+	if err := walkExtensions(hello[start:start+length], func(offset int, extType uint16, body []byte) bool {
+		if extType != extensionPadding {
+			return false
+		}
+		hdrOffset = recordHeaderLen + start + offset
+		bodyLen = len(body)
+		found = true
+		return true
+	}); err != nil {
+		return 0, 0, err
+	}
+	if !found {
+		return 0, 0, errPaddingNotFound
+	}
+	return hdrOffset, bodyLen, nil
+}
+
+// extensionPadding is the RFC 7685 padding extension type.
+const extensionPadding = 0x0015
+
+var errPaddingNotFound = errors.New("padding extension not found in clientHello")
+
 // InjectREALITYIntoPadding finds padding extension in ClientHello and injects REALITY data
-// The padding extension content is replaced with: [REALITY data (69 bytes)][random padding]
+// The padding extension content is replaced with: [REALITY data][random padding]
 func InjectREALITYIntoPadding(clientHello []byte, ext *REALITYExtension) ([]byte, error) {
 	if len(clientHello) < 50 {
 		return nil, errors.New("clientHello too short")
 	}
 
-	// Find padding extension (0x00 0x15)
-	paddingOffset := -1
-	for i := 0; i < len(clientHello)-4; i++ {
-		if clientHello[i] == 0x00 && clientHello[i+1] == 0x15 {
-			// Check extension length
-			extLen := int(clientHello[i+2])<<8 | int(clientHello[i+3])
-			if extLen >= REALITYExtensionLength && i+4+extLen <= len(clientHello) {
-				paddingOffset = i
-				break
-			}
-		}
+	realityData := ext.Marshal()
+
+	paddingOffset, extLen, err := findPaddingExtension(clientHello)
+	if err != nil {
+		return nil, err
+	}
+	// Sized against the payload we actually carry, not the 64-byte core: with
+	// the data-layer v2 signal appended the block is 128 bytes.
+	if extLen < len(realityData) {
+		return nil, fmt.Errorf("padding extension is %d bytes, need at least %d", extLen, len(realityData))
 	}
 
-	if paddingOffset < 0 {
-		return nil, errors.New("padding extension not found in clientHello")
-	}
-
-	// Get padding extension bounds
-	extLen := int(clientHello[paddingOffset+2])<<8 | int(clientHello[paddingOffset+3])
 	dataStart := paddingOffset + 4
 
 	// Make a copy
@@ -191,17 +369,16 @@ func InjectREALITYIntoPadding(clientHello []byte, ext *REALITYExtension) ([]byte
 	copy(result, clientHello)
 
 	// Write REALITY data at the start of padding
-	realityData := ext.Marshal()
-	copy(result[dataStart:dataStart+REALITYExtensionLength], realityData)
+	copy(result[dataStart:dataStart+len(realityData)], realityData)
 
 	// Fill rest with random data (not zeros, to avoid detection)
-	remaining := extLen - REALITYExtensionLength
+	remaining := extLen - len(realityData)
 	if remaining > 0 {
 		randomPadding := make([]byte, remaining)
 		if _, err := rand.Read(randomPadding); err != nil {
 			return nil, fmt.Errorf("failed to generate random padding: %w", err)
 		}
-		copy(result[dataStart+REALITYExtensionLength:dataStart+extLen], randomPadding)
+		copy(result[dataStart+len(realityData):dataStart+extLen], randomPadding)
 	}
 
 	return result, nil
@@ -209,6 +386,11 @@ func InjectREALITYIntoPadding(clientHello []byte, ext *REALITYExtension) ([]byte
 
 // ExtractREALITYFromPadding extracts REALITY extension from the start of padding data.
 // No magic check — caller must verify AuthToken to confirm this is a real REALITY client.
+//
+// Everything after the 64-byte core is copied into ext.Extra: for a v2 peer that
+// is the [salt][MAC] block, for a v1 peer it is random padding that fails the MAC
+// check. The copy keeps ext independent of the caller's buffer, which on the
+// server is a long-lived peek buffer.
 func ExtractREALITYFromPadding(paddingData []byte) (*REALITYExtension, error) {
 	if len(paddingData) < REALITYExtensionLength {
 		return nil, errors.New("padding too short for REALITY data")
@@ -217,6 +399,10 @@ func ExtractREALITYFromPadding(paddingData []byte) (*REALITYExtension, error) {
 	ext := &REALITYExtension{}
 	if err := ext.Unmarshal(paddingData[:REALITYExtensionLength]); err != nil {
 		return nil, err
+	}
+
+	if tail := paddingData[REALITYExtensionLength:]; len(tail) >= DataV2ExtraLength {
+		ext.Extra = append([]byte(nil), tail[:DataV2ExtraLength]...)
 	}
 
 	return ext, nil
@@ -228,6 +414,9 @@ func AddPaddingWithREALITY(clientHello []byte, ext *REALITYExtension, totalPaddi
 	if totalPaddingLen < MinPaddingSize {
 		totalPaddingLen = MinPaddingSize
 	}
+	if n := REALITYExtensionLength + len(ext.Extra); totalPaddingLen < n {
+		totalPaddingLen = n
+	}
 
 	// Find extensions section
 	if len(clientHello) < 50 {
@@ -238,24 +427,14 @@ func AddPaddingWithREALITY(clientHello []byte, ext *REALITYExtension, totalPaddi
 	origRecordLen := int(clientHello[3])<<8 | int(clientHello[4])
 	debugLog("AddPaddingWithREALITY: input len=%d, record_len=%d (0x%02x%02x)", len(clientHello), origRecordLen, clientHello[3], clientHello[4])
 
-	// First, check if there's an existing padding extension (any size)
-	// If found, we need to REPLACE it, not add a duplicate
-	existingPaddingOffset := -1
-	existingPaddingLen := 0
-	for i := 0; i < len(clientHello)-4; i++ {
-		if clientHello[i] == 0x00 && clientHello[i+1] == 0x15 {
-			existingPaddingLen = int(clientHello[i+2])<<8 | int(clientHello[i+3])
-			if i+4+existingPaddingLen <= len(clientHello) {
-				existingPaddingOffset = i
-				debugLog("AddPaddingWithREALITY: found existing padding at offset=%d, len=%d", i, existingPaddingLen)
-				break
-			}
-		}
-	}
-
-	// If existing padding found, replace it instead of adding duplicate
-	if existingPaddingOffset >= 0 {
+	// If a padding extension is already present, replace it rather than adding a
+	// second one. Located by walking the ClientHello, not by scanning for the
+	// bytes 00 15 — see findPaddingExtension for why the scan was wrong.
+	if existingPaddingOffset, existingPaddingLen, err := findPaddingExtension(clientHello); err == nil {
+		debugLog("AddPaddingWithREALITY: found existing padding at offset=%d, len=%d", existingPaddingOffset, existingPaddingLen)
 		return replacePaddingExtension(clientHello, existingPaddingOffset, existingPaddingLen, ext, totalPaddingLen)
+	} else if !errors.Is(err, errPaddingNotFound) {
+		return nil, err
 	}
 
 	// Parse to find extensions offset
@@ -307,14 +486,14 @@ func AddPaddingWithREALITY(clientHello []byte, ext *REALITYExtension, totalPaddi
 
 	// Write REALITY data
 	realityData := ext.Marshal()
-	copy(paddingExt[4:4+REALITYExtensionLength], realityData)
+	copy(paddingExt[4:4+len(realityData)], realityData)
 
 	// Fill rest with random
-	remaining := totalPaddingLen - REALITYExtensionLength
+	remaining := totalPaddingLen - len(realityData)
 	if remaining > 0 {
 		randomPadding := make([]byte, remaining)
 		rand.Read(randomPadding)
-		copy(paddingExt[4+REALITYExtensionLength:], randomPadding)
+		copy(paddingExt[4+len(realityData):], randomPadding)
 	}
 
 	// Build new ClientHello
@@ -355,6 +534,11 @@ func AddPaddingWithREALITY(clientHello []byte, ext *REALITYExtension, totalPaddi
 func replacePaddingExtension(clientHello []byte, paddingOffset, oldPaddingLen int, ext *REALITYExtension, totalPaddingLen int) ([]byte, error) {
 	debugLog("replacePaddingExtension: offset=%d, oldLen=%d, newLen=%d", paddingOffset, oldPaddingLen, totalPaddingLen)
 
+	realityData := ext.Marshal()
+	if totalPaddingLen < len(realityData) {
+		totalPaddingLen = len(realityData)
+	}
+
 	// Build new padding extension
 	newPaddingExt := make([]byte, 4+totalPaddingLen)
 	newPaddingExt[0] = 0x00 // Extension type high byte
@@ -363,15 +547,14 @@ func replacePaddingExtension(clientHello []byte, paddingOffset, oldPaddingLen in
 	newPaddingExt[3] = byte(totalPaddingLen)
 
 	// Write REALITY data
-	realityData := ext.Marshal()
-	copy(newPaddingExt[4:4+REALITYExtensionLength], realityData)
+	copy(newPaddingExt[4:4+len(realityData)], realityData)
 
 	// Fill rest with random
-	remaining := totalPaddingLen - REALITYExtensionLength
+	remaining := totalPaddingLen - len(realityData)
 	if remaining > 0 {
 		randomPadding := make([]byte, remaining)
 		rand.Read(randomPadding)
-		copy(newPaddingExt[4+REALITYExtensionLength:], randomPadding)
+		copy(newPaddingExt[4+len(realityData):], randomPadding)
 	}
 
 	// Calculate size difference

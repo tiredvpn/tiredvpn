@@ -42,7 +42,7 @@ import (
 )
 
 var (
-	Version     = "1.4.0"
+	Version     = "1.4.2"
 	connCounter uint64
 )
 
@@ -372,6 +372,85 @@ type Config struct {
 	// If empty, unauthorized REALITY connections are silently dropped.
 	REALITYCoverDomain string
 
+	// NodeMaxClients caps distinct authenticated clients on this node. 0 = off.
+	//
+	// The vector is address reputation, and it is the only confirmed one that
+	// ignores what our traffic looks like: on 2026-08-04 one of two identical
+	// servers inside a /24 was banned and the other was not. The Iranian
+	// numbers are the ones to hold in mind - 200 users on an address bought two
+	// hours, 5 to 7 bought two days.
+	//
+	// Enforced only after a client authenticates, so a prober can never observe
+	// it. See nodecap.go.
+	NodeMaxClients int
+
+	// NodeMaxBytesPerWindow caps traffic carried in one window. 0 = off.
+	// This is the ceiling that carries meaning on a relay, where the peers are
+	// downstream nodes rather than people.
+	NodeMaxBytesPerWindow int64
+
+	// NodeWindow is the sliding window the traffic ceiling is measured over.
+	// 0 = one hour.
+	NodeWindow time.Duration
+
+	// REALITYRequireDataV2 rejects clients that do not negotiate the v2 data
+	// layer (per-connection X25519 keys + ChaCha20-Poly1305). Off during the
+	// rollout so upgraded exits keep serving older clients; turn it on once
+	// every client in the deployment is upgraded, to close the downgrade path
+	// an active attacker could otherwise force by mangling the padding block.
+	REALITYRequireDataV2 bool
+
+	// REALITYPrivateKey is the server's static X25519 key, base64 (raw url).
+	// The B1 session_id authentication key is derived from it, and so is the
+	// certificate HMAC that lets a client authenticate the server without a CA
+	// once B1.5 lands - one key, both directions. Required when REALITYB1Enabled
+	// is set; the server refuses to start without it rather than generating a
+	// throwaway that would drop every client on the next restart.
+	//
+	// Falls back to TIREDVPN_REALITY_PRIVATE_KEY so it need not sit in the
+	// process command line where any local user can read it.
+	REALITYPrivateKey string
+
+	// REALITYB1Enabled accepts the B1 transport: a real TLS 1.3 handshake with
+	// authentication carried in session_id.
+	REALITYB1Enabled bool
+
+	// REALITYLegacyEnabled accepts the old transport, the one that hides
+	// credentials in padding extension 0x0015. Switch it off once
+	// reality_auth_legacy_total stops growing.
+	REALITYLegacyEnabled bool
+
+	// REALITYMaxTimeDiff is the client clock skew tolerated by B1
+	// authentication, in seconds. 0 disables the check.
+	REALITYMaxTimeDiff int
+
+	// REALITYMinClientVer is the lowest client version accepted, "X.Y.Z".
+	// Empty disables the check, which is where the first B1 release leaves it.
+	REALITYMinClientVer string
+
+	// REALITYMirrorMode selects how much of the handshake is mirrored to the
+	// real donor site: "off" mirrors nothing, "adaptive" opens a donor
+	// connection only for sources we have not seen before, "always" mirrors
+	// every connection the way the upstream reference does.
+	//
+	// B1 implements "off" only; the other two arrive with B1.5 and are
+	// validated here so a config written against that release fails loudly on
+	// an older binary instead of quietly mirroring nothing.
+	REALITYMirrorMode string
+
+	// BurstReshape turns on the nudge/ack exchange that splits the inner TLS
+	// handshake so the nDPI burst heuristic stops matching. "off" or "on".
+	//
+	// It must be set the same way on the client: a server that reshapes while
+	// the client does not will prepend noise to the client's data. There is no
+	// negotiation for it at that layer, so the rollout has to flip both ends.
+	BurstReshape string
+
+	// BurstReshapePadFlight adds this many bytes to the server flight for extra
+	// margin. Zero, i.e. off. Costs bytes on every connection and, like
+	// BurstReshape, has to match the client.
+	BurstReshapePadFlight int
+
 	// Shaper, when non-nil, is built from TOML [shaper]. The server-side
 	// pipeline does not yet consume it — server morph processing lives
 	// outside internal/strategy.MorphedConn — so this field is reserved for
@@ -398,8 +477,13 @@ func Run(cfg *Config) error {
 	}
 
 	initAdmissionControl(cfg)
+	initNodeCap(cfg)
 
-	if err := InitREALITYKeys(); err != nil {
+	if err := validateREALITYConfig(cfg); err != nil {
+		return fmt.Errorf("reality configuration: %w", err)
+	}
+
+	if err := InitREALITYKeys(cfg); err != nil {
 		return fmt.Errorf("reality initialization failed: %w", err)
 	}
 
@@ -653,14 +737,10 @@ func initTLSConfig(cfg *Config, srvCtx *serverContext) error {
 	if err != nil {
 		return fmt.Errorf("failed to load certificate: %w", err)
 	}
-	srvCtx.tlsConfig = &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		NextProtos: []string{
-			"h2",
-			"http/1.1",
-		},
-		MinVersion: tls.VersionTLS12,
-	}
+	// Built in tlsprofile.go: it drops the ML-KEM hybrids that made our
+	// ServerHello 1088 bytes larger than every donor's, and varies the rest per
+	// node so one JARM query stops tying the fleet together.
+	srvCtx.tlsConfig = buildTLSProfile(cfg, cert)
 	return nil
 }
 
@@ -1144,11 +1224,32 @@ func handleConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 		return
 	}
 
-	// Check for REALITY protocol (TLS with REALITY extension)
-	if DetectREALITYExtension(peekBuf) {
-		logger.Info("Detected REALITY protocol")
-		HandleREALITYConnection(buffConn, srvCtx, logger)
-		return
+	// REALITY, newest transport first. B1 claims a connection by parsing the
+	// authentication out of session_id; only if it declines do we look for the
+	// legacy padding extension. Order matters: a B1 ClientHello carries no
+	// padding-ext credentials, so the legacy detector would misfile it as an
+	// ordinary TLS handshake and serve the fake website.
+	if srvCtx.cfg.REALITYB1Enabled {
+		if tryREALITYB1(buffConn, peekBuf, srvCtx, logger) {
+			return
+		}
+	}
+	if srvCtx.cfg.REALITYLegacyEnabled && DetectREALITYExtension(peekBuf) {
+		logger.Debug("Padding extension present, trying the REALITY transport")
+		claimed, hello := HandleREALITYConnection(buffConn, srvCtx, logger)
+		if claimed {
+			return
+		}
+		// Not one of ours: an ordinary client whose ClientHello carries a real
+		// padding extension, which OpenSSL adds to anything between 256 and 511
+		// bytes. Replay the hello and continue down the ordinary TLS path, so
+		// it gets the same answer as any other connection. Dropping it here is
+		// what made a padding extension a one-packet way to recognise us.
+		logger.Debug("REALITY did not claim the connection, continuing as ordinary TLS")
+		buffConn = &bufferedConn{
+			Conn:   conn,
+			reader: io.MultiReader(bytes.NewReader(hello), conn),
+		}
 	}
 
 	// Check if this is a TLS ClientHello (without REALITY extension)
@@ -1156,11 +1257,30 @@ func handleConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 	if len(peekBuf) > 0 && peekBuf[0] == 0x16 {
 		logger.Debug("TLS ClientHello detected (no REALITY extension), performing TLS handshake")
 
+		// Imitate the donor's tolerance for ChangeCipherSpec floods before the
+		// handshake starts, so a prober measuring us measures the site we claim
+		// to be. See ccsguard.go; the name comes from the peek buffer we
+		// already parsed.
+		sni, _ := ExtractSNI(peekBuf)
+		guard := newCCSGuard(buffConn, sni)
+
 		// Wrap buffered connection with TLS
-		tlsConn := tls.Server(buffConn, srvCtx.tlsConfig)
-		if err := tlsConn.Handshake(); err != nil {
+		tlsConn := tls.Server(guard, srvCtx.tlsConfig)
+		err := tlsConn.Handshake()
+		guard.handshakeDone()
+		if err != nil {
+			// Close, the way the B1 path does. Handing the raw socket to the
+			// fake website here answered a peer that had opened a TLS handshake
+			// with a plaintext HTTP response on the same connection - measured,
+			// not supposed: break the handshake with a bogus record, then send
+			// "GET / HTTP/1.1" and our server replied "HTTP/1.1 200 OK, Server:
+			// nginx". No HTTPS server on earth does that, so it identified us in
+			// one connection with no statistics and no timing.
+			//
+			// crypto/tls has already sent whatever alert the failure warrants,
+			// so closing leaves exactly the behaviour a real server shows.
 			logger.Debug("TLS handshake failed: %v", err)
-			serveFakeWebsite(conn, cfg, logger)
+			_ = tlsConn.Close()
 			return
 		}
 
@@ -2791,6 +2911,17 @@ func handleProtocolConfusion(conn net.Conn, srvCtx *serverContext, logger *log.L
 	// the ack synchronously to the kernel send buffer.
 	conn = ktls.TryEnable(conn, "tired-confusion")
 
+	// Burst reshaping wraps the payload phase only: the mode byte, the target
+	// address and the success ack above are this tunnel's own control preamble,
+	// and a reshaper that sees them mistakes the one-byte mode read for the
+	// client's first application burst and holds the ack behind a nudge.
+	//
+	// With the feature off this returns conn unchanged, so the kTLS/splice fast
+	// path below is untouched in the default configuration. With it on the
+	// wrapper stays in the path and that fast path is given up - the exchange
+	// needs to see the first write in each direction, which splice would hide.
+	conn = strategy.ReshapeServerStream(conn, burstReshapeConfig(srvCtx.cfg))
+
 	// Relay data
 	var wg sync.WaitGroup
 	var bytesUp, bytesDown int64
@@ -3042,10 +3173,46 @@ func handleConfusionTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverC
 	}
 }
 
+// tunnelIdentity is what the node ceiling counts, and an empty result means
+// "do not count this session at all".
+//
+// It used to fall back to the peer address when no client id was supplied. That
+// was wrong, and wrong in the direction that matters: handleTLSConnection
+// reaches this funnel with an empty id after nothing but a plain TLS handshake,
+// which anyone can complete because we serve a certificate to everyone. A peer
+// that never authenticated could therefore both measure the ceiling by opening
+// connections until refused - the exact fingerprint the placement was chosen to
+// avoid - and exhaust it, denying service to real users with no credential at
+// all.
+//
+// So only a session that arrives with an identity is counted. The cost is that
+// transports which authenticate against a single shared secret pass no id and
+// go uncounted, so the ceiling under-counts on those. That is the safe error:
+// it protects less than configured, rather than handing an unauthenticated peer
+// a lever. Closing it properly means each call site stating whether its peer
+// authenticated, which is a signature change across every transport.
+func tunnelIdentity(clientID string) string {
+	return clientID
+}
+
 // handleRawTunnel handles raw tunnel connections
 // clientID is used for TUN mode to track IP allocation (e.g. "reality:abcd1234")
 func handleRawTunnel(conn net.Conn, srvCtx *serverContext, logger *log.Logger, clientID string) {
 	logger.Debug("Starting raw tunnel mode")
+
+	// Node ceiling. Here rather than at accept on purpose: every transport
+	// funnels through this function once its client has authenticated, so a
+	// peer that cannot authenticate never reaches the ceiling and cannot
+	// measure it. See nodecap.go for why that placement is the whole design.
+	//
+	// A refused client currently has nowhere to go - see nodeCapNoFailover - so
+	// this only fires when an operator has deliberately set a ceiling.
+	release, admitted := nodeCapacity.admit(tunnelIdentity(clientID), time.Now())
+	if !admitted {
+		logger.Warn("Node ceiling reached, refusing a new session (client: %s)", clientID)
+		return
+	}
+	defer release()
 
 	// Track per-client connection for metrics. Use a closure on the conn
 	// variable so the defer picks up the kTLS-wrapped value if we hand
@@ -4145,6 +4312,13 @@ type bufferedConn struct {
 func (bc *bufferedConn) Read(p []byte) (int, error) {
 	return bc.reader.Read(p)
 }
+
+// Unwrap returns the connection this one buffers, so a caller can reach the
+// *tls.Conn underneath and read the handshake result off it. It deliberately
+// does not forward ConnectionState: a bufferedConn that claimed to be a TLS
+// connection would be handed to code that then reads bytes past the replay
+// buffer straight off the socket.
+func (bc *bufferedConn) Unwrap() net.Conn { return bc.Conn }
 
 // Ensure interface compliance
 var _ net.Conn = (*bufferedConn)(nil)

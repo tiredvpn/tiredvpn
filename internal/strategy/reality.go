@@ -32,12 +32,35 @@ type REALITYStrategy struct {
 	sniRotator *evasion.SNIRotator
 
 	// Destination tracking
+	destPool    []string // the derived donor pool, in rotator order
 	recentDests map[string]time.Time
 	destMu      sync.RWMutex
 
-	// Client's ephemeral X25519 key pair
-	clientPrivKey [32]byte
-	clientPubKey  [32]byte
+	// requireDataV2 refuses to fall back to the v1 data layer when the server
+	// does not confirm v2. Off by default because during the rollout (exits →
+	// relays → clients) a new client still meets old servers; turn it on once
+	// every server in the deployment is upgraded.
+	requireDataV2 bool
+
+	// fingerprint names the uTLS browser profile used to build the ClientHello.
+	// Fixed for the lifetime of the strategy: switching profiles mid-session is
+	// itself a detection signal (see handshakeGate), so this is set once at
+	// construction and never rotated.
+	fingerprint string
+
+	// gate serialises TLS handshakes per donor SNI. See handshake_gate.go.
+	gate *handshakeGate
+
+	// B1 transport: a real TLS 1.3 handshake with authentication in session_id.
+	// Off unless the server's static public key is configured, because without
+	// it there is nothing to seal against.
+	b1Enabled       bool
+	serverStaticPub []byte
+
+	// clockOffset carries the correction learned from the server's one-way time
+	// record. One per strategy, so a device with a drifting clock stops failing
+	// the server's time check after its first successful connection.
+	clockOffset customtls.ClockOffset
 
 	// Post-Quantum crypto (optional)
 	pqEnabled      bool
@@ -53,12 +76,20 @@ type REALITYStrategy struct {
 type realityConn struct {
 	net.Conn               // the smux stream (Read/Write/Deadlines)
 	sess     *smux.Session // owns the smux session over the data conn
+	tlsConn  net.Conn      // B1 only: the TLS connection smux runs over
 	tcpConn  net.Conn      // underlying TCP, closed last
 }
 
+// Close tears the stack down from the top: stream, session, TLS, TCP. Closing
+// the TLS connection before the TCP one lets it send its close_notify, which is
+// what a real client does — dropping the TCP underneath it instead would leave
+// a truncated session, and truncation is visible.
 func (c *realityConn) Close() error {
 	streamErr := c.Conn.Close()
 	c.sess.Close()
+	if c.tlsConn != nil {
+		c.tlsConn.Close()
+	}
 	c.tcpConn.Close()
 	return streamErr
 }
@@ -86,18 +117,60 @@ func NewREALITYStrategy(manager *Manager, secret []byte) *REALITYStrategy {
 	// Use cooldown strategy for destination selection over the derived subpool
 	sniRotator := evasion.NewSNIRotatorWithPool(subPool, evasion.StrategyCooldown)
 
-	// Generate client key pair
-	privKey, pubKey, _ := customtls.GenerateX25519KeyPair()
-
+	// No key pair here on purpose: the X25519 key is generated per connection in
+	// connect(). A process-wide key made the data-layer key a constant, so every
+	// connection of a client reused one ChaCha20 keystream from counter zero.
 	return &REALITYStrategy{
-		manager:       manager,
-		secret:        secret,
-		sniRotator:    sniRotator,
-		recentDests:   make(map[string]time.Time),
-		clientPrivKey: privKey,
-		clientPubKey:  pubKey,
+		manager:     manager,
+		secret:      secret,
+		sniRotator:  sniRotator,
+		destPool:    subPool,
+		recentDests: make(map[string]time.Time),
+		fingerprint: customtls.DefaultFingerprintName,
+		gate:        newHandshakeGate(),
 	}
 }
+
+// SetB1 enables the B1 transport with the server's static X25519 public key.
+//
+// An empty or wrong-sized key leaves B1 off rather than failing: the legacy
+// path still works, and a client that silently refused to connect because of a
+// malformed config field would be worse than one that connects the old way.
+func (r *REALITYStrategy) SetB1(serverStaticPub []byte) {
+	if len(serverStaticPub) != 32 {
+		if len(serverStaticPub) != 0 {
+			log.Warn("REALITY: B1 server key is %d bytes, want 32; B1 stays off", len(serverStaticPub))
+		}
+		return
+	}
+	r.serverStaticPub = append([]byte(nil), serverStaticPub...)
+	r.b1Enabled = true
+	log.Info("REALITY: B1 transport enabled")
+}
+
+// SetFingerprint selects the uTLS browser profile used for the ClientHello.
+// An empty or unknown name keeps the default profile and logs a warning; the
+// alternative — silently dialing with a profile the operator did not ask for —
+// makes a config typo indistinguishable from a working setup.
+//
+// Call this before the first Connect: the profile is deliberately stable for
+// the lifetime of the strategy, because changing fingerprint after a censor has
+// throttled a SNI escalates a 120 s freeze into a 600 s block of all TLS.
+func (r *REALITYStrategy) SetFingerprint(name string) {
+	if name == "" {
+		return
+	}
+	if _, ok := customtls.LookupFingerprint(name); !ok {
+		log.Warn("REALITY: unknown TLS fingerprint %q, using %q (available: %v)",
+			name, customtls.DefaultFingerprintName, customtls.FingerprintNames())
+		return
+	}
+	r.fingerprint = name
+}
+
+// SetRequireDataV2 makes the client refuse servers that do not confirm the v2
+// data layer, instead of silently falling back to v1.
+func (r *REALITYStrategy) SetRequireDataV2(v bool) { r.requireDataV2 = v }
 
 // NewREALITYStrategyPQ creates a REALITY strategy with post-quantum crypto
 // manager is required for IPv6/IPv4 transport layer support
@@ -206,10 +279,26 @@ func (r *REALITYStrategy) Probe(ctx context.Context, target string) error {
 // self-contained conn (see realityConn): the returned conn owns its own TCP,
 // framing and smux session, and closing it tears down only that stack.
 //
-// Smux session reuse is intentionally disabled: TSPU (Russian DPI) throttles
-// the underlying TCP after the first stream finishes, so any subsequent stream
-// on the same TCP arrives after an idle gap and gets dropped. A fresh TCP per
-// request avoids this — at the cost of one REALITY handshake (~200ms) each time.
+// Smux session reuse is disabled here, and the reason on record needs
+// qualifying rather than repeating.
+//
+// What was observed, around early 2025: TSPU throttled the underlying TCP after
+// the first stream finished, so a later stream on the same connection arrived
+// after an idle gap and was dropped. The conclusion drawn was that reuse is
+// unusable, and a fresh TCP per request has been the behaviour since, at the
+// cost of a REALITY handshake of roughly 200 ms each time.
+//
+// What is different now: the mechanism needs an idle gap of some length, and in
+// this configuration no such gap occurs. smux keeps the session busy with a NOP
+// every ten seconds (see mux.SmuxSilentConfig for why that is its own problem),
+// so a reused connection is never quiet for long enough to be throttled by it.
+// The original measurement predates that, and was never repeated afterwards.
+//
+// So this is not "the old note was wrong". It is: the observation stands for
+// the configuration it was made in, the configuration has since changed, and
+// nobody has re-measured. Turning reuse back on is a decision that needs a
+// fresh measurement first - against a live TSPU path, watching for a throttle
+// after an idle gap - not an argument from either of these comments.
 //
 // The strategy holds NO shared session state: multiple callers (TUN tunnel,
 // proxy pool, health checker) dial concurrently, and one caller closing its
@@ -238,6 +327,40 @@ func (r *REALITYStrategy) connect(ctx context.Context, target string, wrapFirstF
 	}
 
 	log.Debug("REALITY: Using destination %s for cover", dest)
+
+	// Fresh key material for this connection. Both feed the data-layer key
+	// schedule, so two connections of the same client never share a keystream —
+	// this holds even against an old server, which derives the v1 key from the
+	// client public key it receives.
+	//
+	// Done before taking the gate below, deliberately. The gate rations
+	// handshakes actually in flight; local key generation is not one, and it can
+	// fail, which would burn a slot and its whole spacing interval on a dial
+	// that never reached the network. The keys carry no timestamp, so they do
+	// not go stale while we wait for a slot — the time-bucketed auth token is
+	// computed later, inside buildClientHello.
+	clientPrivKey, clientPubKey, err := customtls.GenerateX25519KeyPair()
+	if err != nil {
+		return nil, fmt.Errorf("reality: key generation failed: %w", err)
+	}
+	var clientSalt [32]byte
+	if _, err := cryptorand.Read(clientSalt[:]); err != nil {
+		return nil, fmt.Errorf("reality: salt generation failed: %w", err)
+	}
+
+	// Handshake discipline: hold the per-SNI gate for the whole handshake, so
+	// concurrency is measured over handshakes actually in flight and the spacing
+	// is measured between handshake starts. See handshake_gate.go for the
+	// censor behaviour this defends against.
+	sniKey, _, err := net.SplitHostPort(dest)
+	if err != nil {
+		sniKey = dest
+	}
+	releaseGate, err := r.gate.acquire(ctx, sniKey)
+	if err != nil {
+		return nil, fmt.Errorf("reality: handshake gate: %w", err)
+	}
+	defer releaseGate()
 
 	deadline, hasDeadline := ctx.Deadline()
 	timeout := 30 * time.Second
@@ -295,7 +418,24 @@ func (r *REALITYStrategy) connect(ctx context.Context, target string, wrapFirstF
 		}
 	}()
 
-	clientHello, err := r.buildClientHello(dest)
+	// B1: a real TLS 1.3 handshake instead of everything below. The legacy path
+	// stays until the rollout finishes (epic task 010), which is why this is a
+	// branch rather than a replacement.
+	//
+	// seqovl's decoy prefix has no place on this path: it prepends a record to
+	// the first flight, and the first flight is now a genuine ClientHello whose
+	// bytes are authenticated by session_id.
+	if r.b1Enabled && wrapFirstFlight == nil {
+		conn, err := r.connectB1(ctx, tcpConn, dest, deadline)
+		if err != nil {
+			tcpConn.Close()
+			return nil, err
+		}
+		log.Info("REALITY B1: tunnel established to %s via %s", target, dest)
+		return conn, nil
+	}
+
+	clientHello, err := r.buildClientHello(dest, clientPrivKey, clientSalt)
 	if err != nil {
 		tcpConn.Close()
 		return nil, fmt.Errorf("reality: clienthello build failed: %w", err)
@@ -362,7 +502,18 @@ func (r *REALITYStrategy) connect(ctx context.Context, target string, wrapFirstF
 	log.Debug("REALITY: ServerHello received (%d bytes)", len(serverHello))
 	log.Debug("REALITY: ServerHello hex: %s", log.HexDump(serverHello, 128))
 
-	if err := r.validateServerHello(serverHello, dest); err != nil {
+	// A HelloRetryRequest here never comes from our own server — it can only be
+	// an in-path probe or the real donor. Checked before validateServerHello:
+	// an HRR carries no REALITY extension, so validation would reject it as a
+	// malformed ServerHello and lose the fact that we were probed.
+	if isHelloRetryRequest(serverHello) {
+		r.handleHelloRetryRequest(tcpConn, dest)
+		tcpConn.Close()
+		return nil, errHelloRetryRequest
+	}
+
+	serverExt, err := r.validateServerHello(serverHello, clientPubKey)
+	if err != nil {
 		tcpConn.Close()
 		return nil, fmt.Errorf("reality: validation failed: %w", err)
 	}
@@ -373,10 +524,10 @@ func (r *REALITYStrategy) connect(ctx context.Context, target string, wrapFirstF
 		return nil, fmt.Errorf("reality: mux negotiate: %w", err)
 	}
 
-	// Wrap TCP in a chacha20-over-TLS-record framing layer so TSPU sees
-	// a normal TLS Application Data stream instead of raw smux bytes.
-	// Without this, TSPU throttles the connection after ~600 bytes.
-	dataConn, err := NewRealityDataConn(tcpConn, r.secret, r.clientPubKey[:], true)
+	// Wrap TCP in an encrypted TLS-record framing layer so TSPU sees a normal
+	// TLS Application Data stream instead of raw smux bytes. Without this, TSPU
+	// throttles the connection after ~600 bytes.
+	dataConn, err := r.wrapDataLayer(tcpConn, serverExt, clientPrivKey, clientPubKey, clientSalt)
 	if err != nil {
 		tcpConn.Close()
 		return nil, fmt.Errorf("reality: data conn init: %w", err)
@@ -423,8 +574,6 @@ func (r *REALITYStrategy) selectDestination() (string, error) {
 
 	// The rotator is already seeded from the per-user derived subpool
 	// (see NewREALITYStrategy / derivePool), so no Tier 1 forcing is needed here.
-	// Fallback list used only if the rotator's pool is somehow empty.
-	fallbackSNIs := getRussianSNIsStatic()
 
 	// Try up to 10 times to find a non-recent destination
 	for attempt := 0; attempt < 10; attempt++ {
@@ -450,10 +599,40 @@ func (r *REALITYStrategy) selectDestination() (string, error) {
 		return dest, nil
 	}
 
-	// Fallback: use any destination
-	sni := fallbackSNIs[0]
+	// Every donor is inside its cooldown window. Pick the least recently used
+	// one rather than a fixed fallback: the previous code returned
+	// getRussianSNIsStatic()[0] here, so under any sustained load — which with
+	// a four-domain donor pool and a fresh handshake per CONNECT arrives fast —
+	// every dial past the first few piled onto yandex.ru. That is precisely the
+	// burst pattern the per-SNI freeze looks for, manufactured by us.
+	sni := r.leastRecentlyUsedDestLocked()
 	r.recentDests[sni] = time.Now()
 	return net.JoinHostPort(sni, "443"), nil
+}
+
+// leastRecentlyUsedDestLocked returns the donor SNI whose last use is furthest
+// in the past. Callers must hold destMu.
+func (r *REALITYStrategy) leastRecentlyUsedDestLocked() string {
+	pool := r.destPool
+	if len(pool) == 0 {
+		pool = getRussianSNIsStatic()
+	}
+
+	var (
+		best    string
+		bestUse time.Time
+	)
+	for _, sni := range pool {
+		lastUse, used := r.recentDests[sni]
+		if !used {
+			// Never used at all: nothing can be less recent than that.
+			return sni
+		}
+		if best == "" || lastUse.Before(bestUse) {
+			best, bestUse = sni, lastUse
+		}
+	}
+	return best
 }
 
 // derivePool derives a deterministic per-user subpool of size n from globalPool.
@@ -558,8 +737,13 @@ func (r *REALITYStrategy) getIranianSNIs() []string {
 }
 
 // buildClientHello constructs a TLS ClientHello with REALITY extension hidden in padding
-// Uses uTLS for realistic browser fingerprint (Chrome) + hides REALITY data in padding extension
-func (r *REALITYStrategy) buildClientHello(dest string) ([]byte, error) {
+// Uses uTLS for a realistic browser fingerprint + hides REALITY data in padding extension.
+// The profile comes from configuration (see SetFingerprint); it is fixed for the
+// lifetime of the strategy, never rotated per connection.
+//
+// clientPrivKey and clientSalt are this connection's ephemeral material; both
+// end up inside the 256-byte padding block, whose size on the wire is unchanged.
+func (r *REALITYStrategy) buildClientHello(dest string, clientPrivKey, clientSalt [32]byte) ([]byte, error) {
 	log.Info("REALITY-BUILD: Starting buildClientHello for %s", dest)
 
 	// Extract hostname from dest
@@ -568,26 +752,27 @@ func (r *REALITYStrategy) buildClientHello(dest string) ([]byte, error) {
 		host = dest
 	}
 
-	// Use uTLS to build realistic Chrome ClientHello with padding
+	fp, _ := customtls.LookupFingerprint(r.fingerprint)
+
 	config := &customtls.Config{
 		ServerName:         host,
-		Fingerprint:        "chrome",
+		Fingerprint:        r.fingerprint,
 		ALPN:               []string{"h2", "http/1.1"},
 		InsecureSkipVerify: true,
 		PaddingLen:         customtls.MinPaddingSize, // 256 bytes for REALITY + random
 	}
 
-	// Build ClientHello with padding using Chrome fingerprint
-	clientHello, err := customtls.BuildClientHelloBytes(config, customtls.FingerprintChrome124)
+	clientHello, err := customtls.BuildClientHelloBytes(config, fp)
 	if err != nil {
 		log.Error("REALITY-BUILD: uTLS build failed: %v", err)
 		return nil, fmt.Errorf("uTLS clientHello build failed: %w", err)
 	}
 
-	log.Info("REALITY-BUILD: uTLS ClientHello built (%d bytes, record_len=%d)", len(clientHello), int(clientHello[3])<<8|int(clientHello[4]))
+	log.Info("REALITY-BUILD: uTLS ClientHello built (profile=%s, %d bytes, record_len=%d)",
+		fp.Name, len(clientHello), int(clientHello[3])<<8|int(clientHello[4]))
 
-	// Create REALITY extension
-	realityExt, err := customtls.NewClientREALITYExtension(r.secret, r.clientPrivKey)
+	// Create REALITY extension (with the v2 data-layer signal appended)
+	realityExt, err := customtls.NewClientREALITYExtensionDataV2(r.secret, clientPrivKey, clientSalt)
 	if err != nil {
 		log.Error("REALITY-BUILD: extension creation failed: %v", err)
 		return nil, fmt.Errorf("reality extension creation failed: %w", err)
@@ -652,9 +837,9 @@ func (r *REALITYStrategy) readServerHello(conn net.Conn, timeout time.Duration) 
 	return result, nil
 }
 
-// validateServerHello validates the server's response
-// Looks for REALITY data in padding extension (0x0015)
-func (r *REALITYStrategy) validateServerHello(serverHello []byte, expectedDest string) error {
+// validateServerHello validates the server's response and returns the extension
+// it found. Looks for REALITY data in padding extension (0x0015).
+func (r *REALITYStrategy) validateServerHello(serverHello []byte, clientPubKey [32]byte) (*customtls.REALITYExtension, error) {
 	// Search for REALITY in padding extension (0x0015)
 	var serverExt *customtls.REALITYExtension
 
@@ -677,7 +862,7 @@ func (r *REALITYStrategy) validateServerHello(serverHello []byte, expectedDest s
 			// Extract REALITY extension from start of padding (no magic check).
 			paddingData := serverHello[extDataStart : extDataStart+extLen]
 			ext, err := customtls.ExtractREALITYFromPadding(paddingData)
-			if err == nil && customtls.VerifyServerAuth(r.secret, r.clientPubKey[:], ext.AuthToken) {
+			if err == nil && customtls.VerifyServerAuth(r.secret, clientPubKey[:], ext.AuthToken) {
 				serverExt = ext
 				break
 			}
@@ -685,17 +870,48 @@ func (r *REALITYStrategy) validateServerHello(serverHello []byte, expectedDest s
 	}
 
 	if serverExt == nil {
-		return errors.New("reality extension not found in serverhello padding")
-	}
-
-	// Verify server auth token
-	if !customtls.VerifyServerAuth(r.secret, r.clientPubKey[:], serverExt.AuthToken) {
-		return errors.New("server auth token validation failed")
+		return nil, errors.New("reality extension not found in serverhello padding")
 	}
 
 	log.Debug("REALITY: Server auth validated (padding mode)")
 
-	return nil
+	return serverExt, nil
+}
+
+// wrapDataLayer picks the data-layer version for this connection.
+//
+// A v2 server appends [serverSalt][MAC] to its ServerHello padding; the MAC
+// covers both public keys and both salts, so only a peer holding the shared
+// secret can produce it, and an active middlebox cannot substitute its own key
+// share while replaying the server's auth token. If the confirmation is absent
+// the server is still on v1 and we fall back — unless requireDataV2 is set.
+//
+// Even the fallback is safe from the v1 keystream reuse this change is about:
+// the key there is derived from clientPubKey, which is now fresh per connection.
+func (r *REALITYStrategy) wrapDataLayer(tcpConn net.Conn, serverExt *customtls.REALITYExtension, clientPrivKey, clientPubKey, clientSalt [32]byte) (net.Conn, error) {
+	serverSalt, ok := customtls.ParseServerDataV2(r.secret, clientPubKey, serverExt.PubKey, clientSalt, serverExt.Extra)
+	if !ok {
+		if r.requireDataV2 {
+			return nil, errors.New("server did not confirm data layer v2")
+		}
+		log.Info("REALITY: server on legacy data layer v1, falling back")
+		return NewRealityDataConn(tcpConn, r.secret, clientPubKey[:], true)
+	}
+
+	ecdh, err := RealityV2ECDH(clientPrivKey, serverExt.PubKey)
+	if err != nil {
+		return nil, fmt.Errorf("ecdh: %w", err)
+	}
+
+	log.Debug("REALITY: data layer v2 negotiated")
+	return NewRealityDataConnV2(tcpConn, RealityV2Params{
+		SharedSecret: r.secret,
+		ECDH:         ecdh,
+		ClientPub:    clientPubKey,
+		ServerPub:    serverExt.PubKey,
+		ClientSalt:   clientSalt,
+		ServerSalt:   serverSalt,
+	}, true)
 }
 
 // Helper functions

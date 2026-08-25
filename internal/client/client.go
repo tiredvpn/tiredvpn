@@ -23,11 +23,12 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/porthopping"
 	"github.com/tiredvpn/tiredvpn/internal/shaper"
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
+	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 	"github.com/tiredvpn/tiredvpn/internal/tun"
 )
 
 var (
-	Version   = "1.4.0"
+	Version   = "1.4.2"
 	BuildTime = "unknown"
 
 	// Global metrics instance (nil if metrics disabled)
@@ -95,9 +96,36 @@ type Config struct {
 	// Seqovl level-A packet overlap (Linux + CAP_NET_ADMIN, off by default)
 	SeqovlPacketEnabled bool // Enable packet-level TCP sequence overlap
 
+	// REALITYRequireDataV2 refuses servers still on the v1 REALITY data layer
+	// instead of falling back to it. Off until every server is upgraded.
+	REALITYRequireDataV2 bool
+
+	// BurstReshape turns on the nudge/ack exchange that splits the inner TLS
+	// handshake. Must match the server's -burst-reshape, and the pad value must
+	// match too; a one-sided setting corrupts streams.
+	BurstReshape string
+
+	// BurstReshapePadFlight must equal the server's -burst-reshape-pad-flight.
+	BurstReshapePadFlight int
+
+	// REALITYServerPubKey is the server's static X25519 public key, base64.
+	// A non-empty value means "speak B1 to this server" - there is no probing
+	// and no downgrade on error, because a transport that falls back when the
+	// handshake fails is a transport a censor can force back to the old one.
+	// It also anchors the certificate HMAC check that authenticates the server
+	// without a CA once B1.5 lands.
+	//
+	// The key is public: it ships alongside the secret because that channel
+	// already exists, not because it needs protecting.
+	REALITYServerPubKey string
+
 	// RTT Masking
 	RTTMaskingEnabled bool   // Enable RTT masking
 	RTTProfile        string // RTT profile name
+
+	// TLSFingerprint names the uTLS browser profile used for ClientHellos.
+	// Empty means the built-in default (see internal/tls.DefaultFingerprintName).
+	TLSFingerprint string
 
 	// ECH (Encrypted Client Hello) - hides SNI from DPI
 	ECHEnabled    bool   // Enable ECH
@@ -249,28 +277,36 @@ func buildManager(cfg *Config, secret string) (*strategy.Manager, error) {
 	portHoppingCfg := buildPortHoppingConfig(cfg)
 
 	mgrCfg := strategy.DefaultManagerConfig{
-		ServerAddr:          cfg.ServerAddr,
-		Secret:              []byte(secret),
-		CoverHost:           cfg.CoverHost,
-		ServerAddrV6:        cfg.ServerAddrV6,
-		PreferIPv6:          cfg.PreferIPv6,
-		FallbackToV4:        cfg.FallbackToV4,
-		RTTMaskingEnabled:   cfg.RTTMaskingEnabled,
-		RTTProfile:          rttProfile,
-		QUICEnabled:         cfg.QUICEnabled,
-		QUICPort:            cfg.QUICPort,
-		ICMPTunnelEnabled:   cfg.ICMPTunnelEnabled,
-		SeqovlPacketEnabled: cfg.SeqovlPacketEnabled,
-		ECHEnabled:          cfg.ECHEnabled,
-		ECHConfigList:       echConfigList,
-		ECHPublicName:       cfg.ECHPublicName,
-		QUICSNIFragEnabled:  cfg.QUICSNIFragEnabled,
-		PQEnabled:           cfg.PQEnabled,
-		PQServerKemPubB64:   cfg.PQServerKemPubB64,
-		AndroidMode:         cfg.AndroidMode || cfg.MacOSMode,
-		PortHopping:         portHoppingCfg,
-		Shaper:              cfg.Shaper,
-		ShaperID:            cfg.ShaperID,
+		ServerAddr:             cfg.ServerAddr,
+		Secret:                 []byte(secret),
+		CoverHost:              cfg.CoverHost,
+		ServerAddrV6:           cfg.ServerAddrV6,
+		PreferIPv6:             cfg.PreferIPv6,
+		FallbackToV4:           cfg.FallbackToV4,
+		RTTMaskingEnabled:      cfg.RTTMaskingEnabled,
+		RTTProfile:             rttProfile,
+		QUICEnabled:            cfg.QUICEnabled,
+		QUICPort:               cfg.QUICPort,
+		ICMPTunnelEnabled:      cfg.ICMPTunnelEnabled,
+		SeqovlPacketEnabled:    cfg.SeqovlPacketEnabled,
+		TLSFingerprint:         cfg.TLSFingerprint,
+		REALITYServerPubKeyB64: cfg.REALITYServerPubKey,
+		ECHEnabled:             cfg.ECHEnabled,
+		ECHConfigList:          echConfigList,
+		ECHPublicName:          cfg.ECHPublicName,
+		QUICSNIFragEnabled:     cfg.QUICSNIFragEnabled,
+		PQEnabled:              cfg.PQEnabled,
+		PQServerKemPubB64:      cfg.PQServerKemPubB64,
+		AndroidMode:            cfg.AndroidMode || cfg.MacOSMode,
+		PortHopping:            portHoppingCfg,
+		Shaper:                 cfg.Shaper,
+		ShaperID:               cfg.ShaperID,
+
+		REALITYRequireDataV2: cfg.REALITYRequireDataV2,
+		BurstReshape: strategy.BurstReshapeConfig{
+			Enabled:   cfg.BurstReshape == "on",
+			PadFlight: cfg.BurstReshapePadFlight,
+		},
 	}
 	mgr := strategy.NewDefaultManager(mgrCfg)
 
@@ -341,6 +377,12 @@ func buildPortHoppingConfig(cfg *Config) *porthopping.Config {
 
 // logEnabledFeatures logs info lines for each optional feature that is active.
 func logEnabledFeatures(cfg *Config, mgr *strategy.Manager) {
+	// Always logged, not gated on a flag: which browser we are pretending to be
+	// is the single most consequential thing about how we look on the wire, and
+	// an operator debugging a block needs it in the log without extra verbosity.
+	if fp, ok := customtls.LookupFingerprint(cfg.TLSFingerprint); ok {
+		log.Info("TLS fingerprint: %s", fp.Name)
+	}
 	if cfg.RTTMaskingEnabled {
 		log.Info("RTT masking enabled (profile=%s)", cfg.RTTProfile)
 	}

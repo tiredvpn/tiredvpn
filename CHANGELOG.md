@@ -7,6 +7,29 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.4.2] - 2026-08-25
+
+### Fixed
+
+- **The decoy website advertised HTTP/2 and could not speak it, so it did not
+  work for any browser.** Every TLS path that can end at the fake nginx site
+  offers `h2` in ALPN, but the decoy only ever wrote HTTP/1.1. A client that
+  agreed on h2 - which is every browser, and `curl` without `--http1.1` - was
+  waiting for a SETTINGS frame and got `HTTP/1.1 200 OK` instead: a protocol
+  error where the page should have been. The cover was therefore missing on
+  port 443, where it is the whole point, and a site that advertises h2 and then
+  does not speak it is a one-request tell. The decoy now reads the negotiated
+  ALPN and serves the same page and headers over a real HTTP/2 server when the
+  peer chose h2. Dropping h2 from ALPN was not the alternative: every donor we
+  imitate advertises it, and the REALITY B1 handshake matches a donor's ALPN as
+  part of its fingerprint.
+
+### Security
+
+- **Every REALITY connection of a client reused one ChaCha20 keystream.** The data-layer key *and* nonce were derived from `HKDF(secret, salt=clientPubKey)`, and both inputs were constant for the lifetime of the process: the password is long-lived and the X25519 key pair was generated once in the strategy constructor. Every connection therefore started encrypting from counter zero with the same keystream, so XORing two captured connections cancelled the keystream and left the XOR of two plaintexts - under which sits smux with fixed header fields, i.e. known plaintext in every frame. Recovering traffic did not require the key. The X25519 key pair is now generated per connection, which alone breaks the reuse even against a server that has not been upgraded.
+- **REALITY data records are now authenticated and forward-secret (data layer v2).** Records are sealed with ChaCha20-Poly1305 under a key derived from an X25519 exchange between two ephemeral per-connection keys, salted with fresh random values from both sides, with an explicit record counter in the nonce. Previously the tunnel was bare ChaCha20: an active middlebox could flip bits inside it unnoticed, a leaked password decrypted any recorded traffic, and the record body was exactly the plaintext length, unlike a real TLS 1.3 record. Version negotiation rides inside the existing 256-byte padding block as a MAC over per-connection randomness, so the ClientHello and ServerHello are byte-for-byte the same size as before and an unupgraded peer keeps working. Rollout order is exits, then relays, then clients; `-reality-require-data-v2` (server and client) closes the v1 downgrade path once the fleet is upgraded.
+- **The server's ServerHello padding was a fixed byte ramp.** 192 bytes of `byte(i*7%256)` went out in every REALITY ServerHello, which is one DPI signature matching every server we run regardless of IP or cover domain. It is now CSPRNG output.
+
 ## [1.4.0] - 2026-08-25
 
 ### Added

@@ -17,6 +17,7 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/mux"
 	"github.com/tiredvpn/tiredvpn/internal/porthopping"
 	"github.com/tiredvpn/tiredvpn/internal/shaper"
+	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 )
 
 // clientSocketBufferBytes is the SO_RCVBUF/SO_SNDBUF size applied to client TCP
@@ -82,6 +83,11 @@ type Manager struct {
 	maxRetries     int
 	parallelProbes int
 	adaptiveOrder  bool // Reorder strategies based on success rate
+
+	// burstReshape configures the nudge/ack exchange that splits the inner
+	// handshake. Off unless the operator turns it on, and it must be on at both
+	// ends - see internal/strategy/burst_reshape.go.
+	burstReshape BurstReshapeConfig
 
 	// Circuit breaker
 	circuitBreakers *CircuitBreakerManager
@@ -1139,6 +1145,22 @@ type DefaultManagerConfig struct {
 	// REALITY configuration
 	REALITYEnabled bool // Enable REALITY protocol (99.5% success rate)
 
+	// REALITYServerPubKeyB64 is the server's static X25519 public key, base64.
+	// Non-empty switches the REALITY client onto the B1 transport: a real TLS
+	// 1.3 handshake with authentication in session_id.
+	REALITYServerPubKeyB64 string
+
+	// TLSFingerprint names the uTLS browser profile used for ClientHellos
+	// (see internal/tls.FingerprintMap). Empty selects the default profile.
+	// It is fixed for the process lifetime on purpose — rotating fingerprints
+	// after a censor throttles a SNI escalates the penalty.
+	TLSFingerprint string
+
+	// REALITYRequireDataV2 refuses servers that do not confirm the v2 data
+	// layer (per-connection X25519 keys + ChaCha20-Poly1305) instead of falling
+	// back to v1. Off during the rollout, since clients are upgraded last.
+	REALITYRequireDataV2 bool
+
 	// WebSocket Padded configuration
 	WebSocketPaddedEnabled bool // Enable WebSocket with Salamander padding
 
@@ -1166,6 +1188,10 @@ type DefaultManagerConfig struct {
 	// NoopShaper behaviour (wire-format unchanged).
 	Shaper shaper.Shaper
 
+	// BurstReshape configures the nudge/ack exchange. It has to match the
+	// server: see internal/strategy/burst_reshape.go.
+	BurstReshape BurstReshapeConfig
+
 	// ShaperID is the 1-byte value advertised to the server in the MRPH
 	// handshake so it can rebuild the matching framing. 0 (noop) keeps the
 	// legacy wire format. Ignored when Shaper is nil.
@@ -1175,6 +1201,9 @@ type DefaultManagerConfig struct {
 // NewDefaultManager creates a manager with all strategies pre-registered
 func NewDefaultManager(cfg DefaultManagerConfig) *Manager {
 	m := NewManager()
+
+	// Set before registering: strategies copy this at construction.
+	m.SetBurstReshape(cfg.BurstReshape)
 
 	initManagerTransport(m, cfg)
 	initManagerPortHopping(m, cfg)
@@ -1284,7 +1313,10 @@ func registerSeqovlStrategy(m *Manager, cfg DefaultManagerConfig, hasServer, has
 	if !hasServer || !hasSecret {
 		return
 	}
-	m.Register(NewSeqovlStrategy(m, cfg.Secret, cfg.SeqovlPacketEnabled))
+	seqovl := NewSeqovlStrategy(m, cfg.Secret, cfg.SeqovlPacketEnabled)
+	seqovl.SetFingerprint(cfg.TLSFingerprint)
+	seqovl.SetRequireDataV2(cfg.REALITYRequireDataV2)
+	m.Register(seqovl)
 }
 
 // registerICMPStrategy registers the ICMP tunnel backup strategy.
@@ -1360,6 +1392,16 @@ func registerTLSStrategies(m *Manager, cfg DefaultManagerConfig, hasServer, hasS
 	}
 
 	reality := NewREALITYStrategy(m, cfg.Secret)
+	reality.SetFingerprint(cfg.TLSFingerprint)
+	if cfg.REALITYServerPubKeyB64 != "" {
+		key, err := customtls.DecodeKeyBase64(cfg.REALITYServerPubKeyB64)
+		if err != nil {
+			log.Warn("REALITY: B1 server key is not valid base64: %v; B1 stays off", err)
+		} else {
+			reality.SetB1(key)
+		}
+	}
+	reality.SetRequireDataV2(cfg.REALITYRequireDataV2)
 	if cfg.PQEnabled && cfg.PQServerKemPubB64 != "" {
 		kemPub, err := base64.StdEncoding.DecodeString(cfg.PQServerKemPubB64)
 		if err == nil && len(kemPub) > 0 {
@@ -2499,4 +2541,19 @@ func (m *Manager) ResetIPv6Check() {
 	defer m.ipv6Mu.Unlock()
 	m.ipv6CheckedOnce = false
 	log.Debug("IPv6 connectivity check reset, will re-check on next connection")
+}
+
+// SetBurstReshape configures burst reshaping for strategies created afterwards.
+// Call it before building strategies: the setting is copied at construction.
+func (m *Manager) SetBurstReshape(cfg BurstReshapeConfig) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.burstReshape = cfg
+}
+
+// BurstReshape returns the configured reshaping settings.
+func (m *Manager) BurstReshape() BurstReshapeConfig {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.burstReshape
 }

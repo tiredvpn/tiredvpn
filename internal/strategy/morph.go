@@ -680,7 +680,6 @@ func (mc *MorphedConn) Write(p []byte) (int, error) {
 		return 0, err
 	}
 
-
 	mc.packetsSent++
 	mc.bytesSent += int64(len(packet))
 
@@ -752,7 +751,6 @@ func (mc *MorphedConn) Read(p []byte) (int, error) {
 
 	// Return buffer to its bucketed pool (no-op for bucket=-1).
 	releasePacketBuf(payload, bucket)
-
 
 	return copied, nil
 }

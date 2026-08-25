@@ -19,13 +19,13 @@ var ErrShaperOverflow = errors.New("shaper queue overflow")
 // pacer tuning constants — see ADR §7. Exposed as package-private so tests
 // can reference them without re-deriving.
 const (
-	pacerQueueCap         = 256
-	pacerThrottleStart    = pacerQueueCap / 2 // 128
-	pacerMaxDelay         = 50 * time.Millisecond
+	pacerQueueCap          = 256
+	pacerThrottleStart     = pacerQueueCap / 2 // 128
+	pacerMaxDelay          = 50 * time.Millisecond
 	pacerCoalesceSkipBelow = 100 * time.Microsecond
-	pacerCoalesceFlushAt  = 200 * time.Microsecond
-	pacerEnqueueTimeout   = 1 * time.Second
-	pacerDrainTimeout     = 100 * time.Millisecond
+	pacerCoalesceFlushAt   = 200 * time.Microsecond
+	pacerEnqueueTimeout    = 1 * time.Second
+	pacerDrainTimeout      = 100 * time.Millisecond
 	// maxCoalesceFrames bounds the number of buffers in a single writev
 	// vector. 32 × 1500B ≈ 48 KiB ≈ one TCP send window's worth of payload,
 	// which keeps tail-latency bounded while reducing syscall count by an
@@ -51,9 +51,9 @@ type writePacer struct {
 	sh    shaper.Shaper
 	queue chan pacedFrame
 
-	done    chan struct{}
+	done      chan struct{}
 	closeOnce sync.Once
-	wg      sync.WaitGroup
+	wg        sync.WaitGroup
 
 	// errSeen holds the last non-nil Conn.Write error observed by the
 	// pacer goroutine. Producers consult it before enqueue so a broken
