@@ -355,6 +355,27 @@ type Config struct {
 	// If empty, unauthorized REALITY connections are silently dropped.
 	REALITYCoverDomain string
 
+	// NodeMaxClients caps distinct authenticated clients on this node. 0 = off.
+	//
+	// The vector is address reputation, and it is the only confirmed one that
+	// ignores what our traffic looks like: on 2026-08-04 one of two identical
+	// servers inside a /24 was banned and the other was not. The Iranian
+	// numbers are the ones to hold in mind - 200 users on an address bought two
+	// hours, 5 to 7 bought two days.
+	//
+	// Enforced only after a client authenticates, so a prober can never observe
+	// it. See nodecap.go.
+	NodeMaxClients int
+
+	// NodeMaxBytesPerWindow caps traffic carried in one window. 0 = off.
+	// This is the ceiling that carries meaning on a relay, where the peers are
+	// downstream nodes rather than people.
+	NodeMaxBytesPerWindow int64
+
+	// NodeWindow is the sliding window the traffic ceiling is measured over.
+	// 0 = one hour.
+	NodeWindow time.Duration
+
 	// REALITYRequireDataV2 rejects clients that do not negotiate the v2 data
 	// layer (per-connection X25519 keys + ChaCha20-Poly1305). Off during the
 	// rollout so upgraded exits keep serving older clients; turn it on once
@@ -439,6 +460,7 @@ func Run(cfg *Config) error {
 	}
 
 	initAdmissionControl(cfg)
+	initNodeCap(cfg)
 
 	if err := validateREALITYConfig(cfg); err != nil {
 		return fmt.Errorf("reality configuration: %w", err)
@@ -3097,10 +3119,38 @@ func handleConfusionTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverC
 	}
 }
 
+// tunnelIdentity is what the node ceiling counts. A client id where we have
+// one, so several sessions from one person count once; otherwise the peer
+// address, which over-counts a shared NAT but never under-counts, and a ceiling
+// that errs strict is the safe direction here.
+func tunnelIdentity(conn net.Conn, clientID string) string {
+	if clientID != "" {
+		return clientID
+	}
+	if addr := conn.RemoteAddr(); addr != nil {
+		return "addr:" + addr.String()
+	}
+	return "anonymous"
+}
+
 // handleRawTunnel handles raw tunnel connections
 // clientID is used for TUN mode to track IP allocation (e.g. "reality:abcd1234")
 func handleRawTunnel(conn net.Conn, srvCtx *serverContext, logger *log.Logger, clientID string) {
 	logger.Debug("Starting raw tunnel mode")
+
+	// Node ceiling. Here rather than at accept on purpose: every transport
+	// funnels through this function once its client has authenticated, so a
+	// peer that cannot authenticate never reaches the ceiling and cannot
+	// measure it. See nodecap.go for why that placement is the whole design.
+	//
+	// A refused client currently has nowhere to go - see nodeCapNoFailover - so
+	// this only fires when an operator has deliberately set a ceiling.
+	release, admitted := nodeCapacity.admit(tunnelIdentity(conn, clientID), time.Now())
+	if !admitted {
+		logger.Warn("Node ceiling reached, refusing a new session (client: %s)", clientID)
+		return
+	}
+	defer release()
 
 	// Track per-client connection for metrics. Use a closure on the conn
 	// variable so the defer picks up the kTLS-wrapped value if we hand

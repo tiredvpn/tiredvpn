@@ -409,6 +409,13 @@ func registerServerFlags(fs *flag.FlagSet, cfg *server.Config) *serverFlagOpts {
 	fs.StringVar(&cfg.REALITYCoverDomain, "reality-cover-domain", "", "Hostname to transparently proxy unauthorized REALITY probes to (operator-set, e.g. 'www.microsoft.com'); empty = silently drop. Never derived from client SNI.")
 	// Transition switch for the data-layer rewrite: leave off while old clients
 	// are still around, turn on afterwards to remove the v1 downgrade path.
+	// Node ceilings. Both default to off: a non-zero default would start
+	// refusing users on deployments running fine today, and a refused client
+	// has nowhere to go yet. The metrics are on regardless, so an operator can
+	// read their real numbers before choosing a limit.
+	fs.IntVar(&cfg.NodeMaxClients, "node-max-clients", 0, "Cap distinct authenticated clients on this node (0 = off). Address reputation is the one blocking vector that ignores traffic shape; 200 users on one address bought two hours in the Iranian experiment, 5-7 bought two days.")
+	fs.Int64Var(&cfg.NodeMaxBytesPerWindow, "node-max-bytes", 0, "Cap bytes carried per window on this node (0 = off). This is the ceiling that means something on a relay, where peers are downstream nodes rather than people.")
+	fs.DurationVar(&cfg.NodeWindow, "node-window", time.Hour, "Sliding window the traffic ceiling is measured over")
 	fs.BoolVar(&cfg.REALITYRequireDataV2, "reality-require-data-v2", false, "Reject REALITY clients that do not negotiate the v2 data layer (per-connection keys + AEAD). Turn on only after every client is upgraded.")
 	// B1 transport. -reality-b1 defaults to off while the B1 handler is still
 	// a stub: with it on, a server without a static key refuses to start, and
