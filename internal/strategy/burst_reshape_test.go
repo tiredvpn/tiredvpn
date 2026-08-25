@@ -114,9 +114,28 @@ type logEntry struct {
 	when time.Time
 }
 
-func (w *writeLog) add(dir string, n int) {
+// begin records a write that is about to be handed to the pipe and returns its
+// index, so the byte count can be corrected once the write returns.
+//
+// The order has to be taken here rather than on return. net.Pipe.Write returns
+// only once the peer has taken the bytes, and the peer may answer immediately -
+// the reshaping client writes its ack from inside the Read that received the
+// nudge. Recording on return therefore captures the order the two goroutines
+// happened to be rescheduled in, not the order of the wire, and the nudge and
+// the ack swap places under it: measured at 10 reorderings in 3000 runs at
+// -cpu=4, with the order writes were issued in violated 0 times out of 3000.
+func (w *writeLog) begin(dir string, n int) int {
 	w.mu.Lock()
+	defer w.mu.Unlock()
 	w.entries = append(w.entries, logEntry{dir: dir, n: n, when: time.Now()})
+	return len(w.entries) - 1
+}
+
+// finish replaces the recorded length with what the write actually reported, so
+// the entry carries the real byte count and not just the requested one.
+func (w *writeLog) finish(i, n int) {
+	w.mu.Lock()
+	w.entries[i].n = n
 	w.mu.Unlock()
 }
 
@@ -136,8 +155,9 @@ type loggingConn struct {
 }
 
 func (c *loggingConn) Write(p []byte) (int, error) {
+	i := c.log.begin(c.dir, len(p))
 	n, err := c.Conn.Write(p)
-	c.log.add(c.dir, n)
+	c.log.finish(i, n)
 	return n, err
 }
 
@@ -245,6 +265,14 @@ func TestExchangeSplitsTheFlight(t *testing.T) {
 
 	entries := l.snapshot()
 	// Expected order: c->s hello, s->c nudge, c->s ack, s->c reply.
+	//
+	// The position of an entry is the position of the write on the wire, and
+	// that is a property of the mechanism rather than of scheduling: the client
+	// writes its ack from inside the Read that received the nudge, so the ack
+	// cannot be issued before the nudge, and the server writes the reply only
+	// after the ack arrives. What is NOT guaranteed - and what this used to
+	// assert by accident - is anything about the order the writes *return* in.
+	// See writeLog.begin.
 	var order []string
 	for _, e := range entries {
 		order = append(order, fmt.Sprintf("%s:%d", e.dir, e.n))
@@ -254,17 +282,29 @@ func TestExchangeSplitsTheFlight(t *testing.T) {
 	}
 	nudge := entries[1]
 	ack := entries[2]
-	if nudge.dir != "s->c" || nudge.n < reshapeNudgeMin || nudge.n > reshapeNudgeMax {
-		t.Errorf("second write should be the nudge, got %v", order)
+	reply2 := entries[3]
+
+	if nudge.dir != "s->c" {
+		t.Errorf("second write should come from the server, got %v", order)
 	}
-	if ack.dir != "c->s" || ack.n != reshapeAckLen {
-		t.Errorf("third write should be the ack, got %v", order)
+	if nudge.n < reshapeNudgeMin || nudge.n > reshapeNudgeMax {
+		t.Errorf("nudge length %d outside [%d,%d], got %v", nudge.n, reshapeNudgeMin, reshapeNudgeMax, order)
+	}
+	if ack.dir != "c->s" {
+		t.Errorf("third write should come from the client, got %v", order)
 	}
 	if ack.n != reshapeAckLen {
-		t.Errorf("ack length %d, want the fixed %d", ack.n, reshapeAckLen)
+		t.Errorf("ack length %d, want the fixed %d, got %v", ack.n, reshapeAckLen, order)
 	}
-	if !ack.when.After(nudge.when) {
-		t.Errorf("ack must be written after the nudge")
+	if reply2.dir != "s->c" || reply2.n != len(reply) {
+		t.Errorf("fourth write should be the held reply of %d bytes, got %v", len(reply), order)
+	}
+	// Redundant with the positions above while the recorder is honest, and the
+	// check that goes red first if it stops being: a reordered recorder puts the
+	// ack's timestamp strictly before the nudge's. Not strict, so two writes
+	// landing on the same clock reading cannot fail it.
+	if ack.when.Before(nudge.when) {
+		t.Errorf("ack was recorded before the nudge")
 	}
 
 	// The drain goroutine is parked in Read, which is correct: there is nothing
