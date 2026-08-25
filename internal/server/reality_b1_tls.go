@@ -103,7 +103,7 @@ func b1TLSFor(srvCtx *serverContext) (*tls.Config, *certMinter) {
 // conn is the buffered connection that still replays the ClientHello, so
 // crypto/tls reads the same bytes the gate already inspected - the same
 // mechanism the plain TLS path uses.
-func handleREALITYB1(conn net.Conn, peekBuf []byte, clientID string, secret []byte, srvCtx *serverContext, logger *log.Logger) {
+func handleREALITYB1(conn net.Conn, peekBuf []byte, clientID string, secret []byte, clientFlags byte, srvCtx *serverContext, logger *log.Logger) {
 	cfg, _ := b1TLSFor(srvCtx)
 
 	// Derive the connection's auth key and carry it on the connection so
@@ -170,7 +170,21 @@ func handleREALITYB1(conn net.Conn, peekBuf []byte, clientID string, secret []by
 	}
 
 	realityAuthB1Total.Add(1)
-	logger.Info("REALITY B1: tunnel established for %s (client: %s)", conn.RemoteAddr(), clientID)
+
+	// Whether this client can tolerate server-initiated reshaping. Reshaping is
+	// the server's decision and this is the only input to it: a client that did
+	// not advertise the bit is left alone, which is what makes it safe to run
+	// old and new clients against the same server during a rollout.
+	//
+	// Nothing reads this yet - the reshaping itself lands in its own change.
+	// The negotiation ships first on purpose, so that by the time reshaping
+	// exists there are already clients in the field advertising support for it.
+	reshapeOK := clientFlags&customtls.AuthFlagReshapeCapable != 0
+	if reshapeOK {
+		realityReshapeCapableTotal.Add(1)
+	}
+	logger.Info("REALITY B1: tunnel established for %s (client: %s, reshape-capable: %v)",
+		conn.RemoteAddr(), clientID, reshapeOK)
 
 	if dispatch != protocol.TypeMux {
 		// Single-stream mode: the tunnel runs directly over TLS.

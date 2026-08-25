@@ -24,7 +24,7 @@ const (
 
 // icmpSession tracks an active ICMP tunnel session.
 type icmpSession struct {
-	sessionID  uint32
+	sessionID uint32
 	// c2sCipher decrypts client-to-server packets (matches client's sendCipher).
 	// s2cCipher encrypts server-to-client packets (matches client's recvCipher).
 	c2sCipher  cipherAEAD
@@ -34,7 +34,7 @@ type icmpSession struct {
 	recvCh     chan []byte
 	lastActive time.Time
 	mu         sync.Mutex
-	s2cSeq     uint32     // monotonic counter for all s2c replies; protected by mu
+	s2cSeq     uint32 // monotonic counter for all s2c replies; protected by mu
 	done       chan struct{}
 	once       sync.Once // guards close(done)
 }

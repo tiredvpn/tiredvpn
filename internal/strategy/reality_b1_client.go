@@ -199,7 +199,10 @@ func (r *REALITYStrategy) sealSessionID(uconn *utls.UConn) ([]byte, error) {
 
 	payload := customtls.AuthPayload{
 		Version: b1Version,
-		Flags:   customtls.AuthFlagExporterBinding,
+		// Advertised unconditionally, both of them. These say what this client
+		// can cope with, not what it will do, so there is nothing to configure
+		// and nothing to coordinate with the server's rollout.
+		Flags:   customtls.AuthFlagExporterBinding | customtls.AuthFlagReshapeCapable,
 		Time:    uint32(r.clockOffset.Now().Unix()),
 		ShortID: customtls.ShortIDFor(r.secret),
 	}

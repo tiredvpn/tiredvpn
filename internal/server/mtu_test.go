@@ -29,10 +29,10 @@ func TestResolveTunMTU(t *testing.T) {
 
 func TestNegotiateMTU(t *testing.T) {
 	cases := []struct {
-		name             string
-		clientMTU        int
-		serverMTU        int
-		want             int
+		name      string
+		clientMTU int
+		serverMTU int
+		want      int
 	}{
 		{"legacy client (0) takes server MTU", 0, 1500, 1500},
 		{"client smaller wins", 1280, 1500, 1280},

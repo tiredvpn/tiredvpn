@@ -607,3 +607,79 @@ func BenchmarkB1ClientThroughput(b *testing.B) {
 		}
 	}
 }
+
+// TestB1ClientAdvertisesReshapeCapability checks the negotiation from the wire:
+// the bit reaches the server inside the sealed session_id.
+func TestB1ClientAdvertisesReshapeCapability(t *testing.T) {
+	srv := newB1TestServer(t)
+	res := dialB1Recorded(t, "firefox", srv, nil)
+	helloRaw := clientHelloFromWire(t, res.writes)
+
+	peerPub, err := customtls.ExtractPeerX25519(helloRaw)
+	if err != nil {
+		t.Fatalf("ExtractPeerX25519: %v", err)
+	}
+	sessionID, err := customtls.SessionIDFrom(helloRaw)
+	if err != nil {
+		t.Fatalf("SessionIDFrom: %v", err)
+	}
+	zeroed, err := customtls.ZeroSessionID(helloRaw)
+	if err != nil {
+		t.Fatalf("ZeroSessionID: %v", err)
+	}
+	payload, err := customtls.OpenSessionID(srv.staticPriv.Bytes(), peerPub,
+		zeroed, helloRaw[4+2:4+2+32], sessionID)
+	if err != nil {
+		t.Fatalf("OpenSessionID: %v", err)
+	}
+
+	if !payload.HasFlag(customtls.AuthFlagReshapeCapable) {
+		t.Fatal("the client did not advertise reshape capability")
+	}
+	if !payload.HasFlag(customtls.AuthFlagExporterBinding) {
+		t.Fatal("the client did not advertise exporter binding")
+	}
+}
+
+// TestB1ClientDoesNotWaitForReshaping is the requirement that is easy to get
+// wrong and expensive to get wrong: reshaping is server-led, and a client that
+// advertises the capability must not block waiting for a server that never
+// acts on it.
+//
+// The stand-in server here does no reshaping at all - it is, from the client's
+// side, indistinguishable from one that predates the feature. The tunnel has to
+// come up and carry data at full speed anyway.
+func TestB1ClientDoesNotWaitForReshaping(t *testing.T) {
+	srv := newB1TestServer(t)
+
+	start := time.Now()
+	conn, err := dialB1(t, b1Client(t, srv), srv)
+	if err != nil {
+		t.Fatalf("connectB1 against a server that never reshapes: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	// A block waiting for a nudge would show up as a multi-second dial. On
+	// loopback the whole handshake is milliseconds; a second is generous.
+	if elapsed > time.Second {
+		t.Fatalf("dial took %v against a server that does not reshape: the client is "+
+			"waiting for something the server will never send", elapsed)
+	}
+
+	payload := []byte("the tunnel still carries data")
+	writeErr := make(chan error, 1)
+	go func() {
+		_, err := conn.Write(payload)
+		writeErr <- err
+	}()
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("reading the echo: %v", err)
+	}
+	if err := <-writeErr; err != nil {
+		t.Fatalf("writing: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("data did not survive the round trip")
+	}
+}

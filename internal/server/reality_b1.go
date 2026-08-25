@@ -29,6 +29,11 @@ var (
 	// silently takes the cover with it: the connection ends up closed, which is
 	// the shape the cover was meant to avoid, and nothing in the log says so.
 	realityDonorDialFailTotal atomic.Uint64
+
+	// realityReshapeCapableTotal counts authenticated B1 clients that advertised
+	// they can tolerate server-initiated reshaping. It is the number that says
+	// when the field has caught up enough for the server side to be switched on.
+	realityReshapeCapableTotal atomic.Uint64
 )
 
 // realityB1Gate holds the state the gate needs across connections.
@@ -127,8 +132,8 @@ func tryREALITYB1(conn net.Conn, peekBuf []byte, srvCtx *serverContext, logger *
 	// The counter moves in handleREALITYB1, after the binding proves the client
 	// holds the secret. Counting here would count anyone who got a short ID
 	// right, which is not the same thing.
-	logger.Debug("REALITY B1: session_id accepted (client: %s)", verdict.entry.clientID)
-	handleREALITYB1(conn, peekBuf, verdict.entry.clientID, verdict.entry.secret, srvCtx, logger)
+	logger.Debug("REALITY B1: session_id accepted (client: %s, flags %#02x)", verdict.entry.clientID, verdict.flags)
+	handleREALITYB1(conn, peekBuf, verdict.entry.clientID, verdict.entry.secret, verdict.flags, srvCtx, logger)
 	return true
 }
 
@@ -154,6 +159,12 @@ type b1Verdict struct {
 	ok     bool
 	reason b1Reason
 	entry  shortIDEntry
+
+	// flags are the client's advertised capabilities, read out of the sealed
+	// session_id. Meaningful only when ok is true: on any other verdict the
+	// payload either did not open or did not authenticate, so its contents
+	// prove nothing.
+	flags byte
 }
 
 // evaluate runs the gate: one X25519, one AEAD open, one map lookup.
@@ -219,7 +230,7 @@ func (g *realityB1Gate) evaluate(srvCtx *serverContext, helloRaw []byte, now tim
 		return b1Verdict{reason: reasonReplay}, nil
 	}
 
-	return b1Verdict{ok: true, reason: reasonAuthenticated, entry: entry}, nil
+	return b1Verdict{ok: true, reason: reasonAuthenticated, entry: entry, flags: payload.Flags}, nil
 }
 
 // refreshIndexIfNeeded rebuilds the short-ID index in the background when it is
@@ -386,6 +397,11 @@ func writeREALITYAuthMetrics(w io.Writer) {
 	fmt.Fprintf(w, "# HELP reality_auth_b1_total REALITY clients authenticated via the B1 transport\n")
 	fmt.Fprintf(w, "# TYPE reality_auth_b1_total counter\n")
 	fmt.Fprintf(w, "reality_auth_b1_total %d\n", realityAuthB1Total.Load())
+	fmt.Fprintf(w, "\n")
+
+	fmt.Fprintf(w, "# HELP reality_reshape_capable_total Authenticated B1 clients that advertised tolerance for server-initiated reshaping\n")
+	fmt.Fprintf(w, "# TYPE reality_reshape_capable_total counter\n")
+	fmt.Fprintf(w, "reality_reshape_capable_total %d\n", realityReshapeCapableTotal.Load())
 	fmt.Fprintf(w, "\n")
 
 	fmt.Fprintf(w, "# HELP reality_donor_dial_fail_total Unauthenticated connections that could not be handed to a donor because the dial failed\n")

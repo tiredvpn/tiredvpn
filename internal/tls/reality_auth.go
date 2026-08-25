@@ -56,11 +56,35 @@ const (
 )
 
 // Capability flags carried in AuthPayload.Flags.
+//
+// These are how the two ends agree on optional behaviour without an extra
+// round trip and without an operator having to set matching flags on both
+// sides. A flag on a command line cannot work here: a staged rollout always has
+// a window where only one side has been updated, so any option documented as
+// "must match the client setting" can never be turned on safely. The bit rides
+// inside the sealed session_id, so the server learns what the client supports
+// before it answers anything.
+//
+// The rule for every bit in this field: the CLIENT advertises what it can
+// tolerate, the SERVER decides what to do. A client sets its bits
+// unconditionally and never waits for the server to act on them, so a new
+// client against an old server behaves exactly like an old client. That is what
+// lets clients ship first.
 const (
 	// AuthFlagExporterBinding advertises that the client will send the
 	// exporter-binding record (see reality_binding.go) as its first
 	// application data.
 	AuthFlagExporterBinding = 1 << 0
+
+	// AuthFlagReshapeCapable advertises that the client understands
+	// server-initiated traffic reshaping and will not be confused by it.
+	//
+	// It is a statement about tolerance, not intent: the client does not
+	// reshape anything itself and does not wait for the server to. A server
+	// that never reshapes is indistinguishable, from the client's side, from
+	// one that has not been updated - which is exactly the property that makes
+	// it safe to deploy clients before servers.
+	AuthFlagReshapeCapable = 1 << 1
 )
 
 // ClientHello field sizes, used to locate session_id without hardcoding 39.
