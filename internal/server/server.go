@@ -42,7 +42,7 @@ import (
 )
 
 var (
-	Version     = "1.4.0"
+	Version     = "1.4.2"
 	connCounter uint64
 )
 
