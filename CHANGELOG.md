@@ -7,6 +7,57 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-08-25
+
+### Added
+- **IPv6 inside the tunnel (dual-stack).** A client started with `-tun-ipv6 dual`
+  negotiates IPv6 tunnel addresses with an exit configured with `-ip-pool-v6`, so
+  applications reach IPv6-only destinations through the VPN and stop bypassing it
+  over a native IPv6 default route. Off by default.
+  - Handshake version `0x04`: the request layout is unchanged, and the exit
+    answers with its usual version-dependent response plus a trailing
+    `[serverIP6:16][clientIP6:16]` block. Every layout sent to a client below
+    `0x04` is byte-identical to 1.3.x.
+  - A client's IPv6 address is derived from its IPv4 lease (pool prefix with the
+    lease in the low 32 bits), so no second allocator or lease store is involved.
+    The pool must be a ULA prefix (`fc00::/7`) leaving at least 32 host bits.
+  - NAT66 on the exit, with the uplink interface detected from the IPv6 route.
+  - Relays forward the exit-assigned addresses downstream across all transports.
+  - Client installs `::/1` + `8000::/1`, which outrank an RA-learned default
+    without touching the host's own, and pins a `/128` bypass to its transport
+    peer first.
+  - New metric `tiredvpn_tunnel_dualstack_sessions_total`.
+
+**Deployment order matters:** upgrade exits and relays before enabling
+`-tun-ipv6 dual` on any client. A relay older than this release does not
+degrade to IPv4 - it forwards the extension bytes downstream as tunnel traffic
+and corrupts the session.
+
+### Fixed
+- **Remotely reachable panic in the REALITY handshake parser.** An extension
+  declaring more body than the ClientHello carries was sliced without bounds
+  checking. Reachable on the unauthenticated anti-probe path, with no recover on
+  it, so one crafted packet ended the process.
+- Handshake responses are now read to completion for every client version.
+  Previously only the 9-byte prefix was guaranteed, so a fragmented extended
+  response left its tail in the stream and the packet loop parsed it as a
+  frame header - a silent desync of the tunnel.
+- Each IP pool gets its own nftables NAT table. Instances sharing a host used one
+  table name and replaced it wholesale, so starting one instance silently removed
+  the masquerade rules of every other.
+- `Run` returns when its listener closes instead of spinning on `Accept` at full
+  CPU after shutdown.
+- The connectivity gate and the periodic reprobe follow the transport the manager
+  actually dials. A client given both `-server` and `-server-v6` probed over IPv6
+  while the gate waited on a blocked IPv4 address, and never connected.
+- A server bypass route installed by the operator is no longer deleted on
+  teardown; only routes we pinned ourselves are removed.
+- `parsePort` rejects trailing garbage instead of truncating `"995abc"` to a
+  valid port.
+- The server warns when a foreign forward chain with policy drop will discard
+  client traffic that its own rules accept.
+
+
 ## [1.3.27] - 2026-08-07
 
 ### Added
