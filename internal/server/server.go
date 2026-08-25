@@ -11,6 +11,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	mrand "math/rand/v2"
@@ -550,6 +551,15 @@ func Run(cfg *Config) error {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
+			// handleShutdownSignal closes the listener, after which Accept
+			// fails forever: without this the loop would spin on continue at
+			// full CPU until the process is killed. A closed listener is the
+			// only clean way out of Run, so it is also the only path that
+			// returns nil.
+			if errors.Is(err, net.ErrClosed) {
+				log.Info("Listener closed, server stopped accepting connections")
+				return nil
+			}
 			log.Debug("Accept error: %v", err)
 			continue
 		}

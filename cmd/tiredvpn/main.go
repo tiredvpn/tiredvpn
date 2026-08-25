@@ -570,13 +570,10 @@ func runServer(args []string) {
 		}()
 	}
 
-	// server.Run does not return on success, because it has no success: its
-	// last statement is the accept loop, so every way out of it is an error.
-	// Testing the result for nil reads like a safety check and is a tautology -
-	// staticcheck proves it, which is what SA4023 was reporting.
-	err := server.Run(cfg)
-	fmt.Printf("Error: %v\n", err)
-	os.Exit(1)
+	if err := server.Run(cfg); err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
+	}
 }
 
 func runClient(args []string) {

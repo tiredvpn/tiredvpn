@@ -108,7 +108,12 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
-          version: latest
+          # Pinned, not "latest", on purpose. A floating linter is not a gate:
+          # golangci-lint 2.13.1 added a check that turned CI red on main with
+          # no change of ours, and it did it the day before a tag. Bump this
+          # deliberately, in its own commit, with the findings fixed in the same
+          # change - not by loosening it back to latest for freshness.
+          version: v2.13.1
 
   helm_chart:
     runs-on: ubuntu-latest
