@@ -111,8 +111,7 @@ func tryREALITYB1(conn net.Conn, peekBuf []byte, srvCtx *serverContext, logger *
 		// The reason is logged locally and never signalled to the peer: same
 		// destination, same bytes, same delay.
 		logger.Debug("REALITY B1: no match (%s), serving donor", verdict.reason)
-		realityDonorFallback(conn, peekBuf, srvCtx, logger)
-		return true
+		return realityDonorFallback(conn, peekBuf, srvCtx, logger)
 	}
 
 	// The counter moves in handleREALITYB1, after the binding proves the client
@@ -282,29 +281,34 @@ func versionAtLeast(version [3]byte, minVer string) bool {
 //
 // peekBuf goes to the donor byte for byte. B1 carries no padding extension, so
 // unlike the legacy path there is nothing to strip.
-func realityDonorFallback(conn net.Conn, peekBuf []byte, srvCtx *serverContext, logger *log.Logger) {
+// realityDonorFallback proxies an unauthenticated ClientHello to a donor.
+//
+// It reports whether it served the connection. False means there was no donor
+// to send it to and the caller must fall through to the ordinary TLS path -
+// closing instead would answer a ClientHello with a bare FIN, which is exactly
+// the shape that made a padding extension enough to recognise our servers.
+func realityDonorFallback(conn net.Conn, peekBuf []byte, srvCtx *serverContext, logger *log.Logger) bool {
 	dest := donorDestination(peekBuf, srvCtx.cfg.REALITYCoverDomain)
 	if dest == "" {
-		// No allowlisted SNI and no cover domain: close without a word, which
-		// is what the legacy path does and the only option that does not
-		// confirm anything.
-		return
+		logger.Debug("REALITY B1: no donor for this ClientHello, handing back to the ordinary path")
+		return false
 	}
 
 	destConn, err := net.DialTimeout("tcp", net.JoinHostPort(dest, "443"), 10*time.Second)
 	if err != nil {
 		logger.Debug("REALITY B1: donor %s unreachable: %v", dest, err)
-		return
+		return false
 	}
 	defer destConn.Close()
 
 	if _, err := destConn.Write(peekBuf); err != nil {
 		logger.Debug("REALITY B1: forwarding to donor %s failed: %v", dest, err)
-		return
+		return true // the donor was reached; the connection is spent either way
 	}
 
 	logger.Debug("REALITY B1: proxying %s to donor %s", conn.RemoteAddr(), dest)
 	proxyBothWays(conn, destConn)
+	return true
 }
 
 // donorDestination applies the destination policy to a ClientHello.

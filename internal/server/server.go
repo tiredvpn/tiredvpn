@@ -1159,9 +1159,21 @@ func handleConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 		}
 	}
 	if srvCtx.cfg.REALITYLegacyEnabled && DetectREALITYExtension(peekBuf) {
-		logger.Info("Detected REALITY protocol")
-		HandleREALITYConnection(buffConn, srvCtx, logger)
-		return
+		logger.Debug("Padding extension present, trying the REALITY transport")
+		claimed, hello := HandleREALITYConnection(buffConn, srvCtx, logger)
+		if claimed {
+			return
+		}
+		// Not one of ours: an ordinary client whose ClientHello carries a real
+		// padding extension, which OpenSSL adds to anything between 256 and 511
+		// bytes. Replay the hello and continue down the ordinary TLS path, so
+		// it gets the same answer as any other connection. Dropping it here is
+		// what made a padding extension a one-packet way to recognise us.
+		logger.Debug("REALITY did not claim the connection, continuing as ordinary TLS")
+		buffConn = &bufferedConn{
+			Conn:   conn,
+			reader: io.MultiReader(bytes.NewReader(hello), conn),
+		}
 	}
 
 	// Check if this is a TLS ClientHello (without REALITY extension)
