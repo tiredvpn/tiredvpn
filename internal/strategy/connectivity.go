@@ -40,6 +40,7 @@ func (r ConnectivityResult) HasBasicConnectivity() bool {
 // ConnectivityChecker performs pre-flight connectivity checks before trying strategies
 type ConnectivityChecker struct {
 	serverAddr  string        // full addr host:port
+	altAddr     string        // same server on the other address family, optional
 	timeout     time.Duration // timeout for the TCP gate (2-3 sec)
 	auxTimeout  time.Duration // bounded timeout for the UDP/ICMP probes
 	auxGrace    time.Duration // how long Check waits for UDP/ICMP after TCP lands
@@ -61,6 +62,47 @@ func NewConnectivityChecker(serverAddr string, timeout time.Duration, androidMod
 		auxGrace:    300 * time.Millisecond,
 		androidMode: androidMode,
 	}
+}
+
+// SetAltAddr registers the same server's address on the other family (the
+// IPv6 one when -server carries IPv4, or the reverse). The TCP gate then
+// accepts either: the question it answers is "can this client reach its
+// server", and with a dual-addressed server that is true as long as one family
+// works. Without it a client configured with both addresses sat in
+// "waiting for network" against a blocked IPv4 while its IPv6 transport was
+// perfectly reachable. Empty or duplicate values are ignored.
+func (c *ConnectivityChecker) SetAltAddr(addr string) {
+	if addr == "" || addr == c.serverAddr {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.altAddr = addr
+}
+
+// addrsToTry returns the addresses the TCP gate probes, preferred one first.
+func (c *ConnectivityChecker) addrsToTry() []string {
+	c.mu.RLock()
+	alt := c.altAddr
+	c.mu.RUnlock()
+	if alt == "" {
+		return []string{c.serverAddr}
+	}
+	return []string{c.serverAddr, alt}
+}
+
+// checkTCPAny reports success as soon as any configured address answers, and
+// returns the last error when none do.
+func (c *ConnectivityChecker) checkTCPAny(ctx context.Context) error {
+	var lastErr error
+	for _, addr := range c.addrsToTry() {
+		err := c.checkTCP(ctx, addr)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+	}
+	return lastErr
 }
 
 // Check performs TCP, UDP and ICMP connectivity checks
@@ -86,7 +128,7 @@ func (c *ConnectivityChecker) Check(ctx context.Context) ConnectivityResult {
 	tcpDone := make(chan struct{})
 	go func() {
 		start := time.Now()
-		tcpErr = c.checkTCP(ctx, c.serverAddr)
+		tcpErr = c.checkTCPAny(ctx)
 		tcpLatency = time.Since(start)
 		close(tcpDone)
 	}()
@@ -162,7 +204,7 @@ func (c *ConnectivityChecker) checkTCPOnly(ctx context.Context) ConnectivityResu
 	result := ConnectivityResult{CheckedAt: time.Now()}
 
 	start := time.Now()
-	err := c.checkTCP(ctx, c.serverAddr)
+	err := c.checkTCPAny(ctx)
 	result.TCP = err == nil
 	if err != nil {
 		result.Error = err
@@ -278,7 +320,7 @@ func (c *ConnectivityChecker) WaitForConnectivity(ctx context.Context, interval 
 		return result
 	}
 
-	log.Warn("No connectivity to %s, waiting for network...", c.serverAddr)
+	log.Warn("No connectivity to %s, waiting for network...", strings.Join(c.addrsToTry(), " or "))
 
 	backoff := interval
 	timer := time.NewTimer(backoff)
@@ -297,16 +339,25 @@ func (c *ConnectivityChecker) WaitForConnectivity(ctx context.Context, interval 
 				log.Info("Connectivity restored to %s", c.serverAddr)
 				return result
 			}
-			if backoff < maxProbeInterval {
-				backoff *= probeBackoffFactor
-				if backoff > maxProbeInterval {
-					backoff = maxProbeInterval
-				}
-			}
+			backoff = nextProbeBackoff(backoff)
 			timer.Reset(backoff)
 			log.Debug("Still no connectivity to %s, retrying in %v...", c.serverAddr, backoff)
 		}
 	}
+}
+
+// nextProbeBackoff advances the WaitForConnectivity retry delay: multiply by
+// probeBackoffFactor, clamped at maxProbeInterval. A caller-supplied interval
+// already at or above the ceiling is left alone rather than pulled down to it.
+func nextProbeBackoff(cur time.Duration) time.Duration {
+	if cur >= maxProbeInterval {
+		return cur
+	}
+	next := cur * probeBackoffFactor
+	if next > maxProbeInterval {
+		next = maxProbeInterval
+	}
+	return next
 }
 
 // LastResult returns the last cached connectivity result

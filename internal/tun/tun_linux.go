@@ -73,7 +73,23 @@ type TUNDevice struct {
 	// so delRoutes does not cover it). Guarded by bypassMu: the watcher
 	// goroutine re-pins it while Close may be tearing it down.
 	bypassRoute *netlink.Route
-	bypassMu    sync.Mutex
+	// serverBypassIP6 / bypassRoute6 are the IPv6 twins of the pair above.
+	// They matter only for a dual-stack tunnel: the ::/1 + 8000::/1
+	// half-defaults installed by EnableDualStack cover every IPv6
+	// destination, so a client using the IPv6 transport (-server-v6 /
+	// -prefer-ipv6) would route its own transport socket into the tunnel.
+	// Set via SetServerBypassIP6 before EnableDualStack.
+	serverBypassIP6 net.IP
+	bypassRoute6    *netlink.Route
+	// bypassPreexisted records that a host route to the server was already in
+	// the table before we pinned ours. Such a route belongs to the operator
+	// (NetworkManager profile, a boot script, a hand-typed `ip route add`), and
+	// on a host with no default route for that family it is the only way the
+	// server is reachable at all. Deleting it on teardown left the next client
+	// start with no path to the server, so teardown skips it.
+	bypassPreexisted  bool
+	bypass6Preexisted bool
+	bypassMu          sync.Mutex
 
 	// deferRoutes, when true, makes Configure bring the interface up and assign
 	// the tunnel address but NOT install the route set (notably a 0.0.0.0/0
@@ -85,6 +101,38 @@ type TUNDevice struct {
 	// routesInstalled guards InstallRoutes so it is idempotent across the
 	// initial connect and subsequent reconnects.
 	routesInstalled bool
+
+	// dualStack records that the client wants IPv6 inside the tunnel
+	// (handshake v0x04). It only relaxes the historical disable_ipv6=1 in
+	// Configure; the v6 address/routes are installed by EnableDualStack once
+	// the exit has actually negotiated dual-stack. Set via SetDualStack before
+	// Configure.
+	dualStack bool
+	// v6Enabled reports that EnableDualStack ran to completion: the link
+	// carries localIP6/remoteIP6, the v6 half-default routes in routes6 are
+	// installed, and the ip6 MSS clamp table exists. Drives v6-aware teardown
+	// in Close/DisableIPv6 and route re-installs in reAddRoutes.
+	v6Enabled bool
+	localIP6  net.IP
+	remoteIP6 net.IP
+	routes6   []*net.IPNet
+	// v6PeerForm records which address form actually landed on the link:
+	// true for the point-to-point clientIP6/128 with peer serverIP6/128,
+	// false for the /64 fallback used on kernels that reject a v6 peer.
+	// Every later address operation has to use the same form — netlink
+	// matches on the whole address, so deleting the wrong form fails and
+	// leaves the stale address behind.
+	v6PeerForm bool
+}
+
+// SetDualStack records the client's intent to negotiate IPv6 inside the
+// tunnel. When set before Configure, the interface keeps IPv6 enabled
+// (disable_ipv6=0, mirroring the server-side ConfigureSubnet) so a later
+// EnableDualStack can assign the negotiated v6 address. When the exit
+// declines dual-stack, DisableIPv6 restores the exact v4-only state.
+// Linux only; on Android the host owns interface configuration.
+func (t *TUNDevice) SetDualStack(dual bool) {
+	t.dualStack = dual
 }
 
 // SetDeferRoutes requests that Configure NOT install routes immediately, leaving
@@ -104,12 +152,32 @@ func (t *TUNDevice) SetServerBypassIP(ip net.IP) {
 	t.bypassMu.Unlock()
 }
 
+// SetServerBypassIP6 records the VPN server's public IPv6 so that, once the
+// dual-stack half-default routes are installed, traffic to the server keeps
+// leaving via the physical interface instead of looping through the tunnel.
+// Linux only; on Android the server socket is protected via VpnService.protect().
+func (t *TUNDevice) SetServerBypassIP6(ip net.IP) {
+	if ip != nil && ip.To4() != nil {
+		return // not an IPv6 address; the v4 bypass covers it
+	}
+	t.bypassMu.Lock()
+	t.serverBypassIP6 = ip
+	t.bypassMu.Unlock()
+}
+
 // bypassIP returns the server IP to keep off the tunnel, or nil once the device
 // is torn down. Read under the lock because the watcher goroutine races Close.
 func (t *TUNDevice) bypassIP() net.IP {
 	t.bypassMu.Lock()
 	defer t.bypassMu.Unlock()
 	return t.serverBypassIP
+}
+
+// bypassIP6 is the IPv6 twin of bypassIP.
+func (t *TUNDevice) bypassIP6() net.IP {
+	t.bypassMu.Lock()
+	defer t.bypassMu.Unlock()
+	return t.serverBypassIP6
 }
 
 // mssTableName returns the per-interface nftables table name for MSS clamping.
@@ -191,6 +259,11 @@ func (t *TUNDevice) Close() error {
 		if err := removeMSSClamping(t.name); err != nil {
 			log.Warn("Failed to remove MSS clamping rules: %v", err)
 		}
+		if t.v6Enabled {
+			if err := removeMSSClampingV6(t.name); err != nil {
+				log.Warn("Failed to remove IPv6 MSS clamping rules: %v", err)
+			}
+		}
 	}
 
 	// Remove only the routes this device installed, before deleting the link.
@@ -203,14 +276,34 @@ func (t *TUNDevice) Close() error {
 	// Remove the server bypass host route (it lives on the physical link, not
 	// the TUN, so delRoutes does not cover it).
 	t.bypassMu.Lock()
-	if t.bypassRoute != nil {
-		if err := netlink.RouteDel(t.bypassRoute); err != nil {
+	for _, b := range []struct {
+		route       *netlink.Route
+		preexisting bool
+	}{
+		{t.bypassRoute, t.bypassPreexisted},
+		{t.bypassRoute6, t.bypass6Preexisted},
+	} {
+		if b.route == nil {
+			continue
+		}
+		if b.preexisting {
+			// The operator's own host route to the server. On a host with no
+			// default route for that family it is the only path there, so
+			// deleting it would strand the next client start.
+			log.Debug("Server bypass: leaving pre-existing route to %s in place", b.route.Dst)
+			continue
+		}
+		if err := netlink.RouteDel(b.route); err != nil {
 			log.Debug("Failed to delete server bypass route: %v", err)
 		}
-		t.bypassRoute = nil
 	}
-	// Stop the watcher from re-pinning a route we just tore down.
+	t.bypassRoute = nil
+	t.bypassRoute6 = nil
+	t.bypassPreexisted = false
+	t.bypass6Preexisted = false
+	// Stop the watcher from re-pinning routes we just tore down.
 	t.serverBypassIP = nil
+	t.serverBypassIP6 = nil
 	t.bypassMu.Unlock()
 
 	t.file.SetReadDeadline(time.Now())
@@ -287,11 +380,20 @@ func (t *TUNDevice) Configure(localIP, remoteIP net.IP, routes []string) error {
 	t.remoteIP = remoteIP
 	t.routes = routes
 
+	// Dual-stack intent keeps IPv6 enabled on the link (mirroring the
+	// server-side ConfigureSubnet) so EnableDualStack can assign the
+	// negotiated v6 address after the handshake. When dual-stack is off — or
+	// was requested but the exit declined it (DisableIPv6) — the historical
+	// disable_ipv6=1 stands, byte-identical to before.
+	disableV6 := "1"
+	if t.dualStack {
+		disableV6 = "0"
+	}
 	sysctlPath := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/disable_ipv6", t.name)
-	if err := os.WriteFile(sysctlPath, []byte("1"), 0644); err != nil {
-		log.Warn("Failed to disable IPv6 on %s: %v", t.name, err)
+	if err := os.WriteFile(sysctlPath, []byte(disableV6), 0644); err != nil {
+		log.Warn("Failed to set disable_ipv6=%s on %s: %v", disableV6, t.name, err)
 	} else {
-		log.Debug("Disabled IPv6 on %s (before up)", t.name)
+		log.Debug("Set disable_ipv6=%s on %s (before up)", disableV6, t.name)
 	}
 
 	link, err := netlink.LinkByName(t.name)
@@ -342,6 +444,188 @@ func (t *TUNDevice) Configure(localIP, remoteIP net.IP, routes []string) error {
 
 	log.Info("TUN device %s configured: local=%s, remote=%s", t.name, localIP, remoteIP)
 	return nil
+}
+
+// EnableDualStack brings up the IPv6 side of the tunnel after the exit
+// negotiated dual-stack (handshake v0x04 with the dual-stack flag). It
+// installs the negotiated v6 address and the two v6 half-default routes
+// (::/1, 8000::/1) into the TUN together, so there is no intermediate state
+// with a v6 address but routes to nowhere (or vice versa). The split default
+// outranks RA-learned ::/0 routes on prefix length without touching the
+// host's real default route or its RA machinery.
+//
+// Idempotent: safe to call on every (re)connect. Address replacement mirrors
+// the v4 UpdateLocalIP/UpdatePeerIP behavior and route installs use
+// RouteReplace.
+func (t *TUNDevice) EnableDualStack(clientIP6, serverIP6 net.IP) error {
+	p2pLocal, p2pPeer, fallback, err := dualStackAddrPlan(clientIP6, serverIP6)
+	if err != nil {
+		return err
+	}
+	routes6, err := dualStackRouteNets()
+	if err != nil {
+		return err
+	}
+
+	link, err := netlink.LinkByName(t.name)
+	if err != nil {
+		return fmt.Errorf("failed to find link %s: %w", t.name, err)
+	}
+
+	// The interface must accept IPv6 before the address can be assigned.
+	// Configure already wrote 0 when dual-stack intent was set; rewrite it
+	// here so the call is self-contained (e.g. after a fallback DisableIPv6).
+	sysctlPath := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/disable_ipv6", t.name)
+	if err := os.WriteFile(sysctlPath, []byte("0"), 0644); err != nil {
+		return fmt.Errorf("failed to enable IPv6 on %s: %w", t.name, err)
+	}
+
+	// Address: same shape as the v4 point-to-point setup — clientIP6/128 with
+	// peer serverIP6/128, falling back to the /64 pool prefix when the kernel
+	// rejects a v6 peer address.
+	if t.v6Enabled && !t.localIP6.Equal(clientIP6) {
+		// Reconnect assigned a new v6 (follows the v4 assignment): drop the
+		// stale address before adding the new one, in whichever form it was
+		// installed as.
+		if err := t.delV6Addr(link, t.localIP6); err != nil {
+			log.Debug("Failed to delete old v6 addr %s on %s: %v", t.localIP6, t.name, err)
+		}
+	}
+	peerForm := true
+	if err := netlink.AddrReplace(link, &netlink.Addr{IPNet: p2pLocal, Peer: p2pPeer}); err != nil {
+		if err2 := netlink.AddrReplace(link, &netlink.Addr{IPNet: fallback}); err2 != nil {
+			return fmt.Errorf("failed to set IPv6 address: %w", err)
+		}
+		peerForm = false
+		log.Info("TUN device %s: v6 peer address unsupported, using %s", t.name, fallback)
+	}
+
+	// Publish the state as soon as the address is on the link and before the
+	// routes go in: everything below can fail, and the caller's fallback is
+	// DisableIPv6, whose guard is v6Enabled. Recording late used to make a
+	// failed route install leave the address (and possibly one half-default)
+	// stranded on the interface.
+	t.localIP6 = p2pLocal.IP
+	t.remoteIP6 = p2pPeer.IP
+	t.v6PeerForm = peerForm
+	t.routes6 = routes6
+	t.v6Enabled = true
+
+	// The tunnel's own IPv6 transport socket must keep leaving through the
+	// physical link. Pinned before the half-defaults below, which otherwise
+	// swallow it on the very next packet.
+	t.addServerBypass6()
+
+	// Routes: installed together with the address, idempotently. Tracking
+	// them in addedRoutes makes Close remove exactly these.
+	for _, dst := range routes6 {
+		t.trackRoute(dst)
+		if err := netlink.RouteReplace(&netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst}); err != nil {
+			return fmt.Errorf("failed to add route %s: %w", dst, err)
+		}
+	}
+
+	// MSS clamp for the ip6 family, mirroring the v4 table. The v6 base
+	// header is 40 bytes (vs 20 for v4), so the clamp is mtu-60 against the
+	// v4 mtu-40 — same "MTU minus L3+L4 headers" logic.
+	if mss := t.mtu - 60; mss > 0 {
+		if err := addMSSClampingV6(t.name, t.mtu); err != nil {
+			log.Warn("Failed to set IPv6 MSS clamping: %v", err)
+		} else {
+			log.Info("TCP MSS clamping (IPv6) set to %d on %s", mss, t.name)
+		}
+	}
+
+	log.Info("TUN device %s dual-stack enabled: local=%s, peer=%s, routes=%v",
+		t.name, clientIP6, serverIP6, dualStackRouteCIDRs)
+	return nil
+}
+
+// v6AddrForms returns the link address for ip in the form currently installed
+// (v6PeerForm) first and the other form second. Address operations retry
+// against the second form because netlink matches the whole address: a
+// mismatched delete does not fail loudly, it just leaves the stale address on
+// the interface, and the replacement add then collides with it.
+func (t *TUNDevice) v6AddrForms(ip net.IP) []*netlink.Addr {
+	peer := &netlink.Addr{
+		IPNet: &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)},
+		Peer:  &net.IPNet{IP: t.remoteIP6, Mask: net.CIDRMask(128, 128)},
+	}
+	fallback := &netlink.Addr{IPNet: &net.IPNet{IP: ip, Mask: net.CIDRMask(64, 128)}}
+	if t.v6PeerForm {
+		return []*netlink.Addr{peer, fallback}
+	}
+	return []*netlink.Addr{fallback, peer}
+}
+
+// delV6Addr removes ip from the link, trying the recorded form first.
+func (t *TUNDevice) delV6Addr(link netlink.Link, ip net.IP) error {
+	if ip == nil {
+		return nil
+	}
+	var lastErr error
+	for _, addr := range t.v6AddrForms(ip) {
+		err := netlink.AddrDel(link, addr)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+	}
+	return lastErr
+}
+
+// setV6Addr assigns ip to the link, trying the recorded form first and the
+// other one as a fallback. Returns the form that stuck so the caller can
+// update v6PeerForm.
+func (t *TUNDevice) setV6Addr(link netlink.Link, ip net.IP) (peerForm bool, err error) {
+	forms := t.v6AddrForms(ip)
+	for i, addr := range forms {
+		if err = netlink.AddrReplace(link, addr); err == nil {
+			if i == 0 {
+				return t.v6PeerForm, nil
+			}
+			return !t.v6PeerForm, nil
+		}
+	}
+	return t.v6PeerForm, err
+}
+
+// DisableIPv6 pins the interface back to the exact v4-only state: any v6
+// address/routes/clamp installed by EnableDualStack are removed and
+// disable_ipv6=1 is restored. Called when dual-stack was requested but the
+// exit did not negotiate it, so a declined negotiation never leaves a
+// half-configured v6 path behind.
+func (t *TUNDevice) DisableIPv6() {
+	if t.name == "" {
+		return
+	}
+
+	if t.v6Enabled {
+		if link, err := netlink.LinkByName(t.name); err == nil {
+			for _, dst := range t.routes6 {
+				if err := netlink.RouteDel(&netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst}); err != nil {
+					log.Debug("Failed to delete v6 route %s on %s: %v", dst, t.name, err)
+				}
+				t.untrackRoute(dst)
+			}
+			if err := t.delV6Addr(link, t.localIP6); err != nil {
+				log.Debug("Failed to delete v6 addr %s on %s: %v", t.localIP6, t.name, err)
+			}
+		}
+		if err := removeMSSClampingV6(t.name); err != nil {
+			log.Warn("Failed to remove IPv6 MSS clamping rules: %v", err)
+		}
+		t.v6Enabled = false
+		t.localIP6 = nil
+		t.remoteIP6 = nil
+		t.routes6 = nil
+		t.v6PeerForm = false
+	}
+
+	sysctlPath := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/disable_ipv6", t.name)
+	if err := os.WriteFile(sysctlPath, []byte("1"), 0644); err != nil {
+		log.Warn("Failed to disable IPv6 on %s: %v", t.name, err)
+	}
 }
 
 // addRoutes installs the given routes on the link, normalizing bare IPs to
@@ -430,8 +714,37 @@ func (t *TUNDevice) physicalRouteTo(ip net.IP) (*netlink.Route, error) {
 // bypass that was wiped out from under us (e.g. a Wi-Fi reassociation takes the
 // link down and the kernel drops every route attached to it). No-op if no
 // server IP was set.
-func (t *TUNDevice) addServerBypass() {
-	ip := t.bypassIP()
+func (t *TUNDevice) addServerBypass() { t.pinBypass(t.bypassIP()) }
+
+// addServerBypass6 pins the same host route for the IPv6 transport address.
+// Called by EnableDualStack before the ::/1 + 8000::/1 half-defaults land, so
+// a client dialling its server over IPv6 never routes that socket into its own
+// tunnel. No-op when no v6 server address was configured.
+func (t *TUNDevice) addServerBypass6() { t.pinBypass(t.bypassIP6()) }
+
+// hostRouteExists reports whether the routing table already holds a route for
+// exactly dst. Used to tell an operator-installed host route to the server
+// apart from one we pinned ourselves, so teardown does not delete somebody
+// else's. A listing failure answers false: re-pinning and removing our own
+// route is the pre-existing behaviour and the safer default.
+func hostRouteExists(dst *net.IPNet, v6 bool) bool {
+	family := netlink.FAMILY_V4
+	if v6 {
+		family = netlink.FAMILY_V6
+	}
+	routes, err := netlink.RouteListFiltered(family,
+		&netlink.Route{Dst: dst}, netlink.RT_FILTER_DST)
+	if err != nil {
+		log.Debug("Server bypass: cannot list routes for %s: %v", dst, err)
+		return false
+	}
+	return len(routes) > 0
+}
+
+// pinBypass installs the /32 (v4) or /128 (v6) host route to ip through the
+// current physical gateway and records it for teardown. Shared by the v4 and
+// v6 paths; physicalRouteTo already selects the right address family.
+func (t *TUNDevice) pinBypass(ip net.IP) {
 	if ip == nil {
 		return
 	}
@@ -440,13 +753,16 @@ func (t *TUNDevice) addServerBypass() {
 		log.Warn("Server bypass: cannot resolve physical route to %s: %v", ip, err)
 		return
 	}
+	v6 := ip.To4() == nil
 	bits := 32
-	if ip.To4() == nil {
+	if v6 {
 		bits = 128
 	}
+	dst := &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)}
+	preexisting := hostRouteExists(dst, v6)
 	bypass := &netlink.Route{
 		LinkIndex: r.LinkIndex,
-		Dst:       &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)},
+		Dst:       dst,
 		Gw:        r.Gw,
 		Src:       r.Src,
 	}
@@ -456,9 +772,15 @@ func (t *TUNDevice) addServerBypass() {
 	}
 	t.bypassMu.Lock()
 	// Close raced us and tore the device down: undo the pin instead of leaking it.
-	closed := t.serverBypassIP == nil
+	closed := (v6 && t.serverBypassIP6 == nil) || (!v6 && t.serverBypassIP == nil)
 	if !closed {
-		t.bypassRoute = bypass
+		if v6 {
+			t.bypassRoute6 = bypass
+			t.bypass6Preexisted = t.bypass6Preexisted || preexisting
+		} else {
+			t.bypassRoute = bypass
+			t.bypassPreexisted = t.bypassPreexisted || preexisting
+		}
 	}
 	t.bypassMu.Unlock()
 	if closed {
@@ -470,9 +792,13 @@ func (t *TUNDevice) addServerBypass() {
 
 // EnsureServerBypass re-pins the server bypass if traffic to the server would
 // currently go through the tunnel. Cheap enough to poll: the healthy path costs
-// one RouteGet and touches nothing.
+// one RouteGet per configured family and touches nothing.
 func (t *TUNDevice) EnsureServerBypass() {
-	ip := t.bypassIP()
+	t.ensureBypass(t.bypassIP())
+	t.ensureBypass(t.bypassIP6())
+}
+
+func (t *TUNDevice) ensureBypass(ip net.IP) {
 	if ip == nil {
 		return
 	}
@@ -489,7 +815,7 @@ func (t *TUNDevice) EnsureServerBypass() {
 	} else {
 		log.Warn("Server bypass: traffic to %s now routes via %s, re-pinning", ip, t.name)
 	}
-	t.addServerBypass()
+	t.pinBypass(ip)
 }
 
 // WatchServerBypass polls the bypass route and restores it when the host drops
@@ -499,7 +825,7 @@ func (t *TUNDevice) EnsureServerBypass() {
 // full-tunnel routes swallow the traffic to the server and every reconnect
 // attempt dials into the dead tunnel. Returns when stop is closed.
 func (t *TUNDevice) WatchServerBypass(stop <-chan struct{}) {
-	if t.bypassIP() == nil {
+	if t.bypassIP() == nil && t.bypassIP6() == nil {
 		return
 	}
 	ticker := time.NewTicker(bypassWatchInterval)
@@ -589,6 +915,17 @@ func (t *TUNDevice) trackRoute(dst *net.IPNet) {
 	t.addedRoutes = append(t.addedRoutes, dst)
 }
 
+// untrackRoute drops dst from t.addedRoutes (used when a route is removed
+// ahead of teardown, e.g. DisableIPv6 tearing down the v6 half-defaults).
+func (t *TUNDevice) untrackRoute(dst *net.IPNet) {
+	for i, existing := range t.addedRoutes {
+		if existing.String() == dst.String() {
+			t.addedRoutes = append(t.addedRoutes[:i], t.addedRoutes[i+1:]...)
+			return
+		}
+	}
+}
+
 // reAddRoutes re-installs t.routes after an address change, normalizing bare
 // IPs the same way addRoutes does. It logs at debug level since this runs on
 // every reconnect/IP update; hard failures are already surfaced by addRoutes
@@ -619,14 +956,35 @@ func (t *TUNDevice) reAddRoutes(link netlink.Link, reason string) {
 			log.Debug("Re-added route %s after %s", route, reason)
 		}
 	}
+	// The v6 half-defaults are not part of t.routes (they are implied by the
+	// negotiated dual-stack, not user-supplied), so re-assert them separately
+	// with the same idempotent RouteReplace.
+	if t.v6Enabled {
+		for _, dst := range t.routes6 {
+			t.trackRoute(dst)
+			if err := netlink.RouteReplace(&netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst}); err != nil {
+				log.Warn("Failed to re-add v6 route %s: %v", dst, err)
+			}
+		}
+	}
 }
 
-func (t *TUNDevice) ConfigureSubnet(localIP net.IP, network *net.IPNet) error {
+// ConfigureSubnet sets up the server-side TUN with subnet routing. serverIP6,
+// when non-nil, enables dual-stack on the link: IPv6 stays enabled (instead
+// of the historical disable_ipv6=1) and the server's tunnel v6 address is
+// assigned with the full pool prefix so the kernel routes the whole ULA
+// prefix back into the TUN. A nil serverIP6 keeps the exact IPv4-only
+// behavior, including disable_ipv6=1.
+func (t *TUNDevice) ConfigureSubnet(localIP net.IP, network *net.IPNet, serverIP6 *net.IPNet) error {
 	t.localIP = localIP
 
 	sysctlPath := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/disable_ipv6", t.name)
-	if err := os.WriteFile(sysctlPath, []byte("1"), 0644); err != nil {
-		log.Warn("Failed to disable IPv6 on %s: %v", t.name, err)
+	disableV6 := "1"
+	if serverIP6 != nil {
+		disableV6 = "0"
+	}
+	if err := os.WriteFile(sysctlPath, []byte(disableV6), 0644); err != nil {
+		log.Warn("Failed to set disable_ipv6=%s on %s: %v", disableV6, t.name, err)
 	}
 
 	link, err := netlink.LinkByName(t.name)
@@ -650,6 +1008,17 @@ func (t *TUNDevice) ConfigureSubnet(localIP net.IP, network *net.IPNet) error {
 	addr := fmt.Sprintf("%s/%d", localIP.String(), ones)
 	if err := netlink.AddrAdd(link, &netlink.Addr{IPNet: ipNet}); err != nil {
 		return fmt.Errorf("failed to set IP address: %w", err)
+	}
+
+	// Dual-stack: assign the server's tunnel v6 address with the full pool
+	// prefix (e.g. fd00:10:8::1/64). The connected route this installs is what
+	// makes the kernel hand replies for any client v6 address in the prefix
+	// back to the TUN for the dispatcher to route.
+	if serverIP6 != nil {
+		if err := netlink.AddrAdd(link, &netlink.Addr{IPNet: serverIP6}); err != nil {
+			return fmt.Errorf("failed to set IPv6 address: %w", err)
+		}
+		log.Info("TUN device %s dual-stack enabled: %s", t.name, serverIP6)
 	}
 
 	mss := t.mtu - 40
@@ -717,6 +1086,7 @@ func (t *TUNDevice) UpdateLocalIP(newLocalIP net.IP) error {
 	if t.linkHasAddr(link, newLocalIP) {
 		t.localIP = newLocalIP
 		log.Debug("TUN device %s already carries %s, skipping addr swap", t.name, newLocalIP)
+		t.updateLocalIP6(link)
 		t.reAddRoutes(link, "IP sync")
 		return nil
 	}
@@ -740,6 +1110,10 @@ func (t *TUNDevice) UpdateLocalIP(newLocalIP net.IP) error {
 	t.localIP = newLocalIP
 	log.Info("TUN device %s local IP updated to %s", t.name, newLocalIP)
 
+	// The client v6 follows the v4 assignment (pool-prefix | v4-uint32), so a
+	// v4 reassignment implies a v6 one when dual-stack is live.
+	t.updateLocalIP6(link)
+
 	// AddrDel above flushes every route bound to the old source/link, so re-add
 	// the tracked route set idempotently (RouteReplace, same as 27109a3) to
 	// restore the default route and any split-tunnel routes. The server-bypass
@@ -747,6 +1121,42 @@ func (t *TUNDevice) UpdateLocalIP(newLocalIP net.IP) error {
 	t.reAddRoutes(link, "IP change")
 
 	return nil
+}
+
+// updateLocalIP6 swaps the tunnel v6 address after the v4 local IP changed.
+// The exit assigns client v6 as pool-prefix | client-v4-uint32, so the new v6
+// is derived from the previous v6 address and the new v4 (deriveClientIP6).
+// No-op when dual-stack is not live or the derived address is unchanged.
+//
+// Both the delete and the add go through the recorded address form
+// (v6PeerForm) with the other form as a retry: on a kernel that rejected the
+// v6 peer, EnableDualStack installed the /64 fallback, and a peer-form delete
+// silently matches nothing — the stale address then survives the lease change
+// and the fresh add collides with it.
+func (t *TUNDevice) updateLocalIP6(link netlink.Link) {
+	if !t.v6Enabled {
+		return
+	}
+	newIP6 := deriveClientIP6(t.localIP6, t.localIP)
+	if newIP6 == nil || newIP6.Equal(t.localIP6) {
+		return
+	}
+	if err := t.delV6Addr(link, t.localIP6); err != nil {
+		log.Debug("Failed to delete old v6 addr %s: %v", t.localIP6, err)
+	}
+	peerForm, err := t.setV6Addr(link, newIP6)
+	if err != nil {
+		// Neither address form was accepted. The v6 half-defaults still point
+		// into the TUN, so leaving them up black-holes every IPv6 flow behind
+		// an interface with no usable address. Tear the v6 side down and keep
+		// the session IPv4-only instead.
+		log.Warn("Failed to update v6 local IP to %s: %v, disabling IPv6 on %s", newIP6, err, t.name)
+		t.DisableIPv6()
+		return
+	}
+	t.v6PeerForm = peerForm
+	t.localIP6 = newIP6
+	log.Info("TUN device %s local IPv6 updated to %s", t.name, newIP6)
 }
 
 // linkHasAddr reports whether the link already carries ip as an IPv4 address.
@@ -776,16 +1186,17 @@ func ifnamePad(name string) []byte {
 	return b
 }
 
-// mssRule builds the nftables expressions for a single MSS clamping rule.
-// It matches: oifname == ifName AND tcp AND tcp flags SYN (SYN|RST mask) AND sets MSS.
-func mssRule(ifName string, mtu int) []expr.Any {
-	mss := uint16(mtu - 40)
+// mssRuleExprs builds the nftables expressions for a single MSS clamping rule.
+// It matches: ifKey (oifname/iifname) == ifName AND tcp AND tcp flags SYN
+// (SYN|RST mask) AND sets MSS. The same expressions work in an ip (v4) or ip6
+// family table; only the clamped value differs (v6 base header is 40 bytes).
+func mssRuleExprs(ifKey expr.MetaKey, ifName string, mss uint16) []expr.Any {
 	mssBE := make([]byte, 2)
 	binary.BigEndian.PutUint16(mssBE, mss)
 
 	return []expr.Any{
-		// oifname == ifName
-		&expr.Meta{Key: expr.MetaKeyOIFNAME, Register: 1},
+		// oifname/iifname == ifName
+		&expr.Meta{Key: ifKey, Register: 1},
 		&expr.Cmp{
 			Op:       expr.CmpOpEq,
 			Register: 1,
@@ -838,6 +1249,17 @@ func mssRule(ifName string, mtu int) []expr.Any {
 	}
 }
 
+// mssRule builds the nftables expressions for a single MSS clamping rule.
+// It matches: oifname == ifName AND tcp AND tcp flags SYN (SYN|RST mask) AND sets MSS.
+func mssRule(ifName string, mtu int) []expr.Any {
+	return mssRuleExprs(expr.MetaKeyOIFNAME, ifName, uint16(mtu-40))
+}
+
+// mssRuleIIF is like mssRule but matches iifname (inbound).
+func mssRuleIIF(ifName string, mtu int) []expr.Any {
+	return mssRuleExprs(expr.MetaKeyIIFNAME, ifName, uint16(mtu-40))
+}
+
 // addMSSClamping installs nftables rules for TCP MSS clamping on ifName.
 // Creates a per-interface table mssTableName(ifName) (IPv4, filter/forward/
 // mangle priority) with two rules: one matching outbound (oifname) and one
@@ -887,55 +1309,57 @@ func addMSSClamping(ifName string, mtu int) error {
 	return nil
 }
 
-// mssRuleIIF is like mssRule but matches iifname (inbound).
-func mssRuleIIF(ifName string, mtu int) []expr.Any {
-	mss := uint16(mtu - 40)
-	mssBE := make([]byte, 2)
-	binary.BigEndian.PutUint16(mssBE, mss)
-
-	return []expr.Any{
-		&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
-		&expr.Cmp{
-			Op:       expr.CmpOpEq,
-			Register: 1,
-			Data:     ifnamePad(ifName),
-		},
-		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
-		&expr.Cmp{
-			Op:       expr.CmpOpEq,
-			Register: 1,
-			Data:     []byte{unix.IPPROTO_TCP},
-		},
-		&expr.Payload{
-			DestRegister: 1,
-			Base:         expr.PayloadBaseTransportHeader,
-			Offset:       13,
-			Len:          1,
-		},
-		&expr.Bitwise{
-			DestRegister:   1,
-			SourceRegister: 1,
-			Len:            1,
-			Mask:           []byte{0x06},
-			Xor:            []byte{0x00},
-		},
-		&expr.Cmp{
-			Op:       expr.CmpOpEq,
-			Register: 1,
-			Data:     []byte{0x02},
-		},
-		&expr.Immediate{
-			Register: 1,
-			Data:     mssBE,
-		},
-		&expr.Exthdr{
-			SourceRegister: 1,
-			Type:           2,
-			Offset:         2,
-			Len:            2,
-			Op:             expr.ExthdrOpTcpopt,
-		},
+// addMSSClampingV6 is the ip6-family counterpart of addMSSClamping, installed
+// only when dual-stack is negotiated (EnableDualStack). Same table name and
+// chain structure as the v4 clamp — nftables tables are namespaced per
+// family, so the two coexist and are torn down independently. The clamped
+// value is mtu-60: the v6 base header is 40 bytes (vs 20 for v4), keeping the
+// same "MTU minus L3+L4 headers" logic as the v4 mtu-40.
+// Non-fatal: logs a warning and returns nil if nftables is unavailable.
+func addMSSClampingV6(ifName string, mtu int) error {
+	conn, err := nftables.New()
+	if err != nil {
+		log.Warn("nftables unavailable, skipping IPv6 MSS clamping: %v", err)
+		return nil
 	}
+
+	tbl := conn.AddTable(&nftables.Table{
+		Family: nftables.TableFamilyIPv6,
+		Name:   mssTableName(ifName),
+	})
+
+	chain := conn.AddChain(&nftables.Chain{
+		Name:     "mssclamping",
+		Table:    tbl,
+		Type:     nftables.ChainTypeFilter,
+		Hooknum:  nftables.ChainHookForward,
+		Priority: nftables.ChainPriorityMangle,
+		Policy:   chainPolicyAcceptPtr(),
+	})
+
+	mss := uint16(mtu - 60)
+
+	// outbound: oifname == ifName
+	conn.AddRule(&nftables.Rule{
+		Table: tbl,
+		Chain: chain,
+		Exprs: mssRuleExprs(expr.MetaKeyOIFNAME, ifName, mss),
+	})
+
+	// inbound: iifname == ifName
+	conn.AddRule(&nftables.Rule{
+		Table: tbl,
+		Chain: chain,
+		Exprs: mssRuleExprs(expr.MetaKeyIIFNAME, ifName, mss),
+	})
+
+	if err := conn.Flush(); err != nil {
+		log.Warn("Failed to flush nftables IPv6 MSS clamping rules: %v", err)
+		return nil
+	}
+
+	log.Debug("nftables IPv6 MSS clamping installed for %s (MSS=%d)", ifName, mtu-60)
+	return nil
 }
 
 // chainPolicyAcceptPtr returns a pointer to ChainPolicyAccept, as required by the nftables API.
@@ -966,5 +1390,30 @@ func removeMSSClamping(ifName string) error {
 	}
 
 	log.Debug("nftables MSS clamping table %q removed", mssTableName(ifName))
+	return nil
+}
+
+// removeMSSClampingV6 deletes this interface's ip6-family MSS clamping table.
+// Called only when the table was installed (v6Enabled), so the v4-only path
+// never issues a delete for a table that cannot exist.
+// Non-fatal: logs a warning and returns nil if the operation fails.
+func removeMSSClampingV6(ifName string) error {
+	conn, err := nftables.New()
+	if err != nil {
+		log.Warn("nftables unavailable, cannot remove IPv6 MSS clamping: %v", err)
+		return nil
+	}
+
+	conn.DelTable(&nftables.Table{
+		Family: nftables.TableFamilyIPv6,
+		Name:   mssTableName(ifName),
+	})
+
+	if err := conn.Flush(); err != nil {
+		log.Warn("Failed to remove nftables IPv6 MSS clamping table: %v", err)
+		return nil
+	}
+
+	log.Debug("nftables IPv6 MSS clamping table %q removed", mssTableName(ifName))
 	return nil
 }

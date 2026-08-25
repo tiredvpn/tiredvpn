@@ -11,6 +11,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	mrand "math/rand/v2"
@@ -327,6 +328,15 @@ type Config struct {
 	IPPoolNetwork   string        // CIDR range, e.g., "10.8.0.0/24"
 	IPPoolLeaseTime time.Duration // Lease duration (0 = permanent)
 
+	// IPPoolV6 is the IPv6 prefix for TUN dual-stack clients, e.g.
+	// "fd00:10:8::/64". When set, the pool derives per-client v6 addresses
+	// (prefix with the client v4 in the low 32 bits, server at prefix::1),
+	// the shared TUN and dispatcher route v6 downlink traffic, and NAT66
+	// masquerades the prefix on the WAN. A client handshaking with version
+	// >= 0x04 gets the dual-stack flag and a trailing
+	// [serverIP6:16][clientIP6:16] block in its handshake response.
+	IPPoolV6 string
+
 	// Port hopping (multi-port listening)
 	PortRange         string        // Single port ("995") or range ("47000-47100")
 	PortRangeMaxPorts int           // Maximum number of ports to open (default: 50)
@@ -466,6 +476,15 @@ func Run(cfg *Config) error {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
+			// handleShutdownSignal closes the listener, after which Accept
+			// fails forever: without this the loop would spin on continue at
+			// full CPU until the process is killed. A closed listener is the
+			// only clean way out of Run, so it is also the only path that
+			// returns nil.
+			if errors.Is(err, net.ErrClosed) {
+				log.Info("Listener closed, server stopped accepting connections")
+				return nil
+			}
 			log.Debug("Accept error: %v", err)
 			continue
 		}
@@ -577,6 +596,7 @@ func initIPPool(cfg *Config, srvCtx *serverContext) error {
 		Network:   cfg.IPPoolNetwork,
 		ServerIP:  cfg.TunIP.String(),
 		LeaseTime: cfg.IPPoolLeaseTime,
+		NetworkV6: cfg.IPPoolV6,
 		KeyPrefix: cfg.RedisPrefix,
 	}, redisClient)
 	if err != nil {
@@ -595,7 +615,11 @@ func initIPPool(cfg *Config, srvCtx *serverContext) error {
 	if tunName == "" {
 		tunName = "tiredvpn0"
 	}
-	sharedTUN, err := NewSharedTUN(tunName, cfg.TunIP, network, resolveTunMTU(cfg), 0)
+	var v6m *IPv6Metrics
+	if srvCtx.metrics != nil {
+		v6m = srvCtx.metrics.ipv6Metrics
+	}
+	sharedTUN, err := NewSharedTUN(tunName, cfg.TunIP, network, resolveTunMTU(cfg), 0, pool, v6m)
 	if err != nil {
 		return fmt.Errorf("failed to create shared TUN: %w", err)
 	}
@@ -609,6 +633,15 @@ func initIPPool(cfg *Config, srvCtx *serverContext) error {
 	// Docker entrypoint warn-and-continue behavior this replaces.
 	if err := tun.SetupServerNAT(cfg.IPPoolNetwork, os.Getenv("TIREDVPN_WAN_IFACE")); err != nil {
 		log.Warn("NAT auto-config failed: %v", err)
+	}
+
+	// Dual-stack: NAT66 for the ULA pool plus a sanity check that the box can
+	// actually reach the v6 internet. Both warn-and-continue, same as v4 NAT.
+	if pool.DualStack() {
+		if err := tun.SetupServerNAT6(cfg.IPPoolV6, os.Getenv("TIREDVPN_WAN_IFACE")); err != nil {
+			log.Warn("NAT66 auto-config failed: %v", err)
+		}
+		warnIfNoGlobalIPv6Uplink()
 	}
 
 	return nil
@@ -2267,11 +2300,12 @@ func handleMorphTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverConte
 		}()
 	}
 
-	// Send success response via morph packet: [dataLen:4][paddingLen:2][status:1][serverIP:4][clientIP:4]
-	respData := make([]byte, 9)
-	respData[0] = 0x00 // Success
-	copy(respData[1:5], serverIP.To4())
-	copy(respData[5:9], clientIP.To4())
+	// Send success response via morph packet: [dataLen:4][paddingLen:2][payload][padding]
+	// Local exit: v6 addrs from our pool. Relay: v6 addrs assigned by the
+	// upstream exit (absent when the exit did not negotiate dual-stack).
+	dual := downstreamDualStackAddrs(sink, cfg.IPPoolV6, clientIP)
+	respData := buildTUNHandshakeResponse(clientVersion, serverIP, clientIP, tunHandshakeCaps{}, dual)
+	recordDualStackSession(srvCtx, clientVersion, dual)
 
 	padLen := 30
 	resp := make([]byte, 6+len(respData)+padLen)
@@ -2927,13 +2961,13 @@ func handleConfusionTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverC
 		}()
 	}
 
-	// Send success response with length prefix: [length:4][status:1][serverIP:4][clientIP:4]
-	// Confusion protocol uses length-prefixed frames for all data after "TIRED" magic
-	resp := make([]byte, 13)                 // 4 bytes length + 9 bytes data
-	binary.BigEndian.PutUint32(resp[0:4], 9) // length = 9
-	resp[4] = 0x00                           // Success
-	copy(resp[5:9], serverIP.To4())
-	copy(resp[9:13], clientIP.To4())
+	// Send success response with length prefix: [length:4][payload]
+	// Confusion protocol uses length-prefixed frames for all data after "TIRED" magic.
+	// Local exit: v6 addrs from our pool. Relay: v6 addrs assigned by the
+	// upstream exit (absent when the exit did not negotiate dual-stack).
+	dual := downstreamDualStackAddrs(sink, cfg.IPPoolV6, clientIP)
+	resp := frameConfusionTUNResponse(buildTUNHandshakeResponse(clientVersion, serverIP, clientIP, tunHandshakeCaps{}, dual))
+	recordDualStackSession(srvCtx, clientVersion, dual)
 	if err := writeConfusionFrame(resp); err != nil {
 		logger.Debug("Confusion TUN handshake response write failed: %v", err)
 		return
@@ -3279,95 +3313,32 @@ func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger
 
 	serverIP := cfg.TunIP
 
-	// Build response based on client version
-	// Legacy (9 bytes): [status:1][serverIP:4][clientIP:4]
-	// Extended v1 (14 bytes): [status:1][serverIP:4][clientIP:4][flags:1][portStart:2][portEnd:2]
-	// Extended v2 (20+ bytes): [status:1][serverIP:4][clientIP:4][flags:1][portStart:2][portEnd:2][hopInterval:4][strategy:1][seedLen:1][seed:0-32]
+	// Build response based on client version via the shared constructor
+	// (buildTUNHandshakeResponse covers the legacy/v1/v2/flags-only layouts and
+	// the v0x04 dual-stack block).
 	//
 	// Auto-MTU: a v3 client understands the active probe. As the terminating exit
 	// (no upstream relay - that branch returned earlier) we always echo probe
 	// frames, so advertise the capability via the flags byte (bit 0x02).
-	var probeFlags byte
-	if clientVersion >= 0x03 {
-		probeFlags = tun.ProbeCapFlag
-	}
-	var resp []byte
-	if clientVersion >= 0x01 && cfg.PortRange != "" {
+	caps := tunHandshakeCaps{mtuProbe: true}
+	if cfg.PortRange != "" {
 		// Get port range bounds for extended response
 		portStart, portEnd := getPortRangeBounds(cfg.PortRange)
 		if portStart > 0 && portEnd > portStart {
-			// Check if client supports v2 (full port hop config)
-			if clientVersion >= 0x02 {
-				// Prepare extended v2 response
-				seedBytes := []byte(cfg.PortHopSeed)
-				if len(seedBytes) > 32 {
-					seedBytes = seedBytes[:32]
-				}
-				respLen := 20 + len(seedBytes)
-				resp = make([]byte, respLen)
-				resp[0] = 0x00 // Success
-				copy(resp[1:5], serverIP.To4())
-				copy(resp[5:9], clientIP.To4())
-				resp[9] = 0x01 | probeFlags // flags: port hopping available (+ auto-MTU)
-				binary.BigEndian.PutUint16(resp[10:12], uint16(portStart))
-				binary.BigEndian.PutUint16(resp[12:14], uint16(portEnd))
-
-				// Hop interval in seconds (default 60)
-				hopInterval := int(cfg.PortHopInterval.Seconds())
-				if hopInterval <= 0 {
-					hopInterval = 60
-				}
-				binary.BigEndian.PutUint32(resp[14:18], uint32(hopInterval))
-
-				// Strategy byte: 0=random, 1=sequential, 2=fibonacci
-				switch cfg.PortHopStrategy {
-				case "sequential":
-					resp[18] = 0x01
-				case "fibonacci":
-					resp[18] = 0x02
-				default:
-					resp[18] = 0x00 // random
-				}
-
-				// Seed
-				resp[19] = byte(len(seedBytes))
-				if len(seedBytes) > 0 {
-					copy(resp[20:], seedBytes)
-				}
-
-				logger.Info("Sending v2 extended response with port hopping: %d-%d, interval=%ds, strategy=%s, seed_len=%d",
-					portStart, portEnd, hopInterval, cfg.PortHopStrategy, len(seedBytes))
-			} else {
-				// v1 response (backward compatible)
-				resp = make([]byte, 14)
-				resp[0] = 0x00 // Success
-				copy(resp[1:5], serverIP.To4())
-				copy(resp[5:9], clientIP.To4())
-				resp[9] = 0x01 | probeFlags // flags: port hopping available (+ auto-MTU)
-				binary.BigEndian.PutUint16(resp[10:12], uint16(portStart))
-				binary.BigEndian.PutUint16(resp[12:14], uint16(portEnd))
-				logger.Info("Sending v1 extended response with port hopping: %d-%d", portStart, portEnd)
-			}
+			caps.portHopping = true
+			caps.portStart, caps.portEnd = portStart, portEnd
+			caps.hopInterval = int(cfg.PortHopInterval.Seconds())
+			caps.hopStrategy = portHopStrategyByte(cfg.PortHopStrategy)
+			caps.hopSeed = []byte(cfg.PortHopSeed)
+			logger.Info("Advertising port hopping: %d-%d, interval=%ds, strategy=%s, seed_len=%d",
+				portStart, portEnd, caps.hopInterval, cfg.PortHopStrategy, len(caps.hopSeed))
 		}
 	}
-
-	// v3 client without a port-hop extended response still needs the flags byte to
-	// carry the auto-MTU probe capability: emit a 10-byte response.
-	if resp == nil && probeFlags != 0 {
-		resp = make([]byte, 10)
-		resp[0] = 0x00 // Success
-		copy(resp[1:5], serverIP.To4())
-		copy(resp[5:9], clientIP.To4())
-		resp[9] = probeFlags
-		logger.Debug("Sending v3 response advertising auto-MTU probe capability")
-	}
-
-	// Fallback to legacy response
-	if resp == nil {
-		resp = make([]byte, 9)
-		resp[0] = 0x00 // Success
-		copy(resp[1:5], serverIP.To4())
-		copy(resp[5:9], clientIP.To4())
+	dual := deriveDualStackAddrs(cfg.IPPoolV6, clientIP)
+	resp := buildTUNHandshakeResponse(clientVersion, serverIP, clientIP, caps, dual)
+	recordDualStackSession(srvCtx, clientVersion, dual)
+	if dual != nil && clientVersion >= tunClientVersionDualStack {
+		logger.Info("Advertising dual-stack: server6=%s client6=%s", dual.ServerIP6, dual.ClientIP6)
 	}
 
 	if _, err := conn.Write(resp); err != nil {
@@ -3492,6 +3463,13 @@ func relayTUNToUpstream(conn net.Conn, srvCtx *serverContext, logger *log.Logger
 		origin = originOf(conn.RemoteAddr())
 	}
 
+	// The client's handshake version travels upstream verbatim, so it is also
+	// what the exit answered; keep it for the dual-stack accounting below.
+	clientVersion := byte(0x00)
+	if len(handshake) >= 7 {
+		clientVersion = handshake[6]
+	}
+
 	dialCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	upstreamConn, resp, err := srvCtx.upstreamDialer.DialTUN(dialCtx, handshake, origin)
 	cancel()
@@ -3510,6 +3488,14 @@ func relayTUNToUpstream(conn net.Conn, srvCtx *serverContext, logger *log.Logger
 		logger.Debug("Relay: failed to send handshake response to client: %v", err)
 		return
 	}
+
+	// Account the dual-stack session here too. Unlike the morph/confusion/h2/
+	// polling relay paths, this one never builds a response of its own (it is
+	// the plain hop-to-hop path and forwards the exit's bytes verbatim), so
+	// without this call the counter misses exactly the path that carries most
+	// relayed traffic. Counted after the write succeeded: the session only
+	// exists once the client has the addresses.
+	recordRelayedDualStackSession(srvCtx, clientVersion, resp)
 
 	logger.Info("Relay TUN bridge established (client=%s, upstream-assigned=%s)",
 		conn.RemoteAddr(), net.IP(resp[5:9]))
@@ -3826,11 +3812,12 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 	h2Conn.clientIP = clientIP
 	tunnel.targetConn = h2Conn // Mark as TUN mode
 
-	// Send success response: [status:1][serverIP:4][clientIP:4]
-	resp := make([]byte, 9)
-	resp[0] = 0x00 // Success
-	copy(resp[1:5], serverIP.To4())
-	copy(resp[5:9], clientIP.To4())
+	// Send success response: shared-constructor payload sent as raw stego data.
+	// Local exit: v6 addrs from our pool. Relay: v6 addrs assigned by the
+	// upstream exit (absent when the exit did not negotiate dual-stack).
+	dual := downstreamDualStackAddrs(tunnel.sink, cfg.IPPoolV6, clientIP)
+	resp := buildTUNHandshakeResponse(clientVersion, serverIP, clientIP, tunHandshakeCaps{}, dual)
+	recordDualStackSession(srvCtx, clientVersion, dual)
 	sendStegoResponse(framer, tunnel.streamID, resp, cfg)
 
 	logger.Info("H2 TUN mode established (client=%s, server=%s)", clientIP, serverIP)
@@ -5024,11 +5011,12 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 		}()
 	}
 
-	// Send success response: [status:1][serverIP:4][clientIP:4]
-	resp := make([]byte, 9)
-	resp[0] = 0x00 // Success
-	copy(resp[1:5], serverIP.To4())
-	copy(resp[5:9], clientIP.To4())
+	// Send success response: shared-constructor payload written to the polling
+	// buffer. Local exit: v6 addrs from our pool. Relay: v6 addrs assigned by
+	// the upstream exit (absent when the exit did not negotiate dual-stack).
+	dual := downstreamDualStackAddrs(sink, cfg.IPPoolV6, clientIP)
+	resp := buildTUNHandshakeResponse(clientVersion, serverIP, clientIP, tunHandshakeCaps{}, dual)
+	recordDualStackSession(srvCtx, clientVersion, dual)
 	sess.WriteToClient(resp)
 
 	logger.Info("HTTP Polling TUN mode established (client=%s, server=%s)", clientIP, serverIP)

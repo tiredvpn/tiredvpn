@@ -15,3 +15,12 @@ func SetupServerNAT(pool string, wanOverride string) error {
 	}
 	return fmt.Errorf("server TUN mode NAT auto-config is only supported on Linux")
 }
+
+// SetupServerNAT6 is the NAT66 twin of SetupServerNAT; Linux-only for the
+// same reasons (nftables/netlink).
+func SetupServerNAT6(pool string, wanOverride string) error {
+	if pool == "" {
+		return nil
+	}
+	return fmt.Errorf("server TUN mode NAT66 auto-config is only supported on Linux")
+}

@@ -66,8 +66,91 @@ type TUNDevice struct {
 	remoteIP  net.IP
 	routes    []string
 
+	// Dual-stack state: dualStack is the client's intent (SetDualStack);
+	// v6Enabled/localIP6/remoteIP6 are set once EnableDualStack installed the
+	// negotiated v6 address and half-default routes.
+	dualStack bool
+	v6Enabled bool
+	localIP6  net.IP
+	remoteIP6 net.IP
+
 	writeMu sync.Mutex
 	readBuf []byte
+}
+
+// SetDualStack records the client's intent to negotiate IPv6 inside the
+// tunnel. On macOS there is no disable_ipv6 sysctl to flip in Configure, so
+// this only gates the post-handshake EnableDualStack.
+func (t *TUNDevice) SetDualStack(dual bool) {
+	t.dualStack = dual
+}
+
+// EnableDualStack assigns the negotiated v6 point-to-point address and
+// installs the two v6 half-default routes (::/1, 8000::/1) into the utun.
+// The split default outranks RA-learned ::/0 on prefix length without
+// touching the host's real default route. Mirrors the v4
+// `ifconfig inet local remote` + `route add -net` pattern in Configure.
+//
+// Idempotent: the utun outlives a reconnect, so the routes are usually
+// already installed and `route add` fails with EEXIST ("File exists"). That
+// used to surface as an EnableDualStack error, whose caller responds with
+// DisableIPv6 — every reconnect tore down a perfectly good IPv6 and the next
+// one brought it back. `route change` refreshes an existing route in place,
+// with no window in which the route is missing (the v4 path solves the same
+// problem by ignoring route errors outright, and Linux by using RouteReplace).
+func (t *TUNDevice) EnableDualStack(clientIP6, serverIP6 net.IP) error {
+	if _, _, _, err := dualStackAddrPlan(clientIP6, serverIP6); err != nil {
+		return err
+	}
+	if err := runIfconfig(t.name, "inet6", clientIP6.String(), serverIP6.String(),
+		"prefixlen", "128"); err != nil {
+		return fmt.Errorf("ifconfig inet6: %w", err)
+	}
+
+	// Publish the state as soon as the address is on the link and before the
+	// routes go in. Everything below can fail, and the caller's fallback is
+	// DisableIPv6, whose guard is v6Enabled: recording late left a failed
+	// second route install with the address and the first half-default
+	// stranded on the interface.
+	t.localIP6 = clientIP6
+	t.remoteIP6 = serverIP6
+	t.v6Enabled = true
+
+	for _, r := range dualStackRouteCIDRs {
+		if err := runRoute("add", "-inet6", r, "-iface", t.name); err == nil {
+			continue
+		}
+		if err := runRoute("change", "-inet6", r, "-iface", t.name); err != nil {
+			return fmt.Errorf("route add/change -inet6 %s: %w", r, err)
+		}
+	}
+
+	log.Info("utun %s dual-stack enabled: local=%s, peer=%s, routes=%v",
+		t.name, clientIP6, serverIP6, dualStackRouteCIDRs)
+	return nil
+}
+
+// DisableIPv6 undoes EnableDualStack (v6 routes and address) when the exit
+// declined dual-stack. macOS has no per-interface disable_ipv6 sysctl; a utun
+// without an inet6 address carries no IPv6, so removing what we added is
+// sufficient.
+func (t *TUNDevice) DisableIPv6() {
+	if !t.v6Enabled {
+		return
+	}
+	for _, r := range dualStackRouteCIDRs {
+		if err := runRoute("delete", "-inet6", r, "-iface", t.name); err != nil {
+			log.Debug("route delete -inet6 %s failed: %v", r, err)
+		}
+	}
+	if t.localIP6 != nil {
+		if err := runIfconfig(t.name, "inet6", t.localIP6.String(), "-alias"); err != nil {
+			log.Debug("ifconfig inet6 -alias failed: %v", err)
+		}
+	}
+	t.localIP6 = nil
+	t.remoteIP6 = nil
+	t.v6Enabled = false
 }
 
 // MTU returns the current effective interface MTU (atomic read).
@@ -215,6 +298,17 @@ func (t *TUNDevice) SetReadDeadline(deadline time.Time) error {
 // (vpn.go) compile.
 func (t *TUNDevice) SetServerBypassIP(net.IP) {}
 
+// SetServerBypassIP6 is a no-op on macOS, for the same reason as
+// SetServerBypassIP. Note the exposure this leaves: with -prefer-ipv6 and a
+// negotiated dual-stack tunnel, the ::/1 + 8000::/1 half-defaults installed by
+// EnableDualStack also cover the client's own IPv6 transport socket, so the
+// CLI/utun path on macOS loops its server traffic into the tunnel. Fixing it
+// needs the scutil/route bypass the v4 side does not have either, so both
+// families stay unimplemented together rather than half-done. The
+// NetworkExtension path is unaffected: the host owns routing there and
+// excludes the tunnel's own socket.
+func (t *TUNDevice) SetServerBypassIP6(net.IP) {}
+
 // EnsureServerBypass is a no-op on macOS; see SetServerBypassIP.
 func (t *TUNDevice) EnsureServerBypass() {}
 
@@ -265,7 +359,7 @@ func (t *TUNDevice) Configure(localIP, remoteIP net.IP, routes []string) error {
 
 // ConfigureSubnet — point-to-multipoint mode. Used by the server flow; the
 // macOS client never runs as a server so we just refuse loudly to catch misuse.
-func (t *TUNDevice) ConfigureSubnet(localIP net.IP, network *net.IPNet) error {
+func (t *TUNDevice) ConfigureSubnet(localIP net.IP, network *net.IPNet, serverIP6 *net.IPNet) error {
 	return fmt.Errorf("ConfigureSubnet not supported on darwin (server-only API)")
 }
 

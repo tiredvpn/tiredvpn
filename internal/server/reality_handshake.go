@@ -285,6 +285,17 @@ func removeExtensionByType(extensions []byte, targetType uint16) []byte {
 		extType := binary.BigEndian.Uint16(extensions[offset:])
 		extLen := int(binary.BigEndian.Uint16(extensions[offset+2:]))
 
+		// An extension may declare more body than the buffer holds: the outer
+		// extensions-length field is checked by the caller, but nothing
+		// validates the individual ones. Slicing on that length panicked, and
+		// this runs on unauthenticated input (handleREALITYUnauthorized), with
+		// no recover() anywhere on the path - one crafted ClientHello took the
+		// process down. Stop the walk instead, the same way
+		// findREALITYExtension does.
+		if extLen > len(extensions)-offset-4 {
+			break
+		}
+
 		if extType != targetType {
 			// Keep this extension
 			result.Write(extensions[offset : offset+4+extLen])

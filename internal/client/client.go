@@ -58,6 +58,11 @@ type Config struct {
 	TunRoutes string
 	AutoMTU   bool // active end-to-end MTU probe; TunMTU becomes the upper bound (cap)
 
+	// TunIPv6Policy is the -tun-ipv6 value ("off" default, "dual" to route
+	// IPv6 through the tunnel when the exit negotiates dual-stack). Parsed
+	// via tun.ParseIPv6Policy in runTUNMode.
+	TunIPv6Policy string
+
 	// Host-supplied TUN integration (Android VpnService / macOS NetworkExtension).
 	// In both modes the TUN fd is created by the host and passed in via TunFd;
 	// the host (not Go) also owns route/DNS/firewall setup.
@@ -270,8 +275,13 @@ func buildManager(cfg *Config, secret string) (*strategy.Manager, error) {
 	mgr := strategy.NewDefaultManager(mgrCfg)
 
 	connectivityChecker := strategy.NewConnectivityChecker(cfg.ServerAddr, 3*time.Second, cfg.AndroidMode || cfg.MacOSMode)
+	// With both families configured the gate must accept either, or a client
+	// whose IPv4 is blocked (and whose IPv6 transport works fine) never gets
+	// past "waiting for network" - the manager dials v6 while the gate probes
+	// the dead v4.
+	connectivityChecker.SetAltAddr(cfg.ServerAddrV6)
 	mgr.SetConnectivityChecker(connectivityChecker)
-	log.Debug("Connectivity checker initialized for %s", cfg.ServerAddr)
+	log.Debug("Connectivity checker initialized for %s (alt=%q)", cfg.ServerAddr, cfg.ServerAddrV6)
 
 	if cfg.StrategyName != "" {
 		log.Info("Forcing strategy: %s", cfg.StrategyName)
@@ -434,7 +444,11 @@ func runProbeAndServe(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal
 	log.Info("Available strategies: %d/%d", available, len(results))
 
 	reprobeCtx, reprobeCancel := context.WithCancel(context.Background())
-	mgr.StartPeriodicReprobe(reprobeCtx, cfg.ServerAddr)
+	// Reprobe the address the manager actually dials. Passing cfg.ServerAddr
+	// blindly re-probed IPv4 every interval on a client running over IPv6, so
+	// each round measured a path the tunnel does not use - and on a host whose
+	// IPv4 is blocked, measured nothing at all.
+	mgr.StartPeriodicReprobe(reprobeCtx, mgr.GetServerAddr(reprobeCtx))
 
 	if cfg.PortHoppingEnabled {
 		mgr.StartPortHopChecker(reprobeCtx)
@@ -465,6 +479,14 @@ func runControlSocketMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Si
 		}
 	}
 
+	// IPv6 inside the tunnel: -tun-ipv6 dual opts the control-socket path into
+	// the v0x04 dual-stack handshake, same policy parser as desktop TUN mode.
+	// Default off keeps the handshake byte-identical to pre-dual-stack cores.
+	dualStack, err := parseTunIPv6Policy(cfg.TunIPv6Policy)
+	if err != nil {
+		return err
+	}
+
 	// Create control server with connect function
 	ctrlCfg := &tun.ControlConfig{
 		ServerAddr: cfg.ServerAddr,
@@ -472,11 +494,12 @@ func runControlSocketMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Si
 		MTU:        cfg.TunMTU,
 		DNS:        "8.8.8.8", // Default DNS
 		Routes:     cfg.TunRoutes,
+		DualStack:  dualStack,
 
 		// ReconnectFn - called on network change (WiFi→LTE, cell handoff)
 		// Resets circuit breakers and uses optimized fast reconnect
 		// Must send TUN handshake with current IP so server knows this is a TUN session
-		ReconnectFn: func(ctx context.Context, currentIP net.IP, mtu int) (net.Conn, net.IP, net.IP, error) {
+		ReconnectFn: func(ctx context.Context, currentIP net.IP, mtu int) (tun.ReconnectResult, error) {
 			log.Info("Network change reconnect triggered (current IP: %s)", currentIP)
 
 			// Reset all circuit breakers and confidences - old network state is invalid
@@ -485,7 +508,7 @@ func runControlSocketMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Si
 			// Use optimized reconnect with shorter timeouts
 			conn, strat, err := mgr.ConnectForReconnect(ctx, cfg.ServerAddr)
 			if err != nil {
-				return nil, nil, nil, err
+				return tun.ReconnectResult{}, err
 			}
 
 			log.Info("Network change reconnect successful via %s, sending TUN handshake", strat.Name())
@@ -498,38 +521,21 @@ func runControlSocketMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Si
 
 			// Send TUN mode handshake with our current IP
 			// Server will recognize us and restore the session
-			handshake := make([]byte, 8)
-			handshake[0] = 0x02 // TUN mode
-			copy(handshake[1:5], currentIP.To4())
-			binary.BigEndian.PutUint16(handshake[5:7], uint16(mtu))
-			handshake[7] = 0x03 // Version 3: full port hopping config + auto-MTU probe
-
-			if _, err := conn.Write(handshake); err != nil {
-				conn.Close()
-				return nil, nil, nil, fmt.Errorf("handshake write failed: %w", err)
-			}
-
-			// Read response (up to 64 bytes for extended v2 with port hopping config)
-			// Minimum 9 bytes: [status:1][serverIP:4][clientIP:4]
-			resp := make([]byte, 64)
-			n, err := io.ReadAtLeast(conn, resp, 9)
+			serverIP, assignedIP, serverIP6, assignedIP6, err := sendReconnectHandshake(conn, currentIP, mtu, dualStack)
 			if err != nil {
 				conn.Close()
-				return nil, nil, nil, fmt.Errorf("handshake read failed: %w", err)
+				return tun.ReconnectResult{}, err
 			}
-			resp = resp[:n] // Trim to actual response size
-
-			if resp[0] != 0x00 {
-				conn.Close()
-				return nil, nil, nil, fmt.Errorf("server rejected reconnect: status=%d", resp[0])
-			}
-
-			serverIP := net.IP(resp[1:5])
-			assignedIP := net.IP(resp[5:9])
 
 			log.Info("Reconnect handshake complete (server: %s, assigned: %s)", serverIP, assignedIP)
 
-			return conn, serverIP, assignedIP, nil
+			return tun.ReconnectResult{
+				Conn:        conn,
+				ServerIP:    serverIP,
+				AssignedIP:  assignedIP,
+				ServerIP6:   serverIP6,
+				AssignedIP6: assignedIP6,
+			}, nil
 		},
 
 		// Connect function - connects to server, returns assigned IP
@@ -596,8 +602,100 @@ func runControlSocketMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Si
 	return nil
 }
 
+// parseTunIPv6Policy resolves the -tun-ipv6 flag value ("", "off", "dual")
+// to whether the dual-stack TUN handshake is enabled. An empty value means
+// the flag was never set and behaves like "off"; anything the shared policy
+// parser rejects is an error here too.
+func parseTunIPv6Policy(flagValue string) (bool, error) {
+	if flagValue == "" {
+		flagValue = "off"
+	}
+	policy, err := tun.ParseIPv6Policy(flagValue)
+	if err != nil {
+		return false, err
+	}
+	return policy == tun.IPv6PolicyDual, nil
+}
+
+// sendReconnectHandshake performs the TUN mode handshake on a fresh reconnect
+// connection, sending the client's current IP so the server can restore the
+// session. dualStack selects the version byte: v0x04 when -tun-ipv6 dual is
+// active (re-negotiating IPv6 on reconnect too), otherwise the historical
+// v0x03.
+//
+// serverIP6/assignedIP6 carry the re-negotiated dual-stack pair and are both
+// nil when the exit did not offer IPv6 on this reconnect. The caller has to
+// propagate them: the exit derives the client v6 from the v4 lease, so a new
+// v4 silently implies a new v6, and a host-owned interface cannot recompute it.
+func sendReconnectHandshake(conn net.Conn, currentIP net.IP, mtu int, dualStack bool) (serverIP, assignedIP, serverIP6, assignedIP6 net.IP, err error) {
+	version := byte(0x03) // Version 3: full port hopping config + auto-MTU probe
+	if dualStack {
+		version = 0x04 // Version 4: + dual-stack IPv6 negotiation
+	}
+	handshake := make([]byte, 8)
+	handshake[0] = 0x02 // TUN mode
+	copy(handshake[1:5], currentIP.To4())
+	binary.BigEndian.PutUint16(handshake[5:7], uint16(mtu))
+	handshake[7] = version
+
+	if _, err := conn.Write(handshake); err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("handshake write failed: %w", err)
+	}
+
+	// Read response (up to 64 bytes for extended v2 with port hopping config)
+	// Minimum 9 bytes: [status:1][serverIP:4][clientIP:4]
+	// The dual-stack path uses ReadTUNHandshakeResponse, which additionally
+	// drains the trailing 32-byte [serverIP6:16][clientIP6:16] block so the
+	// stream stays frame-aligned for the relay that follows.
+	var resp []byte
+	var n int
+	if dualStack {
+		resp, err = tun.ReadTUNHandshakeResponse(conn)
+		n = len(resp)
+	} else {
+		buf := make([]byte, 64)
+		n, err = io.ReadAtLeast(conn, buf, 9)
+		resp = buf[:n]
+	}
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("handshake read failed: %w", err)
+	}
+	if n < 9 {
+		return nil, nil, nil, nil, fmt.Errorf("handshake response too short: %d bytes", n)
+	}
+
+	if resp[0] != 0x00 {
+		return nil, nil, nil, nil, fmt.Errorf("server rejected reconnect: status=%d", resp[0])
+	}
+
+	serverIP = net.IP(resp[1:5])
+	assignedIP = net.IP(resp[5:9])
+
+	if dualStack {
+		if caps, ok := tun.ParseTUNHandshakeCapabilities(resp[:n]); ok && caps.DualStackEnabled {
+			serverIP6, assignedIP6 = caps.ServerIP6, caps.ClientIP6
+			log.Info("Reconnect re-negotiated dual-stack: client=%s server=%s", assignedIP6, serverIP6)
+		} else {
+			log.Warn("Dual-stack requested but the exit did not negotiate IPv6 on reconnect; continuing IPv4-only")
+		}
+	}
+
+	return serverIP, assignedIP, serverIP6, assignedIP6, nil
+}
+
 func runTUNMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) error {
 	log.Info("Starting TUN mode")
+
+	// IPv6 policy: off (default) keeps the tunnel v4-only; dual opts into the
+	// v0x04 dual-stack handshake. Empty means the flag was never set.
+	ipv6Policy := "off"
+	if cfg.TunIPv6Policy != "" {
+		ipv6Policy = cfg.TunIPv6Policy
+	}
+	policy, err := tun.ParseIPv6Policy(ipv6Policy)
+	if err != nil {
+		return err
+	}
 
 	// Parse routes
 	var routes []string
@@ -613,16 +711,21 @@ func runTUNMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) erro
 	}
 
 	vpnCfg := tun.VPNConfig{
-		TunName:     cfg.TunName,
-		MTU:         cfg.TunMTU,
-		LocalIP:     localIP,
-		RemoteIP:    net.ParseIP(cfg.TunPeerIP),
-		Routes:      routes,
-		ServerAddr:  cfg.ServerAddr,
-		Manager:     mgr,
-		AutoMTU:     cfg.AutoMTU,     // active end-to-end MTU probe
-		TunFd:       cfg.TunFd,       // Android VpnService TUN fd
-		ProtectPath: cfg.ProtectPath, // Android socket protection path
+		TunName:  cfg.TunName,
+		MTU:      cfg.TunMTU,
+		LocalIP:  localIP,
+		RemoteIP: net.ParseIP(cfg.TunPeerIP),
+		Routes:   routes,
+		// Both transport addresses: the v6 one is what -prefer-ipv6 makes the
+		// strategy manager dial, and a dual-stack tunnel's ::/1 + 8000::/1
+		// half-defaults would otherwise route that socket into the tunnel.
+		ServerAddr:   cfg.ServerAddr,
+		ServerAddrV6: cfg.ServerAddrV6,
+		Manager:      mgr,
+		AutoMTU:      cfg.AutoMTU, // active end-to-end MTU probe
+		DualStack:    policy == tun.IPv6PolicyDual,
+		TunFd:        cfg.TunFd,       // Android VpnService TUN fd
+		ProtectPath:  cfg.ProtectPath, // Android socket protection path
 	}
 
 	vpnClient, err := tun.NewVPNClient(vpnCfg)

@@ -31,13 +31,22 @@ type ControlResponse struct {
 	Error     string `json:"error,omitempty"`
 	IP        string `json:"ip,omitempty"`         // Assigned TUN IP
 	ServerIP  string `json:"server_ip,omitempty"`  // Server's TUN IP
-	DNS       string `json:"dns,omitempty"`        // DNS server
-	MTU       int    `json:"mtu,omitempty"`        // MTU value
-	Routes    string `json:"routes,omitempty"`     // Suggested routes
-	Connected bool   `json:"connected,omitempty"`  // Whether VPN is connected
-	Strategy  string `json:"strategy,omitempty"`   // Connection strategy name
-	LatencyMs int64  `json:"latency_ms,omitempty"` // Connection latency in ms
-	Attempts  int    `json:"attempts,omitempty"`   // Number of connection attempts
+	IP6       string `json:"ip6,omitempty"`        // Assigned TUN IPv6 (dual-stack only)
+	ServerIP6 string `json:"server_ip6,omitempty"` // Server's TUN IPv6 (dual-stack only)
+	// IPv6Removed reports that a reconnect renegotiated the session without
+	// dual-stack while the previous one had it. Absent (omitempty) on every
+	// other response, so the JSON contract stays additive: a host that does
+	// not know the field behaves exactly as before, and one that does can tear
+	// the v6 configuration down instead of leaving it pointed at an exit that
+	// no longer routes it.
+	IPv6Removed bool   `json:"ipv6_removed,omitempty"`
+	DNS         string `json:"dns,omitempty"`        // DNS server
+	MTU         int    `json:"mtu,omitempty"`        // MTU value
+	Routes      string `json:"routes,omitempty"`     // Suggested routes
+	Connected   bool   `json:"connected,omitempty"`  // Whether VPN is connected
+	Strategy    string `json:"strategy,omitempty"`   // Connection strategy name
+	LatencyMs   int64  `json:"latency_ms,omitempty"` // Connection latency in ms
+	Attempts    int    `json:"attempts,omitempty"`   // Number of connection attempts
 }
 
 // EventMessage represents asynchronous events from Go to Android
@@ -59,6 +68,8 @@ type ControlServer struct {
 	serverConn      net.Conn // Connection to VPN server
 	assignedIP      net.IP   // IP assigned by server
 	serverIP        net.IP   // Server's TUN IP
+	assignedIP6     net.IP   // IPv6 assigned by server (dual-stack only)
+	serverIP6       net.IP   // Server's TUN IPv6 (dual-stack only)
 	mtu             int
 	waitingForFd    bool
 	tunFdCh         chan int      // Channel to receive TUN fd
@@ -82,6 +93,29 @@ type ControlServer struct {
 	config *ControlConfig
 }
 
+// ReconnectResult is the outcome of a reconnect handshake performed by
+// ControlConfig.ReconnectFn.
+//
+// The reconnect re-runs the full handshake, so the exit may hand out a
+// different lease than the one the session started with — and because the
+// client's tunnel IPv6 is derived from its IPv4 (pool prefix | v4), a new v4
+// implies a new v6. It may also stop offering dual-stack altogether. Both have
+// to reach the host: a desktop TUN recomputes the v6 locally, but a host-owned
+// interface (Android VpnService, macOS NetworkExtension) cannot, and would
+// keep sending on an address the exit no longer routes.
+type ReconnectResult struct {
+	Conn       net.Conn
+	ServerIP   net.IP
+	AssignedIP net.IP
+
+	// ServerIP6 / AssignedIP6 carry the re-negotiated dual-stack addresses.
+	// Both nil means the exit answered without dual-stack on this reconnect,
+	// which the control server reports to the host so it can drop the v6
+	// configuration instead of black-holing on it.
+	ServerIP6   net.IP
+	AssignedIP6 net.IP
+}
+
 // ConnectionMetadata holds info about the last connection for Android UI
 type ConnectionMetadata struct {
 	Strategy  string
@@ -96,13 +130,20 @@ type ControlConfig struct {
 	MTU        int
 	DNS        string
 	Routes     string
+
+	// DualStack opts the TUN handshake into IPv6 dual-stack negotiation
+	// (version 0x04 instead of 0x03). Default false preserves the historical
+	// behavior byte-for-byte; when the exit does not negotiate dual-stack the
+	// response simply carries no IPv6 fields.
+	DualStack bool
+
 	ConnectFn  func(ctx context.Context) (assignedIP, serverIP net.IP, conn net.Conn, err error)
 	StartVPNFn func(tunFd int, localIP, remoteIP net.IP, conn net.Conn) error
 
-	// ReconnectFn is called on network change to re-establish connection
-	// It receives the current assigned IP to send in handshake
-	// Returns new server connection with handshake already done, plus new assigned IP
-	ReconnectFn func(ctx context.Context, currentIP net.IP, mtu int) (conn net.Conn, serverIP net.IP, assignedIP net.IP, err error)
+	// ReconnectFn is called on network change to re-establish connection.
+	// It receives the current assigned IP to send in handshake and returns a
+	// new server connection with the handshake already done.
+	ReconnectFn func(ctx context.Context, currentIP net.IP, mtu int) (ReconnectResult, error)
 
 	// GetConnectionInfoFn returns metadata about the last connection (for Android UI)
 	GetConnectionInfoFn func() ConnectionMetadata
@@ -253,12 +294,14 @@ func (cs *ControlServer) handleConnect(ctx context.Context) ControlResponse {
 	if cs.assignedIP != nil {
 		// Already connected, return existing config
 		return ControlResponse{
-			Status:   "waiting_fd",
-			IP:       cs.assignedIP.String(),
-			ServerIP: cs.serverIP.String(),
-			DNS:      cs.config.DNS,
-			MTU:      cs.mtu,
-			Routes:   cs.config.Routes,
+			Status:    "waiting_fd",
+			IP:        cs.assignedIP.String(),
+			ServerIP:  cs.serverIP.String(),
+			IP6:       ipString(cs.assignedIP6),
+			ServerIP6: ipString(cs.serverIP6),
+			DNS:       cs.config.DNS,
+			MTU:       cs.mtu,
+			Routes:    cs.config.Routes,
 		}
 	}
 
@@ -293,13 +336,24 @@ func (cs *ControlServer) handleConnect(ctx context.Context) ControlResponse {
 	log.Info("Connected to server, real IP: %s (placeholder was: %s), waiting for TUN fd", realAssignedIP, placeholderIP)
 
 	return ControlResponse{
-		Status:   "waiting_fd",
-		IP:       realAssignedIP.String(),
-		ServerIP: realServerIP.String(),
-		DNS:      cs.config.DNS,
-		MTU:      cs.mtu,
-		Routes:   cs.config.Routes,
+		Status:    "waiting_fd",
+		IP:        realAssignedIP.String(),
+		ServerIP:  realServerIP.String(),
+		IP6:       ipString(cs.assignedIP6),
+		ServerIP6: ipString(cs.serverIP6),
+		DNS:       cs.config.DNS,
+		MTU:       cs.mtu,
+		Routes:    cs.config.Routes,
 	}
+}
+
+// ipString renders an IP for a ControlResponse, mapping nil to "" so the
+// omitempty JSON field stays absent when dual-stack was not negotiated.
+func ipString(ip net.IP) string {
+	if ip == nil {
+		return ""
+	}
+	return ip.String()
 }
 
 // handleSetFdWithReceivedFd starts VPN with fd received via SCM_RIGHTS
@@ -394,6 +448,8 @@ func (cs *ControlServer) handleSetFdWithReceivedFd(ctx context.Context, fd int) 
 		Status:    "connected",
 		IP:        cs.assignedIP.String(),
 		ServerIP:  cs.serverIP.String(),
+		IP6:       ipString(cs.assignedIP6),
+		ServerIP6: ipString(cs.serverIP6),
 		Connected: true,
 	}
 	if cs.config.GetConnectionInfoFn != nil {
@@ -487,6 +543,8 @@ func (cs *ControlServer) hotSwapTunFdLocked(newFd int) ControlResponse {
 		Status:    "connected",
 		IP:        cs.assignedIP.String(),
 		ServerIP:  cs.serverIP.String(),
+		IP6:       ipString(cs.assignedIP6),
+		ServerIP6: ipString(cs.serverIP6),
 		Connected: true,
 	}
 	if cs.config.GetConnectionInfoFn != nil {
@@ -635,9 +693,13 @@ func (cs *ControlServer) handleReconnect(ctx context.Context, reason string, new
 		}
 	}
 
+	// ipv6Removed records that this reconnect ended a dual-stack session, so
+	// the response can tell the host to tear its v6 configuration down.
+	var ipv6Removed bool
+
 	// Use ReconnectFn if available (preferred - handles circuit breaker reset)
 	if cs.config.ReconnectFn != nil {
-		newConn, serverIP, assignedIP, err := cs.config.ReconnectFn(ctx, cs.assignedIP, cs.mtu)
+		res, err := cs.config.ReconnectFn(ctx, cs.assignedIP, cs.mtu)
 		if err != nil {
 			log.Error("Reconnect failed: %v", err)
 			clearReconnecting()
@@ -646,20 +708,35 @@ func (cs *ControlServer) handleReconnect(ctx context.Context, reason string, new
 				Error:  fmt.Sprintf("reconnect failed: %v", err),
 			}
 		}
-		cs.serverConn = newConn
-		cs.serverIP = serverIP
+		cs.serverConn = res.Conn
+		cs.serverIP = res.ServerIP
 		// Update assigned IP if server gave us a new one
-		if assignedIP != nil && !assignedIP.Equal(net.IPv4zero) {
-			if !assignedIP.Equal(cs.assignedIP) {
-				log.Info("Server assigned new IP: %s (was: %s)", assignedIP, cs.assignedIP)
-				cs.assignedIP = assignedIP
+		if res.AssignedIP != nil && !res.AssignedIP.Equal(net.IPv4zero) {
+			if !res.AssignedIP.Equal(cs.assignedIP) {
+				log.Info("Server assigned new IP: %s (was: %s)", res.AssignedIP, cs.assignedIP)
+				cs.assignedIP = res.AssignedIP
 				// Update TUN device with new local IP
 				if cs.tunDev != nil {
-					cs.tunDev.UpdateLocalIP(assignedIP)
+					cs.tunDev.UpdateLocalIP(res.AssignedIP)
 				}
 			}
 		}
-		log.Info("Reconnected successfully via ReconnectFn (server IP: %s, assigned: %s)", serverIP, cs.assignedIP)
+		// The exit re-runs the whole negotiation on a reconnect, so the v6
+		// pair can change with the v4 lease or disappear entirely. Track both
+		// here — this is the only place the host learns about it, and a stale
+		// v6 on the interface black-holes silently while IPv4 keeps working.
+		hadIPv6 := cs.assignedIP6 != nil
+		if !res.AssignedIP6.Equal(cs.assignedIP6) || !res.ServerIP6.Equal(cs.serverIP6) {
+			log.Info("Reconnect dual-stack addresses changed: client %s -> %s, server %s -> %s",
+				cs.assignedIP6, res.AssignedIP6, cs.serverIP6, res.ServerIP6)
+		}
+		cs.assignedIP6 = res.AssignedIP6
+		cs.serverIP6 = res.ServerIP6
+		ipv6Removed = hadIPv6 && cs.assignedIP6 == nil
+		if ipv6Removed {
+			log.Warn("Reconnect: the exit no longer offers dual-stack, dropping the tunnel's IPv6")
+		}
+		log.Info("Reconnected successfully via ReconnectFn (server IP: %s, assigned: %s)", res.ServerIP, cs.assignedIP)
 	} else {
 		// Fallback: use ConnectFn (less optimal - may need new IP)
 		assignedIP, serverIP, conn, err := cs.config.ConnectFn(ctx)
@@ -674,6 +751,12 @@ func (cs *ControlServer) handleReconnect(ctx context.Context, reason string, new
 		cs.serverConn = conn
 		cs.assignedIP = assignedIP
 		cs.serverIP = serverIP
+		// This path returns a connection without running a TUN handshake, so
+		// nothing renegotiated dual-stack. Drop any v6 we were holding rather
+		// than carry addresses the new session never agreed on.
+		ipv6Removed = cs.assignedIP6 != nil
+		cs.assignedIP6 = nil
+		cs.serverIP6 = nil
 		log.Info("Reconnected via ConnectFn, IP: %s", assignedIP)
 	}
 
@@ -714,10 +797,13 @@ func (cs *ControlServer) handleReconnect(ctx context.Context, reason string, new
 
 	// Get connection metadata for Android UI
 	resp := ControlResponse{
-		Status:    "connected",
-		IP:        cs.assignedIP.String(),
-		ServerIP:  cs.serverIP.String(),
-		Connected: true,
+		Status:      "connected",
+		IP:          cs.assignedIP.String(),
+		ServerIP:    cs.serverIP.String(),
+		IP6:         ipString(cs.assignedIP6),
+		ServerIP6:   ipString(cs.serverIP6),
+		IPv6Removed: ipv6Removed,
+		Connected:   true,
 	}
 	if cs.config.GetConnectionInfoFn != nil {
 		info := cs.config.GetConnectionInfoFn()
@@ -1018,13 +1104,18 @@ func (cs *ControlServer) attemptReconnect(ctx context.Context) bool {
 	time.Sleep(100 * time.Millisecond)
 
 	var newConn net.Conn
-	var serverIP, assignedIP net.IP
+	var serverIP, assignedIP, serverIP6, assignedIP6 net.IP
 	var err error
 
 	// Prefer ReconnectFn (handles circuit breaker reset)
 	if cs.config.ReconnectFn != nil {
-		newConn, serverIP, assignedIP, err = cs.config.ReconnectFn(ctx, cs.assignedIP, cs.mtu)
+		var res ReconnectResult
+		res, err = cs.config.ReconnectFn(ctx, cs.assignedIP, cs.mtu)
+		newConn, serverIP, assignedIP = res.Conn, res.ServerIP, res.AssignedIP
+		serverIP6, assignedIP6 = res.ServerIP6, res.AssignedIP6
 	} else if cs.config.ConnectFn != nil {
+		// No handshake runs on this path, so nothing renegotiated dual-stack:
+		// the v6 pair stays nil and is cleared below.
 		assignedIP, serverIP, newConn, err = cs.config.ConnectFn(ctx)
 	} else {
 		log.Error("No reconnect function configured")
@@ -1047,6 +1138,20 @@ func (cs *ControlServer) attemptReconnect(ctx context.Context) bool {
 				cs.tunDev.UpdateLocalIP(assignedIP)
 			}
 		}
+	}
+	// The v6 pair follows the v4 lease and can also disappear entirely; the
+	// auto-reconnect path has no response to carry it, so at least keep the
+	// server's own view of the session honest and emit an event the host can
+	// act on rather than silently holding a dead address.
+	if !assignedIP6.Equal(cs.assignedIP6) || !serverIP6.Equal(cs.serverIP6) {
+		log.Info("Auto-reconnect dual-stack addresses changed: client %s -> %s, server %s -> %s",
+			cs.assignedIP6, assignedIP6, cs.serverIP6, serverIP6)
+		cs.assignedIP6 = assignedIP6
+		cs.serverIP6 = serverIP6
+		// Sent from its own goroutine: sendEvent takes cs.mu, which this
+		// function holds for its whole body.
+		go cs.sendEvent("ipv6_changed", fmt.Sprintf(`{"ip6":"%s","server_ip6":"%s"}`,
+			ipString(assignedIP6), ipString(serverIP6)))
 	}
 
 	// Start new TUN relay
@@ -1172,23 +1277,45 @@ func (cs *ControlServer) performTUNHandshake() (assignedIP, serverIP net.IP, err
 	// Send TUN mode handshake
 	// Format: [mode:1][localIP:4][mtu:2][version:1]
 	// Send 0.0.0.0 to request auto IP assignment
+	version := byte(tunHandshakeVersion)
+	if cs.config.DualStack {
+		version = tunHandshakeVersionDualStack
+	}
 	handshake := make([]byte, 8)
 	handshake[0] = 0x02 // TUN mode
 	// localIP = 0.0.0.0 (bytes 1:5 remain zero to request auto assignment)
 	binary.BigEndian.PutUint16(handshake[5:7], uint16(mtu))
-	handshake[7] = tunHandshakeVersion // v3: also signals auto-MTU probe support
+	handshake[7] = version // v3: auto-MTU probe; v4: + dual-stack
 
-	log.Debug("Sending TUN handshake: mode=0x02, mtu=%d, version=0x%02x", mtu, tunHandshakeVersion)
+	log.Debug("Sending TUN handshake: mode=0x02, mtu=%d, version=0x%02x", mtu, version)
 	if _, err := cs.serverConn.Write(handshake); err != nil {
 		return nil, nil, fmt.Errorf("handshake write failed: %w", err)
 	}
 
 	// Read response (up to 64 bytes for extended v2 with port hopping config)
 	// Minimum 9 bytes: [status:1][serverIP:4][clientIP:4]
-	resp := make([]byte, 64)
-	n, err := io.ReadAtLeast(cs.serverConn, resp, 9)
+	// The dual-stack path reuses readHandshakeResponse, which additionally
+	// drains the trailing 32-byte [serverIP6:16][clientIP6:16] block so the
+	// stream stays frame-aligned for the relay that follows.
+	var resp []byte
+	var n int
+	if cs.config.DualStack {
+		resp, n, err = readHandshakeResponse(cs.serverConn, tunHandshakeVersionDualStack)
+	} else {
+		buf := make([]byte, 64)
+		n, err = io.ReadAtLeast(cs.serverConn, buf, 9)
+		resp = buf
+	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("handshake read failed: %w", err)
+	}
+	// Guard before any indexing: a short response with a nil error would make
+	// resp[0] / resp[5:9] below panic, and that panic is swallowed by the
+	// recover() in handleConnection — the host then sees the control socket
+	// close instead of a {"status":"error"} response, and cs.serverConn is
+	// left assigned and open because the caller's error path never runs.
+	if n < 9 {
+		return nil, nil, fmt.Errorf("handshake response too short: %d bytes", n)
 	}
 	resp = resp[:n] // Trim to actual response size
 
@@ -1207,6 +1334,23 @@ func (cs *ControlServer) performTUNHandshake() (assignedIP, serverIP net.IP, err
 
 	serverIP = net.IP(resp[1:5])
 	assignedIP = net.IP(resp[5:9])
+
+	// Dual-stack: when the exit answered the v0x04 handshake with the
+	// dual-stack flag, record the negotiated v6 addresses so the next
+	// ControlResponse can hand them to Android (which configures them on the
+	// VpnService interface). A declined negotiation leaves both nil and the
+	// session is plain v4 — identical to a 0x03 handshake.
+	cs.assignedIP6 = nil
+	cs.serverIP6 = nil
+	if cs.config.DualStack {
+		if caps, ok := parseServerCapabilities(resp, n); ok && caps.DualStackEnabled {
+			cs.assignedIP6 = caps.ClientIP6
+			cs.serverIP6 = caps.ServerIP6
+			log.Info("Dual-stack negotiated: client=%s server=%s", caps.ClientIP6, caps.ServerIP6)
+		} else {
+			log.Warn("Dual-stack requested but the exit did not negotiate IPv6; continuing IPv4-only")
+		}
+	}
 
 	log.Debug("TUN handshake successful: assigned=%s, server=%s", assignedIP, serverIP)
 	return assignedIP, serverIP, nil

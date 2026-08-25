@@ -28,6 +28,17 @@ type SharedTUN struct {
 	network  *net.IPNet // e.g., 10.9.0.0/24
 	mtu      int
 
+	// v6prefix is the dual-stack pool prefix (e.g. fd00:10:8::/64), nil when
+	// the server runs IPv4-only. Used by the dispatcher to route tunnel-IPv6
+	// packets back to clients: the destination's low 32 bits embed the
+	// client's IPv4 lease (see IPPool.ClientIP6), so the SAME client registry
+	// keyed by v4 string serves both families — no second map.
+	v6prefix *net.IPNet
+
+	// v6m counts in-tunnel IPv6 dispatch outcomes; nil when metrics are
+	// unavailable (single-secret mode without the API server).
+	v6m *IPv6Metrics
+
 	// Client registry: IP string -> writer
 	clients   map[string]*ClientWriter
 	clientsMu sync.RWMutex
@@ -131,8 +142,11 @@ func (rt *reconnectTracker) record(clientID string) (int, bool) {
 	return len(fresh), len(fresh) > rt.maxPerMin
 }
 
-// NewSharedTUN creates and configures a shared TUN device for all clients
-func NewSharedTUN(name string, serverIP net.IP, network *net.IPNet, mtu, workers int) (*SharedTUN, error) {
+// NewSharedTUN creates and configures a shared TUN device for all clients.
+// pool may be nil (no lease pool, e.g. tests) or IPv4-only; when it is
+// dual-stack the TUN additionally gets the pool's server IPv6 address and the
+// dispatcher learns the v6 prefix for downlink routing. v6m may be nil.
+func NewSharedTUN(name string, serverIP net.IP, network *net.IPNet, mtu, workers int, pool *IPPool, v6m *IPv6Metrics) (*SharedTUN, error) {
 	if workers <= 0 {
 		workers = runtime.NumCPU()
 	}
@@ -143,8 +157,19 @@ func NewSharedTUN(name string, serverIP net.IP, network *net.IPNet, mtu, workers
 		return nil, err
 	}
 
+	// Dual-stack: the server's tunnel v6 address is prefix::1 with the full
+	// pool prefix on the link, so the kernel routes the whole ULA prefix back
+	// into the TUN. nil keeps ConfigureSubnet byte-identical to IPv4-only
+	// (including disable_ipv6=1).
+	var serverIP6 *net.IPNet
+	var v6prefix *net.IPNet
+	if pool != nil && pool.DualStack() {
+		v6prefix = pool.V6Prefix()
+		serverIP6 = &net.IPNet{IP: pool.ServerIP6(), Mask: v6prefix.Mask}
+	}
+
 	// Configure with subnet routing (not point-to-point)
-	if err := tunDev.ConfigureSubnet(serverIP, network); err != nil {
+	if err := tunDev.ConfigureSubnet(serverIP, network, serverIP6); err != nil {
 		tunDev.Close()
 		return nil, err
 	}
@@ -155,6 +180,8 @@ func NewSharedTUN(name string, serverIP net.IP, network *net.IPNet, mtu, workers
 		serverIP:      serverIP,
 		network:       network,
 		mtu:           mtu,
+		v6prefix:      v6prefix,
+		v6m:           v6m,
 		clients:       make(map[string]*ClientWriter),
 		reconnTracker: newReconnectTracker(10), // warn if >10 reconnects/min
 		workers:       workers,
@@ -316,15 +343,13 @@ func (st *SharedTUN) packetDispatcher() {
 			continue
 		}
 
-		// Check IP version
-		version := buf[0] >> 4
-		if version != 4 {
-			log.Debug("SharedTUN: non-IPv4 packet (version=%d), dropping", version)
+		// Resolve the registry key for this packet's destination. For IPv4 the
+		// key is the destination address itself; for dual-stack IPv6 it is the
+		// embedded client IPv4 lease. Non-routable packets are dropped inside.
+		dstIP, ok := st.routeKey(buf, n)
+		if !ok {
 			continue
 		}
-
-		// Extract destination IP from IPv4 header (bytes 16-19)
-		dstIP := net.IP(buf[16:20]).String()
 
 		if log.DebugEnabled() {
 			log.Debug("SharedTUN: read %d bytes from TUN, dst=%s", n, dstIP)
@@ -351,6 +376,48 @@ func (st *SharedTUN) packetDispatcher() {
 			log.Debug("SharedTUN: worker %d channel full, dropping packet for %s", workerIdx, dstIP)
 		}
 	}
+}
+
+// routeKey maps a packet read from the TUN to the client-registry key for its
+// destination, or reports it as a drop. The registry is keyed by IPv4 string
+// for both families: a dual-stack IPv6 packet whose destination lies in the
+// pool prefix carries the client's IPv4 lease in its low 32 bits (the inverse
+// of IPPool.ClientIP6), which is extracted and used as the key. The IPv4 path
+// is byte-for-byte the historical behavior; IPv6 packets on an IPv4-only
+// server drop exactly as before.
+func (st *SharedTUN) routeKey(buf []byte, n int) (string, bool) {
+	version := buf[0] >> 4
+
+	if version == 4 {
+		// Extract destination IP from IPv4 header (bytes 16-19)
+		return net.IP(buf[16:20]).String(), true
+	}
+
+	if version == 6 && st.v6prefix != nil {
+		if n < 40 {
+			if st.v6m != nil {
+				st.v6m.RecordTunnelV6DropShortHeader()
+			}
+			log.Debug("SharedTUN: IPv6 packet too short (%d bytes), dropping", n)
+			return "", false
+		}
+		dst := net.IP(buf[24:40])
+		if !st.v6prefix.Contains(dst) {
+			if st.v6m != nil {
+				st.v6m.RecordTunnelV6DropNotInPool()
+			}
+			log.Debug("SharedTUN: IPv6 dst %s outside pool %s, dropping", dst, st.v6prefix)
+			return "", false
+		}
+		if st.v6m != nil {
+			st.v6m.RecordTunnelV6Routed()
+		}
+		// Embedded client IPv4 lease in the low 32 bits.
+		return net.IP(dst[12:16]).String(), true
+	}
+
+	log.Debug("SharedTUN: non-IPv4 packet (version=%d), dropping", version)
+	return "", false
 }
 
 // packetWorker processes packets for a subset of clients

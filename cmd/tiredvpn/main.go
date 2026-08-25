@@ -163,6 +163,8 @@ MULTI-CLIENT OPTIONS:
         IP pool CIDR for TUN clients (e.g., '10.8.0.0/24')
   -ip-pool-lease duration
         IP lease duration (default 24h)
+  -ip-pool-v6 string
+        IPv6 prefix for TUN dual-stack clients (e.g., 'fd00:10:8::/64')
 
 PORT HOPPING OPTIONS:
   -port-range string
@@ -256,6 +258,9 @@ TUN MODE (Full VPN):
         TUN device MTU (default 1280)
   -tun-routes string
         Routes to add (comma-separated, e.g. '0.0.0.0/0' for full tunnel)
+  -tun-ipv6 string
+        IPv6 inside the tunnel: off (v4-only, default), dual (route IPv6 through
+        the tunnel when the exit negotiates dual-stack; v4-only fallback otherwise)
   -tun-fd int
         Use existing TUN file descriptor - for Android VpnService (default -1)
 
@@ -413,6 +418,7 @@ func registerServerFlags(fs *flag.FlagSet, cfg *server.Config) *serverFlagOpts {
 	// IP Pool flags for TUN mode
 	fs.StringVar(&cfg.IPPoolNetwork, "ip-pool", "", "IP pool CIDR for TUN clients (e.g., '10.8.0.0/24'). Enables auto IP assignment.")
 	opts.ipPoolLease = fs.Duration("ip-pool-lease", 24*time.Hour, "IP lease duration (0 = permanent)")
+	fs.StringVar(&cfg.IPPoolV6, "ip-pool-v6", "", "IPv6 prefix for TUN dual-stack clients (e.g., 'fd00:10:8::/64'). Enables IPv6 inside the tunnel for v0x04 clients.")
 
 	// IPv6 Transport flags
 	fs.StringVar(&cfg.ListenAddrV6, "listen-v6", "[::]:995", "IPv6 listen address")
@@ -452,6 +458,11 @@ func runServer(args []string) {
 
 	if cfg.TunMTU < 1280 || cfg.TunMTU > 9000 {
 		fmt.Printf("Error: -tun-mtu must be between 1280 and 9000, got %d\n", cfg.TunMTU)
+		os.Exit(1)
+	}
+
+	if err := server.ValidateIPPoolV6(cfg.IPPoolV6); err != nil {
+		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -527,6 +538,7 @@ func runClient(args []string) {
 	fs.IntVar(&cfg.TunMTU, "tun-mtu", 1280, "TUN device MTU (with -auto-mtu this is the upper bound/cap)")
 	fs.BoolVar(&cfg.AutoMTU, "auto-mtu", true, "Actively probe the real end-to-end MTU and apply min(probed, -tun-mtu); floor 1280")
 	fs.StringVar(&cfg.TunRoutes, "tun-routes", "", "Routes to add (comma-separated, e.g. '0.0.0.0/0' for full tunnel)")
+	fs.StringVar(&cfg.TunIPv6Policy, "tun-ipv6", "off", "IPv6 inside the tunnel: off (v4-only), dual (route IPv6 through the tunnel when the exit supports it)")
 
 	// Android VpnService flags
 	fs.IntVar(&cfg.TunFd, "tun-fd", -1, "Use existing TUN file descriptor (for Android VpnService)")
