@@ -951,17 +951,21 @@ func handleQUICConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 	logger.Info("QUIC connection from %s (authenticated)", remoteAddr)
 
 	// Extract clientID from QUICServerConn if available
-	clientID := ""
+	var clientID clientIdentity
 	if qc, ok := conn.(*strategy.QUICServerConn); ok {
-		clientID = qc.ClientID
+		if qc.ClientIDFromRegistry {
+			clientID = registryIdentity(qc.ClientID)
+		} else {
+			clientID = sharedIdentity(qc.ClientID)
+		}
 	}
 
 	// Track per-client connection for metrics
-	if srvCtx.registry != nil && clientID != "" {
-		if err := srvCtx.registry.AddConnection(clientID, conn); err != nil {
+	if srvCtx.registry != nil && clientID.id != "" {
+		if err := srvCtx.registry.AddConnection(clientID.id, conn); err != nil {
 			logger.Warn("Failed to track QUIC connection for client %s: %v", clientID, err)
 		} else {
-			defer srvCtx.registry.RemoveConnection(clientID, conn)
+			defer srvCtx.registry.RemoveConnection(clientID.id, conn)
 		}
 	}
 
@@ -1068,8 +1072,8 @@ func handleQUICConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 	}
 
 	// Update per-client metrics
-	if srvCtx.registry != nil && clientID != "" {
-		srvCtx.registry.AddBytes(clientID, bytesUp, bytesDown)
+	if srvCtx.registry != nil && clientID.id != "" {
+		srvCtx.registry.AddBytes(clientID.id, bytesUp, bytesDown)
 	}
 }
 
@@ -1356,7 +1360,7 @@ func handleTLSConnection(conn *tls.Conn, srvCtx *serverContext, connID uint64) {
 	case protocol.TypeStego:
 		handleHTTP2WithALPN(conn, srvCtx, logger)
 	case protocol.TypeRaw:
-		handleRawTunnel(conn, srvCtx, logger, "")
+		handleRawTunnel(conn, srvCtx, logger, clientIdentity{})
 	case protocol.TypeConfusion:
 		handleProtocolConfusion(conn, srvCtx, logger)
 	case protocol.TypeAntiProbe:
@@ -1490,7 +1494,7 @@ func handleHTTP2WithALPN(conn net.Conn, srvCtx *serverContext, logger *log.Logge
 
 	hpackDec := hpack.NewDecoder(4096, nil)
 	authenticated := false
-	var authClientID string
+	var authClientID clientIdentity
 	var tunnel *h2TunnelState
 	var connTracked bool
 
@@ -1521,7 +1525,7 @@ func handleMorphConnectionWithALPN(conn net.Conn, srvCtx *serverContext, logger 
 type h2TunnelState struct {
 	targetConn      net.Conn
 	streamID        uint32
-	clientID        string // Client ID for IP pool allocation
+	clientID        clientIdentity // Client identity for IP pool allocation
 	remoteAddr      string // Peer host, used to qualify the IP-pool lease key
 	mu              sync.Mutex
 	sharedTUNWriter *ClientWriter // For shared TUN mode
@@ -1552,7 +1556,7 @@ func handleHTTP2(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
 	hpackDec := hpack.NewDecoder(4096, nil)
 
 	authenticated := false
-	var authClientID string
+	var authClientID clientIdentity
 	var tunnel *h2TunnelState
 	var connTracked bool
 	defer cleanupH2Conn(conn, srvCtx, &tunnel, &connTracked, &authClientID)
@@ -1578,15 +1582,15 @@ func initH2Framer(conn net.Conn, logger *log.Logger) (*http2.Framer, error) {
 }
 
 // cleanupH2Conn closes tunnel target and removes per-client connection tracking on defer.
-func cleanupH2Conn(conn net.Conn, srvCtx *serverContext, tunnel **h2TunnelState, connTracked *bool, authClientID *string) {
+func cleanupH2Conn(conn net.Conn, srvCtx *serverContext, tunnel **h2TunnelState, connTracked *bool, authClientID *clientIdentity) {
 	if *tunnel != nil && (*tunnel).targetConn != nil {
 		(*tunnel).targetConn.Close()
 	}
 	if *tunnel != nil && (*tunnel).sink != nil {
 		(*tunnel).sink.Close()
 	}
-	if *connTracked && srvCtx.registry != nil && *authClientID != "" {
-		srvCtx.registry.RemoveConnection(*authClientID, conn)
+	if *connTracked && srvCtx.registry != nil && authClientID.id != "" {
+		srvCtx.registry.RemoveConnection(authClientID.id, conn)
 	}
 }
 
@@ -1597,7 +1601,7 @@ func cleanupH2Conn(conn net.Conn, srvCtx *serverContext, tunnel **h2TunnelState,
 // (legacy non-ALPN path), in which case no kTLS upgrade happens. When set, it
 // is invoked exactly once — immediately after auth succeeds — and returns the
 // connection and framer to use for the subsequent relay phase.
-func runH2FrameLoop(connPtr *net.Conn, framerPtr **http2.Framer, hpackDec *hpack.Decoder, srvCtx *serverContext, logger *log.Logger, authenticated *bool, authClientID *string, connTracked *bool, tunnel **h2TunnelState, handover func(net.Conn) (net.Conn, *http2.Framer)) {
+func runH2FrameLoop(connPtr *net.Conn, framerPtr **http2.Framer, hpackDec *hpack.Decoder, srvCtx *serverContext, logger *log.Logger, authenticated *bool, authClientID *clientIdentity, connTracked *bool, tunnel **h2TunnelState, handover func(net.Conn) (net.Conn, *http2.Framer)) {
 	cfg := srvCtx.cfg
 	for {
 		conn := *connPtr
@@ -1645,7 +1649,7 @@ func runH2FrameLoop(connPtr *net.Conn, framerPtr **http2.Framer, hpackDec *hpack
 }
 
 // processH2HeadersFrame extracts auth headers and, if valid, marks the connection authenticated.
-func processH2HeadersFrame(conn net.Conn, f *http2.HeadersFrame, framer *http2.Framer, hpackDec *hpack.Decoder, srvCtx *serverContext, logger *log.Logger, authenticated *bool, authClientID *string, connTracked *bool) {
+func processH2HeadersFrame(conn net.Conn, f *http2.HeadersFrame, framer *http2.Framer, hpackDec *hpack.Decoder, srvCtx *serverContext, logger *log.Logger, authenticated *bool, authClientID *clientIdentity, connTracked *bool) {
 	var apiKey, requestID string
 	hpackDec.SetEmitFunc(func(hf hpack.HeaderField) {
 		logger.Debug("  Header: %s = %s", hf.Name, truncate(hf.Value, 50))
@@ -1672,8 +1676,8 @@ func processH2HeadersFrame(conn net.Conn, f *http2.HeadersFrame, framer *http2.F
 	*authClientID = clientID
 	sendH2AuthAck(framer, f.StreamID, secret)
 
-	if !*connTracked && srvCtx.registry != nil && clientID != "" {
-		if err := srvCtx.registry.AddConnection(clientID, conn); err != nil {
+	if !*connTracked && srvCtx.registry != nil && clientID.id != "" {
+		if err := srvCtx.registry.AddConnection(clientID.id, conn); err != nil {
 			logger.Warn("Failed to track H2 connection for client %s: %v", clientID, err)
 		} else {
 			*connTracked = true
@@ -1683,24 +1687,24 @@ func processH2HeadersFrame(conn net.Conn, f *http2.HeadersFrame, framer *http2.F
 
 // verifyH2AuthMulti checks per-client secrets then global secret for HTTP/2 stego auth.
 // Returns (ok, clientID, usedSecret).
-func verifyH2AuthMulti(srvCtx *serverContext, apiKey, requestID string, logger *log.Logger) (bool, string, []byte) {
+func verifyH2AuthMulti(srvCtx *serverContext, apiKey, requestID string, logger *log.Logger) (bool, clientIdentity, []byte) {
 	if srvCtx.registry != nil {
 		for _, client := range srvCtx.registry.ListClients() {
 			if verifyH2Auth(apiKey, requestID, []byte(client.Secret)) {
 				logger.Info("HTTP/2 steganography authenticated (client: %s, id: %s)", client.Name, client.ID)
-				return true, client.ID, []byte(client.Secret)
+				return true, registryIdentity(client.ID), []byte(client.Secret)
 			}
 		}
 	}
 	if len(srvCtx.cfg.Secret) > 0 && verifyH2Auth(apiKey, requestID, srvCtx.cfg.Secret) {
 		logger.Info("HTTP/2 steganography authenticated (global secret)")
-		return true, "global", srvCtx.cfg.Secret
+		return true, sharedIdentity(globalClientID), srvCtx.cfg.Secret
 	}
-	return false, "", nil
+	return false, clientIdentity{}, nil
 }
 
 // handleH2DataFrame processes an authenticated HTTP/2 DATA frame.
-func handleH2DataFrame(conn net.Conn, f *http2.DataFrame, framer *http2.Framer, cfg *Config, srvCtx *serverContext, _ *h2TunnelState, authClientID string, logger *log.Logger, tunnelPtr **h2TunnelState) {
+func handleH2DataFrame(conn net.Conn, f *http2.DataFrame, framer *http2.Framer, cfg *Config, srvCtx *serverContext, _ *h2TunnelState, authClientID clientIdentity, logger *log.Logger, tunnelPtr **h2TunnelState) {
 	data := f.Data()
 	logger.Debug("Received DATA: %d bytes", len(data))
 
@@ -1959,7 +1963,7 @@ func handleMorphConnection(conn net.Conn, srvCtx *serverContext, logger *log.Log
 	// Verify auth token against per-client secrets and global secret
 	authenticated := false
 	var usedSecret []byte
-	var clientID string // For IP pool allocation
+	var clientID clientIdentity // For IP pool allocation
 
 	// 1. Try per-client secrets from Redis (if registry exists)
 	if srvCtx.registry != nil {
@@ -1972,7 +1976,7 @@ func handleMorphConnection(conn net.Conn, srvCtx *serverContext, logger *log.Log
 				logger.Info("Traffic Morph authenticated (client: %s, id: %s)", client.Name, client.ID)
 				authenticated = true
 				usedSecret = secretBytes
-				clientID = client.ID
+				clientID = registryIdentity(client.ID)
 				break
 			}
 		}
@@ -1986,7 +1990,7 @@ func handleMorphConnection(conn net.Conn, srvCtx *serverContext, logger *log.Log
 			logger.Info("Traffic Morph authenticated (global secret)")
 			authenticated = true
 			usedSecret = srvCtx.cfg.Secret
-			clientID = "global" // Use "global" as clientID for global secret users
+			clientID = sharedIdentity(globalClientID) // every client on the shared secret lands here
 		}
 	}
 
@@ -2008,12 +2012,12 @@ func handleMorphConnection(conn net.Conn, srvCtx *serverContext, logger *log.Log
 	// Track per-client connection for metrics. Use a closure on the conn
 	// variable so the defer picks up the kTLS-wrapped value if we hand
 	// the socket over later via ktls.TryEnable + registry.SwapConn.
-	if srvCtx.registry != nil && clientID != "" {
-		if err := srvCtx.registry.AddConnection(clientID, conn); err != nil {
+	if srvCtx.registry != nil && clientID.id != "" {
+		if err := srvCtx.registry.AddConnection(clientID.id, conn); err != nil {
 			logger.Warn("Failed to track connection for client %s: %v", clientID, err)
 		} else {
 			defer func() {
-				srvCtx.registry.RemoveConnection(clientID, conn)
+				srvCtx.registry.RemoveConnection(clientID.id, conn)
 			}()
 		}
 	}
@@ -2033,10 +2037,10 @@ func handleMorphConnection(conn net.Conn, srvCtx *serverContext, logger *log.Log
 	// frame reads (target addr) and writes (relay data) go through kTLS.
 	preSwap := conn
 	conn = ktls.TryEnable(conn, "tired-morph")
-	if conn != preSwap && srvCtx.registry != nil && clientID != "" {
+	if conn != preSwap && srvCtx.registry != nil && clientID.id != "" {
 		// Replace the stored *tls.Conn with the live *ktls.Conn so
 		// forced-disconnect Close() targets the right socket wrapper.
-		srvCtx.registry.SwapConn(clientID, preSwap, conn)
+		srvCtx.registry.SwapConn(clientID.id, preSwap, conn)
 	}
 
 	// Read first morph packet containing target address
@@ -2283,8 +2287,8 @@ func handleMorphConnection(conn net.Conn, srvCtx *serverContext, logger *log.Log
 	}
 
 	// Update per-client metrics
-	if srvCtx.registry != nil && clientID != "" {
-		srvCtx.registry.AddBytes(clientID, bytesUp, bytesDown)
+	if srvCtx.registry != nil && clientID.id != "" {
+		srvCtx.registry.AddBytes(clientID.id, bytesUp, bytesDown)
 	}
 }
 
@@ -2320,16 +2324,16 @@ func morphFramePacket(pkt []byte) []byte {
 }
 
 // handleMorphTUNMode handles TUN mode over Morph protocol
-func handleMorphTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverContext, logger *log.Logger, clientID string) {
+func handleMorphTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverContext, logger *log.Logger, clientID clientIdentity) {
 	cfg := srvCtx.cfg
 	logger.Debug("Processing Morph TUN mode, remaining data: %d bytes, hex=%x", len(remainingData), remainingData)
 
 	// Track per-client connection for metrics
-	if srvCtx.registry != nil && clientID != "" {
-		if err := srvCtx.registry.AddConnection(clientID, conn); err != nil {
+	if srvCtx.registry != nil && clientID.id != "" {
+		if err := srvCtx.registry.AddConnection(clientID.id, conn); err != nil {
 			logger.Warn("Failed to track connection for client %s: %v", clientID, err)
 		} else {
-			defer srvCtx.registry.RemoveConnection(clientID, conn)
+			defer srvCtx.registry.RemoveConnection(clientID.id, conn)
 		}
 	}
 
@@ -2411,7 +2415,7 @@ func handleMorphTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverConte
 		serverIP = cfg.TunIP
 
 		// Register client with shared TUN using Morph framing
-		writer := srvCtx.sharedTUN.RegisterClient(clientIP, clientID, conn, morphFramePacket)
+		writer := srvCtx.sharedTUN.RegisterClient(clientIP, clientID.id, conn, morphFramePacket)
 		localSink := newLocalTUNSink(srvCtx.sharedTUN, writer, clientIP)
 		sink = localSink
 		defer func() {
@@ -2717,7 +2721,7 @@ func handleWebSocket(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
 				Conn:   conn,
 				reader: io.MultiReader(bytes.NewReader(payload), conn),
 			}
-			handleRawTunnel(wsConn, srvCtx, logger, "")
+			handleRawTunnel(wsConn, srvCtx, logger, clientIdentity{})
 			return
 		}
 	}
@@ -2762,7 +2766,7 @@ func handleAntiProbeDispatch(conn net.Conn, srvCtx *serverContext, logger *log.L
 }
 
 // handleAntiProbeAuth handles anti-probe authenticated connections
-func handleAntiProbeAuth(conn net.Conn, srvCtx *serverContext, secret []byte, clientID string, logger *log.Logger) {
+func handleAntiProbeAuth(conn net.Conn, srvCtx *serverContext, secret []byte, clientID clientIdentity, logger *log.Logger) {
 	cfg := srvCtx.cfg
 	logger.Debug("Processing anti-probe authentication (client: %s)", clientID)
 
@@ -3023,7 +3027,9 @@ func handleConfusionTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverC
 	// Use only client IP (without port) for clientID to prevent IP pool exhaustion
 	// when client reconnects on different ports (e.g., port hopping)
 	clientHost, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
-	clientID := fmt.Sprintf("confusion:%s", clientHost)
+	// Behind a relay this is the relay's address, the same for every client
+	// it forwards, so it cannot key a lease on its own.
+	clientID := sharedIdentity(fmt.Sprintf("confusion:%s", clientHost))
 
 	// Check for version byte (v2 clients send 7 bytes total)
 	var clientVersion uint8 = 1 // Default to v1 for backwards compatibility
@@ -3083,7 +3089,7 @@ func handleConfusionTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverC
 		serverIP = cfg.TunIP
 
 		// Register client with shared TUN (default framing: [length:4][packet:N])
-		writer := srvCtx.sharedTUN.RegisterClient(clientIP, clientID, conn, nil)
+		writer := srvCtx.sharedTUN.RegisterClient(clientIP, clientID.id, conn, nil)
 		localSink := newLocalTUNSink(srvCtx.sharedTUN, writer, clientIP)
 		sink = localSink
 		defer func() {
@@ -3197,7 +3203,7 @@ func tunnelIdentity(clientID string) string {
 
 // handleRawTunnel handles raw tunnel connections
 // clientID is used for TUN mode to track IP allocation (e.g. "reality:abcd1234")
-func handleRawTunnel(conn net.Conn, srvCtx *serverContext, logger *log.Logger, clientID string) {
+func handleRawTunnel(conn net.Conn, srvCtx *serverContext, logger *log.Logger, clientID clientIdentity) {
 	logger.Debug("Starting raw tunnel mode")
 
 	// Node ceiling. Here rather than at accept on purpose: every transport
@@ -3207,7 +3213,7 @@ func handleRawTunnel(conn net.Conn, srvCtx *serverContext, logger *log.Logger, c
 	//
 	// A refused client currently has nowhere to go - see nodeCapNoFailover - so
 	// this only fires when an operator has deliberately set a ceiling.
-	release, admitted := nodeCapacity.admit(tunnelIdentity(clientID), time.Now())
+	release, admitted := nodeCapacity.admit(tunnelIdentity(clientID.id), time.Now())
 	if !admitted {
 		logger.Warn("Node ceiling reached, refusing a new session (client: %s)", clientID)
 		return
@@ -3217,12 +3223,12 @@ func handleRawTunnel(conn net.Conn, srvCtx *serverContext, logger *log.Logger, c
 	// Track per-client connection for metrics. Use a closure on the conn
 	// variable so the defer picks up the kTLS-wrapped value if we hand
 	// the socket over later via ktls.TryEnable + registry.SwapConn.
-	if srvCtx.registry != nil && clientID != "" {
-		if err := srvCtx.registry.AddConnection(clientID, conn); err != nil {
+	if srvCtx.registry != nil && clientID.id != "" {
+		if err := srvCtx.registry.AddConnection(clientID.id, conn); err != nil {
 			logger.Warn("Failed to track connection for client %s: %v", clientID, err)
 		} else {
 			defer func() {
-				srvCtx.registry.RemoveConnection(clientID, conn)
+				srvCtx.registry.RemoveConnection(clientID.id, conn)
 			}()
 		}
 	}
@@ -3301,10 +3307,10 @@ func handleRawTunnel(conn net.Conn, srvCtx *serverContext, logger *log.Logger, c
 	// the kernel send buffer.
 	preSwap := conn
 	conn = ktls.TryEnable(conn, "tired-raw")
-	if conn != preSwap && srvCtx.registry != nil && clientID != "" {
+	if conn != preSwap && srvCtx.registry != nil && clientID.id != "" {
 		// Replace the stored *tls.Conn pointer so forced-disconnect Close()
 		// targets the live ktls.Conn wrapper rather than the stale *tls.Conn.
-		srvCtx.registry.SwapConn(clientID, preSwap, conn)
+		srvCtx.registry.SwapConn(clientID.id, preSwap, conn)
 	}
 
 	// Relay data
@@ -3338,8 +3344,8 @@ func handleRawTunnel(conn net.Conn, srvCtx *serverContext, logger *log.Logger, c
 	}
 
 	// Update per-client metrics
-	if srvCtx.registry != nil && clientID != "" {
-		srvCtx.registry.AddBytes(clientID, bytesUp, bytesDown)
+	if srvCtx.registry != nil && clientID.id != "" {
+		srvCtx.registry.AddBytes(clientID.id, bytesUp, bytesDown)
 	}
 }
 
@@ -3349,7 +3355,7 @@ func handleTUNMode(conn net.Conn, cfg *Config, logger *log.Logger) {
 }
 
 // handleTUNModeWithHandshake handles TUN mode with pre-read handshake data (for QUIC)
-func handleTUNModeWithHandshake(conn net.Conn, srvCtx *serverContext, logger *log.Logger, handshake []byte, clientID string) {
+func handleTUNModeWithHandshake(conn net.Conn, srvCtx *serverContext, logger *log.Logger, handshake []byte, clientID clientIdentity) {
 	handleTUNModeCore(conn, srvCtx.cfg, srvCtx, logger, handshake, clientID)
 }
 
@@ -3366,7 +3372,7 @@ func handleTUNModeWithContext(conn net.Conn, cfg *Config, srvCtx *serverContext,
 		return
 	}
 
-	handleTUNModeCore(conn, cfg, srvCtx, logger, handshake[:n], "")
+	handleTUNModeCore(conn, cfg, srvCtx, logger, handshake[:n], clientIdentity{})
 }
 
 // resolveTunMTU returns the configured TUN MTU, falling back to the package
@@ -3391,7 +3397,7 @@ func negotiateMTU(clientMTU, serverMTU int) int {
 
 // handleTUNModeCore is the core TUN mode handler
 // authClientID is the authenticated client ID from QUIC/etc (empty if not available)
-func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger *log.Logger, handshake []byte, authClientID string) {
+func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger *log.Logger, handshake []byte, authClientID clientIdentity) {
 	requestedIP := net.IP(handshake[0:4])
 	clientMTU := int(binary.BigEndian.Uint16(handshake[4:6]))
 	// Negotiate MTU: use min(clientMTU, serverMTU) as effective MTU.
@@ -3416,12 +3422,14 @@ func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger
 	isAutoRequest := requestedIP.Equal(net.IPv4zero) || requestedIP.Equal(net.IPv4(0, 0, 0, 0))
 
 	// Use authenticated clientID if available, otherwise fallback to connection-based ID
-	var clientID string
-	if authClientID != "" {
-		// Use stable clientID from authentication (e.g. from Redis/API)
-		clientID = authClientID
-	} else {
-		clientID = fmt.Sprintf("tun:%s", conn.RemoteAddr().String())
+	// A client that authenticated carries whatever identity that transport
+	// resolved, including whether it distinguishes one client from another.
+	// Without one, fall back to the peer address - which on a relay is the
+	// relay's own address and therefore the same for every client behind it,
+	// so it is shared rather than per-client.
+	clientID := authClientID
+	if clientID.id == "" {
+		clientID = sharedIdentity(fmt.Sprintf("tun:%s", conn.RemoteAddr().String()))
 	}
 
 	logger.Info("TUN client request: IP=%s, clientID=%s", requestedIP, clientID)
@@ -3518,7 +3526,7 @@ func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger
 
 	// Register client with shared TUN
 	// Default framing: [length:4][packet:N]
-	writer := srvCtx.sharedTUN.RegisterClient(clientIP, clientID, conn, nil)
+	writer := srvCtx.sharedTUN.RegisterClient(clientIP, clientID.id, conn, nil)
 	defer func() {
 		srvCtx.sharedTUN.UnregisterClient(clientIP, writer)
 		// Don't release IP - it stays allocated for reconnects
@@ -3967,7 +3975,7 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 
 		// Register client with shared TUN using custom frame function
 		// Note: For H2, we send directly in frameFunc, so it returns nil
-		writer := srvCtx.sharedTUN.RegisterClient(clientIP, tunnel.clientID, h2Conn, func(pkt []byte) []byte {
+		writer := srvCtx.sharedTUN.RegisterClient(clientIP, tunnel.clientID.id, h2Conn, func(pkt []byte) []byte {
 			sendPacketDown(pkt)
 			return nil // Already sent directly
 		})
@@ -4035,7 +4043,7 @@ func handleConfusionData(conn net.Conn, data []byte, srvCtx *serverContext, logg
 	conn.Write([]byte("TIRED"))
 
 	// Continue as raw tunnel
-	handleRawTunnel(conn, srvCtx, logger, "")
+	handleRawTunnel(conn, srvCtx, logger, clientIdentity{})
 }
 
 // Helper functions
@@ -4081,13 +4089,13 @@ func detectTimingKnock(data []byte, secret []byte) bool {
 
 // detectTimingKnockWithRegistry checks timing knock against per-client secrets and global secret
 // Returns (matched, secret, clientID)
-func detectTimingKnockWithRegistry(data []byte, srvCtx *serverContext) (bool, []byte, string) {
+func detectTimingKnockWithRegistry(data []byte, srvCtx *serverContext) (bool, []byte, clientIdentity) {
 	// 1. Try per-client secrets
 	if srvCtx.registry != nil {
 		for _, client := range srvCtx.registry.ListClients() {
 			if detectTimingKnock(data, []byte(client.Secret)) {
 				log.Debug("Timing knock matched client: %s (id: %s)", client.Name, client.ID)
-				return true, []byte(client.Secret), client.ID
+				return true, []byte(client.Secret), registryIdentity(client.ID)
 			}
 		}
 	}
@@ -4095,10 +4103,10 @@ func detectTimingKnockWithRegistry(data []byte, srvCtx *serverContext) (bool, []
 	// 2. Fallback to global secret
 	if len(srvCtx.cfg.Secret) > 0 && detectTimingKnock(data, srvCtx.cfg.Secret) {
 		log.Debug("Timing knock matched global secret")
-		return true, srvCtx.cfg.Secret, "global"
+		return true, srvCtx.cfg.Secret, sharedIdentity(globalClientID)
 	}
 
-	return false, nil, ""
+	return false, nil, clientIdentity{}
 }
 
 func verifyFullKnockSequence(conn net.Conn, secret []byte, logger *log.Logger) bool {
@@ -4367,7 +4375,7 @@ func handleWebSocketPadded(conn net.Conn, srvCtx *serverContext, logger *log.Log
 	// Verify X-Auth-Token against per-client secrets and global secret
 	authTokenHex, hasAuthToken := headers["X-Auth-Token"]
 	var usedSecret []byte
-	var clientID string
+	var clientID clientIdentity
 
 	if hasAuthToken {
 		authToken, err := hex.DecodeString(authTokenHex)
@@ -4383,7 +4391,7 @@ func handleWebSocketPadded(conn net.Conn, srvCtx *serverContext, logger *log.Log
 				if verifyMorphAuth(authToken, []byte(client.Secret)) {
 					logger.Info("WebSocket Padded authenticated (client: %s, id: %s)", client.Name, client.ID)
 					usedSecret = []byte(client.Secret)
-					clientID = client.ID
+					clientID = registryIdentity(client.ID)
 					break
 				}
 			}
@@ -4394,7 +4402,7 @@ func handleWebSocketPadded(conn net.Conn, srvCtx *serverContext, logger *log.Log
 			if verifyMorphAuth(authToken, srvCtx.cfg.Secret) {
 				logger.Info("WebSocket Padded authenticated (global secret)")
 				usedSecret = srvCtx.cfg.Secret
-				clientID = "global"
+				clientID = sharedIdentity(globalClientID)
 			}
 		}
 
@@ -4406,7 +4414,7 @@ func handleWebSocketPadded(conn net.Conn, srvCtx *serverContext, logger *log.Log
 		// No auth token - fallback to global secret for backward compatibility
 		if len(srvCtx.cfg.Secret) > 0 {
 			usedSecret = srvCtx.cfg.Secret
-			clientID = "global-legacy"
+			clientID = sharedIdentity("global-legacy")
 			logger.Debug("WebSocket Padded: No auth token, using global secret (legacy mode)")
 		} else {
 			logger.Error("WebSocket Padded: No auth token and no global secret configured")
@@ -4440,8 +4448,8 @@ func handleWebSocketPadded(conn net.Conn, srvCtx *serverContext, logger *log.Log
 	// the kernel send buffer.
 	preSwap := conn
 	conn = ktls.TryEnable(conn, "tired-ws")
-	if conn != preSwap && srvCtx.registry != nil && clientID != "" {
-		srvCtx.registry.SwapConn(clientID, preSwap, conn)
+	if conn != preSwap && srvCtx.registry != nil && clientID.id != "" {
+		srvCtx.registry.SwapConn(clientID.id, preSwap, conn)
 	}
 
 	// Wrap with SalamanderConn using the authenticated secret
@@ -4469,7 +4477,7 @@ func computeWebSocketAccept(key string) string {
 // HTTPPollingSession represents a single polling session
 type HTTPPollingSession struct {
 	ID         string
-	ClientID   string
+	ClientID   clientIdentity
 	Origin     string // Peer host of the request that opened the session
 	Secret     []byte
 	Created    time.Time
@@ -4543,7 +4551,7 @@ func (pm *HTTPPollingManager) cleanup() {
 }
 
 // GetOrCreate gets or creates a session
-func (pm *HTTPPollingManager) GetOrCreate(sessionID string, secret []byte, clientID, origin string) (*HTTPPollingSession, bool) {
+func (pm *HTTPPollingManager) GetOrCreate(sessionID string, secret []byte, clientID clientIdentity, origin string) (*HTTPPollingSession, bool) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
@@ -4833,7 +4841,7 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 	existingSess := pollingManager.Get(sessionID)
 
 	var usedSecret []byte
-	var clientID string
+	var clientID clientIdentity
 
 	if existingSess != nil {
 		// Session exists - verify auth against session's secret
@@ -4870,7 +4878,7 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 				secretBytes := []byte(c.Secret)
 				if verifyPollingAuth(authToken, sessionID, secretBytes) {
 					usedSecret = secretBytes
-					clientID = c.ID
+					clientID = registryIdentity(c.ID)
 					logger.Debug("HTTP Polling: Auth matched client '%s' (id=%s)", c.Name, c.ID)
 					break
 				}
@@ -4880,7 +4888,7 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 		if usedSecret == nil && len(srvCtx.cfg.Secret) > 0 {
 			if verifyPollingAuth(authToken, sessionID, srvCtx.cfg.Secret) {
 				usedSecret = srvCtx.cfg.Secret
-				clientID = "global"
+				clientID = sharedIdentity(globalClientID)
 				logger.Debug("HTTP Polling: Auth matched global secret")
 			}
 		}
@@ -5113,7 +5121,7 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 	}
 
 	requestedIP := net.IP(remainingData[0:4])
-	clientID := fmt.Sprintf("polling:%s", sess.ClientID)
+	clientID := sess.ClientID.prefixed("polling")
 	logger.Debug("HTTP Polling TUN: requestedIP=%s, clientID=%s", requestedIP, clientID)
 
 	// Check for version byte (v2 clients send 7 bytes total)
@@ -5175,7 +5183,7 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 
 		// Register client with shared TUN using custom framer for polling
 		// Polling uses [length:4][packet:N] framing
-		writer := srvCtx.sharedTUN.RegisterClient(clientIP, clientID, pollConn, nil)
+		writer := srvCtx.sharedTUN.RegisterClient(clientIP, clientID.id, pollConn, nil)
 		localSink := newLocalTUNSink(srvCtx.sharedTUN, writer, clientIP)
 		sink = localSink
 		defer func() {

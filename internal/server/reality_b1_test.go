@@ -21,7 +21,7 @@ type b1Fixture struct {
 	srvCtx    *serverContext
 	serverPub [32]byte
 	secret    []byte
-	clientID  string
+	clientID  clientIdentity
 }
 
 // newB1Fixture loads a static server key and builds a gate holding one client.
@@ -62,7 +62,7 @@ func newB1Fixture(t *testing.T, extraClients int) b1Fixture {
 		srvCtx:    &serverContext{cfg: cfg},
 		serverPub: serverPub,
 		secret:    secret,
-		clientID:  "alice",
+		clientID:  registryIdentity("alice"),
 	}
 }
 
@@ -166,7 +166,7 @@ func TestB1GateAcceptsValidHello(t *testing.T) {
 		t.Fatalf("valid hello did not authenticate: %s", verdict.reason)
 	}
 	if verdict.entry.clientID != f.clientID {
-		t.Fatalf("clientID = %q, want %q", verdict.entry.clientID, f.clientID)
+		t.Fatalf("clientID = %+v, want %+v", verdict.entry.clientID, f.clientID)
 	}
 	if string(verdict.entry.secret) != string(f.secret) {
 		t.Fatal("gate returned the wrong secret")
@@ -592,7 +592,7 @@ func TestShortIDIndexRebuildSkipsUnusableClients(t *testing.T) {
 		nil,
 	}, global)
 
-	if e, ok := idx.Lookup(customtls.ShortIDFor([]byte("good-secret"))); !ok || e.clientID != "ok" {
+	if e, ok := idx.Lookup(customtls.ShortIDFor([]byte("good-secret"))); !ok || e.clientID.id != "ok" || !e.clientID.perClient {
 		t.Fatal("an enabled client is missing from the index")
 	}
 	if _, ok := idx.Lookup(customtls.ShortIDFor([]byte("disabled-secret"))); ok {
@@ -601,7 +601,7 @@ func TestShortIDIndexRebuildSkipsUnusableClients(t *testing.T) {
 	if _, ok := idx.Lookup(customtls.ShortIDFor([]byte("expired-secret"))); ok {
 		t.Fatal("an expired client can still authenticate")
 	}
-	if e, ok := idx.Lookup(customtls.ShortIDFor(global)); !ok || e.clientID != "global" {
+	if e, ok := idx.Lookup(customtls.ShortIDFor(global)); !ok || e.clientID.id != "global" || e.clientID.perClient {
 		t.Fatal("the global secret is missing from the index")
 	}
 }

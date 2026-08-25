@@ -66,7 +66,7 @@ func TestRawTunnelKTLSHandover(t *testing.T) {
 			tlsConn.Close()
 			return
 		}
-		handleRawTunnel(tlsConn, srvCtx, logger, "")
+		handleRawTunnel(tlsConn, srvCtx, logger, clientIdentity{})
 	}()
 
 	// Client: dial, complete TLS handshake, send tired-raw frame.

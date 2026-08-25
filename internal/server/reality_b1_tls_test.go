@@ -363,7 +363,7 @@ func TestB1HandshakeIsBoundedAndTheTunnelIsNot(t *testing.T) {
 			return
 		}
 		rec := &deadlineRecorder{Conn: raw}
-		handleREALITYB1(rec, peek, "test-client", secret, customtls.AuthFlagExporterBinding, srvCtx, log.WithPrefix("test"))
+		handleREALITYB1(rec, peek, registryIdentity("test-client"), secret, customtls.AuthFlagExporterBinding, srvCtx, log.WithPrefix("test"))
 		recorded <- rec.seen()
 	}()
 

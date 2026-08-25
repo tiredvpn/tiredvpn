@@ -1,10 +1,7 @@
 package server
 
 import (
-	"crypto/hmac"
 	"crypto/rand"
-	"crypto/sha256"
-	"fmt"
 	"io"
 	"net"
 	"time"
@@ -385,11 +382,7 @@ func handleREALITYAuthenticated(conn net.Conn, srvCtx *serverContext, logger *lo
 	// Close connection to real destination (we only needed the certificate)
 	destConn.Close()
 
-	// Derive stable clientID from the shared secret — same user reconnects with the same secret,
-	// so gets the same clientID and same IP from the pool.
-	mac := hmac.New(sha256.New, usedSecret)
-	mac.Write([]byte("tiredvpn-client-id-v1"))
-	clientID := fmt.Sprintf("reality:%x", mac.Sum(nil)[:8])
+	clientID := realityClientIdentity(usedSecret)
 
 	logger.Info("REALITY: Tunnel established for %s (client: %s)", conn.RemoteAddr(), clientID)
 
@@ -448,7 +441,7 @@ func dataLayerVersion(v2 bool) int {
 // after its TypeMux write. params non-nil selects the v2 AEAD layer keyed by
 // this connection's X25519 exchange; nil is a v1 client, still keyed by
 // HKDF(secret, salt=clientPubKey).
-func handleREALITYMuxSession(conn net.Conn, srvCtx *serverContext, logger *log.Logger, clientID string, usedSecret []byte, clientPubKey [32]byte, params *strategy.RealityV2Params) {
+func handleREALITYMuxSession(conn net.Conn, srvCtx *serverContext, logger *log.Logger, clientID clientIdentity, usedSecret []byte, clientPubKey [32]byte, params *strategy.RealityV2Params) {
 	// Mirror the client-side wrap: server is !isClient so write/read keys are reversed.
 	var (
 		dataConn net.Conn
