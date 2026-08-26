@@ -143,7 +143,8 @@ For production use Let's Encrypt or any CA-signed certificate. See
 The server now:
 
 - Accepts TLS (TCP) on `:443` and QUIC (UDP) on `:443`
-- Also listens on `[::]:995` (`-listen-v6`, IPv6 is on by default)
+- Also listens on `[::]:443` — IPv6 is on by default and follows the `-listen`
+  port unless `-listen-v6` says otherwise
 - Serves a fake website to unauthenticated visitors, over HTTP/1.1 or HTTP/2
   depending on the ALPN the peer negotiated
 - Authenticates clients by HMAC-verified secret

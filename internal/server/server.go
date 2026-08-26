@@ -351,9 +351,11 @@ type Config struct {
 	MaxConcurrentConns int
 
 	// IPv6 Support
-	ListenAddrV6 string // "[::]:995"
-	EnableIPv6   bool   // default: true
-	DualStack    bool   // default: true
+	// ListenAddrV6 is the IPv6 listen address. Empty means "derive it from
+	// ListenAddr" — same port, host [::] — see resolveListenAddrV6.
+	ListenAddrV6 string
+	EnableIPv6   bool // default: true
+	DualStack    bool // default: true
 
 	// EnableICMP enables the ICMP tunnel server (requires CAP_NET_RAW).
 	// If the process lacks the capability, the listener is silently skipped.
@@ -537,13 +539,25 @@ func Run(cfg *Config) error {
 
 	go handleShutdownSignal(sigChan, srvCtx, quicServer, listener)
 
-	if cfg.EnableIPv6 && cfg.ListenAddrV6 != "" {
-		log.Info("Starting dual-stack mode: IPv4 and IPv6")
-		go func() {
-			if err := startIPv6Listener(cfg.ListenAddrV6, srvCtx); err != nil {
-				log.Error("IPv6 listener failed: %v", err)
-			}
-		}()
+	if cfg.EnableIPv6 {
+		// Derived here rather than at flag-parse time so every way of building
+		// a Config ends up under the same rule.
+		addrV6, derived, err := resolveListenAddrV6(cfg)
+		switch {
+		case err != nil:
+			log.Warn("IPv6 listener disabled: %v", err)
+		case derived:
+			log.Info("Starting dual-stack mode: IPv4 and IPv6 on %s (derived from -listen %s; pass -listen-v6 to override)", addrV6, cfg.ListenAddr)
+		default:
+			log.Info("Starting dual-stack mode: IPv4 and IPv6 on %s", addrV6)
+		}
+		if err == nil {
+			go func() {
+				if err := startIPv6Listener(addrV6, srvCtx); err != nil {
+					log.Error("IPv6 listener failed: %v", err)
+				}
+			}()
+		}
 	}
 
 	if cfg.EnableICMP {

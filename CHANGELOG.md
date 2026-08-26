@@ -7,6 +7,25 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The IPv6 listener now follows the `-listen` port instead of always trying
+  995.** `-listen-v6` defaulted to the literal `[::]:995`, and `-enable-v6` is
+  on by default, so every server told to listen anywhere other than 995 asked
+  for IPv6 on a port its operator never named. Where 995 was taken the listener
+  simply failed and left a line in the log - three units on one host, on 994,
+  996 and 997, all had no IPv6 entry at all while appearing configured for it.
+  Where 995 was free the process quietly opened it, adding observable surface
+  that only `ss -ltn` would reveal. An empty `-listen-v6` now takes the port
+  from `-listen` and binds `[::]` on it: `-listen :443` gives `[::]:443`,
+  `-listen 1.2.3.4:994` gives `[::]:994`. The log states the address and that it
+  was derived. IPv6 stays off, with the reason logged, when `-listen` already
+  names an IPv6 address or has no usable port.
+  - **This changes behavior for deployments that relied on the default.** A
+    server on a non-995 port used to attempt IPv6 on 995 and will now listen on
+    its own port - open that port for IPv6 in the firewall, and drop 995 if it
+    was opened only for this. An explicit `-listen-v6` is honored exactly as
+    before, including the Helm chart, which sets it.
 ## [1.6.0] - 2026-08-26
 
 ### Changed
