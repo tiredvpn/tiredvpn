@@ -26,6 +26,35 @@ Versions follow [Semantic Versioning](https://semver.org/).
     its own port - open that port for IPv6 in the firewall, and drop 995 if it
     was opened only for this. An explicit `-listen-v6` is honored exactly as
     before, including the Helm chart, which sets it.
+- **`VPN started on <iface> (IP: ...)` now prints the address the interface
+  carries.** It printed the address from the client config, which is the one
+  requested at handshake time; by the time the line is reached the exit has
+  already assigned an address and the TUN device has been moved to it. On a
+  server that hands out addresses from a pool the two differ on every start, and
+  the log showed three consecutive lines that contradicted each other. The line
+  is what operators read when diagnosing address assignment, and it was once
+  read as evidence of two clients sharing one tunnel address - a defect that did
+  not exist.
+- **The client no longer reports a local proxy it is not running.** `Listening
+  on <addr> (SOCKS5/HTTP)` was printed at startup, before any socket was opened
+  and before the mode was even chosen, so it appeared in every run that never
+  listens: all four benchmark modes, Android control-socket mode, TUN mode with
+  an empty `-listen` (a deliberate configuration where another process owns the
+  local port), and any run where the listen failed - that last one leaving the
+  log asserting both that the proxy listens and that it could not start. The
+  claim is now made where the socket is, once, and carries the address the
+  listener is bound to rather than the configured string. A proxy switched off
+  with an empty `-listen` says so explicitly instead of printing an empty
+  address. The same treatment covers the `HTTP proxy on <addr>` line, and proxy
+  mode - which had no success line at all and relied on the startup claim - now
+  reports its own listeners.
+  - **Behavior change in one corner:** proxy mode (no `-tun`) with an empty
+    `-listen` now fails at startup with an explanation. It used to reach
+    `net.Listen("tcp", "")`, which binds a random port on every interface - an
+    unauthenticated proxy reachable from outside, on a port nothing in the log
+    named. TUN mode is unaffected: an empty `-listen` there means the local
+    proxy is off, which is a supported configuration.
+
 ## [1.6.0] - 2026-08-26
 
 ### Changed
