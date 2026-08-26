@@ -7,6 +7,8 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.7.1] - 2026-08-27
+
 ### Fixed
 
 - **`-listen [::]:<port>` no longer switches the IPv6 listener off.** 1.7.0
