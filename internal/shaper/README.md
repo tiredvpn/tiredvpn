@@ -94,13 +94,20 @@ registration and determinism, and the `MorphedConn` Wrap/Unwrap roundtrip.
 go test ./internal/shaper/presets -run TestPreset_ -v
 ```
 
-Each histogram-backed preset is sampled 100k times and the empirical bin counts
-are compared against the spec weights with Pearson's χ². The Wilson–Hilferty
-cube-root transform yields the upper-tail p-value; tests pass when p > 0.05,
-i.e. we cannot reject the null hypothesis that samples come from the specified
-distribution. `random_per_session` instead runs a pairwise two-sample χ² across
-10 seeds and requires ≥ 60% of pairs to be distinguishable at p < 0.01 — the
-point of that preset is that two sessions do *not* look alike.
+`chrome_browsing`, `youtube_streaming` and `bittorrent_idle` are each sampled
+100k times and the empirical bin counts are compared against the spec weights
+with Pearson's χ². The Wilson–Hilferty cube-root transform yields the upper-tail
+p-value; tests pass when p > 0.05, i.e. we cannot reject the null hypothesis
+that samples come from the specified distribution.
+
+`random_per_session` is checked the other way round — the point of that preset
+is that two sessions do *not* look alike. It runs a pairwise two-sample χ² over
+10 seeds × 5000 samples on a coarse 10-bucket grid and requires ≥ 40% of pairs
+to be distinguishable at p < 0.01. The bar is 40% rather than something higher
+because there are only two data-plane-safe base presets to rotate between, so
+roughly half the pairs share a base and are similar by construction.
+
+`imap_sync` has no χ² test.
 
 ### End-to-end roundtrip
 
@@ -120,8 +127,11 @@ than the payload to pin the pacer's graceful-overflow contract.
 go test ./internal/strategy -run=^$ -bench=BenchmarkMorphedConn -benchmem
 ```
 
-Compares NoopShaper vs. `chrome_browsing` vs. `youtube_streaming` for a 64 KiB
-payload. Saved baseline: `internal/strategy/testdata/shaper_overhead.txt`.
+`BenchmarkMorphedConn_{Noop,Chrome,Youtube}Shaper` plus `_Async` variants, over
+a 64 KiB payload. Saved baseline:
+`internal/strategy/testdata/shaper_overhead.txt`. The deployment-realistic
+numbers in the next section come from `BenchmarkRealistic_*` instead — loopback
+TCP and a 16 MiB payload — so the two sets are not comparable.
 
 ### Visual / Jupyter inspection
 
