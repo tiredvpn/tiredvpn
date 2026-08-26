@@ -66,13 +66,13 @@ type v6BlockRule struct {
 // Order matters: every accept has to precede the final reject, which matches
 // everything left.
 //
-//	1. oifname lo        — local IPv6 (::1) never leaves the host
-//	2. oifname <tunnel>  — the tunnel's own v6, if dual-stack is live
-//	3. fe80::/10         — link-local: neighbour discovery, DAD, RS/RA
-//	4. ff00::/8          — multicast: RA/NS/MLD, mDNS, LLMNR
-//	5. <allow>/128       — the VPN server itself, so the transport can still
-//	                       reach an exit dialled over IPv6
-//	6. reject            — everything else, including all global unicast
+//  1. oifname lo        — local IPv6 (::1) never leaves the host
+//  2. oifname <tunnel>  — the tunnel's own v6, if dual-stack is live
+//  3. fe80::/10         — link-local: neighbour discovery, DAD, RS/RA
+//  4. ff00::/8          — multicast: RA/NS/MLD, mDNS, LLMNR
+//  5. <allow>/128       — the VPN server itself, so the transport can still
+//     reach an exit dialled over IPv6
+//  6. reject            — everything else, including all global unicast
 func ipv6BlockPlan(ifName string, allow []net.IP) []v6BlockRule {
 	rules := []v6BlockRule{
 		{Name: "accept " + loopbackIfName, Exprs: v6AcceptOifRule(loopbackIfName)},

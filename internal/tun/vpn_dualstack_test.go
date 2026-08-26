@@ -410,68 +410,6 @@ func TestReadHandshakeResponseNoPeekWithoutDual(t *testing.T) {
 	}
 }
 
-// TestResolveServerBypassIP6 covers the address the v6 bypass route is pinned
-// for: only a literal IPv6 (with or without a port) qualifies, and an IPv4
-// server address must not produce one — the v4 bypass already covers it.
-func TestResolveServerBypassIP6(t *testing.T) {
-	for _, tc := range []struct {
-		addr string
-		want string
-	}{
-		{"", ""},
-		{"[2001:db8::1]:995", "2001:db8::1"},
-		{"2001:db8::1", "2001:db8::1"},
-		{"1.2.3.4:995", ""},
-		{"1.2.3.4", ""},
-	} {
-		got := resolveServerBypassIP6(tc.addr)
-		if tc.want == "" {
-			if got != nil {
-				t.Errorf("resolveServerBypassIP6(%q) = %s, want nil", tc.addr, got)
-			}
-			continue
-		}
-		if got == nil || !got.Equal(net.ParseIP(tc.want)) {
-			t.Errorf("resolveServerBypassIP6(%q) = %s, want %s", tc.addr, got, tc.want)
-		}
-	}
-}
-
-// TestServerBypassIP6Source pins which config field the v6 bypass is taken
-// from. -server-v6 wins, but a v6 literal in -server has to work on its own:
-// that is how an exit reachable only over IPv6 is configured in practice, and
-// before this the bypass was silently skipped for it.
-func TestServerBypassIP6Source(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		cfg    VPNConfig
-		want   string
-		wantIs bool
-	}{
-		{"v6 only in -server", VPNConfig{ServerAddr: "[2001:db8::1]:997"}, "2001:db8::1", true},
-		{"v6 only in -server-v6", VPNConfig{ServerAddrV6: "[2001:db8::2]:995"}, "2001:db8::2", true},
-		{"both set, -server-v6 wins", VPNConfig{
-			ServerAddr:   "[2001:db8::1]:997",
-			ServerAddrV6: "[2001:db8::2]:995",
-		}, "2001:db8::2", true},
-		{"v4 server, no v6 anywhere", VPNConfig{ServerAddr: "1.2.3.4:995"}, "", false},
-		{"nothing configured", VPNConfig{}, "", false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			got := serverBypassIP6(tc.cfg)
-			if !tc.wantIs {
-				if got != nil {
-					t.Fatalf("serverBypassIP6 = %s, want nil", got)
-				}
-				return
-			}
-			if got == nil || !got.Equal(net.ParseIP(tc.want)) {
-				t.Fatalf("serverBypassIP6 = %s, want %s", got, tc.want)
-			}
-		})
-	}
-}
-
 // TestHandshakeRequestVersionByte checks the request bytes written by
 // doHandshake: still 8 bytes, only the version byte changes.
 func TestHandshakeRequestVersionByte(t *testing.T) {

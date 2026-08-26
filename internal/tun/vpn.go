@@ -214,69 +214,6 @@ type VPNConfig struct {
 	ProtectPath string // Unix socket path for VpnService.protect() calls
 }
 
-// resolveServerBypassIP extracts the server's public IP from a "host:port"
-// address for the full-tunnel bypass route. Returns nil if the host cannot be
-// resolved to an IP, in which case the bypass is simply skipped.
-func resolveServerBypassIP(serverAddr string) net.IP {
-	host, _, err := net.SplitHostPort(serverAddr)
-	if err != nil {
-		host = serverAddr
-	}
-	if ip := net.ParseIP(host); ip != nil {
-		return ip
-	}
-	ips, err := net.LookupIP(host)
-	if err != nil || len(ips) == 0 {
-		return nil
-	}
-	return ips[0]
-}
-
-// resolveServerBypassIP6 is the IPv6 twin of resolveServerBypassIP: it pulls
-// the server's IPv6 out of a "[host]:port" address so a /128 bypass can be
-// pinned before the dual-stack half-defaults (::/1 + 8000::/1) are installed.
-// Returns nil when the address carries no IPv6 — unlike resolveServerBypassIP
-// it never falls back to an A record, since an IPv4 bypass is already handled
-// by the v4 path.
-func resolveServerBypassIP6(serverAddr string) net.IP {
-	if serverAddr == "" {
-		return nil
-	}
-	host, _, err := net.SplitHostPort(serverAddr)
-	if err != nil {
-		host = serverAddr
-	}
-	if ip := net.ParseIP(host); ip != nil {
-		if ip.To4() != nil {
-			return nil
-		}
-		return ip
-	}
-	ips, err := net.LookupIP(host)
-	if err != nil {
-		return nil
-	}
-	for _, ip := range ips {
-		if ip.To4() == nil {
-			return ip
-		}
-	}
-	return nil
-}
-
-// serverBypassIP6 picks the IPv6 transport address a /128 bypass has to be
-// pinned for before the dual-stack half-defaults go in. -server-v6 wins when
-// set, but -server is checked too: an exit reachable only over IPv6 is
-// addressed by putting the v6 literal straight into -server, with no v4 flag at
-// all. Missing that case would drop the client's own transport socket into its
-// own tunnel the moment dual-stack is negotiated.
-func serverBypassIP6(cfg VPNConfig) net.IP {
-	if ips := serverIP6s(cfg); len(ips) > 0 {
-		return ips[0]
-	}
-	return nil
-}
-
 // serverAddrList returns every configured transport address, most preferred
 // first and deduplicated: -server-v6, -server, then the rest of the endpoint
 // list. The first two lead so a single-server client keeps the exact ordering
@@ -302,11 +239,15 @@ func serverAddrList(cfg VPNConfig) []string {
 func serverIP6s(cfg VPNConfig) []net.IP {
 	var out []net.IP
 	for _, addr := range serverAddrList(cfg) {
-		ip := resolveServerBypassIP6(addr)
-		if ip == nil || containsIP(out, ip) {
-			continue
+		for _, ip := range resolveBypassIPs(addr) {
+			// A v4-mapped literal (::ffff:1.2.3.4) is an IPv4 address wearing
+			// v6 syntax: the kernel has no v6 route for that form, and the v4
+			// bypass already covers the host.
+			if ip.To4() != nil || containsIP(out, ip) {
+				continue
+			}
+			out = append(out, ip)
 		}
-		out = append(out, ip)
 	}
 	return out
 }
