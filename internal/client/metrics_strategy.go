@@ -27,16 +27,16 @@ type StrategyMetrics struct {
 
 // NewStrategyMetrics creates a new strategy metrics collector
 func NewStrategyMetrics() *StrategyMetrics {
-	// TLS handshake duration buckets (milliseconds)
+	// TLS handshake duration buckets (seconds, to match the _seconds metric name)
 	// Covers 10ms to 5s for various network conditions
-	tlsBuckets := []float64{10, 50, 100, 200, 500, 1000, 2000, 5000}
+	tlsBuckets := []float64{0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5}
 
 	// Connection retry buckets (count)
 	retryBuckets := []float64{0, 1, 2, 3, 5, 10, 20}
 
-	// Connection phase timing buckets (milliseconds)
+	// Connection phase timing buckets (seconds, 1ms to 1s)
 	// For DNS, TCP, TLS, App layer phases
-	phaseBuckets := []float64{1, 5, 10, 50, 100, 500, 1000}
+	phaseBuckets := []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1}
 
 	// Fallback chain depth buckets (strategy count)
 	fallbackBuckets := []float64{0, 1, 2, 3, 4, 5}
@@ -59,7 +59,7 @@ func NewStrategyMetrics() *StrategyMetrics {
 
 // RecordTLSHandshake records TLS handshake duration for a strategy
 func (sm *StrategyMetrics) RecordTLSHandshake(strategyID string, duration time.Duration) {
-	sm.tlsHandshakeDuration.Observe(float64(duration.Milliseconds()))
+	sm.tlsHandshakeDuration.Observe(duration.Seconds())
 }
 
 // RecordConnectRetries records number of retry attempts for a connection
@@ -77,7 +77,7 @@ func (sm *StrategyMetrics) RecordSelectionReason(reason string) {
 // RecordPhaseDuration records connection phase duration (dns/tcp/tls/app)
 func (sm *StrategyMetrics) RecordPhaseDuration(phase string, duration time.Duration) {
 	if hist, ok := sm.phasesDuration[phase]; ok {
-		hist.Observe(float64(duration.Milliseconds()))
+		hist.Observe(duration.Seconds())
 	}
 }
 

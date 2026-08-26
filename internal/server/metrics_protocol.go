@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/metrics"
 )
@@ -27,8 +28,9 @@ type ProtocolMetrics struct {
 }
 
 func NewProtocolMetrics() *ProtocolMetrics {
-	// TLS handshake buckets (ms): 1, 5, 10, 50, 100, 200, 500, 1000
-	tlsBuckets := []float64{1, 5, 10, 50, 100, 200, 500, 1000}
+	// TLS handshake buckets (seconds, to match the _seconds metric name):
+	// 1ms, 5ms, 10ms, 50ms, 100ms, 200ms, 500ms, 1s
+	tlsBuckets := []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.2, 0.5, 1}
 
 	return &ProtocolMetrics{
 		quicPacketLoss:       make(map[string]float64),
@@ -64,8 +66,8 @@ func (pm *ProtocolMetrics) RecordQUIC0RTTAccepted() {
 }
 
 // TLS recording methods
-func (pm *ProtocolMetrics) RecordTLSHandshake(durationMs float64) {
-	pm.tlsHandshakeDuration.Observe(durationMs)
+func (pm *ProtocolMetrics) RecordTLSHandshake(duration time.Duration) {
+	pm.tlsHandshakeDuration.Observe(duration.Seconds())
 }
 
 func (pm *ProtocolMetrics) RecordTLSCipherSuite(suite string) {

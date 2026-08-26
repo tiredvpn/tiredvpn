@@ -149,7 +149,7 @@ Scrape rules matching on `tiredvpn_.*` will miss them.
 | `tiredvpn_postquantum_handshakes_total` | counter | — | Post-quantum handshakes |
 | `tiredvpn_geneva_effectiveness` | gauge | `key` | Geneva strategy effectiveness per key |
 | `tiredvpn_traffic_morph_mimicry_score` | gauge | `profile` | Traffic morphing accuracy per profile |
-| `tiredvpn_protocol_confusion_success_rate` | histogram | `type` | Protocol confusion effectiveness (see the bucket caveat below) |
+| `tiredvpn_protocol_confusion_success_rate` | histogram | `type` | Protocol confusion effectiveness, buckets 0.0-1.0 |
 
 ### Burst reshaping
 
@@ -168,7 +168,7 @@ Emitted when `-burst-reshape on` is in effect.
 |---|---|---|---|
 | `tiredvpn_tls_version` | gauge | `version` | TLS version usage |
 | `tiredvpn_tls_cipher_suite` | gauge | `suite` | Cipher suite usage |
-| `tiredvpn_tls_handshake_duration_seconds` | histogram | — | TLS handshake duration (**observed in milliseconds**) |
+| `tiredvpn_tls_handshake_duration_seconds` | histogram | — | TLS handshake duration, in seconds |
 | `tiredvpn_quic_rtt_milliseconds` | gauge | `client_id` | QUIC RTT |
 | `tiredvpn_quic_packet_loss_rate` | gauge | `client_id` | QUIC packet loss rate |
 | `tiredvpn_quic_congestion_events_total` | counter | `client_id` | QUIC congestion events |
@@ -216,7 +216,7 @@ Emitted when `-burst-reshape on` is in effect.
 | Metric | Type | Labels | Description |
 |---|---|---|---|
 | `tiredvpn_rtt_milliseconds` | histogram | — | RTT distribution |
-| `tiredvpn_connection_duration_seconds` | histogram | — | Connection lifetime (observed in seconds) |
+| `tiredvpn_connection_duration_seconds` | histogram | — | Connection lifetime, in seconds |
 | `tiredvpn_throughput_mbps` | gauge | `direction` (`upload`, `download`) | Current throughput |
 | `tiredvpn_bandwidth_utilization_percent` | gauge | — | Bandwidth utilisation |
 | `tiredvpn_packet_retransmissions_total` | counter | — | Packet retransmissions |
@@ -285,9 +285,9 @@ the rest of this block requires the adaptive strategy manager to be running.
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `tiredvpn_local_connect_phases_duration_seconds` | histogram | `phase` (`dns`, `tcp`, `tls`, `app`) | Per-phase connect duration (**observed in milliseconds**) |
-| `tiredvpn_local_tls_handshake_duration_seconds` | histogram | — | TLS handshake duration (**observed in milliseconds**) |
-| `tiredvpn_local_dns_resolution_duration_seconds` | histogram | — | DNS lookup time (**observed in milliseconds**) |
+| `tiredvpn_local_connect_phases_duration_seconds` | histogram | `phase` (`dns`, `tcp`, `tls`, `app`) | Per-phase connect duration, in seconds |
+| `tiredvpn_local_tls_handshake_duration_seconds` | histogram | — | TLS handshake duration, in seconds |
+| `tiredvpn_local_dns_resolution_duration_seconds` | histogram | — | DNS lookup time, in seconds |
 | `tiredvpn_local_connect_retries` | histogram | — | Retry attempts per connect |
 | `tiredvpn_local_fallback_chain_length` | histogram | — | Fallback chain depth |
 
@@ -349,21 +349,25 @@ Only populated by the Android client.
 
 Read these before writing dashboards or alerts.
 
-- **Duration histograms named `_seconds` hold milliseconds.**
+- **Every `_seconds` histogram is in seconds.** This was not always true.
   `tiredvpn_tls_handshake_duration_seconds`,
   `tiredvpn_local_tls_handshake_duration_seconds`,
   `tiredvpn_local_dns_resolution_duration_seconds` and
-  `tiredvpn_local_connect_phases_duration_seconds` are all observed with
-  `duration.Milliseconds()`, and their bucket boundaries are millisecond values
-  (1…5000). `tiredvpn_connection_duration_seconds` is the exception — it really
-  is seconds. `tiredvpn_local_strategy_latency_seconds` is a gauge and really is
-  seconds.
-- **Histogram `le` labels are rendered with no decimals** (`%.0f`). A histogram
-  with fractional boundaries collapses: `tiredvpn_protocol_confusion_success_rate`
-  has buckets 0.0…1.0, which all render as `le="0"` or `le="1"`. Treat its
-  `_sum`/`_count` as usable and its buckets as not.
+  `tiredvpn_local_connect_phases_duration_seconds` held milliseconds against
+  millisecond bucket boundaries (1…5000) up to and including 1.5.1, so quantiles
+  over them read 1000x too large. Their boundaries are now 0.001…5. Anything
+  scraped across the upgrade has a discontinuity at that point; queries written
+  for the old exposition need their thresholds divided by 1000.
+- Series named `_milliseconds` (`tiredvpn_rtt_milliseconds`,
+  `tiredvpn_local_rtt_milliseconds`, `tiredvpn_quic_rtt_milliseconds`,
+  `tiredvpn_relay_latency_overhead_milliseconds`) are unaffected and stay in
+  milliseconds.
 - Histograms emit `_bucket{le=...}` (cumulative, plus `+Inf`), `_sum` and
-  `_count`, as Prometheus expects.
+  `_count`, as Prometheus expects. `le` and `_sum` are rendered in shortest
+  round-trip form, so fractional boundaries survive:
+  `tiredvpn_protocol_confusion_success_rate` exposes eleven distinct buckets
+  across 0.0…1.0. Up to 1.5.1 they were printed with `%.0f` and collapsed onto
+  `le="0"` and `le="1"`.
 - **Five REALITY metrics have no `tiredvpn_` prefix** — see the table above.
 - Counter/gauge typing follows the `# TYPE` line in the source; a few series
   typed `counter` are monotonic-by-construction rather than by a counter
@@ -410,7 +414,7 @@ tiredvpn_local_strategy_current
 tiredvpn_local_strategy_confidence
 ```
 
-**Connect latency, p95 (client)** — remember the buckets are milliseconds:
+**Connect latency, p95 (client)** — the result is in seconds:
 
 ```promql
 histogram_quantile(0.95, sum by (phase, le) (rate(tiredvpn_local_connect_phases_duration_seconds_bucket[5m])))
