@@ -12,7 +12,6 @@ package endpoint
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 )
 
@@ -180,21 +179,14 @@ func (p FamilyPolicy) families() []Family {
 	}
 }
 
-// buildCandidates expands endpoints into the ordered candidate list.
+// buildCandidates expands endpoints into the ordered candidate list, taking the
+// endpoint order from the selection policy.
 //
 // The order is endpoint-major: every family of the first endpoint before the
 // second endpoint's. Falling back within a server is cheaper than moving to
 // another one (same secret, same bypass route, same latency profile), so it
 // must be tried first.
-func buildCandidates(endpoints []Endpoint, policy FamilyPolicy) []Candidate {
-	order := make([]int, len(endpoints))
-	for i := range order {
-		order[i] = i
-	}
-	sort.SliceStable(order, func(a, b int) bool {
-		return endpoints[order[a]].Order < endpoints[order[b]].Order
-	})
-
+func buildCandidates(endpoints []Endpoint, policy FamilyPolicy, order []int) []Candidate {
 	families := policy.families()
 	cands := make([]Candidate, 0, len(endpoints)*len(families))
 	seen := make(map[string]bool, len(endpoints)*len(families))

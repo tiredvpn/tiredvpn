@@ -62,33 +62,32 @@ type TUNDevice struct {
 	// from ever touching the main table / default route or another tunnel.
 	addedRoutes []*net.IPNet
 
-	// serverBypassIP is the VPN server's public IP. When the installed route set
-	// covers this IP (a default route, or the 0.0.0.0/1 + 128.0.0.0/1 pair), a
-	// /32 (or /128) host route to it is pinned through the current physical
-	// gateway so server traffic does not loop back into the tunnel. Set via
-	// SetServerBypassIP before Configure.
-	serverBypassIP net.IP
-	// bypassRoute is the host route installed for serverBypassIP, kept so
-	// teardown removes exactly it (it lives on the physical link, not the TUN,
-	// so delRoutes does not cover it). Guarded by bypassMu: the watcher
-	// goroutine re-pins it while Close may be tearing it down.
-	bypassRoute *netlink.Route
-	// serverBypassIP6 / bypassRoute6 are the IPv6 twins of the pair above.
-	// They matter only for a dual-stack tunnel: the ::/1 + 8000::/1
-	// half-defaults installed by EnableDualStack cover every IPv6
-	// destination, so a client using the IPv6 transport (-server-v6 /
-	// -prefer-ipv6) would route its own transport socket into the tunnel.
-	// Set via SetServerBypassIP6 before EnableDualStack.
-	serverBypassIP6 net.IP
-	bypassRoute6    *netlink.Route
-	// bypassPreexisted records that a host route to the server was already in
-	// the table before we pinned ours. Such a route belongs to the operator
-	// (NetworkManager profile, a boot script, a hand-typed `ip route add`), and
-	// on a host with no default route for that family it is the only way the
-	// server is reachable at all. Deleting it on teardown left the next client
-	// start with no path to the server, so teardown skips it.
-	bypassPreexisted  bool
-	bypass6Preexisted bool
+	// serverBypassIPs are every server transport address this client may dial.
+	// When the installed route set covers one of them (a default route, or the
+	// 0.0.0.0/1 + 128.0.0.0/1 pair), a /32 (or /128) host route to it is pinned
+	// through the current physical gateway so server traffic does not loop back
+	// into the tunnel.
+	//
+	// It is a set, not one address per family, because the client walks a list
+	// of servers: with a full tunnel up, dialling the SECOND server without a
+	// pin of its own routes that dial into the tunnel and it dies there. Every
+	// endpoint is therefore pinned at startup rather than at the moment of the
+	// switch - which also removes the race where the client has moved on but
+	// the route has not. Set via SetServerBypassIPs before Configure.
+	serverBypassIPs []net.IP
+	// bypassRoutes maps a bypass address to the host route installed for it,
+	// kept so teardown removes exactly those (they live on the physical link,
+	// not the TUN, so delRoutes does not cover them). Guarded by bypassMu: the
+	// watcher goroutine re-pins them while Close may be tearing them down.
+	bypassRoutes map[string]*netlink.Route
+	// bypassPreexisted records, per address, that a host route to it was
+	// already in the table before we pinned ours. Such a route belongs to the
+	// operator (NetworkManager profile, a boot script, a hand-typed
+	// `ip route add`), and on a host with no default route for that family it
+	// is the only way the server is reachable at all. Deleting it on teardown
+	// left the next client start with no path to the server, so teardown skips
+	// it.
+	bypassPreexisted map[string]bool
 	// v6BlockAllow are the IPv6 addresses punched through the leak block (the
 	// server's own transport addresses). Guarded by bypassMu, like the bypass
 	// state it mirrors.
@@ -144,43 +143,84 @@ func (t *TUNDevice) SetDeferRoutes(defer_ bool) {
 	t.deferRoutes = defer_
 }
 
-// SetServerBypassIP records the VPN server's public IP so that, when a default
-// route is installed, traffic to the server keeps leaving via the physical
-// interface instead of looping through the tunnel. Linux only; on Android the
-// server socket is protected via VpnService.protect() instead.
-func (t *TUNDevice) SetServerBypassIP(ip net.IP) {
+// SetServerBypassIPs records every server transport address that must keep
+// leaving via the physical interface instead of looping through the tunnel.
+// Nil and duplicate addresses are dropped. Replaces the whole set, so it is the
+// one call a caller with a server list needs. Linux only; on Android the server
+// socket is protected via VpnService.protect() instead.
+func (t *TUNDevice) SetServerBypassIPs(ips []net.IP) {
+	out := make([]net.IP, 0, len(ips))
+	for _, ip := range ips {
+		if ip == nil || containsIP(out, ip) {
+			continue
+		}
+		out = append(out, ip)
+	}
 	t.bypassMu.Lock()
-	t.serverBypassIP = ip
+	t.serverBypassIPs = out
 	t.bypassMu.Unlock()
 }
 
-// SetServerBypassIP6 records the VPN server's public IPv6 so that, once the
-// dual-stack half-default routes are installed, traffic to the server keeps
-// leaving via the physical interface instead of looping through the tunnel.
-// Linux only; on Android the server socket is protected via VpnService.protect().
+// SetServerBypassIP records the VPN server's public IPv4, replacing whatever
+// IPv4 addresses were in the bypass set. A wrapper over SetServerBypassIPs kept
+// for the single-server callers (macOS, tests, benchmarks).
+func (t *TUNDevice) SetServerBypassIP(ip net.IP) {
+	t.replaceBypassFamily(ip, false)
+}
+
+// SetServerBypassIP6 is the IPv6 twin of SetServerBypassIP. It matters only for
+// a dual-stack tunnel: the ::/1 + 8000::/1 half-defaults installed by
+// EnableDualStack cover every IPv6 destination, so a client using the IPv6
+// transport would route its own transport socket into the tunnel.
 func (t *TUNDevice) SetServerBypassIP6(ip net.IP) {
 	if ip != nil && ip.To4() != nil {
 		return // not an IPv6 address; the v4 bypass covers it
 	}
-	t.bypassMu.Lock()
-	t.serverBypassIP6 = ip
-	t.bypassMu.Unlock()
+	t.replaceBypassFamily(ip, true)
 }
 
-// bypassIP returns the server IP to keep off the tunnel, or nil once the device
+// replaceBypassFamily swaps out every address of one family, leaving the other
+// family's entries alone. That is what makes the two legacy setters composable:
+// calling both leaves one address of each, exactly as the old pair of fields
+// held.
+func (t *TUNDevice) replaceBypassFamily(ip net.IP, v6 bool) {
+	t.bypassMu.Lock()
+	defer t.bypassMu.Unlock()
+	kept := make([]net.IP, 0, len(t.serverBypassIPs)+1)
+	for _, existing := range t.serverBypassIPs {
+		if isV6(existing) == v6 {
+			continue
+		}
+		kept = append(kept, existing)
+	}
+	if ip != nil && !containsIP(kept, ip) {
+		kept = append(kept, ip)
+	}
+	t.serverBypassIPs = kept
+}
+
+// bypassIPs returns every address to keep off the tunnel, empty once the device
 // is torn down. Read under the lock because the watcher goroutine races Close.
-func (t *TUNDevice) bypassIP() net.IP {
+func (t *TUNDevice) bypassIPs() []net.IP {
 	t.bypassMu.Lock()
 	defer t.bypassMu.Unlock()
-	return t.serverBypassIP
+	return append([]net.IP(nil), t.serverBypassIPs...)
 }
 
-// bypassIP6 is the IPv6 twin of bypassIP.
-func (t *TUNDevice) bypassIP6() net.IP {
-	t.bypassMu.Lock()
-	defer t.bypassMu.Unlock()
-	return t.serverBypassIP6
+// bypassIPsFamily returns the bypass addresses of one family.
+func (t *TUNDevice) bypassIPsFamily(v6 bool) []net.IP {
+	out := make([]net.IP, 0, 2)
+	for _, ip := range t.bypassIPs() {
+		if isV6(ip) == v6 {
+			out = append(out, ip)
+		}
+	}
+	return out
 }
+
+// isV6 reports whether ip is an IPv6 address (v4-mapped forms count as IPv4,
+// matching what physicalRouteTo and pinBypass decide the family from).
+func isV6(ip net.IP) bool { return ip != nil && ip.To4() == nil }
 
 // mssTableName returns the per-interface nftables table name for MSS clamping.
 // It is scoped to the interface so tearing down one tunnel never deletes the
@@ -283,34 +323,15 @@ func (t *TUNDevice) Close() error {
 	// Remove the server bypass host route (it lives on the physical link, not
 	// the TUN, so delRoutes does not cover it).
 	t.bypassMu.Lock()
-	for _, b := range []struct {
-		route       *netlink.Route
-		preexisting bool
-	}{
-		{t.bypassRoute, t.bypassPreexisted},
-		{t.bypassRoute6, t.bypass6Preexisted},
-	} {
-		if b.route == nil {
-			continue
-		}
-		if b.preexisting {
-			// The operator's own host route to the server. On a host with no
-			// default route for that family it is the only path there, so
-			// deleting it would strand the next client start.
-			log.Debug("Server bypass: leaving pre-existing route to %s in place", b.route.Dst)
-			continue
-		}
-		if err := netlink.RouteDel(b.route); err != nil {
+	for _, route := range bypassRoutesToDelete(t.bypassRoutes, t.bypassPreexisted) {
+		if err := netlink.RouteDel(route); err != nil {
 			log.Debug("Failed to delete server bypass route: %v", err)
 		}
 	}
-	t.bypassRoute = nil
-	t.bypassRoute6 = nil
-	t.bypassPreexisted = false
-	t.bypass6Preexisted = false
+	t.bypassRoutes = nil
+	t.bypassPreexisted = nil
 	// Stop the watcher from re-pinning routes we just tore down.
-	t.serverBypassIP = nil
-	t.serverBypassIP6 = nil
+	t.serverBypassIPs = nil
 	t.bypassMu.Unlock()
 
 	t.file.SetReadDeadline(time.Now())
@@ -677,6 +698,18 @@ func routesCoverIP(routes []string, ip net.IP) bool {
 	return false
 }
 
+// routesCoverAnyIP is routesCoverIP over a whole bypass set. One covered
+// address is enough to need the bypass machinery, and pinning is per-address
+// anyway, so there is nothing to gain from knowing which ones matched.
+func routesCoverAnyIP(routes []string, ips []net.IP) bool {
+	for _, ip := range ips {
+		if routesCoverIP(routes, ip) {
+			return true
+		}
+	}
+	return false
+}
+
 // physicalRouteTo finds the most specific route to ip that does NOT go through
 // our own TUN, i.e. the path the server traffic must keep taking. It reads the
 // main table directly instead of using RouteGet because once the tunnel routes
@@ -734,13 +767,22 @@ func (t *TUNDevice) physicalRouteTo(ip net.IP) (*netlink.Route, error) {
 // bypass that was wiped out from under us (e.g. a Wi-Fi reassociation takes the
 // link down and the kernel drops every route attached to it). No-op if no
 // server IP was set.
-func (t *TUNDevice) addServerBypass() { t.pinBypass(t.bypassIP()) }
+func (t *TUNDevice) addServerBypass() { t.pinBypassAll(t.bypassIPsFamily(false)) }
 
-// addServerBypass6 pins the same host route for the IPv6 transport address.
+// addServerBypass6 pins the same host routes for the IPv6 transport addresses.
 // Called by EnableDualStack before the ::/1 + 8000::/1 half-defaults land, so
 // a client dialling its server over IPv6 never routes that socket into its own
 // tunnel. No-op when no v6 server address was configured.
-func (t *TUNDevice) addServerBypass6() { t.pinBypass(t.bypassIP6()) }
+func (t *TUNDevice) addServerBypass6() { t.pinBypassAll(t.bypassIPsFamily(true)) }
+
+// pinBypassAll pins one host route per address. A failure on one address is
+// logged and skipped rather than aborting: the remaining endpoints are still
+// worth pinning, and the client can reach the server through any of them.
+func (t *TUNDevice) pinBypassAll(ips []net.IP) {
+	for _, ip := range ips {
+		t.pinBypass(ip)
+	}
+}
 
 // hostRouteExists reports whether the routing table already holds a route for
 // exactly dst. Used to tell an operator-installed host route to the server
@@ -759,6 +801,34 @@ func hostRouteExists(dst *net.IPNet, v6 bool) bool {
 		return false
 	}
 	return len(routes) > 0
+}
+
+// bypassRoutesToDelete picks the bypass routes teardown owns, i.e. the ones it
+// pinned itself.
+//
+// A route that was already in the table before we pinned ours belongs to the
+// operator (NetworkManager profile, boot script, hand-typed `ip route add`),
+// and on a host with no default route for that family it is the only way the
+// server is reachable at all: deleting it strands the next client start. With a
+// server list this is a per-address decision - one endpoint being operator-owned
+// says nothing about the others - which is why it is a map lookup and not a
+// pair of booleans.
+//
+// Split out of Close so the decision is testable without root: installing a
+// real route to compare against needs CAP_NET_ADMIN, the rule does not.
+func bypassRoutesToDelete(routes map[string]*netlink.Route, preexisted map[string]bool) []*netlink.Route {
+	out := make([]*netlink.Route, 0, len(routes))
+	for key, route := range routes {
+		if route == nil {
+			continue
+		}
+		if preexisted[key] {
+			log.Debug("Server bypass: leaving pre-existing route to %s in place", route.Dst)
+			continue
+		}
+		out = append(out, route)
+	}
+	return out
 }
 
 // pinBypass installs the /32 (v4) or /128 (v6) host route to ip through the
@@ -790,32 +860,36 @@ func (t *TUNDevice) pinBypass(ip net.IP) {
 		log.Warn("Server bypass: failed to pin host route to %s: %v", ip, err)
 		return
 	}
+	key := ip.String()
 	t.bypassMu.Lock()
-	// Close raced us and tore the device down: undo the pin instead of leaking it.
-	closed := (v6 && t.serverBypassIP6 == nil) || (!v6 && t.serverBypassIP == nil)
-	if !closed {
-		if v6 {
-			t.bypassRoute6 = bypass
-			t.bypass6Preexisted = t.bypass6Preexisted || preexisting
-		} else {
-			t.bypassRoute = bypass
-			t.bypassPreexisted = t.bypassPreexisted || preexisting
+	// Close raced us and dropped this address: undo the pin instead of leaking
+	// a route nothing will ever tear down. Checking the address itself rather
+	// than "any address of this family" is what keeps one endpoint's teardown
+	// from silently orphaning another's route.
+	dropped := !containsIP(t.serverBypassIPs, ip)
+	if !dropped {
+		if t.bypassRoutes == nil {
+			t.bypassRoutes = make(map[string]*netlink.Route, len(t.serverBypassIPs))
+			t.bypassPreexisted = make(map[string]bool, len(t.serverBypassIPs))
 		}
+		t.bypassRoutes[key] = bypass
+		t.bypassPreexisted[key] = t.bypassPreexisted[key] || preexisting
 	}
 	t.bypassMu.Unlock()
-	if closed {
+	if dropped {
 		netlink.RouteDel(bypass)
 		return
 	}
 	log.Info("Server bypass route pinned: %s/%d via %v (linkIndex %d)", ip, bits, r.Gw, r.LinkIndex)
 }
 
-// EnsureServerBypass re-pins the server bypass if traffic to the server would
-// currently go through the tunnel. Cheap enough to poll: the healthy path costs
-// one RouteGet per configured family and touches nothing.
+// EnsureServerBypass re-pins the server bypasses if traffic to any of them
+// would currently go through the tunnel. Cheap enough to poll: the healthy path
+// costs one RouteGet per configured address and touches nothing.
 func (t *TUNDevice) EnsureServerBypass() {
-	t.ensureBypass(t.bypassIP())
-	t.ensureBypass(t.bypassIP6())
+	for _, ip := range t.bypassIPs() {
+		t.ensureBypass(ip)
+	}
 }
 
 func (t *TUNDevice) ensureBypass(ip net.IP) {
@@ -845,7 +919,7 @@ func (t *TUNDevice) ensureBypass(ip net.IP) {
 // full-tunnel routes swallow the traffic to the server and every reconnect
 // attempt dials into the dead tunnel. Returns when stop is closed.
 func (t *TUNDevice) WatchServerBypass(stop <-chan struct{}) {
-	if t.bypassIP() == nil && t.bypassIP6() == nil {
+	if len(t.bypassIPs()) == 0 {
 		return
 	}
 	ticker := time.NewTicker(bypassWatchInterval)
@@ -861,8 +935,11 @@ func (t *TUNDevice) WatchServerBypass(stop <-chan struct{}) {
 }
 
 func (t *TUNDevice) addRoutes(link netlink.Link, routes []string) {
-	// Pin the server bypass before any tunnel route that covers the server lands.
-	if routesCoverIP(routes, t.bypassIP()) {
+	// Pin the server bypasses before any tunnel route that covers a server
+	// lands. All of them, at once: the client walks its endpoint list without
+	// telling this layer, so pinning only the one it happens to be using now
+	// would leave the next dial to route itself into the tunnel.
+	if routesCoverAnyIP(routes, t.bypassIPsFamily(false)) {
 		t.addServerBypass()
 	}
 	var invalid []string
@@ -953,7 +1030,7 @@ func (t *TUNDevice) untrackRoute(dst *net.IPNet) {
 func (t *TUNDevice) reAddRoutes(link netlink.Link, reason string) {
 	// A reconnect often follows the very event that wiped the bypass (link flap,
 	// gateway change), so verify it before re-asserting the tunnel routes.
-	if routesCoverIP(t.routes, t.bypassIP()) {
+	if routesCoverAnyIP(t.routes, t.bypassIPs()) {
 		t.EnsureServerBypass()
 	}
 	for _, route := range t.routes {

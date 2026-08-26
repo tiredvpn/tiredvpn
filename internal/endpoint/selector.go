@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net"
+	"sort"
 	"sync"
 	"time"
 )
@@ -40,6 +41,11 @@ type DialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 type Config struct {
 	Endpoints []Endpoint
 	Family    FamilyPolicy
+
+	// Selection ranks endpoints against each other; Family ranks the addresses
+	// within one endpoint. The zero value is SelectPriority - the configured
+	// order, which is what a single-endpoint client has always done.
+	Selection SelectionPolicy
 
 	// FailureThreshold is how many failed connect CYCLES put a candidate in
 	// cooldown. Counting individual strategy failures instead would trip on the
@@ -152,7 +158,7 @@ func NewSelector(cfg Config) (*Selector, error) {
 
 	eps := make([]Endpoint, len(cfg.Endpoints))
 	copy(eps, cfg.Endpoints)
-	cands := buildCandidates(eps, cfg.Family)
+	cands := buildCandidates(eps, cfg.Family, endpointOrder(eps, cfg.Selection, cfg.Rand))
 	if len(cands) == 0 {
 		return nil, fmt.Errorf("%w (policy=%s, endpoints=%d)", ErrNoCandidates, cfg.Family, len(eps))
 	}
@@ -270,15 +276,17 @@ func (s *Selector) Reconsider(now time.Time) (Candidate, bool) {
 		return Candidate{}, false
 	}
 
+	rank := s.rankLocked()
+
 	if s.inCooldownLocked(s.pinnedIdx, now) {
-		if i, ok := s.firstAvailableLocked(now); ok {
+		if i, ok := s.firstAvailableLocked(rank, now); ok {
 			s.repinLocked(i, now)
 			return s.cands[s.pinnedIdx], true
 		}
 	}
 
-	if s.pinnedIdx > 0 && now.Sub(s.pinnedAt) >= s.cfg.MinDwell {
-		for i := range s.pinnedIdx {
+	if pos := rankPos(rank, s.pinnedIdx); pos > 0 && now.Sub(s.pinnedAt) >= s.cfg.MinDwell {
+		for _, i := range rank[:pos] {
 			if !s.inCooldownLocked(i, now) {
 				s.repinLocked(i, now)
 				break
@@ -287,6 +295,65 @@ func (s *Selector) Reconsider(now time.Time) (Candidate, bool) {
 	}
 
 	return s.cands[s.pinnedIdx], true
+}
+
+// rankLocked returns the candidate indices in preference order under the active
+// selection policy. For every policy but SelectLatency that is the order the
+// candidate list was built in, so this is the identity permutation.
+//
+// Latency re-ranks ENDPOINTS, never the families inside one. Sorting the two
+// addresses of one server by RTT would silently override the family policy -
+// a separate decision the operator already made, and one with consequences
+// (a censor that throttles IPv4 makes it the slow one on purpose) that a
+// millisecond comparison has no business reversing.
+func (s *Selector) rankLocked() []int {
+	rank := make([]int, len(s.cands))
+	for i := range rank {
+		rank[i] = i
+	}
+	if s.cfg.Selection != SelectLatency {
+		return rank
+	}
+
+	best := make(map[int]time.Duration, len(s.endpoints))
+	for i, c := range s.cands {
+		l := s.health[i].latencyEWMA
+		if l <= 0 {
+			continue
+		}
+		if cur, seen := best[c.EndpointIdx]; !seen || l < cur {
+			best[c.EndpointIdx] = l
+		}
+	}
+	if len(best) == 0 {
+		return rank
+	}
+
+	sort.SliceStable(rank, func(a, b int) bool {
+		la, oka := best[s.cands[rank[a]].EndpointIdx]
+		lb, okb := best[s.cands[rank[b]].EndpointIdx]
+		if oka != okb {
+			// A measured endpoint outranks an unmeasured one. The alternative -
+			// treating "unknown" as "fast" - would send every reconnect to a
+			// server nobody has ever timed.
+			return oka
+		}
+		if oka && la != lb {
+			return la < lb
+		}
+		return false
+	})
+	return rank
+}
+
+// rankPos returns the position of candidate index i in the rank order.
+func rankPos(rank []int, i int) int {
+	for pos, idx := range rank {
+		if idx == i {
+			return pos
+		}
+	}
+	return 0
 }
 
 // Next returns the candidate to try after the pinned one failed, without
@@ -304,16 +371,19 @@ func (s *Selector) Next(now time.Time) (Candidate, bool) {
 		return Candidate{}, false
 	}
 
-	for k := 1; k < len(s.cands); k++ {
-		i := (s.pinnedIdx + k) % len(s.cands)
+	rank := s.rankLocked()
+	pos := rankPos(rank, s.pinnedIdx)
+
+	for k := 1; k < len(rank); k++ {
+		i := rank[(pos+k)%len(rank)]
 		if !s.inCooldownLocked(i, now) {
 			return s.cands[i], true
 		}
 	}
 
 	best := -1
-	for k := 1; k < len(s.cands); k++ {
-		i := (s.pinnedIdx + k) % len(s.cands)
+	for k := 1; k < len(rank); k++ {
+		i := rank[(pos+k)%len(rank)]
 		if best < 0 || betterFallback(s.health[i], s.health[best]) {
 			best = i
 		}
@@ -334,9 +404,10 @@ func betterFallback(a, b health) bool {
 	return a.cooldownUntil.Before(b.cooldownUntil)
 }
 
-// firstAvailableLocked returns the most preferred candidate not in cooldown.
-func (s *Selector) firstAvailableLocked(now time.Time) (int, bool) {
-	for i := range s.cands {
+// firstAvailableLocked returns the most preferred candidate not in cooldown,
+// walking the rank order rather than the raw index order.
+func (s *Selector) firstAvailableLocked(rank []int, now time.Time) (int, bool) {
+	for _, i := range rank {
 		if !s.inCooldownLocked(i, now) {
 			return i, true
 		}
@@ -537,7 +608,8 @@ func (s *Selector) ProbeCurrent(ctx context.Context) (Candidate, bool) {
 // hasFallbackAfterLocked reports whether some less-preferred candidate is
 // available to fall back to.
 func (s *Selector) hasFallbackAfterLocked(i int, now time.Time) bool {
-	for j := i + 1; j < len(s.cands); j++ {
+	rank := s.rankLocked()
+	for _, j := range rank[rankPos(rank, i)+1:] {
 		if !s.inCooldownLocked(j, now) {
 			return true
 		}

@@ -197,12 +197,21 @@ func (s *ICMPTunnelStrategy) Probe(ctx context.Context, target string) error {
 
 // Connect establishes ICMP tunnel connection
 func (s *ICMPTunnelStrategy) Connect(ctx context.Context, target string) (net.Conn, error) {
-	log.Debug("ICMP Tunnel: Connecting to %s via %s (mode=%s)", target, s.serverAddr, s.mode)
+	// The address to tunnel to is whatever the caller passed - i.e. the endpoint
+	// the selector pinned for this cycle. s.serverAddr, baked in at
+	// construction, is only the fallback for callers that pass nothing: with a
+	// server list it names the first endpoint forever, so honouring it over
+	// target would keep pinging a server the client has already given up on.
+	dest := target
+	if dest == "" {
+		dest = s.serverAddr
+	}
+	log.Debug("ICMP Tunnel: Connecting to %s (mode=%s)", dest, s.mode)
 
 	// Extract host from server address
-	host, _, err := net.SplitHostPort(s.serverAddr)
+	host, _, err := net.SplitHostPort(dest)
 	if err != nil {
-		host = s.serverAddr
+		host = dest
 	}
 
 	// Resolve server IP

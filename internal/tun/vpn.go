@@ -174,6 +174,17 @@ type VPNConfig struct {
 	// transport socket. Recorded so the TUN can pin a /128 bypass for it.
 	ServerAddrV6 string
 
+	// ServerAddrs is every transport address of every configured endpoint, in
+	// "host:port" form, including the two above. With a server list the client
+	// may dial any of them, and under a full tunnel a dial to an unpinned
+	// address routes straight into the tunnel and dies there - so all of them
+	// are pinned at startup, before the first switch rather than at the moment
+	// of it.
+	//
+	// Empty means "just ServerAddr / ServerAddrV6", which is what every
+	// single-server caller (macOS, JNI, benchmarks) keeps passing.
+	ServerAddrs []string
+
 	// AutoMTU enables the active MTU probe. When set, MTU becomes the upper bound
 	// (cap) and the client measures the real end-to-end ceiling, applying
 	// min(probed, cap). Only effective on interfaces we own (non-fd Linux/macOS).
@@ -263,30 +274,89 @@ func serverBypassIP6(cfg VPNConfig) net.IP {
 	return nil
 }
 
-// serverIP6s lists every IPv6 transport address this client might dial, in
-// preference order (-server-v6 first, then -server). serverBypassIP6 pins a
-// route for the first one; the IPv6 leak block has to punch a hole for all of
-// them, since the strategy manager can switch between them across reconnects
-// and a hole for an address that is never dialled costs nothing.
-func serverIP6s(cfg VPNConfig) []net.IP {
-	var out []net.IP
-	for _, addr := range []string{cfg.ServerAddrV6, cfg.ServerAddr} {
-		ip := resolveServerBypassIP6(addr)
-		if ip == nil {
+// serverAddrList returns every configured transport address, most preferred
+// first and deduplicated: -server-v6, -server, then the rest of the endpoint
+// list. The first two lead so a single-server client keeps the exact ordering
+// it had before the list existed.
+func serverAddrList(cfg VPNConfig) []string {
+	out := make([]string, 0, 2+len(cfg.ServerAddrs))
+	seen := make(map[string]bool, 2+len(cfg.ServerAddrs))
+	for _, addr := range append([]string{cfg.ServerAddrV6, cfg.ServerAddr}, cfg.ServerAddrs...) {
+		if addr == "" || seen[addr] {
 			continue
 		}
-		dup := false
-		for _, seen := range out {
-			if seen.Equal(ip) {
-				dup = true
-				break
-			}
+		seen[addr] = true
+		out = append(out, addr)
+	}
+	return out
+}
+
+// serverIP6s lists every IPv6 transport address this client might dial, in
+// preference order. serverBypassIP6 pins a route for the first one; the IPv6
+// leak block has to punch a hole for all of them, since the client can switch
+// between them across reconnects and a hole for an address that is never
+// dialled costs nothing.
+func serverIP6s(cfg VPNConfig) []net.IP {
+	var out []net.IP
+	for _, addr := range serverAddrList(cfg) {
+		ip := resolveServerBypassIP6(addr)
+		if ip == nil || containsIP(out, ip) {
+			continue
 		}
-		if !dup {
+		out = append(out, ip)
+	}
+	return out
+}
+
+// serverBypassIPs lists every address a host route has to be pinned for: one
+// per configured endpoint, both families.
+//
+// A hostname contributes ALL of its records, not just the first. The dialer is
+// free to pick any of them, and a /32 to an address that is never dialled costs
+// one routing-table entry - whereas missing the one that IS dialled costs the
+// tunnel.
+func serverBypassIPs(cfg VPNConfig) []net.IP {
+	var out []net.IP
+	for _, addr := range serverAddrList(cfg) {
+		for _, ip := range resolveBypassIPs(addr) {
+			if containsIP(out, ip) {
+				continue
+			}
 			out = append(out, ip)
 		}
 	}
 	return out
+}
+
+// resolveBypassIPs turns one "host:port" address into every IP behind it. An
+// address literal resolves to itself; a hostname to all of its A and AAAA
+// records. An unresolvable host yields nothing and is simply skipped, which is
+// the pre-existing behaviour for a bypass that cannot be computed.
+func resolveBypassIPs(serverAddr string) []net.IP {
+	if serverAddr == "" {
+		return nil
+	}
+	host, _, err := net.SplitHostPort(serverAddr)
+	if err != nil {
+		host = serverAddr
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return []net.IP{ip}
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return nil
+	}
+	return ips
+}
+
+func containsIP(list []net.IP, ip net.IP) bool {
+	for _, existing := range list {
+		if existing.Equal(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // ipv6PolicyOrLegacy resolves the effective policy: IPv6Policy when set,
@@ -351,19 +421,18 @@ func NewVPNClient(cfg VPNConfig) (*VPNClient, error) {
 		// device at IPv6PolicyOff, because on Android VpnService owns both
 		// routing and filtering.
 		tunDev.SetIPv6Policy(cfg.ipv6PolicyOrLegacy())
-		// Pin a server bypass route before configuring routes, so a full-tunnel
-		// default route does not loop the client's own server traffic.
-		if bypassIP := resolveServerBypassIP(cfg.ServerAddr); bypassIP != nil {
-			tunDev.SetServerBypassIP(bypassIP)
-		}
-		// Same for the IPv6 transport: once dual-stack is negotiated the
-		// ::/1 + 8000::/1 half-defaults cover every IPv6 destination, the
-		// client's own server among them. Pinned unconditionally when a v6
-		// server address is configured — a /128 host route to an address the
-		// manager ends up not dialling costs nothing, and -prefer-ipv6 can
-		// flip between reconnects.
-		if bypassIP6 := serverBypassIP6(cfg); bypassIP6 != nil {
-			tunDev.SetServerBypassIP6(bypassIP6)
+		// Pin a bypass route for EVERY configured endpoint before configuring
+		// routes, so a full-tunnel default route does not loop the client's own
+		// server traffic - not for the current endpoint alone, because by the
+		// time the client decides to try the second one the tunnel is already
+		// up and the unpinned dial goes into it.
+		//
+		// This covers both families for the same reason it always did on the v6
+		// side: once dual-stack is negotiated the ::/1 + 8000::/1 half-defaults
+		// cover every IPv6 destination, the client's own servers among them.
+		if bypassIPs := serverBypassIPs(cfg); len(bypassIPs) > 0 {
+			tunDev.SetServerBypassIPs(bypassIPs)
+			log.Debug("Server bypass: %d endpoint address(es) will be pinned", len(bypassIPs))
 		}
 		// Same addresses, one layer down: the IPv6 leak block rejects outbound
 		// v6, and the client's own transport must not be caught by it.
@@ -1598,37 +1667,56 @@ func (v *VPNClient) handleDisconnect() {
 	}
 }
 
-// checkNetworkConnectivity performs a quick TCP check to the server
+// networkCheckTimeout bounds one connectivity probe from the reconnect loop.
+const networkCheckTimeout = 3 * time.Second
+
+// checkNetworkConnectivity answers "is there a network at all", in two steps:
+// the server first, then a well-known public host.
+//
+// The server step goes through the manager's own connectivity gate, which dials
+// the pinned endpoint (and its sibling address) on the real transport port.
+// This used to be hand-rolled here and additionally dialled :443 and :80 on the
+// server's own host - a three-port scan of our own machine, run on a timer, and
+// a signature in its own right. It also only ever spoke IPv4, so a v6-only
+// endpoint reported "no network" forever.
+//
+// The second step is unchanged and is what distinguishes "the network is down"
+// from "the network is up and the server is not": the caller parks in
+// waitForNetworkRestore only for the former.
 func (v *VPNClient) checkNetworkConnectivity() bool {
-	// Try a quick TCP connection to the server port
-	host, _, err := net.SplitHostPort(v.serverAddr)
-	if err != nil {
-		host = v.serverAddr
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), networkCheckTimeout)
+	defer cancel()
 
-	// Try common ports that are usually open
-	testAddrs := []string{
-		v.serverAddr,                  // Original server address
-		net.JoinHostPort(host, "443"), // HTTPS
-		net.JoinHostPort(host, "80"),  // HTTP
-	}
-
-	for _, addr := range testAddrs {
-		conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
-		if err == nil {
-			conn.Close()
-			return true
+	if v.manager != nil {
+		if checker := v.manager.ConnectivityChecker(); checker != nil {
+			if checker.Check(ctx).HasBasicConnectivity() {
+				return true
+			}
+		} else if v.serverAddr != "" {
+			// No gate configured (macOS, benchmarks): one dial of the real
+			// address, and nothing else.
+			conn, err := net.DialTimeout("tcp", v.serverAddr, networkCheckTimeout)
+			if err == nil {
+				conn.Close()
+				return true
+			}
 		}
 	}
 
-	// Also try Google DNS as a fallback check
-	conn, err := net.DialTimeout("tcp", "8.8.8.8:53", 3*time.Second)
-	if err == nil {
-		conn.Close()
-		return true
-	}
+	return internetReachable()
+}
 
-	return false
+// internetReachable reports whether anything outside answers, using a public
+// resolver as the reference point. It is deliberately NOT a check of our own
+// server: the caller needs to tell a dead link apart from a blocked endpoint,
+// and only a third party can do that.
+func internetReachable() bool {
+	conn, err := net.DialTimeout("tcp", "8.8.8.8:53", networkCheckTimeout)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
 }
 
 // waitForNetworkRestore waits until network connectivity is restored
