@@ -12,10 +12,10 @@ import (
 // hardcoded "[::]:995" default is exactly the defect being fixed.
 func TestDeriveListenAddrV6(t *testing.T) {
 	cases := []struct {
-		name     string
-		listen   string
-		want     string
-		wantErr  string // substring the reason must mention; "" = must succeed
+		name    string
+		listen  string
+		want    string
+		wantErr string // substring the reason must mention; "" = must succeed
 	}{
 		{name: "port only", listen: ":443", want: "[::]:443"},
 		{name: "v4 wildcard", listen: "0.0.0.0:443", want: "[::]:443"},
@@ -26,10 +26,16 @@ func TestDeriveListenAddrV6(t *testing.T) {
 		{name: "non-995 port is not 995", listen: ":994", want: "[::]:994"},
 		{name: "v4-mapped v6 counts as v4", listen: "[::ffff:1.2.3.4]:443", want: "[::]:443"},
 
-		// -listen already names the v6 side; adding a second v6 socket would be
-		// second-guessing the operator.
-		{name: "v6 wildcard", listen: "[::]:443", wantErr: "already an IPv6 address"},
-		{name: "v6 literal", listen: "[2001:db8::1]:443", wantErr: "already an IPv6 address"},
+		// The v6 wildcard asks for both families: tcp4 binds 0.0.0.0 from it and
+		// the derived tcp6 socket opens alongside on the same port (see
+		// TestWildcardListenersCoexist). Refusing here would leave that operator
+		// with no IPv6 entry at all.
+		{name: "v6 wildcard", listen: "[::]:443", want: "[::]:443"},
+		{name: "v6 wildcard, non-995 port", listen: "[::]:997", want: "[::]:997"},
+
+		// A concrete v6 literal is refused because the IPv4 listener cannot bind
+		// it at all — the process dies before the v6 listener is reached.
+		{name: "v6 literal", listen: "[2001:db8::1]:443", wantErr: "IPv4 listener cannot bind"},
 
 		// Malformed input must disable v6 with a reason, never panic or abort.
 		{name: "no port", listen: "1.2.3.4", wantErr: "cannot parse"},
@@ -142,5 +148,50 @@ func TestDerivedAddrIsBindable(t *testing.T) {
 
 	if got := l.Addr().(*net.TCPAddr).Port; got != port {
 		t.Errorf("bound port %d, want %d from -listen", got, port)
+	}
+}
+
+// TestWildcardListenersCoexist is the positive control under the decision to
+// derive [::]:port from -listen [::]:port. The claim being tested is that the
+// two sockets do not fight over the port: the main listener uses tcp4, which
+// turns a wildcard host into 0.0.0.0, and Go sets IPV6_V6ONLY on every tcp6
+// socket, so the derived listener binds the v6 wildcard beside it.
+//
+// It runs against the real network stack rather than asserting the claim in a
+// comment, because the opposite belief — that this pair collides — is what put
+// the refusal into deriveListenAddrV6 in the first place, and it survived
+// review precisely because nobody made it fail.
+func TestWildcardListenersCoexist(t *testing.T) {
+	main4, err := net.Listen("tcp4", "[::]:0")
+	if err != nil {
+		t.Fatalf(`net.Listen("tcp4", "[::]:0"): %v`, err)
+	}
+	defer main4.Close()
+
+	addr4, ok := main4.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("main listener address is %T, want *net.TCPAddr", main4.Addr())
+	}
+	if !addr4.IP.Equal(net.IPv4zero) {
+		t.Fatalf("tcp4 on a v6 wildcard bound %s, want 0.0.0.0 — the premise of the derivation no longer holds", addr4.IP)
+	}
+
+	derived, err := deriveListenAddrV6(net.JoinHostPort("::", strconv.Itoa(addr4.Port)))
+	if err != nil {
+		t.Fatalf("deriveListenAddrV6 refused the v6 wildcard: %v", err)
+	}
+
+	v6, err := net.Listen("tcp6", derived)
+	if err != nil {
+		t.Fatalf("tcp6 listener on %s alongside tcp4 on port %d: %v", derived, addr4.Port, err)
+	}
+	defer v6.Close()
+
+	addr6, ok := v6.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("v6 listener address is %T, want *net.TCPAddr", v6.Addr())
+	}
+	if addr6.Port != addr4.Port {
+		t.Errorf("v6 listener took port %d, want %d — both sockets must sit on the -listen port", addr6.Port, addr4.Port)
 	}
 }

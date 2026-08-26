@@ -34,11 +34,23 @@ func deriveListenAddrV6(listenAddr string) (string, error) {
 		return "", fmt.Errorf("-listen %q has no port", listenAddr)
 	}
 
-	// A host that is already an IPv6 literal means the operator addressed the
-	// v6 side themselves in -listen. Deriving a second v6 socket from it would
-	// be second-guessing that; -listen-v6 is the flag for saying otherwise.
-	if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
-		return "", fmt.Errorf("-listen %q is already an IPv6 address; set -listen-v6 explicitly to add a second IPv6 socket", listenAddr)
+	// A concrete IPv6 literal is a dead end, but not because of this function:
+	// the main listener runs net.Listen("tcp4", ...), and tcp4 rejects an IPv6
+	// address outright ("no suitable address found"), so the process never gets
+	// this far. Report the reason rather than derive an address for a server
+	// that will not start.
+	//
+	// The v6 wildcard is the opposite case and used to be lumped in with it, on
+	// the assumption that deriving [::]:port would collide with the main socket.
+	// Measured, and it does not: tcp4 with a wildcard host binds 0.0.0.0, and Go
+	// sets IPV6_V6ONLY on every tcp6 socket, so the two coexist on one port.
+	// Verified both halves directly — net.Listen("tcp4", "[::]:P") reports
+	// 0.0.0.0:P, and a tcp6 listener on the same port opens alongside it without
+	// error. Refusing to derive here would leave an operator who wrote -listen
+	// [::]:997 — that is, who asked for both families — with no IPv6 entry at
+	// all, which is the very failure this whole change exists to remove.
+	if ip := net.ParseIP(host); ip != nil && ip.To4() == nil && !ip.IsUnspecified() {
+		return "", fmt.Errorf("-listen %q is an IPv6 address, which the IPv4 listener cannot bind; set -listen and -listen-v6 explicitly", listenAddr)
 	}
 
 	// Everything else — the empty host of ":443", the v4 wildcard, a concrete
