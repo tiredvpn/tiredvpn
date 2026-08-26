@@ -32,6 +32,26 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **A second dual-stack tunnel on the same machine no longer steals the first
+  one's IPv6 routes.** The two IPv6 half-defaults (`::/1`, `8000::/1`) went in
+  without a metric, so both tunnels got the kernel default of 1024 - and the
+  same destination at the same metric is one routing entry, not two. Bringing up
+  a second client (its own `-tun-name`, e.g. `tiredvpn1`) rewrote the first
+  client's entry to point at the second interface, and stopping the second
+  client deleted it outright. The first tunnel was left holding an IPv6 address
+  with no route through it: v6 traffic fell back to the RA-learned default and
+  went out unencrypted, past the tunnel, while v4 kept working and hid it.
+  Reproduces with two clients up at once on Linux; a single tunnel was never
+  affected. The half-defaults now carry a per-interface metric, so both tunnels
+  keep their own entries and teardown of one leaves the other alone.
+  - **Visible change:** `ip -6 route` now shows the half-defaults at
+    `metric 100 + <interface index>` instead of 1024. With two tunnels up, the
+    default v6 path belongs to whichever was started first (lower interface
+    index, hence lower metric) - deliberately, so a test client started later
+    cannot displace the primary tunnel. The base of 100 keeps our routes ahead
+    of another VPN's half-default at the kernel default; against the host's own
+    `::/0` nothing changes, since a `/1` wins on prefix length regardless of
+    metric. IPv4 route metrics are untouched.
 - **Breaking for dashboards: four `_seconds` histograms now really are in
   seconds.** `tiredvpn_tls_handshake_duration_seconds`,
   `tiredvpn_local_tls_handshake_duration_seconds`,

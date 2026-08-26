@@ -13,6 +13,40 @@ import (
 // trick used on the IPv4 side.
 var dualStackRouteCIDRs = []string{"::/1", "8000::/1"}
 
+// v6HalfDefaultMetricBase is the metric floor for the half-default routes in
+// dualStackRouteCIDRs.
+//
+// Why 100 rather than the kernel's default 1024: another VPN on the same host
+// installs its own ::/1 with the kernel default, and ours has to win that
+// comparison or the full tunnel silently stops being full. Against the
+// RA-learned ::/0 the metric never comes into it — a /1 beats a /0 on prefix
+// length alone — so the choice of base does not affect that relationship in
+// either direction.
+const v6HalfDefaultMetricBase = 100
+
+// v6HalfDefaultPriority is the metric for a half-default route on the tunnel
+// with index linkIndex.
+//
+// The link index is the summand because it is unique across the interfaces
+// alive at any one moment: two tunnels on the same host therefore get two
+// distinct (dst, metric) pairs, which the kernel keeps as two separate routing
+// entries instead of collapsing them into one that the second RouteReplace
+// would steal from the first. It is also stable for the lifetime of an
+// interface, so RouteReplace on a reconnect still updates our own entry rather
+// than accumulating a new one per reconnect.
+//
+// The consequence is that the tunnel brought up first has the lower index,
+// hence the lower metric, hence the default: a deliberate choice in favour of
+// the primary tunnel over a test client started later.
+func v6HalfDefaultPriority(linkIndex int) int {
+	if linkIndex < 0 {
+		// Not a real index; keep the metric at the base rather than letting it
+		// slide below it.
+		linkIndex = 0
+	}
+	return v6HalfDefaultMetricBase + linkIndex
+}
+
 // dualStackRouteNets parses dualStackRouteCIDRs. The constants are known-good,
 // so a parse failure is a programmer error and reported as such.
 func dualStackRouteNets() ([]*net.IPNet, error) {

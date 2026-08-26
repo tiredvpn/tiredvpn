@@ -224,6 +224,47 @@ func TestDualStackRouteNetsRejectsBadCIDR(t *testing.T) {
 	}
 }
 
+// TestV6HalfDefaultPriorityDistinctPerLink checks the property the metric
+// exists for: two tunnels on the same host must not produce the same
+// (destination, metric) pair, because that is one kernel routing entry and the
+// second tunnel's install would take it over from the first — leaving the first
+// with a v6 address and no route the moment the second one goes away.
+func TestV6HalfDefaultPriorityDistinctPerLink(t *testing.T) {
+	seen := make(map[int]int, 64)
+	for idx := 1; idx <= 64; idx++ {
+		p := v6HalfDefaultPriority(idx)
+		if p == 0 {
+			t.Fatalf("linkIndex %d: priority 0 leaves the kernel default (1024), which collides", idx)
+		}
+		if p < v6HalfDefaultMetricBase {
+			t.Errorf("linkIndex %d: priority %d is below the base %d, so a foreign ::/1 could outrank us",
+				idx, p, v6HalfDefaultMetricBase)
+		}
+		if prev, dup := seen[p]; dup {
+			t.Errorf("linkIndex %d and %d share priority %d", prev, idx, p)
+		}
+		seen[p] = idx
+	}
+
+	// The earlier-started tunnel has the lower index and must win.
+	if v6HalfDefaultPriority(3) >= v6HalfDefaultPriority(9) {
+		t.Errorf("lower link index must get the lower (better) metric: %d vs %d",
+			v6HalfDefaultPriority(3), v6HalfDefaultPriority(9))
+	}
+
+	// A metric below the base would let another VPN's kernel-default ::/1 or a
+	// hand-added low-metric route beat ours; the guard clamps instead.
+	if got := v6HalfDefaultPriority(-1); got != v6HalfDefaultMetricBase {
+		t.Errorf("v6HalfDefaultPriority(-1) = %d, want the base %d", got, v6HalfDefaultMetricBase)
+	}
+
+	// The base has to beat the kernel default another VPN's half-default gets,
+	// or a full tunnel stops being full.
+	if v6HalfDefaultMetricBase >= 1024 {
+		t.Errorf("base %d does not outrank the kernel default 1024", v6HalfDefaultMetricBase)
+	}
+}
+
 // TestDualStackRouteNetsCoverAddressSpace checks the property the two
 // half-defaults exist for: together they cover every address a client can
 // reach, while each is a /1 and so outranks an RA-learned ::/0 on prefix

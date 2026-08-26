@@ -55,12 +55,17 @@ type TUNDevice struct {
 	remoteIP  net.IP
 	routes    []string
 
-	// addedRoutes records the destinations actually installed on this link so
+	// addedRoutes records the routes actually installed on this link so
 	// teardown can remove exactly its own routes (netlink.RouteDel) instead of
 	// relying on the kernel's cascade delete from LinkDel. On a multi-tunnel
 	// host that cascade is fine, but explicit scoped deletion keeps cleanup
 	// from ever touching the main table / default route or another tunnel.
-	addedRoutes []*net.IPNet
+	//
+	// The metric is part of the record, not just the destination, because that
+	// is what the kernel keys an entry on: the same destination at two metrics
+	// is two routes. Teardown then deletes exactly what install created rather
+	// than relying on the matcher to fill the metric in for it.
+	addedRoutes []trackedRoute
 
 	// serverBypassIPs are every server transport address this client may dial.
 	// When the installed route set covers one of them (a default route, or the
@@ -134,6 +139,45 @@ type TUNDevice struct {
 	// matches on the whole address, so deleting the wrong form fails and
 	// leaves the stale address behind.
 	v6PeerForm bool
+}
+
+// trackedRoute is one route this device installed: its destination and the
+// metric it went in with. Both are needed to delete it again.
+type trackedRoute struct {
+	dst      *net.IPNet
+	priority int
+}
+
+// sameAs reports whether two records name the same kernel routing entry.
+func (r trackedRoute) sameAs(other trackedRoute) bool {
+	return r.priority == other.priority && r.dst.String() == other.dst.String()
+}
+
+func (r trackedRoute) String() string {
+	if r.priority == 0 {
+		return r.dst.String()
+	}
+	return fmt.Sprintf("%s metric %d", r.dst, r.priority)
+}
+
+// tunRoute builds an install request for a route pointed at the tunnel. The
+// metric is left at 0 (the kernel picks its default) — deliberately, for the
+// IPv4 side: the tunnel's v4 default is expected to beat a DHCP-installed one
+// with metric 600, and moving our v4 metrics up would break that comparison.
+func tunRoute(linkIndex int, dst *net.IPNet) *netlink.Route {
+	return &netlink.Route{LinkIndex: linkIndex, Dst: dst}
+}
+
+// v6HalfDefaultRoute builds the request for one of the IPv6 half-defaults on
+// this tunnel. Install and delete both go through it, so the metric that makes
+// two tunnels coexist (see v6HalfDefaultPriority) cannot be present on one side
+// and missing on the other.
+func v6HalfDefaultRoute(linkIndex int, dst *net.IPNet) *netlink.Route {
+	return &netlink.Route{
+		LinkIndex: linkIndex,
+		Dst:       dst,
+		Priority:  v6HalfDefaultPriority(linkIndex),
+	}
 }
 
 // SetDeferRoutes requests that Configure NOT install routes immediately, leaving
@@ -359,13 +403,33 @@ func (t *TUNDevice) delRoutes() {
 		log.Warn("Cannot delete routes, link %s lookup failed: %v", t.name, err)
 		return
 	}
-	idx := link.Attrs().Index
-	for _, dst := range t.addedRoutes {
-		if err := netlink.RouteDel(&netlink.Route{LinkIndex: idx, Dst: dst}); err != nil {
-			log.Debug("Failed to delete route %s on %s: %v", dst, t.name, err)
+	for _, route := range t.routeDelSpecs(link.Attrs().Index) {
+		if err := netlink.RouteDel(route); err != nil {
+			log.Debug("Failed to delete route %s on %s: %v", route.Dst, t.name, err)
 		}
 	}
 	t.addedRoutes = nil
+}
+
+// routeDelSpecs turns the tracked set into deletion requests scoped to
+// linkIndex, each carrying the metric its route was installed with.
+//
+// Measured, not assumed (see TestRootRouteDelMetricSemantics): given the
+// destination and the interface, the kernel deletes the entry whatever metric
+// the request names, so omitting it would work today. The metric is included
+// anyway — reproducing the install exactly is an invariant that holds no
+// matter how lenient the matcher is, and it is the tracked set, not the
+// kernel, that decides what teardown touches.
+func (t *TUNDevice) routeDelSpecs(linkIndex int) []*netlink.Route {
+	specs := make([]*netlink.Route, 0, len(t.addedRoutes))
+	for _, r := range t.addedRoutes {
+		specs = append(specs, &netlink.Route{
+			LinkIndex: linkIndex,
+			Dst:       r.dst,
+			Priority:  r.priority,
+		})
+	}
+	return specs
 }
 
 func (t *TUNDevice) File() *os.File {
@@ -545,10 +609,13 @@ func (t *TUNDevice) EnableDualStack(clientIP6, serverIP6 net.IP) error {
 	t.addServerBypass6()
 
 	// Routes: installed together with the address, idempotently. Tracking
-	// them in addedRoutes makes Close remove exactly these.
+	// them in addedRoutes makes Close remove exactly these. The per-link metric
+	// keeps a second dual-stack tunnel on this host from replacing our entries
+	// with its own (same Dst plus same metric is one entry, not two).
 	for _, dst := range routes6 {
-		t.trackRoute(dst)
-		if err := netlink.RouteReplace(&netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst}); err != nil {
+		route := v6HalfDefaultRoute(link.Attrs().Index, dst)
+		t.trackRoute(route)
+		if err := netlink.RouteReplace(route); err != nil {
 			return fmt.Errorf("failed to add route %s: %w", dst, err)
 		}
 	}
@@ -642,10 +709,13 @@ func (t *TUNDevice) DisableIPv6() {
 	if t.v6Enabled {
 		if link, err := netlink.LinkByName(t.name); err == nil {
 			for _, dst := range t.routes6 {
-				if err := netlink.RouteDel(&netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst}); err != nil {
+				// Built by the same helper as the install, so the deletion
+				// carries the metric netlink needs to match the entry.
+				route := v6HalfDefaultRoute(link.Attrs().Index, dst)
+				if err := netlink.RouteDel(route); err != nil {
 					log.Debug("Failed to delete v6 route %s on %s: %v", dst, t.name, err)
 				}
-				t.untrackRoute(dst)
+				t.untrackRoute(route)
 			}
 			if err := t.delV6Addr(link, t.localIP6); err != nil {
 				log.Debug("Failed to delete v6 addr %s on %s: %v", t.localIP6, t.name, err)
@@ -956,12 +1026,13 @@ func (t *TUNDevice) addRoutes(link netlink.Link, routes []string) {
 			log.Warn("Failed to parse route %s: %v", route, err)
 			continue
 		}
-		t.trackRoute(dst)
+		r := tunRoute(link.Attrs().Index, dst)
+		t.trackRoute(r)
 		// RouteReplace is idempotent: it installs the route if absent and is a
 		// no-op (no EEXIST) if it already exists. addRoutes runs on the initial
 		// install and again on every reconnect, so RouteAdd here used to spam
 		// "file exists" warnings once the route was already present.
-		if err := netlink.RouteReplace(&netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst}); err != nil {
+		if err := netlink.RouteReplace(r); err != nil {
 			log.Warn("Failed to add route %s: %v", route, err)
 		}
 	}
@@ -1001,22 +1072,31 @@ func (t *TUNDevice) InstallRoutes() {
 	log.Info("Routes installed on %s after successful server connection", t.name)
 }
 
-// trackRoute records dst in t.addedRoutes for scoped teardown, deduping so
-// reconnect re-adds do not grow the list unbounded.
-func (t *TUNDevice) trackRoute(dst *net.IPNet) {
+// trackRoute records an installed route in t.addedRoutes for scoped teardown,
+// deduping so reconnect re-adds do not grow the list unbounded. It takes the
+// very route that was handed to netlink, so what teardown deletes cannot drift
+// from what install created.
+//
+// The dedup key is the (destination, metric) pair, because that pair is what
+// the kernel keys a routing entry on: two entries differing only in metric are
+// two routes and both need deleting.
+func (t *TUNDevice) trackRoute(route *netlink.Route) {
+	entry := trackedRoute{dst: route.Dst, priority: route.Priority}
 	for _, existing := range t.addedRoutes {
-		if existing.String() == dst.String() {
+		if existing.sameAs(entry) {
 			return
 		}
 	}
-	t.addedRoutes = append(t.addedRoutes, dst)
+	t.addedRoutes = append(t.addedRoutes, entry)
 }
 
-// untrackRoute drops dst from t.addedRoutes (used when a route is removed
-// ahead of teardown, e.g. DisableIPv6 tearing down the v6 half-defaults).
-func (t *TUNDevice) untrackRoute(dst *net.IPNet) {
+// untrackRoute drops a route from t.addedRoutes (used when it is removed ahead
+// of teardown, e.g. DisableIPv6 tearing down the v6 half-defaults). It takes
+// the same route the deletion was built from, metric included.
+func (t *TUNDevice) untrackRoute(route *netlink.Route) {
+	entry := trackedRoute{dst: route.Dst, priority: route.Priority}
 	for i, existing := range t.addedRoutes {
-		if existing.String() == dst.String() {
+		if existing.sameAs(entry) {
 			t.addedRoutes = append(t.addedRoutes[:i], t.addedRoutes[i+1:]...)
 			return
 		}
@@ -1044,10 +1124,11 @@ func (t *TUNDevice) reAddRoutes(link netlink.Link, reason string) {
 			log.Warn("Failed to parse route %s: %v", route, err)
 			continue
 		}
-		t.trackRoute(dst)
+		r := tunRoute(link.Attrs().Index, dst)
+		t.trackRoute(r)
 		// RouteReplace keeps re-adds idempotent across reconnects / IP changes:
 		// an already-present route is refreshed rather than failing with EEXIST.
-		if err := netlink.RouteReplace(&netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst}); err != nil {
+		if err := netlink.RouteReplace(r); err != nil {
 			log.Warn("Failed to re-add route %s: %v", route, err)
 		} else {
 			log.Debug("Re-added route %s after %s", route, reason)
@@ -1055,11 +1136,14 @@ func (t *TUNDevice) reAddRoutes(link netlink.Link, reason string) {
 	}
 	// The v6 half-defaults are not part of t.routes (they are implied by the
 	// negotiated dual-stack, not user-supplied), so re-assert them separately
-	// with the same idempotent RouteReplace.
+	// with the same idempotent RouteReplace — and the same per-link metric they
+	// were installed with, or the replace would land on a second entry instead
+	// of refreshing ours.
 	if t.v6Enabled {
 		for _, dst := range t.routes6 {
-			t.trackRoute(dst)
-			if err := netlink.RouteReplace(&netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst}); err != nil {
+			r := v6HalfDefaultRoute(link.Attrs().Index, dst)
+			t.trackRoute(r)
+			if err := netlink.RouteReplace(r); err != nil {
 				log.Warn("Failed to re-add v6 route %s: %v", dst, err)
 			}
 		}
