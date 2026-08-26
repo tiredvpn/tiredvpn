@@ -5,7 +5,7 @@ server looks like on the wire. The client registers a set of them at startup,
 probes them, and picks one. If the active one dies mid-session, the client moves
 to the next.
 
-This page lists what the engine actually registers in v1.5.0, the exact IDs you
+This page lists what the engine actually registers in v1.5.1, the exact IDs you
 pass to `-strategy`, and where the code is honest about not being finished.
 
 ## Registered strategies

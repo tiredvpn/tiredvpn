@@ -1,6 +1,6 @@
 # Server Reference
 
-Complete reference for `tiredvpn server` (v1.5.0).
+Complete reference for `tiredvpn server` (v1.5.1).
 
 ## Usage
 

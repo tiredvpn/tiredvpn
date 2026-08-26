@@ -164,8 +164,8 @@ helm install my-tiredvpn oci://ghcr.io/tiredvpn/charts/tiredvpn --version 0.3.0 
   -f my-values.yaml
 ```
 
-The chart is versioned separately from the binary: chart `0.3.0` ships
-`appVersion` 1.5.0. Each tagged release patch-bumps the chart and pushes it to
+The chart is versioned separately from the binary: chart `0.3.1` ships
+`appVersion` 1.5.1. Each tagged release patch-bumps the chart and pushes it to
 the OCI registry.
 
 See [deploy/helm/tiredvpn/README.md](deploy/helm/tiredvpn/README.md) for values, examples, and TLS/auth/Redis/HPA options.
@@ -432,7 +432,7 @@ Pre-built images are available on Docker Hub. Platforms: `linux/amd64`, `linux/a
 | Tag | Description |
 |-----|-------------|
 | `latest` | Latest stable release |
-| `1.5.0` | Pinned version (one tag per release) |
+| `1.5.1` | Pinned version (one tag per release) |
 | `edge` | Latest `main` branch build |
 
 ### Run the server

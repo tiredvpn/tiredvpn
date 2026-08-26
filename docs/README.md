@@ -36,5 +36,5 @@ examples live outside `docs/`:
 - [`SECURITY.md`](../SECURITY.md) - how to report a vulnerability
 - [`CONTRIBUTING.md`](../CONTRIBUTING.md) - development workflow
 
-These pages describe TiredVPN 1.5.0. Where a page documents behaviour that
+These pages describe TiredVPN 1.5.1. Where a page documents behaviour that
 changed in a specific release, it says so.

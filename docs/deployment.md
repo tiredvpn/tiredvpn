@@ -1,6 +1,6 @@
 # Deployment
 
-Production deployment of TiredVPN 1.5.0 — packages, containers, Kubernetes,
+Production deployment of TiredVPN 1.5.1 — packages, containers, Kubernetes,
 TLS, firewall, multi-hop and capacity limits.
 
 ## What a release ships
@@ -171,7 +171,7 @@ all, whatever `-api-addr` says. See [monitoring.md](monitoring.md).
 ```bash
 git clone https://github.com/tiredvpn/tiredvpn.git
 cd tiredvpn
-docker build --build-arg VERSION=1.5.0 -t tiredvpn:local .
+docker build --build-arg VERSION=1.5.1 -t tiredvpn:local .
 ```
 
 Without `--build-arg VERSION`, the binary reports `dev`.
@@ -226,7 +226,7 @@ The chart gates server TUN behind `server.tun.enabled`:
 
 ```bash
 helm install my-tiredvpn oci://ghcr.io/tiredvpn/charts/tiredvpn \
-  --version 0.3.0 \
+  --version 0.3.1 \
   --set server.tun.enabled=true \
   -f my-values.yaml
 ```
