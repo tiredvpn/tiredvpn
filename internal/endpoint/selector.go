@@ -245,6 +245,32 @@ func (s *Selector) Siblings(c Candidate) []string {
 	return out
 }
 
+// GateAddrs returns every address the connectivity gate may accept on behalf of
+// c: the other families of the same endpoint first, then every other endpoint in
+// preference order.
+//
+// Siblings alone are not enough once there is a pool. The gate decides whether
+// to dial or to sit in a wait loop, so feeding it one endpoint means a client
+// whose first server is unreachable waits for that server to come back instead
+// of moving to the next one - with three healthy servers configured and idle.
+// Widening the set turns "the network is down" into what it should mean: not one
+// address in the pool answers.
+//
+// Parked candidates are included on purpose. This is the gate, not the chooser:
+// its answer only says which addresses are reachable, and Reconsider still
+// applies cooldowns when picking what to dial. Leaving a parked-but-live server
+// out would make the client wait when it has somewhere to go.
+func (s *Selector) GateAddrs(c Candidate) []string {
+	out := s.Siblings(c)
+	for _, cand := range s.cands {
+		if cand.EndpointIdx == c.EndpointIdx || cand.Addr == c.Addr {
+			continue
+		}
+		out = append(out, cand.Addr)
+	}
+	return out
+}
+
 // CandidateForAddr looks a candidate up by the address that answered.
 func (s *Selector) CandidateForAddr(addr string) (Candidate, bool) {
 	idx, ok := s.byAddr[addr]

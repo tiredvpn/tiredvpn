@@ -833,7 +833,10 @@ func (m *Manager) preflightCandidate(ctx context.Context, sel *endpoint.Selector
 	}
 
 	if sel != nil {
-		checker.SetAddrs(cand.Addr, sel.Siblings(cand)...)
+		// The whole pool, not just this endpoint's other family: the gate
+		// decides between dialling and waiting, so a narrow view makes a client
+		// wait out its first server while the rest of the pool sits idle.
+		checker.SetAddrs(cand.Addr, sel.GateAddrs(cand)...)
 	}
 
 	result := checker.Check(ctx)
@@ -864,9 +867,10 @@ func (m *Manager) preflightCandidate(ctx context.Context, sel *endpoint.Selector
 		return cand, nil
 	}
 
-	// The gate dialled both addresses of this server and only the sibling
-	// answered. That is a free verdict - the packets went out either way - so
-	// act on it instead of dialling the dead family through every strategy.
+	// The gate walked the pool and something other than the pinned address
+	// answered - the other family of this server, or another server entirely.
+	// That is a free verdict, the packets went out either way, so act on it
+	// instead of dialling a silent address through every strategy in turn.
 	log.Info("Pre-flight: %s silent, %s answered - switching endpoint", cand, other)
 	sel.ReportProbe(cand, false, 0)
 	sel.ReportProbe(other, true, result.Latency)

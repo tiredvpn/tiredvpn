@@ -23,13 +23,15 @@ transport based on current network conditions.
 
 The system probes available strategies, ranks them by latency and reliability,
 and falls back to alternatives mid-session if the active strategy gets blocked.
-This makes it effective against sophisticated filtering systems like TSPU
-(Russia), GFW (China), and similar DPI infrastructure.
+The same applies one level down: a client can be given a list of servers, and
+the address family and the server are both re-decided at runtime rather than
+settled once at startup. This targets filtering systems like TSPU (Russia),
+GFW (China), and similar DPI infrastructure.
 
 Key design goals:
 
-- **Resilience** - no single point of failure; if one strategy is blocked,
-  the client seamlessly switches to another.
+- **Resilience** - no single point of failure. A blocked strategy, a dead IPv6
+  path, or an unreachable server each get replaced without a restart.
 - **Stealth** - traffic patterns are morphed to resemble legitimate services
   (video streaming, CDN traffic, HTTPS browsing).
 - **Performance** - multiplexed connections via smux, QUIC transport, and
@@ -48,14 +50,22 @@ Key design goals:
 - **Multiplexed connections** via smux for efficient stream management
 - **TUN mode** for full system traffic tunneling
 - **SOCKS5 and HTTP proxy** modes
+- **Server pool** - a list of endpoints in TOML with `priority`, `latency`, or
+  `weighted` selection, and per-candidate parking with exponential cooldown
+- **Runtime transport fallback** - the address family is re-decided during the
+  session, not fixed at startup
+- **IPv6 inside the tunnel** (dual-stack), on by default, with outbound IPv6
+  blocked when the exit cannot carry it so it does not leak around the VPN
 - **Port hopping** with random, sequential, and Fibonacci strategies
-- **IPv6 transport** with dual-stack support and automatic fallback
 - **Encrypted Client Hello (ECH)** to hide SNI from DPI
 - **Post-quantum cryptography** (ML-KEM-768 + ML-DSA-65)
 - **Multi-hop routing** through chained servers
+- **TOML configuration** with CLI overrides (`-config`)
+- **Native packages** - `.deb`/`.rpm`, signed apt/yum repositories, one-line
+  installer, and a systemd unit that brings up forwarding and NAT itself
 - **Prometheus-compatible metrics** endpoint
 - **Android integration** via JNI (c-shared build mode)
-- **Docker support** with multi-stage builds
+- **Docker and Helm** - multi-arch images and a chart on ghcr.io
 - **Client management** with Redis backend and REST API
 - **QR code generation** for mobile client provisioning
 
@@ -133,21 +143,30 @@ different pool with `tiredvpn-init --ip-pool <CIDR>`. Details:
 For other distros or hosts without systemd, download the binary directly:
 
 ```bash
-curl -LO https://github.com/tiredvpn/tiredvpn/releases/latest/download/tiredvpn-linux-amd64.tar.gz
+base=https://github.com/tiredvpn/tiredvpn/releases/latest/download
+curl -LO $base/tiredvpn-linux-amd64.tar.gz
+curl -LO $base/checksums.txt
+grep tiredvpn-linux-amd64.tar.gz checksums.txt | sha256sum -c -
 tar xzf tiredvpn-linux-amd64.tar.gz
 sudo mv tiredvpn-linux-amd64 /usr/local/bin/tiredvpn
 ```
 
-Available platforms: `linux-amd64`, `linux-arm64`. Other installation
-methods are described in the [Docker](#docker) and
-[Building from Source](#building-from-source) sections below.
+Available platforms: `linux-amd64`, `linux-arm64`. This gives you the binary
+only - no systemd unit and no `tiredvpn-init`; use `install.sh --method binary`
+if you want those too. Other installation methods are described in the
+[Docker](#docker) and [Building from Source](#building-from-source) sections
+below.
 
 Kubernetes via Helm (server and/or client from a single release):
 
 ```bash
-helm install my-tiredvpn oci://ghcr.io/tiredvpn/charts/tiredvpn --version 0.1.0 \
+helm install my-tiredvpn oci://ghcr.io/tiredvpn/charts/tiredvpn --version 0.3.0 \
   -f my-values.yaml
 ```
+
+The chart is versioned separately from the binary: chart `0.3.0` ships
+`appVersion` 1.5.0. Each tagged release patch-bumps the chart and pushes it to
+the OCI registry.
 
 See [deploy/helm/tiredvpn/README.md](deploy/helm/tiredvpn/README.md) for values, examples, and TLS/auth/Redis/HPA options.
 
@@ -250,58 +269,146 @@ sudo tiredvpn client \
 
 This creates a TUN interface and routes all traffic through the VPN.
 
+Since 1.5.0 `-tun-ipv6` defaults to `dual`: IPv6 goes through the tunnel when
+the exit was started with `-ip-pool-v6`, and is rejected outright when it was
+not, so applications cannot reach the internet over a native IPv6 default route
+while the VPN is up. `-tun-ipv6 off` restores the pre-1.5.0 behaviour, which is
+what a split tunnel usually wants - `dual` sends *all* IPv6 into the tunnel,
+including destinations you deliberately routed around it on IPv4. The blocking
+half is Linux-only; on macOS it warns instead.
+
 ---
 
 ## Configuration
 
-TiredVPN is configured entirely via CLI flags. Run `tiredvpn server -help` or
-`tiredvpn client -help` for the full list.
+TiredVPN takes configuration from CLI flags, from a TOML file (`-config`), or
+from both. Precedence is **CLI flag > TOML > default**, and a flag counts as
+set only if it was passed explicitly - leaving it at its default value never
+overwrites a TOML field.
+
+```bash
+tiredvpn client -config /etc/tiredvpn/client.toml
+tiredvpn server -config /etc/tiredvpn/server.toml
+```
+
+Annotated examples: [`configs/client.example.toml`](configs/client.example.toml)
+and [`configs/server.example.toml`](configs/server.example.toml). Unknown keys
+are rejected, so a typo fails at startup instead of being ignored.
+
+TOML does not yet cover the whole flag surface. On the client it carries the
+server list, the selection policy, `strategy.mode`, `tls.fingerprint`, the
+shaper and the log level; on the server, the listen address, the certificate
+and key, and the log level. Everything else - `-secret`, the `-tun-*` flags,
+the evasion knobs - is still flags only. The full mapping and the deprecation
+plan are in
+[`internal/config/toml/MIGRATION.md`](internal/config/toml/MIGRATION.md).
+
+Run `tiredvpn server -help` or `tiredvpn client -help` for the full flag list.
 
 ### Server flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `-config` | | Path to a TOML config; CLI flags override it |
 | `-listen` | `:443` | IPv4 listen address |
 | `-listen-v6` | `[::]:995` | IPv6 listen address |
+| `-dual-stack` | `true` | Listen on both IPv4 and IPv6 |
 | `-cert` | `server.crt` | TLS certificate file |
 | `-key` | `server.key` | TLS private key file |
 | `-secret` | | Shared secret (single-client mode) |
 | `-redis` | | Redis address for multi-client mode |
+| `-redis-db` | `0` | Redis logical database, 0-15 (`TIREDVPN_REDIS_DB`) |
+| `-redis-prefix` | `tiredvpn:` | Redis key namespace (`TIREDVPN_REDIS_PREFIX`) |
 | `-api-addr` | `127.0.0.1:8080` | REST API for client management |
+| `-api-token` | | Bearer token for the management API (`TIREDVPN_API_TOKEN`) |
 | `-ip-pool` | | CIDR for TUN client IP assignment |
+| `-ip-pool-v6` | | IPv6 ULA prefix for dual-stack TUN clients |
 | `-tun-mtu` | `1280` | TUN interface MTU (1280-9000) |
 | `-port-range` | | Multi-port listening (e.g. `47000-47100`) |
 | `-no-quic` | `false` | Disable QUIC/UDP listener |
 | `-upstream` | | Upstream server for multi-hop |
 | `-fake-root` | `./www` | Directory served to unauthenticated visitors |
 | `-enable-icmp` | `false` | Enable ICMP tunnel listener (requires CAP_NET_RAW) |
+| `-reality-b1` | `false` | Accept the REALITY B1 transport; needs `-reality-private-key` |
+| `-reality-private-key` | | Static X25519 key, base64 (`TIREDVPN_REALITY_PRIVATE_KEY`) |
+| `-max-conns` | `0` | Cap on in-flight incoming connections (0 = 4096) |
+| `-pprof` | | Serve pprof on this address (e.g. `:6060`) |
 | `-debug` | `false` | Verbose logging |
+
+Generate the B1 key pair with `tiredvpn reality-keygen`.
 
 ### Client flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-server` | | Remote server address (required) |
+| `-config` | | Path to a TOML config; CLI flags override it |
+| `-server` | | Remote server address (required unless the config lists servers) |
+| `-server-v6` | | Same server over IPv6 (e.g. `[2001:db8::1]:995`) |
+| `-server-policy` | | Order of the `[[servers]]` list: `priority`, `latency`, `weighted` (empty = `priority`) |
 | `-secret` | | Shared secret (required) |
 | `-listen` | `127.0.0.1:1080` | Local SOCKS5/HTTP proxy address |
+| `-http-listen` | | Separate HTTP proxy address |
 | `-tun` | `false` | Enable TUN mode (full VPN) |
 | `-tun-routes` | | Routes to tunnel (e.g. `0.0.0.0/0`) |
+| `-tun-ipv6` | `dual` | IPv6 while the tunnel is up: `dual`, `block`, `off` |
+| `-tun-mtu` | `1280` | TUN MTU; with `-auto-mtu` this is the upper bound |
+| `-auto-mtu` | `true` | Probe the real end-to-end MTU and apply `min(probed, -tun-mtu)` |
 | `-quic` | `false` | Enable QUIC transport |
-| `-strategy` | | Force a specific strategy |
+| `-strategy` | | Force a specific strategy (`-list` prints them) |
 | `-seqovl-packet` | `false` | Packet-level TCP sequence overlap for `seqovl` (Linux + CAP_NET_ADMIN) |
 | `-port-hop` | `false` | Enable port hopping |
 | `-ech` | `false` | Enable Encrypted Client Hello |
 | `-pq` | `false` | Enable post-quantum crypto |
 | `-rtt-masking` | `false` | Hide proxy timing signature |
+| `-shaper` | | Traffic shaper preset for the morph strategies |
 | `-prefer-ipv6` | `true` | Prefer IPv6 transport |
+| `-fallback-v4` | `true` | Fall back to IPv4 if IPv6 fails |
 | `-fallback` | `true` | Mid-session strategy fallback |
 | `-benchmark` | `false` | Run strategy latency benchmark |
+| `-debug` | `false` | Verbose logging |
+
+### Several servers
+
+A list of servers is config-file only - there is no flag that takes more than
+one address. `[server]` and `[[servers]]` are mutually exclusive (a lone
+`[server]` *is* a one-element list), and passing `-server` collapses whatever
+the file says to a single entry.
+
+```toml
+[[servers]]
+name = "ams"
+address = "203.0.113.10"
+port = 443
+address_v6 = "2001:db8::10"
+weight = 100
+
+[[servers]]
+name = "fra"
+address = "203.0.113.20"
+port = 443
+weight = 50
+
+[selection]
+policy = "priority"      # priority (list order) | latency | weighted
+family = "prefer_v6"     # prefer_v6 | prefer_v4 | v6_only | v4_only
+failure_threshold = 2    # failed connect cycles before a candidate is parked
+cooldown = "1m"          # first cooldown; doubles per repeat, jittered
+max_cooldown = "30m"
+min_dwell = "5m"         # hold a fallback this long before going back
+health_check = "off"     # off | active
+```
+
+A dial target is an (endpoint, family) pair, so moving from IPv6 to IPv4 and
+moving between servers are the same operation. Background health checking is
+off by default on purpose: polling every server on a timer is a periodic
+fan-out pattern with nothing behind it. With it off, the client learns a server
+is up by dialling it.
 
 ### Client management
 
 ```bash
-# Add a client (multi-client mode with Redis)
-tiredvpn admin add -api http://127.0.0.1:8080 -server vpn.example.com:443
+# Add a client (multi-client mode with Redis); -name is required
+tiredvpn admin add -api http://127.0.0.1:8080 -server vpn.example.com:443 -name alice
 
 # List clients
 tiredvpn admin list -api http://127.0.0.1:8080
@@ -313,6 +420,9 @@ tiredvpn admin delete -api http://127.0.0.1:8080 -id <client-id>
 tiredvpn admin qr -server vpn.example.com:443 -secret <secret>
 ```
 
+If the server runs with `-api-token`, pass the same value as `-api-token` to
+the `add`, `list`, and `delete` subcommands (or set `TIREDVPN_API_TOKEN`).
+
 ---
 
 ## Docker
@@ -322,8 +432,8 @@ Pre-built images are available on Docker Hub. Platforms: `linux/amd64`, `linux/a
 | Tag | Description |
 |-----|-------------|
 | `latest` | Latest stable release |
-| `1.3.3` | Pinned version |
-| `edge` | Latest main branch build |
+| `1.5.0` | Pinned version (one tag per release) |
+| `edge` | Latest `main` branch build |
 
 ### Run the server
 
@@ -415,31 +525,30 @@ needed. It just needs `/dev/net/tun`, `NET_ADMIN`, and a writable
 ```bash
 git clone https://github.com/tiredvpn/tiredvpn.git
 cd tiredvpn
-make build
+make build          # -> ./tiredvpn
 ```
 
-Or directly with Go:
+Or directly with Go (this skips the `-X main.version` ldflag, so
+`tiredvpn -version` reports `dev`):
 
 ```bash
 go build -o tiredvpn ./cmd/tiredvpn/
 ```
 
-### Cross-compile for Linux (amd64)
+### Other targets
 
-```bash
-make build-linux
-```
-
-### Cross-compile for Android (arm64)
-
-```bash
-make build-android
-```
+| Target | Output |
+|--------|--------|
+| `make build-linux` | `tiredvpn-linux-amd64` |
+| `make build-android` | `libtiredvpn.so` (arm64 c-shared, needs CGo) |
+| `make build-macos-cli` | `tiredvpn-macos-arm64`, `tiredvpn-macos-amd64` |
+| `make build-macos-lib` | `build/macos/libtiredvpn.a` (universal; macOS host only) |
 
 ### Run tests
 
 ```bash
-make test
+make test           # go test -race ./internal/...
+make lint           # golangci-lint run ./...
 ```
 
 ---
@@ -448,12 +557,14 @@ make test
 
 TiredVPN includes an adaptive strategy engine that automatically selects the
 best transport. Each strategy targets a different aspect of DPI evasion.
+`tiredvpn client -list` prints the ones registered for your current flags, in
+priority order; `-strategy <id>` pins one.
 
 | ID | Name | Description |
 |----|------|-------------|
-| `quic_salamander` | QUIC Salamander | QUIC over UDP with Salamander padding (default, hardest to fingerprint) |
-| `quic` | QUIC Tunnel | QUIC transport with version spoofing (draft-29 to bypass TSPU) |
-| `reality` | REALITY Protocol | Impersonates legitimate websites with authentic TLS fingerprints |
+| `reality` | REALITY Protocol | Impersonates legitimate websites with authentic TLS fingerprints (first in the default order) |
+| `quic_salamander` | QUIC Salamander | QUIC over UDP with Salamander padding (opt-in: `-quic`) |
+| `quic` | QUIC Tunnel | QUIC transport with version spoofing, draft-29 to bypass TSPU (opt-in: `-quic`) |
 | `seqovl` | Seqovl (Sequence Overlap) | Prepends a secret-marked decoy TLS record before the REALITY ClientHello to desync stateful DPI reassembly (packet-level overlap on Linux via `-seqovl-packet`) |
 | `http2_stego` | HTTP/2 Steganography | Hides data inside HTTP/2 frames with NaiveProxy-style padding |
 | `websocket_padded` | WebSocket Salamander | WebSocket transport with Salamander obfuscation padding |
@@ -481,28 +592,32 @@ The strategy engine supports:
 ## Architecture
 
 ```
-cmd/tiredvpn/          CLI entrypoint (server, client, admin)
+cmd/tiredvpn/          CLI entrypoint (server, client, admin, reality-keygen)
 internal/
   server/              Server-side connection handling, TLS/QUIC listeners
   client/              Client-side proxy, TUN, strategy orchestration
   strategy/            DPI bypass strategies and adaptive engine
-  tun/                 TUN device management
+  endpoint/            Server pool: candidates, selection policy, parking
+  tun/                 TUN device management, routes, IPv6 policy
   mux/                 smux multiplexer integration
-  tunnel/              Tunnel abstractions
-  proxy/               SOCKS5 and HTTP proxy
+  protocol/            Wire format and handshake versions
   tls/                 TLS utilities and uTLS fingerprinting
   evasion/             Low-level evasion primitives
   geneva/              Geneva packet manipulation engine
+  detect/              Network and blocking detection
   porthopping/         Port hopping logic
-  multiport/           Multi-port listener
   pool/                IP address pool for TUN clients
+  shaper/              Behavioural traffic shaping (presets, distributions)
   metrics/             Prometheus metrics collector
   padding/             Traffic padding utilities
   protect/             Android VpnService socket protection
   control/             Android control socket protocol
-  config/              Configuration types
+  capabilities/        Runtime capability probing
+  config/toml/         TOML schema, loader, and CLI-override resolver
   log/                 Structured logging
   benchmark/           Strategy benchmarking
+  buildinfo/           Version and build metadata
+  integration/         Cross-package integration tests
   ktls/                Kernel TLS offload
 ```
 
@@ -515,7 +630,9 @@ Full documentation is available in the [docs/](docs/) directory:
 - [Getting Started](docs/getting-started.md)
 - [Server Reference](docs/server.md)
 - [Client Reference](docs/client.md)
+- [Admin and Client Management](docs/admin.md)
 - [DPI Bypass Strategies](docs/strategies.md)
+- [Architecture](docs/architecture.md)
 - [Deployment Guide](docs/deployment.md)
 - [Security Model](docs/security.md)
 - [Monitoring](docs/monitoring.md)

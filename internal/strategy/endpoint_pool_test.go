@@ -247,3 +247,53 @@ func TestEndpointListAloneRegistersStrategies(t *testing.T) {
 		t.Fatalf("pinned %q, want the single configured endpoint", got)
 	}
 }
+
+// TestGateDoesNotStrandTheClientOnADeadFirstEndpoint covers the case the pool
+// exists for: the first server is unreachable outright, and three healthy ones
+// are configured behind it.
+//
+// The pre-flight gate decides between dialling and sitting in a wait loop. It
+// used to be handed only the pinned endpoint's own addresses, so an unreachable
+// first server looked exactly like "the network is down": the client waited for
+// that one server to come back while the rest of the pool sat idle. Observed on
+// a live client with four servers configured - four minutes in it had still not
+// tried servers two, three or four.
+//
+// The other pool tests miss this because they build a manager with no
+// connectivity checker at all, which skips the gate entirely. This one installs
+// the checker exactly as the client does.
+func TestGateDoesNotStrandTheClientOnADeadFirstEndpoint(t *testing.T) {
+	dead := newCountingListener(t)
+	live := newCountingListener(t)
+	dead.stop()
+
+	clk := newEndpointClock()
+	m := newMultiEndpointManager(t, clk, endpoint.Config{
+		FailureThreshold: 2,
+		Cooldown:         10 * time.Minute,
+		MinDwell:         5 * time.Minute,
+	}, dead.addr, live.addr)
+
+	// A fresh manager has never connected, so the gate runs rather than being
+	// skipped as it is on the hot reconnect path.
+	m.SetConnectivityChecker(NewConnectivityChecker(dead.addr, time.Second, false))
+	m.Register(&targetStrategy{mgr: m, id: "s1", priority: 1})
+
+	// A generous bound that still fails fast: without the fix the gate parks in
+	// WaitForConnectivity and only the deadline ends the test.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	conn, _, err := m.Connect(ctx, "")
+	if err != nil {
+		t.Fatalf("Connect with a dead first endpoint and a live second: %v", err)
+	}
+	conn.Close()
+
+	if got := m.GetServerAddr(ctx); got != live.addr {
+		t.Fatalf("pinned %s, want the live endpoint %s", got, live.addr)
+	}
+	if live.accepts.Load() == 0 {
+		t.Error("the live endpoint was never dialled")
+	}
+}
