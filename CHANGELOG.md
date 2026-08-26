@@ -7,6 +7,8 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-08-27
+
 ### Fixed
 
 - **The IPv6 listener now follows the `-listen` port instead of always trying
