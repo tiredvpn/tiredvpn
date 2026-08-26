@@ -295,6 +295,17 @@ func (m *Manager) Register(s Strategy) {
 	m.sortStrategies()
 }
 
+// ConnectivityChecker returns the pre-flight gate, or nil when none was set.
+//
+// Exported so the reconnect loop asks the same question the same way the
+// connect path does, against the addresses the selector pinned - instead of
+// inventing its own probe and, in the process, its own observable signature.
+func (m *Manager) ConnectivityChecker() *ConnectivityChecker {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.connectivityChecker
+}
+
 // SetConnectivityChecker sets the connectivity checker for pre-flight checks
 func (m *Manager) SetConnectivityChecker(checker *ConnectivityChecker) {
 	m.mu.Lock()
@@ -1242,6 +1253,12 @@ type DefaultManagerConfig struct {
 	// still describe the first endpoint.
 	Endpoints []endpoint.Endpoint
 
+	// EndpointTuning is the [selection] section: which endpoint wins among the
+	// healthy ones and how quickly a failing one is parked. Its zero value
+	// keeps the historical behaviour - configured order, and the family policy
+	// derived from PreferIPv6/FallbackToV4 above.
+	EndpointTuning endpoint.Tuning
+
 	// RTT Masking configuration
 	RTTMaskingEnabled bool        // Enable RTT masking on connections
 	RTTProfile        *RTTProfile // RTT profile to use (nil = auto-select)
@@ -1349,14 +1366,18 @@ func initManagerTransport(m *Manager, cfg DefaultManagerConfig) {
 		eps = []endpoint.Endpoint{{Name: "server", V4: cfg.ServerAddr, V6: cfg.ServerAddrV6}}
 	}
 
-	policy := endpoint.FamilyPolicyFromLegacy(cfg.PreferIPv6, cfg.FallbackToV4)
-	sel, err := endpoint.NewSelector(endpoint.Config{Endpoints: eps, Family: policy})
+	legacy := endpoint.FamilyPolicyFromLegacy(cfg.PreferIPv6, cfg.FallbackToV4)
+	sel, err := endpoint.NewTunedSelector(eps, cfg.EndpointTuning, legacy)
 	if err != nil {
 		log.Warn("Endpoint selector not configured: %v", err)
 		return
 	}
 	m.endpoints = sel
 
+	if len(eps) > 1 {
+		log.Info("Endpoint pool: %d servers, selection=%s, family=%s",
+			len(eps), cfg.EndpointTuning.Selection, cfg.EndpointTuning.FamilyOr(legacy))
+	}
 	if cfg.ServerAddrV6 != "" && cfg.PreferIPv6 {
 		log.Info("IPv6 transport enabled (IPv6=%s, IPv4=%s, fallback=%v)",
 			cfg.ServerAddrV6, cfg.ServerAddr, cfg.FallbackToV4)
@@ -1366,7 +1387,13 @@ func initManagerTransport(m *Manager, cfg DefaultManagerConfig) {
 // SetEndpoints replaces the endpoint list and the family policy, discarding all
 // accumulated candidate health.
 func (m *Manager) SetEndpoints(eps []endpoint.Endpoint, policy endpoint.FamilyPolicy) error {
-	sel, err := endpoint.NewSelector(endpoint.Config{Endpoints: eps, Family: policy})
+	return m.SetEndpointsTuned(eps, endpoint.Tuning{Family: &policy})
+}
+
+// SetEndpointsTuned is SetEndpoints with the whole [selection] section rather
+// than the family policy alone.
+func (m *Manager) SetEndpointsTuned(eps []endpoint.Endpoint, tuning endpoint.Tuning) error {
+	sel, err := endpoint.NewTunedSelector(eps, tuning, endpoint.PreferV6)
 	if err != nil {
 		return err
 	}
@@ -1447,8 +1474,15 @@ func initManagerRTTMasking(m *Manager, cfg DefaultManagerConfig) {
 
 // registerAllStrategies registers all transport strategies onto the manager.
 func registerAllStrategies(m *Manager, cfg DefaultManagerConfig) {
-	hasServer := cfg.ServerAddr != ""
+	// A config that only fills Endpoints has a server just as much as one that
+	// fills ServerAddr. Checking ServerAddr alone would register nothing at all
+	// for a pure server-list client - every strategy gated out, and the failure
+	// mode is "no strategies available" rather than anything that points at the
+	// config.
+	hasServer := cfg.ServerAddr != "" || cfg.ServerAddrV6 != "" || len(cfg.Endpoints) > 0
 	hasSecret := len(cfg.Secret) > 0
+
+	warnEndpointPinnedFlags(cfg)
 
 	registerQUICStrategies(m, cfg, hasServer, hasSecret)
 	registerTLSStrategies(m, cfg, hasServer, hasSecret)
@@ -1460,6 +1494,64 @@ func registerAllStrategies(m *Manager, cfg DefaultManagerConfig) {
 	registerGenevaStrategies(m, cfg, hasServer, hasSecret)
 	registerSeqovlStrategy(m, cfg, hasServer, hasSecret)
 	registerICMPStrategy(m, cfg, hasServer, hasSecret)
+}
+
+// derivedSalamanderPort picks the Salamander port when the flag left it unset:
+// the port of ServerAddr, then of the first endpoint, then 443.
+//
+// The endpoint fallback matters for a client configured only through
+// [[servers]], where ServerAddr is empty and the old derivation silently landed
+// on 443 - a port the exit is not listening on.
+func derivedSalamanderPort(cfg DefaultManagerConfig) int {
+	addrs := []string{cfg.ServerAddr}
+	if len(cfg.Endpoints) > 0 {
+		addrs = append(addrs, cfg.Endpoints[0].V4, cfg.Endpoints[0].V6)
+	}
+	for _, addr := range addrs {
+		if addr == "" {
+			continue
+		}
+		_, portStr, err := net.SplitHostPort(addr)
+		if err != nil {
+			continue
+		}
+		if p, err := strconv.Atoi(portStr); err == nil && p > 0 {
+			return p
+		}
+	}
+	return 443
+}
+
+// warnEndpointPinnedFlags reports the settings that a server list silently
+// makes wrong, rather than letting them fail as an unexplained dead transport.
+//
+// The QUIC Salamander port, when not given explicitly, is derived from the
+// FIRST endpoint's port and then applied to whatever host the selector picks.
+// With a list whose members listen on different ports that is simply the wrong
+// port on every endpoint but one. Making it per-endpoint needs a per-endpoint
+// port in the config, which the [[servers]] section does not carry today.
+func warnEndpointPinnedFlags(cfg DefaultManagerConfig) {
+	if len(cfg.Endpoints) < 2 {
+		return
+	}
+	if !cfg.QUICEnabled || cfg.QUICSNIFragEnabled || cfg.QUICSalamanderPort != 0 {
+		return
+	}
+	ports := make(map[string]bool, len(cfg.Endpoints))
+	for _, ep := range cfg.Endpoints {
+		for _, addr := range []string{ep.V4, ep.V6} {
+			if addr == "" {
+				continue
+			}
+			if _, port, err := net.SplitHostPort(addr); err == nil {
+				ports[port] = true
+			}
+		}
+	}
+	if len(ports) > 1 {
+		log.Warn("QUIC Salamander port is derived from the first endpoint but the pool uses %d different ports; "+
+			"set quic_salamander_port explicitly or Salamander will dial the wrong port on the others", len(ports))
+	}
 }
 
 // registerSeqovlStrategy registers the seqovl (TCP sequence overlap, level B
@@ -1529,14 +1621,7 @@ func registerQUICStrategies(m *Manager, cfg DefaultManagerConfig, hasServer, has
 	if !cfg.QUICSNIFragEnabled {
 		salPort := cfg.QUICSalamanderPort
 		if salPort == 0 {
-			if _, portStr, err := net.SplitHostPort(cfg.ServerAddr); err == nil {
-				if p, err := strconv.Atoi(portStr); err == nil {
-					salPort = p
-				}
-			}
-			if salPort == 0 {
-				salPort = 443
-			}
+			salPort = derivedSalamanderPort(cfg)
 		}
 		m.Register(NewQUICSalamanderStrategy(m, cfg.Secret, salPort))
 	}

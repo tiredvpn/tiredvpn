@@ -347,6 +347,11 @@ func (t *TUNDevice) SetServerBypassIP(net.IP) {}
 // excludes the tunnel's own socket.
 func (t *TUNDevice) SetServerBypassIP6(net.IP) {}
 
+// SetServerBypassIPs is a no-op on macOS; see SetServerBypassIP. The exposure
+// it leaves grows with a server list rather than changing in kind: on Linux
+// every endpoint gets a pinned host route, here none of them do.
+func (t *TUNDevice) SetServerBypassIPs([]net.IP) {}
+
 // EnsureServerBypass is a no-op on macOS; see SetServerBypassIP.
 func (t *TUNDevice) EnsureServerBypass() {}
 
