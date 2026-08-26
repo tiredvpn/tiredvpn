@@ -839,6 +839,13 @@ type QUICServerConn struct {
 	ClientID   string
 	ClientName string
 
+	// ClientIDFromRegistry records where ClientID came from. A registry client
+	// has its own secret and its own id, so that id identifies one client. The
+	// global-secret fallback gives every client the same id, and a caller that
+	// keys anything per client on it - an IP-pool lease, for one - has to know
+	// the difference. The zero value is the shared case on purpose.
+	ClientIDFromRegistry bool
+
 	mu     sync.Mutex
 	closed bool
 }
@@ -876,6 +883,7 @@ func (c *QUICServerConn) VerifyClient() error {
 			if verifyWithSecret(info.Secret) {
 				c.secret = info.Secret
 				c.ClientID = info.ClientID
+				c.ClientIDFromRegistry = true
 				c.ClientName = info.Name
 				log.Info("QUIC authenticated (client: %s, id: %s)", info.Name, info.ClientID)
 				return c.sendAck()

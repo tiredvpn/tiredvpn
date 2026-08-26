@@ -295,7 +295,7 @@ func TestRelayChainForwardsDualStack(t *testing.T) {
 		}
 		hpackDec := hpack.NewDecoder(4096, nil)
 		authenticated := false
-		var authClientID string
+		var authClientID clientIdentity
 		var tunnel *h2TunnelState
 		var connTracked bool
 		runH2FrameLoop(&conn, &framer, hpackDec, relayCtx, logger, &authenticated, &authClientID, &connTracked, &tunnel, nil)

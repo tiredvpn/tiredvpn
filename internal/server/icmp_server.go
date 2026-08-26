@@ -235,7 +235,7 @@ func (s *ICMPServer) getOrCreateSession(
 	// pipeConnToSend is not left blocking on serverConn.Read until TTL eviction.
 	// removeSession uses sync.Once internally so duplicate calls are harmless.
 	go func() {
-		handleRawTunnel(clientConn, s.srvCtx, logger, "")
+		handleRawTunnel(clientConn, s.srvCtx, logger, clientIdentity{})
 		s.removeSession(sess.sessionID)
 	}()
 

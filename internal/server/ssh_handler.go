@@ -50,7 +50,7 @@ func handleSSHCamouflage(conn net.Conn, srvCtx *serverContext, logger *log.Logge
 // sshServerHandshake performs banner exchange, KEXINIT negotiation and the ECDH
 // round trip, verifying the client auth token. On success it returns the matched
 // client ID (or "global" for the global secret).
-func sshServerHandshake(conn net.Conn, srvCtx *serverContext, logger *log.Logger) (string, error) {
+func sshServerHandshake(conn net.Conn, srvCtx *serverContext, logger *log.Logger) (clientIdentity, error) {
 	conn.SetDeadline(time.Now().Add(15 * time.Second))
 	defer conn.SetDeadline(time.Time{})
 
@@ -59,43 +59,43 @@ func sshServerHandshake(conn net.Conn, srvCtx *serverContext, logger *log.Logger
 	// 1. Read the client banner line.
 	line, err := br.ReadString('\n')
 	if err != nil {
-		return "", fmt.Errorf("reading client banner: %w", err)
+		return clientIdentity{}, fmt.Errorf("reading client banner: %w", err)
 	}
 	if !bytes.HasPrefix([]byte(line), []byte("SSH-2.0")) {
-		return "", fmt.Errorf("not an SSH-2.0 banner")
+		return clientIdentity{}, fmt.Errorf("not an SSH-2.0 banner")
 	}
 	// 2. Send our banner.
 	if _, err := conn.Write([]byte(strategy.SSHBanner)); err != nil {
-		return "", err
+		return clientIdentity{}, err
 	}
 	// 3. Read the client KEXINIT (discard contents).
 	if _, err := strategy.ReadSSHPacket(br); err != nil {
-		return "", fmt.Errorf("reading client KEXINIT: %w", err)
+		return clientIdentity{}, fmt.Errorf("reading client KEXINIT: %w", err)
 	}
 	// 4. Send our KEXINIT.
 	if err := strategy.WriteSSHPacket(conn, strategy.BuildSSHKexInit()); err != nil {
-		return "", err
+		return clientIdentity{}, err
 	}
 	// 5. Read the client ECDH init carrying the auth token.
 	payload, err := strategy.ReadSSHPacket(br)
 	if err != nil {
-		return "", fmt.Errorf("reading client ECDH init: %w", err)
+		return clientIdentity{}, fmt.Errorf("reading client ECDH init: %w", err)
 	}
 	token, err := strategy.ParseSSHKexPubKey(payload, 30) // SSH_MSG_KEX_ECDH_INIT
 	if err != nil {
-		return "", err
+		return clientIdentity{}, err
 	}
 
 	clientID, secret, ok := verifySSHAuth(token, srvCtx)
 	if !ok {
-		return "", fmt.Errorf("auth token verification failed")
+		return clientIdentity{}, fmt.Errorf("auth token verification failed")
 	}
 
 	// 6. Send the ECDH reply carrying our token derived from the same secret so
 	//    the client can confirm the server understands the protocol.
 	serverToken := strategy.GenerateSSHAuthToken(secret)
 	if err := strategy.WriteSSHPacket(conn, strategy.BuildSSHKexECDH(31, serverToken)); err != nil { // SSH_MSG_KEX_ECDH_REPLY
-		return "", err
+		return clientIdentity{}, err
 	}
 
 	conn.SetDeadline(time.Time{})
@@ -105,17 +105,17 @@ func sshServerHandshake(conn net.Conn, srvCtx *serverContext, logger *log.Logger
 // verifySSHAuth checks the token against per-client secrets (registry) and then
 // the global secret. Returns the matched client ID, the secret used, and whether
 // authentication succeeded.
-func verifySSHAuth(token []byte, srvCtx *serverContext) (string, []byte, bool) {
+func verifySSHAuth(token []byte, srvCtx *serverContext) (clientIdentity, []byte, bool) {
 	if srvCtx.registry != nil {
 		for _, client := range srvCtx.registry.ListClients() {
 			secret := []byte(client.Secret)
 			if strategy.VerifySSHAuthToken(token, secret) {
-				return client.ID, secret, true
+				return registryIdentity(client.ID), secret, true
 			}
 		}
 	}
 	if len(srvCtx.cfg.Secret) > 0 && strategy.VerifySSHAuthToken(token, srvCtx.cfg.Secret) {
-		return "global", srvCtx.cfg.Secret, true
+		return sharedIdentity(globalClientID), srvCtx.cfg.Secret, true
 	}
-	return "", nil, false
+	return clientIdentity{}, nil, false
 }

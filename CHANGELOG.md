@@ -36,6 +36,24 @@ Versions follow [Semantic Versioning](https://semver.org/).
   applications fall back to IPv4 immediately instead of waiting out a timeout.
   Linux only — on macOS the gap is reported with a warning rather than hidden,
   and on Android filtering belongs to `VpnService`.
+### Fixed
+
+- **Clients sharing one secret still shared one tunnel IP, and evicted each
+  other every thirty seconds.** 1.3.26 qualified the IP-pool lease with the
+  client's address, but only for the identity spelled `global`. REALITY derives
+  its identity as an HMAC of the secret and nothing else, so every client on a
+  shared secret authenticates as the same `reality:<hex>`; HTTP polling builds
+  `polling:global` the same way. Those never matched the check, so the flap the
+  earlier fix was written for carried on unnoticed under a different name: one
+  Dubai exit had three addresses on a single `reality:` identity taking
+  10.8.2.4 from each other, each eviction landing on a connection that had
+  carried traffic a moment earlier, until the client gave up on REALITY and
+  fell back to a slower transport. Whether an identity can key a lease is now
+  recorded where the identity is derived - registry clients are per-client,
+  anything derived from the shared secret is not - instead of being guessed
+  from how the string is spelled. An identity nobody classified counts as
+  shared, so the next transport to be added fails safe. Registry clients are
+  unaffected and keep their address across a change of network.
 
 ## [1.4.2] - 2026-08-25
 

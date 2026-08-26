@@ -61,7 +61,7 @@ func handleIMAPCamouflage(conn net.Conn, srvCtx *serverContext, logger *log.Logg
 // imapServerHandshake reads the client greeting, answers CAPABILITY, verifies
 // the LOGIN auth token and answers SELECT INBOX. On success it returns the
 // matched client ID (or "global") and the buffered reader for the tunnel phase.
-func imapServerHandshake(conn net.Conn, srvCtx *serverContext, logger *log.Logger) (string, *bufio.Reader, error) {
+func imapServerHandshake(conn net.Conn, srvCtx *serverContext, logger *log.Logger) (clientIdentity, *bufio.Reader, error) {
 	conn.SetDeadline(time.Now().Add(15 * time.Second))
 	defer conn.SetDeadline(time.Time{})
 
@@ -70,68 +70,68 @@ func imapServerHandshake(conn net.Conn, srvCtx *serverContext, logger *log.Logge
 	// 1. Read the unsolicited greeting line the client opened with.
 	greeting, err := br.ReadString('\n')
 	if err != nil {
-		return "", nil, fmt.Errorf("reading client greeting: %w", err)
+		return clientIdentity{}, nil, fmt.Errorf("reading client greeting: %w", err)
 	}
 	if !strings.HasPrefix(greeting, "* OK") {
-		return "", nil, fmt.Errorf("not an IMAP greeting")
+		return clientIdentity{}, nil, fmt.Errorf("not an IMAP greeting")
 	}
 
 	// 2. CAPABILITY.
 	capLine, err := br.ReadString('\n')
 	if err != nil {
-		return "", nil, fmt.Errorf("reading CAPABILITY: %w", err)
+		return clientIdentity{}, nil, fmt.Errorf("reading CAPABILITY: %w", err)
 	}
 	capTag := imapTag(capLine)
 	if capTag == "" || !strings.Contains(capLine, "CAPABILITY") {
-		return "", nil, fmt.Errorf("expected CAPABILITY command")
+		return clientIdentity{}, nil, fmt.Errorf("expected CAPABILITY command")
 	}
 	if _, err := conn.Write([]byte(strategy.IMAPPreLoginCaps())); err != nil {
-		return "", nil, err
+		return clientIdentity{}, nil, err
 	}
 	if _, err := conn.Write([]byte(capTag + " OK Pre-login capabilities listed, post-login capabilities have more.\r\n")); err != nil {
-		return "", nil, err
+		return clientIdentity{}, nil, err
 	}
 
 	// 3. LOGIN <user> <base64-token>.
 	loginLine, err := br.ReadString('\n')
 	if err != nil {
-		return "", nil, fmt.Errorf("reading LOGIN: %w", err)
+		return clientIdentity{}, nil, fmt.Errorf("reading LOGIN: %w", err)
 	}
 	fields := strings.Fields(loginLine)
 	if len(fields) < 4 || !strings.EqualFold(fields[1], "LOGIN") {
-		return "", nil, fmt.Errorf("malformed LOGIN command")
+		return clientIdentity{}, nil, fmt.Errorf("malformed LOGIN command")
 	}
 	loginTag := fields[0]
 	token, err := base64DecodeToken(fields[3])
 	if err != nil {
-		return "", nil, fmt.Errorf("decoding LOGIN token: %w", err)
+		return clientIdentity{}, nil, fmt.Errorf("decoding LOGIN token: %w", err)
 	}
 
 	clientID, _, ok := verifyIMAPAuth(token, srvCtx)
 	if !ok {
 		// Look like a real auth rejection before bailing out.
 		_, _ = conn.Write([]byte(loginTag + " NO [AUTHENTICATIONFAILED] Authentication failed.\r\n"))
-		return "", nil, fmt.Errorf("auth token verification failed")
+		return clientIdentity{}, nil, fmt.Errorf("auth token verification failed")
 	}
 
 	if _, err := conn.Write([]byte(strategy.IMAPPostLoginCaps())); err != nil {
-		return "", nil, err
+		return clientIdentity{}, nil, err
 	}
 	if _, err := fmt.Fprintf(conn, "%s OK [CAPABILITY %s] Logged in\r\n", loginTag, strategy.IMAPCapsInline()); err != nil {
-		return "", nil, err
+		return clientIdentity{}, nil, err
 	}
 
 	// 4. SELECT INBOX.
 	selectLine, err := br.ReadString('\n')
 	if err != nil {
-		return "", nil, fmt.Errorf("reading SELECT: %w", err)
+		return clientIdentity{}, nil, fmt.Errorf("reading SELECT: %w", err)
 	}
 	selectTag := imapTag(selectLine)
 	if selectTag == "" || !strings.Contains(strings.ToUpper(selectLine), "SELECT") {
-		return "", nil, fmt.Errorf("expected SELECT command")
+		return clientIdentity{}, nil, fmt.Errorf("expected SELECT command")
 	}
 	if _, err := conn.Write([]byte(buildIMAPSelectResponse(selectTag))); err != nil {
-		return "", nil, err
+		return clientIdentity{}, nil, err
 	}
 
 	conn.SetDeadline(time.Time{})
@@ -173,17 +173,17 @@ func buildIMAPSelectResponse(tag string) string {
 // verifyIMAPAuth checks the token against per-client secrets (registry) and
 // then the global secret. Returns the matched client ID, the secret used, and
 // whether authentication succeeded.
-func verifyIMAPAuth(token []byte, srvCtx *serverContext) (string, []byte, bool) {
+func verifyIMAPAuth(token []byte, srvCtx *serverContext) (clientIdentity, []byte, bool) {
 	if srvCtx.registry != nil {
 		for _, client := range srvCtx.registry.ListClients() {
 			secret := []byte(client.Secret)
 			if strategy.VerifyIMAPAuthToken(token, secret) {
-				return client.ID, secret, true
+				return registryIdentity(client.ID), secret, true
 			}
 		}
 	}
 	if len(srvCtx.cfg.Secret) > 0 && strategy.VerifyIMAPAuthToken(token, srvCtx.cfg.Secret) {
-		return "global", srvCtx.cfg.Secret, true
+		return sharedIdentity(globalClientID), srvCtx.cfg.Secret, true
 	}
-	return "", nil, false
+	return clientIdentity{}, nil, false
 }
