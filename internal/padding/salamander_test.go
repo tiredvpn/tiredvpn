@@ -552,7 +552,19 @@ func TestSalamanderUDPRoundtrip(t *testing.T) {
 // false-accept a UDP packet. This is the regression guard for the QUIC
 // Salamander "no matching secret" / per-address cache poisoning bug, where the
 // old length-prefix + 0x80 long-header heuristic accepted ~50% of garbage.
+//
+// The zero threshold is only meaningful because the tag is udpTagLen bytes
+// wide. At 8 bytes the expected number of false accepts over n trials is
+// n*2^-64 ~ 1e-15, so a single accept here means the check is broken, not
+// unlucky. At the earlier width of 2 bytes the expectation was n*2^-16 ~ 0.3
+// and this test failed roughly one run in four - it was a coin flip, and it did
+// come up heads in CI. The assertion below is therefore deliberately exact; do
+// not "fix" a failure by allowing a nonzero budget.
 func TestSalamanderUDPWrongSecretRejected(t *testing.T) {
+	if udpTagLen < 8 {
+		t.Fatalf("udpTagLen=%d: a tag narrower than 8 bytes makes this test statistical, not deterministic", udpTagLen)
+	}
+
 	right := NewSalamanderPadder([]byte("the-correct-secret-AAAAA"), Balanced)
 	wrong := NewSalamanderPadder([]byte("a-different-secret-BBBBB"), Balanced)
 
@@ -571,6 +583,206 @@ func TestSalamanderUDPWrongSecretRejected(t *testing.T) {
 	}
 	if falseAccepts != 0 {
 		t.Fatalf("wrong secret false-accepted %d/%d packets, want 0", falseAccepts, n)
+	}
+
+	// Positive control: the same loop with the right secret must accept every
+	// packet. Without it, "zero false accepts" is indistinguishable from
+	// DecryptUDP rejecting everything unconditionally.
+	for i := 0; i < 100; i++ {
+		payload := make([]byte, 1200)
+		rand.Read(payload)
+		enc, err := right.EncryptUDP(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := right.DecryptUDP(enc); !ok {
+			t.Fatalf("right secret rejected its own packet at iteration %d", i)
+		}
+	}
+}
+
+// TestSalamanderUDPTagCheckedInFull verifies that every byte of the tag takes
+// part in the accept decision. A comparison that stops early - or a tag widened
+// in EncryptUDP but still compared two bytes deep in DecryptUDP - would leave
+// the trailing bytes free, silently restoring the old 2^-16 odds while the
+// constant says 8. Corrupting each tag position in turn is the only way to see
+// that; a single flip at position 0 would pass either way.
+func TestSalamanderUDPTagCheckedInFull(t *testing.T) {
+	padder := NewSalamanderPadder([]byte("tag-coverage-secret"), Balanced)
+	payload := []byte("payload under a fully checked tag")
+
+	for i := 0; i < udpTagLen; i++ {
+		enc, err := padder.EncryptUDP(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Tag byte i sits at offset 8+i: the 8-byte salt is sent in the clear
+		// and the masked header follows it, so flipping a ciphertext bit there
+		// flips exactly one decrypted tag byte.
+		enc[8+i] ^= 0x01
+		if _, ok := padder.DecryptUDP(enc); ok {
+			t.Errorf("tag byte %d corrupted, packet still accepted: tag not compared in full", i)
+		}
+	}
+}
+
+// TestSalamanderUDPWireSizeStable pins the observable datagram sizes that the
+// UDP framing produces. This is the property Salamander exists for, and it is
+// what a wider tag threatens: the tag lives inside the padded region, so a
+// packet that no longer fits its bucket jumps to the next one and the size
+// distribution on the wire moves.
+//
+// Two claims are checked. First, that for the payload sizes QUIC actually
+// emits - small ACK/control datagrams and full-size packets around the
+// quic-go default of 1280 - the datagram size is exactly what it was with the
+// old 2-byte tag. Second, that below the largest bucket the size alphabet is
+// the bucket list and nothing else, which is what makes the first claim more
+// than a lookup table.
+func TestSalamanderUDPWireSizeStable(t *testing.T) {
+	padder := NewSalamanderPadder([]byte("wire-size-secret"), Balanced)
+	buckets := padder.GetBuckets() // 400, 800, 1200, 1400
+
+	// Sizes a quic-go connection puts on the wire: bare ACKs and probes at the
+	// low end, Initial and full data packets at InitialPacketSize=1280. The
+	// wanted values were produced by the 2-byte-tag build and are frozen here.
+	quicSizes := []struct {
+		payload  int
+		wantWire int
+	}{
+		{21, 400}, {25, 400}, {33, 400}, {42, 400}, {55, 400}, {68, 400},
+		{120, 400}, {256, 400}, {512, 800}, {700, 800}, {900, 1200},
+		{1024, 1200}, {1200, 1400}, {1252, 1400}, {1280, 1400},
+	}
+	for _, tc := range quicSizes {
+		enc, err := padder.EncryptUDP(make([]byte, tc.payload))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(enc) != tc.wantWire {
+			t.Errorf("payload %d: datagram %d bytes, want %d - the tag widening moved this size into another bucket",
+				tc.payload, len(enc), tc.wantWire)
+		}
+	}
+
+	// Every payload that still fits the largest bucket must come out as one of
+	// the bucket values. Anything else means padding stopped normalising and
+	// the payload length is leaking directly.
+	maxPadded := buckets[len(buckets)-1] - 8 - udpHeaderLen
+	inBucket := make(map[int]bool, len(buckets))
+	for _, b := range buckets {
+		inBucket[b] = true
+	}
+	for n := 1; n <= maxPadded; n++ {
+		enc, err := padder.EncryptUDP(make([]byte, n))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !inBucket[len(enc)] {
+			t.Fatalf("payload %d: datagram %d bytes is not a bucket %v", n, len(enc), buckets)
+		}
+	}
+}
+
+// TestSalamanderUDPBucketBoundaries records exactly where the payload-to-bucket
+// boundaries sit now, so the shift caused by the wider tag is written down
+// rather than discovered later on a packet capture. Each boundary moved down by
+// six bytes (2-byte tag -> 8-byte tag), which means payloads in the six-byte
+// window below each old boundary - 383..388, 783..788, 1183..1188, 1383..1388 -
+// now travel one bucket up. None of those windows carries QUIC traffic in the
+// configurations this code ships with, see TestSalamanderUDPWireSizeStable.
+//
+// Above the largest bucket the padder gives up and sends payload+8+udpHeaderLen
+// verbatim, so there the datagram grew by the full six bytes and the exact
+// payload length is on the wire. That leak predates this change; the tag only
+// shifted it by six.
+func TestSalamanderUDPBucketBoundaries(t *testing.T) {
+	padder := NewSalamanderPadder([]byte("boundary-secret"), Balanced)
+
+	cases := []struct {
+		payload  int
+		wantWire int
+	}{
+		{382, 400}, {383, 800}, // was 388/389
+		{782, 800}, {783, 1200}, // was 788/789
+		{1182, 1200}, {1183, 1400}, // was 1188/1189
+		{1382, 1400}, {1383, 1401}, // was 1388/1389, and 1389 went out as 1401 too
+	}
+	for _, tc := range cases {
+		enc, err := padder.EncryptUDP(make([]byte, tc.payload))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(enc) != tc.wantWire {
+			t.Errorf("payload %d: datagram %d bytes, want %d", tc.payload, len(enc), tc.wantWire)
+		}
+	}
+}
+
+// TestMultiSecretManySecretsNoFalseAccept exercises the path where a narrow tag
+// hurts most. ReadFrom walks the whole secret registry looking for a match, so
+// one unmatched packet costs one trial per registered secret and the odds of a
+// false accept scale with the registry size. With 512 secrets a 2-byte tag
+// would have accepted roughly one packet in 128 and cached the wrong secret for
+// that address, which then also corrupts every reply written back to it.
+//
+// The rejection half is paired with an acceptance half using a secret buried in
+// the middle of the registry: "nothing was accepted" would otherwise be
+// satisfied by a ReadFrom that rejects unconditionally.
+func TestMultiSecretManySecretsNoFalseAccept(t *testing.T) {
+	const numSecrets = 512
+
+	secrets := make([][]byte, numSecrets)
+	for i := range secrets {
+		s := make([]byte, 32)
+		rand.Read(s)
+		secrets[i] = s
+	}
+	provider := func() [][]byte { return secrets }
+
+	globalSecret := []byte("server-global-secret")
+	stranger := NewSalamanderPadder([]byte("secret-of-nobody-in-the-registry"), Balanced)
+
+	// Rejection: packets from a secret the server does not hold.
+	const rounds = 200
+	for i := 0; i < rounds; i++ {
+		enc, err := stranger.EncryptUDP(make([]byte, 1200))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		mc := newChanPacketConn()
+		conn := NewMultiSecretSalamanderPacketConn(mc, globalSecret, Balanced, provider)
+		mc.inject(enc)
+
+		if _, _, err := conn.ReadFrom(make([]byte, 65536)); err == nil {
+			conn.Close()
+			t.Fatalf("round %d: packet from an unregistered secret accepted after %d trials", i, numSecrets)
+		}
+		conn.Close()
+	}
+
+	// Acceptance: a secret in the middle of the registry must still be found,
+	// and the payload must come back intact.
+	client := NewSalamanderPadder(secrets[numSecrets/2], Balanced)
+	payload := make([]byte, 1200)
+	rand.Read(payload)
+	enc, err := client.EncryptUDP(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mc := newChanPacketConn()
+	conn := NewMultiSecretSalamanderPacketConn(mc, globalSecret, Balanced, provider)
+	defer conn.Close()
+	mc.inject(enc)
+
+	buf := make([]byte, 65536)
+	n, _, err := conn.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("registered client secret rejected: %v", err)
+	}
+	if !bytes.Equal(buf[:n], payload) {
+		t.Error("payload corrupted through the multi-secret path")
 	}
 }
 
