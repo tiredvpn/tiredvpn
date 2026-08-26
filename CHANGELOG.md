@@ -7,6 +7,21 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`-listen [::]:<port>` no longer switches the IPv6 listener off.** 1.7.0
+  started deriving the v6 address from `-listen`, but refused to derive one
+  when `-listen` already named an IPv6 host, on the belief that a second
+  socket on that port would collide with the main listener. It does not. The
+  main listener runs on `tcp4`, which turns a wildcard host into `0.0.0.0`,
+  and Go sets `IPV6_V6ONLY` on every `tcp6` socket, so the two coexist on one
+  port - measured directly, and now pinned by a test that opens both. The
+  refusal therefore denied IPv6 to exactly the operator who had asked for both
+  families by writing `[::]`. A concrete literal such as `[2001:db8::1]:443`
+  is still refused, for a different and real reason: `tcp4` cannot bind it at
+  all, so the process exits before the IPv6 listener is ever reached, and the
+  message now says so.
+
 ## [1.7.0] - 2026-08-27
 
 ### Fixed

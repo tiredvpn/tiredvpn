@@ -90,9 +90,14 @@ exit. `-upstream-secret` is mandatory when `-upstream` is set.
 
 An empty `-listen-v6` takes the port from `-listen` and widens the host to
 `[::]`: `-listen :443` gives `[::]:443`, `-listen 1.2.3.4:994` gives `[::]:994`.
-Two cases leave IPv6 off with a reason in the log — `-listen` that already names
-an IPv6 address (say so with `-listen-v6` instead), and a `-listen` with no port
-or an unparsable one.
+`-listen [::]:997` gives `[::]:997` — the IPv4 listener reads a wildcard host as
+`0.0.0.0`, and the IPv6 socket is `V6ONLY`, so both sit on the port.
+
+Two cases leave IPv6 off with a reason in the log: a `-listen` with no port or
+an unparsable one, and a `-listen` naming a *concrete* IPv6 address such as
+`[2001:db8::1]:443`. The second one stops the server outright, before the IPv6
+listener is reached — the IPv4 listener cannot bind an IPv6 address. Give both
+families explicitly (`-listen` plus `-listen-v6`) instead.
 
 These control the *transport* the client dials. IPv6 **inside** the tunnel is
 `-ip-pool-v6`.
