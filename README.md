@@ -164,7 +164,7 @@ helm install my-tiredvpn oci://ghcr.io/tiredvpn/charts/tiredvpn --version 0.3.0 
   -f my-values.yaml
 ```
 
-The chart is versioned separately from the binary: chart `0.3.1` ships
+The chart is versioned separately from the binary: chart `0.3.2` ships
 `appVersion` 1.5.1. Each tagged release patch-bumps the chart and pushes it to
 the OCI registry.
 
