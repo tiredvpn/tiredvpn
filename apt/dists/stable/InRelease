@@ -4,44 +4,44 @@ Hash: SHA512
 Origin: TiredVPN
 Label: TiredVPN
 Codename: stable
-Date: Wed, 26 Aug 2026 11:23:10 UTC
+Date: Wed, 26 Aug 2026 20:20:54 UTC
 Architectures: amd64 arm64
 Components: main
 Description: TiredVPN apt repository
 MD5Sum:
- 9d5ae532753ea031315842360644cd2f 742 main/binary-amd64/Packages
- 15dc6ac5be0a09c1f0319986bd96d075 523 main/binary-amd64/Packages.gz
+ af5685f117fb3ae7da638e80b8d186a6 742 main/binary-amd64/Packages
+ fa8b643f3269df92653f0ebf7f921c2d 524 main/binary-amd64/Packages.gz
  a1cb1598e0aa53fb7a19e480edb1fd61 106 main/binary-amd64/Release
- 3a4db5948b6c445fb38592124b934476 742 main/binary-arm64/Packages
- 70bdf1b935e6458bfeb57d81be006560 521 main/binary-arm64/Packages.gz
+ b5793256d0f22c0525621a008198c357 742 main/binary-arm64/Packages
+ 8ba81515755bacba8f4914f797b8027f 524 main/binary-arm64/Packages.gz
  833f0c2c40c4bd6fc40c49fa19ba6a0e 106 main/binary-arm64/Release
 SHA1:
- a0bc965ae408e48d230bbab53be4caef55ddac46 742 main/binary-amd64/Packages
- 9b98ca7898023446fdcdc02059bdb2de6c57fe29 523 main/binary-amd64/Packages.gz
+ a4f61465b4c61dfa36be74e2b3db57f79dc373ef 742 main/binary-amd64/Packages
+ f53175443f833d1c2404607d443d243cea302a6a 524 main/binary-amd64/Packages.gz
  cbfc21b1aea4c89370605c63ec154f6fec1a0765 106 main/binary-amd64/Release
- cc8b8a71f6ec0ac4337f01838469578415b1f837 742 main/binary-arm64/Packages
- 50838d8b148b4931ccc7a9688f08e4a91143bd03 521 main/binary-arm64/Packages.gz
+ 445e901bc03f991012bc2e4f34ae0b1619457582 742 main/binary-arm64/Packages
+ 5ef9cb0efc1a02ac685e429b9372074c6f037a93 524 main/binary-arm64/Packages.gz
  3bca33c026140b27d9e2f0e3015f33da87d18e20 106 main/binary-arm64/Release
 SHA256:
- 15a9f702a52b33735785fe5058c833b263bf11bd657cb35ad27d55b19dfe4da8 742 main/binary-amd64/Packages
- 2993aa22d1c4ff2474189f174b5fd2e24c05da29c63546ec855103bf1296bb4d 523 main/binary-amd64/Packages.gz
+ 1b03104fef9653a8b8fc14604dd602af98340ac7a994b0dec0349d288e04a22c 742 main/binary-amd64/Packages
+ c13a54de949d6d2c368ed9caec054f904fafd2f433d33e14204afc19abed9694 524 main/binary-amd64/Packages.gz
  f56fb9ff2142f536cc47925e506d8cc1e0f6279b4aa0d1ed26922aa43934b7c7 106 main/binary-amd64/Release
- a3688c838a8a8ff5b7d811cc81e745f5f1ef1045a7da1794123b18cf20f583f1 742 main/binary-arm64/Packages
- d3db7379db7cf3314c172c16d10368cc1e399774dfe1d0fca46e1cb98ad50a6a 521 main/binary-arm64/Packages.gz
+ 677866d4bf72351f1246337469ceacfba822c6af918c37a0cb9c5ff0b62adf1d 742 main/binary-arm64/Packages
+ 0e2b8e908f2b30dda2da25998e5b34c332d83d8d1370a16cdab0f6fc45f83d6e 524 main/binary-arm64/Packages.gz
  2ea051df46bf72e3e60ff7def56f180e193b56db497b982353db591146d6542a 106 main/binary-arm64/Release
 -----BEGIN PGP SIGNATURE-----
 
-iQIzBAEBCgAdFiEERHHoMQRgX2u48+4LJqtRtqgl770FAmqOzJ4ACgkQJqtRtqgl
-773m3w//VWI4xTLstoDzJJdmGmJFiFIJ9CiwsrYYn41mArGTHR9C8KymjrUnEhEH
-puJx39dJUy+GlMPNFgXu0fCy2ptWTOxl5XzPALvvQo4brNBtMSrdlvn+gktquSL6
-2p/HgTbk1IAyWcDqs5VpjJVItBGRCMptStbSH7pGuQmE5eVhS3DXEIZgqGenIUrz
-6LUdmvCW9lAGmGYAWqLwsMjEUdQTE1D8FbLWjGKl7gMsD/duKqvg7IhX8eQcaSZ8
-LBAoxEMp5hv5qGDaTlHLvIwRG2ZExsQaklgqFvbbRBy0GJ8ShwvBNLbW92Pyf3j/
-aFYROARX4yzpHJ+AosO5HUzgz4hXzJJ12LwO7Rgkh5ya0hnb+XQKNe/xr2YiKnsj
-7MakWdV0F89LJMJN6F0tBow5bNYNG45NN/dv+zkwgSHuIVQMfCAEJ01TengpBpva
-PIgr4ZUTT9B+0lLGAKYsjtdYCY9nHiKpvTlh117nEkDQ/TnrRahjDGBQgKjNq9aQ
-Y9RX93pLskApbzeMoGDcn4owA3Ad7ZRycrG9JvyB2jiwD70tiL4su9/DHujOIICN
-syiltYXZy67ussP8WE4kB5J9KTL8DM5g9beVcCNDMWKcOQ9nkM6K+TzlNQPwiS5G
-w5mWc/eQviktkI1sIlPrJl48Mjz7TAE7/d7k5DcqEyBN57KVJ1g=
-=TfFN
+iQIzBAEBCgAdFiEERHHoMQRgX2u48+4LJqtRtqgl770FAmqPSqYACgkQJqtRtqgl
+773ACxAAm+i2L9IyYb4ncFaNz5Px+t7YVEyvKrpRVm7lm52lAo/D3UeTZP+SVMt3
+YITmQmZdry3hzW8MAtib9AzDAdg+ZYIEUxV6FYxraJnDNctlyQsLHhMlHHwkyHPG
+Mfkppq2un2nctrB/4C8j8ciH4CJzT3l8mEBGUmFnlJAHr6MJwZscwd5fIk1nE41B
+c5rOsk0ZfJ4ovRfe0wjyBJ74SIIq9IsbdHKXkEC3+fVYAsxzvw+1c9fmcKuIlO+t
+r1r43KBhvWDeLOsAtCT9YWCXKNCEE+Jnrkt0Aye3CGc19U6tNj95BoQqUFdFr+1I
+C/USjumfVkjNtAR5dy2gERLEnUaDDS++01CF0BWA0AbF6QhgrAmkpl7kgEmZ62jo
+qDafxAlQr3La4ZLr+PVxbXS/Q5YnXRMCcRerBw7noB5tjK6z5O6QYS0VuROBAx5i
+MaEVEkTsF/dFhF9Z6F6mo5ZPLhSVtDaDRl9d/sIhsZGD424qwoCyyATk8oVTEE3W
+3nO2Apt+Ej9+abrxrFV0h66ApDkguNnNYWwVg3jZn/lLV8CcD1/bGXzi+XXkih9q
+W5RVsTPMbDHYvBmxVKhSF9er8m8KwjrSHRl597TyiLdEhuutuLT3fLWVDcCPYupG
+r6fdNl6yc7ooirMPvtyEeptmQFpzIKdyE0oyZhKfHomndl0/vks=
+=J7lo
 -----END PGP SIGNATURE-----
