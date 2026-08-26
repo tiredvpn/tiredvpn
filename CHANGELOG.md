@@ -7,6 +7,8 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-08-26
+
 ### Changed
 
 - **Salamander's UDP framing now carries an 8-byte authenticity tag instead of
