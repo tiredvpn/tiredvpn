@@ -7,6 +7,54 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The IPv6 listener now follows the `-listen` port instead of always trying
+  995.** `-listen-v6` defaulted to the literal `[::]:995`, and `-enable-v6` is
+  on by default, so every server told to listen anywhere other than 995 asked
+  for IPv6 on a port its operator never named. Where 995 was taken the listener
+  simply failed and left a line in the log - three units on one host, on 994,
+  996 and 997, all had no IPv6 entry at all while appearing configured for it.
+  Where 995 was free the process quietly opened it, adding observable surface
+  that only `ss -ltn` would reveal. An empty `-listen-v6` now takes the port
+  from `-listen` and binds `[::]` on it: `-listen :443` gives `[::]:443`,
+  `-listen 1.2.3.4:994` gives `[::]:994`. The log states the address and that it
+  was derived. IPv6 stays off, with the reason logged, when `-listen` already
+  names an IPv6 address or has no usable port.
+  - **This changes behavior for deployments that relied on the default.** A
+    server on a non-995 port used to attempt IPv6 on 995 and will now listen on
+    its own port - open that port for IPv6 in the firewall, and drop 995 if it
+    was opened only for this. An explicit `-listen-v6` is honored exactly as
+    before, including the Helm chart, which sets it.
+- **`VPN started on <iface> (IP: ...)` now prints the address the interface
+  carries.** It printed the address from the client config, which is the one
+  requested at handshake time; by the time the line is reached the exit has
+  already assigned an address and the TUN device has been moved to it. On a
+  server that hands out addresses from a pool the two differ on every start, and
+  the log showed three consecutive lines that contradicted each other. The line
+  is what operators read when diagnosing address assignment, and it was once
+  read as evidence of two clients sharing one tunnel address - a defect that did
+  not exist.
+- **The client no longer reports a local proxy it is not running.** `Listening
+  on <addr> (SOCKS5/HTTP)` was printed at startup, before any socket was opened
+  and before the mode was even chosen, so it appeared in every run that never
+  listens: all four benchmark modes, Android control-socket mode, TUN mode with
+  an empty `-listen` (a deliberate configuration where another process owns the
+  local port), and any run where the listen failed - that last one leaving the
+  log asserting both that the proxy listens and that it could not start. The
+  claim is now made where the socket is, once, and carries the address the
+  listener is bound to rather than the configured string. A proxy switched off
+  with an empty `-listen` says so explicitly instead of printing an empty
+  address. The same treatment covers the `HTTP proxy on <addr>` line, and proxy
+  mode - which had no success line at all and relied on the startup claim - now
+  reports its own listeners.
+  - **Behavior change in one corner:** proxy mode (no `-tun`) with an empty
+    `-listen` now fails at startup with an explanation. It used to reach
+    `net.Listen("tcp", "")`, which binds a random port on every interface - an
+    unauthenticated proxy reachable from outside, on a port nothing in the log
+    named. TUN mode is unaffected: an empty `-listen` there means the local
+    proxy is off, which is a supported configuration.
+
 ## [1.6.0] - 2026-08-26
 
 ### Changed

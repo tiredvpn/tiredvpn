@@ -103,8 +103,8 @@ Examples:
   Server (second instance on the same Redis, isolated namespace):
     tiredvpn server -listen :994 -redis localhost:6379 -redis-db 1 -redis-prefix tiredvpn-relay:
 
-  Server (dual-stack IPv4 + IPv6):
-    tiredvpn server -listen :443 -listen-v6 [::]:995 -dual-stack -cert server.crt -key server.key
+  Server (dual-stack IPv4 + IPv6; v6 follows the -listen port unless overridden):
+    tiredvpn server -listen :443 -cert server.crt -key server.key
 
   Client (SOCKS5 proxy):
     tiredvpn client -server host:443 -secret <secret> -listen 127.0.0.1:1080
@@ -137,7 +137,7 @@ CORE OPTIONS:
   -listen string
         Listen address for IPv4 (default ":443")
   -listen-v6 string
-        IPv6 listen address (default "[::]:995")
+        IPv6 listen address (default: same port as -listen on [::])
   -cert string
         TLS certificate file (default "server.crt")
   -key string
@@ -517,7 +517,7 @@ func registerServerFlags(fs *flag.FlagSet, cfg *server.Config) *serverFlagOpts {
 	fs.StringVar(&cfg.IPPoolV6, "ip-pool-v6", "", "IPv6 prefix for TUN dual-stack clients (e.g., 'fd00:10:8::/64'). Enables IPv6 inside the tunnel for v0x04 clients.")
 
 	// IPv6 Transport flags
-	fs.StringVar(&cfg.ListenAddrV6, "listen-v6", "[::]:995", "IPv6 listen address")
+	fs.StringVar(&cfg.ListenAddrV6, "listen-v6", "", "IPv6 listen address (default: same port as -listen on [::])")
 	fs.BoolVar(&cfg.EnableIPv6, "enable-v6", true, "Enable IPv6 listener")
 	fs.BoolVar(&cfg.DualStack, "dual-stack", true, "Listen on both IPv4 and IPv6")
 

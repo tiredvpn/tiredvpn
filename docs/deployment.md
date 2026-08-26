@@ -372,8 +372,9 @@ firewall-cmd --permanent --add-port=443/udp
 firewall-cmd --reload
 ```
 
-With `-enable-v6` (default on) the server also listens on `-listen-v6`, default
-`[::]:995` — open 995/tcp and 995/udp too, or change the address.
+With `-enable-v6` (default on) the server also listens on `-listen-v6`. Left
+unset, that is `[::]` on the `-listen` port, so the rules above already cover it.
+Set `-listen-v6` to put IPv6 on a different port, and open that port too.
 
 If you use port hopping (`-port-range`), open the whole range:
 
@@ -496,7 +497,7 @@ The server listens on IPv6 by default:
 | Flag | Default |
 |---|---|
 | `-enable-v6` | `true` |
-| `-listen-v6` | `[::]:995` |
+| `-listen-v6` | empty — `[::]` on the `-listen` port |
 | `-dual-stack` | `true` |
 | `-ip-pool-v6` | empty (in-tunnel IPv6 disabled) |
 
@@ -512,7 +513,6 @@ Two different things are called "IPv6" here:
 ```bash
 tiredvpn server \
   -listen :443 \
-  -listen-v6 "[::]:995" \
   -cert server.crt \
   -key server.key \
   -secret <secret> \

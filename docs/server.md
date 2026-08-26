@@ -84,9 +84,15 @@ exit. `-upstream-secret` is mandatory when `-upstream` is set.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-listen-v6` | `[::]:995` | IPv6 listen address. |
-| `-enable-v6` | `true` | Start the IPv6 listener. Skipped when false or when `-listen-v6` is empty. |
-| `-dual-stack` | `true` | Accepted, but nothing reads it. The IPv6 listener is gated by `-enable-v6` and a non-empty `-listen-v6` alone; IPv4 always listens. |
+| `-listen-v6` | empty | IPv6 listen address. Empty means `[::]` on the `-listen` port. |
+| `-enable-v6` | `true` | Start the IPv6 listener. Skipped when false, and when `-listen-v6` is empty and no address can be derived from `-listen` — the log says which. |
+| `-dual-stack` | `true` | Accepted, but nothing reads it. The IPv6 listener is gated by `-enable-v6` alone; IPv4 always listens. |
+
+An empty `-listen-v6` takes the port from `-listen` and widens the host to
+`[::]`: `-listen :443` gives `[::]:443`, `-listen 1.2.3.4:994` gives `[::]:994`.
+Two cases leave IPv6 off with a reason in the log — `-listen` that already names
+an IPv6 address (say so with `-listen-v6` instead), and a `-listen` with no port
+or an unparsable one.
 
 These control the *transport* the client dials. IPv6 **inside** the tunnel is
 `-ip-pool-v6`.
@@ -458,7 +464,6 @@ tiredvpn server \
 ```bash
 tiredvpn server \
   -listen :443 \
-  -listen-v6 [::]:995 \
   -cert server.crt \
   -key server.key \
   -secret <secret>

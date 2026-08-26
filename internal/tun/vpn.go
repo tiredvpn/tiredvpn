@@ -1233,6 +1233,27 @@ func (v *VPNClient) GetServerCapabilities() ServerCapabilities {
 	return v.serverCaps
 }
 
+// LocalIP returns the tunnel address the interface actually carries: the one
+// the exit assigned during the handshake, or the requested one when the exit
+// echoed it back unchanged. Callers that log the address must use this rather
+// than the configured VPNConfig.LocalIP — after Start returns, connect has
+// already replaced the requested address with the assigned one and updated the
+// TUN device, so the configured value is stale.
+//
+// Taken under v.mu, the same lock connect holds while it mutates localIP.
+// The result is a copy: net.IP is a slice, and handing out the live one would
+// let a caller mutate the client's own state.
+func (v *VPNClient) LocalIP() net.IP {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.localIP == nil {
+		return nil
+	}
+	out := make(net.IP, len(v.localIP))
+	copy(out, v.localIP)
+	return out
+}
+
 // sendKeepalive periodically sends keepalive packets to prevent timeout
 func (v *VPNClient) sendKeepalive() {
 	defer func() {

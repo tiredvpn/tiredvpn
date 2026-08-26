@@ -207,10 +207,9 @@ func Run(cfg *Config) error {
 			log.Info("  endpoint %d: %s v4=%q v6=%q", i, e.Label(i), e.V4, e.V6)
 		}
 	}
-	log.Info("Listening on %s (SOCKS5/HTTP)", cfg.ListenAddr)
-	if cfg.HTTPListenAddr != "" {
-		log.Info("HTTP proxy on %s", cfg.HTTPListenAddr)
-	}
+	// No "Listening on ..." here. This runs before any listener exists, and
+	// four of the modes dispatched below (the benchmarks) never open one at
+	// all; the claim is made where the socket is, in startProxy.
 	log.Info("Adaptive config: reprobe=%v, circuitThreshold=%d, circuitReset=%v, fallback=%v",
 		cfg.ReprobeInterval, cfg.CircuitThreshold, cfg.CircuitResetTime, cfg.EnableFallback)
 
@@ -873,7 +872,11 @@ func runTUNMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) erro
 		}
 	}
 
-	log.Info("VPN started on %s (IP: %s)", cfg.TunName, cfg.TunIP)
+	// Start returns only after a successful handshake, so by now the exit has
+	// either assigned an address (and connect moved the TUN device onto it) or
+	// echoed back the requested one. Which of the two gets printed is decided
+	// inside logVPNStarted, where a test can hold it to the assigned one.
+	logVPNStarted(cfg, vpnClient)
 	if len(routes) > 0 {
 		log.Info("Routes: %v", routes)
 	}
@@ -949,28 +952,25 @@ func runTUNMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) erro
 	var tunnelPool *pool.TunnelPool
 	var listener, httpListener net.Listener
 
+	// The pool is tied to the SOCKS address being configured at all, not to the
+	// listen succeeding — the HTTP listener below shares it.
 	if cfg.ListenAddr != "" {
-		// Create connection pool for proxy
 		poolCfg := pool.DefaultConfig()
 		tunnelPool = pool.NewTunnelPool(mgr, cfg.ServerAddr, poolCfg)
+	}
 
-		var err error
-		listener, err = net.Listen("tcp", cfg.ListenAddr)
-		if err != nil {
-			log.Warn("Failed to start SOCKS proxy: %v", err)
-		} else {
-			log.Info("SOCKS5/HTTP proxy listening on %s", cfg.ListenAddr)
-			go acceptConnections(listener, tunnelPool, "socks")
-		}
+	listener, err = startProxy(cfg.ListenAddr, socksProxyLabel)
+	if err != nil {
+		log.Warn("Failed to start SOCKS proxy: %v", err)
+	} else if listener != nil {
+		go acceptConnections(listener, tunnelPool, "socks")
 	}
 
 	if cfg.HTTPListenAddr != "" {
-		var err error
-		httpListener, err = net.Listen("tcp", cfg.HTTPListenAddr)
+		httpListener, err = startProxy(cfg.HTTPListenAddr, httpProxyLabel)
 		if err != nil {
 			log.Warn("Failed to start HTTP proxy: %v", err)
 		} else {
-			log.Info("HTTP proxy listening on %s", cfg.HTTPListenAddr)
 			go acceptConnections(httpListener, tunnelPool, "http")
 		}
 	}
@@ -1020,14 +1020,21 @@ func runProxyMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) er
 	}()
 
 	// Main listener (auto-detect SOCKS5/HTTP)
-	listener, err := net.Listen("tcp", cfg.ListenAddr)
+	listener, err := startProxy(cfg.ListenAddr, socksProxyLabel)
 	if err != nil {
 		return fmt.Errorf("failed to listen: %w", err)
+	}
+	if listener == nil {
+		// Proxy mode with no proxy port has nothing to do. Refusing beats what
+		// net.Listen does with an empty address, which is to bind a random port
+		// on every interface — an open proxy nobody asked for and nothing in
+		// the log to find it by.
+		return fmt.Errorf("proxy mode needs a listen address: pass -listen, or -tun to run without a local proxy")
 	}
 
 	var httpListener net.Listener
 	if cfg.HTTPListenAddr != "" {
-		httpListener, err = net.Listen("tcp", cfg.HTTPListenAddr)
+		httpListener, err = startProxy(cfg.HTTPListenAddr, httpProxyLabel)
 		if err != nil {
 			listener.Close()
 			return fmt.Errorf("failed to listen HTTP: %w", err)

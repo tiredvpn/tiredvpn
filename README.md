@@ -311,7 +311,7 @@ Run `tiredvpn server -help` or `tiredvpn client -help` for the full flag list.
 |------|---------|-------------|
 | `-config` | | Path to a TOML config; CLI flags override it |
 | `-listen` | `:443` | IPv4 listen address |
-| `-listen-v6` | `[::]:995` | IPv6 listen address |
+| `-listen-v6` | | IPv6 listen address (default: `[::]` on the `-listen` port) |
 | `-dual-stack` | `true` | Listen on both IPv4 and IPv6 |
 | `-cert` | `server.crt` | TLS certificate file |
 | `-key` | `server.key` | TLS private key file |
