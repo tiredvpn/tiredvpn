@@ -19,6 +19,7 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/client"
 	"github.com/tiredvpn/tiredvpn/internal/server"
 	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
+	"github.com/tiredvpn/tiredvpn/internal/tun"
 )
 
 // version is overridden at link time via -ldflags="-X main.version=$VERSION".
@@ -248,7 +249,13 @@ ADVANCED OPTIONS:
 }
 
 func printClientHelp() {
-	fmt.Println(`tiredvpn client - VPN client
+	fmt.Println(clientHelpText)
+}
+
+// clientHelpText is the hand-maintained client help. It duplicates the flag
+// registrations in runClient by hand, so it drifts silently unless something
+// checks it; the defaults that matter are pinned in main_test.go.
+const clientHelpText = `tiredvpn client - VPN client
 
 Usage:
   tiredvpn client [options]
@@ -277,6 +284,15 @@ IPv6 TRANSPORT:
   -fallback-v4
         Fallback to IPv4 if IPv6 fails (default true)
 
+SERVER LIST (config file only):
+  -server-policy string
+        Order of the [[servers]] list: priority (config order), latency,
+        weighted. Empty means priority.
+        A list of servers is configured in TOML ([[servers]]), not on the
+        command line; -server and -server-v6 collapse it to one endpoint.
+        See [selection] in configs/client.example.toml for the failure
+        threshold, cooldown and dwell knobs.
+
 TUN MODE (Full VPN):
   -tun
         Enable TUN mode (full VPN with system routes)
@@ -291,8 +307,16 @@ TUN MODE (Full VPN):
   -tun-routes string
         Routes to add (comma-separated, e.g. '0.0.0.0/0' for full tunnel)
   -tun-ipv6 string
-        IPv6 inside the tunnel: off (v4-only, default), dual (route IPv6 through
-        the tunnel when the exit negotiates dual-stack; v4-only fallback otherwise)
+        What happens to IPv6 while the tunnel is up (default "dual"):
+          dual  - route IPv6 through the tunnel when the exit negotiates
+                  dual-stack; when it does not, reject outbound IPv6 so it
+                  cannot leave outside the VPN
+          block - never ask the exit for IPv6, just reject outbound IPv6
+          off   - IPv4-only tunnel, host IPv6 left alone (it will bypass the
+                  VPN on a dual-stack host)
+        Note for split tunnels: dual sends ALL IPv6 into the tunnel, including
+        destinations deliberately routed around it on IPv4. Linux only; on
+        macOS the blocking half is not implemented and warns.
   -tun-fd int
         Use existing TUN file descriptor - for Android VpnService (default -1)
 
@@ -386,8 +410,7 @@ MONITORING:
   -pprof string
         Enable pprof profiling on address (e.g., :6060)
   -version
-        Show version`)
-}
+        Show version`
 
 // serverFlagOpts holds the server flags that need post-parse processing because
 // they don't live directly on server.Config (env fallbacks, unit conversion,
@@ -609,6 +632,11 @@ func runClient(args []string) {
 	fs.BoolVar(&cfg.PreferIPv6, "prefer-ipv6", true, "Prefer IPv6 transport if available")
 	fs.BoolVar(&cfg.FallbackToV4, "fallback-v4", true, "Fallback to IPv4 if IPv6 fails")
 
+	// Server selection. Named -server-policy, not -fallback: that one already
+	// means "fall back to another strategy", and one flag cannot mean both.
+	fs.StringVar(&cfg.Selection.Policy, "server-policy", "",
+		"Order of the [[servers]] list: priority (config order), latency, weighted. Empty = priority")
+
 	// TUN mode flags
 	fs.BoolVar(&cfg.TunMode, "tun", false, "Enable TUN mode (full VPN with system routes)")
 	fs.StringVar(&cfg.TunName, "tun-name", "tiredvpn0", "TUN device name")
@@ -617,7 +645,7 @@ func runClient(args []string) {
 	fs.IntVar(&cfg.TunMTU, "tun-mtu", 1280, "TUN device MTU (with -auto-mtu this is the upper bound/cap)")
 	fs.BoolVar(&cfg.AutoMTU, "auto-mtu", true, "Actively probe the real end-to-end MTU and apply min(probed, -tun-mtu); floor 1280")
 	fs.StringVar(&cfg.TunRoutes, "tun-routes", "", "Routes to add (comma-separated, e.g. '0.0.0.0/0' for full tunnel)")
-	fs.StringVar(&cfg.TunIPv6Policy, "tun-ipv6", "off", "IPv6 inside the tunnel: off (v4-only), dual (route IPv6 through the tunnel when the exit supports it)")
+	fs.StringVar(&cfg.TunIPv6Policy, "tun-ipv6", tun.DefaultIPv6Policy, "IPv6 while the tunnel is up: dual (route it through the tunnel, rejecting it when the exit cannot carry it), block (reject it without asking the exit), off (IPv4-only tunnel, host IPv6 bypasses the VPN)")
 
 	// Android VpnService flags
 	fs.IntVar(&cfg.TunFd, "tun-fd", -1, "Use existing TUN file descriptor (for Android VpnService)")

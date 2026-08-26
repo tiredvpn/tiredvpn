@@ -7,6 +7,35 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`-tun-ipv6` now defaults to `dual`.** IPv6 goes into the tunnel by default
+  instead of being left to the host, where every application with a working
+  IPv6 default route reached the internet outside the VPN and handed out the
+  user's real address (issue #55). Against an exit without `-ip-pool-v6` the
+  negotiation simply does not succeed and the session stays IPv4-only, exactly
+  as before.
+  - **Split tunnels change behaviour.** `dual` sends *all* IPv6 into the
+    tunnel, including destinations deliberately routed around it on IPv4.
+    Clients that route a prefix list rather than a full tunnel should set
+    `-tun-ipv6 off` if they want the old split.
+  - Deployment order matters: an exit that predates dual-stack answers a
+    `0x04` client without a flags byte, which costs a 300 ms grace per connect
+    and logs a warning. Upgrade exits and relays before clients.
+
+### Added
+
+- **`-tun-ipv6 block`, and blocking as the fallback of `dual`.** When the
+  tunnel is not carrying IPv6 — the exit declined dual-stack, or `block` was
+  asked for outright — outbound IPv6 is rejected for the life of the tunnel, so
+  it cannot leave around the VPN. Implemented as a per-interface nftables table
+  in the `ip6` family hooked at output, installed and removed with the tunnel
+  like the MSS clamp. Loopback, the tunnel itself, link-local (`fe80::/10`),
+  multicast (`ff00::/8`) and the VPN server's own IPv6 addresses stay
+  reachable; everything else is rejected with ICMPv6 admin-prohibited, so
+  applications fall back to IPv4 immediately instead of waiting out a timeout.
+  Linux only — on macOS the gap is reported with a warning rather than hidden,
+  and on Android filtering belongs to `VpnService`.
 ### Fixed
 
 - **Clients sharing one secret still shared one tunnel IP, and evicted each

@@ -50,6 +50,19 @@ type Config struct {
 	PreferIPv6   bool   // Prefer IPv6 transport if available (default: true)
 	FallbackToV4 bool   // Fallback to IPv4 if IPv6 fails (default: true)
 
+	// Servers is the configured endpoint list ([[servers]] in the TOML). When
+	// it is empty the client falls back to the single ServerAddr/ServerAddrV6
+	// pair above, which is what a unit started with nothing but -server has.
+	//
+	// ServerAddr/ServerAddrV6 stay authoritative for everything that reads a
+	// single address: ResolveEndpoints keeps them equal to the first entry.
+	Servers []ServerSpec
+
+	// Selection tunes which endpoint gets dialled and how long a failed one is
+	// parked. The zero value means "legacy behaviour": family from
+	// PreferIPv6/FallbackToV4, defaults for everything else.
+	Selection SelectionSpec
+
 	// TUN mode
 	TunMode   bool
 	TunName   string
@@ -165,8 +178,13 @@ func Run(cfg *Config) error {
 		return listStrategies(cfg)
 	}
 
-	if cfg.ServerAddr == "" {
-		return fmt.Errorf("-server is required")
+	// Resolve the endpoint list before anything reads cfg.ServerAddr: it is
+	// ResolveEndpoints that fills that field from the first entry when the
+	// client was configured with a [[servers]] list. It may also adopt a
+	// secret carried by the config, so it has to run before resolveSecret.
+	eps, err := ResolveEndpoints(cfg)
+	if err != nil {
+		return err
 	}
 
 	secret := resolveSecret(cfg)
@@ -184,6 +202,11 @@ func Run(cfg *Config) error {
 
 	log.Info("tiredvpn client %s starting...", Version)
 	log.Info("Server: %s, Cover: %s", cfg.ServerAddr, cfg.CoverHost)
+	if len(eps) > 1 {
+		for i, e := range eps {
+			log.Info("  endpoint %d: %s v4=%q v6=%q", i, e.Label(i), e.V4, e.V6)
+		}
+	}
 	log.Info("Listening on %s (SOCKS5/HTTP)", cfg.ListenAddr)
 	if cfg.HTTPListenAddr != "" {
 		log.Info("HTTP proxy on %s", cfg.HTTPListenAddr)
@@ -272,6 +295,18 @@ func applyAdaptiveDefaults(cfg *Config) {
 
 // buildManager constructs and configures the strategy manager.
 func buildManager(cfg *Config, secret string) (*strategy.Manager, error) {
+	// Resolved here rather than passed in: RunWithContext (Android/macOS) and
+	// Run are separate entry points, and a parameter would let one of them
+	// build a manager whose endpoints disagree with cfg.ServerAddr.
+	eps, err := ResolveEndpoints(cfg)
+	if err != nil {
+		return nil, err
+	}
+	selCfg, err := selectorConfig(cfg, eps)
+	if err != nil {
+		return nil, err
+	}
+
 	rttProfile := resolveRTTProfile(cfg)
 	echConfigList := decodeECHConfig(cfg)
 	portHoppingCfg := buildPortHoppingConfig(cfg)
@@ -283,6 +318,7 @@ func buildManager(cfg *Config, secret string) (*strategy.Manager, error) {
 		ServerAddrV6:           cfg.ServerAddrV6,
 		PreferIPv6:             cfg.PreferIPv6,
 		FallbackToV4:           cfg.FallbackToV4,
+		Endpoints:              eps,
 		RTTMaskingEnabled:      cfg.RTTMaskingEnabled,
 		RTTProfile:             rttProfile,
 		QUICEnabled:            cfg.QUICEnabled,
@@ -310,12 +346,25 @@ func buildManager(cfg *Config, secret string) (*strategy.Manager, error) {
 	}
 	mgr := strategy.NewDefaultManager(mgrCfg)
 
+	// The constructor already built a selector from mgrCfg; this replaces it
+	// with one that also carries the [selection] tuning (family policy,
+	// failure threshold, cooldown, dwell). Building a selector costs no I/O,
+	// so the second pass is a rebuild of a value, not a second dial.
+	if err := mgr.SetEndpointSelection(selCfg); err != nil {
+		return nil, fmt.Errorf("server selection: %w", err)
+	}
+	// The authoritative line: initManagerTransport logs the family it derived
+	// from the legacy flags, which an explicit selection.family overrides.
+	log.Info("Endpoint selection: %d endpoint(s), family=%s, policy=%s",
+		len(eps), selCfg.Family, selectionPolicyName(cfg.Selection.Policy))
+
 	connectivityChecker := strategy.NewConnectivityChecker(cfg.ServerAddr, 3*time.Second, cfg.AndroidMode || cfg.MacOSMode)
 	// With both families configured the gate must accept either, or a client
 	// whose IPv4 is blocked (and whose IPv6 transport works fine) never gets
 	// past "waiting for network" - the manager dials v6 while the gate probes
-	// the dead v4.
-	connectivityChecker.SetAltAddr(cfg.ServerAddrV6)
+	// the dead v4. Connect re-points the gate at the pinned candidate on every
+	// cycle; this is the starting position.
+	connectivityChecker.SetAddrs(cfg.ServerAddr, cfg.ServerAddrV6)
 	mgr.SetConnectivityChecker(connectivityChecker)
 	log.Debug("Connectivity checker initialized for %s (alt=%q)", cfg.ServerAddr, cfg.ServerAddrV6)
 
@@ -486,11 +535,12 @@ func runProbeAndServe(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal
 	log.Info("Available strategies: %d/%d", available, len(results))
 
 	reprobeCtx, reprobeCancel := context.WithCancel(context.Background())
-	// Reprobe the address the manager actually dials. Passing cfg.ServerAddr
+	// The reprobe resolves the address itself, per cycle. Passing cfg.ServerAddr
 	// blindly re-probed IPv4 every interval on a client running over IPv6, so
-	// each round measured a path the tunnel does not use - and on a host whose
-	// IPv4 is blocked, measured nothing at all.
-	mgr.StartPeriodicReprobe(reprobeCtx, mgr.GetServerAddr(reprobeCtx))
+	// each round measured a path the tunnel does not use - and a value captured
+	// once at start-up goes stale the moment the client falls back to the other
+	// family.
+	mgr.StartPeriodicReprobe(reprobeCtx)
 
 	if cfg.PortHoppingEnabled {
 		mgr.StartPortHopChecker(reprobeCtx)
@@ -728,9 +778,12 @@ func sendReconnectHandshake(conn net.Conn, currentIP net.IP, mtu int, dualStack 
 func runTUNMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) error {
 	log.Info("Starting TUN mode")
 
-	// IPv6 policy: off (default) keeps the tunnel v4-only; dual opts into the
-	// v0x04 dual-stack handshake. Empty means the flag was never set.
-	ipv6Policy := "off"
+	// IPv6 policy: dual (the default) opts into the v0x04 dual-stack handshake
+	// and blocks outbound IPv6 when the exit declines it; off keeps the tunnel
+	// v4-only and leaves host IPv6 alone. Empty means the flag was never set -
+	// which is the case for a client configured purely through TOML, since the
+	// schema has no key for this yet, so the default has to be named here too.
+	ipv6Policy := tun.DefaultIPv6Policy
 	if cfg.TunIPv6Policy != "" {
 		ipv6Policy = cfg.TunIPv6Policy
 	}
@@ -763,11 +816,18 @@ func runTUNMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) erro
 		// half-defaults would otherwise route that socket into the tunnel.
 		ServerAddr:   cfg.ServerAddr,
 		ServerAddrV6: cfg.ServerAddrV6,
-		Manager:      mgr,
-		AutoMTU:      cfg.AutoMTU, // active end-to-end MTU probe
-		DualStack:    policy == tun.IPv6PolicyDual,
-		TunFd:        cfg.TunFd,       // Android VpnService TUN fd
-		ProtectPath:  cfg.ProtectPath, // Android socket protection path
+		// Every address the client may dial, so a full tunnel can pin a
+		// bypass route for each. With more than one endpoint the pair above
+		// only covers the first.
+		ServerAddrs: allServerAddrs(cfg),
+		Manager:     mgr,
+		AutoMTU:     cfg.AutoMTU, // active end-to-end MTU probe
+		// Pass the whole policy, not a bool: collapsing it to
+		// "dual or not" silently turns -tun-ipv6 block into off, since block
+		// negotiates nothing and would be indistinguishable from it.
+		IPv6Policy:  policy,
+		TunFd:       cfg.TunFd,       // Android VpnService TUN fd
+		ProtectPath: cfg.ProtectPath, // Android socket protection path
 	}
 
 	vpnClient, err := tun.NewVPNClient(vpnCfg)

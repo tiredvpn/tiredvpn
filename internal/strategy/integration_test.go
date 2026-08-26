@@ -156,7 +156,7 @@ func TestWebSocketPaddedIntegration(t *testing.T) {
 
 	// Create client strategy with manager pointing to our test server
 	mgr := NewManager()
-	mgr.serverAddrV4 = addr
+	setTestEndpoint(mgr, addr)
 	strategy := NewWebSocketPaddedStrategy(mgr, secret)
 
 	// Test connection
@@ -301,7 +301,7 @@ func TestWebSocketPaddedMultipleMessages(t *testing.T) {
 	// Listener already bound before goroutine launch; no startup sleep needed.
 
 	mgr := NewManager()
-	mgr.serverAddrV4 = addr
+	setTestEndpoint(mgr, addr)
 	strategy := NewWebSocketPaddedStrategy(mgr, secret)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -449,7 +449,7 @@ func TestWebSocketPaddedLargePayload(t *testing.T) {
 	// Listener already bound before goroutine launch; no startup sleep needed.
 
 	mgr := NewManager()
-	mgr.serverAddrV4 = addr
+	setTestEndpoint(mgr, addr)
 	strategy := NewWebSocketPaddedStrategy(mgr, secret)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

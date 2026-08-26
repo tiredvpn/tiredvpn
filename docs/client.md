@@ -251,10 +251,70 @@ preset = "chrome_browsing"
 level = "info"
 ```
 
+`strategy.mode` is optional: leave it out to let the client pick a strategy,
+which is what the bare `-strategy` default does.
+
 CLI-only flags (TUN, port-hopping, ECH, post-quantum, benchmarking) are not
 yet mapped to TOML and stay command-line only — see the
 [migration guide](../internal/config/toml/MIGRATION.md) for the field-by-field
 table and roadmap.
+
+### Several servers
+
+`[server]` describes one endpoint. `[[servers]]` describes a list of them, and
+a lone `[server]` is defined to be a one-element list — so setting both is a
+startup error rather than a silent choice between the two.
+
+```toml
+[[servers]]
+name       = "ams"
+address    = "203.0.113.10"
+port       = 443
+address_v6 = "2001:db8::10"   # same server over IPv6; port_v6 defaults to port
+weight     = 100
+
+[[servers]]
+name    = "fra"
+address = "203.0.113.20"
+port    = 443
+weight  = 50
+
+[selection]
+policy            = "priority"   # priority (list order) | latency | weighted
+family            = "prefer_v6"  # prefer_v6 | prefer_v4 | v6_only | v4_only
+failure_threshold = 2            # failed connect cycles before a server is parked
+cooldown          = "1m"         # first cooldown; doubles per repeat, jittered
+max_cooldown      = "30m"
+min_dwell         = "5m"         # hold a fallback this long before going back
+health_check      = "off"        # off | active
+```
+
+Per-entry fields: `name` (unique, used in logs), `address`, `port`,
+`address_v6`, `port_v6`, `weight`, and the overrides `secret` and `sni`. An
+entry needs at least one of `address` / `address_v6`; an omitted port is 443,
+and `port_v6` follows `port`.
+
+Notes worth reading once:
+
+- **One secret for all servers.** The secret is fixed when a strategy is
+  constructed, so a per-server `secret` cannot take effect on a switch. Entries
+  that disagree — or disagree with `-secret` — are a startup error, not a
+  silent fallback to the wrong key. A single `secret` shared by every entry is
+  fine and is used as the client's secret.
+- **`sni` is recorded but not applied yet**: the cover host is still
+  process-wide (`-cover`). The client says so in the log rather than pretending.
+- **`policy` other than `priority`, and `health_check = "active"`, are not
+  implemented yet** and warn on startup. `health_check` stays off by default on
+  purpose: walking N servers on a timer is a periodic fan-out pattern with no
+  cover traffic behind it.
+- **`-server` / `-server-v6` collapse the list** to a single endpoint, with a
+  warning. `-server-policy` sets `selection.policy` from the command line;
+  `-fallback` was already taken by strategy fallback, hence the longer name.
+- **Address family.** Omitting `selection.family` keeps
+  `-prefer-ipv6`/`-fallback-v4` in charge. The mapping is `true`+`true` →
+  `prefer_v6`, `true`+`false` → `v6_only`, and `false` → `v4_only` for any
+  fallback value — because `-prefer-ipv6=false` has always meant "IPv4, and do
+  not probe IPv6 at all". `prefer_v4` is reachable only from the config file.
 
 ## Traffic Shaper
 

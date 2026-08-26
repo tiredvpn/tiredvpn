@@ -138,9 +138,11 @@ type VPNClient struct {
 	// Server capabilities (received during handshake)
 	serverCaps ServerCapabilities
 
-	// dualStack selects handshake version 0x04 (IPv6 dual-stack negotiation).
-	// Set from VPNConfig.DualStack.
-	dualStack bool
+	// ipv6Policy is what the client does with IPv6 for the life of this
+	// tunnel: negotiate it into the tunnel (handshake version 0x04), block it
+	// when the tunnel cannot carry it, or leave the host alone. Resolved from
+	// VPNConfig by VPNConfig.ipv6PolicyOrLegacy.
+	ipv6Policy IPv6Policy
 	// Auto-MTU active probe state.
 	autoMTU       bool                   // -auto-mtu enabled
 	ownsInterface bool                   // we created the TUN (can change MTU live)
@@ -172,15 +174,39 @@ type VPNConfig struct {
 	// transport socket. Recorded so the TUN can pin a /128 bypass for it.
 	ServerAddrV6 string
 
+	// ServerAddrs is every transport address of every configured endpoint, in
+	// "host:port" form; ServerAddr and ServerAddrV6 are the first endpoint's
+	// and appear here too.
+	//
+	// A full tunnel needs a host route for each of them: with a single bypass
+	// pinned, dialling a second server sends the transport socket into the
+	// tunnel it is supposed to carry, and it dies there. Every entry is pinned
+	// at start-up rather than at the moment of a switch, so there is no window
+	// where the client has moved and the route has not.
+	//
+	// Empty means "just ServerAddr / ServerAddrV6", which is what every
+	// single-server caller (macOS, JNI, benchmarks) keeps passing.
+	ServerAddrs []string
+
 	// AutoMTU enables the active MTU probe. When set, MTU becomes the upper bound
 	// (cap) and the client measures the real end-to-end ceiling, applying
 	// min(probed, cap). Only effective on interfaces we own (non-fd Linux/macOS).
 	AutoMTU bool
 
-	// DualStack opts the client into IPv6 inside the tunnel: the handshake
-	// version byte becomes 0x04 (instead of 0x03), asking a dual-stack exit to
-	// assign IPv6 tunnel addresses. The request format is unchanged, so this
-	// is safe against old servers (they ignore the unknown version).
+	// IPv6Policy selects what happens to IPv6 while the tunnel is up:
+	// IPv6PolicyDual (the -tun-ipv6 default) asks the exit for IPv6 tunnel
+	// addresses with handshake version 0x04 instead of 0x03 and blocks
+	// outbound IPv6 if it declines; IPv6PolicyBlock blocks without asking;
+	// IPv6PolicyOff is the historical v4-only tunnel with host IPv6 untouched.
+	// The handshake request format is identical either way, so asking is safe
+	// against old exits — they ignore the unknown version.
+	IPv6Policy IPv6Policy
+
+	// DualStack is the pre-policy spelling of IPv6Policy == IPv6PolicyDual,
+	// kept for callers that have not moved over (macOS, benchmarks). Ignored
+	// when IPv6Policy is set to anything but its zero value.
+	//
+	// Deprecated: set IPv6Policy instead.
 	DualStack bool
 
 	// Android VpnService support
@@ -188,31 +214,69 @@ type VPNConfig struct {
 	ProtectPath string // Unix socket path for VpnService.protect() calls
 }
 
-// resolveServerBypassIP extracts the server's public IP from a "host:port"
-// address for the full-tunnel bypass route. Returns nil if the host cannot be
-// resolved to an IP, in which case the bypass is simply skipped.
-func resolveServerBypassIP(serverAddr string) net.IP {
-	host, _, err := net.SplitHostPort(serverAddr)
-	if err != nil {
-		host = serverAddr
+// serverAddrList returns every configured transport address, most preferred
+// first and deduplicated: -server-v6, -server, then the rest of the endpoint
+// list. The first two lead so a single-server client keeps the exact ordering
+// it had before the list existed.
+func serverAddrList(cfg VPNConfig) []string {
+	out := make([]string, 0, 2+len(cfg.ServerAddrs))
+	seen := make(map[string]bool, 2+len(cfg.ServerAddrs))
+	for _, addr := range append([]string{cfg.ServerAddrV6, cfg.ServerAddr}, cfg.ServerAddrs...) {
+		if addr == "" || seen[addr] {
+			continue
+		}
+		seen[addr] = true
+		out = append(out, addr)
 	}
-	if ip := net.ParseIP(host); ip != nil {
-		return ip
-	}
-	ips, err := net.LookupIP(host)
-	if err != nil || len(ips) == 0 {
-		return nil
-	}
-	return ips[0]
+	return out
 }
 
-// resolveServerBypassIP6 is the IPv6 twin of resolveServerBypassIP: it pulls
-// the server's IPv6 out of a "[host]:port" address so a /128 bypass can be
-// pinned before the dual-stack half-defaults (::/1 + 8000::/1) are installed.
-// Returns nil when the address carries no IPv6 — unlike resolveServerBypassIP
-// it never falls back to an A record, since an IPv4 bypass is already handled
-// by the v4 path.
-func resolveServerBypassIP6(serverAddr string) net.IP {
+// serverIP6s lists every IPv6 transport address this client might dial, in
+// preference order. serverBypassIP6 pins a route for the first one; the IPv6
+// leak block has to punch a hole for all of them, since the client can switch
+// between them across reconnects and a hole for an address that is never
+// dialled costs nothing.
+func serverIP6s(cfg VPNConfig) []net.IP {
+	var out []net.IP
+	for _, addr := range serverAddrList(cfg) {
+		for _, ip := range resolveBypassIPs(addr) {
+			// A v4-mapped literal (::ffff:1.2.3.4) is an IPv4 address wearing
+			// v6 syntax: the kernel has no v6 route for that form, and the v4
+			// bypass already covers the host.
+			if ip.To4() != nil || containsIP(out, ip) {
+				continue
+			}
+			out = append(out, ip)
+		}
+	}
+	return out
+}
+
+// serverBypassIPs lists every address a host route has to be pinned for: one
+// per configured endpoint, both families.
+//
+// A hostname contributes ALL of its records, not just the first. The dialer is
+// free to pick any of them, and a /32 to an address that is never dialled costs
+// one routing-table entry - whereas missing the one that IS dialled costs the
+// tunnel.
+func serverBypassIPs(cfg VPNConfig) []net.IP {
+	var out []net.IP
+	for _, addr := range serverAddrList(cfg) {
+		for _, ip := range resolveBypassIPs(addr) {
+			if containsIP(out, ip) {
+				continue
+			}
+			out = append(out, ip)
+		}
+	}
+	return out
+}
+
+// resolveBypassIPs turns one "host:port" address into every IP behind it. An
+// address literal resolves to itself; a hostname to all of its A and AAAA
+// records. An unresolvable host yields nothing and is simply skipped, which is
+// the pre-existing behaviour for a bypass that cannot be computed.
+func resolveBypassIPs(serverAddr string) []net.IP {
 	if serverAddr == "" {
 		return nil
 	}
@@ -221,34 +285,34 @@ func resolveServerBypassIP6(serverAddr string) net.IP {
 		host = serverAddr
 	}
 	if ip := net.ParseIP(host); ip != nil {
-		if ip.To4() != nil {
-			return nil
-		}
-		return ip
+		return []net.IP{ip}
 	}
 	ips, err := net.LookupIP(host)
 	if err != nil {
 		return nil
 	}
-	for _, ip := range ips {
-		if ip.To4() == nil {
-			return ip
-		}
-	}
-	return nil
+	return ips
 }
 
-// serverBypassIP6 picks the IPv6 transport address a /128 bypass has to be
-// pinned for before the dual-stack half-defaults go in. -server-v6 wins when
-// set, but -server is checked too: an exit reachable only over IPv6 is
-// addressed by putting the v6 literal straight into -server, with no v4 flag at
-// all. Missing that case would drop the client's own transport socket into its
-// own tunnel the moment dual-stack is negotiated.
-func serverBypassIP6(cfg VPNConfig) net.IP {
-	if ip := resolveServerBypassIP6(cfg.ServerAddrV6); ip != nil {
-		return ip
+func containsIP(list []net.IP, ip net.IP) bool {
+	for _, existing := range list {
+		if existing.Equal(ip) {
+			return true
+		}
 	}
-	return resolveServerBypassIP6(cfg.ServerAddr)
+	return false
+}
+
+// ipv6PolicyOrLegacy resolves the effective policy: IPv6Policy when set,
+// otherwise the deprecated DualStack bool.
+func (cfg VPNConfig) ipv6PolicyOrLegacy() IPv6Policy {
+	if cfg.IPv6Policy != IPv6PolicyOff {
+		return cfg.IPv6Policy
+	}
+	if cfg.DualStack {
+		return IPv6PolicyDual
+	}
+	return IPv6PolicyOff
 }
 
 // NewVPNClient creates a new VPN client
@@ -294,23 +358,29 @@ func NewVPNClient(cfg VPNConfig) (*VPNClient, error) {
 		if err != nil {
 			return nil, err
 		}
-		// Record dual-stack intent before Configure so the interface keeps
-		// IPv6 enabled for the post-handshake EnableDualStack.
-		tunDev.SetDualStack(cfg.DualStack)
-		// Pin a server bypass route before configuring routes, so a full-tunnel
-		// default route does not loop the client's own server traffic.
-		if bypassIP := resolveServerBypassIP(cfg.ServerAddr); bypassIP != nil {
-			tunDev.SetServerBypassIP(bypassIP)
+		// Record the IPv6 policy before Configure: it keeps IPv6 enabled on
+		// the interface for the post-handshake EnableDualStack, and decides
+		// whether outbound IPv6 gets blocked once the tunnel's IPv6 fate is
+		// known. Only on interfaces we own — the fd branch above leaves the
+		// device at IPv6PolicyOff, because on Android VpnService owns both
+		// routing and filtering.
+		tunDev.SetIPv6Policy(cfg.ipv6PolicyOrLegacy())
+		// Pin a bypass route for EVERY configured endpoint before configuring
+		// routes, so a full-tunnel default route does not loop the client's own
+		// server traffic - not for the current endpoint alone, because by the
+		// time the client decides to try the second one the tunnel is already
+		// up and the unpinned dial goes into it.
+		//
+		// This covers both families for the same reason it always did on the v6
+		// side: once dual-stack is negotiated the ::/1 + 8000::/1 half-defaults
+		// cover every IPv6 destination, the client's own servers among them.
+		if bypassIPs := serverBypassIPs(cfg); len(bypassIPs) > 0 {
+			tunDev.SetServerBypassIPs(bypassIPs)
+			log.Debug("Server bypass: %d endpoint address(es) will be pinned", len(bypassIPs))
 		}
-		// Same for the IPv6 transport: once dual-stack is negotiated the
-		// ::/1 + 8000::/1 half-defaults cover every IPv6 destination, the
-		// client's own server among them. Pinned unconditionally when a v6
-		// server address is configured — a /128 host route to an address the
-		// manager ends up not dialling costs nothing, and -prefer-ipv6 can
-		// flip between reconnects.
-		if bypassIP6 := serverBypassIP6(cfg); bypassIP6 != nil {
-			tunDev.SetServerBypassIP6(bypassIP6)
-		}
+		// Same addresses, one layer down: the IPv6 leak block rejects outbound
+		// v6, and the client's own transport must not be caught by it.
+		tunDev.SetIPv6BlockAllow(serverIP6s(cfg))
 		// Defer route installation (notably the 0.0.0.0/0 default route) until a
 		// real connection + handshake to the server succeeds. Configure brings
 		// the interface up and assigns its address, but leaves the host's normal
@@ -332,16 +402,17 @@ func NewVPNClient(cfg VPNConfig) (*VPNClient, error) {
 		stopCh:        make(chan struct{}),
 		autoMTU:       cfg.AutoMTU,
 		ownsInterface: cfg.TunFd <= 0,
-		dualStack:     cfg.DualStack,
+		ipv6Policy:    cfg.ipv6PolicyOrLegacy(),
 	}, nil
 }
 
 // handshakeVersion returns the TUN handshake version byte this client sends:
-// 0x04 when dual-stack was opted into (VPNConfig.DualStack), else the default
-// 0x03. The request layout is identical either way, so this is the only
-// on-wire difference.
+// 0x04 when the policy negotiates dual-stack, else the default 0x03. The
+// request layout is identical either way, so this is the only on-wire
+// difference the IPv6 policy makes. -tun-ipv6=block keeps 0x03: it wants the
+// host's IPv6 stopped, not carried, so there is nothing to ask the exit for.
 func (v *VPNClient) handshakeVersion() byte {
-	if v.dualStack {
+	if v.ipv6Policy.NegotiatesDualStack() {
 		return tunHandshakeVersionDualStack
 	}
 	return tunHandshakeVersion
@@ -785,22 +856,36 @@ func (v *VPNClient) connect(parent context.Context) error {
 	}
 	v.mu.Unlock()
 
-	// Dual-stack: bring up the v6 side of the tunnel only when the exit
-	// actually negotiated it. A declined negotiation (old server, no
-	// -ip-pool-v6) restores the exact v4-only interface state — no v6
-	// address, no v6 routes, disable_ipv6=1 — so nothing leaks or blackholes.
-	// Host-owned interfaces (Android VpnService / macOS NE fd) are configured
-	// by the host, which consumes the negotiated addresses out of band.
-	if v.dualStack && v.ownsInterface {
-		if hasCaps && caps.DualStackEnabled {
-			if err := v.tun.EnableDualStack(caps.ClientIP6, caps.ServerIP6); err != nil {
-				log.Warn("Dual-stack: failed to configure IPv6 on the tunnel: %v (continuing IPv4-only)", err)
-				v.tun.DisableIPv6()
-			}
-		} else {
-			log.Warn("Dual-stack requested but the exit did not negotiate IPv6; continuing IPv4-only")
+	// IPv6: bring up the v6 side of the tunnel only when the exit actually
+	// negotiated it. A declined negotiation (old server, no -ip-pool-v6)
+	// restores the exact v4-only interface state — no v6 address, no v6
+	// routes, disable_ipv6=1 — and then blocks outbound IPv6, so it neither
+	// blackholes nor escapes the tunnel. Host-owned interfaces (Android
+	// VpnService / macOS NE fd) are configured by the host, which consumes the
+	// negotiated addresses and owns its own filtering.
+	//
+	// Done here rather than at Configure time on purpose: routes are deferred
+	// until a connect succeeds, so until this point the host still relies on
+	// its own routing and cutting its IPv6 would take away connectivity the
+	// tunnel is not yet replacing.
+	switch ipv6ActionFor(v.ipv6Policy, v.ownsInterface, hasCaps && caps.DualStackEnabled) {
+	case ipv6ActionNone:
+		// Historical behavior: the tunnel is v4-only, host IPv6 untouched.
+	case ipv6ActionEnableDual:
+		if err := v.tun.EnableDualStack(caps.ClientIP6, caps.ServerIP6); err != nil {
+			log.Warn("Dual-stack: failed to configure IPv6 on the tunnel: %v (continuing IPv4-only)", err)
+			// DisableIPv6 restores the v4-only interface and, since the
+			// tunnel ends up not carrying IPv6, applies the leak block.
 			v.tun.DisableIPv6()
 		}
+	case ipv6ActionBlock:
+		if v.ipv6Policy == IPv6PolicyDual {
+			log.Warn("Dual-stack requested but the exit did not negotiate IPv6; " +
+				"continuing IPv4-only and blocking outbound IPv6 so it cannot leave outside the tunnel")
+			v.tun.DisableIPv6()
+			break
+		}
+		v.tun.ApplyIPv6LeakBlock()
 	}
 
 	// Mark the start of this session for storm detection. If the DPI tears the
@@ -1526,37 +1611,56 @@ func (v *VPNClient) handleDisconnect() {
 	}
 }
 
-// checkNetworkConnectivity performs a quick TCP check to the server
+// networkCheckTimeout bounds one connectivity probe from the reconnect loop.
+const networkCheckTimeout = 3 * time.Second
+
+// checkNetworkConnectivity answers "is there a network at all", in two steps:
+// the server first, then a well-known public host.
+//
+// The server step goes through the manager's own connectivity gate, which dials
+// the pinned endpoint (and its sibling address) on the real transport port.
+// This used to be hand-rolled here and additionally dialled :443 and :80 on the
+// server's own host - a three-port scan of our own machine, run on a timer, and
+// a signature in its own right. It also only ever spoke IPv4, so a v6-only
+// endpoint reported "no network" forever.
+//
+// The second step is unchanged and is what distinguishes "the network is down"
+// from "the network is up and the server is not": the caller parks in
+// waitForNetworkRestore only for the former.
 func (v *VPNClient) checkNetworkConnectivity() bool {
-	// Try a quick TCP connection to the server port
-	host, _, err := net.SplitHostPort(v.serverAddr)
-	if err != nil {
-		host = v.serverAddr
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), networkCheckTimeout)
+	defer cancel()
 
-	// Try common ports that are usually open
-	testAddrs := []string{
-		v.serverAddr,                  // Original server address
-		net.JoinHostPort(host, "443"), // HTTPS
-		net.JoinHostPort(host, "80"),  // HTTP
-	}
-
-	for _, addr := range testAddrs {
-		conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
-		if err == nil {
-			conn.Close()
-			return true
+	if v.manager != nil {
+		if checker := v.manager.ConnectivityChecker(); checker != nil {
+			if checker.Check(ctx).HasBasicConnectivity() {
+				return true
+			}
+		} else if v.serverAddr != "" {
+			// No gate configured (macOS, benchmarks): one dial of the real
+			// address, and nothing else.
+			conn, err := net.DialTimeout("tcp", v.serverAddr, networkCheckTimeout)
+			if err == nil {
+				conn.Close()
+				return true
+			}
 		}
 	}
 
-	// Also try Google DNS as a fallback check
-	conn, err := net.DialTimeout("tcp", "8.8.8.8:53", 3*time.Second)
-	if err == nil {
-		conn.Close()
-		return true
-	}
+	return internetReachable()
+}
 
-	return false
+// internetReachable reports whether anything outside answers, using a public
+// resolver as the reference point. It is deliberately NOT a check of our own
+// server: the caller needs to tell a dead link apart from a blocked endpoint,
+// and only a third party can do that.
+func internetReachable() bool {
+	conn, err := net.DialTimeout("tcp", "8.8.8.8:53", networkCheckTimeout)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
 }
 
 // waitForNetworkRestore waits until network connectivity is restored

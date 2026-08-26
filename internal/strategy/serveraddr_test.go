@@ -3,7 +3,11 @@ package strategy
 import (
 	"context"
 	"net"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/tiredvpn/tiredvpn/internal/endpoint"
 )
 
 // liveV6Listener starts an IPv6 loopback listener and returns its address plus
@@ -55,37 +59,91 @@ func deadV6Addr(t *testing.T) string {
 	return addr
 }
 
+// setTestEndpoint points a manager at a single IPv4 address. It is the
+// replacement for the old `mgr.serverAddrV4 = addr` one-liner, and it must stay
+// equivalent: v4_only with one candidate is exactly what the old field meant.
+func setTestEndpoint(m *Manager, addr string) {
+	sel, err := endpoint.NewSelector(endpoint.Config{
+		Endpoints: []endpoint.Endpoint{{Name: "test", V4: addr}},
+		Family:    endpoint.V4Only,
+	})
+	if err != nil {
+		panic(err)
+	}
+	m.endpoints = sel
+}
+
+// countingDialer wraps a real dialer and counts calls, so a test can assert how
+// many times the selector went to the network rather than only what it decided.
+type countingDialer struct {
+	calls atomic.Int64
+}
+
+func (d *countingDialer) dial(ctx context.Context, network, addr string) (net.Conn, error) {
+	d.calls.Add(1)
+	dl := &net.Dialer{Timeout: 2 * time.Second}
+	return dl.DialContext(ctx, network, addr)
+}
+
+// newFamilyManager builds a manager whose selector describes one dual-addressed
+// server under the legacy flag pair, with a counting dialer for the family
+// probe.
+func newFamilyManager(t *testing.T, v4, v6 string, preferIPv6, fallbackToV4 bool) (*Manager, *countingDialer) {
+	t.Helper()
+	d := &countingDialer{}
+	sel, err := endpoint.NewSelector(endpoint.Config{
+		Endpoints:    []endpoint.Endpoint{{Name: "test", V4: v4, V6: v6}},
+		Family:       endpoint.FamilyPolicyFromLegacy(preferIPv6, fallbackToV4),
+		Dial:         d.dial,
+		ProbeTimeout: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewSelector: %v", err)
+	}
+	m := NewManager()
+	m.endpoints = sel
+	return m, d
+}
+
 // TestGetServerAddrSelection pins the transport-family choice. This is the
 // decision that used to be bypassed: the probe dialled IPv6 while the
 // connectivity gate and the periodic reprobe were built straight from
 // cfg.ServerAddr, so a host with a censored IPv4 never brought the tunnel up
 // even though its v6 path was clean.
+//
+// The verdict now comes from the explicit probe step Connect runs, not from
+// GetServerAddr - but the answers it produces are the same ones the old
+// implementation produced, which is what this test holds fixed.
 func TestGetServerAddrSelection(t *testing.T) {
 	const v4 = "127.0.0.1:443"
+	ctx := context.Background()
 
 	t.Run("no v6 configured falls through to v4", func(t *testing.T) {
-		m := &Manager{serverAddrV4: v4, preferIPv6: true, fallbackToV4: true}
+		m, d := newFamilyManager(t, v4, "", true, true)
 		// Without a v6 address there is nothing to probe; returning anything
 		// but v4 here would dial an empty host.
-		if got := m.GetServerAddr(context.Background()); got != v4 {
+		m.ProbeEndpointFamily(ctx)
+		if got := m.GetServerAddr(ctx); got != v4 {
 			t.Fatalf("GetServerAddr = %q, want %q", got, v4)
 		}
-		if m.ipv6CheckedOnce {
-			t.Error("connectivity probe ran with no v6 address configured")
+		if n := d.calls.Load(); n != 0 {
+			t.Errorf("connectivity probe dialled %d times with no v6 address configured", n)
 		}
 	})
 
 	t.Run("preferIPv6 false keeps v4 even with v6 configured", func(t *testing.T) {
-		// Fallback is off, so if the short-circuit were missing the failed probe
-		// against the dead v6 address would surface v6 here instead of v4.
-		m := &Manager{serverAddrV4: v4, serverAddrV6: deadV6Addr(t), preferIPv6: false, fallbackToV4: false}
-		if got := m.GetServerAddr(context.Background()); got != v4 {
+		m, d := newFamilyManager(t, v4, deadV6Addr(t), false, false)
+		m.ProbeEndpointFamily(ctx)
+		if got := m.GetServerAddr(ctx); got != v4 {
 			t.Fatalf("GetServerAddr = %q, want %q", got, v4)
 		}
 		// -prefer-ipv6=false is a "keep this client off IPv6" knob: it must not
-		// even cost a probe dial.
-		if m.ipv6CheckedOnce {
-			t.Error("probed IPv6 despite preferIPv6=false")
+		// even cost a probe dial, and v6 must not be reachable as a fallback.
+		if n := d.calls.Load(); n != 0 {
+			t.Errorf("probed %d times despite preferIPv6=false", n)
+		}
+		if cands := m.selector().Candidates(); len(cands) != 1 || cands[0].Addr != v4 {
+			t.Errorf("candidates = %v, want the v4 address alone", cands)
 		}
 	})
 
@@ -93,43 +151,67 @@ func TestGetServerAddrSelection(t *testing.T) {
 		live, stop := liveV6Listener(t)
 		defer stop()
 
-		m := &Manager{serverAddrV4: v4, serverAddrV6: live, preferIPv6: true, fallbackToV4: true}
-		if got := m.GetServerAddr(context.Background()); got != live {
+		m, d := newFamilyManager(t, v4, live, true, true)
+		m.ProbeEndpointFamily(ctx)
+		if got := m.GetServerAddr(ctx); got != live {
 			t.Fatalf("GetServerAddr = %q, want the v6 address %q", got, live)
 		}
-		if !m.ipv6Available {
-			t.Error("reachable v6 was not recorded as available")
+		if n := d.calls.Load(); n != 1 {
+			t.Errorf("probe dialled %d times, want exactly 1", n)
 		}
 	})
 
 	t.Run("v6 unreachable with fallback lands on v4", func(t *testing.T) {
-		m := &Manager{serverAddrV4: v4, serverAddrV6: deadV6Addr(t), preferIPv6: true, fallbackToV4: true}
-		if got := m.GetServerAddr(context.Background()); got != v4 {
+		m, _ := newFamilyManager(t, v4, deadV6Addr(t), true, true)
+		m.ProbeEndpointFamily(ctx)
+		if got := m.GetServerAddr(ctx); got != v4 {
 			t.Fatalf("GetServerAddr = %q, want the v4 fallback %q", got, v4)
 		}
 	})
 
 	t.Run("v6 unreachable without fallback still returns v6", func(t *testing.T) {
 		dead := deadV6Addr(t)
-		m := &Manager{serverAddrV4: v4, serverAddrV6: dead, preferIPv6: true, fallbackToV4: false}
+		m, _ := newFamilyManager(t, v4, dead, true, false)
 		// -fallback-v4=false is an explicit "never touch IPv4" knob; silently
 		// dropping to v4 here would defeat it and leak onto the blocked family.
-		if got := m.GetServerAddr(context.Background()); got != dead {
+		m.ProbeEndpointFamily(ctx)
+		if got := m.GetServerAddr(ctx); got != dead {
 			t.Fatalf("GetServerAddr = %q, want %q (fallback disabled)", got, dead)
 		}
 	})
 }
 
-// TestGetServerAddrProbeCaching proves the verdict is computed once. Every
-// Connect and every reprobe calls GetServerAddr; re-probing on each call would
-// add a dial (and up to a 3s timeout) to the hot reconnect path.
-func TestGetServerAddrProbeCaching(t *testing.T) {
+// TestGetServerAddrNeverDials is the property the refactor exists for.
+// GetServerAddr is on the path of every strategy in a scan; it used to hold a
+// mutex across a 3s DialContext. A single dial from here would put that back.
+func TestGetServerAddrNeverDials(t *testing.T) {
 	live, stop := liveV6Listener(t)
 	defer stop()
 
-	m := &Manager{serverAddrV4: "127.0.0.1:443", serverAddrV6: live, preferIPv6: true, fallbackToV4: true}
+	m, d := newFamilyManager(t, "127.0.0.1:443", live, true, true)
 	ctx := context.Background()
 
+	for range 20 {
+		if got := m.GetServerAddr(ctx); got != live {
+			t.Fatalf("GetServerAddr = %q, want %q", got, live)
+		}
+	}
+	if n := d.calls.Load(); n != 0 {
+		t.Fatalf("GetServerAddr dialled %d times, want 0", n)
+	}
+}
+
+// TestFamilyProbeRunsOnce proves the verdict is computed once. Every connect
+// cycle calls the probe step; re-dialling on each one would add up to a 3s
+// timeout to the hot reconnect path.
+func TestFamilyProbeRunsOnce(t *testing.T) {
+	live, stop := liveV6Listener(t)
+	defer stop()
+
+	m, d := newFamilyManager(t, "127.0.0.1:443", live, true, true)
+	ctx := context.Background()
+
+	m.ProbeEndpointFamily(ctx)
 	if got := m.GetServerAddr(ctx); got != live {
 		t.Fatalf("GetServerAddr = %q, want %q", got, live)
 	}
@@ -140,47 +222,81 @@ func TestGetServerAddrProbeCaching(t *testing.T) {
 	stop()
 
 	for i := range 4 {
+		m.ProbeEndpointFamily(ctx)
 		if got := m.GetServerAddr(ctx); got != live {
 			t.Fatalf("call %d: GetServerAddr = %q, want the cached %q (probe must not repeat)", i, got, live)
 		}
 	}
+	if n := d.calls.Load(); n != 1 {
+		t.Fatalf("probe dialled %d times across 5 cycles, want 1", n)
+	}
 }
 
-// TestResetIPv6CheckReprobes covers the network-change path (WiFi -> LTE):
-// after ResetIPv6Check the cached verdict must be discarded, otherwise a client
-// that lost IPv6 keeps dialling a dead family until restart.
-func TestResetIPv6CheckReprobes(t *testing.T) {
+// TestResetHealthReprobes covers the network-change path (WiFi -> LTE): after a
+// reset the cached verdict must be discarded, otherwise a client that lost IPv6
+// keeps dialling a dead family until restart.
+func TestResetHealthReprobes(t *testing.T) {
+	for name, reset := range map[string]func(*Manager){
+		"ResetHealth":    (*Manager).ResetHealth,
+		"ResetIPv6Check": (*Manager).ResetIPv6Check, // deprecated alias, Android calls it
+	} {
+		t.Run(name, func(t *testing.T) {
+			live, stop := liveV6Listener(t)
+			defer stop()
+
+			const v4 = "127.0.0.1:443"
+			m, _ := newFamilyManager(t, v4, live, true, true)
+			ctx := context.Background()
+
+			m.ProbeEndpointFamily(ctx)
+			if got := m.GetServerAddr(ctx); got != live {
+				t.Fatalf("GetServerAddr = %q, want %q", got, live)
+			}
+
+			// Network changed: the v6 endpoint is gone.
+			stop()
+
+			reset(m)
+			m.ProbeEndpointFamily(ctx)
+			if got := m.GetServerAddr(ctx); got != v4 {
+				t.Fatalf("GetServerAddr = %q after reset, want the v4 fallback %q", got, v4)
+			}
+		})
+	}
+}
+
+// TestResetForNetworkChangeResetsEndpoints is the desktop half of the bug: the
+// Android control socket called ResetIPv6Check by hand, ResetForNetworkChange
+// did not, so a family verdict outlived every network change everywhere else.
+func TestResetForNetworkChangeResetsEndpoints(t *testing.T) {
 	live, stop := liveV6Listener(t)
 	defer stop()
 
 	const v4 = "127.0.0.1:443"
-	m := &Manager{serverAddrV4: v4, serverAddrV6: live, preferIPv6: true, fallbackToV4: true}
+	m, _ := newFamilyManager(t, v4, live, true, true)
 	ctx := context.Background()
 
-	if got := m.GetServerAddr(ctx); got != live {
-		t.Fatalf("GetServerAddr = %q, want %q", got, live)
-	}
-
-	// Network changed: the v6 endpoint is gone.
-	stop()
-
-	m.ResetIPv6Check()
-	if m.ipv6CheckedOnce {
-		t.Fatal("ResetIPv6Check left the checked-once flag set")
-	}
+	stop() // v6 is down at this point
+	m.ProbeEndpointFamily(ctx)
 	if got := m.GetServerAddr(ctx); got != v4 {
-		t.Fatalf("GetServerAddr = %q after reset, want the v4 fallback %q", got, v4)
+		t.Fatalf("GetServerAddr = %q, want the v4 fallback %q", got, v4)
 	}
-	if m.ipv6Available {
-		t.Error("re-probe did not clear the stale availability flag")
+
+	m.ResetForNetworkChange()
+	if got := m.GetServerAddr(ctx); got != live {
+		t.Fatalf("GetServerAddr = %q after network change, want the preferred v6 %q", got, live)
 	}
 }
 
-// TestCheckIPv6ConnectivityNoAddr guards the early return: an unconfigured v6
-// address must report "unavailable" instead of dialling an empty host.
-func TestCheckIPv6ConnectivityNoAddr(t *testing.T) {
-	m := &Manager{}
-	if m.checkIPv6Connectivity(context.Background()) {
-		t.Fatal("checkIPv6Connectivity = true with no v6 address configured")
+// TestGetServerAddrWithoutSelector guards the degenerate manager: NewManager
+// has no endpoints, and roughly fifteen call sites dereference this result.
+func TestGetServerAddrWithoutSelector(t *testing.T) {
+	m := NewManager()
+	if got := m.GetServerAddr(context.Background()); got != "" {
+		t.Fatalf("GetServerAddr = %q with no selector, want empty", got)
 	}
+	if states := m.EndpointStates(); states != nil {
+		t.Fatalf("EndpointStates = %v with no selector, want nil", states)
+	}
+	m.ResetHealth() // must not panic
 }

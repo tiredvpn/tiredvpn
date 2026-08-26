@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+
+	"github.com/tiredvpn/tiredvpn/internal/endpoint"
+	"github.com/tiredvpn/tiredvpn/internal/log"
 )
 
 // ApplyClientFlags overlays explicitly-set CLI flags from fs onto cfg.
@@ -14,9 +17,13 @@ import (
 //
 // Mapping (flag → TOML field):
 //
-//	-server      → server.address + server.port  (host:port split)
-//	-strategy    → strategy.mode
-//	-debug       → logging.level = "debug" (when true)
+//	-server        → server.address + server.port  (host:port split, collapses [[servers]])
+//	-server-v6     → server.address_v6 + server.port_v6 (same collapse)
+//	-server-policy → selection.policy
+//	-prefer-ipv6   → selection.family (with -fallback-v4; see familyFromLegacyFlags)
+//	-fallback-v4   → selection.family
+//	-strategy      → strategy.mode
+//	-debug         → logging.level = "debug" (when true)
 //
 // Flags absent from this mapping are ignored — they belong to subsystems
 // not yet represented in the TOML schema, and the caller continues to read
@@ -40,10 +47,24 @@ func ApplyClientFlags(cfg *ClientConfig, fs *flag.FlagSet) error {
 				visitErr = fmt.Errorf("flag -server: %w", err)
 				return
 			}
+			collapseToSingleServer(cfg, f.Name)
 			cfg.Server.Address = host
 			if port != 0 {
 				cfg.Server.Port = port
 			}
+		case "server-v6":
+			host, port, err := splitHostPort(f.Value.String())
+			if err != nil {
+				visitErr = fmt.Errorf("flag -server-v6: %w", err)
+				return
+			}
+			collapseToSingleServer(cfg, f.Name)
+			cfg.Server.AddressV6 = host
+			if port != 0 {
+				cfg.Server.PortV6 = port
+			}
+		case "server-policy":
+			cfg.selection().Policy = f.Value.String()
 		case "strategy":
 			cfg.Strategy.Mode = f.Value.String()
 		case "debug":
@@ -52,7 +73,92 @@ func ApplyClientFlags(cfg *ClientConfig, fs *flag.FlagSet) error {
 			}
 		}
 	})
-	return visitErr
+	if visitErr != nil {
+		return visitErr
+	}
+	if fam, ok := familyFromLegacyFlags(fs); ok {
+		cfg.selection().Family = fam
+	}
+	return nil
+}
+
+// selection returns the [selection] block, creating it on first write. Callers
+// that only read must go through Selection.Resolve, which tolerates nil.
+func (c *ClientConfig) selection() *Selection {
+	if c.Selection == nil {
+		c.Selection = &Selection{}
+	}
+	return c.Selection
+}
+
+// familyFromLegacyFlags maps the -prefer-ipv6 / -fallback-v4 pair onto a
+// selection.family spelling, but only when at least one of them was passed
+// explicitly. An untouched pair must leave selection.family alone: the flags
+// both default to true, and writing "prefer_v6" from a default would silently
+// beat a family the config file asked for.
+//
+// Both values are read even when only one was passed, because the mapping is a
+// function of the pair (endpoint.FamilyPolicyFromLegacy owns the table, and the
+// -prefer-ipv6=false row is v4_only rather than prefer_v4 on purpose).
+func familyFromLegacyFlags(fs *flag.FlagSet) (string, bool) {
+	touched := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "prefer-ipv6" || f.Name == "fallback-v4" {
+			touched = true
+		}
+	})
+	if !touched {
+		return "", false
+	}
+	return endpoint.FamilyPolicyFromLegacy(
+		lookupBoolFlag(fs, "prefer-ipv6"),
+		lookupBoolFlag(fs, "fallback-v4"),
+	).String(), true
+}
+
+// lookupBoolFlag reads a bool flag's current value (default or set). A flag the
+// FlagSet does not know reads as false, which for both of our callers is the
+// conservative answer.
+func lookupBoolFlag(fs *flag.FlagSet, name string) bool {
+	f := fs.Lookup(name)
+	if f == nil {
+		return false
+	}
+	return f.Value.String() == "true"
+}
+
+// collapseToSingleServer folds a [[servers]] list down to its first entry, so
+// that -server / -server-v6 have one unambiguous thing to overwrite.
+//
+// The first entry is kept rather than discarded wholesale: -server-v6 on its
+// own must not erase the IPv4 address (the two flags have always been
+// independent), and the entry's name/secret/sni stay attached to the endpoint
+// they describe.
+//
+// One consequence worth stating: an entry that never spelled out port_v6 still
+// follows port, so -server host:443 moves the IPv6 port to 443 as well. That is
+// the schema's rule applied consistently rather than a special case; pin
+// port_v6 in the file, or pass -server-v6, to keep the two apart.
+func collapseToSingleServer(cfg *ClientConfig, flagName string) {
+	if len(cfg.Servers) == 0 {
+		return
+	}
+	kept := cfg.Servers[0]
+	if len(cfg.Servers) > 1 {
+		log.Warn("flag -%s collapses the %d-entry [[servers]] list to one endpoint (%s); the rest are ignored",
+			flagName, len(cfg.Servers), kept.label(0))
+	}
+	cfg.Server = kept
+	cfg.Servers = nil
+}
+
+// label names an entry for a message: its name when it has one, its position
+// otherwise.
+func (s ClientServer) label(i int) string {
+	if s.Name != "" {
+		return s.Name
+	}
+	return fmt.Sprintf("servers[%d]", i)
 }
 
 // ApplyServerFlags overlays explicitly-set CLI flags from fs onto cfg.
@@ -150,6 +256,33 @@ func mergeClient(dst, src *ClientConfig) {
 	}
 	if src.Server.Port != 0 {
 		dst.Server.Port = src.Server.Port
+	}
+	if src.Server.AddressV6 != "" {
+		dst.Server.AddressV6 = src.Server.AddressV6
+	}
+	if src.Server.PortV6 != 0 {
+		dst.Server.PortV6 = src.Server.PortV6
+	}
+	if src.Server.Name != "" {
+		dst.Server.Name = src.Server.Name
+	}
+	if src.Server.Weight != 0 {
+		dst.Server.Weight = src.Server.Weight
+	}
+	if src.Server.Secret != "" {
+		dst.Server.Secret = src.Server.Secret
+	}
+	if src.Server.SNI != "" {
+		dst.Server.SNI = src.Server.SNI
+	}
+	// The list is atomic: a partial merge of two server lists has no meaning a
+	// reader could predict (is entry 2 of the file entry 2 of the defaults?).
+	if len(src.Servers) > 0 {
+		dst.Servers = src.Servers
+	}
+	if src.Selection != nil {
+		sel := *src.Selection
+		dst.Selection = &sel
 	}
 	if src.Strategy.Mode != "" {
 		dst.Strategy.Mode = src.Strategy.Mode
@@ -249,4 +382,3 @@ func splitHostPort(s string) (string, int, error) {
 	}
 	return host, port, nil
 }
-

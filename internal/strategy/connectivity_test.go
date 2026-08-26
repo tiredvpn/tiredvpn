@@ -226,7 +226,7 @@ func TestCheckerAltAddrGate(t *testing.T) {
 	t.Run("primary dead, alt live", func(t *testing.T) {
 		c := NewConnectivityChecker(deadAddr, 2*time.Second, false)
 		c.SetAltAddr(live)
-		if err := c.checkTCPAny(context.Background()); err != nil {
+		if _, err := c.checkTCPAny(context.Background()); err != nil {
 			t.Fatalf("checkTCPAny = %v, want nil (alt is reachable)", err)
 		}
 	})
@@ -234,7 +234,7 @@ func TestCheckerAltAddrGate(t *testing.T) {
 	t.Run("both dead", func(t *testing.T) {
 		c := NewConnectivityChecker(deadAddr, 500*time.Millisecond, false)
 		c.SetAltAddr(deadAddr + "0")
-		if err := c.checkTCPAny(context.Background()); err == nil {
+		if _, err := c.checkTCPAny(context.Background()); err == nil {
 			t.Fatal("checkTCPAny = nil, want an error when neither address answers")
 		}
 	})

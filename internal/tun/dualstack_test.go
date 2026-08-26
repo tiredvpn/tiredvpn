@@ -8,9 +8,10 @@ import (
 	"testing"
 )
 
-// TestParseIPv6Policy pins the -tun-ipv6 flag surface: exactly {off, dual}
-// today, everything else an error. The accepted set is a closed list so a
-// future "block" value slots in without changing the flag's shape.
+// TestParseIPv6Policy pins the -tun-ipv6 flag surface: exactly
+// {off, dual, block}, everything else an error. The empty string stays an
+// error on purpose — callers name the default themselves via
+// DefaultIPv6Policy rather than inheriting a silent one.
 func TestParseIPv6Policy(t *testing.T) {
 	for _, tc := range []struct {
 		in      string
@@ -19,8 +20,8 @@ func TestParseIPv6Policy(t *testing.T) {
 	}{
 		{"off", IPv6PolicyOff, false},
 		{"dual", IPv6PolicyDual, false},
+		{"block", IPv6PolicyBlock, false},
 		{"", IPv6PolicyOff, true},
-		{"block", IPv6PolicyOff, true}, // reserved for the leak-block branch, not yet valid
 		{"on", IPv6PolicyOff, true},
 		{"DUAL", IPv6PolicyOff, true},
 		{" dual", IPv6PolicyOff, true},
@@ -302,7 +303,7 @@ func TestControlResponseIPv6RemovedJSON(t *testing.T) {
 func TestHandshakeFallbackNonDualServer(t *testing.T) {
 	// Legacy 9-byte response (pre-flags server).
 	conn := &scriptedConn{chunks: [][]byte{{0x00, 10, 8, 0, 1, 10, 8, 0, 2}}}
-	v := &VPNClient{tun: &TUNDevice{mtu: 1280}, dualStack: true}
+	v := &VPNClient{tun: &TUNDevice{mtu: 1280}, ipv6Policy: IPv6PolicyDual}
 	resp, n, err := v.doHandshake(conn, net.IPv4zero)
 	if err != nil {
 		t.Fatalf("doHandshake: %v", err)

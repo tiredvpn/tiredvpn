@@ -42,7 +42,7 @@ func newStormTestManager(t *testing.T, clk *fakeClock) (*Manager, string) {
 	addr := startEchoListener(t)
 
 	m := NewManager()
-	m.serverAddrV4 = addr
+	setTestEndpoint(m, addr)
 	m.stormDetector = newTestDetector(clk)
 	m.Register(&mockStrategy{id: "reality", name: "REALITY", priority: 5, serverAddr: addr})
 	m.Register(&mockStrategy{id: "http2_stego", name: "HTTP2 Stego", priority: 10, serverAddr: addr})
@@ -65,7 +65,7 @@ func TestManager_StormFailsOverToNextStrategy(t *testing.T) {
 	ctx := t.Context()
 
 	// First connection picks the highest-priority strategy: reality.
-	conn, strat, err := m.Connect(ctx, m.serverAddrV4)
+	conn, strat, err := m.Connect(ctx, m.GetServerAddr(ctx))
 	if err != nil {
 		t.Fatalf("initial connect: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestManager_StormFailsOverToNextStrategy(t *testing.T) {
 	}
 
 	// Next connect must avoid reality and pick http2_stego.
-	conn2, strat2, err := m.Connect(ctx, m.serverAddrV4)
+	conn2, strat2, err := m.Connect(ctx, m.GetServerAddr(ctx))
 	if err != nil {
 		t.Fatalf("failover connect: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestManager_StableSessionNoFailover(t *testing.T) {
 		t.Fatal("reality parked after a healthy session")
 	}
 
-	conn, strat, err := m.Connect(ctx, m.serverAddrV4)
+	conn, strat, err := m.Connect(ctx, m.GetServerAddr(ctx))
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
@@ -133,7 +133,7 @@ func TestManager_CooldownRestoresStrategy(t *testing.T) {
 	}
 
 	// reality is highest priority and should be picked again.
-	conn, strat, err := m.Connect(ctx, m.serverAddrV4)
+	conn, strat, err := m.Connect(ctx, m.GetServerAddr(ctx))
 	if err != nil {
 		t.Fatalf("post-cooldown connect: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestManager_AllParkedUnparksToAvoidOutage(t *testing.T) {
 	}
 
 	// Both parked: the fallback must unpark and still return a connection.
-	conn, _, err := m.Connect(ctx, m.serverAddrV4)
+	conn, _, err := m.Connect(ctx, m.GetServerAddr(ctx))
 	if err != nil {
 		t.Fatalf("expected connection via unpark fallback, got error: %v", err)
 	}
@@ -193,7 +193,7 @@ func TestManager_ForcedModeDoesNotPark(t *testing.T) {
 	}
 
 	// Even though parked in the detector, forced mode keeps using reality.
-	conn, strat, err := m.Connect(ctx, m.serverAddrV4)
+	conn, strat, err := m.Connect(ctx, m.GetServerAddr(ctx))
 	if err != nil {
 		t.Fatalf("forced connect: %v", err)
 	}
@@ -208,7 +208,7 @@ func TestManager_StormClearsLastSuccessful(t *testing.T) {
 	m, _ := newStormTestManager(t, clk)
 	ctx := t.Context()
 
-	conn, _, err := m.Connect(ctx, m.serverAddrV4)
+	conn, _, err := m.Connect(ctx, m.GetServerAddr(ctx))
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
@@ -288,7 +288,7 @@ func TestManager_ReconnectSkipsParkedStrategy(t *testing.T) {
 	m.lastSuccessfulStrategy = reality
 	m.mu.Unlock()
 
-	conn, strat, err := m.ConnectForReconnect(ctx, m.serverAddrV4)
+	conn, strat, err := m.ConnectForReconnect(ctx, m.GetServerAddr(ctx))
 	if err != nil {
 		t.Fatalf("reconnect: %v", err)
 	}

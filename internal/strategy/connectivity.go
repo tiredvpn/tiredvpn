@@ -24,9 +24,16 @@ const (
 
 // ConnectivityResult holds the result of a connectivity check
 type ConnectivityResult struct {
-	TCP       bool          // TCP connect to server port succeeded
-	UDP       bool          // UDP connectivity check passed
-	ICMP      bool          // ICMP ping succeeded (optional)
+	TCP  bool // TCP connect to server port succeeded
+	UDP  bool // UDP connectivity check passed
+	ICMP bool // ICMP ping succeeded (optional)
+
+	// Addr is the address that actually answered the TCP gate, empty when none
+	// did. The gate already tries several addresses and knows which one worked;
+	// reporting it costs nothing and is what lets the endpoint selector learn
+	// "the other family is up" without a single extra packet.
+	Addr string
+
 	Latency   time.Duration // RTT to server
 	Error     error         // Last error encountered
 	CheckedAt time.Time     // When the check was performed
@@ -39,14 +46,17 @@ func (r ConnectivityResult) HasBasicConnectivity() bool {
 
 // ConnectivityChecker performs pre-flight connectivity checks before trying strategies
 type ConnectivityChecker struct {
-	serverAddr  string        // full addr host:port
-	altAddr     string        // same server on the other address family, optional
 	timeout     time.Duration // timeout for the TCP gate (2-3 sec)
 	auxTimeout  time.Duration // bounded timeout for the UDP/ICMP probes
 	auxGrace    time.Duration // how long Check waits for UDP/ICMP after TCP lands
 	androidMode bool          // skip ICMP check on Android (os/exec not allowed)
 
+	// serverAddr and altAddrs move with the pinned endpoint, so both are
+	// guarded: Connect rewrites them per cycle while a wait loop may be reading
+	// them from another goroutine.
 	mu         sync.RWMutex
+	serverAddr string   // full addr host:port
+	altAddrs   []string // same server on its other address families, optional
 	lastResult ConnectivityResult
 }
 
@@ -72,37 +82,54 @@ func NewConnectivityChecker(serverAddr string, timeout time.Duration, androidMod
 // "waiting for network" against a blocked IPv4 while its IPv6 transport was
 // perfectly reachable. Empty or duplicate values are ignored.
 func (c *ConnectivityChecker) SetAltAddr(addr string) {
-	if addr == "" || addr == c.serverAddr {
-		return
-	}
+	c.mu.RLock()
+	primary := c.serverAddr
+	c.mu.RUnlock()
+	c.SetAddrs(primary, addr)
+}
+
+// SetAddrs points the gate at primary, with alts as the same server's other
+// address families. Empty and duplicate values are dropped; an empty primary is
+// ignored, so a caller that only knows the alternates cannot blank out the
+// address the gate dials.
+func (c *ConnectivityChecker) SetAddrs(primary string, alts ...string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.altAddr = addr
+	if primary != "" {
+		c.serverAddr = primary
+	}
+	seen := map[string]bool{c.serverAddr: true}
+	c.altAddrs = nil
+	for _, a := range alts {
+		if a == "" || seen[a] {
+			continue
+		}
+		seen[a] = true
+		c.altAddrs = append(c.altAddrs, a)
+	}
 }
 
 // addrsToTry returns the addresses the TCP gate probes, preferred one first.
 func (c *ConnectivityChecker) addrsToTry() []string {
 	c.mu.RLock()
-	alt := c.altAddr
-	c.mu.RUnlock()
-	if alt == "" {
-		return []string{c.serverAddr}
-	}
-	return []string{c.serverAddr, alt}
+	defer c.mu.RUnlock()
+	out := make([]string, 0, 1+len(c.altAddrs))
+	out = append(out, c.serverAddr)
+	return append(out, c.altAddrs...)
 }
 
-// checkTCPAny reports success as soon as any configured address answers, and
-// returns the last error when none do.
-func (c *ConnectivityChecker) checkTCPAny(ctx context.Context) error {
+// checkTCPAny reports the address that answered as soon as any configured one
+// does, and returns the last error when none do.
+func (c *ConnectivityChecker) checkTCPAny(ctx context.Context) (string, error) {
 	var lastErr error
 	for _, addr := range c.addrsToTry() {
 		err := c.checkTCP(ctx, addr)
 		if err == nil {
-			return nil
+			return addr, nil
 		}
 		lastErr = err
 	}
-	return lastErr
+	return "", lastErr
 }
 
 // Check performs TCP, UDP and ICMP connectivity checks
@@ -111,8 +138,12 @@ func (c *ConnectivityChecker) Check(ctx context.Context) ConnectivityResult {
 		CheckedAt: time.Now(),
 	}
 
+	c.mu.RLock()
+	primary := c.serverAddr
+	c.mu.RUnlock()
+
 	// Parse host from server address
-	host, port, err := net.SplitHostPort(c.serverAddr)
+	host, port, err := net.SplitHostPort(primary)
 	if err != nil {
 		result.Error = fmt.Errorf("invalid server address: %w", err)
 		return result
@@ -124,11 +155,12 @@ func (c *ConnectivityChecker) Check(ctx context.Context) ConnectivityResult {
 	// them just auxGrace, then fall back to the last known value and let them
 	// finish updating the cache in the background.
 	var tcpErr error
+	var tcpAddr string
 	var tcpLatency time.Duration
 	tcpDone := make(chan struct{})
 	go func() {
 		start := time.Now()
-		tcpErr = c.checkTCPAny(ctx)
+		tcpAddr, tcpErr = c.checkTCPAny(ctx)
 		tcpLatency = time.Since(start)
 		close(tcpDone)
 	}()
@@ -141,7 +173,7 @@ func (c *ConnectivityChecker) Check(ctx context.Context) ConnectivityResult {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			udpOK.Store(c.checkUDP(ctx, c.serverAddr) == nil)
+			udpOK.Store(c.checkUDP(ctx, primary) == nil)
 		}()
 		// ICMP check (optional, may fail without root).
 		// Skip on Android - os/exec causes SIGSYS due to seccomp.
@@ -159,6 +191,7 @@ func (c *ConnectivityChecker) Check(ctx context.Context) ConnectivityResult {
 	result.TCP = tcpErr == nil
 	if result.TCP {
 		result.Latency = tcpLatency
+		result.Addr = tcpAddr
 	}
 	if tcpErr != nil {
 		result.Error = tcpErr
@@ -204,12 +237,13 @@ func (c *ConnectivityChecker) checkTCPOnly(ctx context.Context) ConnectivityResu
 	result := ConnectivityResult{CheckedAt: time.Now()}
 
 	start := time.Now()
-	err := c.checkTCPAny(ctx)
+	addr, err := c.checkTCPAny(ctx)
 	result.TCP = err == nil
 	if err != nil {
 		result.Error = err
 	} else {
 		result.Latency = time.Since(start)
+		result.Addr = addr
 	}
 
 	// Carry forward last known UDP/ICMP (they gate QUIC and rarely flip).
@@ -336,12 +370,12 @@ func (c *ConnectivityChecker) WaitForConnectivity(ctx context.Context, interval 
 		case <-timer.C:
 			result = c.checkTCPOnly(ctx)
 			if result.TCP {
-				log.Info("Connectivity restored to %s", c.serverAddr)
+				log.Info("Connectivity restored to %s", result.Addr)
 				return result
 			}
 			backoff = nextProbeBackoff(backoff)
 			timer.Reset(backoff)
-			log.Debug("Still no connectivity to %s, retrying in %v...", c.serverAddr, backoff)
+			log.Debug("Still no connectivity to %s, retrying in %v...", c.ServerAddr(), backoff)
 		}
 	}
 }
@@ -367,7 +401,9 @@ func (c *ConnectivityChecker) LastResult() ConnectivityResult {
 	return c.lastResult
 }
 
-// ServerAddr returns the server address being checked
+// ServerAddr returns the primary server address currently being checked.
 func (c *ConnectivityChecker) ServerAddr() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.serverAddr
 }

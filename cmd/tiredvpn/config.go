@@ -21,7 +21,8 @@ import (
 // — this precedence is enforced inside ResolveClient via flag.Visit).
 //
 // Mapped fields:
-//   - server.address + server.port → cfg.ServerAddr (joined host:port)
+//   - [server] / [[servers]]       → cfg.Servers (and cfg.ServerAddr, the first entry)
+//   - [selection]                  → cfg.Selection
 //   - strategy.mode                → cfg.StrategyName
 //   - tls.fingerprint              → cfg.TLSFingerprint
 //   - shaper.{preset|custom}       → cfg.Shaper (built via presets.FromConfig)
@@ -39,7 +40,9 @@ func applyClientTOMLConfig(cfg *client.Config, path string, fs *flag.FlagSet) er
 		return fmt.Errorf("config %s: %w", path, err)
 	}
 
-	cfg.ServerAddr = joinHostPort(tcfg.Server.Address, tcfg.Server.Port)
+	if err := applyServerList(cfg, tcfg); err != nil {
+		return fmt.Errorf("config %s: %w", path, err)
+	}
 	if tcfg.Strategy.Mode != "" {
 		cfg.StrategyName = tcfg.Strategy.Mode
 	}
@@ -63,6 +66,110 @@ func applyClientTOMLConfig(cfg *client.Config, path string, fs *flag.FlagSet) er
 		cfg.ShaperID = byte(presets.IDForName(tcfg.Shaper.Preset))
 	}
 	return nil
+}
+
+// applyServerList maps the resolved [server] / [[servers]] / [selection]
+// blocks onto the runtime config.
+//
+// cfg.ServerAddr is set from the first entry here as well as by
+// client.ResolveEndpoints later, because everything between the two - the
+// "-server is required" check, the MTU validation, the startup log - reads it,
+// and a config that only says [[servers]] would otherwise look serverless
+// until the client is already running.
+func applyServerList(cfg *client.Config, tcfg *tomlcfg.ClientConfig) error {
+	list := tcfg.ServerList()
+	specs := make([]client.ServerSpec, 0, len(list))
+	for _, s := range list {
+		spec := client.ServerSpec{
+			Name:   s.Name,
+			Weight: s.Weight,
+			Secret: s.Secret,
+			SNI:    s.SNI,
+		}
+		if s.Address != "" {
+			spec.Addr = joinHostPort(s.Address, s.Port)
+		}
+		if s.AddressV6 != "" {
+			// JoinHostPort brackets it, which is the form the transport and
+			// the TUN bypass expect; the schema stores it bare so the file
+			// does not have to.
+			spec.AddrV6 = joinHostPort(s.AddressV6, s.PortV6)
+		}
+		specs = append(specs, spec)
+	}
+	if len(specs) > 0 {
+		cfg.Servers = specs
+		cfg.ServerAddr = specs[0].Addr
+		cfg.ServerAddrV6 = specs[0].AddrV6
+	}
+
+	sel, err := tcfg.Selection.Resolve()
+	if err != nil {
+		return err
+	}
+	// Each field is copied only when the file (or the flag overlay that has
+	// already been folded into it) says something, so a TOML that is silent
+	// about selection leaves the CLI-set values - and the legacy defaults -
+	// exactly where they were.
+	if sel.Policy != "" {
+		cfg.Selection.Policy = sel.Policy
+	}
+	if sel.Family != "" {
+		cfg.Selection.Family = sel.Family
+	}
+	if sel.FailureThreshold != 0 {
+		cfg.Selection.FailureThreshold = sel.FailureThreshold
+	}
+	if sel.Cooldown != 0 {
+		cfg.Selection.Cooldown = sel.Cooldown
+	}
+	if sel.MaxCooldown != 0 {
+		cfg.Selection.MaxCooldown = sel.MaxCooldown
+	}
+	if sel.MinDwell != 0 {
+		cfg.Selection.MinDwell = sel.MinDwell
+	}
+	if sel.RecheckInterval != 0 {
+		cfg.Selection.RecheckInterval = sel.RecheckInterval
+	}
+	if sel.HealthCheck != "" {
+		cfg.Selection.HealthCheck = sel.HealthCheck
+	}
+	return nil
+}
+
+// scanArgValue returns the value following name in a hand-parsed argv, or "".
+// Used by the JNI entry point, which has no FlagSet.
+func scanArgValue(args []string, name string) string {
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == name {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+// collapseServers folds a configured server list down to one entry whose
+// addresses come from the command line.
+//
+// Entry 0 is kept rather than the list dropped outright, so a name or a secret
+// attached to it survives; only the addresses are replaced, and only when the
+// caller actually has one.
+func collapseServers(list []client.ServerSpec, addr, addrV6 string) []client.ServerSpec {
+	if len(list) == 0 {
+		return nil
+	}
+	if len(list) > 1 {
+		log.Warn("-server/-server-v6 collapses the %d-entry server list to one endpoint; the rest are ignored", len(list))
+	}
+	kept := list[0]
+	if addr != "" {
+		kept.Addr = addr
+	}
+	if addrV6 != "" {
+		kept.AddrV6 = addrV6
+	}
+	return []client.ServerSpec{kept}
 }
 
 // applyShaperFlag builds cfg.Shaper from the -shaper preset name and seed.

@@ -68,10 +68,13 @@ func (pc *PooledConn) Close() error {
 
 // TunnelPool hands out fresh tunnel connections, bounded by MaxConnections.
 // Connections are single-use and never returned for reuse (see PooledConn).
+// The pool holds no server address: Connect resolves the destination from the
+// manager's endpoint selector and overrides whatever target it is handed. A
+// copy kept here would be a third place where the address lives and the one
+// most likely to go stale after a family fallback.
 type TunnelPool struct {
-	config     Config
-	manager    Connector
-	serverAddr string
+	config  Config
+	manager Connector
 
 	totalConns int32 // atomic counter of live connections
 }
@@ -80,12 +83,13 @@ type TunnelPool struct {
 // seam so tests can substitute a scripted connector.
 var _ Connector = (*strategy.Manager)(nil)
 
-// NewTunnelPool creates a new connection pool
+// NewTunnelPool creates a new connection pool. serverAddr is accepted for call
+// compatibility and ignored; the manager decides which endpoint to dial.
 func NewTunnelPool(mgr *strategy.Manager, serverAddr string, cfg Config) *TunnelPool {
+	_ = serverAddr
 	return &TunnelPool{
-		config:     cfg,
-		manager:    mgr,
-		serverAddr: serverAddr,
+		config:  cfg,
+		manager: mgr,
 	}
 }
 
@@ -183,7 +187,7 @@ func (p *TunnelPool) createConn(ctx context.Context) (*PooledConn, error) {
 	connectCtx, cancel := context.WithTimeout(ctx, p.config.ConnectTimeout)
 	defer cancel()
 
-	conn, usedStrategy, err := p.manager.Connect(connectCtx, p.serverAddr)
+	conn, usedStrategy, err := p.manager.Connect(connectCtx, "")
 	if err != nil {
 		atomic.AddInt32(&p.totalConns, -1)
 		return nil, err
