@@ -174,6 +174,19 @@ type VPNConfig struct {
 	// transport socket. Recorded so the TUN can pin a /128 bypass for it.
 	ServerAddrV6 string
 
+	// ServerAddrs is every transport address the client may dial, across all
+	// configured endpoints and both families - ServerAddr and ServerAddrV6 are
+	// the first endpoint's and appear here too.
+	//
+	// A full tunnel needs a host route for each of them: with a single bypass
+	// pinned, dialling a second server sends the transport socket into the
+	// tunnel it is supposed to carry. The routes are pinned for every entry at
+	// start-up rather than when the client switches, so there is no window
+	// where the client has moved and the route has not.
+	//
+	// Filled by the client; consumed by the platform TUN layer.
+	ServerAddrs []string
+
 	// AutoMTU enables the active MTU probe. When set, MTU becomes the upper bound
 	// (cap) and the client measures the real end-to-end ceiling, applying
 	// min(probed, cap). Only effective on interfaces we own (non-fd Linux/macOS).

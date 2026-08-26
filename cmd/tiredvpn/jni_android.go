@@ -437,19 +437,41 @@ func parseClientArgs(args []string) (*client.Config, error) {
 		TunMTU: 1280,
 	}
 
+	// -config is applied BEFORE the scan below, so that the args the app passed
+	// explicitly overwrite what the file said. This parser has no equivalent of
+	// flag.Visit - "was it set?" is only knowable by whether the token is
+	// present - so the precedence has to come from the order of the two passes.
+	if path := scanArgValue(args, "-config"); path != "" {
+		if err := applyClientTOMLConfig(cfg, path, nil); err != nil {
+			return nil, err
+		}
+	}
+
 	// Shaper preset/seed are captured during the scan and applied after the loop
 	// so a -shaper-seed in any position still feeds the same -shaper build.
 	var (
-		shaperName string
-		shaperSeed int64
+		shaperName    string
+		shaperSeed    int64
+		sawServerFlag bool
 	)
 
 	// Parse flags from args (simple parser, doesn't use flag package)
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
+		case "-config":
+			// Consumed before the loop; skip its value so it is not reported
+			// as an unknown token.
+			if i+1 < len(args) {
+				i++
+			}
 		case "-server":
 			if i+1 < len(args) {
 				cfg.ServerAddr = args[i+1]
+				// A single address on the command line collapses a
+				// [[servers]] list from -config, the same way the desktop
+				// flag does. Without it -server would look accepted and the
+				// client would dial the list instead.
+				sawServerFlag = true
 				i++
 			}
 		case "-secret":
@@ -588,6 +610,7 @@ func parseClientArgs(args []string) (*client.Config, error) {
 		case "-server-v6":
 			if i+1 < len(args) {
 				cfg.ServerAddrV6 = args[i+1]
+				sawServerFlag = true
 				i++
 			}
 		case "-prefer-ipv6":
@@ -614,6 +637,10 @@ func parseClientArgs(args []string) (*client.Config, error) {
 			// contract drift between the app and the core is visible.
 			log.Warn("parseClientArgs: ignoring unknown flag %q", args[i])
 		}
+	}
+
+	if sawServerFlag {
+		cfg.Servers = collapseServers(cfg.Servers, cfg.ServerAddr, cfg.ServerAddrV6)
 	}
 
 	// Build the shaper exactly like the CLI path (runClient -> applyShaperFlag):

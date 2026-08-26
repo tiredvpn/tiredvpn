@@ -284,6 +284,15 @@ IPv6 TRANSPORT:
   -fallback-v4
         Fallback to IPv4 if IPv6 fails (default true)
 
+SERVER LIST (config file only):
+  -server-policy string
+        Order of the [[servers]] list: priority (config order), latency,
+        weighted. Empty means priority.
+        A list of servers is configured in TOML ([[servers]]), not on the
+        command line; -server and -server-v6 collapse it to one endpoint.
+        See [selection] in configs/client.example.toml for the failure
+        threshold, cooldown and dwell knobs.
+
 TUN MODE (Full VPN):
   -tun
         Enable TUN mode (full VPN with system routes)
@@ -622,6 +631,11 @@ func runClient(args []string) {
 	fs.StringVar(&cfg.ServerAddrV6, "server-v6", "", "Server IPv6 address (e.g., [2001:db8::100]:995)")
 	fs.BoolVar(&cfg.PreferIPv6, "prefer-ipv6", true, "Prefer IPv6 transport if available")
 	fs.BoolVar(&cfg.FallbackToV4, "fallback-v4", true, "Fallback to IPv4 if IPv6 fails")
+
+	// Server selection. Named -server-policy, not -fallback: that one already
+	// means "fall back to another strategy", and one flag cannot mean both.
+	fs.StringVar(&cfg.Selection.Policy, "server-policy", "",
+		"Order of the [[servers]] list: priority (config order), latency, weighted. Empty = priority")
 
 	// TUN mode flags
 	fs.BoolVar(&cfg.TunMode, "tun", false, "Enable TUN mode (full VPN with system routes)")

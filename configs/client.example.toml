@@ -8,8 +8,51 @@
 address = "vpn.example.org"
 port = 443
 
+# Same server over IPv6. port_v6 defaults to `port` above.
+# address_v6 = "2001:db8::10"
+# port_v6 = 443
+
+# --- Several servers: [[servers]] instead of [server] ---
+# A lone [server] IS a one-element list, so the two are mutually exclusive:
+# setting both is a startup error rather than a guess about which one wins.
+# -server / -server-v6 on the command line collapse the list back to one entry.
+#
+# [[servers]]
+# name = "ams"
+# address = "203.0.113.10"
+# port = 443
+# address_v6 = "2001:db8::10"
+# weight = 100
+#
+# [[servers]]
+# name = "fra"
+# address = "203.0.113.20"
+# port = 443
+# weight = 50
+
+# --- Which server gets dialled, and when it is given up on ---
+# [selection]
+# policy = "priority"    # priority (list order) | latency | weighted
+#
+# Address family. Omit it to keep the -prefer-ipv6/-fallback-v4 flags in
+# charge; note that -prefer-ipv6=false means v4_only, so prefer_v4 (try IPv4,
+# fall back to IPv6) is only reachable from here.
+# family = "prefer_v6"   # prefer_v6 | prefer_v4 | v6_only | v4_only
+#
+# failure_threshold = 2  # failed connect CYCLES before a candidate is parked
+# cooldown = "1m"        # first cooldown; doubles per repeat, jittered
+# max_cooldown = "30m"   # ceiling for that doubling
+# min_dwell = "5m"       # hold a fallback this long before going back
+#
+# Off by default and worth keeping that way: polling N servers on a timer is a
+# periodic fan-out pattern with nothing behind it, which is what a censor
+# looks for. With it off, the client learns about a server by dialling it.
+# health_check = "off"   # off | active
+# recheck_interval = "5m"
+
 [strategy]
 # TLS-mimicry transport. Options: reality, grpc, morph, ...
+# Optional: omit it (or leave it empty) to let the client pick a strategy.
 mode = "reality"
 
 # Optional strategy-specific options (free-form key/value).

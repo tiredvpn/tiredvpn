@@ -5,7 +5,6 @@ package client
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -17,8 +16,11 @@ import (
 // RunWithContext starts the client with a cancelable context.
 // This is used by the JNI bridge on Android to allow graceful shutdown.
 func RunWithContext(ctx context.Context, cfg *Config) error {
-	if cfg.ServerAddr == "" {
-		return fmt.Errorf("-server is required")
+	// Same order as Run: the endpoint list decides cfg.ServerAddr (the app may
+	// have passed a -config with a [[servers]] list) and may carry the secret,
+	// so it has to be resolved before either is read.
+	if _, err := ResolveEndpoints(cfg); err != nil {
+		return err
 	}
 
 	// Try environment variable for secret

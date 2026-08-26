@@ -17,9 +17,17 @@ at its default value never silently overwrites a TOML field.
 
 | Old CLI flag                  | New TOML location              | Notes                              |
 |-------------------------------|--------------------------------|------------------------------------|
-| `--server=host:port`          | `[server] address` + `port`    | host:port string is split          |
-| `--strategy=NAME`             | `[strategy] mode`              |                                    |
+| `--server=host:port`          | `[server] address` + `port`    | host:port split; collapses `[[servers]]` to one entry |
+| `--server-v6=[host]:port`     | `[server] address_v6` + `port_v6` | same collapse; `port_v6` defaults to `port` |
+| `--server-policy=NAME`        | `[selection] policy`           | `priority` (default), `latency`, `weighted` |
+| `--prefer-ipv6` / `--fallback-v4` | `[selection] family`       | `true`+`true` → `prefer_v6`, `true`+`false` → `v6_only`, `false` → `v4_only` for any fallback |
+| `--strategy=NAME`             | `[strategy] mode`              | optional; empty means the client picks |
 | `--debug`                     | `[logging] level = "debug"`    | flag forces level only when `true` |
+
+A list of servers has no flag equivalent: `[[servers]]` is config-file only,
+and `[server]` is defined to be a one-element list (setting both is an error).
+See [docs/client.md](../../../docs/client.md#several-servers) for the per-entry
+fields and the `[selection]` knobs.
 
 Flags not yet represented in the TOML schema (`--listen`, `--secret`,
 `--tun-*`, benchmark/probe knobs, `--list`, etc.) continue to be read directly

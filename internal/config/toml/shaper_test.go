@@ -160,13 +160,19 @@ func TestClientValidate(t *testing.T) {
 	if err := c.Validate(); err == nil {
 		t.Fatal("empty client should fail")
 	}
-	c = &ClientConfig{Server: ClientServer{Address: "x", Port: 0}, Strategy: Strategy{Mode: "x"}}
+	c = &ClientConfig{Server: ClientServer{Address: "x", Port: 99999}, Strategy: Strategy{Mode: "x"}}
 	if err := c.Validate(); err == nil {
-		t.Fatal("port 0 should fail")
+		t.Fatal("out-of-range port should fail")
 	}
+	// An omitted port is not an invalid port: it means 443.
+	c = &ClientConfig{Server: ClientServer{Address: "x"}, Strategy: Strategy{Mode: "x"}}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("omitted port should default to %d, got: %v", DefaultPort, err)
+	}
+	// strategy.mode is optional: empty means "let the manager choose".
 	c = &ClientConfig{Server: ClientServer{Address: "x", Port: 80}, Strategy: Strategy{Mode: ""}}
-	if err := c.Validate(); err == nil {
-		t.Fatal("empty mode should fail")
+	if err := c.Validate(); err != nil {
+		t.Fatalf("empty strategy.mode must be allowed, got: %v", err)
 	}
 	c = &ClientConfig{Server: ClientServer{Address: "x", Port: 80}, Strategy: Strategy{Mode: "y"}}
 	if err := c.Validate(); err != nil {
