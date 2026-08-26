@@ -16,8 +16,9 @@ type ClientPerformanceMetrics struct {
 }
 
 func NewClientPerformanceMetrics() *ClientPerformanceMetrics {
-	// DNS timing buckets (ms): 1, 5, 10, 50, 100, 500, 1000, 5000
-	dnsBuckets := []float64{1, 5, 10, 50, 100, 500, 1000, 5000}
+	// DNS timing buckets (seconds, to match the _seconds metric name):
+	// 1ms, 5ms, 10ms, 50ms, 100ms, 500ms, 1s, 5s
+	dnsBuckets := []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5}
 
 	cpm := &ClientPerformanceMetrics{
 		runtimeStats:  metrics.NewRuntimeStats(),
@@ -40,7 +41,7 @@ func (cpm *ClientPerformanceMetrics) periodicUpdate() {
 }
 
 func (cpm *ClientPerformanceMetrics) RecordDNSResolution(duration time.Duration) {
-	cpm.dnsResolution.Observe(float64(duration.Milliseconds()))
+	cpm.dnsResolution.Observe(duration.Seconds())
 }
 
 func (cpm *ClientPerformanceMetrics) ExportPrometheus(w http.ResponseWriter) {

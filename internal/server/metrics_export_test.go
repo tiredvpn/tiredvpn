@@ -212,7 +212,7 @@ func TestMetricsProtocolExport(t *testing.T) {
 	pm.RecordQUICCongestion("client-a")
 	pm.RecordQUICCongestion("client-b")
 	pm.RecordQUIC0RTTAccepted()
-	pm.RecordTLSHandshake(12.5)
+	pm.RecordTLSHandshake(12500 * time.Microsecond)
 	pm.RecordTLSCipherSuite("TLS_AES_128_GCM_SHA256")
 	pm.RecordTLSCipherSuite("TLS_AES_128_GCM_SHA256")
 	pm.RecordTLSVersion("1.3")
