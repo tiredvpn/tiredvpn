@@ -7,6 +7,8 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-08-26
+
 ### Changed
 
 - **`-tun-ipv6` now defaults to `dual`.** IPv6 goes into the tunnel by default
@@ -24,6 +26,23 @@ Versions follow [Semantic Versioning](https://semver.org/).
     and logs a warning. Upgrade exits and relays before clients.
 
 ### Added
+
+- **A pool of servers, with the family fallback folded into it.** A dial target
+  is now an (endpoint, family) candidate, so moving from IPv6 to IPv4 and moving
+  between servers are the same operation. Servers come from `[[servers]]` in
+  TOML, the policy from `[selection]` — `priority` (order as written),
+  `latency` (measured, ranking endpoints rather than families so a slow path
+  cannot silently override `prefer_v6`), or `weighted` (sticky: reselecting per
+  dial would show up as visible flapping between addresses). `-server` still
+  works and collapses the list to one entry.
+- **The transport family is re-decided at runtime.** It used to be settled once
+  per process: an IPv6 path that died an hour into a session kept being dialled
+  until a restart, and a client whose IPv4 got blocked never noticed its IPv6
+  had come back. A candidate is parked after two failed connect cycles, with an
+  exponential cooldown and a dwell window before the preferred one is retried —
+  and that retry rides a reconnect that would have happened anyway, so steady
+  state adds no dials. Background health-checking across the list is off by
+  default: walking every server on a timer is a pattern worth avoiding.
 
 - **`-tun-ipv6 block`, and blocking as the fallback of `dual`.** When the
   tunnel is not carrying IPv6 — the exit declined dual-stack, or `block` was
