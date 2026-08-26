@@ -7,6 +7,29 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Salamander's UDP framing now carries an 8-byte authenticity tag instead of
+  2.** The tag is what tells the receiver a packet was encrypted under the
+  secret it is holding, and at two bytes a packet from a foreign secret passed
+  the check once every 65536 attempts. That is not a rounding error on a server
+  that trials every registered client secret against every unmatched packet: a
+  false accept caches the wrong secret for that address and corrupts everything
+  written back to it. At eight bytes the odds are 2^-64.
+  - **This is a wire-format change for the QUIC/Salamander UDP transport, and
+    it is not negotiated.** A client and an exit on different sides of this
+    change will not talk to each other at all - the tag never matches, every
+    packet is dropped. There is nothing to negotiate against, because the
+    transport is not enabled anywhere: no exit runs QUIC-Salamander and no
+    client passes `-quic`. A version byte in the header would have bought
+    compatibility with zero peers at the price of a fixed-position field in
+    every datagram, which is the kind of thing this padding exists to avoid.
+  - Datagram sizes on the wire are unchanged for the packet sizes QUIC
+    actually sends. The tag lives inside the padded region, so a wider tag eats
+    into the random padding rather than the bucket. The exception is payloads
+    within six bytes below a bucket boundary (383-388, 783-788, 1183-1188,
+    1383-1388 at the `Balanced` level), which move up one bucket.
+
 ### Fixed
 
 - **Breaking for dashboards: four `_seconds` histograms now really are in

@@ -2,6 +2,7 @@ package padding
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 
@@ -144,39 +145,61 @@ func (sp *SalamanderPadder) Decrypt(ciphertext []byte) ([]byte, error) {
 	return plaintext, nil
 }
 
-// keyTag derives a deterministic 2-byte verification tag from the secret and
-// salt. It is used by the UDP/QUIC framing to confirm that a packet was
-// encrypted with the same secret before trusting the (XOR-only, unauthenticated)
-// length prefix. A wrong secret yields a different keystream and therefore a
-// different tag, so mismatches are rejected deterministically instead of being
-// guessed at via header heuristics.
-func (sp *SalamanderPadder) keyTag(salt []byte) ([2]byte, error) {
+// udpTagLen is the width of the keyed authenticity tag carried by the UDP/QUIC
+// framing. It sets the odds that a packet encrypted under a foreign secret
+// survives the check: 2^-udpTagLen*8. The previous width of 2 bytes gave 2^-16,
+// i.e. one bogus accept per ~65k trials - a server holding a few thousand
+// per-client secrets trials each of them against every unmatched packet, so at
+// that width false accepts are an operational event, not a theoretical one. At
+// 8 bytes the same server needs on the order of 10^19 trials before the first
+// one, which is out of reach of any traffic volume this code will ever see.
+//
+// The six extra bytes cost nothing on the wire in the common case: EncryptUDP
+// pads to a fixed size bucket, so a wider tag only eats into the random padding
+// and the datagram an observer measures is unchanged. The exceptions are
+// payloads within six bytes below a bucket boundary, which move up one bucket,
+// and payloads above the largest bucket, where no padding applies at all and
+// the datagram grows by six. See TestSalamanderUDPWireSizeStable.
+const udpTagLen = 8
+
+// udpHeaderLen is the framing that precedes the payload inside the masked
+// region: [tag:udpTagLen][lenHi][lenLo].
+const udpHeaderLen = udpTagLen + 2
+
+// keyTag derives a deterministic verification tag from the secret and salt. It
+// is used by the UDP/QUIC framing to confirm that a packet was encrypted with
+// the same secret before trusting the (XOR-only, unauthenticated) length
+// prefix. A wrong secret yields a different keystream and therefore a different
+// tag, so mismatches are rejected deterministically instead of being guessed at
+// via header heuristics.
+func (sp *SalamanderPadder) keyTag(salt []byte) ([udpTagLen]byte, error) {
+	var tag [udpTagLen]byte
 	h, err := blake2b.New256(sp.secret)
 	if err != nil {
-		return [2]byte{}, err
+		return tag, err
 	}
 	// Domain-separate the tag from the XOR keystream so the tag never leaks
 	// keystream bytes used to mask the payload.
 	h.Write([]byte("tag"))
 	h.Write(salt)
-	sum := h.Sum(nil)
-	return [2]byte{sum[0], sum[1]}, nil
+	copy(tag[:], h.Sum(nil))
+	return tag, nil
 }
 
 // EncryptUDP frames a single UDP/QUIC payload for transmission. The inner
-// plaintext layout is [tag:2][lenHi][lenLo][payload], which Encrypt then masks
-// with the keystream and pads to a bucket. The tag lets the receiver verify the
-// secret deterministically.
+// plaintext layout is [tag:udpTagLen][lenHi][lenLo][payload], which is then
+// masked with the keystream and padded to a bucket. The tag lets the receiver
+// verify the secret deterministically.
 func (sp *SalamanderPadder) EncryptUDP(payload []byte) ([]byte, error) {
 	if len(payload) > 65535 {
 		return nil, fmt.Errorf("salamander: payload too large (%d > 65535)", len(payload))
 	}
 
-	inner := make([]byte, 4+len(payload))
+	inner := make([]byte, udpHeaderLen+len(payload))
 	// tag is filled after we know the salt, so encrypt manually below.
-	inner[2] = byte(len(payload) >> 8)
-	inner[3] = byte(len(payload))
-	copy(inner[4:], payload)
+	inner[udpTagLen] = byte(len(payload) >> 8)
+	inner[udpTagLen+1] = byte(len(payload))
+	copy(inner[udpHeaderLen:], payload)
 
 	// Generate salt + keystream exactly like Encrypt, but inject the tag.
 	salt := make([]byte, 8)
@@ -187,8 +210,7 @@ func (sp *SalamanderPadder) EncryptUDP(payload []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	inner[0] = tag[0]
-	inner[1] = tag[1]
+	copy(inner[:udpTagLen], tag[:])
 
 	h, err := blake2b.New256(sp.secret)
 	if err != nil {
@@ -226,7 +248,7 @@ func (sp *SalamanderPadder) EncryptUDP(payload []byte) ([]byte, error) {
 // embedded tag matches the secret; otherwise ok is false. This is the
 // authoritative secret-match check for the UDP/QUIC transport.
 func (sp *SalamanderPadder) DecryptUDP(ciphertext []byte) (payload []byte, ok bool) {
-	if len(ciphertext) < 8+4 {
+	if len(ciphertext) < 8+udpHeaderLen {
 		return nil, false
 	}
 	salt := ciphertext[:8]
@@ -245,21 +267,24 @@ func (sp *SalamanderPadder) DecryptUDP(ciphertext []byte) (payload []byte, ok bo
 
 	enc := ciphertext[8:]
 	// Decrypt just the header first (tag + length) to validate cheaply.
-	var hdr [4]byte
-	for i := 0; i < 4; i++ {
+	var hdr [udpHeaderLen]byte
+	for i := 0; i < udpHeaderLen; i++ {
 		hdr[i] = enc[i] ^ hash[i%32]
 	}
-	if hdr[0] != wantTag[0] || hdr[1] != wantTag[1] {
+	// Constant-time so the number of leading tag bytes an attacker got right is
+	// not readable from how long the reject took. MultiSecret trials this per
+	// registered secret, which would otherwise be a convenient amplifier.
+	if subtle.ConstantTimeCompare(hdr[:udpTagLen], wantTag[:]) != 1 {
 		return nil, false
 	}
-	dataLen := int(hdr[2])<<8 | int(hdr[3])
-	if dataLen < 0 || 4+dataLen > len(enc) {
+	dataLen := int(hdr[udpTagLen])<<8 | int(hdr[udpTagLen+1])
+	if udpHeaderLen+dataLen > len(enc) {
 		return nil, false
 	}
 
 	payload = make([]byte, dataLen)
 	for i := 0; i < dataLen; i++ {
-		payload[i] = enc[4+i] ^ hash[(4+i)%32]
+		payload[i] = enc[udpHeaderLen+i] ^ hash[(udpHeaderLen+i)%32]
 	}
 	return payload, true
 }
