@@ -4,8 +4,18 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
 	"sync"
 )
+
+// formatValue renders a float the way the Prometheus text exposition format
+// expects: shortest round-trippable form, no forced decimals. A fixed-precision
+// verb here is not cosmetic — %.0f collapses every fractional bucket boundary
+// onto the same le label, and Prometheus keeps only the last of the duplicated
+// series.
+func formatValue(v float64) string {
+	return strconv.FormatFloat(v, 'g', -1, 64)
+}
 
 // Histogram is a simple histogram implementation for tracking value distributions
 // Thread-safe for concurrent use
@@ -175,10 +185,10 @@ func (h *Histogram) FormatPrometheus(metricName string, labels map[string]string
 		cumulative += snapshot.Counts[i]
 		bucketLabel := labelStr
 		if bucketLabel == "" {
-			bucketLabel = fmt.Sprintf("{le=\"%.0f\"}", boundary)
+			bucketLabel = fmt.Sprintf("{le=\"%s\"}", formatValue(boundary))
 		} else {
 			// Insert le label
-			bucketLabel = bucketLabel[:len(bucketLabel)-1] + fmt.Sprintf(",le=\"%.0f\"}", boundary)
+			bucketLabel = bucketLabel[:len(bucketLabel)-1] + fmt.Sprintf(",le=\"%s\"}", formatValue(boundary))
 		}
 		result += fmt.Sprintf("%s_bucket%s %d\n", metricName, bucketLabel, cumulative)
 	}
@@ -193,8 +203,9 @@ func (h *Histogram) FormatPrometheus(metricName string, labels map[string]string
 	}
 	result += fmt.Sprintf("%s_bucket%s %d\n", metricName, infLabel, cumulative)
 
-	// Sum
-	result += fmt.Sprintf("%s_sum%s %.2f\n", metricName, labelStr, snapshot.Sum)
+	// Sum. Two decimals were enough while every duration histogram held
+	// milliseconds; in seconds they quantise the mean to 10ms.
+	result += fmt.Sprintf("%s_sum%s %s\n", metricName, labelStr, formatValue(snapshot.Sum))
 
 	// Count
 	result += fmt.Sprintf("%s_count%s %d\n", metricName, labelStr, snapshot.Count)

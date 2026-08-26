@@ -7,6 +7,30 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Breaking for dashboards: four `_seconds` histograms now really are in
+  seconds.** `tiredvpn_tls_handshake_duration_seconds`,
+  `tiredvpn_local_tls_handshake_duration_seconds`,
+  `tiredvpn_local_dns_resolution_duration_seconds` and
+  `tiredvpn_local_connect_phases_duration_seconds` were observed with
+  `duration.Milliseconds()` against millisecond bucket boundaries (1…5000),
+  while their names promised the Prometheus base unit. Every
+  `histogram_quantile` over them returned a value 1000x too large. Values are
+  now observed in seconds and the boundaries are 0.001…5. Queries and alert
+  thresholds written against the old exposition must be divided by 1000, and
+  series scraped across the upgrade have a discontinuity at that point.
+  `tiredvpn_connection_duration_seconds`,
+  `tiredvpn_local_strategy_latency_seconds` and every `_milliseconds` series are
+  unchanged.
+- **Histogram `le` labels are no longer rounded to whole numbers.** They were
+  rendered with `%.0f`, so a histogram with fractional boundaries collapsed onto
+  duplicate series and Prometheus kept only the last of them:
+  `tiredvpn_protocol_confusion_success_rate` exposed its eleven buckets across
+  0.0…1.0 as `le="0"` and `le="1"`. `le` and `_sum` are now printed in shortest
+  round-trip form; `+Inf` is unchanged. `_sum` previously carried two decimals,
+  which would have quantised the new second-valued means to 10 ms.
+
 ## [1.5.1] - 2026-08-26
 
 ### Fixed
