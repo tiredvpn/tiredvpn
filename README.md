@@ -569,13 +569,13 @@ priority order; `-strategy <id>` pins one.
 | `http2_stego` | HTTP/2 Steganography | Hides data inside HTTP/2 frames with NaiveProxy-style padding |
 | `websocket_padded` | WebSocket Salamander | WebSocket transport with Salamander obfuscation padding |
 | `http_polling` | HTTP Polling | Short-lived HTTP/1.1 requests (meek-style), evades long-connection detection |
-| `morph_*` | Traffic Morphing | Reshapes traffic to match video streaming profiles (Yandex, VK) |
-| `confusion_*` | Protocol Confusion | Makes packets appear as DNS/HTTP/SSH/SMTP over TLS |
-| `geneva_*` | Geneva Engine | Country-specific packet manipulation (Russia TSPU, China GFW, Iran, Turkey) |
+| `morph_*` | Traffic Morphing | Reshapes traffic to match video streaming profiles (Yandex, VK, Baidu, Aparat) |
+| `confusion_*` | Protocol Confusion | Makes packets appear as DNS/HTTP/SSH/SMTP over TLS, plus a multi-layer variant |
+| `geneva_*` | Geneva Engine | Country-specific packet manipulation. Registered by default: `geneva_russia`, `geneva_china`, `geneva_iran`. Turkey rules exist in the engine but are not registered as a strategy. |
 | `antiprobe` | Anti-Probe | Server masquerades as normal website; reveals tunnel only to authenticated clients |
 | `state_exhaustion` | State Exhaustion | Floods DPI state table with decoys to trigger fail-open mode |
-| `mesh_relay` | Mesh Relay | Routes through relay nodes in regions with lighter filtering |
-| `icmp_tunnel` | ICMP Tunnel | Backup tunnel over ICMP Echo (stealth mode, requires CAP_NET_RAW) |
+| `mesh_relay` | Mesh Relay | Routes through relay nodes in regions with lighter filtering (opt-in, needs relay nodes configured) |
+| `icmp_tunnel` | ICMP Tunnel | Backup tunnel over ICMP Echo (opt-in: `-icmp-tunnel`, requires CAP_NET_RAW and a server started with `-enable-icmp`) |
 | `ssh_camouflage` | SSH Camouflage | Tunnel under SSH traffic (priority 28, requires server support) |
 | `imap_camouflage` | IMAP Camouflage | Tunnel under IMAP mail protocol (priority 29, requires server support) |
 

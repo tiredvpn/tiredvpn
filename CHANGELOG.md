@@ -7,6 +7,22 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-08-26
+
+### Fixed
+
+- **A client with a server list waited on its first server instead of moving to
+  the next one.** The pre-flight gate decides between dialling and sitting in a
+  wait loop, and it was only ever shown the pinned endpoint's own addresses. So
+  an unreachable first server was indistinguishable from a dead network, and the
+  client waited it out - seen on a live client with four servers configured,
+  four minutes in it had still not dialled the other three, all healthy. The
+  gate now sees every address in the pool, which restores the real meaning of
+  "no network": not one address answers. Steady state is unchanged - the probe
+  stops at the first address that answers, so a healthy endpoint still costs one
+  dial.
+
+
 ## [1.5.0] - 2026-08-26
 
 ### Changed

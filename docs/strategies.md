@@ -142,11 +142,12 @@ CRYPTO frames — it applies to the plain `quic` strategy, and when it is on
 `quic_salamander` is **not registered at all** (the two are alternatives, not
 layers).
 
-`-quic-port` sets the plain-QUIC port (default 8443). The Salamander port comes
-from `-quic-salamander-port` or, unset, from the port of `-server` / the first
-endpoint. With a multi-endpoint pool on mixed ports the client warns: the
-derived port is applied to whatever host the selector picks, so set it
-explicitly.
+`-quic-port` sets the plain-QUIC port (default 8443). The Salamander port has no
+flag or TOML key: it is always derived from the port of `-server`, then the
+first endpoint, then 443. With a multi-endpoint pool listening on mixed ports
+the client warns, and the warning names a `quic_salamander_port` setting that
+does not exist — the only fix today is to make the pool homogeneous on the port
+Salamander should use.
 
 ### HTTP/2 Steganography — `http2_stego`
 
@@ -181,10 +182,12 @@ the same framing.
 
 ### Geneva — `geneva_russia`, `geneva_china`, `geneva_iran`
 
-Applies country-specific packet manipulation (fragment, duplicate, reorder) from
-the [Geneva](https://geneva.cs.umd.edu) engine. On Linux with `CAP_NET_ADMIN` it
-injects through NFQUEUE; elsewhere it degrades to byte-level fragmentation of
-the TLS ClientHello.
+Fragments the TLS ClientHello at the TCP level before negotiation, using
+country-specific rule-sets from the [Geneva](https://geneva.cs.umd.edu) engine
+(3 rules for Russia, 3 for China, 2 for Iran). Application-layer fragmentation
+always runs. On Linux with `CAP_NET_ADMIN` an NFQUEUE injector starts on the
+first `Connect()` and adds kernel-level packet manipulation on top; without the
+capability it logs and skips that half.
 
 The engine also carries a `turkey` rule-set, but no ID registers it. Using it
 needs a code change to add `NewGenevaStrategy(m, secret, "turkey")`.
@@ -205,16 +208,18 @@ confusion parses.
 
 ### SSH Camouflage — `ssh_camouflage`
 
-Sends a real SSH banner and a synthetic KEXINIT, then wraps tunnel data in SSH
-binary packet framing with message type `0xFF`. The server authenticates with
-HMAC-SHA256 over a shared token and accepts timestamps inside a 300-second
-window.
+Sends an OpenSSH banner (`SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.5`) and a
+synthetic KEXINIT, then wraps tunnel data in SSH binary packet framing with
+message type `0xFF`. Authentication is a 32-byte
+`HMAC-SHA256(secret, "ssh-auth" || bucket)` where the bucket is
+`unix_time / 300`; the server accepts the current bucket and its two neighbours,
+so tolerated clock skew is up to ten minutes.
 
 ### IMAP Camouflage — `imap_camouflage`
 
 Plays a mailbox sync: Dovecot-style greeting, LOGIN, SELECT, then payload inside
-FETCH response bodies and APPEND literals. Same HMAC-SHA256 authentication as
-SSH camouflage.
+FETCH response bodies and APPEND literals. Same time-bucketed HMAC-SHA256
+scheme as SSH camouflage, under its own `"imap-auth"` context.
 
 ### State Table Exhaustion — `state_exhaustion`
 
@@ -349,7 +354,7 @@ tiredvpn client -server host:443 -secret <s> -benchmark
 # Same, machine-readable on stdout (logs go to stderr)
 tiredvpn client -server host:443 -secret <s> -benchmark-json
 
-# Latency + throughput + exit-IP check
+# Full run: HTTP reachability, latency, speed, exit-IP change
 tiredvpn client -server host:443 -secret <s> -benchmark-full
 
 # All strategies × all RTT profiles (78 combinations)
