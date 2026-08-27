@@ -491,12 +491,17 @@ number in a config file is a unit waiting to be guessed wrong. A
 
 Notes worth reading once:
 
-- **One secret for all servers.** The secret is fixed when a strategy is
-  constructed, so a per-server `secret` cannot take effect on a switch. Entries
-  that disagree - or disagree with `-secret` - are a startup error, not a
-  silent fallback to the wrong key. A single `secret` shared by every entry is
-  fine and is used as the client's secret. Setting it on some entries but not
-  others is also an error.
+- **`secret` is per server.** Each entry may carry its own; the key travels
+  with the dial, so switching server switches the key with it, along with
+  everything derived from it (the REALITY donor pool, the client identifier the
+  server looks you up by). Entries that disagree are normal, not an error.
+  `-secret` / `TIREDVPN_SECRET` is the default for entries that name none of
+  their own - the two no longer compete. A list where some entries carry a
+  secret, some do not, and no default is configured anywhere IS a startup
+  error: that config has no key for half its servers, and the likeliest cause
+  is a missed line. If every entry agrees on one `secret` and nothing else
+  named a default, that value becomes the client's, which is what lets the
+  config file be the only place a secret appears.
 - **`sni` is recorded but not applied yet**: the cover host is still
   process-wide (`-cover`). The client says so in the log rather than pretending.
 - **`policy` other than `priority`, and `health_check = "active"`, are not

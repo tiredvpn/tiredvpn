@@ -7,6 +7,25 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **A server pool may now give every server its own `secret`.** Until now a
+  `[[servers]]` list whose entries disagreed on `secret` was a startup error,
+  and the reason was an implementation detail rather than the protocol: the key
+  was copied into each strategy when the strategy was built, once, so it could
+  not follow an endpoint switch. The key is now resolved per candidate and
+  travels with the dial, along with everything derived from it - the REALITY
+  donor pool and the client identifier the server looks a client up by, both of
+  which would otherwise have arrived at the new server derived from the old
+  server's key. Pooling servers that belong to different accounts, or that were
+  provisioned separately, no longer requires making them share one credential.
+  `-secret` / `TIREDVPN_SECRET` becomes the default for entries that name none
+  of their own instead of competing with them, so the two can now be combined.
+  A single server with `-secret` and no list behaves exactly as before. What
+  stays an error is a list where some entries carry a secret, some do not, and
+  no default is configured anywhere: that configuration has no key for half its
+  servers.
+
 ## [1.7.1] - 2026-08-27
 
 ### Fixed

@@ -29,6 +29,18 @@ port = 443
 # address = "203.0.113.20"
 # port = 443
 # weight = 50
+#
+# Each entry may carry its own `secret`: the key is resolved per endpoint and
+# travels with the dial, so switching server switches the key with it. -secret /
+# TIREDVPN_SECRET is the default for entries that name none. Setting it on some
+# entries and not others, with no default configured anywhere, is a startup
+# error - that config has no key for half its servers.
+#
+# [[servers]]
+# name = "usa"
+# address = "203.0.113.30"
+# port = 443
+# secret = "the-key-this-server-knows-me-by"
 
 # --- Which server gets dialled, and when it is given up on ---
 # [selection]
