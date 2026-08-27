@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -379,5 +380,152 @@ func TestShortIDFollowsDialSecret(t *testing.T) {
 	}
 	if errors.Is(err, errB1NoAuthKey) {
 		t.Fatalf("failed for the wrong reason: %v", err)
+	}
+}
+
+// developerDonors is the global cover pool derivePool draws from.
+func developerDonors() []string {
+	out := make([]string, 0, 8)
+	for _, e := range evasion.WhitelistedSNIs {
+		if e.Category == "developer" {
+			out = append(out, e.SNI)
+		}
+	}
+	return out
+}
+
+// sniRecorder is a listener that reads the ClientHello off every connection it
+// accepts and remembers the cover domain it named, in arrival order. Each
+// connection is closed straight after, so the client's dial fails - which is
+// fine, the ClientHello is the whole subject here.
+type sniRecorder struct {
+	addr string
+	mu   sync.Mutex
+	seen []string
+}
+
+func newSNIRecorder(t *testing.T) *sniRecorder {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	rec := &sniRecorder{addr: ln.Addr().String()}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+			hello, _, err := peekClientHello(conn)
+			conn.Close()
+			switch {
+			case err != nil:
+				rec.record("read failed: " + err.Error())
+			default:
+				start, length, ok := walkSNIHostname(hello)
+				if !ok {
+					rec.record("no SNI in the ClientHello")
+					continue
+				}
+				rec.record(string(hello[start : start+length]))
+			}
+		}
+	}()
+	t.Cleanup(func() { _ = ln.Close(); <-done })
+	return rec
+}
+
+func (r *sniRecorder) record(s string) {
+	r.mu.Lock()
+	r.seen = append(r.seen, s)
+	r.mu.Unlock()
+}
+
+func (r *sniRecorder) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.seen)
+}
+
+func (r *sniRecorder) snapshot() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.seen)
+}
+
+// TestCoverDomainsOnTheWireFollowTheDialSecret is the call-site test for the
+// donor pool, and it deliberately reads the domains off a socket rather than
+// asking the strategy which pool it would use.
+//
+// The distinction is not academic. A test that calls donorsFor directly stays
+// green when the CALLER hands it the wrong secret - and the caller is exactly
+// where this can go wrong, twice over: connect chooses the destination, and
+// selectDestination resolves the pool. Either one reverting to the strategy's
+// construction-time secret would put one user's donor sequence on the wire while
+// authenticating as another, which is the linkage derivePool exists to break.
+//
+// The cooldown rotator walks its pool in order, so the sequence of cover domains
+// across successive dials IS the derived pool. That makes the assertion exact
+// rather than statistical.
+func TestCoverDomainsOnTheWireFollowTheDialSecret(t *testing.T) {
+	const (
+		builtIn = "the-secret-the-strategy-was-built-with"
+		dialing = "the-secret-of-the-endpoint-being-dialled"
+	)
+	donors := developerDonors()
+	if len(donors) < 2 {
+		t.Skipf("cover pool has %d entries, nothing to order", len(donors))
+	}
+	wantBuiltIn := derivePool(donors, []byte(builtIn), len(donors))
+	wantDialing := derivePool(donors, []byte(dialing), len(donors))
+	if slices.Equal(wantBuiltIn, wantDialing) {
+		t.Fatal("the two secrets derive the same ordering; this test could not tell them apart")
+	}
+
+	rec := newSNIRecorder(t)
+
+	m := NewManager()
+	m.setDefaultSecret([]byte(builtIn))
+	if err := m.SetEndpointsTuned([]endpoint.Endpoint{
+		{Name: "peer", V4: rec.addr, Order: 0, Secret: dialing},
+	}, endpoint.Tuning{Family: v4Only()}); err != nil {
+		t.Fatalf("SetEndpointsTuned: %v", err)
+	}
+
+	r := NewREALITYStrategy(m, []byte(builtIn))
+	// The real gate spaces handshakes to one donor by a quarter of a second;
+	// these dials go to loopback and there is nothing to space out.
+	r.gate = newHandshakeGateWith(2, 0, 0)
+	m.Register(r)
+
+	// One Connect makes more than one dial (the manager retries), so this loops
+	// on the count of ClientHellos seen rather than on a dial count.
+	for attempt := 0; rec.count() < len(wantDialing) && attempt < 4*len(wantDialing); attempt++ {
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		conn, _, err := m.Connect(ctx, rec.addr)
+		cancel()
+		if err == nil {
+			conn.Close()
+			t.Fatal("the recording listener answered a handshake it cannot complete")
+		}
+	}
+
+	got := rec.snapshot()
+	if len(got) < len(wantDialing) {
+		t.Fatalf("only %d ClientHellos reached the listener, want %d", len(got), len(wantDialing))
+	}
+	got = got[:len(wantDialing)]
+	if !slices.Equal(got, wantDialing) {
+		if slices.Equal(got, wantBuiltIn) {
+			t.Fatalf("the cover domains on the wire are the CONSTRUCTION secret's pool (%v): "+
+				"the dial secret is not reaching the donor selection", got)
+		}
+		t.Fatalf("cover domains = %v, want the dial secret's pool %v", got, wantDialing)
 	}
 }
