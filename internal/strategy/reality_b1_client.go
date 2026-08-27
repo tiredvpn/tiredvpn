@@ -55,7 +55,7 @@ var errB1NoAuthKey = errors.New("reality b1: certificate check ran before the au
 //     to be derived before the handshake starts.
 //   - The binding record is the first application data, so it goes after the
 //     handshake and before smux.
-func (r *REALITYStrategy) connectB1(ctx context.Context, tcpConn net.Conn, dest string, deadline time.Time) (net.Conn, error) {
+func (r *REALITYStrategy) connectB1(ctx context.Context, tcpConn net.Conn, dest string, deadline time.Time, secret []byte) (net.Conn, error) {
 	host, _, err := net.SplitHostPort(dest)
 	if err != nil {
 		host = dest
@@ -95,7 +95,7 @@ func (r *REALITYStrategy) connectB1(ctx context.Context, tcpConn net.Conn, dest 
 		return nil, fmt.Errorf("reality b1: build client: %w", err)
 	}
 
-	authKey, err = r.sealSessionID(uconn)
+	authKey, err = r.sealSessionID(uconn, secret)
 	if err != nil {
 		return nil, err
 	}
@@ -127,7 +127,7 @@ func (r *REALITYStrategy) connectB1(ctx context.Context, tcpConn net.Conn, dest 
 	// proof_c and the dispatch byte travel together inside one encrypted record.
 	// The dispatch byte used to go out on its own, unencrypted, in its own TCP
 	// segment — signature #1 from the improvement plan.
-	if err := customtls.WriteClientBinding(uconn, r.secret, ekm, protocol.TypeMux); err != nil {
+	if err := customtls.WriteClientBinding(uconn, secret, ekm, protocol.TypeMux); err != nil {
 		return nil, fmt.Errorf("reality b1: client binding: %w", err)
 	}
 
@@ -183,7 +183,7 @@ func (r *REALITYStrategy) connectB1(ctx context.Context, tcpConn net.Conn, dest 
 // against. It does — GREASE ECH caches its payload under a sync.Once, which is
 // what makes this safe for the Firefox profile — and the length check below is
 // the cheap runtime guard against that ceasing to be true.
-func (r *REALITYStrategy) sealSessionID(uconn *utls.UConn) ([]byte, error) {
+func (r *REALITYStrategy) sealSessionID(uconn *utls.UConn, secret []byte) ([]byte, error) {
 	if err := uconn.BuildHandshakeState(); err != nil {
 		return nil, fmt.Errorf("reality b1: build handshake state: %w", err)
 	}
@@ -210,7 +210,7 @@ func (r *REALITYStrategy) sealSessionID(uconn *utls.UConn) ([]byte, error) {
 		// and nothing to coordinate with the server's rollout.
 		Flags:   customtls.AuthFlagExporterBinding | customtls.AuthFlagReshapeCapable,
 		Time:    uint32(r.clockOffset.Now().Unix()),
-		ShortID: customtls.ShortIDFor(r.secret),
+		ShortID: customtls.ShortIDFor(secret),
 	}
 
 	sid, err := customtls.SealSessionID(eph, r.serverStaticPub, aad, hello.Random, payload)

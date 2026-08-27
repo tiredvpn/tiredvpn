@@ -390,7 +390,7 @@ func TestWrapDataLayerVersionChoice(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		conn, err := r.wrapDataLayer(writeOnlyConn{Writer: io.Discard}, ext, priv, pub, salt)
+		conn, err := r.wrapDataLayer(writeOnlyConn{Writer: io.Discard}, ext, priv, pub, salt, r.secret)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -405,7 +405,7 @@ func TestWrapDataLayerVersionChoice(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		conn, err := r.wrapDataLayer(writeOnlyConn{Writer: io.Discard}, ext, priv, pub, salt)
+		conn, err := r.wrapDataLayer(writeOnlyConn{Writer: io.Discard}, ext, priv, pub, salt, r.secret)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -421,7 +421,7 @@ func TestWrapDataLayerVersionChoice(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := r.wrapDataLayer(writeOnlyConn{Writer: io.Discard}, ext, priv, pub, salt); err == nil {
+		if _, err := r.wrapDataLayer(writeOnlyConn{Writer: io.Discard}, ext, priv, pub, salt, r.secret); err == nil {
 			t.Fatal("fell back to v1 despite requireDataV2")
 		}
 	})

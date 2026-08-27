@@ -58,7 +58,7 @@ func dialB1Recorded(t *testing.T, profile string, srv *b1TestServer, tune func(*
 	r := b1Client(t, srv)
 	r.SetFingerprint(profile)
 
-	conn, err := r.connectB1(t.Context(), rec, "github.com:443", deadline)
+	conn, err := r.connectB1(t.Context(), rec, "github.com:443", deadline, r.secret)
 	if err != nil {
 		t.Fatalf("connectB1 with %s: %v", profile, err)
 	}
@@ -354,7 +354,7 @@ func TestB1ServerMustNotSelectP256(t *testing.T) {
 
 	r := b1Client(t, srv)
 	r.SetFingerprint("firefox")
-	_, err = r.connectB1(t.Context(), tcpConn, "github.com:443", deadline)
+	_, err = r.connectB1(t.Context(), tcpConn, "github.com:443", deadline, r.secret)
 	tcpConn.Close()
 	<-srvDone
 

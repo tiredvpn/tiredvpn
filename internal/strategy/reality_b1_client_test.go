@@ -255,7 +255,7 @@ func dialB1(t *testing.T, r *REALITYStrategy, srv *b1TestServer) (net.Conn, erro
 	deadline := time.Now().Add(10 * time.Second)
 	_ = tcpConn.SetDeadline(deadline)
 
-	conn, err := r.connectB1(t.Context(), tcpConn, "github.com:443", deadline)
+	conn, err := r.connectB1(t.Context(), tcpConn, "github.com:443", deadline, r.secret)
 	if err != nil {
 		tcpConn.Close()
 		<-srvDone
@@ -409,7 +409,7 @@ func TestB1ClientSendsNothingInTheClear(t *testing.T) {
 	deadline := time.Now().Add(10 * time.Second)
 	_ = tcpConn.SetDeadline(deadline)
 
-	conn, err := b1Client(t, srv).connectB1(t.Context(), rec, "github.com:443", deadline)
+	conn, err := b1Client(t, srv).connectB1(t.Context(), rec, "github.com:443", deadline, srv.secret)
 	if err != nil {
 		t.Fatalf("connectB1: %v", err)
 	}
@@ -497,7 +497,7 @@ func TestB1ClientStillSendsRenegotiationInfo(t *testing.T) {
 			r := b1Client(t, srv)
 			r.SetFingerprint(profile)
 
-			conn, err := r.connectB1(t.Context(), rec, "github.com:443", deadline)
+			conn, err := r.connectB1(t.Context(), rec, "github.com:443", deadline, r.secret)
 			if err != nil {
 				t.Fatalf("connectB1 with %s: %v", profile, err)
 			}
@@ -578,7 +578,7 @@ func BenchmarkB1ClientThroughput(b *testing.B) {
 
 	r := NewREALITYStrategy(nil, srv.secret)
 	r.SetB1(srv.publicKey())
-	conn, err := r.connectB1(b.Context(), tcpConn, "github.com:443", deadline)
+	conn, err := r.connectB1(b.Context(), tcpConn, "github.com:443", deadline, r.secret)
 	if err != nil {
 		b.Fatalf("connectB1: %v", err)
 	}

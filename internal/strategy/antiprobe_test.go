@@ -12,7 +12,7 @@ func TestKnockSequenceGeneration(t *testing.T) {
 	secret := []byte("test-secret-key")
 	strat := NewAntiProbeStrategy(NewManager(), secret)
 
-	seq := strat.generateKnockSequence()
+	seq := generateKnockSequence(strat.knockSecret)
 
 	// Should have 5 delays and 5 sizes
 	if len(seq.Delays) != 5 {
@@ -43,10 +43,10 @@ func TestKnockSequenceDeterministic(t *testing.T) {
 	secret := []byte("deterministic-secret")
 
 	strat1 := NewAntiProbeStrategy(NewManager(), secret)
-	seq1 := strat1.generateKnockSequence()
+	seq1 := generateKnockSequence(strat1.knockSecret)
 
 	strat2 := NewAntiProbeStrategy(NewManager(), secret)
-	seq2 := strat2.generateKnockSequence()
+	seq2 := generateKnockSequence(strat2.knockSecret)
 
 	// Should produce identical sequences
 	if len(seq1.Delays) != len(seq2.Delays) {
@@ -69,10 +69,10 @@ func TestKnockSequenceDifferentSecrets(t *testing.T) {
 	secret2 := []byte("secret-two")
 
 	strat1 := NewAntiProbeStrategy(NewManager(), secret1)
-	seq1 := strat1.generateKnockSequence()
+	seq1 := generateKnockSequence(strat1.knockSecret)
 
 	strat2 := NewAntiProbeStrategy(NewManager(), secret2)
-	seq2 := strat2.generateKnockSequence()
+	seq2 := generateKnockSequence(strat2.knockSecret)
 
 	// Should produce different sequences
 	identical := true
@@ -130,11 +130,11 @@ func TestPacketDataFilling(t *testing.T) {
 
 	// Generate packet data for sequence 0
 	packet1 := make([]byte, 50)
-	strat.fillPacketData(packet1, 0)
+	fillPacketData(packet1, 0, strat.knockSecret)
 
 	// Generate same packet again
 	packet2 := make([]byte, 50)
-	strat.fillPacketData(packet2, 0)
+	fillPacketData(packet2, 0, strat.knockSecret)
 
 	// Should be identical (deterministic)
 	for i := range packet1 {
@@ -146,7 +146,7 @@ func TestPacketDataFilling(t *testing.T) {
 
 	// Different sequence should produce different data
 	packet3 := make([]byte, 50)
-	strat.fillPacketData(packet3, 1)
+	fillPacketData(packet3, 1, strat.knockSecret)
 
 	identical := true
 	for i := range packet1 {
@@ -168,7 +168,7 @@ func TestKnockSequenceVariability(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		secret := []byte{byte(i), byte(i * 2), byte(i * 3)}
 		strat := NewAntiProbeStrategy(NewManager(), secret)
-		sequences[i] = strat.generateKnockSequence()
+		sequences[i] = generateKnockSequence(strat.knockSecret)
 	}
 
 	// Check that we have variability in delays
@@ -201,7 +201,7 @@ func TestKnockSequenceVariability(t *testing.T) {
 func TestKnockSequenceTiming(t *testing.T) {
 	secret := []byte("timing-test")
 	strat := NewAntiProbeStrategy(NewManager(), secret)
-	seq := strat.generateKnockSequence()
+	seq := generateKnockSequence(strat.knockSecret)
 
 	// Calculate total time for knock sequence
 	totalTime := time.Duration(0)
@@ -222,7 +222,7 @@ func TestKnockSequenceTiming(t *testing.T) {
 func TestKnockPacketSizes(t *testing.T) {
 	secret := []byte("size-test")
 	strat := NewAntiProbeStrategy(NewManager(), secret)
-	seq := strat.generateKnockSequence()
+	seq := generateKnockSequence(strat.knockSecret)
 
 	// Calculate total bytes sent
 	totalBytes := 0
@@ -254,7 +254,7 @@ func TestHMACBasedGeneration(t *testing.T) {
 
 	// Verify hash is used for generation
 	strat := NewAntiProbeStrategy(NewManager(), secret)
-	seq := strat.generateKnockSequence()
+	seq := generateKnockSequence(strat.knockSecret)
 
 	// First delay should be derived from first byte of hash
 	expectedDelay := time.Duration(50+int(expectedHash[0])%150) * time.Millisecond
@@ -303,7 +303,7 @@ func TestKnockSequenceHashDistribution(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		secret := []byte{byte(i), byte(i >> 8), byte(i >> 16)}
 		strat := NewAntiProbeStrategy(NewManager(), secret)
-		seq := strat.generateKnockSequence()
+		seq := generateKnockSequence(strat.knockSecret)
 
 		for _, delay := range seq.Delays {
 			ms := int(delay.Milliseconds())

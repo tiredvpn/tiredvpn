@@ -27,7 +27,11 @@ import (
 // REALITYStrategy implements the REALITY protocol (Xray-like)
 // Server impersonates legitimate websites (yandex.ru, microsoft.com) without their private keys
 type REALITYStrategy struct {
-	manager    *Manager // IPv6/IPv4 transport layer support
+	manager *Manager // IPv6/IPv4 transport layer support
+
+	// secret is the fallback key: what the strategy was constructed with, used
+	// when the dial's context names none (single-server clients, tests). The key
+	// actually in force comes from dialSecret(ctx, r.secret) - see secret.go.
 	secret     []byte
 	sniRotator *evasion.SNIRotator
 
@@ -35,6 +39,15 @@ type REALITYStrategy struct {
 	destPool    []string // the derived donor pool, in rotator order
 	recentDests map[string]time.Time
 	destMu      sync.RWMutex
+
+	// donors caches the donor pool derived for a secret other than r.secret,
+	// keyed by that secret. The pool is a function of the key (see derivePool),
+	// so a client walking endpoints with different keys must not carry one
+	// endpoint's donor set onto another - that set is exactly the thing
+	// derivePool exists to keep per-user. Deriving costs an HKDF plus a sort, so
+	// it is done once per secret rather than once per dial.
+	donors   map[string]*donorSet
+	donorsMu sync.Mutex
 
 	// requireDataV2 refuses to fall back to the v1 data layer when the server
 	// does not confirm v2. Off by default because during the rollout (exits →
@@ -126,9 +139,52 @@ func NewREALITYStrategy(manager *Manager, secret []byte) *REALITYStrategy {
 		sniRotator:  sniRotator,
 		destPool:    subPool,
 		recentDests: make(map[string]time.Time),
+		donors:      make(map[string]*donorSet),
 		fingerprint: customtls.DefaultFingerprintName,
 		gate:        newHandshakeGate(),
 	}
+}
+
+// donorSet is the cover-domain pool derived from one secret, together with the
+// rotator that walks it. One per secret: the rotator carries the position in the
+// cycle, and sharing that across two different pools would defeat the cooldown.
+type donorSet struct {
+	pool    []string
+	rotator *evasion.SNIRotator
+}
+
+// donorsFor returns the donor pool and rotator belonging to secret.
+//
+// The set built at construction answers for the constructor's own secret and
+// for a dial that named none, which is every single-server client. Any other
+// secret gets its own set, derived on first use and kept.
+func (r *REALITYStrategy) donorsFor(secret []byte) ([]string, *evasion.SNIRotator) {
+	if len(secret) == 0 || string(secret) == string(r.secret) {
+		return r.destPool, r.sniRotator
+	}
+
+	r.donorsMu.Lock()
+	defer r.donorsMu.Unlock()
+	if d, ok := r.donors[string(secret)]; ok {
+		return d.pool, d.rotator
+	}
+
+	developerPool := make([]string, 0, 8)
+	for _, entry := range evasion.WhitelistedSNIs {
+		if entry.Category == "developer" {
+			developerPool = append(developerPool, entry.SNI)
+		}
+	}
+	pool := derivePool(developerPool, secret, len(developerPool))
+	if len(pool) == 0 {
+		pool = getRussianSNIsStatic()
+	}
+	d := &donorSet{pool: pool, rotator: evasion.NewSNIRotatorWithPool(pool, evasion.StrategyCooldown)}
+	if r.donors == nil {
+		r.donors = make(map[string]*donorSet)
+	}
+	r.donors[string(secret)] = d
+	return d.pool, d.rotator
 }
 
 // SetB1 enables the B1 transport with the server's static X25519 public key.
@@ -321,7 +377,14 @@ func (r *REALITYStrategy) connect(ctx context.Context, target string, wrapFirstF
 	serverAddr := r.manager.GetServerAddr(ctx)
 	log.Debug("REALITY: Connecting to %s via %s", target, serverAddr)
 
-	dest, err := r.selectDestination()
+	// Resolved once, here, and passed down by hand. Everything below that touches
+	// the key - the donor pool, the ClientHello extension, the ServerHello check,
+	// the data layer, the B1 session_id - has to agree on it, and re-reading the
+	// context in each of them would let a mid-handshake endpoint switch split the
+	// handshake across two keys.
+	secret := dialSecret(ctx, r.secret)
+
+	dest, err := r.selectDestination(secret)
 	if err != nil {
 		return nil, fmt.Errorf("reality: destination selection failed: %w", err)
 	}
@@ -426,7 +489,7 @@ func (r *REALITYStrategy) connect(ctx context.Context, target string, wrapFirstF
 	// the first flight, and the first flight is now a genuine ClientHello whose
 	// bytes are authenticated by session_id.
 	if r.b1Enabled && wrapFirstFlight == nil {
-		conn, err := r.connectB1(ctx, tcpConn, dest, deadline)
+		conn, err := r.connectB1(ctx, tcpConn, dest, deadline, secret)
 		if err != nil {
 			tcpConn.Close()
 			return nil, err
@@ -435,7 +498,7 @@ func (r *REALITYStrategy) connect(ctx context.Context, target string, wrapFirstF
 		return conn, nil
 	}
 
-	clientHello, err := r.buildClientHello(dest, clientPrivKey, clientSalt)
+	clientHello, err := r.buildClientHello(dest, clientPrivKey, clientSalt, secret)
 	if err != nil {
 		tcpConn.Close()
 		return nil, fmt.Errorf("reality: clienthello build failed: %w", err)
@@ -512,7 +575,7 @@ func (r *REALITYStrategy) connect(ctx context.Context, target string, wrapFirstF
 		return nil, errHelloRetryRequest
 	}
 
-	serverExt, err := r.validateServerHello(serverHello, clientPubKey)
+	serverExt, err := r.validateServerHello(serverHello, clientPubKey, secret)
 	if err != nil {
 		tcpConn.Close()
 		return nil, fmt.Errorf("reality: validation failed: %w", err)
@@ -527,7 +590,7 @@ func (r *REALITYStrategy) connect(ctx context.Context, target string, wrapFirstF
 	// Wrap TCP in an encrypted TLS-record framing layer so TSPU sees a normal
 	// TLS Application Data stream instead of raw smux bytes. Without this, TSPU
 	// throttles the connection after ~600 bytes.
-	dataConn, err := r.wrapDataLayer(tcpConn, serverExt, clientPrivKey, clientPubKey, clientSalt)
+	dataConn, err := r.wrapDataLayer(tcpConn, serverExt, clientPrivKey, clientPubKey, clientSalt, secret)
 	if err != nil {
 		tcpConn.Close()
 		return nil, fmt.Errorf("reality: data conn init: %w", err)
@@ -560,7 +623,11 @@ func (r *REALITYStrategy) connect(ctx context.Context, target string, wrapFirstF
 }
 
 // selectDestination chooses a legitimate destination from the SNI whitelist
-func (r *REALITYStrategy) selectDestination() (string, error) {
+// derived for secret. Two endpoints with different secrets therefore hide behind
+// different donor domains, which is the point of derivePool.
+func (r *REALITYStrategy) selectDestination(secret []byte) (string, error) {
+	pool, rotator := r.donorsFor(secret)
+
 	r.destMu.Lock()
 	defer r.destMu.Unlock()
 
@@ -578,7 +645,7 @@ func (r *REALITYStrategy) selectDestination() (string, error) {
 	// Try up to 10 times to find a non-recent destination
 	for attempt := 0; attempt < 10; attempt++ {
 		// Use SNI rotator over the derived subpool
-		sni := r.sniRotator.Next()
+		sni := rotator.Next()
 
 		// Check cooldown (30 seconds)
 		if lastUse, used := r.recentDests[sni]; used {
@@ -605,15 +672,14 @@ func (r *REALITYStrategy) selectDestination() (string, error) {
 	// a four-domain donor pool and a fresh handshake per CONNECT arrives fast —
 	// every dial past the first few piled onto yandex.ru. That is precisely the
 	// burst pattern the per-SNI freeze looks for, manufactured by us.
-	sni := r.leastRecentlyUsedDestLocked()
+	sni := r.leastRecentlyUsedDestLocked(pool)
 	r.recentDests[sni] = time.Now()
 	return net.JoinHostPort(sni, "443"), nil
 }
 
 // leastRecentlyUsedDestLocked returns the donor SNI whose last use is furthest
 // in the past. Callers must hold destMu.
-func (r *REALITYStrategy) leastRecentlyUsedDestLocked() string {
-	pool := r.destPool
+func (r *REALITYStrategy) leastRecentlyUsedDestLocked(pool []string) string {
 	if len(pool) == 0 {
 		pool = getRussianSNIsStatic()
 	}
@@ -743,7 +809,7 @@ func (r *REALITYStrategy) getIranianSNIs() []string {
 //
 // clientPrivKey and clientSalt are this connection's ephemeral material; both
 // end up inside the 256-byte padding block, whose size on the wire is unchanged.
-func (r *REALITYStrategy) buildClientHello(dest string, clientPrivKey, clientSalt [32]byte) ([]byte, error) {
+func (r *REALITYStrategy) buildClientHello(dest string, clientPrivKey, clientSalt [32]byte, secret []byte) ([]byte, error) {
 	log.Info("REALITY-BUILD: Starting buildClientHello for %s", dest)
 
 	// Extract hostname from dest
@@ -772,7 +838,7 @@ func (r *REALITYStrategy) buildClientHello(dest string, clientPrivKey, clientSal
 		fp.Name, len(clientHello), int(clientHello[3])<<8|int(clientHello[4]))
 
 	// Create REALITY extension (with the v2 data-layer signal appended)
-	realityExt, err := customtls.NewClientREALITYExtensionDataV2(r.secret, clientPrivKey, clientSalt)
+	realityExt, err := customtls.NewClientREALITYExtensionDataV2(secret, clientPrivKey, clientSalt)
 	if err != nil {
 		log.Error("REALITY-BUILD: extension creation failed: %v", err)
 		return nil, fmt.Errorf("reality extension creation failed: %w", err)
@@ -839,7 +905,7 @@ func (r *REALITYStrategy) readServerHello(conn net.Conn, timeout time.Duration) 
 
 // validateServerHello validates the server's response and returns the extension
 // it found. Looks for REALITY data in padding extension (0x0015).
-func (r *REALITYStrategy) validateServerHello(serverHello []byte, clientPubKey [32]byte) (*customtls.REALITYExtension, error) {
+func (r *REALITYStrategy) validateServerHello(serverHello []byte, clientPubKey [32]byte, secret []byte) (*customtls.REALITYExtension, error) {
 	// Search for REALITY in padding extension (0x0015)
 	var serverExt *customtls.REALITYExtension
 
@@ -862,7 +928,7 @@ func (r *REALITYStrategy) validateServerHello(serverHello []byte, clientPubKey [
 			// Extract REALITY extension from start of padding (no magic check).
 			paddingData := serverHello[extDataStart : extDataStart+extLen]
 			ext, err := customtls.ExtractREALITYFromPadding(paddingData)
-			if err == nil && customtls.VerifyServerAuth(r.secret, clientPubKey[:], ext.AuthToken) {
+			if err == nil && customtls.VerifyServerAuth(secret, clientPubKey[:], ext.AuthToken) {
 				serverExt = ext
 				break
 			}
@@ -888,14 +954,14 @@ func (r *REALITYStrategy) validateServerHello(serverHello []byte, clientPubKey [
 //
 // Even the fallback is safe from the v1 keystream reuse this change is about:
 // the key there is derived from clientPubKey, which is now fresh per connection.
-func (r *REALITYStrategy) wrapDataLayer(tcpConn net.Conn, serverExt *customtls.REALITYExtension, clientPrivKey, clientPubKey, clientSalt [32]byte) (net.Conn, error) {
-	serverSalt, ok := customtls.ParseServerDataV2(r.secret, clientPubKey, serverExt.PubKey, clientSalt, serverExt.Extra)
+func (r *REALITYStrategy) wrapDataLayer(tcpConn net.Conn, serverExt *customtls.REALITYExtension, clientPrivKey, clientPubKey, clientSalt [32]byte, secret []byte) (net.Conn, error) {
+	serverSalt, ok := customtls.ParseServerDataV2(secret, clientPubKey, serverExt.PubKey, clientSalt, serverExt.Extra)
 	if !ok {
 		if r.requireDataV2 {
 			return nil, errors.New("server did not confirm data layer v2")
 		}
 		log.Info("REALITY: server on legacy data layer v1, falling back")
-		return NewRealityDataConn(tcpConn, r.secret, clientPubKey[:], true)
+		return NewRealityDataConn(tcpConn, secret, clientPubKey[:], true)
 	}
 
 	ecdh, err := RealityV2ECDH(clientPrivKey, serverExt.PubKey)
@@ -905,7 +971,7 @@ func (r *REALITYStrategy) wrapDataLayer(tcpConn net.Conn, serverExt *customtls.R
 
 	log.Debug("REALITY: data layer v2 negotiated")
 	return NewRealityDataConnV2(tcpConn, RealityV2Params{
-		SharedSecret: r.secret,
+		SharedSecret: secret,
 		ECDH:         ecdh,
 		ClientPub:    clientPubKey,
 		ServerPub:    serverExt.PubKey,

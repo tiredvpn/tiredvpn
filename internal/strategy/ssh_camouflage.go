@@ -81,6 +81,7 @@ func (s *SSHCamouflageStrategy) Probe(ctx context.Context, target string) error 
 // Connect dials the server over plain TCP and performs the fake SSH handshake.
 func (s *SSHCamouflageStrategy) Connect(ctx context.Context, target string) (net.Conn, error) {
 	serverAddr := s.manager.GetServerAddr(ctx)
+	secret := dialSecret(ctx, s.secret)
 	log.Debug("SSH Camouflage: connecting to %s (raw TCP, fake SSH handshake)", serverAddr)
 
 	dialer := &net.Dialer{}
@@ -89,7 +90,7 @@ func (s *SSHCamouflageStrategy) Connect(ctx context.Context, target string) (net
 		return nil, err
 	}
 
-	if err := performSSHClientHandshake(conn, s.secret); err != nil {
+	if err := performSSHClientHandshake(conn, secret); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("ssh camouflage handshake: %w", err)
 	}

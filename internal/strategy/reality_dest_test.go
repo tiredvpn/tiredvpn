@@ -24,7 +24,7 @@ func TestSelectDestinationSpreadsUnderLoad(t *testing.T) {
 	const dials = 40
 	counts := make(map[string]int, len(pool))
 	for range dials {
-		dest, err := r.selectDestination()
+		dest, err := r.selectDestination(r.secret)
 		if err != nil {
 			t.Fatalf("selectDestination: %v", err)
 		}
@@ -59,7 +59,7 @@ func TestLeastRecentlyUsedDestPrefersUnusedThenOldest(t *testing.T) {
 
 	// Nothing used yet: the first entry is as good as any, but it must come
 	// from the pool.
-	if got := r.leastRecentlyUsedDestLocked(); got != "a.example" {
+	if got := r.leastRecentlyUsedDestLocked(r.destPool); got != "a.example" {
 		t.Fatalf("empty history returned %q", got)
 	}
 
@@ -67,12 +67,12 @@ func TestLeastRecentlyUsedDestPrefersUnusedThenOldest(t *testing.T) {
 	r.recentDests["a.example"] = now
 	r.recentDests["b.example"] = now.Add(-time.Minute)
 	// c.example never used — must win over both.
-	if got := r.leastRecentlyUsedDestLocked(); got != "c.example" {
+	if got := r.leastRecentlyUsedDestLocked(r.destPool); got != "c.example" {
 		t.Fatalf("unused donor not preferred, got %q", got)
 	}
 
 	r.recentDests["c.example"] = now.Add(-time.Second)
-	if got := r.leastRecentlyUsedDestLocked(); got != "b.example" {
+	if got := r.leastRecentlyUsedDestLocked(r.destPool); got != "b.example" {
 		t.Fatalf("oldest donor not chosen, got %q", got)
 	}
 }

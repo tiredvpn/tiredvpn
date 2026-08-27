@@ -266,12 +266,12 @@ func listStrategies(cfg *Config) error {
 	return nil
 }
 
-// resolveSecret returns the effective secret: from cfg, env, or insecure default.
+// resolveSecret returns the effective default secret: from cfg, env, or the
+// insecure placeholder. It is the key for every endpoint that does not carry one
+// of its own; endpoints that do are authenticated with theirs (see
+// reconcileSecrets and internal/strategy/secret.go).
 func resolveSecret(cfg *Config) string {
-	s := cfg.Secret
-	if s == "" {
-		s = os.Getenv("TIREDVPN_SECRET")
-	}
+	s := defaultSecret(cfg)
 	if s == "" {
 		log.Warn("No secret provided - using default (INSECURE!)")
 		s = "default-secret-change-me"

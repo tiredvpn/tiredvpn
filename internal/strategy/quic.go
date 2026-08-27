@@ -167,6 +167,7 @@ func (s *QUICStrategy) buildProbePacket() []byte {
 func (s *QUICStrategy) Connect(ctx context.Context, target string) (net.Conn, error) {
 	// Get server address (IPv6/IPv4 with automatic fallback)
 	addr := s.manager.GetServerAddr(ctx)
+	secret := dialSecret(ctx, s.secret)
 
 	// Use Salamander port if enabled
 	if s.useSalamander {
@@ -234,7 +235,7 @@ func (s *QUICStrategy) Connect(ctx context.Context, target string) (net.Conn, er
 		}
 
 		// Wrap with Salamander
-		padder := padding.NewSalamanderPadder(s.secret, padding.Balanced)
+		padder := padding.NewSalamanderPadder(secret, padding.Balanced)
 		salamanderConn := padding.NewSalamanderPacketConn(udpConn, padder)
 
 		// Parse server address (use generic "udp" to support both IPv4/IPv6)
@@ -351,7 +352,7 @@ func (s *QUICStrategy) Connect(ctx context.Context, target string) (net.Conn, er
 	quicConn := &QUICConn{
 		Conn:   conn,
 		stream: stream,
-		secret: s.secret,
+		secret: secret,
 	}
 
 	if err := quicConn.Handshake(); err != nil {

@@ -2,6 +2,7 @@ package client
 
 import (
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/endpoint"
@@ -93,13 +94,26 @@ func ResolveEndpoints(cfg *Config) ([]endpoint.Endpoint, error) {
 	return eps, nil
 }
 
-// reconcileSecrets enforces the one-secret rule.
+// reconcileSecrets validates the secrets across the server list and settles what
+// the client's default secret is.
 //
-// A strategy bakes the secret in when it is constructed, so a per-endpoint
-// secret cannot take effect on a switch. Rather than accept the field and
-// quietly authenticate with the wrong key, a mismatch is an error. A single
-// secret shared by every entry is fine and is adopted as the client's secret
-// when no -secret was given, so the field is not decoration either.
+// Different secrets on different servers are legal: the secret in force is a
+// property of the endpoint being dialled and travels with the dial (see
+// internal/strategy/secret.go). -secret / TIREDVPN_SECRET is the default for
+// entries that name none of their own, which is why the two no longer conflict.
+//
+// What stays an error is a list where some entries carry a secret, some do not,
+// and there is no default for the ones that do not: that config has no answer
+// for half its servers, and the likeliest cause is a missed line rather than an
+// intent. With a default present the same shape is a deliberate "these two
+// servers are special", so it is accepted.
+//
+// The one write-back: when nothing else named a default, the first entry's
+// secret becomes it. That is what lets a config file be the only place a secret
+// appears, and it also keeps resolveSecret's "no secret - using the insecure
+// default" warning off a list where every entry does have one. No dial can reach
+// the adopted value, because a default is only consulted for an endpoint without
+// a secret and by then there are none.
 func reconcileSecrets(cfg *Config, specs []ServerSpec) error {
 	var withSecret, without []string
 	common := ""
@@ -112,28 +126,33 @@ func reconcileSecrets(cfg *Config, specs []ServerSpec) error {
 		withSecret = append(withSecret, name)
 		if common == "" {
 			common = s.Secret
-			continue
-		}
-		if s.Secret != common {
-			return fmt.Errorf("servers %s and %s configure different secrets: "+
-				"one secret for all servers in this version (the secret is fixed when a strategy is built)",
-				withSecret[0], name)
 		}
 	}
 	if common == "" {
 		return nil
 	}
-	if len(without) > 0 {
-		return fmt.Errorf("server %s sets a secret but %s does not: "+
-			"set it on every entry or on none (a per-server secret is not supported in this version)",
-			withSecret[0], without[0])
+
+	if defaultSecret(cfg) != "" {
+		return nil
 	}
-	if cfg.Secret != "" && cfg.Secret != common {
-		return fmt.Errorf("the configured server secret differs from -secret / TIREDVPN_SECRET: " +
-			"remove one of the two rather than guessing which server the other belongs to")
+	if len(without) > 0 {
+		return fmt.Errorf("server %s sets a secret but %s does not, and no default is configured: "+
+			"give every entry a secret, or set -secret / TIREDVPN_SECRET for the ones that have none",
+			withSecret[0], without[0])
 	}
 	cfg.Secret = common
 	return nil
+}
+
+// defaultSecret is the secret for endpoints that name none: the flag, then the
+// environment. Deliberately without resolveSecret's insecure placeholder - this
+// answers "did the operator configure a default", and the placeholder is what
+// happens when the answer is no.
+func defaultSecret(cfg *Config) string {
+	if cfg.Secret != "" {
+		return cfg.Secret
+	}
+	return os.Getenv("TIREDVPN_SECRET")
 }
 
 func specName(i int, name string) string {

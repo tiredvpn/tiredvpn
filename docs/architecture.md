@@ -116,7 +116,9 @@ candidates.
 ```
 
 Falling back from IPv6 to IPv4 within one server is tried before moving to
-another server: same secret, same bypass route, same latency profile. Candidate
+another server: same key, same bypass route, same latency profile. Moving to
+another server may change the key - each endpoint can carry its own `secret`,
+which is resolved per candidate and travels with the dial. Candidate
 order comes from `[selection]` — `priority` (as written), `latency` (measured
 EWMA, ranking endpoints rather than families so a slow path cannot override
 `prefer_v6`), or `weighted`, which is sticky because reselecting per dial would
