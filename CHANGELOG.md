@@ -7,6 +7,8 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-08-27
+
 ### Changed
 
 - **A server pool may now give every server its own `secret`.** Until now a
