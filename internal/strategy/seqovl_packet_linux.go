@@ -3,6 +3,7 @@
 package strategy
 
 import (
+	"bytes"
 	"context"
 
 	"github.com/tiredvpn/tiredvpn/internal/capabilities"
@@ -27,7 +28,13 @@ const seqovlQueueNum = 1
 // The default OverlapPrimitive uses the safe geometry (fake segment sits below
 // the server's rcv_nxt), so even without the server-side NFQUEUE drop the
 // cooperating server's kernel discards the fake and the real stream stays clean.
-func (s *SeqovlStrategy) tryStartPacketOverlap() bool {
+//
+// secret is the key of the endpoint being dialled, and it marks the fake
+// segments. One NFQUEUE hook carries one marker for the whole process, so the
+// injector is pinned to the endpoint that started it - see SeqovlStrategy for
+// why that is a limitation rather than a bug, and why a later endpoint with a
+// different key gets a warning instead of a second injector.
+func (s *SeqovlStrategy) tryStartPacketOverlap(secret []byte) bool {
 	if !s.packetEnabled {
 		return false
 	}
@@ -38,7 +45,7 @@ func (s *SeqovlStrategy) tryStartPacketOverlap() bool {
 	}
 
 	s.injectorOnce.Do(func() {
-		marker := seqovlPacketMarker(s.secret)
+		marker := seqovlPacketMarker(secret)
 		prim := geneva.NewOverlapPrimitive(marker)
 		strat := geneva.NewOverlapStrategy(prim)
 
@@ -51,9 +58,16 @@ func (s *SeqovlStrategy) tryStartPacketOverlap() bool {
 		}
 		s.injector = inj
 		s.injectorStop = cancel
+		s.injectorSecret = append([]byte(nil), secret...)
 		s.packetActive.Store(true)
 		log.Info("Seqovl: packet-level overlap active on NFQUEUE %d (server must provision the OUTPUT rule)", seqovlQueueNum)
 	})
 
+	if s.packetActive.Load() && !bytes.Equal(s.injectorSecret, secret) {
+		s.mismatchOnce.Do(func() {
+			log.Warn("Seqovl: packet-level overlap is marked with the key of the endpoint that started it " +
+				"and cannot follow a switch; this endpoint rides the level-B decoy alone")
+		})
+	}
 	return s.packetActive.Load()
 }

@@ -26,6 +26,19 @@ Versions follow [Semantic Versioning](https://semver.org/).
   no default is configured anywhere: that configuration has no key for half its
   servers.
 
+### Fixed
+
+- **Seqovl's packet-level overlap no longer marks its fake segments with the
+  wrong key, silently.** Level A (Linux, `-seqovl-packet`, off by default) is one
+  NFQUEUE hook for the whole process carrying one marker, derived once when the
+  injector starts. With a pool whose endpoints have different secrets it stayed
+  on the first endpoint's key, so the marker meant nothing to any other server
+  and the fake segments were only discarded by luck of the safe geometry. The
+  marker now comes from the endpoint that starts the injector, and a later
+  endpoint with a different key gets a warning saying level A cannot follow it
+  and that connection rides the level-B decoy alone - which is per connection
+  and does follow the key.
+
 ## [1.7.1] - 2026-08-27
 
 ### Fixed

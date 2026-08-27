@@ -131,6 +131,18 @@ type SeqovlStrategy struct {
 	injectorOnce sync.Once
 	injectorStop context.CancelFunc
 	packetActive atomic.Bool
+
+	// injectorSecret is the key the level-A marker was derived from, and
+	// mismatchOnce keeps the warning about it to one line.
+	//
+	// Level A is one NFQUEUE hook for the whole process, carrying one marker,
+	// while the key is per endpoint. So the injector is pinned to whichever
+	// endpoint started it and cannot follow a switch; a pool whose endpoints
+	// have different secrets gets level A on one of them and level B - which is
+	// per connection and does follow the key - on all of them. Saying so out
+	// loud beats a silently ineffective marker.
+	injectorSecret []byte
+	mismatchOnce   sync.Once
 }
 
 // NewSeqovlStrategy creates a seqovl strategy over its own REALITY handshake.
@@ -192,14 +204,14 @@ func (s *SeqovlStrategy) Connect(ctx context.Context, target string) (net.Conn, 
 	// CAP_NET_ADMIN and an operator-provisioned OUTPUT NFQUEUE rule. On Android /
 	// unprivileged hosts tryStartPacketOverlap is a no-op and we ride level B
 	// alone. Either way the app-framing decoy below always runs.
-	if s.packetEnabled {
-		s.tryStartPacketOverlap()
-	}
-	log.Debug("Seqovl: connecting to %s (decoy prefix + REALITY, packet=%v)", target, s.packetActive.Load())
 	// The decoy record is written on the conn's first write, which happens after
 	// Connect returns, so the key is captured here rather than looked up there.
 	// The REALITY handshake underneath resolves the same context to the same key.
 	secret := dialSecret(ctx, s.secret)
+	if s.packetEnabled {
+		s.tryStartPacketOverlap(secret)
+	}
+	log.Debug("Seqovl: connecting to %s (decoy prefix + REALITY, packet=%v)", target, s.packetActive.Load())
 	return s.reality.connect(ctx, target, func(c net.Conn) net.Conn {
 		return newSeqovlConn(c, secret)
 	})
