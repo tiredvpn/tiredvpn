@@ -182,6 +182,12 @@ type Manager struct {
 	// selector itself is safe for concurrent use.
 	endpoints *endpoint.Selector
 
+	// secret is the process-wide shared secret: -secret / TIREDVPN_SECRET, or
+	// the one value a config file gave every server. It is the fallback for
+	// endpoints that do not carry a secret of their own - see secret.go for how
+	// the secret in force reaches a strategy. Guarded by m.mu.
+	secret []byte
+
 	// Shared TLS client session cache for resumption across reconnects.
 	// The adaptive manager reconnects frequently (fallback, reprobe); without a
 	// shared cache every stdlib-TLS strategy does a full handshake each time,
@@ -462,6 +468,9 @@ func (m *Manager) ProbeAll(ctx context.Context, target string) []Result {
 		target = addr
 		log.Debug("Probing with effective server address: %s", target)
 	}
+	// Same endpoint, same key: a probe that authenticates does it against the
+	// pinned endpoint, which is the one whose address was just resolved above.
+	ctx = m.ensureDialSecret(ctx)
 
 	m.mu.RLock()
 	// Filter out disabled strategies (priority <= 0)
@@ -782,8 +791,16 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 		// family - which is exactly what the old one-shot IPv6 check did.
 		cand, _ = sel.ProbeCurrent(ctx)
 
+		// Name the secret for THIS candidate, on this dial's own context. The
+		// pinned candidate can move underneath us - a concurrent Connect, the
+		// pre-flight gate, a health report - so reading the pin again down in a
+		// strategy would let a handshake authenticate to one server with another
+		// server's key. Here the address and the key are decided together and
+		// travel together.
+		dialCtx := withDialSecret(ctx, m.secretForCandidate(cand))
+
 		start := time.Now()
-		conn, strategy, err := m.ConnectExcluding(ctx, m.withHoppedPort(cand.Addr), nil)
+		conn, strategy, err := m.ConnectExcluding(dialCtx, m.withHoppedPort(cand.Addr), nil)
 		if err == nil {
 			sel.Report(cand, true, time.Since(start))
 			return conn, strategy, nil
@@ -901,6 +918,11 @@ func (m *Manager) ConnectExcluding(ctx context.Context, target string, excludeID
 
 // connectWithRTT is the internal connect method with optional RTT masking
 func (m *Manager) connectWithRTT(ctx context.Context, target string, excludeIDs []string, useRTTMasking bool) (net.Conn, Strategy, error) {
+	// Every path that reaches a strategy's Connect goes through here, so this is
+	// where a dial that nobody labelled picks up the pinned endpoint's secret.
+	// dialEndpoints labels its own, per candidate, and that label wins.
+	ctx = m.ensureDialSecret(ctx)
+
 	m.mu.RLock()
 	// Check if we have a recent successful strategy to try first (for fast reconnect)
 	lastSuccessful := m.lastSuccessfulStrategy
@@ -1345,6 +1367,11 @@ func NewDefaultManager(cfg DefaultManagerConfig) *Manager {
 
 	// Set before registering: strategies copy this at construction.
 	m.SetBurstReshape(cfg.BurstReshape)
+
+	// Set before the selector exists: it is the fallback every endpoint without
+	// a secret of its own resolves to, and CurrentSecret must never return nil
+	// once a dial can start.
+	m.setDefaultSecret(cfg.Secret)
 
 	initManagerTransport(m, cfg)
 	initManagerPortHopping(m, cfg)
@@ -2275,6 +2302,9 @@ func (m *Manager) ConnectForReconnect(ctx context.Context, target string) (net.C
 			log.Debug("Reconnect: using effective server address: %s", target)
 		}
 	}
+	// This path calls Connect on the strategies itself rather than going through
+	// connectWithRTT, so it has to name the key for the address it just resolved.
+	ctx = m.ensureDialSecret(ctx)
 
 	m.mu.RLock()
 	lastStrategy := m.lastSuccessfulStrategy
@@ -2467,8 +2497,9 @@ func (m *Manager) performMakeBeforeBreak(newPort int) {
 
 	log.Debug("Port hop: establishing new connection to %s (make before break)", newTarget)
 
-	// Try to connect using the last successful strategy
-	conn, err := lastStrategy.Connect(ctx, newTarget)
+	// Try to connect using the last successful strategy. Same endpoint, only a
+	// different port, so the pinned endpoint's key is the right one.
+	conn, err := lastStrategy.Connect(m.ensureDialSecret(ctx), newTarget)
 	if err != nil {
 		log.Warn("Port hop: new connection failed (%v), forcing hard reconnect", err)
 		m.CloseMuxSession()
@@ -2561,7 +2592,9 @@ func (m *Manager) performBudgetRecycling() {
 
 	log.Debug("Budget recycling: pre-warming new carrier to %s", target)
 
-	conn, err := lastStrategy.Connect(ctx, target)
+	// The replacement carrier goes to the same endpoint the old one did, so it
+	// authenticates with that endpoint's key.
+	conn, err := lastStrategy.Connect(m.ensureDialSecret(ctx), target)
 	if err != nil {
 		log.Warn("Budget recycling: new connection failed (%v), keeping current carrier", err)
 		return
