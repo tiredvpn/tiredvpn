@@ -108,32 +108,62 @@ func TestResolveEndpoints_EntryWithoutAddress(t *testing.T) {
 	}
 }
 
-// TestResolveEndpoints_Secrets pins the rule from the plan: the secret is
-// baked into a strategy when it is constructed, so a per-server secret cannot
-// take effect on a switch. Disagreement is an error, never a silent choice.
+// TestResolveEndpoints_Secrets pins the rules a server list's secrets follow.
+//
+// Different secrets on different servers are legal now: the key travels with the
+// dial rather than being baked into a strategy. What is left to check is the
+// shape of the list - where the default comes from, and which shapes have no
+// answer for half their servers.
 func TestResolveEndpoints_Secrets(t *testing.T) {
-	t.Run("differing secrets are rejected", func(t *testing.T) {
+	t.Run("differing secrets are kept per endpoint", func(t *testing.T) {
+		t.Setenv("TIREDVPN_SECRET", "")
 		cfg := &Config{Servers: []ServerSpec{
 			{Name: "ams", Addr: "203.0.113.10:443", Secret: "one"},
 			{Name: "fra", Addr: "203.0.113.20:443", Secret: "two"},
 		}}
-		_, err := ResolveEndpoints(cfg)
-		if err == nil || !strings.Contains(err.Error(), "different secrets") {
-			t.Fatalf("err = %v, want a rejection naming the mismatch", err)
+		eps, err := ResolveEndpoints(cfg)
+		if err != nil {
+			t.Fatalf("ResolveEndpoints: %v", err)
+		}
+		if eps[0].Secret != "one" || eps[1].Secret != "two" {
+			t.Fatalf("secrets = %q/%q, want one/two", eps[0].Secret, eps[1].Secret)
 		}
 	})
 
-	t.Run("secret on some entries only is rejected", func(t *testing.T) {
+	t.Run("secret on some entries only, with no default, is rejected", func(t *testing.T) {
+		t.Setenv("TIREDVPN_SECRET", "")
 		cfg := &Config{Servers: []ServerSpec{
 			{Name: "ams", Addr: "203.0.113.10:443", Secret: "one"},
 			{Name: "fra", Addr: "203.0.113.20:443"},
 		}}
 		if _, err := ResolveEndpoints(cfg); err == nil {
-			t.Fatal("a half-configured secret must not fall back to the global one silently")
+			t.Fatal("a half-configured secret must not fall back to the insecure placeholder silently")
+		}
+	})
+
+	t.Run("secret on some entries only is fine with a default", func(t *testing.T) {
+		t.Setenv("TIREDVPN_SECRET", "")
+		cfg := &Config{
+			Secret: "from-flag",
+			Servers: []ServerSpec{
+				{Name: "ams", Addr: "203.0.113.10:443", Secret: "override"},
+				{Name: "fra", Addr: "203.0.113.20:443"},
+			},
+		}
+		eps, err := ResolveEndpoints(cfg)
+		if err != nil {
+			t.Fatalf("ResolveEndpoints: %v", err)
+		}
+		if eps[0].Secret != "override" || eps[1].Secret != "" {
+			t.Fatalf("secrets = %q/%q, want override and the default", eps[0].Secret, eps[1].Secret)
+		}
+		if cfg.Secret != "from-flag" {
+			t.Fatalf("Secret = %q, want the flag left alone as the default", cfg.Secret)
 		}
 	})
 
 	t.Run("one shared secret is adopted", func(t *testing.T) {
+		t.Setenv("TIREDVPN_SECRET", "")
 		cfg := &Config{Servers: []ServerSpec{
 			{Name: "ams", Addr: "203.0.113.10:443", Secret: "shared"},
 			{Name: "fra", Addr: "203.0.113.20:443", Secret: "shared"},
@@ -146,13 +176,38 @@ func TestResolveEndpoints_Secrets(t *testing.T) {
 		}
 	})
 
-	t.Run("config secret conflicting with -secret is rejected", func(t *testing.T) {
+	t.Run("-secret does not compete with a per-server secret", func(t *testing.T) {
+		t.Setenv("TIREDVPN_SECRET", "")
 		cfg := &Config{
 			Secret:  "from-flag",
 			Servers: []ServerSpec{{Name: "ams", Addr: "203.0.113.10:443", Secret: "from-file"}},
 		}
-		if _, err := ResolveEndpoints(cfg); err == nil {
-			t.Fatal("two different secrets must not be resolved by guessing")
+		eps, err := ResolveEndpoints(cfg)
+		if err != nil {
+			t.Fatalf("ResolveEndpoints: %v", err)
+		}
+		if eps[0].Secret != "from-file" {
+			t.Fatalf("endpoint secret = %q, want the per-server value to win its own dial", eps[0].Secret)
+		}
+		if cfg.Secret != "from-flag" {
+			t.Fatalf("Secret = %q, want the flag kept as the default", cfg.Secret)
+		}
+	})
+
+	t.Run("every entry with its own secret needs no flag", func(t *testing.T) {
+		t.Setenv("TIREDVPN_SECRET", "")
+		cfg := &Config{Servers: []ServerSpec{
+			{Name: "ams", Addr: "203.0.113.10:443", Secret: "one"},
+			{Name: "fra", Addr: "203.0.113.20:443", Secret: "two"},
+		}}
+		if _, err := ResolveEndpoints(cfg); err != nil {
+			t.Fatalf("ResolveEndpoints: %v", err)
+		}
+		// The adopted default is never dialled with - every endpoint has its own
+		// - but it must not be empty, or resolveSecret substitutes the insecure
+		// placeholder and warns about a secret the operator did configure.
+		if cfg.Secret == "" {
+			t.Fatal("no default adopted: resolveSecret would fall back to the insecure placeholder")
 		}
 	})
 }

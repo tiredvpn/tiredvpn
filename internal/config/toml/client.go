@@ -46,8 +46,9 @@ type ClientServer struct {
 
 	// Secret and SNI are per-endpoint overrides. Both are carried through to
 	// the endpoint description; see internal/client.ResolveEndpoints for what
-	// the runtime does with them today (a differing Secret is an error, not a
-	// silent fallback to the global one).
+	// the runtime does with them today. Secret is honoured: it is the key this
+	// endpoint is dialled with, and entries may disagree. SNI is still recorded
+	// and not applied.
 	Secret string `toml:"secret,omitempty"`
 	SNI    string `toml:"sni,omitempty"`
 }
