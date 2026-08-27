@@ -196,8 +196,12 @@ func (s *SeqovlStrategy) Connect(ctx context.Context, target string) (net.Conn, 
 		s.tryStartPacketOverlap()
 	}
 	log.Debug("Seqovl: connecting to %s (decoy prefix + REALITY, packet=%v)", target, s.packetActive.Load())
+	// The decoy record is written on the conn's first write, which happens after
+	// Connect returns, so the key is captured here rather than looked up there.
+	// The REALITY handshake underneath resolves the same context to the same key.
+	secret := dialSecret(ctx, s.secret)
 	return s.reality.connect(ctx, target, func(c net.Conn) net.Conn {
-		return newSeqovlConn(c, s.secret)
+		return newSeqovlConn(c, secret)
 	})
 }
 

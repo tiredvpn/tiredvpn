@@ -89,6 +89,7 @@ func (s *AntiProbeStrategy) Probe(ctx context.Context, target string) error {
 func (s *AntiProbeStrategy) Connect(ctx context.Context, target string) (net.Conn, error) {
 	// Get server address (IPv6/IPv4 with automatic fallback)
 	serverAddr := s.manager.GetServerAddr(ctx)
+	secret := dialSecret(ctx, s.knockSecret)
 	log.Debug("AntiProbe: Using server address: %s", serverAddr)
 
 	// Phase 1: Connect with TLS first (server requires TLS)
@@ -152,7 +153,7 @@ func (s *AntiProbeStrategy) Connect(ctx context.Context, target string) (net.Con
 	}
 
 	// Phase 3: Perform timing-based authentication over TLS
-	if err := s.timingKnock(tlsConn); err != nil {
+	if err := s.timingKnock(tlsConn, secret); err != nil {
 		tlsConn.Close()
 		return nil, err
 	}
@@ -167,9 +168,9 @@ func (s *AntiProbeStrategy) Connect(ctx context.Context, target string) (net.Con
 }
 
 // timingKnock performs timing-based knock sequence
-func (s *AntiProbeStrategy) timingKnock(conn net.Conn) error {
+func (s *AntiProbeStrategy) timingKnock(conn net.Conn, secret []byte) error {
 	// Generate timing sequence from secret
-	sequence := s.generateKnockSequence()
+	sequence := generateKnockSequence(secret)
 
 	// Send packets with specific timing
 	for i, delay := range sequence.Delays {
@@ -180,7 +181,7 @@ func (s *AntiProbeStrategy) timingKnock(conn net.Conn) error {
 		packet[0] = byte(i) // Sequence number
 
 		// Fill with deterministic data based on secret
-		s.fillPacketData(packet, i)
+		fillPacketData(packet, i, secret)
 
 		if _, err := conn.Write(packet); err != nil {
 			return err
@@ -203,8 +204,8 @@ func (s *AntiProbeStrategy) timingKnock(conn net.Conn) error {
 }
 
 // generateKnockSequence creates timing sequence from secret
-func (s *AntiProbeStrategy) generateKnockSequence() *KnockSequence {
-	h := hmac.New(sha256.New, s.knockSecret)
+func generateKnockSequence(secret []byte) *KnockSequence {
+	h := hmac.New(sha256.New, secret)
 	h.Write([]byte("knock-sequence"))
 	hash := h.Sum(nil)
 
@@ -224,8 +225,8 @@ func (s *AntiProbeStrategy) generateKnockSequence() *KnockSequence {
 }
 
 // fillPacketData fills packet with deterministic data
-func (s *AntiProbeStrategy) fillPacketData(packet []byte, seqNum int) {
-	h := hmac.New(sha256.New, s.knockSecret)
+func fillPacketData(packet []byte, seqNum int, secret []byte) {
+	h := hmac.New(sha256.New, secret)
 	h.Write([]byte{byte(seqNum)})
 	hash := h.Sum(nil)
 

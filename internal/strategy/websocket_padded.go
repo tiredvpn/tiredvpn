@@ -92,6 +92,7 @@ func (s *WebSocketPaddedStrategy) Probe(ctx context.Context, target string) erro
 func (s *WebSocketPaddedStrategy) Connect(ctx context.Context, target string) (net.Conn, error) {
 	// Get server address (IPv6/IPv4 with automatic fallback)
 	serverAddr := s.manager.GetServerAddr(ctx)
+	secret := dialSecret(ctx, s.secret)
 	log.Debug("WebSocket Padded: Connecting to %s via %s", target, serverAddr)
 
 	// 1. Establish TLS connection to server (context-aware)
@@ -133,7 +134,7 @@ func (s *WebSocketPaddedStrategy) Connect(ctx context.Context, target string) (n
 
 	// 2. Send WebSocket upgrade request with auth token
 	wsKey := generateWebSocketKey()
-	authToken := generateAuthToken(s.secret)
+	authToken := generateAuthToken(secret)
 	upgradeReq := fmt.Sprintf(
 		"GET %s HTTP/1.1\r\n"+
 			"Host: %s\r\n"+
@@ -188,7 +189,7 @@ func (s *WebSocketPaddedStrategy) Connect(ctx context.Context, target string) (n
 	paddingLevel := padding.Balanced
 
 	// 5. Wrap with SalamanderConn
-	padder := padding.NewSalamanderPadder(s.secret, paddingLevel)
+	padder := padding.NewSalamanderPadder(secret, paddingLevel)
 	salamanderConn := NewSalamanderConn(baseConn, padder, true) // true = client side
 
 	log.Info("WebSocket Padded: Connection established to %s", target)

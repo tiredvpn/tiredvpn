@@ -309,6 +309,8 @@ func (s *TrafficMorphStrategy) Connect(ctx context.Context, target string) (net.
 	var baseConn net.Conn
 	var err error
 
+	secret := dialSecret(ctx, s.secret)
+
 	if s.baseStrat != nil {
 		baseConn, err = s.baseStrat.Connect(ctx, target)
 	} else {
@@ -358,7 +360,7 @@ func (s *TrafficMorphStrategy) Connect(ctx context.Context, target string) (net.
 		// over a socket whose TLS receive buffer is empty and whose record
 		// sequence counter matches the next byte on the wire.
 		profileName := []byte(s.profile.Name)
-		authToken := generateAuthToken(s.secret)
+		authToken := generateAuthToken(secret)
 		// Layout: MRPH(4) + nameLen(1) + name(N) + auth(32) + shaperID(1).
 		// The trailing shaperID byte is the wire-protocol v2 addition; servers
 		// that predate it ignore the extra byte, and a server that expects it
@@ -406,7 +408,7 @@ func (s *TrafficMorphStrategy) Connect(ctx context.Context, target string) (net.
 	// For the baseStrat path the handshake goes through the underlying strategy
 	// transport via NewMorphedConnWithShaper as before.
 	if s.baseStrat != nil {
-		return newMorphedConnWithShaperID(baseConn, s.profile, s.secret, s.customShaper, s.shaperID), nil
+		return newMorphedConnWithShaperID(baseConn, s.profile, secret, s.customShaper, s.shaperID), nil
 	}
 	sh := s.customShaper
 	if sh == nil {

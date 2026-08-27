@@ -101,16 +101,17 @@ func (s *HTTPPollingStrategy) Probe(ctx context.Context, target string) error {
 func (s *HTTPPollingStrategy) Connect(ctx context.Context, target string) (net.Conn, error) {
 	// Get server address (IPv6/IPv6 with automatic fallback)
 	serverAddr := s.manager.GetServerAddr(ctx)
+	secret := dialSecret(ctx, s.secret)
 	log.Debug("HTTP Polling: Connecting to %s via %s", target, serverAddr)
 
 	// Generate session ID
-	sessionID := generateSessionID(s.secret)
+	sessionID := generateSessionID(secret)
 
 	// Create polling connection with parallel workers
 	pollConn := &HTTPPollingConn{
 		manager:         s.manager,
 		serverAddr:      serverAddr,
-		secret:          s.secret,
+		secret:          secret,
 		host:            s.host,
 		path:            s.path,
 		sessionID:       sessionID,

@@ -251,7 +251,7 @@ func TestAntiProbeKnockSequence(t *testing.T) {
 	secret := []byte("test-secret")
 	strat := NewAntiProbeStrategy(NewManager(), secret)
 
-	seq := strat.generateKnockSequence()
+	seq := generateKnockSequence(strat.knockSecret)
 
 	if len(seq.Delays) != 5 {
 		t.Errorf("Expected 5 delays, got %d", len(seq.Delays))

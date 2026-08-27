@@ -153,6 +153,7 @@ func (s *HTTP2StegoStrategy) Probe(ctx context.Context, target string) error {
 func (s *HTTP2StegoStrategy) Connect(ctx context.Context, target string) (net.Conn, error) {
 	// Get server address (IPv6/IPv4 with automatic fallback)
 	serverAddr := s.manager.GetServerAddr(ctx)
+	secret := dialSecret(ctx, s.secret)
 	log.Debug("HTTP/2 Stego: Using server address: %s", serverAddr)
 
 	// Establish TLS connection with standard ALPN.
@@ -231,7 +232,7 @@ func (s *HTTP2StegoStrategy) Connect(ctx context.Context, target string) (net.Co
 	}
 
 	// Create steganographic connection with padding mode
-	stegoConn := NewHTTP2StegoConn(finalConn, s.secret, true, s.paddingMode)
+	stegoConn := NewHTTP2StegoConn(finalConn, secret, true, s.paddingMode)
 
 	// Perform initial handshake, bounded by the caller's context so a
 	// non-responding server can't hold this strategy past the strategy

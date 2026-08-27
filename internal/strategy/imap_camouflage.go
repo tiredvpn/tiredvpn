@@ -100,6 +100,7 @@ func (s *IMAPCamouflageStrategy) Probe(ctx context.Context, target string) error
 // Connect dials the server over plain TCP and performs the fake IMAP handshake.
 func (s *IMAPCamouflageStrategy) Connect(ctx context.Context, target string) (net.Conn, error) {
 	serverAddr := s.manager.GetServerAddr(ctx)
+	secret := dialSecret(ctx, s.secret)
 	log.Debug("IMAP Camouflage: connecting to %s (raw TCP, fake IMAP handshake)", serverAddr)
 
 	dialer := &net.Dialer{}
@@ -108,7 +109,7 @@ func (s *IMAPCamouflageStrategy) Connect(ctx context.Context, target string) (ne
 		return nil, err
 	}
 
-	br, err := performIMAPClientHandshake(conn, s.secret)
+	br, err := performIMAPClientHandshake(conn, secret)
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("imap camouflage handshake: %w", err)

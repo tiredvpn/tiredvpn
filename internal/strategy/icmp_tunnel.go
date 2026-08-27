@@ -232,7 +232,7 @@ func (s *ICMPTunnelStrategy) Connect(ctx context.Context, target string) (net.Co
 
 	// Derive per-direction keys so client-to-server and server-to-client packets
 	// use independent keystreams, preventing bidirectional nonce reuse.
-	masterKey := DeriveICMPKey(s.secret)
+	masterKey := DeriveICMPKey(dialSecret(ctx, s.secret))
 	sendCipher, err := chacha20poly1305.NewX(DeriveICMPDirectionalKey(masterKey, sessionID, "c2s"))
 	if err != nil {
 		icmpConn.Close()

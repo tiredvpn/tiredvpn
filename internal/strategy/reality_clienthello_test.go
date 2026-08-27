@@ -44,7 +44,7 @@ func TestBuildClientHelloCarriesAuthAndDataV2(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			hello, err := r.buildClientHello("github.com:443", clientPriv, salt)
+			hello, err := r.buildClientHello("github.com:443", clientPriv, salt, r.secret)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -98,7 +98,7 @@ func TestBuildClientHelloRotatesKeyMaterial(t *testing.T) {
 		if _, err := rand.Read(salt[:]); err != nil {
 			t.Fatal(err)
 		}
-		hello, err := r.buildClientHello("github.com:443", priv, salt)
+		hello, err := r.buildClientHello("github.com:443", priv, salt, r.secret)
 		if err != nil {
 			t.Fatal(err)
 		}

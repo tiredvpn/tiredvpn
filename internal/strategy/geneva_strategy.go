@@ -139,6 +139,7 @@ func (g *GenevaStrategy) Connect(ctx context.Context, target string) (net.Conn, 
 
 	// Step 1: Get server address (IPv6/IPv4 with automatic fallback)
 	serverAddr := g.manager.GetServerAddr(ctx)
+	secret := dialSecret(ctx, g.secret)
 	log.Debug("Geneva: Using server address: %s", serverAddr)
 
 	// Step 2: Establish TCP connection to server (context-aware, respects Android timeouts)
@@ -171,7 +172,7 @@ func (g *GenevaStrategy) Connect(ctx context.Context, target string) (net.Conn, 
 
 	// Step 5: Perform WebSocket upgrade (same format as WebSocket Salamander) with auth token
 	wsKey := generateWebSocketKey()
-	authToken := generateAuthToken(g.secret)
+	authToken := generateAuthToken(secret)
 	upgradeReq := fmt.Sprintf(
 		"GET %s HTTP/1.1\r\n"+
 			"Host: %s\r\n"+
@@ -226,7 +227,7 @@ func (g *GenevaStrategy) Connect(ctx context.Context, target string) (net.Conn, 
 	log.Info("Geneva: WebSocket upgrade successful")
 
 	// Step 6: Wrap with SalamanderConn (handles padding)
-	padder := padding.NewSalamanderPadder(g.secret, padding.Balanced)
+	padder := padding.NewSalamanderPadder(secret, padding.Balanced)
 	salamanderConn := NewSalamanderConn(tlsConn, padder, true) // true = client side
 
 	log.Info("Geneva (%s): Connection established with %s manipulation", g.country, genevaConn.GetManipulation())
