@@ -89,6 +89,9 @@ func (t Tuning) config(eps []Endpoint, family FamilyPolicy) Config {
 		FailureThreshold: t.FailureThreshold,
 		Cooldown:         t.Cooldown,
 		MinDwell:         t.MinDwell,
+		// Every caller of this path is a real client being built or rebuilt,
+		// which is exactly the case candidate health has to survive.
+		Shared: true,
 	}
 }
 

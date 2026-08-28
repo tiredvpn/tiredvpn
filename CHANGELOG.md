@@ -7,6 +7,34 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A phone with six servers configured no longer keeps dialling the first
+  one.** Reported on a Pixel 9 that lost Wi-Fi and moved to MTS: three and a
+  half minutes of logs, sixty connection attempts, all to one address, none to
+  the other five in the pool. The address was blackholed - the TCP handshake
+  completed and nothing ever came back - so every transport in the scan died on
+  its connect timeout, and the endpoint layer never got to record a verdict,
+  because the Android service abandons a connect after about twenty-six seconds
+  and rebuilds the client. Two things kept it going in circles. Candidate health
+  lived in the selector the discarded client owned, so the replacement started
+  from the top of the pool with a clean slate and the failure threshold - which
+  counts failed cycles of one selector - could never be reached. And one cycle
+  cost far more than the service was willing to wait: twenty-one strategies at
+  ten seconds each, then the whole list again with RTT masking, including after
+  the service had already given up and the context was cancelled.
+
+  Selectors are now scoped to the process and keyed by their configuration, so a
+  rebuilt client inherits what its predecessor measured. A scan that gets no
+  answer at all from an address - timeouts only, no refusal, no reset, no
+  rejected handshake - is abandoned after two transports on Android rather than
+  running the list out, and that verdict parks the candidate at once instead of
+  waiting for a second cycle that may never finish. An address that answers
+  still gets the whole scan, which is the case the scan exists for: a transport
+  the DPI recognises and cuts is a fact about the transport, not the server. The
+  masked second pass no longer runs against an address that answered nothing, or
+  after the caller has walked away.
+
 ## [1.8.0] - 2026-08-27
 
 ### Changed
