@@ -7,6 +7,8 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.8.1] - 2026-08-29
+
 ### Fixed
 
 - **A phone with six servers configured no longer keeps dialling the first
