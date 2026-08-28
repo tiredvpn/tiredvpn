@@ -210,6 +210,25 @@ const (
 // "nothing was eligible", which say nothing about the address.
 var errStrategyScanFailed = errors.New("all strategies failed")
 
+// errAddrSilent narrows errStrategyScanFailed: the scan was abandoned because
+// the address accepted connections and then answered nothing, on one transport
+// after another. Every failure was a timeout at connectTimeout - no refusal, no
+// reset, no protocol error - which is what a blackholed address looks like and
+// what no application-layer disguise can talk its way out of.
+//
+// Errors carrying it also carry errStrategyScanFailed, so dialEndpoints still
+// treats it as an endpoint verdict; the extra sentinel only says the verdict is
+// strong enough to act on at once.
+var errAddrSilent = errors.New("address answered no transport")
+
+// androidSilentScanAbort is how many consecutive non-UDP strategies must die on
+// the connect timeout before an Android scan gives up on the address.
+//
+// Two rather than the desktop three because the VPN service abandons a connect
+// after ~26s and rebuilds the client: with connectTimeout at 10s, a verdict
+// reached at 30s is a verdict nobody is left to hear.
+const androidSilentScanAbort = 2
+
 // preflightFailThreshold is how many consecutive failed connects must pile up
 // before Connect re-arms the blocking pre-flight connectivity check. See
 // Manager.consecutiveConnectFailures.
@@ -812,7 +831,11 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 			// anything about this endpoint.
 			break
 		}
-		sel.Report(cand, false, 0)
+		if errors.Is(err, errAddrSilent) {
+			sel.ReportSilent(cand)
+		} else {
+			sel.Report(cand, false, 0)
+		}
 	}
 
 	return nil, nil, lastErr
@@ -895,10 +918,29 @@ func (m *Manager) preflightCandidate(ctx context.Context, sel *endpoint.Selector
 	return other, nil
 }
 
+// scanState is what one connect cycle learns about the ADDRESS rather than
+// about any single transport, carried across both passes ConnectExcluding
+// makes over the strategy list.
+//
+// It has to outlive a pass. Every failure re-sorts the list by confidence, so
+// the masked pass sees the same transports in a different order, and a per-pass
+// counter would let that reordering manufacture a silence verdict for an
+// address that had already answered.
+type scanState struct {
+	// answered records that some transport got a reply - a refusal, a reset, a
+	// rejected handshake. One is enough: whatever is wrong from there on is a
+	// property of a transport, which is what the scan exists to work around.
+	answered bool
+	// timeouts counts non-UDP strategies that died on the connect timeout.
+	timeouts int
+}
+
 // ConnectExcluding tries strategies excluding specified ones (for fallback)
 func (m *Manager) ConnectExcluding(ctx context.Context, target string, excludeIDs []string) (net.Conn, Strategy, error) {
+	scan := &scanState{}
+
 	// First pass: try all strategies WITHOUT RTT masking
-	conn, strategy, err := m.connectWithRTT(ctx, target, excludeIDs, false)
+	conn, strategy, err := m.connectWithRTTScan(ctx, target, excludeIDs, false, scan)
 	if err == nil {
 		return conn, strategy, nil
 	}
@@ -908,16 +950,34 @@ func (m *Manager) ConnectExcluding(ctx context.Context, target string, excludeID
 	rttEnabled := m.rttMaskingEnabled
 	m.mu.RUnlock()
 
+	// Two cases where the second pass is pure cost. A cancelled context has
+	// nobody left to hand a connection to - on Android the service has already
+	// given up and is tearing this client down, and the log still showed a
+	// fresh 21-strategy scan starting underneath it. And RTT masking reshapes
+	// the timing of an established session; it cannot make an address that
+	// answered nothing answer, so repeating the whole scan against a silent
+	// address doubles the time before the endpoint layer hears the verdict.
+	if ctx.Err() != nil || errors.Is(err, errAddrSilent) {
+		return nil, nil, err
+	}
+
 	if rttEnabled {
 		log.Info("All strategies failed, retrying with RTT masking enabled...")
-		return m.connectWithRTT(ctx, target, excludeIDs, true)
+		return m.connectWithRTTScan(ctx, target, excludeIDs, true, scan)
 	}
 
 	return nil, nil, err
 }
 
-// connectWithRTT is the internal connect method with optional RTT masking
+// connectWithRTT is the internal connect method with optional RTT masking. It
+// scans on its own, for callers that make a single pass.
 func (m *Manager) connectWithRTT(ctx context.Context, target string, excludeIDs []string, useRTTMasking bool) (net.Conn, Strategy, error) {
+	return m.connectWithRTTScan(ctx, target, excludeIDs, useRTTMasking, &scanState{})
+}
+
+// connectWithRTTScan is connectWithRTT with the cycle-wide scan state supplied
+// by the caller.
+func (m *Manager) connectWithRTTScan(ctx context.Context, target string, excludeIDs []string, useRTTMasking bool, scan *scanState) (net.Conn, Strategy, error) {
 	// Every path that reaches a strategy's Connect goes through here, so this is
 	// where a dial that nobody labelled picks up the pinned endpoint's secret.
 	// dialEndpoints labels its own, per candidate, and that label wins.
@@ -1035,7 +1095,7 @@ func (m *Manager) connectWithRTT(ctx context.Context, target string, excludeIDs 
 		if !m.forced && m.stormDetector.AnyParked() {
 			log.Warn("All strategies parked by storm cooldown - unparking to avoid total outage")
 			m.stormDetector.Reset()
-			return m.connectWithRTT(ctx, target, excludeIDs, useRTTMasking)
+			return m.connectWithRTTScan(ctx, target, excludeIDs, useRTTMasking, scan)
 		}
 		return nil, nil, fmt.Errorf("no available strategies (all excluded or circuit-broken)")
 	}
@@ -1048,49 +1108,58 @@ func (m *Manager) connectWithRTT(ctx context.Context, target string, excludeIDs 
 
 	var lastErr error
 	attemptCount := 0
-	tcpTimeoutCount := 0 // Track consecutive TCP timeouts in this connection attempt
+	addrSilent := false
 
 	for i, s := range strategies {
-		// Android fast QUIC fallback: after N TCP timeouts, skip remaining TCP and try QUIC
-		if androidMode && tcpTimeoutCount >= tcpFailuresThreshold && !isUDPBasedStrategy(s) {
-			log.Info("Fast QUIC fallback: %d TCP timeouts, skipping remaining TCP strategies", tcpTimeoutCount)
-			// Jump to QUIC strategies
-			for _, qs := range quicStrategies {
-				if excludeMap[qs.ID()] || !m.circuitBreakers.Allow(qs.ID()) {
-					continue
-				}
+		if !scan.answered && scan.timeouts >= tcpFailuresThreshold && !isUDPBasedStrategy(s) {
+			// Nothing has come back from this address on any transport. Walking
+			// the rest of the list means one connect timeout per strategy for a
+			// verdict already in hand, and the endpoint layer is waiting for
+			// that verdict to move the client to another server.
+			log.Info("Address %s answered nothing on %d transports - abandoning the scan%s",
+				target, scan.timeouts, modeStr)
+			addrSilent = true
 
-				log.Debug("Trying QUIC fallback: %s", qs.Name())
-				connectCtx, cancel := context.WithTimeout(ctx, m.connectTimeout)
-				start := time.Now()
-				conn, err := qs.Connect(connectCtx, target)
-				latency := time.Since(start)
-				cancel()
-
-				if err == nil {
-					m.mu.Lock()
-					m.lastSuccessfulStrategy = qs
-					m.lastSuccessfulTime = time.Now()
-					m.consecutiveTCPTimeouts = 0
-					m.updateConfidenceWithLatency(qs.ID(), true, latency)
-					m.sortStrategies()
-					m.lastConnectionLatency = latency
-					m.lastConnectionAttempts = attemptCount
-					m.lastConnectionStrategy = qs.Name()
-					m.lastConnectionStrategyID = qs.ID()
-					m.mu.Unlock()
-
-					optimizeTCPConn(conn)
-					if useRTTMasking {
-						conn = WrapWithRTTMasking(conn, rttProfile)
+			// QUIC rides UDP, which the TCP verdict says nothing about. Android
+			// jumps to it here rather than losing it with the rest of the list.
+			if androidMode {
+				log.Info("Fast QUIC fallback: %d TCP timeouts, skipping remaining TCP strategies", scan.timeouts)
+				for _, qs := range quicStrategies {
+					if excludeMap[qs.ID()] || !m.circuitBreakers.Allow(qs.ID()) {
+						continue
 					}
 
-					log.Info("Connected via QUIC fallback %s (latency=%v)", qs.Name(), latency)
-					return conn, qs, nil
+					log.Debug("Trying QUIC fallback: %s", qs.Name())
+					connectCtx, cancel := context.WithTimeout(ctx, m.connectTimeout)
+					start := time.Now()
+					conn, err := qs.Connect(connectCtx, target)
+					latency := time.Since(start)
+					cancel()
+
+					if err == nil {
+						m.mu.Lock()
+						m.lastSuccessfulStrategy = qs
+						m.lastSuccessfulTime = time.Now()
+						m.consecutiveTCPTimeouts = 0
+						m.updateConfidenceWithLatency(qs.ID(), true, latency)
+						m.sortStrategies()
+						m.lastConnectionLatency = latency
+						m.lastConnectionAttempts = attemptCount
+						m.lastConnectionStrategy = qs.Name()
+						m.lastConnectionStrategyID = qs.ID()
+						m.mu.Unlock()
+
+						optimizeTCPConn(conn)
+						if useRTTMasking {
+							conn = WrapWithRTTMasking(conn, rttProfile)
+						}
+
+						log.Info("Connected via QUIC fallback %s (latency=%v)", qs.Name(), latency)
+						return conn, qs, nil
+					}
+					lastErr = fmt.Errorf("%s: %w", qs.Name(), err)
 				}
-				lastErr = fmt.Errorf("%s: %w", qs.Name(), err)
 			}
-			// All QUIC failed too, continue with remaining strategies
 			break
 		}
 
@@ -1156,19 +1225,27 @@ func (m *Manager) connectWithRTT(ctx context.Context, target string, excludeIDs 
 				log.Debug("  Failed: %s TIMEOUT (latency=%v)", s.Name(), latency)
 				strategyTimedOut = true
 
+				if !isUDPBasedStrategy(s) {
+					scan.timeouts++
+					log.Debug("TCP timeout count: %d/%d", scan.timeouts, tcpFailuresThreshold)
+				}
 				// Track TCP timeouts for Android fast fallback
 				if androidMode && !isUDPBasedStrategy(s) {
-					tcpTimeoutCount++
 					m.mu.Lock()
 					m.consecutiveTCPTimeouts++
 					// Re-sort strategies with updated penalty
 					m.sortStrategies()
 					m.mu.Unlock()
-					log.Debug("TCP timeout count: %d/%d (adaptive penalty adjusted)", tcpTimeoutCount, tcpFailuresThreshold)
 				}
 			} else {
 				log.Debug("  Failed: %v (latency=%v)", err, latency)
 				strategyTimedOut = false
+				// A refusal, a reset, a handshake that got an answer it did not
+				// like: the address is talking. Whatever is wrong here is a
+				// property of this transport, which is precisely the case the
+				// full scan exists for, so the address is no longer a candidate
+				// for the silence verdict this cycle.
+				scan.answered = true
 			}
 
 			// Brief pause before retry
@@ -1195,6 +1272,13 @@ func (m *Manager) connectWithRTT(ctx context.Context, target string, excludeIDs 
 		m.mu.Unlock()
 
 		log.Debug("Strategy %s exhausted, moving to next", s.Name())
+	}
+
+	if addrSilent {
+		// No emergency reprobe here: it exists to find a way back to an address
+		// that went dark, and this scan's whole point is that the client should
+		// stop asking this one and try another server.
+		return nil, nil, fmt.Errorf("%w: %w, last error: %w", errAddrSilent, errStrategyScanFailed, lastErr)
 	}
 
 	log.Error("All %d strategies failed after %d attempts%s", len(strategies), attemptCount, modeStr)
@@ -1415,14 +1499,19 @@ func initManagerTransport(m *Manager, cfg DefaultManagerConfig) {
 	}
 }
 
-// SetEndpoints replaces the endpoint list and the family policy, discarding all
-// accumulated candidate health.
+// SetEndpoints replaces the endpoint list and the family policy.
+//
+// Health is discarded only when the new list is genuinely different: selectors
+// are process-scoped per configuration, so re-applying the same endpoints hands
+// back the same instance rather than forgetting everything it measured. Use
+// ResetHealth to discard verdicts deliberately - that is what a network change
+// does.
 func (m *Manager) SetEndpoints(eps []endpoint.Endpoint, policy endpoint.FamilyPolicy) error {
 	return m.SetEndpointsTuned(eps, endpoint.Tuning{Family: &policy})
 }
 
 // SetEndpointsTuned is SetEndpoints with the whole [selection] section rather
-// than the family policy alone.
+// than the family policy alone, and with the same health semantics.
 func (m *Manager) SetEndpointsTuned(eps []endpoint.Endpoint, tuning endpoint.Tuning) error {
 	sel, err := endpoint.NewTunedSelector(eps, tuning, endpoint.PreferV6)
 	if err != nil {
@@ -1471,6 +1560,7 @@ func initManagerAndroidMode(m *Manager, cfg DefaultManagerConfig) {
 	m.connectTimeout = 10 * time.Second
 	m.maxRetries = 1
 	m.androidMode = true
+	m.tcpFailuresBeforeQUIC = androidSilentScanAbort
 	log.Info("Android mode: using optimized timeouts (probe=%v, connect=%v, retries=%d, TCP-first)",
 		m.probeTimeout, m.connectTimeout, m.maxRetries)
 }

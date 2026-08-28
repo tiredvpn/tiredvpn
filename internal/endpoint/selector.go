@@ -67,6 +67,11 @@ type Config struct {
 
 	ProbeTimeout time.Duration
 
+	// Shared makes NewSelector return the process-scoped selector for this
+	// configuration instead of a private one, so candidate health survives a
+	// client being torn down and rebuilt. See shared.go for why that matters.
+	Shared bool
+
 	Dial DialFunc
 	Now  func() time.Time
 	Rand func() float64
@@ -152,10 +157,18 @@ type Selector struct {
 	pinnedAt  time.Time
 }
 
-// NewSelector builds a selector from cfg.
+// NewSelector builds a selector from cfg, or returns the process-scoped one
+// when cfg.Shared is set.
 func NewSelector(cfg Config) (*Selector, error) {
 	cfg.applyDefaults()
+	if cfg.Shared {
+		return sharedSelectorFor(cfg)
+	}
+	return newSelector(cfg)
+}
 
+// newSelector always builds a fresh selector. cfg must already carry defaults.
+func newSelector(cfg Config) (*Selector, error) {
 	eps := make([]Endpoint, len(cfg.Endpoints))
 	copy(eps, cfg.Endpoints)
 	cands := buildCandidates(eps, cfg.Family, endpointOrder(eps, cfg.Selection, cfg.Rand))
@@ -500,6 +513,33 @@ func (s *Selector) ReportProbe(c Candidate, ok bool, latency time.Duration) {
 		return
 	}
 	s.recordFailureLocked(idx, now)
+}
+
+// ReportSilent records the strongest failure verdict a connect cycle can
+// produce: the address accepted the connection and then answered nothing, on
+// every transport in turn.
+//
+// It parks the candidate immediately, without waiting for FailureThreshold.
+// The threshold is there so one bad minute does not cost a good server, and it
+// is right for an ordinary failure - a refusal, a reset, a handshake that got
+// an answer it did not like. Silence across every transport is not a bad
+// minute: it is what a blackholed address looks like, and the second cycle
+// would confirm what the first one established at the price of another full
+// scan. On a phone, where the service restarts the client after every failed
+// cycle, that second scan may never finish.
+func (s *Selector) ReportSilent(c Candidate) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	idx, found := s.byAddr[c.Addr]
+	if !found {
+		return
+	}
+	now := s.cfg.Now()
+	h := &s.health[idx]
+	h.consecutiveFailures++
+	h.lastFailure = now
+	h.backoff = s.nextBackoff(h.backoff)
+	h.cooldownUntil = now.Add(s.jitter(h.backoff))
 }
 
 // recordFailureLocked bumps the streak and parks the candidate once it crosses

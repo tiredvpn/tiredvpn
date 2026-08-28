@@ -209,6 +209,10 @@ func selectorConfig(cfg *Config, eps []endpoint.Endpoint) (endpoint.Config, erro
 		Cooldown:         cfg.Selection.Cooldown,
 		MaxCooldown:      cfg.Selection.MaxCooldown,
 		MinDwell:         cfg.Selection.MinDwell,
+		// The Android service rebuilds the whole client on every failed
+		// connect; without this the selector it hands the new client has never
+		// seen a failure and starts again from the first server in the pool.
+		Shared: true,
 	}, nil
 }
 
