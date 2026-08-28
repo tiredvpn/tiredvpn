@@ -7,6 +7,8 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.8.2] - 2026-08-29
+
 ### Fixed
 
 - **The parking decision from 1.8.1 now survives the pre-flight gate.** Same
