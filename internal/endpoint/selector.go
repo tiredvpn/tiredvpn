@@ -492,11 +492,17 @@ func (s *Selector) Report(c Candidate, ok bool, latency time.Duration) {
 //
 // The asymmetry with Report is deliberate. A probe failure counts against the
 // candidate exactly like a connect failure - it is evidence the address is
-// unreachable. A probe SUCCESS only lifts the cooldown and refreshes latency;
-// it does not clear the failure streak, because a censor that lets the TCP
-// handshake through and kills the session afterwards is the case this whole
-// mechanism exists for. Treating "port answers" as "endpoint works" would pin
-// the client to a dead endpoint forever.
+// unreachable. A probe SUCCESS records only the latency: it clears neither the
+// failure streak nor the cooldown, because a censor that lets the TCP handshake
+// through and kills the session afterwards is the case this whole mechanism
+// exists for. Treating "port answers" as "endpoint works" would pin the client
+// to a dead endpoint forever.
+//
+// Clearing the cooldown used to be the one exception, and it undid the rest.
+// A blackholed address answers its TCP port by definition, so the gate found it
+// healthy the moment after a full scan had condemned it, and the client went
+// straight back. A cooldown ends when it ends, or when Next has nowhere else to
+// go - not because a port accepted a connection.
 func (s *Selector) ReportProbe(c Candidate, ok bool, latency time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -508,11 +514,24 @@ func (s *Selector) ReportProbe(c Candidate, ok bool, latency time.Duration) {
 	h := &s.health[idx]
 	h.probed = true
 	if ok {
-		h.cooldownUntil = time.Time{}
 		h.latencyEWMA = blendLatency(h.latencyEWMA, latency)
 		return
 	}
 	s.recordFailureLocked(idx, now)
+}
+
+// IsParked reports whether the candidate is in cooldown right now. Callers that
+// hold a verdict of their own - the pre-flight gate, which sees a live TCP port
+// and nothing more - use it to check whether the selector has already decided
+// against this address for better reasons.
+func (s *Selector) IsParked(c Candidate) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	idx, found := s.byAddr[c.Addr]
+	if !found {
+		return false
+	}
+	return s.inCooldownLocked(idx, s.cfg.Now())
 }
 
 // ReportSilent records the strongest failure verdict a connect cycle can

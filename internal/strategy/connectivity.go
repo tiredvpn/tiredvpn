@@ -217,9 +217,16 @@ func (c *ConnectivityChecker) Check(ctx context.Context) ConnectivityResult {
 		}()
 	}
 
-	// Log results
-	log.Debug("Connectivity check to %s:%s - TCP:%v UDP:%v ICMP:%v (latency=%v)",
-		host, port, result.TCP, result.UDP, result.ICMP, result.Latency)
+	// The address that ANSWERED, not the one the walk started from. The gate
+	// tries the pool in order, so a line naming only the first address reads as
+	// "this one is up" when the verdict may have come from a different server
+	// entirely - which is what it did on the device.
+	answered := result.Addr
+	if answered == "" {
+		answered = "none"
+	}
+	log.Debug("Connectivity check from %s:%s - TCP:%v (answered=%s) UDP:%v ICMP:%v (latency=%v)",
+		host, port, result.TCP, answered, result.UDP, result.ICMP, result.Latency)
 
 	// Cache result
 	c.mu.Lock()

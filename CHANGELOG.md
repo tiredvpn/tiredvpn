@@ -7,6 +7,38 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The parking decision from 1.8.1 now survives the pre-flight gate.** Same
+  Pixel 9, same LTE, with 1.8.1 installed: the scan did give up on the
+  blackholed address after two silent transports, and the endpoint loop did move
+  to the next server. Then the gate ran for that server, walked the pool as it
+  is meant to, found the blackhole answering its TCP port - which a blackhole
+  always does - and treated the completed handshake as evidence of health. It
+  cleared the cooldown and pinned the client straight back. Eight connect
+  attempts later the log still showed one address and no parking anywhere. A
+  successful probe now records latency only: it clears neither the failure
+  streak nor the cooldown, which is what its own contract already said about
+  not mistaking an open port for a working endpoint. The gate still probes
+  parked candidates, because its question is whether the client has a network at
+  all, but it no longer moves the client onto one.
+
+- **A silent address is now recognised by the clock rather than by the wording
+  of the error.** On the first cycle REALITY reported a plain timeout and the
+  scan was abandoned correctly. On every cycle after that the same ten-second
+  wait came back as `serverhello read failed: ... use of closed network
+  connection` - the deadline fired, something closed the socket, and the text no
+  longer contained a word the classifier recognised. The scan read that as the
+  address having answered and ran the whole list again. An attempt that burns
+  the connect timeout heard nothing whatever its error is called; a refusal or a
+  reset comes back in milliseconds.
+
+- **The log can now tell "not parked" from "parked and chosen anyway".** Each
+  connect cycle prints the candidate it picked along with which candidates are
+  parked and for how long, a failed cycle prints what it did to that candidate's
+  health, and the connectivity gate names the address that actually answered
+  instead of the one it started the walk from.
+
 ## [1.8.1] - 2026-08-29
 
 ### Fixed

@@ -229,6 +229,17 @@ var errAddrSilent = errors.New("address answered no transport")
 // reached at 30s is a verdict nobody is left to hear.
 const androidSilentScanAbort = 2
 
+// silenceLatency is the share of the connect timeout an attempt has to burn
+// before it counts as having heard nothing back, whatever its error says.
+//
+// Not the full timeout: the deadline fires a hair before the caller measures,
+// and a strategy that gives up a moment early on its own inner deadline heard
+// just as little. Not much less either - a transport that got an answer and
+// disliked it comes back in milliseconds, nowhere near this line.
+func silenceLatency(connectTimeout time.Duration) time.Duration {
+	return connectTimeout - connectTimeout/10
+}
+
 // preflightFailThreshold is how many consecutive failed connects must pile up
 // before Connect re-arms the blocking pre-flight connectivity check. See
 // Manager.consecutiveConnectFailures.
@@ -778,6 +789,11 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 	if !ok {
 		return nil, nil, fmt.Errorf("no endpoint candidates configured")
 	}
+	// Without this line a log shows a client dialling the same address over and
+	// over and cannot say whether the endpoint layer never condemned it or
+	// condemned it and chose it anyway. Those are different bugs and we spent a
+	// day telling them apart by hand.
+	log.Info("Endpoint choice: %s (%s)", cand, m.endpointRoster(sel))
 
 	budget := min(maxEndpointAttempts, len(sel.Candidates()))
 	var lastErr error
@@ -836,9 +852,48 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 		} else {
 			sel.Report(cand, false, 0)
 		}
+		m.logEndpointHealth(sel, cand)
 	}
 
 	return nil, nil, lastErr
+}
+
+// endpointRoster renders the pool the way a reader of the log needs it: which
+// candidates are parked and until when. "6 servers, selection=priority" says
+// what was configured; this says what the client currently believes.
+func (m *Manager) endpointRoster(sel *endpoint.Selector) string {
+	now := sel.Now()
+	var parked []string
+	total := 0
+	for _, st := range sel.Snapshot() {
+		total++
+		if st.CooldownUntil.IsZero() || !now.Before(st.CooldownUntil) {
+			continue
+		}
+		parked = append(parked, fmt.Sprintf("%s for %s", st.Addr, st.CooldownUntil.Sub(now).Round(time.Second)))
+	}
+	if len(parked) == 0 {
+		return fmt.Sprintf("%d candidates, none parked", total)
+	}
+	return fmt.Sprintf("%d candidates, parked: %s", total, strings.Join(parked, ", "))
+}
+
+// logEndpointHealth reports what a failed cycle did to a candidate, so a log
+// can distinguish "not parked" from "parked and picked again".
+func (m *Manager) logEndpointHealth(sel *endpoint.Selector, cand endpoint.Candidate) {
+	now := sel.Now()
+	for _, st := range sel.Snapshot() {
+		if st.Addr != cand.Addr {
+			continue
+		}
+		if !st.CooldownUntil.IsZero() && now.Before(st.CooldownUntil) {
+			log.Info("Endpoint %s parked for %s after %d consecutive failure(s)",
+				cand, st.CooldownUntil.Sub(now).Round(time.Second), st.ConsecutiveFailures)
+			return
+		}
+		log.Info("Endpoint %s failed (%d consecutive), not parked yet", cand, st.ConsecutiveFailures)
+		return
+	}
 }
 
 // withHoppedPort rewrites the port when port hopping is active.
@@ -897,13 +952,26 @@ func (m *Manager) preflightCandidate(ctx context.Context, sel *endpoint.Selector
 	if result.Addr == cand.Addr {
 		// The pinned address answered. Record it as a probe, not as a connect:
 		// a completed TCP handshake is not evidence that the transport works,
-		// so this lifts a cooldown but deliberately leaves the failure streak
-		// alone (see Selector.ReportProbe).
+		// so this refreshes latency and deliberately leaves both the failure
+		// streak and any cooldown alone (see Selector.ReportProbe).
 		sel.ReportProbe(cand, true, result.Latency)
 		return cand, nil
 	}
 	other, ok := sel.CandidateForAddr(result.Addr)
 	if !ok {
+		return cand, nil
+	}
+
+	// The gate probes parked candidates on purpose - its question is whether
+	// this client has a network at all, and leaving a parked-but-live server
+	// out would make it wait when it has somewhere to go. Acting on that answer
+	// is a different question, and for a parked candidate the selector has
+	// already answered it, on evidence the gate cannot produce: an address that
+	// swallowed every transport still completes a TCP handshake. Switching here
+	// sent the client straight back to the server a full scan had just
+	// condemned, over and over.
+	if sel.IsParked(other) {
+		log.Debug("Pre-flight: %s answered but is parked - staying on %s", other, cand)
 		return cand, nil
 	}
 
@@ -1221,13 +1289,28 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			// breaker is NOT recorded per retry here - it is recorded once when
 			// the strategy is exhausted, so one logical failure counts once
 			// regardless of maxRetries.
-			if isTimeoutError(err) {
-				log.Debug("  Failed: %s TIMEOUT (latency=%v)", s.Name(), latency)
-				strategyTimedOut = true
+			timedOut := isTimeoutError(err)
+			// Whether the address said anything is a question about the clock,
+			// not about the wording of the error. On the device the same
+			// ten-second wait came back as a timeout on one cycle and as
+			// "use of closed network connection" on the next - the deadline
+			// fired, something closed the socket, and the text stopped
+			// containing the word the classifier looks for. A refusal or a
+			// reset arrives in milliseconds; only silence costs the whole
+			// budget.
+			heardNothing := timedOut || latency >= silenceLatency(m.connectTimeout)
 
+			if timedOut {
+				log.Debug("  Failed: %s TIMEOUT (latency=%v)", s.Name(), latency)
+			} else {
+				log.Debug("  Failed: %v (latency=%v)", err, latency)
+			}
+			strategyTimedOut = timedOut
+
+			if heardNothing {
 				if !isUDPBasedStrategy(s) {
 					scan.timeouts++
-					log.Debug("TCP timeout count: %d/%d", scan.timeouts, tcpFailuresThreshold)
+					log.Debug("TCP silence count: %d/%d", scan.timeouts, tcpFailuresThreshold)
 				}
 				// Track TCP timeouts for Android fast fallback
 				if androidMode && !isUDPBasedStrategy(s) {
@@ -1238,8 +1321,6 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 					m.mu.Unlock()
 				}
 			} else {
-				log.Debug("  Failed: %v (latency=%v)", err, latency)
-				strategyTimedOut = false
 				// A refusal, a reset, a handshake that got an answer it did not
 				// like: the address is talking. Whatever is wrong here is a
 				// property of this transport, which is precisely the case the

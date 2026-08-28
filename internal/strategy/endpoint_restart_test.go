@@ -123,6 +123,34 @@ type greetingStrategy struct {
 	// answered and rejected.
 	refuse bool
 	tries  *atomic.Int64
+
+	// seen records every target this strategy was pointed at, which is what
+	// tells "the endpoint layer moved on" from "it came straight back".
+	seen *targetLog
+}
+
+// targetLog collects the addresses strategies were handed, across managers.
+type targetLog struct {
+	mu   sync.Mutex
+	list []string
+}
+
+func (l *targetLog) add(addr string) {
+	l.mu.Lock()
+	l.list = append(l.list, addr)
+	l.mu.Unlock()
+}
+
+func (l *targetLog) since(n int) []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.list[n:]...)
+}
+
+func (l *targetLog) len() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.list)
 }
 
 func (s *greetingStrategy) Name() string         { return s.id }
@@ -143,6 +171,9 @@ func (s *greetingStrategy) Probe(ctx context.Context, target string) error {
 func (s *greetingStrategy) Connect(ctx context.Context, target string) (net.Conn, error) {
 	if s.tries != nil {
 		s.tries.Add(1)
+	}
+	if s.seen != nil {
+		s.seen.add(target)
 	}
 	if s.refuse {
 		return nil, errors.New("connection refused by peer")
@@ -359,6 +390,12 @@ func TestSilentEndpointDoesNotEatTheWholeConnectBudget(t *testing.T) {
 // The pool here is two silent servers and a live one. maxEndpointAttempts caps
 // a single cycle at two candidates, so cycle one CANNOT reach the live server;
 // only a verdict carried into cycle two can.
+//
+// The pre-flight gate is wired in because the phone has one, and an earlier
+// version of this test did not: the gate probes the whole pool, a blackholed
+// address answers its TCP port, and acting on that answer used to un-park the
+// candidate this test is about. A test without the gate stayed green while the
+// device stayed stuck.
 func TestEndpointHealthSurvivesClientRecreation(t *testing.T) {
 	silentA := newBlackholeListener(t)
 	silentB := newBlackholeListener(t)
@@ -373,7 +410,8 @@ func TestEndpointHealthSurvivesClientRecreation(t *testing.T) {
 	}
 	const strategies = 4
 
-	first := newRestartedManager(t, tuning, strategies, silentA.addr, silentB.addr, live.addr)
+	seen := &targetLog{}
+	first := newGatedRestartedManager(t, tuning, seen, strategies, silentA.addr, silentB.addr, live.addr)
 	if _, _, err := first.Connect(context.Background(), ""); err == nil {
 		t.Fatal("cycle one reached a server it has no budget for - retune the test")
 	}
@@ -385,7 +423,7 @@ func TestEndpointHealthSurvivesClientRecreation(t *testing.T) {
 
 	// The service throws the client away and builds a new one. Same process,
 	// same configuration, no state of its own carried across.
-	second := newRestartedManager(t, tuning, strategies, silentA.addr, silentB.addr, live.addr)
+	second := newGatedRestartedManager(t, tuning, seen, strategies, silentA.addr, silentB.addr, live.addr)
 	conn, _, err := second.Connect(context.Background(), "")
 	if err != nil {
 		t.Fatalf("cycle two: %v", err)
