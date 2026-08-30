@@ -213,6 +213,14 @@ may well start after the client, and nftables matches the name once the device
 appears. A malformed prefix is a startup error: it cannot become correct later,
 and skipping it would leave you with a hole you believe is open.
 
+On a host with IPv6 forwarding on, the client says so at install time. What it
+says is narrow on purpose. The chain is hooked at `output`, which only sees
+packets the host originates, so IPv6 the host **forwards** for its LAN is not
+affected - a router keeps routing. What stops is the router's own outbound
+IPv6: DNS, updates, tunnel and monitoring traffic. The client also names any v6
+tunnel interface (`sit`, `wireguard`, `gre` and friends) that holds a global
+address and is not excepted, since that is the case worth acting on.
+
 Two things to know before flipping this on:
 
 - **Split tunnels change behaviour.** `dual` sends *all* IPv6 into the tunnel,

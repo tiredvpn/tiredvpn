@@ -28,6 +28,17 @@ Versions follow [Semantic Versioning](https://semver.org/).
   punched. Also available as `[tun] ipv6_allow` in the client TOML, so a unit
   configured entirely from a file can use it.
 
+- **The block now says what it is about to cut on a host that carries IPv6 of
+  its own.** At install time the client names any v6 tunnel interface (`sit`,
+  `wireguard`, `gre` and friends) that holds a global address and is not
+  excepted, with the flag that would spare it. On a host with
+  `net.ipv6.conf.all.forwarding=1` it adds what that does and does not mean:
+  the chain is hooked at `output`, which only sees locally originated packets,
+  so IPv6 the host *forwards* is not touched and a router keeps routing. What
+  stops is the router's own outbound IPv6 - DNS, updates, tunnel and
+  monitoring traffic. The block still goes in either way; the decision stays
+  with the operator.
+
 ## [1.8.2] - 2026-08-29
 
 ### Fixed

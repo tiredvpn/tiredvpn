@@ -327,6 +327,9 @@ func (t *TUNDevice) ApplyIPv6LeakBlock() {
 		log.Debug("IPv6 leak block re-asserted for %s (allow: %v %s)", t.name, allow, extra)
 		return
 	}
+	for _, w := range ipv6BlockWarnings(t.name, extra, readHostV6State()) {
+		log.Warn("%s", w)
+	}
 	log.Info("IPv6 leak block active: outbound IPv6 rejected except %s, %s, %s, %v and %q "+
 		"(the tunnel is not carrying IPv6; use -tun-ipv6=off to opt out). "+
 		"If the client is killed without cleanup, remove it with "+
