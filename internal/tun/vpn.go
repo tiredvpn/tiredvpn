@@ -202,6 +202,13 @@ type VPNConfig struct {
 	// against old exits — they ignore the unknown version.
 	IPv6Policy IPv6Policy
 
+	// IPv6Allow is the parsed -tun-ipv6-allow list: interfaces and destination
+	// prefixes the leak block must not touch. It exists because the block is a
+	// host-wide reject and the host may carry IPv6 the client knows nothing
+	// about — a 6in4 tunnel, another VPN, a routed prefix. Empty by default,
+	// which is the block as it shipped.
+	IPv6Allow IPv6AllowList
+
 	// DualStack is the pre-policy spelling of IPv6Policy == IPv6PolicyDual,
 	// kept for callers that have not moved over (macOS, benchmarks). Ignored
 	// when IPv6Policy is set to anything but its zero value.
@@ -315,6 +322,23 @@ func (cfg VPNConfig) ipv6PolicyOrLegacy() IPv6Policy {
 	return IPv6PolicyOff
 }
 
+// applyIPv6BlockConfig records everything the leak block is built from onto a
+// device we own: the policy that decides whether it goes in at all, the holes
+// for the client's own exits, and the operator's exceptions.
+//
+// Extracted from NewVPNClient because that function needs a real TUN and root,
+// while this is three field writes — and the interesting failure is a config
+// field that never reaches the device, which is exactly what a test of
+// NewVPNClient cannot check and a test of this can.
+func applyIPv6BlockConfig(dev *TUNDevice, cfg VPNConfig) {
+	dev.SetIPv6Policy(cfg.ipv6PolicyOrLegacy())
+	// The client's own transport addresses, one layer below the /128 bypass
+	// routes: the block rejects outbound v6, and the dial to an exit reached
+	// over IPv6 must not be caught by it.
+	dev.SetIPv6BlockAllow(serverIP6s(cfg))
+	dev.SetIPv6BlockAllowList(cfg.IPv6Allow)
+}
+
 // NewVPNClient creates a new VPN client
 func NewVPNClient(cfg VPNConfig) (*VPNClient, error) {
 	if cfg.MTU == 0 {
@@ -364,7 +388,7 @@ func NewVPNClient(cfg VPNConfig) (*VPNClient, error) {
 		// known. Only on interfaces we own — the fd branch above leaves the
 		// device at IPv6PolicyOff, because on Android VpnService owns both
 		// routing and filtering.
-		tunDev.SetIPv6Policy(cfg.ipv6PolicyOrLegacy())
+		applyIPv6BlockConfig(tunDev, cfg)
 		// Pin a bypass route for EVERY configured endpoint before configuring
 		// routes, so a full-tunnel default route does not loop the client's own
 		// server traffic - not for the current endpoint alone, because by the
@@ -378,9 +402,6 @@ func NewVPNClient(cfg VPNConfig) (*VPNClient, error) {
 			tunDev.SetServerBypassIPs(bypassIPs)
 			log.Debug("Server bypass: %d endpoint address(es) will be pinned", len(bypassIPs))
 		}
-		// Same addresses, one layer down: the IPv6 leak block rejects outbound
-		// v6, and the client's own transport must not be caught by it.
-		tunDev.SetIPv6BlockAllow(serverIP6s(cfg))
 		// Defer route installation (notably the 0.0.0.0/0 default route) until a
 		// real connection + handshake to the server succeeds. Configure brings
 		// the interface up and assigns its address, but leaves the host's normal

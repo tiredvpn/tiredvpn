@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/tiredvpn/tiredvpn/internal/client"
 	tomlcfg "github.com/tiredvpn/tiredvpn/internal/config/toml"
@@ -25,6 +26,8 @@ import (
 //   - [selection]                  → cfg.Selection
 //   - strategy.mode                → cfg.StrategyName
 //   - tls.fingerprint              → cfg.TLSFingerprint
+//   - tun.ipv6_allow               → cfg.TunIPv6Allow (joined back to the
+//     comma-separated form -tun-ipv6-allow uses)
 //   - shaper.{preset|custom}       → cfg.Shaper (built via presets.FromConfig)
 //   - logging.level                → log.SetDebug when "debug"
 //
@@ -48,6 +51,12 @@ func applyClientTOMLConfig(cfg *client.Config, path string, fs *flag.FlagSet) er
 	}
 	if tcfg.TLS.Fingerprint != "" {
 		cfg.TLSFingerprint = tcfg.TLS.Fingerprint
+	}
+	// Back to the flag's comma-separated form, which is what the runtime
+	// parses. The schema validated that no entry contains a comma, so the
+	// join round-trips.
+	if len(tcfg.Tun.IPv6Allow) > 0 {
+		cfg.TunIPv6Allow = strings.Join(tcfg.Tun.IPv6Allow, ",")
 	}
 	if tcfg.Logging.Level == "debug" {
 		log.SetDebug(true)

@@ -72,8 +72,13 @@ type v6BlockRule struct {
 //  4. ff00::/8          — multicast: RA/NS/MLD, mDNS, LLMNR
 //  5. <allow>/128       — the VPN server itself, so the transport can still
 //     reach an exit dialled over IPv6
-//  6. reject            — everything else, including all global unicast
-func ipv6BlockPlan(ifName string, allow []net.IP) []v6BlockRule {
+//  6. <extra>           — the operator's -tun-ipv6-allow exceptions, by
+//     outbound interface and by destination prefix
+//  7. reject            — everything else, including all global unicast
+//
+// The exceptions come last among the accepts on purpose: with an empty list the
+// plan is the one that shipped before the flag existed, rule for rule.
+func ipv6BlockPlan(ifName string, allow []net.IP, extra IPv6AllowList) []v6BlockRule {
 	rules := []v6BlockRule{
 		{Name: "accept " + loopbackIfName, Exprs: v6AcceptOifRule(loopbackIfName)},
 	}
@@ -103,6 +108,29 @@ func ipv6BlockPlan(ifName string, allow []net.IP) []v6BlockRule {
 		rules = append(rules, v6BlockRule{
 			Name:  "accept " + host.String(),
 			Exprs: v6AcceptDaddrRule(host),
+		})
+	}
+	// Operator exceptions. Both forms are already expressible: an interface is
+	// the same oifname match the tunnel's own accept uses, a prefix the same
+	// destination match as the server holes — the only thing the server holes
+	// could not express is a mask other than /128, which ParseIPv6AllowList
+	// hands over ready-made.
+	for _, iface := range extra.Interfaces {
+		if iface == "" {
+			continue
+		}
+		rules = append(rules, v6BlockRule{
+			Name:  "accept " + iface,
+			Exprs: v6AcceptOifRule(iface),
+		})
+	}
+	for _, pfx := range extra.Prefixes {
+		if pfx == nil {
+			continue
+		}
+		rules = append(rules, v6BlockRule{
+			Name:  "accept " + pfx.String(),
+			Exprs: v6AcceptDaddrRule(pfx),
 		})
 	}
 	return append(rules, v6BlockRule{Name: "reject", Exprs: v6RejectRule()})
@@ -139,11 +167,14 @@ func v6RejectRule() []expr.Any {
 	return []expr.Any{&expr.Reject{Type: nftRejectICMPUnreach, Code: icmp6AdminProhibited}}
 }
 
-// installIPv6LeakBlock creates (or replaces) the leak-block table for ifName.
-// The delete runs in its own flush first, mirroring installNAT6Rules, so
-// re-running after a reconnect replaces the rule set wholesale instead of
-// appending a second copy of every accept.
-func installIPv6LeakBlock(ifName string, allow []net.IP) error {
+// installIPv6LeakBlock creates (or replaces) the leak-block table for ifName
+// and fills its chain with plan. The delete runs in its own flush first,
+// mirroring installNAT6Rules, so re-running after a reconnect replaces the rule
+// set wholesale instead of appending a second copy of every accept.
+//
+// It takes the finished plan rather than the inputs it is built from, so the
+// caller's plan and the installed plan cannot be two different things.
+func installIPv6LeakBlock(ifName string, plan []v6BlockRule) error {
 	if delConn, err := nftables.New(); err == nil {
 		delConn.DelTable(&nftables.Table{Family: nftables.TableFamilyIPv6, Name: v6BlockTableName(ifName)})
 		_ = delConn.Flush()
@@ -169,7 +200,7 @@ func installIPv6LeakBlock(ifName string, allow []net.IP) error {
 		Priority: nftables.ChainPriorityFilter,
 		Policy:   chainPolicyAcceptPtr(),
 	})
-	for _, r := range ipv6BlockPlan(ifName, allow) {
+	for _, r := range plan {
 		conn.AddRule(&nftables.Rule{Table: tbl, Chain: chain, Exprs: r.Exprs})
 	}
 
@@ -211,11 +242,40 @@ func (t *TUNDevice) SetIPv6BlockAllow(ips []net.IP) {
 	t.bypassMu.Unlock()
 }
 
+// SetIPv6BlockAllowList records the operator's -tun-ipv6-allow exceptions:
+// interfaces and destination prefixes that keep working while the block is up.
+// Unlike SetIPv6BlockAllow, which the client computes from its own endpoints,
+// this list is configuration — the host has IPv6 of its own (a 6in4 tunnel,
+// another VPN, a routed prefix) that the block must not take down.
+func (t *TUNDevice) SetIPv6BlockAllowList(a IPv6AllowList) {
+	t.bypassMu.Lock()
+	t.v6BlockAllowList = a
+	t.bypassMu.Unlock()
+}
+
 // blockAllow returns a copy of the allow list under the lock.
 func (t *TUNDevice) blockAllow() []net.IP {
 	t.bypassMu.Lock()
 	defer t.bypassMu.Unlock()
 	return append([]net.IP(nil), t.v6BlockAllow...)
+}
+
+// blockAllowList returns the operator exceptions under the lock. The slices
+// inside are not copied: nothing mutates them after ParseIPv6AllowList built
+// them.
+func (t *TUNDevice) blockAllowList() IPv6AllowList {
+	t.bypassMu.Lock()
+	defer t.bypassMu.Unlock()
+	return t.v6BlockAllowList
+}
+
+// v6BlockPlan is the rule set this device would install right now. Everything
+// that decides the chain's content goes through here — the server holes, the
+// operator exceptions and the interface name — so a test can ask what the
+// device will actually do instead of what ipv6BlockPlan does when called with
+// hand-picked arguments.
+func (t *TUNDevice) v6BlockPlan() []v6BlockRule {
+	return ipv6BlockPlan(t.name, t.blockAllow(), t.blockAllowList())
 }
 
 // setV6BlockInstalled records the block's state and returns the previous one.
@@ -257,20 +317,22 @@ func (t *TUNDevice) ApplyIPv6LeakBlock() {
 		return
 	}
 	allow := t.blockAllow()
-	if err := installIPv6LeakBlock(t.name, allow); err != nil {
+	extra := t.blockAllowList()
+	if err := installIPv6LeakBlock(t.name, t.v6BlockPlan()); err != nil {
 		log.Error("IPv6 leak block: failed to install nftables rules: %v; "+
 			"IPv6 traffic may leave outside the tunnel", err)
 		return
 	}
 	if t.setV6BlockInstalled(true) {
-		log.Debug("IPv6 leak block re-asserted for %s (allow: %v)", t.name, allow)
+		log.Debug("IPv6 leak block re-asserted for %s (allow: %v %s)", t.name, allow, extra)
 		return
 	}
-	log.Info("IPv6 leak block active: outbound IPv6 rejected except %s, %s, %s and %v "+
+	log.Info("IPv6 leak block active: outbound IPv6 rejected except %s, %s, %s, %v and %q "+
 		"(the tunnel is not carrying IPv6; use -tun-ipv6=off to opt out). "+
 		"If the client is killed without cleanup, remove it with "+
 		"'nft delete table ip6 %s'",
-		loopbackIfName, ipv6BlockLinkLocalNet, ipv6BlockMulticastNet, allow, v6BlockTableName(t.name))
+		loopbackIfName, ipv6BlockLinkLocalNet, ipv6BlockMulticastNet, allow, extra,
+		v6BlockTableName(t.name))
 }
 
 // RemoveIPv6LeakBlock takes the block down. Failures are loud: a table left

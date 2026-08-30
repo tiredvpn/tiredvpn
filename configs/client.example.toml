@@ -62,6 +62,16 @@ port = 443
 # health_check = "off"   # off | active
 # recheck_interval = "5m"
 
+# --- Tunnel: exceptions to the IPv6 leak block ---
+# With -tun-ipv6 at its default (dual), an exit that cannot carry IPv6 makes
+# the client reject outbound IPv6 host-wide, so it cannot leave around the
+# tunnel. List here anything that must keep working: an interface name, an
+# IPv6 prefix, or a single address. Same as -tun-ipv6-allow, which replaces
+# this list when passed.
+#
+# [tun]
+# ipv6_allow = ["he6", "2001:db8:77b::/64"]
+
 [strategy]
 # TLS-mimicry transport. Options: reality, grpc, morph, ...
 # Optional: omit it (or leave it empty) to let the client pick a strategy.

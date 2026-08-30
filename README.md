@@ -277,6 +277,10 @@ what a split tunnel usually wants - `dual` sends *all* IPv6 into the tunnel,
 including destinations you deliberately routed around it on IPv4. The blocking
 half is Linux-only; on macOS it warns instead.
 
+If the host carries IPv6 of its own - a 6in4 tunnel, another VPN, a routed
+prefix - name it with `-tun-ipv6-allow he6,2001:db8::/32` (interface names,
+prefixes, or both) and the block leaves it alone.
+
 ---
 
 ## Configuration
@@ -351,6 +355,7 @@ Generate the B1 key pair with `tiredvpn reality-keygen`.
 | `-tun` | `false` | Enable TUN mode (full VPN) |
 | `-tun-routes` | | Routes to tunnel (e.g. `0.0.0.0/0`) |
 | `-tun-ipv6` | `dual` | IPv6 while the tunnel is up: `dual`, `block`, `off` |
+| `-tun-ipv6-allow` | | Exceptions to the IPv6 block: interface names and/or prefixes, comma-separated |
 | `-tun-mtu` | `1280` | TUN MTU; with `-auto-mtu` this is the upper bound |
 | `-auto-mtu` | `true` | Probe the real end-to-end MTU and apply `min(probed, -tun-mtu)` |
 | `-quic` | `false` | Enable QUIC transport |

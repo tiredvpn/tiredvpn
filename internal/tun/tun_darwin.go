@@ -97,6 +97,10 @@ func (t *TUNDevice) SetIPv6Policy(p IPv6Policy) {
 // in. Present so the platform-independent caller in vpn.go needs no build tag.
 func (t *TUNDevice) SetIPv6BlockAllow([]net.IP) {}
 
+// SetIPv6BlockAllowList is a no-op on macOS for the same reason: -tun-ipv6-allow
+// describes exceptions to a block that is not implemented here.
+func (t *TUNDevice) SetIPv6BlockAllowList(IPv6AllowList) {}
+
 // ApplyIPv6LeakBlock is not implemented on macOS. The Linux block is an
 // nftables chain, which has no counterpart here — the equivalent would be a
 // pf anchor, which means owning /etc/pf.conf state that the OS and other VPN

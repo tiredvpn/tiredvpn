@@ -135,6 +135,7 @@ Defaults are `failure_threshold=2`, `cooldown=1m`, `max_cooldown=30m`,
 | `-auto-mtu` | `true` | Probe the real end-to-end MTU and apply `min(probed, -tun-mtu)`; floor 1280 |
 | `-tun-routes` | | Comma-separated CIDRs to route through VPN |
 | `-tun-ipv6` | `dual` | What happens to IPv6 while the tunnel is up: `dual`, `block`, `off` |
+| `-tun-ipv6-allow` | | Exceptions to that block: comma-separated interface names and/or IPv6 prefixes that keep working |
 | `-tun-fd` | `-1` | Use an existing TUN file descriptor (Android VpnService) |
 
 An MTU outside 1280-9000 is a startup error, whether it came from the flag or
@@ -187,6 +188,30 @@ Platform coverage: Linux only. On macOS the blocking half is not implemented
 and the client warns once per session. On Android filtering belongs to
 `VpnService`, and the block is skipped because the client does not own the
 interface.
+
+##### Exceptions: `-tun-ipv6-allow`
+
+The block is host-wide, and a host may carry IPv6 the client knows nothing
+about. A node holding a Hurricane Electric 6in4 tunnel lost its IPv6 to exactly
+this: four clients came up with the default `dual`, none of their exits could
+carry IPv6, and each installed a block whose final reject swallowed everything
+leaving through `he6`. The interface stayed up and kept its address, which is
+what made it look like a routing fault.
+
+`-tun-ipv6-allow` takes a comma-separated list. An entry is either an interface
+name or an IPv6 prefix (a bare address counts as its `/128`), and each one
+becomes an accept rule ahead of the final reject:
+
+```bash
+-tun-ipv6-allow he6
+-tun-ipv6-allow he6,2001:db8:77b::/64
+-tun-ipv6-allow 2001:db8:77b::2
+```
+
+An interface that does not exist is accepted without complaint - a tunnel unit
+may well start after the client, and nftables matches the name once the device
+appears. A malformed prefix is a startup error: it cannot become correct later,
+and skipping it would leave you with a hole you believe is open.
 
 Two things to know before flipping this on:
 
@@ -435,6 +460,7 @@ which is what the bare `-strategy` default does.
 | `[tls]` | `ca_cert` | string | accepted, not yet read by the runtime |
 | `[tls]` | `insecure_skip_verify` | bool | accepted, not yet read by the runtime |
 | `[logging]` | `level` | string | only `"debug"` acts on anything - it turns on debug logging, as `-debug` does |
+| `[tun]` | `ipv6_allow` | array | same as `-tun-ipv6-allow`; one interface name or IPv6 prefix per entry |
 | `[logging]` | `format` | string | accepted, not yet read by the runtime |
 | `[logging]` | `output` | string | accepted, not yet read by the runtime |
 
@@ -442,11 +468,23 @@ which is what the bare `-strategy` default does.
 consumes it. It is listed rather than hidden so a config that sets it is not
 mistaken for a config that changes behaviour.
 
-The TUN, port-hopping, ECH, post-quantum, benchmarking and monitoring knobs
-have no TOML keys at all and stay command-line only - including `-tun-ipv6`,
-whose default therefore applies to a TOML-only client too. See the
-[migration guide](../internal/config/toml/MIGRATION.md) for the field-by-field
-table.
+The port-hopping, ECH, post-quantum, benchmarking and monitoring knobs have no
+TOML keys at all and stay command-line only. So do the TUN knobs, with one
+exception: `[tun] ipv6_allow`, which a pooled unit configured entirely from a
+file would otherwise have no way to set. `-tun-ipv6` itself is still
+command-line only, so its default applies to a TOML-only client - and a file
+that lists exceptions describes exceptions to whatever the unit's command line
+asked for. See the [migration guide](../internal/config/toml/MIGRATION.md) for
+the field-by-field table.
+
+```toml
+[tun]
+ipv6_allow = ["he6", "2001:db8:77b::/64"]
+```
+
+Passing `-tun-ipv6-allow` replaces this list rather than adding to it: "except
+these" is one statement, and a command line that has to know what the file
+already said is not an override.
 
 ### Several servers
 

@@ -27,6 +27,7 @@ default: loading fails and the error names the key and its position.
 | `--prefer-ipv6` / `--fallback-v4` | `[selection] family`       | `true`+`true` → `prefer_v6`, `true`+`false` → `v6_only`, `false` → `v4_only` for any fallback |
 | `--strategy=NAME`             | `[strategy] mode`              | optional; empty means the client picks |
 | `--tls-fingerprint=NAME`      | `[tls] fingerprint`            | **exception to the precedence rule**: a non-empty key in the file overwrites the flag |
+| `--tun-ipv6-allow=LIST`       | `[tun] ipv6_allow`             | comma-separated flag, one entry per array element in the file; the flag replaces the list, it does not extend it |
 | `--shaper=NAME`               | `[shaper] preset`              | an explicit `--shaper` is applied after TOML and wins |
 | `--shaper-seed=N`             | `[shaper] seed`                | the flag is read only alongside `--shaper`; the file's `seed` belongs to `[shaper]` |
 | `--debug`                     | `[logging] level = "debug"`    | flag forces level only when `true`; no other level value does anything yet |
@@ -72,9 +73,10 @@ yet: a server config that omits them fails validation.
 ## Flags with no TOML key
 
 Everything not in the tables above is still read straight from the FlagSet by
-`cmd/tiredvpn`: `--listen` and `--secret` on the client, the whole `--tun-*`
-family (including `--tun-ipv6`, whose default of `dual` therefore applies to a
-TOML-only client as well), port hopping, ECH, post-quantum, REALITY B1,
+`cmd/tiredvpn`: `--listen` and `--secret` on the client, the `--tun-*` family
+except `--tun-ipv6-allow` (`--tun-ipv6` itself included, so its default of
+`dual` applies to a TOML-only client as well), port hopping, ECH,
+post-quantum, REALITY B1,
 burst-reshape, benchmarking, `--api-addr`, `--pprof`, `--list`. They will be
 migrated in follow-up issues.
 

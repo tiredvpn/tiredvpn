@@ -209,3 +209,41 @@ func TestCollapseServers(t *testing.T) {
 		t.Errorf("collapsing an empty list = %+v, want nil", got)
 	}
 }
+
+// TestApplyClientTOMLConfig_TunIPv6Allow is the last hop of the exception list:
+// the [tun] block has to arrive in client.Config in the comma-separated form
+// the runtime parses. A schema key nobody copies over is a key that does
+// nothing, which is indistinguishable from a typo in the file.
+func TestApplyClientTOMLConfig_TunIPv6Allow(t *testing.T) {
+	path := writeClientTOML(t, `
+[server]
+address = "203.0.113.10"
+port = 443
+
+[tun]
+ipv6_allow = ["he6", "2001:db8:77b::/64"]
+`)
+	cfg := &client.Config{}
+	if err := applyClientTOMLConfig(cfg, path, clientFlagSetForTOML()); err != nil {
+		t.Fatalf("applyClientTOMLConfig: %v", err)
+	}
+	if want := "he6,2001:db8:77b::/64"; cfg.TunIPv6Allow != want {
+		t.Errorf("cfg.TunIPv6Allow = %q, want %q", cfg.TunIPv6Allow, want)
+	}
+}
+
+// TestApplyClientTOMLConfig_TunIPv6AllowAbsent: a file that says nothing must
+// not clear a list the command line already put there.
+func TestApplyClientTOMLConfig_TunIPv6AllowAbsent(t *testing.T) {
+	path := writeClientTOML(t, `
+[server]
+address = "203.0.113.10"
+`)
+	cfg := &client.Config{TunIPv6Allow: "he6"}
+	if err := applyClientTOMLConfig(cfg, path, clientFlagSetForTOML()); err != nil {
+		t.Fatalf("applyClientTOMLConfig: %v", err)
+	}
+	if cfg.TunIPv6Allow != "he6" {
+		t.Errorf("cfg.TunIPv6Allow = %q, want the CLI value to survive a silent file", cfg.TunIPv6Allow)
+	}
+}
