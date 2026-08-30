@@ -74,8 +74,14 @@ type Config struct {
 
 	// TunIPv6Policy is the -tun-ipv6 value ("off" default, "dual" to route
 	// IPv6 through the tunnel when the exit negotiates dual-stack). Parsed
-	// via tun.ParseIPv6Policy in runTUNMode.
+	// via tun.ParseIPv6Policy in newTUNVPNConfig.
 	TunIPv6Policy string
+
+	// TunIPv6Allow is the -tun-ipv6-allow value: a comma-separated list of
+	// interface names and IPv6 prefixes the leak block must leave alone, in
+	// the same raw form TunRoutes has. Parsed via tun.ParseIPv6AllowList in
+	// newTUNVPNConfig. Empty means no exceptions, the historical behaviour.
+	TunIPv6Allow string
 
 	// Host-supplied TUN integration (Android VpnService / macOS NetworkExtension).
 	// In both modes the TUN fd is created by the host and passed in via TunFd;
@@ -774,9 +780,13 @@ func sendReconnectHandshake(conn net.Conn, currentIP net.IP, mtu int, dualStack 
 	return serverIP, assignedIP, serverIP6, assignedIP6, nil
 }
 
-func runTUNMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) error {
-	log.Info("Starting TUN mode")
-
+// newTUNVPNConfig maps the client config onto the TUN layer's VPNConfig.
+//
+// Its own function rather than a block inside runTUNMode because everything it
+// does is a mapping that can be wrong quietly: a flag parsed correctly and then
+// not carried into the struct behaves exactly like a flag that was never
+// passed.
+func newTUNVPNConfig(cfg *Config, mgr *strategy.Manager) (tun.VPNConfig, error) {
 	// IPv6 policy: dual (the default) opts into the v0x04 dual-stack handshake
 	// and blocks outbound IPv6 when the exit declines it; off keeps the tunnel
 	// v4-only and leaves host IPv6 alone. Empty means the flag was never set -
@@ -788,7 +798,15 @@ func runTUNMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) erro
 	}
 	policy, err := tun.ParseIPv6Policy(ipv6Policy)
 	if err != nil {
-		return err
+		return tun.VPNConfig{}, err
+	}
+
+	// Exceptions to that block. A bad prefix here fails the start: it can only
+	// be a typo, and a client that ran anyway would leave the operator with a
+	// hole they believe is open.
+	ipv6Allow, err := tun.ParseIPv6AllowList(cfg.TunIPv6Allow)
+	if err != nil {
+		return tun.VPNConfig{}, err
 	}
 
 	// Parse routes
@@ -797,14 +815,13 @@ func runTUNMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) erro
 		routes = append(routes, splitRoutes(cfg.TunRoutes)...)
 	}
 
-	// Create VPN client
 	// Handle "auto" TunIP for Android VpnService
 	localIP := net.ParseIP(cfg.TunIP)
 	if localIP == nil && cfg.TunIP == "auto" {
 		localIP = net.ParseIP("10.8.0.2") // Default client IP
 	}
 
-	vpnCfg := tun.VPNConfig{
+	return tun.VPNConfig{
 		TunName:  cfg.TunName,
 		MTU:      cfg.TunMTU,
 		LocalIP:  localIP,
@@ -825,8 +842,18 @@ func runTUNMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) erro
 		// "dual or not" silently turns -tun-ipv6 block into off, since block
 		// negotiates nothing and would be indistinguishable from it.
 		IPv6Policy:  policy,
+		IPv6Allow:   ipv6Allow,
 		TunFd:       cfg.TunFd,       // Android VpnService TUN fd
 		ProtectPath: cfg.ProtectPath, // Android socket protection path
+	}, nil
+}
+
+func runTUNMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) error {
+	log.Info("Starting TUN mode")
+
+	vpnCfg, err := newTUNVPNConfig(cfg, mgr)
+	if err != nil {
+		return err
 	}
 
 	vpnClient, err := tun.NewVPNClient(vpnCfg)
@@ -877,8 +904,8 @@ func runTUNMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) erro
 	// echoed back the requested one. Which of the two gets printed is decided
 	// inside logVPNStarted, where a test can hold it to the assigned one.
 	logVPNStarted(cfg, vpnClient)
-	if len(routes) > 0 {
-		log.Info("Routes: %v", routes)
+	if len(vpnCfg.Routes) > 0 {
+		log.Info("Routes: %v", vpnCfg.Routes)
 	}
 
 	// Initialize metrics if API addr is configured (TUN mode, no pool yet)

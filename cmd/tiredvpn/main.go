@@ -317,6 +317,14 @@ TUN MODE (Full VPN):
         Note for split tunnels: dual sends ALL IPv6 into the tunnel, including
         destinations deliberately routed around it on IPv4. Linux only; on
         macOS the blocking half is not implemented and warns.
+  -tun-ipv6-allow string
+        Exceptions to that block, comma-separated. An entry is either an
+        interface name (he6) or an IPv6 prefix or address
+        (2001:db8:77b::/64), and gets an accept rule ahead of the final
+        reject. For a host with IPv6 of its own the client knows nothing
+        about: a 6in4 tunnel, another VPN, a routed prefix. An interface that
+        does not exist yet is accepted (it may appear later); a malformed
+        prefix is a startup error.
   -tun-fd int
         Use existing TUN file descriptor - for Android VpnService (default -1)
 
@@ -646,6 +654,7 @@ func runClient(args []string) {
 	fs.BoolVar(&cfg.AutoMTU, "auto-mtu", true, "Actively probe the real end-to-end MTU and apply min(probed, -tun-mtu); floor 1280")
 	fs.StringVar(&cfg.TunRoutes, "tun-routes", "", "Routes to add (comma-separated, e.g. '0.0.0.0/0' for full tunnel)")
 	fs.StringVar(&cfg.TunIPv6Policy, "tun-ipv6", tun.DefaultIPv6Policy, "IPv6 while the tunnel is up: dual (route it through the tunnel, rejecting it when the exit cannot carry it), block (reject it without asking the exit), off (IPv4-only tunnel, host IPv6 bypasses the VPN)")
+	fs.StringVar(&cfg.TunIPv6Allow, "tun-ipv6-allow", "", "Exceptions to the IPv6 block (comma-separated): interface names (he6) and/or IPv6 prefixes or addresses (2001:db8:77b::/64) that keep working while the block is up")
 
 	// Android VpnService flags
 	fs.IntVar(&cfg.TunFd, "tun-fd", -1, "Use existing TUN file descriptor (for Android VpnService)")

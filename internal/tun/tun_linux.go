@@ -97,7 +97,11 @@ type TUNDevice struct {
 	// server's own transport addresses). Guarded by bypassMu, like the bypass
 	// state it mirrors.
 	v6BlockAllow []net.IP
-	bypassMu     sync.Mutex
+	// v6BlockAllowList are the operator's -tun-ipv6-allow exceptions: host
+	// interfaces and destination prefixes the block must leave alone. Same
+	// lock, same lifetime; set from VPNConfig before Configure.
+	v6BlockAllowList IPv6AllowList
+	bypassMu         sync.Mutex
 
 	// deferRoutes, when true, makes Configure bring the interface up and assign
 	// the tunnel address but NOT install the route set (notably a 0.0.0.0/0

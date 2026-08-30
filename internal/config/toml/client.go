@@ -15,6 +15,12 @@ type ClientConfig struct {
 	TLS      ClientTLS      `toml:"tls"`
 	Logging  Logging        `toml:"logging"`
 
+	// Tun holds the tunnel settings that have to survive in a config file
+	// rather than a command line. Most -tun-* flags are still CLI-only; this
+	// block exists for the ones a pooled, file-configured unit cannot do
+	// without.
+	Tun ClientTun `toml:"tun"`
+
 	// Selection tunes how the client picks among the servers above. It is a
 	// pointer so "absent" is distinguishable from "all zero": absent means the
 	// legacy CLI flags decide, all-zero would mean the same but says it
@@ -57,6 +63,41 @@ type ClientServer struct {
 // does not: it is the default that DefaultClient() puts there.
 func (s ClientServer) hasAddress() bool {
 	return s.Address != "" || s.AddressV6 != ""
+}
+
+// ClientTun is the [tun] block.
+type ClientTun struct {
+	// IPv6Allow lists exceptions to the IPv6 leak block: interface names
+	// ("he6") and/or IPv6 prefixes and addresses
+	// ("2001:db8:77b::/64"). It is a list rather than the flag's
+	// comma-separated string because a TOML file has arrays and nothing is
+	// gained by making the reader split one by eye; the runtime joins it back
+	// into the flag's form, which is why entries must not contain a comma
+	// (neither an interface name nor an IPv6 prefix ever does).
+	//
+	// The block itself has no key here: -tun-ipv6 stays CLI-only, so a file
+	// that only lists exceptions describes exceptions to whatever the unit's
+	// command line asked for.
+	IPv6Allow []string `toml:"ipv6_allow,omitempty"`
+}
+
+// validate checks only what is a property of this representation: the entries
+// are joined with commas on the way to the runtime, so a comma inside one would
+// silently become two exceptions, and an empty entry would become none.
+//
+// What an entry MEANS - interface name, prefix, or nonsense - is decided by
+// tun.ParseIPv6AllowList at startup, in one place, for the flag and the file
+// alike. Re-deciding it here would give the two forms two chances to disagree.
+func (t ClientTun) validate() error {
+	for i, entry := range t.IPv6Allow {
+		if strings.Contains(entry, ",") {
+			return fmt.Errorf("tun.ipv6_allow[%d]: %q contains a comma; put each interface or prefix in its own list entry", i, entry)
+		}
+		if strings.TrimSpace(entry) == "" {
+			return fmt.Errorf("tun.ipv6_allow[%d] is empty", i)
+		}
+	}
+	return nil
 }
 
 // Selection is the [selection] block: which server to dial and when to give up
@@ -298,6 +339,10 @@ func (c *ClientConfig) Validate() error {
 	// manager pick", which is the default of the -strategy flag and the only
 	// sane setting for a censorship-resistant client. Demanding it here made
 	// automatic strategy selection unreachable from a config file.
+
+	if err := c.Tun.validate(); err != nil {
+		return err
+	}
 
 	if _, err := c.Selection.Resolve(); err != nil {
 		return err

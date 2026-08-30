@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 
 	"github.com/tiredvpn/tiredvpn/internal/endpoint"
 	"github.com/tiredvpn/tiredvpn/internal/log"
@@ -23,6 +24,7 @@ import (
 //	-prefer-ipv6   → selection.family (with -fallback-v4; see familyFromLegacyFlags)
 //	-fallback-v4   → selection.family
 //	-strategy      → strategy.mode
+//	-tun-ipv6-allow → tun.ipv6_allow (comma-separated → list)
 //	-debug         → logging.level = "debug" (when true)
 //
 // Flags absent from this mapping are ignored — they belong to subsystems
@@ -65,6 +67,11 @@ func ApplyClientFlags(cfg *ClientConfig, fs *flag.FlagSet) error {
 			}
 		case "server-policy":
 			cfg.selection().Policy = f.Value.String()
+		case "tun-ipv6-allow":
+			// The flag replaces the file's list rather than adding to it:
+			// "except these" is one statement, and a command line that has to
+			// know what the file already said is not an override.
+			cfg.Tun.IPv6Allow = splitCommaList(f.Value.String())
 		case "strategy":
 			cfg.Strategy.Mode = f.Value.String()
 		case "debug":
@@ -293,6 +300,11 @@ func mergeClient(dst, src *ClientConfig) {
 	if src.Shaper != nil {
 		dst.Shaper = src.Shaper
 	}
+	// Atomic, like the server list and ALPN: an exception list half from the
+	// defaults and half from the file is not something a reader could predict.
+	if len(src.Tun.IPv6Allow) > 0 {
+		dst.Tun.IPv6Allow = src.Tun.IPv6Allow
+	}
 	if src.TLS.ServerName != "" {
 		dst.TLS.ServerName = src.TLS.ServerName
 	}
@@ -361,6 +373,19 @@ func mergeLogging(dst, src *Logging) {
 	if src.Output != "" {
 		dst.Output = src.Output
 	}
+}
+
+// splitCommaList turns a comma-separated flag value into the list form the
+// schema stores, dropping empty entries and surrounding whitespace so that
+// "he6, 2001:db8::/64" and "he6,2001:db8::/64" are the same two exceptions.
+func splitCommaList(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 // splitHostPort accepts "host:port" or bare ":port" and returns parts.

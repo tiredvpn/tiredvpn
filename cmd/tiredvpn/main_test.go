@@ -240,3 +240,17 @@ func TestClientHelpIPv6Default(t *testing.T) {
 		}
 	}
 }
+
+// TestClientHelpIPv6Allow keeps the hand-written help in step with the
+// -tun-ipv6-allow flag. The help is the only place the flag's two accepted
+// forms are spelled out, and it is a raw string literal nothing else reads.
+func TestClientHelpIPv6Allow(t *testing.T) {
+	if !strings.Contains(clientHelpText, "-tun-ipv6-allow string") {
+		t.Fatal("client help does not document -tun-ipv6-allow at all")
+	}
+	for _, want := range []string{"interface name", "prefix"} {
+		if !strings.Contains(clientHelpText, want) {
+			t.Errorf("client help does not describe the %q form of -tun-ipv6-allow", want)
+		}
+	}
+}
