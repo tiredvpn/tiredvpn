@@ -2,13 +2,13 @@
 
 Helm chart for deploying [tiredvpn](https://github.com/tiredvpn/tiredvpn-oss) — DPI-resistant VPN — on Kubernetes. The chart can deploy the server (exit node) and/or the client (SOCKS5 proxy or TUN tunnel) from a single release.
 
-Chart version 0.3.7, `appVersion` 1.8.2.
+Chart version 0.3.8, `appVersion` 1.9.0.
 
 ## Install
 
 ```bash
 helm install my-tiredvpn oci://ghcr.io/tiredvpn/charts/tiredvpn \
-  --version 0.3.7 -f my-values.yaml
+  --version 0.3.8 -f my-values.yaml
 ```
 
 Or from a local checkout:
@@ -185,7 +185,7 @@ auth on the management API), `-max-conns`, `-node-max-clients`,
 
 ## Known limitations
 
-Verified against the templates and `values.yaml` at chart 0.3.7. Each of these
+Verified against the templates and `values.yaml` at chart 0.3.8. Each of these
 is a chart gap, not a binary bug.
 
 - **`/health` probes without Redis never pass.** `server.config.api.enabled`
@@ -224,7 +224,7 @@ helm template my-release deploy/helm/tiredvpn -f deploy/helm/tiredvpn/ci/server-
 
 - Helm: 3.8+
 - Kubernetes: 1.25+ (uses `policy/v1` PDB, `autoscaling/v2` HPA, `networking.k8s.io/v1` NetworkPolicy)
-- tiredvpn: `appVersion` in Chart.yaml, currently `1.8.2`. CI keeps it in step with the application release — a stable `v*` tag bumps `appVersion` to that version and patch-bumps the chart `version`.
+- tiredvpn: `appVersion` in Chart.yaml, currently `1.9.0`. CI keeps it in step with the application release — a stable `v*` tag bumps `appVersion` to that version and patch-bumps the chart `version`.
 
 ## License
 

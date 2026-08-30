@@ -7,6 +7,8 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-08-30
+
 ### Added
 
 - **`-tun-ipv6-allow`: exceptions to the IPv6 leak block.** A node holding a
