@@ -83,6 +83,13 @@ type Config struct {
 	// newTUNVPNConfig. Empty means no exceptions, the historical behaviour.
 	TunIPv6Allow string
 
+	// TunRoutes6 is the -tun-routes6 value: which IPv6 destinations the tunnel
+	// claims once dual-stack is negotiated, in the same raw comma-separated
+	// form TunRoutes has, plus the literal "none" for no destination at all.
+	// Empty means the ::/1 + 8000::/1 half-defaults, the historical behaviour.
+	// Parsed via tun.ParseIPv6Routes in newTUNVPNConfig.
+	TunRoutes6 string
+
 	// Host-supplied TUN integration (Android VpnService / macOS NetworkExtension).
 	// In both modes the TUN fd is created by the host and passed in via TunFd;
 	// the host (not Go) also owns route/DNS/firewall setup.
@@ -809,6 +816,20 @@ func newTUNVPNConfig(cfg *Config, mgr *strategy.Manager) (tun.VPNConfig, error) 
 		return tun.VPNConfig{}, err
 	}
 
+	// Which IPv6 destinations the tunnel claims. Only dual-stack installs any,
+	// so naming them under a policy that never negotiates IPv6 is a
+	// contradiction the operator cannot discover at runtime — the flag would
+	// simply do nothing — and it is refused here rather than ignored.
+	ipv6Routes, err := tun.ParseIPv6Routes(cfg.TunRoutes6)
+	if err != nil {
+		return tun.VPNConfig{}, err
+	}
+	if ipv6Routes.OperatorManaged() && policy != tun.IPv6PolicyDual {
+		return tun.VPNConfig{}, fmt.Errorf(
+			"-tun-routes6 needs -tun-ipv6=dual: under %q the tunnel never carries IPv6, so there is nothing to route into it",
+			policy)
+	}
+
 	// Parse routes
 	var routes []string
 	if cfg.TunRoutes != "" {
@@ -843,6 +864,7 @@ func newTUNVPNConfig(cfg *Config, mgr *strategy.Manager) (tun.VPNConfig, error) 
 		// negotiates nothing and would be indistinguishable from it.
 		IPv6Policy:  policy,
 		IPv6Allow:   ipv6Allow,
+		IPv6Routes:  ipv6Routes,
 		TunFd:       cfg.TunFd,       // Android VpnService TUN fd
 		ProtectPath: cfg.ProtectPath, // Android socket protection path
 	}, nil

@@ -209,6 +209,13 @@ type VPNConfig struct {
 	// which is the block as it shipped.
 	IPv6Allow IPv6AllowList
 
+	// IPv6Routes is the parsed -tun-routes6 spec: which IPv6 destinations the
+	// tunnel claims once dual-stack is negotiated. The zero value is the
+	// ::/1 + 8000::/1 half-defaults, i.e. the full tunnel issue #55 asks for.
+	// Setting it hands IPv6 routing policy back to the operator, which also
+	// takes the blanket leak block out of play — see IPv6RouteSpec.
+	IPv6Routes IPv6RouteSpec
+
 	// DualStack is the pre-policy spelling of IPv6Policy == IPv6PolicyDual,
 	// kept for callers that have not moved over (macOS, benchmarks). Ignored
 	// when IPv6Policy is set to anything but its zero value.
@@ -337,6 +344,10 @@ func applyIPv6BlockConfig(dev *TUNDevice, cfg VPNConfig) {
 	// over IPv6 must not be caught by it.
 	dev.SetIPv6BlockAllow(serverIP6s(cfg))
 	dev.SetIPv6BlockAllowList(cfg.IPv6Allow)
+	// The route spec belongs here rather than next to Configure: it decides
+	// what EnableDualStack installs *and* whether the block applies at all, so
+	// it has to be on the device before either is consulted.
+	dev.SetIPv6Routes(cfg.IPv6Routes)
 }
 
 // NewVPNClient creates a new VPN client

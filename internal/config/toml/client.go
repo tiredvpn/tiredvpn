@@ -79,6 +79,17 @@ type ClientTun struct {
 	// that only lists exceptions describes exceptions to whatever the unit's
 	// command line asked for.
 	IPv6Allow []string `toml:"ipv6_allow,omitempty"`
+
+	// Routes6 is -tun-routes6: which IPv6 destinations the tunnel claims once
+	// dual-stack is negotiated. A list of prefixes, or the single entry "none"
+	// for no destination at all — which is not the same as an absent key, and
+	// cannot be spelled as an empty array for exactly that reason: omitempty
+	// makes `routes6 = []` and no routes6 the same bytes, while they mean
+	// opposite things (nothing versus the ::/1 + 8000::/1 full tunnel).
+	//
+	// Joined back into the flag's comma-separated form by the runtime, so the
+	// same comma rule as IPv6Allow applies.
+	Routes6 []string `toml:"routes6,omitempty"`
 }
 
 // validate checks only what is a property of this representation: the entries
@@ -95,6 +106,19 @@ func (t ClientTun) validate() error {
 		}
 		if strings.TrimSpace(entry) == "" {
 			return fmt.Errorf("tun.ipv6_allow[%d] is empty", i)
+		}
+	}
+	for i, entry := range t.Routes6 {
+		if strings.Contains(entry, ",") {
+			return fmt.Errorf("tun.routes6[%d]: %q contains a comma; put each prefix in its own list entry", i, entry)
+		}
+		if strings.TrimSpace(entry) == "" {
+			return fmt.Errorf("tun.routes6[%d] is empty", i)
+		}
+		// "none" is a statement about the whole list, not a destination, so a
+		// list that mixes it with prefixes says two contradictory things.
+		if strings.TrimSpace(entry) == "none" && len(t.Routes6) > 1 {
+			return fmt.Errorf(`tun.routes6: "none" claims no destination at all, so it cannot appear alongside %d other entr(y/ies)`, len(t.Routes6)-1)
 		}
 	}
 	return nil

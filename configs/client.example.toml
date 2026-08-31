@@ -72,6 +72,21 @@ port = 443
 # [tun]
 # ipv6_allow = ["he6", "2001:db8:77b::/64"]
 
+# --- Tunnel: which IPv6 destinations the tunnel claims ---
+# The v6 counterpart of -tun-routes. Left out, dual installs ::/1 + 8000::/1,
+# which cover every IPv6 address and beat the host's own default route on
+# prefix length - the full tunnel a laptop wants. On a node that carries IPv6
+# of its own, say ["none"]: the tunnel still gets a v6 address, but claims no
+# destination, and you route into it from your own tables the way you already
+# do for IPv4. A prefix list works too. Setting this also disables the blanket
+# IPv6 leak block, which only makes sense while the tunnel claims all of IPv6.
+# Requires -tun-ipv6=dual. Same as -tun-routes6, which replaces this list when
+# passed. There is no empty-array spelling: [] and an absent key serialize the
+# same, so "claim nothing" is ["none"].
+#
+# [tun]
+# routes6 = ["none"]
+
 [strategy]
 # TLS-mimicry transport. Options: reality, grpc, morph, ...
 # Optional: omit it (or leave it empty) to let the client pick a strategy.

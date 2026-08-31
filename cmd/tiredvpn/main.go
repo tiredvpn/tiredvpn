@@ -325,6 +325,18 @@ TUN MODE (Full VPN):
         about: a 6in4 tunnel, another VPN, a routed prefix. An interface that
         does not exist yet is accepted (it may appear later); a malformed
         prefix is a startup error.
+  -tun-routes6 string
+        Which IPv6 destinations the tunnel claims, the v6 counterpart of
+        -tun-routes. Unset (the default) installs ::/1 + 8000::/1, which is
+        every IPv6 destination and takes over the host's IPv6 default route.
+        'none' claims nothing: the tunnel still gets a v6 address, but the
+        host keeps its own IPv6 routing and the operator routes into the
+        tunnel from their own tables (ip -6 rule / ip -6 route ... table X).
+        Otherwise a comma-separated list of prefixes or addresses to route in.
+        For a node with IPv6 of its own it must not surrender — a 6in4
+        tunnel, a router uplink, a second VPN. Setting it also disables the
+        blanket IPv6 leak block, which only makes sense while the tunnel is
+        claiming all of IPv6. Requires -tun-ipv6=dual.
   -tun-fd int
         Use existing TUN file descriptor - for Android VpnService (default -1)
 
@@ -655,6 +667,7 @@ func runClient(args []string) {
 	fs.StringVar(&cfg.TunRoutes, "tun-routes", "", "Routes to add (comma-separated, e.g. '0.0.0.0/0' for full tunnel)")
 	fs.StringVar(&cfg.TunIPv6Policy, "tun-ipv6", tun.DefaultIPv6Policy, "IPv6 while the tunnel is up: dual (route it through the tunnel, rejecting it when the exit cannot carry it), block (reject it without asking the exit), off (IPv4-only tunnel, host IPv6 bypasses the VPN)")
 	fs.StringVar(&cfg.TunIPv6Allow, "tun-ipv6-allow", "", "Exceptions to the IPv6 block (comma-separated): interface names (he6) and/or IPv6 prefixes or addresses (2001:db8:77b::/64) that keep working while the block is up")
+	fs.StringVar(&cfg.TunRoutes6, "tun-routes6", "", "IPv6 destinations to route into the tunnel, the v6 counterpart of -tun-routes: comma-separated prefixes, or 'none' to claim no IPv6 destination and leave the host's own IPv6 routing alone (default: the ::/1 + 8000::/1 full tunnel)")
 
 	// Android VpnService flags
 	fs.IntVar(&cfg.TunFd, "tun-fd", -1, "Use existing TUN file descriptor (for Android VpnService)")
