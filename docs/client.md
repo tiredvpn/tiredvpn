@@ -136,6 +136,7 @@ Defaults are `failure_threshold=2`, `cooldown=1m`, `max_cooldown=30m`,
 | `-tun-routes` | | Comma-separated CIDRs to route through VPN |
 | `-tun-ipv6` | `dual` | What happens to IPv6 while the tunnel is up: `dual`, `block`, `off` |
 | `-tun-ipv6-allow` | | Exceptions to that block: comma-separated interface names and/or IPv6 prefixes that keep working |
+| `-tun-routes6` | | Which IPv6 destinations the tunnel claims, the v6 counterpart of `-tun-routes`. Unset means all of it. `none` means the host keeps its own IPv6 routing |
 | `-tun-fd` | `-1` | Use an existing TUN file descriptor (Android VpnService) |
 
 An MTU outside 1280-9000 is a startup error, whether it came from the flag or
@@ -212,6 +213,53 @@ An interface that does not exist is accepted without complaint - a tunnel unit
 may well start after the client, and nftables matches the name once the device
 appears. A malformed prefix is a startup error: it cannot become correct later,
 and skipping it would leave you with a hole you believe is open.
+
+##### Which destinations the tunnel claims: `-tun-routes6`
+
+The exception list above fixes the filter. It does not fix the routing, and the
+same node hit the routing next.
+
+`dual` installs `::/1` and `8000::/1` into the main table. Between them they
+cover every IPv6 address, and a `/1` beats a `/0` on prefix length - metrics
+never enter that comparison - so they also take over the host's own default
+route. On a laptop that is the whole point: without it every application with a
+working v6 default reaches the internet around the tunnel. On a node that
+carries IPv6 for a reason of its own it is a regression, and the symptom is
+total: `he6` up, address assigned, 100% loss, everything leaving through a
+tunnel with a ULA source address that nothing routes back.
+
+IPv4 never had this problem because it has a lever. An absent `-tun-routes`
+installs no v4 route at all, which is what lets you put the tunnel's default
+into a table of your own and keep `main` for the host:
+
+```bash
+ip route replace default dev tiredvpn-usa table usa_table
+ip rule add iif wg-mt-usa lookup usa_table
+```
+
+`-tun-routes6` is that lever for IPv6:
+
+```bash
+-tun-routes6 none            # claim nothing; the host routes v6 itself
+-tun-routes6 2001:db8::/32   # claim exactly this
+```
+
+Unset keeps the half-defaults, so nothing changes for a client that does not
+pass it. `none` still negotiates dual-stack and still puts a v6 address on the
+tunnel - what it drops is the claim on the main table, leaving you to route
+into the tunnel from your own tables the same way you already do for IPv4.
+
+Setting it also takes the blanket leak block out of play, which is deliberate
+rather than a convenience. The block rejects every outbound IPv6 packet that is
+not the tunnel's, and that is the right fallback exactly while the tunnel is
+claiming all of IPv6. Once you have named the destinations, the rest of IPv6 is
+yours by construction: there is nothing there to leak, and a blanket reject
+would only cut the host's own connectivity. `-tun-ipv6-allow` still works and is
+still the right tool when you want the block and one hole in it.
+
+The flag needs `-tun-ipv6=dual`. Under `block` or `off` the tunnel never carries
+IPv6, so there would be nothing to route into it, and a flag that silently does
+nothing is worse than one that refuses to start.
 
 On a host with IPv6 forwarding on, the client says so at install time. What it
 says is narrow on purpose. The chain is hooked at `output`, which only sees
@@ -469,6 +517,7 @@ which is what the bare `-strategy` default does.
 | `[tls]` | `insecure_skip_verify` | bool | accepted, not yet read by the runtime |
 | `[logging]` | `level` | string | only `"debug"` acts on anything - it turns on debug logging, as `-debug` does |
 | `[tun]` | `ipv6_allow` | array | same as `-tun-ipv6-allow`; one interface name or IPv6 prefix per entry |
+| `[tun]` | `routes6` | array | same as `-tun-routes6`; one IPv6 prefix per entry, or the single entry `"none"` |
 | `[logging]` | `format` | string | accepted, not yet read by the runtime |
 | `[logging]` | `output` | string | accepted, not yet read by the runtime |
 
@@ -477,22 +526,30 @@ consumes it. It is listed rather than hidden so a config that sets it is not
 mistaken for a config that changes behaviour.
 
 The port-hopping, ECH, post-quantum, benchmarking and monitoring knobs have no
-TOML keys at all and stay command-line only. So do the TUN knobs, with one
-exception: `[tun] ipv6_allow`, which a pooled unit configured entirely from a
-file would otherwise have no way to set. `-tun-ipv6` itself is still
-command-line only, so its default applies to a TOML-only client - and a file
-that lists exceptions describes exceptions to whatever the unit's command line
-asked for. See the [migration guide](../internal/config/toml/MIGRATION.md) for
-the field-by-field table.
+TOML keys at all and stay command-line only. So do the TUN knobs, with two
+exceptions: `[tun] ipv6_allow` and `[tun] routes6`, which a pooled unit
+configured entirely from a file would otherwise have no way to set. `-tun-ipv6`
+itself is still command-line only, so its default applies to a TOML-only client
+- and a file that lists exceptions describes exceptions to whatever the unit's
+command line asked for. See the
+[migration guide](../internal/config/toml/MIGRATION.md) for the field-by-field
+table.
 
 ```toml
 [tun]
 ipv6_allow = ["he6", "2001:db8:77b::/64"]
+routes6 = ["none"]
 ```
 
-Passing `-tun-ipv6-allow` replaces this list rather than adding to it: "except
-these" is one statement, and a command line that has to know what the file
-already said is not an override.
+Passing `-tun-ipv6-allow` or `-tun-routes6` replaces the corresponding list
+rather than adding to it: "except these" and "claim these" are each one
+statement, and a command line that has to know what the file already said is not
+an override.
+
+`routes6` has no empty-array spelling. `routes6 = []` and an absent key are the
+same bytes after serialization, and they mean opposite things - nothing versus
+the full tunnel - so "claim nothing" is written `["none"]`. Mixing `"none"` with
+a prefix is a startup error rather than a guess about which one you meant.
 
 ### Several servers
 
@@ -684,8 +741,12 @@ tiredvpn client \
 
 ### Full VPN with split routing
 
-IPv6 is set to `off` here on purpose: `dual` would send all IPv6 into the
-tunnel, which is not a split tunnel any more.
+IPv6 is set to `off` here on purpose: on its own, `dual` sends all IPv6 into
+the tunnel, which is not a split tunnel any more. Since `-tun-routes6` exists
+there is a second option - keep `dual` and mirror the v4 split on the v6 side
+(`-tun-routes6 2001:db8::/32,...`), which keeps IPv6 working inside the tunnel
+for the destinations you actually want there. `off` remains the simpler answer
+when you do not need IPv6 in the tunnel at all.
 
 ```bash
 sudo tiredvpn client \

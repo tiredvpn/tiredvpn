@@ -7,6 +7,43 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`-tun-routes6`: which IPv6 destinations the tunnel claims.** The 6in4 node
+  that motivated `-tun-ipv6-allow` in 1.9.0 lost its IPv6 a second time, to the
+  other half of the same feature. `-tun-ipv6-allow` fixed the filter; nothing
+  fixed the routing. `dual` installs `::/1` and `8000::/1` into the main table,
+  which between them cover every IPv6 address and beat the host's own `::/0` on
+  prefix length - metrics never enter that comparison - so four clients on one
+  node took its `default dev he6` away and sent every packet out of a tunnel
+  with a ULA source address nothing routes back. The interface was up, the
+  address was assigned, and every destination was 100% loss.
+  IPv4 never had this problem because it has a lever: an absent `-tun-routes`
+  installs no route at all, which is what lets an operator put the tunnel's
+  default into a table of their own (`ip rule` / `ip route ... table X`) and
+  keep `main` for the host. IPv6 had no equivalent, so `dual` was all-or-nothing.
+  `-tun-routes6` is that lever. `none` claims no destination: the tunnel still
+  negotiates dual-stack and still carries a v6 address, but the main table is
+  left alone. A comma-separated prefix list claims exactly those. Unset keeps
+  the `::/1` + `8000::/1` full tunnel, so nothing changes for a client that does
+  not pass the flag. Also available as `[tun] routes6` in the client TOML, where
+  "claim nothing" is written `["none"]` - an empty array and an absent key
+  serialize identically and mean opposite things. Requires `-tun-ipv6=dual`;
+  under `block` or `off` the tunnel never carries IPv6, and a flag that silently
+  does nothing is worse than one that refuses to start.
+
+### Changed
+
+- **Setting `-tun-routes6` disables the blanket IPv6 leak block.** This is a
+  behaviour change, and only for clients that pass the new flag: without it the
+  block is unchanged. The block rejects every outbound IPv6 packet that is not
+  the tunnel's, which is the right fallback exactly while the tunnel claims all
+  of IPv6. Once an operator has named the destinations, the rest of IPv6 is
+  theirs by construction - there is nothing there to leak, and a blanket reject
+  would only cut the host's own connectivity, which is the failure this whole
+  change exists to stop. `-tun-ipv6-allow` is unaffected and remains the right
+  tool when you want the block with a hole in it.
+
 ## [1.9.0] - 2026-08-30
 
 ### Added

@@ -125,6 +125,11 @@ type TUNDevice struct {
 	// see ipv6block_linux.go. Left at IPv6PolicyOff on host-owned interfaces
 	// (Android), where filtering belongs to VpnService.
 	ipv6Policy IPv6Policy
+	// ipv6Routes is the -tun-routes6 spec: which IPv6 destinations
+	// EnableDualStack claims, and — because a blanket block only makes sense
+	// while the tunnel claims all of IPv6 — whether the leak block applies at
+	// all. The zero value is the half-defaults, i.e. the historical behaviour.
+	ipv6Routes IPv6RouteSpec
 	// v6BlockInstalled reports that the leak-block table exists, so teardown
 	// removes exactly what it created and re-installs are logged as such.
 	v6BlockInstalled bool
@@ -542,6 +547,13 @@ func (t *TUNDevice) Configure(localIP, remoteIP net.IP, routes []string) error {
 	return nil
 }
 
+// SetIPv6Routes records the -tun-routes6 spec. Must be called before
+// EnableDualStack, which reads it to decide what to install, and before the
+// leak block's gate, which reads it to decide whether it applies at all.
+func (t *TUNDevice) SetIPv6Routes(s IPv6RouteSpec) {
+	t.ipv6Routes = s
+}
+
 // EnableDualStack brings up the IPv6 side of the tunnel after the exit
 // negotiated dual-stack (handshake v0x04 with the dual-stack flag). It
 // installs the negotiated v6 address and the two v6 half-default routes
@@ -558,7 +570,9 @@ func (t *TUNDevice) EnableDualStack(clientIP6, serverIP6 net.IP) error {
 	if err != nil {
 		return err
 	}
-	routes6, err := dualStackRouteNets()
+	// Which destinations this tunnel claims. Without -tun-routes6 this is the
+	// pair of half-defaults, byte for byte what it always was.
+	routes6, err := t.ipv6Routes.Nets()
 	if err != nil {
 		return err
 	}
@@ -641,8 +655,11 @@ func (t *TUNDevice) EnableDualStack(clientIP6, serverIP6 net.IP) error {
 	// tunnel's own v6 the moment it started working.
 	t.RemoveIPv6LeakBlock()
 
-	log.Info("TUN device %s dual-stack enabled: local=%s, peer=%s, routes=%v",
-		t.name, clientIP6, serverIP6, dualStackRouteCIDRs)
+	// The spec, not the package constant: with -tun-routes6 the two differ, and
+	// a log naming ::/1 while the kernel holds something else is worse than no
+	// log at all.
+	log.Info("TUN device %s dual-stack enabled: local=%s, peer=%s, routes=%s",
+		t.name, clientIP6, serverIP6, t.ipv6Routes)
 	return nil
 }
 

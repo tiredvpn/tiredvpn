@@ -273,13 +273,24 @@ Since 1.5.0 `-tun-ipv6` defaults to `dual`: IPv6 goes through the tunnel when
 the exit was started with `-ip-pool-v6`, and is rejected outright when it was
 not, so applications cannot reach the internet over a native IPv6 default route
 while the VPN is up. `-tun-ipv6 off` restores the pre-1.5.0 behaviour, which is
-what a split tunnel usually wants - `dual` sends *all* IPv6 into the tunnel,
-including destinations you deliberately routed around it on IPv4. The blocking
-half is Linux-only; on macOS it warns instead.
+one answer for a split tunnel - on its own, `dual` sends *all* IPv6 into the
+tunnel, including destinations you deliberately routed around it on IPv4. The
+other answer is `-tun-routes6`, which mirrors the v4 split on the v6 side
+instead of giving IPv6 up. The blocking half is Linux-only; on macOS it warns
+instead.
 
 If the host carries IPv6 of its own - a 6in4 tunnel, another VPN, a routed
 prefix - name it with `-tun-ipv6-allow he6,2001:db8::/32` (interface names,
 prefixes, or both) and the block leaves it alone.
+
+That covers the filter. The routing is a separate lever: `dual` also installs
+`::/1` + `8000::/1`, which beat the host's own default on prefix length and take
+IPv6 over entirely. On a node that must keep routing its own IPv6, pass
+`-tun-routes6 none` - the tunnel still gets a v6 address, but claims no
+destination, and you route into it from your own tables exactly as you already
+do for IPv4 with an absent `-tun-routes`. A prefix list works too
+(`-tun-routes6 2001:db8::/32`). Unset keeps the full tunnel, so a plain client
+is unaffected.
 
 ---
 
@@ -356,6 +367,7 @@ Generate the B1 key pair with `tiredvpn reality-keygen`.
 | `-tun-routes` | | Routes to tunnel (e.g. `0.0.0.0/0`) |
 | `-tun-ipv6` | `dual` | IPv6 while the tunnel is up: `dual`, `block`, `off` |
 | `-tun-ipv6-allow` | | Exceptions to the IPv6 block: interface names and/or prefixes, comma-separated |
+| `-tun-routes6` | | IPv6 destinations the tunnel claims; `none` leaves the host's own IPv6 routing alone |
 | `-tun-mtu` | `1280` | TUN MTU; with `-auto-mtu` this is the upper bound |
 | `-auto-mtu` | `true` | Probe the real end-to-end MTU and apply `min(probed, -tun-mtu)` |
 | `-quic` | `false` | Enable QUIC transport |

@@ -247,3 +247,60 @@ address = "203.0.113.10"
 		t.Errorf("cfg.TunIPv6Allow = %q, want the CLI value to survive a silent file", cfg.TunIPv6Allow)
 	}
 }
+
+// TestApplyClientTOMLConfig_TunRoutes6 is the last hop for -tun-routes6 out of
+// a file: a schema key nobody copies into client.Config does nothing, and on
+// the node this flag exists for "does nothing" means its IPv6 stays dead.
+func TestApplyClientTOMLConfig_TunRoutes6(t *testing.T) {
+	path := writeClientTOML(t, `
+[server]
+address = "203.0.113.10"
+port = 443
+
+[tun]
+routes6 = ["none"]
+`)
+	cfg := &client.Config{}
+	if err := applyClientTOMLConfig(cfg, path, clientFlagSetForTOML()); err != nil {
+		t.Fatalf("applyClientTOMLConfig: %v", err)
+	}
+	if cfg.TunRoutes6 != "none" {
+		t.Errorf("cfg.TunRoutes6 = %q, want %q", cfg.TunRoutes6, "none")
+	}
+}
+
+// TestApplyClientTOMLConfig_TunRoutes6List: a prefix list round-trips through
+// the join the runtime parser expects.
+func TestApplyClientTOMLConfig_TunRoutes6List(t *testing.T) {
+	path := writeClientTOML(t, `
+[server]
+address = "203.0.113.10"
+
+[tun]
+routes6 = ["2001:db8::/32", "2001:db9::/48"]
+`)
+	cfg := &client.Config{}
+	if err := applyClientTOMLConfig(cfg, path, clientFlagSetForTOML()); err != nil {
+		t.Fatalf("applyClientTOMLConfig: %v", err)
+	}
+	if want := "2001:db8::/32,2001:db9::/48"; cfg.TunRoutes6 != want {
+		t.Errorf("cfg.TunRoutes6 = %q, want %q", cfg.TunRoutes6, want)
+	}
+}
+
+// TestApplyClientTOMLConfig_TunRoutes6Absent: a silent file must not clear what
+// the command line set, and must not invent a value — an absent key is the
+// full tunnel, which is not something a file should start claiming by itself.
+func TestApplyClientTOMLConfig_TunRoutes6Absent(t *testing.T) {
+	path := writeClientTOML(t, `
+[server]
+address = "203.0.113.10"
+`)
+	cfg := &client.Config{TunRoutes6: "none"}
+	if err := applyClientTOMLConfig(cfg, path, clientFlagSetForTOML()); err != nil {
+		t.Fatalf("applyClientTOMLConfig: %v", err)
+	}
+	if cfg.TunRoutes6 != "none" {
+		t.Errorf("cfg.TunRoutes6 = %q, want the CLI value to survive a silent file", cfg.TunRoutes6)
+	}
+}

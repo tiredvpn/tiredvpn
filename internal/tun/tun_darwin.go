@@ -73,6 +73,12 @@ type TUNDevice struct {
 	v6Enabled bool
 	localIP6  net.IP
 	remoteIP6 net.IP
+	// ipv6Routes is the -tun-routes6 spec; routes6 is what EnableDualStack
+	// actually installed from it. DisableIPv6 deletes routes6 rather than
+	// re-deriving the list, so a delete cannot go looking for a destination
+	// that was never added.
+	ipv6Routes IPv6RouteSpec
+	routes6    []string
 
 	// ipv6Policy is the full -tun-ipv6 policy. Its blocking half is not
 	// implemented on macOS (see ApplyIPv6LeakBlock); v6BlockWarned keeps that
@@ -93,6 +99,14 @@ func (t *TUNDevice) SetIPv6Policy(p IPv6Policy) {
 	t.dualStack = p.NegotiatesDualStack()
 }
 
+// SetIPv6Routes records the -tun-routes6 spec, read by EnableDualStack. Unlike
+// the block setters below this is not a no-op: route installation is
+// implemented here, so the flag has to reach it or it would silently do
+// nothing on macOS.
+func (t *TUNDevice) SetIPv6Routes(s IPv6RouteSpec) {
+	t.ipv6Routes = s
+}
+
 // SetIPv6BlockAllow is a no-op on macOS: there is no leak block to punch holes
 // in. Present so the platform-independent caller in vpn.go needs no build tag.
 func (t *TUNDevice) SetIPv6BlockAllow([]net.IP) {}
@@ -108,7 +122,11 @@ func (t *TUNDevice) SetIPv6BlockAllowList(IPv6AllowList) {}
 // hidden: on a dual-stack Mac whose exit cannot carry IPv6, applications keep
 // reaching the internet over IPv6 outside the tunnel.
 func (t *TUNDevice) ApplyIPv6LeakBlock() {
-	if !t.ipv6Policy.BlocksLeakedIPv6() || t.v6BlockWarned {
+	// -tun-routes6 means the operator routes IPv6 themselves, so IPv6 outside
+	// the tunnel is their arrangement rather than a leak, and warning about it
+	// would be wrong rather than merely noisy. Same gate as the Linux
+	// wantsIPv6Block.
+	if !t.ipv6Policy.BlocksLeakedIPv6() || t.ipv6Routes.OperatorManaged() || t.v6BlockWarned {
 		return
 	}
 	t.v6BlockWarned = true
@@ -151,11 +169,19 @@ func (t *TUNDevice) EnableDualStack(clientIP6, serverIP6 net.IP) error {
 	// DisableIPv6, whose guard is v6Enabled: recording late left a failed
 	// second route install with the address and the first half-default
 	// stranded on the interface.
+	// Which destinations this tunnel claims. Without -tun-routes6 this is the
+	// pair of half-defaults, exactly as before.
+	routes6, err := t.ipv6Routes.CIDRs()
+	if err != nil {
+		return err
+	}
+
 	t.localIP6 = clientIP6
 	t.remoteIP6 = serverIP6
+	t.routes6 = routes6
 	t.v6Enabled = true
 
-	for _, r := range dualStackRouteCIDRs {
+	for _, r := range routes6 {
 		if err := runRoute("add", "-inet6", r, "-iface", t.name); err == nil {
 			continue
 		}
@@ -164,8 +190,8 @@ func (t *TUNDevice) EnableDualStack(clientIP6, serverIP6 net.IP) error {
 		}
 	}
 
-	log.Info("utun %s dual-stack enabled: local=%s, peer=%s, routes=%v",
-		t.name, clientIP6, serverIP6, dualStackRouteCIDRs)
+	log.Info("utun %s dual-stack enabled: local=%s, peer=%s, routes=%s",
+		t.name, clientIP6, serverIP6, t.ipv6Routes)
 	return nil
 }
 
@@ -180,11 +206,12 @@ func (t *TUNDevice) DisableIPv6() {
 	if !t.v6Enabled {
 		return
 	}
-	for _, r := range dualStackRouteCIDRs {
+	for _, r := range t.routes6 {
 		if err := runRoute("delete", "-inet6", r, "-iface", t.name); err != nil {
 			log.Debug("route delete -inet6 %s failed: %v", r, err)
 		}
 	}
+	t.routes6 = nil
 	if t.localIP6 != nil {
 		if err := runIfconfig(t.name, "inet6", t.localIP6.String(), "-alias"); err != nil {
 			log.Debug("ifconfig inet6 -alias failed: %v", err)

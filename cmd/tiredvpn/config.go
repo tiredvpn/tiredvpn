@@ -28,6 +28,7 @@ import (
 //   - tls.fingerprint              → cfg.TLSFingerprint
 //   - tun.ipv6_allow               → cfg.TunIPv6Allow (joined back to the
 //     comma-separated form -tun-ipv6-allow uses)
+//   - tun.routes6                  → cfg.TunRoutes6 (same join, for -tun-routes6)
 //   - shaper.{preset|custom}       → cfg.Shaper (built via presets.FromConfig)
 //   - logging.level                → log.SetDebug when "debug"
 //
@@ -57,6 +58,9 @@ func applyClientTOMLConfig(cfg *client.Config, path string, fs *flag.FlagSet) er
 	// join round-trips.
 	if len(tcfg.Tun.IPv6Allow) > 0 {
 		cfg.TunIPv6Allow = strings.Join(tcfg.Tun.IPv6Allow, ",")
+	}
+	if len(tcfg.Tun.Routes6) > 0 {
+		cfg.TunRoutes6 = strings.Join(tcfg.Tun.Routes6, ",")
 	}
 	if tcfg.Logging.Level == "debug" {
 		log.SetDebug(true)
