@@ -7,6 +7,8 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-08-31
+
 ### Added
 
 - **`-tun-routes6`: which IPv6 destinations the tunnel claims.** The 6in4 node
