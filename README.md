@@ -273,9 +273,11 @@ Since 1.5.0 `-tun-ipv6` defaults to `dual`: IPv6 goes through the tunnel when
 the exit was started with `-ip-pool-v6`, and is rejected outright when it was
 not, so applications cannot reach the internet over a native IPv6 default route
 while the VPN is up. `-tun-ipv6 off` restores the pre-1.5.0 behaviour, which is
-what a split tunnel usually wants - `dual` sends *all* IPv6 into the tunnel,
-including destinations you deliberately routed around it on IPv4. The blocking
-half is Linux-only; on macOS it warns instead.
+one answer for a split tunnel - on its own, `dual` sends *all* IPv6 into the
+tunnel, including destinations you deliberately routed around it on IPv4. The
+other answer is `-tun-routes6`, which mirrors the v4 split on the v6 side
+instead of giving IPv6 up. The blocking half is Linux-only; on macOS it warns
+instead.
 
 If the host carries IPv6 of its own - a 6in4 tunnel, another VPN, a routed
 prefix - name it with `-tun-ipv6-allow he6,2001:db8::/32` (interface names,

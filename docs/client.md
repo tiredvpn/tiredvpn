@@ -741,8 +741,12 @@ tiredvpn client \
 
 ### Full VPN with split routing
 
-IPv6 is set to `off` here on purpose: `dual` would send all IPv6 into the
-tunnel, which is not a split tunnel any more.
+IPv6 is set to `off` here on purpose: on its own, `dual` sends all IPv6 into
+the tunnel, which is not a split tunnel any more. Since `-tun-routes6` exists
+there is a second option - keep `dual` and mirror the v4 split on the v6 side
+(`-tun-routes6 2001:db8::/32,...`), which keeps IPv6 working inside the tunnel
+for the destinations you actually want there. `off` remains the simpler answer
+when you do not need IPv6 in the tunnel at all.
 
 ```bash
 sudo tiredvpn client \
