@@ -1606,11 +1606,16 @@ func (v *VPNClient) handleDisconnect() {
 					v.manager.ResetForNetworkChange()
 				}
 				log.Warn("No network connectivity, waiting for network to restore...")
-				v.waitForNetworkRestore()
-				// After network restore, reset backoff
+				if !v.waitForNetworkRestore() {
+					return
+				}
+				// After the wait, reset backoff and fall through to a real
+				// connect attempt. Falling through instead of continue is the
+				// point: the probe that said "no network" can itself be wrong,
+				// so every wait must end in an actual dial rather than in
+				// another probe round that parks again.
 				currentDelay = reconnectInitialDelay
-				consecutiveFailures = 0
-				continue
+				consecutiveFailures = 1
 			}
 		}
 
@@ -1703,11 +1708,13 @@ func (v *VPNClient) checkNetworkConnectivity() bool {
 	return internetReachable()
 }
 
-// errMeansPathAlive reports whether a dial error still proves the path is up.
-// An immediate refusal (RST came back) means packets flow in both directions;
-// only silence - a timeout - means the path is dead. Refusals matter here
-// because the gate dials the default-route gateway, and consumer routers
-// routinely have port 53 closed or filtered.
+// errMeansPathAlive reports whether a dial error still suggests the path is
+// up rather than silently dead. An immediate refusal usually means an RST
+// came back - packets flowed both ways. A local firewall can fake that with a
+// REJECT rule, but the caller only uses "alive" to keep retrying the
+// connection instead of parking, which is the safe direction to err in.
+// Refusals matter because the gate dials the default-route gateway, and
+// consumer routers routinely have port 53 closed.
 func errMeansPathAlive(err error) bool {
 	return errors.Is(err, syscall.ECONNREFUSED)
 }
@@ -1722,6 +1729,12 @@ func dialMeansAlive(addr string) bool {
 	}
 	return errMeansPathAlive(err)
 }
+
+// publicFallbackProbes are the last-resort dial targets when no physical
+// gateway was resolved (non-Linux platforms, exotic setups). These addresses
+// are routinely part of the installed TUN routes, so while the tunnel is down
+// they black-hole - which is why they are probes of last resort, not first.
+var publicFallbackProbes = []string{"8.8.8.8:53", "1.1.1.1:53"}
 
 // internetReachable reports whether anything outside answers. It must never
 // probe through the VPN tunnel itself: while the tunnel is down its routes
@@ -1740,12 +1753,14 @@ func internetReachable() bool {
 			return true
 		}
 	}
-	conn, err := net.DialTimeout("tcp", "8.8.8.8:53", networkCheckTimeout)
-	if err != nil {
-		return false
+	for _, addr := range publicFallbackProbes {
+		conn, err := net.DialTimeout("tcp", addr, networkCheckTimeout)
+		if err == nil {
+			conn.Close()
+			return true
+		}
 	}
-	conn.Close()
-	return true
+	return false
 }
 
 // networkParkTimeout caps one wait for "network restore". The wait's own probe
@@ -1755,8 +1770,10 @@ func internetReachable() bool {
 const networkParkTimeout = 2 * time.Minute
 
 // waitForNetworkRestore waits until network connectivity is restored, at most
-// networkParkTimeout; then it returns so the reconnect loop retries anyway.
-func (v *VPNClient) waitForNetworkRestore() {
+// networkParkTimeout. Returns false only when the client was stopped; a
+// timeout returns true so the caller goes straight to a real connect attempt -
+// the negative verdict that caused the wait can itself be wrong.
+func (v *VPNClient) waitForNetworkRestore() bool {
 	checkInterval := 5 * time.Second
 	deadline := time.Now().Add(networkParkTimeout)
 	attempt := 0
@@ -1769,20 +1786,21 @@ func (v *VPNClient) waitForNetworkRestore() {
 
 		select {
 		case <-v.stopCh:
-			return
+			return false
 		case <-time.After(checkInterval):
 		}
 
 		if v.checkNetworkConnectivity() {
 			log.Info("Network connectivity restored after %d checks", attempt)
-			return
+			return true
 		}
 
 		if time.Now().After(deadline) {
 			log.Warn("Network still considered down after %v - retrying connection anyway", networkParkTimeout)
-			return
+			return true
 		}
 	}
+	return false
 }
 
 // addJitter adds random jitter to a duration (+/- jitterFactor)

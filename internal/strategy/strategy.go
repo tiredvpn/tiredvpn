@@ -290,7 +290,7 @@ func (m *Manager) applyUDPGate(udpOK bool) {
 func (m *Manager) shouldSkipFastReconnect(strategyID string, now time.Time) bool {
 	if m.fastReconnectStrategy != strategyID ||
 		now.Sub(m.fastReconnectFirst) > fastReconnectWindow ||
-		!m.fastReconnectLast.IsZero() && now.Sub(m.fastReconnectLast) > fastReconnectGap {
+		!m.fastReconnectLast.IsZero() && now.Sub(m.fastReconnectLast) >= fastReconnectGap {
 		m.fastReconnectStrategy = strategyID
 		m.fastReconnectCount = 0
 		m.fastReconnectFirst = now

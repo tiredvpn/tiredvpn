@@ -310,10 +310,12 @@ func TestManager_FastReconnectIgnoresHeldSessions(t *testing.T) {
 	const id = "reality"
 
 	now := time.Unix(1_700_000_000, 0)
+	// Pauses of exactly fastReconnectGap and longer both restart the count
+	// (the boundary is >=).
 	for i := range 100 {
-		at := now.Add(time.Duration(i) * (fastReconnectGap + time.Second))
+		at := now.Add(time.Duration(i) * fastReconnectGap)
 		if m.shouldSkipFastReconnect(id, at) {
-			t.Fatalf("fast reconnect %d after a session that held >gap must not force a full scan", i)
+			t.Fatalf("fast reconnect %d after a session that held >=gap must not force a full scan", i)
 		}
 	}
 

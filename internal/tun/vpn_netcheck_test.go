@@ -124,9 +124,11 @@ func TestErrMeansPathAlive(t *testing.T) {
 	if !errMeansPathAlive(refused) {
 		t.Fatal("ECONNREFUSED must count as an alive path")
 	}
-	timedOut := &net.OpError{Op: "dial", Err: os.NewSyscallError("i/o timeout", syscall.ETIMEDOUT)}
-	if errMeansPathAlive(timedOut) {
-		t.Fatal("a timeout must not count as an alive path")
+	for _, errno := range []syscall.Errno{syscall.ETIMEDOUT, syscall.EHOSTUNREACH, syscall.ENETUNREACH} {
+		unreachable := &net.OpError{Op: "dial", Err: os.NewSyscallError("connect", errno)}
+		if errMeansPathAlive(unreachable) {
+			t.Fatalf("%v must not count as an alive path", errno)
+		}
 	}
 	if errMeansPathAlive(nil) {
 		t.Fatal("nil error must not count as an alive path via the error path")

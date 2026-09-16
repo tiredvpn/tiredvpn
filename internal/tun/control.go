@@ -1036,11 +1036,13 @@ func (cs *ControlServer) doAutoReconnect(reason string) {
 					return
 				}
 
-				// Network restored, reset backoff
+				// Network restored - or the wait timed out, because the "no
+				// network" verdict can itself be wrong. Reset backoff and fall
+				// through to a real reconnect attempt instead of looping back
+				// into the probe, which would just park again.
 				currentDelay = autoReconnectInitialDelay
-				consecutiveFailures = 0
-				log.Info("Network restored, resuming reconnect")
-				continue
+				consecutiveFailures = 1
+				log.Info("Resuming reconnect after network wait")
 			}
 			lastNetworkCheck = time.Now()
 		}
@@ -1192,11 +1194,14 @@ func (cs *ControlServer) checkNetworkConnectivity() bool {
 	return internetReachable()
 }
 
-// waitForNetwork waits until network connectivity is restored
-// Returns false if stopCh is closed
-// Listens to networkAvailableChan for immediate signal from Android
+// waitForNetwork waits until network connectivity is restored, at most
+// networkParkTimeout. Returns false if stopCh is closed; a timeout returns
+// true so the caller retries the real connection - the negative verdict that
+// caused the wait can itself be wrong (its probes used to enter the dead
+// tunnel). Listens to networkAvailableChan for immediate signal from Android.
 func (cs *ControlServer) waitForNetwork(stopCh chan struct{}) bool {
 	checkInterval := 5 * time.Second
+	deadline := time.Now().Add(networkParkTimeout)
 	attempt := 0
 
 	for {
@@ -1219,6 +1224,11 @@ func (cs *ControlServer) waitForNetwork(stopCh chan struct{}) bool {
 		}
 
 		if cs.checkNetworkConnectivity() {
+			return true
+		}
+
+		if time.Now().After(deadline) {
+			log.Warn("Network still considered down after %v - retrying reconnect anyway", networkParkTimeout)
 			return true
 		}
 	}
