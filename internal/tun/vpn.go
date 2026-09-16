@@ -1703,11 +1703,43 @@ func (v *VPNClient) checkNetworkConnectivity() bool {
 	return internetReachable()
 }
 
-// internetReachable reports whether anything outside answers, using a public
-// resolver as the reference point. It is deliberately NOT a check of our own
-// server: the caller needs to tell a dead link apart from a blocked endpoint,
-// and only a third party can do that.
+// errMeansPathAlive reports whether a dial error still proves the path is up.
+// An immediate refusal (RST came back) means packets flow in both directions;
+// only silence - a timeout - means the path is dead. Refusals matter here
+// because the gate dials the default-route gateway, and consumer routers
+// routinely have port 53 closed or filtered.
+func errMeansPathAlive(err error) bool {
+	return errors.Is(err, syscall.ECONNREFUSED)
+}
+
+// dialMeansAlive dials addr and treats both a completed connect and an
+// immediate refusal as "the path answers".
+func dialMeansAlive(addr string) bool {
+	conn, err := net.DialTimeout("tcp", addr, networkCheckTimeout)
+	if err == nil {
+		conn.Close()
+		return true
+	}
+	return errMeansPathAlive(err)
+}
+
+// internetReachable reports whether anything outside answers. It must never
+// probe through the VPN tunnel itself: while the tunnel is down its routes
+// stay installed, and a probe routed into a dead TUN device reads as "no
+// network" - the exact false negative that used to park the reconnect loop
+// forever while the physical link was fine (8.8.8.8, 8.8.4.8, 9.9.9.9 and
+// 1.1.1.1 are all part of the installed tunnel routes). The default-route
+// gateway is probed first precisely because it cannot take the tunnel; public
+// resolvers remain the fallback for setups where no gateway was resolved.
+// It is deliberately NOT a check of our own server: the caller needs to tell
+// a dead link apart from a blocked endpoint, and only a third party can do
+// that.
 func internetReachable() bool {
+	for _, addr := range physicalGateAddrs() {
+		if dialMeansAlive(addr) {
+			return true
+		}
+	}
 	conn, err := net.DialTimeout("tcp", "8.8.8.8:53", networkCheckTimeout)
 	if err != nil {
 		return false
@@ -1716,9 +1748,17 @@ func internetReachable() bool {
 	return true
 }
 
-// waitForNetworkRestore waits until network connectivity is restored
+// networkParkTimeout caps one wait for "network restore". The wait's own probe
+// can be wrong about the network being down, so parking must stay bounded:
+// past the cap the caller retries the real connection instead of trusting the
+// probe indefinitely.
+const networkParkTimeout = 2 * time.Minute
+
+// waitForNetworkRestore waits until network connectivity is restored, at most
+// networkParkTimeout; then it returns so the reconnect loop retries anyway.
 func (v *VPNClient) waitForNetworkRestore() {
 	checkInterval := 5 * time.Second
+	deadline := time.Now().Add(networkParkTimeout)
 	attempt := 0
 
 	for atomic.LoadInt32(&v.running) == 1 {
@@ -1735,6 +1775,11 @@ func (v *VPNClient) waitForNetworkRestore() {
 
 		if v.checkNetworkConnectivity() {
 			log.Info("Network connectivity restored after %d checks", attempt)
+			return
+		}
+
+		if time.Now().After(deadline) {
+			log.Warn("Network still considered down after %v - retrying connection anyway", networkParkTimeout)
 			return
 		}
 	}

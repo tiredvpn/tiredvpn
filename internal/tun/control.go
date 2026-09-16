@@ -1185,21 +1185,11 @@ func (cs *ControlServer) attemptReconnect(ctx context.Context) bool {
 
 // checkNetworkConnectivity performs a quick TCP check
 func (cs *ControlServer) checkNetworkConnectivity() bool {
-	// Try Google DNS as a quick connectivity check
-	conn, err := net.DialTimeout("tcp", "8.8.8.8:53", 3*time.Second)
-	if err == nil {
-		conn.Close()
-		return true
-	}
-
-	// Try Cloudflare DNS
-	conn, err = net.DialTimeout("tcp", "1.1.1.1:53", 3*time.Second)
-	if err == nil {
-		conn.Close()
-		return true
-	}
-
-	return false
+	// Shared with the reconnect loop. The probe must not enter the tunnel:
+	// 8.8.8.8 and 1.1.1.1 are routinely part of the installed TUN routes, so
+	// dials to them black-hole while the tunnel is down and read as "no
+	// network".
+	return internetReachable()
 }
 
 // waitForNetwork waits until network connectivity is restored
