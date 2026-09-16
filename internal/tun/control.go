@@ -1024,7 +1024,6 @@ func (cs *ControlServer) doAutoReconnect(reason string) {
 		// Check network connectivity periodically
 		if consecutiveFailures%5 == 0 || time.Since(lastNetworkCheck) > 30*time.Second {
 			if !cs.checkNetworkConnectivity() {
-				lastNetworkCheck = time.Now()
 				log.Warn("No network connectivity, waiting...")
 
 				// Wait for network with periodic checks
