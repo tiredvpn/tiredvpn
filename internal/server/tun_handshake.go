@@ -194,13 +194,8 @@ func recordRelayedDualStackSession(srvCtx *serverContext, clientVersion uint8, r
 	})
 }
 
-// frameConfusionTUNResponse wraps a handshake response payload in the
-// confusion transport's length-prefixed frame: [len:4][payload]. On the wire
-// the payload offsets shift by 4 (status@4, serverIP@5:9, clientIP@9:13) —
-// the historical 13-byte frame for the legacy 9-byte payload.
-func frameConfusionTUNResponse(payload []byte) []byte {
-	frame := make([]byte, 4+len(payload))
-	binary.BigEndian.PutUint32(frame[:4], uint32(len(payload)))
-	copy(frame[4:], payload)
-	return frame
-}
+// The confusion transport used to frame its handshake response as
+// [len:4][payload], one prefix more than every other transport, because its
+// client stripped exactly one prefix on its first read. Since 1.11.0 the sealed
+// record layer carries the message boundary and the response goes out bare, so
+// the helper that built that frame is gone along with the shape it built.

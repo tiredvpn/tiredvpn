@@ -2,7 +2,6 @@ package server
 
 import (
 	"bytes"
-	"encoding/binary"
 	"net"
 	"testing"
 )
@@ -280,42 +279,5 @@ func TestDeriveDualStackAddrs(t *testing.T) {
 	}
 	if d := deriveDualStackAddrs("fd00:10:8::/64", nil); d != nil {
 		t.Errorf("nil lease should yield nil, got %+v", d)
-	}
-}
-
-// TestFrameConfusionTUNResponse pins the confusion transport's shifted
-// framing: [len:4][payload], historically a 13-byte frame for the legacy
-// 9-byte payload with serverIP@5:9 and clientIP@9:13.
-func TestFrameConfusionTUNResponse(t *testing.T) {
-	// Legacy payload -> 13-byte frame with the historical offsets.
-	legacy := buildTUNHandshakeResponse(0x03, hsServerIP, hsClientIP, tunHandshakeCaps{}, nil)
-	frame := frameConfusionTUNResponse(legacy)
-	if len(frame) != 13 {
-		t.Fatalf("legacy confusion frame = %d bytes, want 13", len(frame))
-	}
-	if binary.BigEndian.Uint32(frame[0:4]) != 9 {
-		t.Errorf("frame length prefix = %d, want 9", binary.BigEndian.Uint32(frame[0:4]))
-	}
-	if frame[4] != 0x00 {
-		t.Errorf("status = 0x%02x, want 0x00", frame[4])
-	}
-	if !bytes.Equal(frame[5:9], hsServerIP.To4()) {
-		t.Errorf("serverIP@5:9 = %x, want %x", frame[5:9], hsServerIP.To4())
-	}
-	if !bytes.Equal(frame[9:13], hsClientIP.To4()) {
-		t.Errorf("clientIP@9:13 = %x, want %x", frame[9:13], hsClientIP.To4())
-	}
-
-	// v0x04 dual payload -> 46-byte frame, length prefix tracks the payload.
-	dualFrame := frameConfusionTUNResponse(
-		buildTUNHandshakeResponse(0x04, hsServerIP, hsClientIP, tunHandshakeCaps{}, dualTestAddrs()))
-	if len(dualFrame) != 46 {
-		t.Fatalf("dual confusion frame = %d bytes, want 46", len(dualFrame))
-	}
-	if binary.BigEndian.Uint32(dualFrame[0:4]) != 42 {
-		t.Errorf("frame length prefix = %d, want 42", binary.BigEndian.Uint32(dualFrame[0:4]))
-	}
-	if dualFrame[13]&0x04 == 0 {
-		t.Errorf("dual-stack flag missing at payload flags byte (frame[13]): 0x%02x", dualFrame[13])
 	}
 }

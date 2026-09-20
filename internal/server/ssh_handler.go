@@ -20,7 +20,12 @@ func DetectSSHCamouflage(peek []byte) bool {
 	if !bytes.HasPrefix(peek, []byte("SSH-2.0")) {
 		return false
 	}
-	if bytes.Contains(peek, []byte("TIRED")) {
+	// The confusion transport's SSH carrier opens with a banner as well, and it
+	// is dispatched further down. It used to be told apart by the literal TIRED
+	// its first packet carried; that literal is gone with 1.11.0, so the banner
+	// itself is the discriminator - at this point in the dispatch neither
+	// transport has sent anything else.
+	if bytes.HasPrefix(peek, []byte(strategy.ConfusionSSHBanner)) {
 		return false
 	}
 	return true

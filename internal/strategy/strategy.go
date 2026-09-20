@@ -1690,7 +1690,7 @@ func registerAllStrategies(m *Manager, cfg DefaultManagerConfig) {
 	registerTLSStrategies(m, cfg, hasServer, hasSecret)
 	registerMorphStrategies(m, cfg, hasSecret)
 	registerMeshAndAntiProbe(m, cfg, hasServer, hasSecret)
-	registerConfusionAndExhaustion(m)
+	registerConfusionAndExhaustion(m, cfg, hasServer, hasSecret)
 	registerSSHCamouflage(m, cfg, hasServer, hasSecret)
 	registerIMAPCamouflage(m, cfg, hasServer, hasSecret)
 	registerGenevaStrategies(m, cfg, hasServer, hasSecret)
@@ -1902,11 +1902,25 @@ func registerMeshAndAntiProbe(m *Manager, cfg DefaultManagerConfig, hasServer, h
 }
 
 // registerConfusionAndExhaustion registers Protocol Confusion and State Exhaustion.
-func registerConfusionAndExhaustion(m *Manager) {
-	for _, confStrat := range AllConfusionTypes(m) {
+//
+// Both were registered unconditionally until 1.11.0, the only two of the
+// sixteen that were. That was not a shortcut but a consequence: neither read a
+// secret, so there was nothing to gate on. Now that the confusion wire is keyed
+// end to end - the marker, the record layer, the server's answer - a client
+// without a secret cannot complete either of them, and registering them would
+// only add two dead entries to the strategy scan.
+//
+// State exhaustion is gated on the same pair despite RequiresServer() being
+// false: its fallback path dials our server and wraps the connection in the
+// confusion carrier, so it needs a server and a secret just as much.
+func registerConfusionAndExhaustion(m *Manager, cfg DefaultManagerConfig, hasServer, hasSecret bool) {
+	if !hasServer || !hasSecret {
+		return
+	}
+	for _, confStrat := range AllConfusionTypes(m, cfg.Secret) {
 		m.Register(confStrat)
 	}
-	m.Register(NewStateExhaustionStrategy(m))
+	m.Register(NewStateExhaustionStrategy(m, cfg.Secret))
 }
 
 // registerGenevaStrategies registers Geneva strategies for Russia, China, and Iran.

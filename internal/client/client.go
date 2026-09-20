@@ -617,12 +617,6 @@ func runControlSocketMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Si
 
 			log.Info("Network change reconnect successful via %s, sending TUN handshake", strat.Name())
 
-			// Enable raw mode for ConfusedConn BEFORE handshake
-			if confusedConn, ok := conn.(*strategy.ConfusedConn); ok {
-				confusedConn.SetRawMode(true)
-				log.Debug("Enabled raw mode for ConfusedConn before reconnect handshake")
-			}
-
 			// Send TUN mode handshake with our current IP
 			// Server will recognize us and restore the session
 			serverIP, assignedIP, serverIP6, assignedIP6, err := sendReconnectHandshake(conn, currentIP, mtu, dualStack)
@@ -651,13 +645,6 @@ func runControlSocketMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Si
 			}
 
 			log.Info("Connected via %s, waiting for TUN fd from Android", strat.Name())
-
-			// Enable raw mode for ConfusedConn (needed for some strategies)
-			// Raw mode disables automatic length-prefix framing
-			if confusedConn, ok := serverConn.(*strategy.ConfusedConn); ok {
-				confusedConn.SetRawMode(true)
-				log.Debug("Enabled raw mode for ConfusedConn")
-			}
 
 			// Return connection WITHOUT TUN handshake
 			// TUN handshake will be done AFTER Android creates VPN interface and sends FD
@@ -1519,7 +1506,7 @@ func handleSOCKS5Pooled(conn net.Conn, tunnelPool *pool.TunnelPool, connID uint6
 	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 	conn.SetDeadline(time.Time{})
 
-	// Relay data (ConfusedConn handles length-prefixed framing internally)
+	// Relay data (each transport frames the stream itself)
 	err = pool.PooledRelay(conn, serverConn, 5*time.Minute)
 	if err != nil && err != io.EOF {
 		logger.Debug("Relay ended: %v", err)
