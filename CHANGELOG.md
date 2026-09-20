@@ -7,6 +7,88 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-09-20
+
+### Compatibility
+
+- **Hard wire break. Clients older than 1.11.0 will not connect and this is
+  intentional.** A whole-subsystem audit of the DPI strategies (24 confirmed
+  defects) turned up authentication holes, plaintext tunnels, and self-labelling
+  markers that can only be removed by changing what goes on the wire. There is no
+  transitional "server accepts both formats" mode: for the auth fixes that mode
+  would leave the hole open, and for the markers it would keep the fingerprint
+  live. An old client meeting a 1.11.0 server now gets a fast, clean refusal
+  rather than hanging or silently downgrading. Upgrade servers and clients
+  together; ship the Android build before flipping the servers.
+
+### Security
+
+- **Closed the open relay.** `handleProtocolConfusion` handed any host on the
+  internet a TCP relay through the exit node, or a full TUN session with an IP
+  from the pool, for five bytes of ASCII and no proof of the secret; the reply
+  also confirmed "tiredvpn here" to an active prober in one packet. All three
+  entry points into the confusion funnel now verify `HMAC(secret, nonce)` before
+  any dial or pool allocation and before the first identifying byte of the reply;
+  identity is derived from the matched secret, not the client IP.
+- **The three camouflages now carry the tunnel encrypted, as the protocols they
+  imitate.** `ssh_camouflage` runs a real RFC 4253 transport (curve25519-sha256,
+  a signing ssh-ed25519 host key, `SSH_MSG_NEWKEYS`, chacha20-poly1305); its
+  KEXINIT matches stock OpenSSH 9.6p1 byte for byte. `imap_camouflage` runs over
+  STARTTLS with SASL CRAM-MD5 bound to the TLS exporter, and the login name is no
+  longer the first four bytes of the shared secret in the clear. `confusion`
+  seals its payload with ChaCha20-Poly1305 behind a keyed marker. User traffic is
+  no longer readable on any registered strategy.
+- **REALITY server authentication (B1) no longer accepts a signature of
+  attacker-chosen length.** The certificate MAC was compared at the length of the
+  field under the peer's control, so a zero-length signature passed
+  unconditionally. The MAC is now a fixed-width value encoded as a real ECDSA
+  signature (length drawn from the key, not the wire).
+- **SSH auth tokens are bound to direction and session.** The old symmetric token
+  let a MITM reflect the client's token back and pass as the server; it is now
+  keyed on the exchange hash with distinct client/server contexts, so reflection
+  and replay both fail.
+
+### Detectability
+
+- Removed the product's own names from the wire: ALPN `tiredvpn` is now `h3`; the
+  `TIRD` and `QVPN` magic markers are replaced by variable-length keyed markers;
+  the `X-Salamander-Version` header and the `TiredVPN/2.0` User-Agent are gone.
+- The REALITY dispatch byte is carried inside the encrypted record layer instead
+  of as a bare `0x08` after the ServerHello; `requireDataV2` is on by default, so
+  the silent downgrade to an unauthenticated stream cipher is closed.
+- The anti-probe knock is randomised per connection with a replay window instead
+  of being a pure function of the secret; the ClientHello is fragmented at a
+  per-connection random size instead of a fixed 200-byte grid; the padding
+  extension follows the spoofed profile (kept at or above the 64-byte routing
+  floor).
+- Cover SNI and `:authority` are drawn per connection from the shared donor pool
+  instead of hardcoded Google/jsdelivr hosts chosen by the wall clock; stego pads
+  the default tunnel path from `crypto/rand` so record lengths no longer copy the
+  inner packet lengths; HTTP polling backs off when idle and reuses the
+  connection instead of a 50ms metronome of fresh TLS connections.
+- The two SSH-shaped paths (confusion carrier and ssh_camouflage) now present the
+  same OpenSSH 9.6p1 banner and are told apart by a keyed marker, so one host no
+  longer serves two sshd versions depending on how the client opened.
+
+### Correctness
+
+- The circuit breaker no longer sticks in half-open forever: `Allow` is split
+  into a side-effect-free `CanTry` and a slot-taking `BeginHalfOpenAttempt`, and
+  half-open times out. Shallow probes feed a separate reachability statistic
+  rather than the breaker.
+- Geneva packet strategies tamper the duplicate, not the original, so packet-level
+  evasion no longer breaks the connection it was meant to carry.
+- A stray UDP datagram no longer takes down the QUIC listener; a failed Salamander
+  tag drops the datagram and reads the next one.
+- Peer-supplied lengths are bounded before allocation (WebSocket-Padded, Morph,
+  HTTP polling, IMAP); IPv6 port hopping uses `net.JoinHostPort`; the
+  emergency-reprobe channel no longer double-closes; RTT-masking writes are
+  serialised; the stego auth token accepts adjacent minute buckets and compares in
+  constant time.
+- Mesh relay fields are updated under the lock the selector reads them with,
+  relay auth is challenge-response instead of shipping the secret in JSON, and the
+  `change-me-secret` defaults are gone.
+
 ## [1.10.0] - 2026-08-31
 
 ### Added
