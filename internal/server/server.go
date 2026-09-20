@@ -1378,6 +1378,20 @@ func handleConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 	// block it until the auth timeout. Must precede protocol confusion (which
 	// also matches "SSH-2.0-") and TLS, since the SSH handshake is plaintext.
 	if bytes.HasPrefix(peekBuf, []byte("SSH-2.0")) {
+		// The confusion carrier sends its whole first flight at once (banner,
+		// KEXINIT, KEX_ECDH, NEWKEYS, sealed body); the ssh_camouflage (S2) client
+		// sends only its banner and then waits for the server. When the peek stops
+		// mid-carrier - a first flight split across TCP segments - finish it under
+		// a short window before deciding, so a fragmented carrier is not taken for
+		// the bare-banner S2 client and pushed into the camouflage handshake, where
+		// it would fail auth and cost a decoy and a retry. The S2 client sends
+		// nothing more and only waits out that short window, never the auth
+		// timeout. Bytes read are folded back into peekBuf for replay.
+		peekBuf = reassembleSSHCarrierPeek(conn, peekBuf, logger)
+		buffConn = &bufferedConn{
+			Conn:   conn,
+			reader: io.MultiReader(bytes.NewReader(peekBuf), conn),
+		}
 		if DetectSSHCamouflage(peekBuf, srvCtx) {
 			logger.Debug("Detected SSH camouflage")
 			handleSSHCamouflage(buffConn, srvCtx, logger)

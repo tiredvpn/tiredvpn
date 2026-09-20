@@ -24,10 +24,12 @@ import (
 // no marker matching a secret we hold is ssh_camouflage; one whose marker does
 // match is the confusion transport and is dispatched there instead.
 //
-// This never reads from the connection: an incomplete SSH carrier (which is
-// what the ssh_camouflage client's lone banner looks like) returns true so the
-// caller hands it to the interactive handshake rather than blocking it on a
-// read of a carrier it will not finish.
+// This never reads from the connection. An incomplete SSH carrier - what the
+// ssh_camouflage client's lone banner also looks like - returns true, so the
+// caller reaches the interactive handshake. Before deciding, the dispatcher
+// gives a possibly-fragmented carrier a short window to finish
+// (reassembleSSHCarrierPeek), so a carrier split across TCP segments is not
+// classified here as camouflage and pushed into a handshake it will fail.
 func DetectSSHCamouflage(peek []byte, srvCtx *serverContext) bool {
 	if !bytes.HasPrefix(peek, []byte("SSH-2.0")) {
 		return false
@@ -48,6 +50,62 @@ func peekBearsConfusionSSHMarker(peek []byte, srvCtx *serverContext) bool {
 	}
 	_, _, ok := matchConfusionSecret(req, srvCtx)
 	return ok
+}
+
+// sshCarrierReassembleTimeout bounds how long the dispatcher waits for the rest
+// of a fragmented SSH carrier first flight. A confusion carrier sends its whole
+// flight at once, so the remainder arrives within about one RTT and this window
+// is far above that. It is also the most an ssh_camouflage (S2) client waits
+// before the server greets it - that client sends only its banner and then
+// blocks on the server - so the window is kept short to keep that handshake
+// prompt.
+const sshCarrierReassembleTimeout = 500 * time.Millisecond
+
+// sshCarrierPeekCap bounds the reassembly buffer. A confusion SSH carrier is a
+// banner, three handshake packets (the largest a ~1.5 KB KEXINIT) and one sealed
+// body packet; 16 KiB is well above that and stops a dribbling peer from growing
+// the buffer without end.
+const sshCarrierPeekCap = 16 * 1024
+
+// reassembleSSHCarrierPeek completes a confusion SSH carrier whose first flight
+// arrived split across TCP segments, so the dispatcher classifies a whole flight
+// rather than a truncated one that would be mistaken for the bare-banner
+// ssh_camouflage client.
+//
+// It returns at once when the buffer is already a structurally complete carrier
+// (or a definite non-carrier), and otherwise reads on until a short deadline. An
+// ssh_camouflage (S2) client, which sends only its banner and then waits for the
+// server, contributes no more bytes and simply waits out the window; it is never
+// held for the confusion auth timeout. Every byte read is returned so the caller
+// can replay it in front of the handshake that follows.
+func reassembleSSHCarrierPeek(conn net.Conn, peek []byte, logger *log.Logger) []byte {
+	// Already complete, or already definitely not a carrier: nothing to wait for.
+	if _, err := strategy.ParseConfusionRequest(peek); err == nil || !errors.Is(err, strategy.ErrConfusionNeedMore) {
+		return peek
+	}
+
+	buf := make([]byte, len(peek), len(peek)+2048)
+	copy(buf, peek)
+
+	conn.SetReadDeadline(time.Now().Add(sshCarrierReassembleTimeout))
+	defer conn.SetReadDeadline(time.Time{})
+
+	for len(buf) < sshCarrierPeekCap {
+		chunk := make([]byte, 2048)
+		n, err := conn.Read(chunk)
+		if n > 0 {
+			buf = append(buf, chunk[:n]...)
+			if _, perr := strategy.ParseConfusionRequest(buf); perr == nil || !errors.Is(perr, strategy.ErrConfusionNeedMore) {
+				return buf
+			}
+			continue
+		}
+		if err != nil {
+			logger.Debug("SSH carrier reassembly stopped after %d bytes: %v", len(buf), err)
+			return buf
+		}
+	}
+	return buf
 }
 
 // handleSSHCamouflage drives the server side of the SSH transport and then
