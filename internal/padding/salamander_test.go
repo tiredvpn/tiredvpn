@@ -93,6 +93,10 @@ func TestSalamanderDifferentSecrets(t *testing.T) {
 	}
 }
 
+// TestSalamanderBucketNormalization pins the bucket floor each plaintext lands
+// on. The record no longer comes out at exactly the bucket value - it lands in
+// [floor, floor+paddingJitterWidth], see paddingJitterWidth for why - so the
+// floor is what is pinned and the jitter is bounded separately.
 func TestSalamanderBucketNormalization(t *testing.T) {
 	secret := []byte("test-secret")
 
@@ -118,14 +122,22 @@ func TestSalamanderBucketNormalization(t *testing.T) {
 		padder := NewSalamanderPadder(secret, tt.level)
 		plaintext := make([]byte, tt.plaintextLen)
 
-		encrypted, err := padder.Encrypt(plaintext)
-		if err != nil {
-			t.Fatalf("Encrypt failed: %v", err)
+		if got := padder.normalizeToucket(tt.plaintextLen); got != tt.wantBucket {
+			t.Errorf("Level=%v, len=%d: bucket floor = %d, want %d",
+				tt.level, tt.plaintextLen, got, tt.wantBucket)
 		}
 
-		if len(encrypted) != tt.wantBucket {
-			t.Errorf("Level=%v, len=%d: encrypted size = %d, want %d",
-				tt.level, tt.plaintextLen, len(encrypted), tt.wantBucket)
+		// Repeat: a single draw could sit on the floor by chance and hide a
+		// jitter that overshoots.
+		for i := 0; i < 64; i++ {
+			encrypted, err := padder.Encrypt(plaintext)
+			if err != nil {
+				t.Fatalf("Encrypt failed: %v", err)
+			}
+			if len(encrypted) < tt.wantBucket || len(encrypted) > tt.wantBucket+paddingJitterWidth {
+				t.Fatalf("Level=%v, len=%d: encrypted size = %d, want within [%d, %d]",
+					tt.level, tt.plaintextLen, len(encrypted), tt.wantBucket, tt.wantBucket+paddingJitterWidth)
+			}
 		}
 	}
 }
@@ -640,47 +652,72 @@ func TestSalamanderUDPTagCheckedInFull(t *testing.T) {
 // than a lookup table.
 func TestSalamanderUDPWireSizeStable(t *testing.T) {
 	padder := NewSalamanderPadder([]byte("wire-size-secret"), Balanced)
-	buckets := padder.GetBuckets() // 400, 800, 1200, 1400
 
 	// Sizes a quic-go connection puts on the wire: bare ACKs and probes at the
 	// low end, Initial and full data packets at InitialPacketSize=1280. The
 	// wanted values were produced by the 2-byte-tag build and are frozen here.
+	// What is frozen is the bucket FLOOR: since the jitter landed, the datagram
+	// sits in [floor, floor+room] rather than on the floor exactly.
 	quicSizes := []struct {
-		payload  int
-		wantWire int
+		payload   int
+		wantFloor int
 	}{
 		{21, 400}, {25, 400}, {33, 400}, {42, 400}, {55, 400}, {68, 400},
 		{120, 400}, {256, 400}, {512, 800}, {700, 800}, {900, 1200},
 		{1024, 1200}, {1200, 1400}, {1252, 1400}, {1280, 1400},
 	}
 	for _, tc := range quicSizes {
+		floor, hi := dgramBand(padder, tc.payload)
+		if floor != tc.wantFloor {
+			t.Errorf("payload %d: bucket floor %d, want %d - the tag widening moved this size into another bucket",
+				tc.payload, floor, tc.wantFloor)
+			continue
+		}
 		enc, err := padder.EncryptUDP(make([]byte, tc.payload))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(enc) != tc.wantWire {
-			t.Errorf("payload %d: datagram %d bytes, want %d - the tag widening moved this size into another bucket",
-				tc.payload, len(enc), tc.wantWire)
+		if len(enc) < floor || len(enc) > hi {
+			t.Errorf("payload %d: datagram %d bytes, want within [%d, %d]", tc.payload, len(enc), floor, hi)
 		}
 	}
 
-	// Every payload that still fits the largest bucket must come out as one of
-	// the bucket values. Anything else means padding stopped normalising and
-	// the payload length is leaking directly.
-	maxPadded := buckets[len(buckets)-1] - 8 - udpHeaderLen
-	inBucket := make(map[int]bool, len(buckets))
-	for _, b := range buckets {
-		inBucket[b] = true
-	}
+	// Every payload that can travel in one datagram must land in the band of
+	// some rung. Anything else means padding stopped normalising and the
+	// payload length is leaking directly.
+	maxPadded := padder.MaxDatagram() - 8 - udpHeaderLen
 	for n := 1; n <= maxPadded; n++ {
 		enc, err := padder.EncryptUDP(make([]byte, n))
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("payload %d: %v", n, err)
 		}
-		if !inBucket[len(enc)] {
-			t.Fatalf("payload %d: datagram %d bytes is not a bucket %v", n, len(enc), buckets)
+		lo, hi := dgramBand(padder, n)
+		if len(enc) < lo || len(enc) > hi {
+			t.Fatalf("payload %d: datagram %d bytes outside the band [%d, %d] of ladder %v",
+				n, len(enc), lo, hi, padder.dgramBuckets)
 		}
 	}
+}
+
+// dgramBand returns the range of datagram sizes a payload of this length is
+// allowed to produce: the ladder rung it lands on, and that rung plus the room
+// the jitter has before the next rung or the ceiling.
+func dgramBand(padder *SalamanderPadder, payload int) (lo, hi int) {
+	floor, ceil, ok := floorAndCeil(padder.dgramBuckets, udpHeaderLen+payload+8)
+	if !ok {
+		return 0, 0
+	}
+	if ceil == 0 || ceil > padder.MaxDatagram() {
+		ceil = padder.MaxDatagram()
+	}
+	room := ceil - floor
+	if room > paddingJitterWidth {
+		room = paddingJitterWidth
+	}
+	if room < 0 {
+		room = 0
+	}
+	return floor, floor + room
 }
 
 // TestSalamanderUDPBucketBoundaries records exactly where the payload-to-bucket
@@ -691,29 +728,36 @@ func TestSalamanderUDPWireSizeStable(t *testing.T) {
 // now travel one bucket up. None of those windows carries QUIC traffic in the
 // configurations this code ships with, see TestSalamanderUDPWireSizeStable.
 //
-// Above the largest bucket the padder gives up and sends payload+8+udpHeaderLen
-// verbatim, so there the datagram grew by the full six bytes and the exact
-// payload length is on the wire. That leak predates this change; the tag only
-// shifted it by six.
+// Above the largest bucket the padder used to give up and send
+// payload+8+udpHeaderLen verbatim, putting the exact payload length on the
+// wire. The datagram ladder now ends at MaxDatagram instead, so 1383 pads to
+// 1452 rather than travelling bare at 1401, and anything above that ceiling is
+// split by EncryptUDPDatagrams instead of sent oversized.
 func TestSalamanderUDPBucketBoundaries(t *testing.T) {
 	padder := NewSalamanderPadder([]byte("boundary-secret"), Balanced)
 
 	cases := []struct {
-		payload  int
-		wantWire int
+		payload   int
+		wantFloor int
 	}{
 		{382, 400}, {383, 800}, // was 388/389
 		{782, 800}, {783, 1200}, // was 788/789
 		{1182, 1200}, {1183, 1400}, // was 1188/1189
-		{1382, 1400}, {1383, 1401}, // was 1388/1389, and 1389 went out as 1401 too
+		{1382, 1400}, {1383, 1452}, // 1383 used to go out bare at 1401
+		{1434, 1452}, // the largest payload that still fits one datagram
 	}
 	for _, tc := range cases {
+		floor, hi := dgramBand(padder, tc.payload)
+		if floor != tc.wantFloor {
+			t.Errorf("payload %d: bucket floor %d, want %d", tc.payload, floor, tc.wantFloor)
+			continue
+		}
 		enc, err := padder.EncryptUDP(make([]byte, tc.payload))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(enc) != tc.wantWire {
-			t.Errorf("payload %d: datagram %d bytes, want %d", tc.payload, len(enc), tc.wantWire)
+		if len(enc) < floor || len(enc) > hi {
+			t.Errorf("payload %d: datagram %d bytes, want within [%d, %d]", tc.payload, len(enc), floor, hi)
 		}
 	}
 }
