@@ -12,7 +12,6 @@ import (
 	stdtls "crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"io"
@@ -155,56 +154,45 @@ func TestSSHCamouflageAuthenticatesWithTheDialSecret(t *testing.T) {
 	}
 }
 
-// imapLogin is what the fake IMAP server pulls out of the LOGIN line.
-type imapLogin struct {
-	user  string
-	token []byte
-}
-
 // TestIMAPCamouflageAuthenticatesWithTheDialSecret covers both credentials the
-// IMAP camouflage derives: the token in the password field and the username,
-// which is the first four bytes of the secret in hex.
+// IMAP camouflage derives inside its TLS session: the SASL digest and the login
+// address. Both must come from the endpoint's secret, not the one the strategy
+// was constructed with.
 func TestIMAPCamouflageAuthenticatesWithTheDialSecret(t *testing.T) {
-	addr, logins := acceptOne(t, func(conn net.Conn) (any, error) {
-		br := bufio.NewReader(conn)
-		for {
-			line, err := br.ReadString('\n')
-			if err != nil {
-				return nil, err
-			}
-			switch {
-			case strings.HasPrefix(line, "A001 CAPABILITY"):
-				if _, err := conn.Write([]byte("* CAPABILITY IMAP4rev1\r\nA001 OK done\r\n")); err != nil {
-					return nil, err
-				}
-			case strings.HasPrefix(line, "A002 LOGIN "):
-				fields := strings.Fields(strings.TrimSpace(line))
-				if len(fields) != 4 {
-					return nil, io.ErrUnexpectedEOF
-				}
-				tok, err := base64.StdEncoding.DecodeString(fields[3])
-				if err != nil {
-					return nil, err
-				}
-				return imapLogin{user: fields[2], token: tok}, nil
-			}
+	addr, observations := acceptOne(t, func(conn net.Conn) (any, error) {
+		// secret=nil: this server records the credential instead of checking
+		// it, so the assertions below decide which secret produced it.
+		_, _, obs, err := fakeIMAPServerHandshake(t, conn, nil)
+		if err != nil {
+			return nil, err
 		}
+		return obs, nil
 	})
 
 	m := managerAt(t, addr)
 	s := NewIMAPCamouflageStrategy(m, []byte(wireBuiltSecret))
 	m.Register(s)
-	dialAndIgnore(t, m, addr)
+	// Unlike the other recorders here, this server answers the whole exchange
+	// (the credential only exists inside the TLS session), so the dial
+	// succeeds and the connection has to be closed rather than ignored.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if conn, _, err := m.Connect(ctx, addr); err == nil {
+		conn.Close()
+	}
 
-	got := awaitCredential(t, logins).(imapLogin)
-	if !VerifyIMAPAuthToken(got.token, []byte(wireDialSecret)) {
-		t.Fatal("the IMAP token does not verify under the endpoint's secret")
+	got := awaitCredential(t, observations).(imapServerObservation)
+	if !VerifyIMAPAuthResponse(got.digest, []byte(wireDialSecret), got.challenge, got.binding) {
+		t.Fatal("the IMAP digest does not verify under the endpoint's secret")
 	}
-	if VerifyIMAPAuthToken(got.token, []byte(wireBuiltSecret)) {
-		t.Fatal("the IMAP token verifies under the construction secret too")
+	if VerifyIMAPAuthResponse(got.digest, []byte(wireBuiltSecret), got.challenge, got.binding) {
+		t.Fatal("the IMAP digest verifies under the construction secret too")
 	}
-	if want := imapUsername([]byte(wireDialSecret)); got.user != want {
-		t.Fatalf("LOGIN user = %q, want %q (derived from the endpoint's secret)", got.user, want)
+	if want := imapUsername([]byte(wireDialSecret), got.challenge); got.user != want {
+		t.Fatalf("login address = %q, want %q (derived from the endpoint's secret)", got.user, want)
+	}
+	if got.user == imapUsername([]byte(wireBuiltSecret), got.challenge) {
+		t.Fatal("the login address matches the construction secret too; this test cannot tell them apart")
 	}
 }
 
