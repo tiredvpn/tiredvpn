@@ -32,10 +32,12 @@ const seqovlPacketNonceLen = 8
 // self-describing, so a server-side dropper verifies the MAC over the embedded
 // nonce instead of matching a precomputed static list.
 //
-// One NFQUEUE hook serves the whole process, so this nonce is fresh per injector
-// session, not per connection; minting one per fake segment would need
-// geneva.OverlapPrimitive to generate it, which the level-A injector cannot do
-// from here (see the blocker noted in tryStartPacketOverlap's package).
+// One NFQUEUE hook serves the whole process, but the nonce is minted fresh per
+// connection: tryStartPacketOverlap hands geneva.NewOverlapPrimitiveMinted a
+// closure that calls this with a new nonce every time the primitive fires on a
+// new connection, so no two connections' fake segments share a marker. The
+// secret is still the one captured when the injector started (see SeqovlStrategy
+// for why a multi-secret pool keeps only that endpoint's key on level A).
 func seqovlPacketMarker(secret, nonce []byte) []byte {
 	mac := hmac.New(sha256.New, secret)
 	mac.Write([]byte(seqovlPacketSalt))

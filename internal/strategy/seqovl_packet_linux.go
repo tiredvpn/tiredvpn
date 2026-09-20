@@ -30,11 +30,13 @@ const seqovlQueueNum = 1
 // the server's rcv_nxt), so even without the server-side NFQUEUE drop the
 // cooperating server's kernel discards the fake and the real stream stays clean.
 //
-// secret is the key of the endpoint being dialled, and it marks the fake
-// segments. One NFQUEUE hook carries one marker for the whole process, so the
-// injector is pinned to the endpoint that started it - see SeqovlStrategy for
-// why that is a limitation rather than a bug, and why a later endpoint with a
-// different key gets a warning instead of a second injector.
+// secret is the key of the endpoint being dialled, and it keys the per-connection
+// markers. One NFQUEUE hook serves the whole process, and the marker's *secret*
+// is captured from the endpoint that started the injector - so the injector is
+// still pinned to that endpoint's key, and a later endpoint with a different key
+// gets a warning rather than a second injector. The *nonce*, however, is now
+// minted fresh per connection by the OverlapPrimitive, so the fake segments are
+// no longer one fixed 32-byte value across the process; see SeqovlStrategy.
 func (s *SeqovlStrategy) tryStartPacketOverlap(secret []byte) bool {
 	if !s.packetEnabled {
 		return false
@@ -46,15 +48,20 @@ func (s *SeqovlStrategy) tryStartPacketOverlap(secret []byte) bool {
 	}
 
 	s.injectorOnce.Do(func() {
-		// Fresh nonce per injector session so the marker is not the same 32 bytes
-		// on every connection's fake segments (see seqovlPacketMarker).
-		nonce := make([]byte, seqovlPacketNonceLen)
-		if _, err := cryptorand.Read(nonce); err != nil {
-			log.Debug("Seqovl: packet-level nonce generation failed: %v - staying on level B", err)
-			return
+		// Mint a fresh nonce (hence a fresh marker) for each connection's fake
+		// segment. The injector is one process-wide NFQUEUE hook, but the
+		// OverlapPrimitive calls this per connection, so the [nonce||HMAC] marker
+		// is not the same 32 bytes on every fake segment (see seqovlPacketMarker).
+		secretCopy := append([]byte(nil), secret...)
+		mint := func() []byte {
+			nonce := make([]byte, seqovlPacketNonceLen)
+			if _, err := cryptorand.Read(nonce); err != nil {
+				log.Debug("Seqovl: packet-level nonce generation failed: %v - fake suppressed for this connection", err)
+				return nil
+			}
+			return seqovlPacketMarker(secretCopy, nonce)
 		}
-		marker := seqovlPacketMarker(secret, nonce)
-		prim := geneva.NewOverlapPrimitive(marker)
+		prim := geneva.NewOverlapPrimitiveMinted(mint)
 		strat := geneva.NewOverlapStrategy(prim)
 
 		ctx, cancel := context.WithCancel(context.Background())
