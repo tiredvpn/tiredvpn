@@ -8,6 +8,7 @@ import (
 	"io"
 	"math/rand"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -687,7 +688,7 @@ func (v *VPNClient) seamlessPortHop(newPort int) {
 	if err != nil {
 		host = v.serverAddr
 	}
-	newTarget := fmt.Sprintf("%s:%d", host, newPort)
+	newTarget := net.JoinHostPort(host, strconv.Itoa(newPort))
 
 	// Try to establish new connection (make)
 	var newConn net.Conn
