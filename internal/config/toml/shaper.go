@@ -38,11 +38,11 @@ type ShaperCustom struct {
 // DistConfig is a tagged union of supported distributions. Exactly one of the
 // inline structs (matching Type) must be populated.
 type DistConfig struct {
-	Type      DistType        `toml:"type"`
-	Histogram *HistogramDist  `toml:"histogram,omitempty"`
-	LogNormal *LogNormalDist  `toml:"lognormal,omitempty"`
-	Pareto    *ParetoDist     `toml:"pareto,omitempty"`
-	Markov    *MarkovDist     `toml:"markov,omitempty"`
+	Type      DistType       `toml:"type"`
+	Histogram *HistogramDist `toml:"histogram,omitempty"`
+	LogNormal *LogNormalDist `toml:"lognormal,omitempty"`
+	Pareto    *ParetoDist    `toml:"pareto,omitempty"`
+	Markov    *MarkovDist    `toml:"markov,omitempty"`
 }
 
 // HistogramDist describes a discrete weighted distribution. Bins must be

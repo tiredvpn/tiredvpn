@@ -10,11 +10,11 @@ import (
 // Protocol type bytes sent as the first byte after TLS handshake.
 // ALPN values in ClientHello are cleartext and visible to DPI; these bytes are encrypted.
 const (
-	TypeStego    = byte(0x01)
-	TypeRaw      = byte(0x02)
-	TypeMorph    = byte(0x03)
-	TypeWS       = byte(0x04)
-	TypePolling  = byte(0x05)
+	TypeStego     = byte(0x01)
+	TypeRaw       = byte(0x02)
+	TypeMorph     = byte(0x03)
+	TypeWS        = byte(0x04)
+	TypePolling   = byte(0x05)
 	TypeConfusion = byte(0x06)
 	TypeAntiProbe = byte(0x07)
 	TypeMux       = byte(0x08) // smux stream multiplexing (REALITY)

@@ -18,11 +18,11 @@ type captureConn struct {
 	buf []byte
 }
 
-func (c *captureConn) Write(p []byte) (int, error) { c.buf = append(c.buf, p...); return len(p), nil }
-func (c *captureConn) Read([]byte) (int, error)    { return 0, io.EOF }
-func (c *captureConn) Close() error                { return nil }
-func (c *captureConn) LocalAddr() net.Addr         { return nil }
-func (c *captureConn) RemoteAddr() net.Addr        { return nil }
+func (c *captureConn) Write(p []byte) (int, error)      { c.buf = append(c.buf, p...); return len(p), nil }
+func (c *captureConn) Read([]byte) (int, error)         { return 0, io.EOF }
+func (c *captureConn) Close() error                     { return nil }
+func (c *captureConn) LocalAddr() net.Addr              { return nil }
+func (c *captureConn) RemoteAddr() net.Addr             { return nil }
 func (c *captureConn) SetDeadline(time.Time) error      { return nil }
 func (c *captureConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *captureConn) SetWriteDeadline(time.Time) error { return nil }

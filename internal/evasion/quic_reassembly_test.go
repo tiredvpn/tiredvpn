@@ -61,9 +61,9 @@ func (c *bufferedPacketConn) Close() error {
 	return nil
 }
 
-func (c *bufferedPacketConn) LocalAddr() net.Addr              { return c.addr }
-func (c *bufferedPacketConn) SetDeadline(_ time.Time) error    { return nil }
-func (c *bufferedPacketConn) SetReadDeadline(_ time.Time) error { return nil }
+func (c *bufferedPacketConn) LocalAddr() net.Addr                { return c.addr }
+func (c *bufferedPacketConn) SetDeadline(_ time.Time) error      { return nil }
+func (c *bufferedPacketConn) SetReadDeadline(_ time.Time) error  { return nil }
 func (c *bufferedPacketConn) SetWriteDeadline(_ time.Time) error { return nil }
 
 // TestQUICReassemblyMaxSessionsDoS verifies that QUICReassemblyPacketConn
@@ -160,7 +160,9 @@ func TestQUICFragmentReassemblyRoundTrip(t *testing.T) {
 // truncate reassembled data when it exceeds len(p).
 //
 // Bug: if len(assembled) > len(p), the code silently truncates:
-//   assembled = assembled[:len(p)]
+//
+//	assembled = assembled[:len(p)]
+//
 // This returns partial data with no error, corrupting the stream.
 //
 // After fix: ReadFrom should return an error or expand the buffer.

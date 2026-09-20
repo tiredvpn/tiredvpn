@@ -29,8 +29,8 @@ func (d *DropPrimitive) String() string {
 
 // TamperPrimitive modifies TCP header fields
 type TamperPrimitive struct {
-	Field string      // "flags", "seq", "ack", "win", "chksum"
-	Value any // New value or modification
+	Field string // "flags", "seq", "ack", "win", "chksum"
+	Value any    // New value or modification
 }
 
 // NewTamperPrimitive creates a tamper primitive

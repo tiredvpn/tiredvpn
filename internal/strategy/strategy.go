@@ -208,8 +208,8 @@ type Manager struct {
 
 // Fast-reconnect loop-guard tuning. See Manager.fastReconnectStrategy.
 const (
-	fastReconnectLimit  = 3               // fast reconnects of one strategy allowed before forcing a full scan
-	fastReconnectWindow = 5 * time.Minute // window over which fast reconnects are counted
+	fastReconnectLimit  = 3                // fast reconnects of one strategy allowed before forcing a full scan
+	fastReconnectWindow = 5 * time.Minute  // window over which fast reconnects are counted
 	fastReconnectGap    = 30 * time.Second // max pause between counted reconnects; a longer one means the session held
 )
 
