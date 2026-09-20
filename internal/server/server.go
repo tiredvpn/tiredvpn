@@ -1341,11 +1341,20 @@ func handleConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 		return
 	}
 
-	// Raw TCP protocol confusion: DNS-over-TCP / HTTP / SSH / SMTP preamble + TIRED marker
-	if detectConfusionMagic(peekBuf) {
+	// Raw TCP protocol confusion. Entry point 1 of 3 into the confusion funnel;
+	// all three authenticate here, before the handler sees anything.
+	if sess, consumed, ok := classifyConfusion(buffConn, peekBuf, srvCtx, logger); ok {
 		logger.Debug("Detected raw TCP protocol confusion")
-		handleProtocolConfusion(buffConn, srvCtx, logger)
+		handleProtocolConfusion(sess, srvCtx, logger)
 		return
+	} else if len(consumed) > 0 {
+		// Not ours after all. Replay every byte we read so the fake website
+		// answers exactly the same connection it would have answered if this
+		// detector had never looked.
+		buffConn = &bufferedConn{
+			Conn:   conn,
+			reader: io.MultiReader(bytes.NewReader(consumed), conn),
+		}
 	}
 
 	// Unknown protocol - serve fake website
@@ -1376,7 +1385,10 @@ func handleTLSConnection(conn *tls.Conn, srvCtx *serverContext, connID uint64) {
 	case protocol.TypeRaw:
 		handleRawTunnel(conn, srvCtx, logger, clientIdentity{})
 	case protocol.TypeConfusion:
-		handleProtocolConfusion(conn, srvCtx, logger)
+		// Entry point 2 of 3. Nothing in the tree writes this discriminator, so
+		// the only peer that arrives here is one that chose to - which is
+		// exactly why it has to authenticate like the other two.
+		handleConfusionDispatch(conn, srvCtx, logger)
 	case protocol.TypeAntiProbe:
 		handleAntiProbeDispatch(conn, srvCtx, logger)
 	case protocol.TypeMorph:
@@ -1447,11 +1459,18 @@ func handleTLSConnectionLegacy(conn net.Conn, srvCtx *serverContext, connID uint
 		return
 	}
 
-	// Check for protocol confusion magic
-	if detectConfusionMagic(peekBuf) {
-		logger.Debug("Detected protocol confusion magic over TLS")
-		handleProtocolConfusion(buffConn, srvCtx, logger)
+	// Check for protocol confusion. Entry point 3 of 3. On a failed match the
+	// consumed bytes are replayed, so the WebSocket and HTTP/1 detectors below
+	// still see the connection they would have seen.
+	if sess, consumed, ok := classifyConfusion(buffConn, peekBuf, srvCtx, logger); ok {
+		logger.Debug("Detected protocol confusion over TLS")
+		handleProtocolConfusion(sess, srvCtx, logger)
 		return
+	} else if len(consumed) > 0 {
+		buffConn = &bufferedConn{
+			Conn:   conn,
+			reader: io.MultiReader(bytes.NewReader(consumed), conn),
+		}
 	}
 
 	// Check for WebSocket Padded
@@ -1540,7 +1559,7 @@ type h2TunnelState struct {
 	targetConn      net.Conn
 	streamID        uint32
 	clientID        clientIdentity // Client identity for IP pool allocation
-	remoteAddr      string // Peer host, used to qualify the IP-pool lease key
+	remoteAddr      string         // Peer host, used to qualify the IP-pool lease key
 	mu              sync.Mutex
 	sharedTUNWriter *ClientWriter // For shared TUN mode
 	sharedTUN       *SharedTUN    // Reference to shared TUN
@@ -2800,108 +2819,72 @@ func handleAntiProbeAuth(conn net.Conn, srvCtx *serverContext, secret []byte, cl
 	handleRawTunnel(conn, srvCtx, logger, clientID)
 }
 
-// handleProtocolConfusion handles protocol confusion connections
-func handleProtocolConfusion(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
-	cfg := srvCtx.cfg
-	logger.Debug("Processing protocol confusion")
-
-	// Read enough data to find the magic marker (TIRED is at ~offset 50 in DNS confusion)
-	// Use multiple reads to gather data since bufferedConn may return peeked data first
-	buf := make([]byte, 4096)
-	totalRead := 0
-
-	for totalRead < 256 { // Read at least 256 bytes to find marker
-		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		n, err := conn.Read(buf[totalRead:])
-		if err != nil {
-			if totalRead > 0 {
-				break // Use what we have
+// handleConfusionDispatch is the entry from the encrypted 1-byte discriminator,
+// which arrives with no peek of its own. It authenticates the same way the two
+// detector-driven entries do and falls back to the fake website, so choosing the
+// discriminator buys a peer nothing.
+func handleConfusionDispatch(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
+	sess, consumed, ok := classifyConfusion(conn, nil, srvCtx, logger)
+	if !ok {
+		replay := conn
+		if len(consumed) > 0 {
+			replay = &bufferedConn{
+				Conn:   conn,
+				reader: io.MultiReader(bytes.NewReader(consumed), conn),
 			}
-			logger.Debug("Failed to read confusion data: %v", err)
-			return
 		}
-		totalRead += n
-
-		// Check if we found the marker
-		if bytes.Contains(buf[:totalRead], []byte("TIRED")) {
-			break
-		}
+		serveFakeWebsite(replay, srvCtx.cfg, logger)
+		return
 	}
-	conn.SetReadDeadline(time.Time{})
+	handleProtocolConfusion(sess, srvCtx, logger)
+}
 
-	logger.Debug("Read %d bytes for confusion detection", totalRead)
+// handleProtocolConfusion serves an authenticated confusion connection.
+//
+// It is reached only through classifyConfusion, so by the time the first byte of
+// this function runs the peer has proved it holds a secret this server knows,
+// the record layer is keyed to that secret and a fresh per-connection nonce, and
+// nothing has been written back. The target address is read out of a sealed
+// frame rather than off the wire, which is the difference between "a peer asked
+// us to dial this" and "anyone can make us dial anything".
+func handleProtocolConfusion(sess *confusionSession, srvCtx *serverContext, logger *log.Logger) {
+	conn := sess.conn
+	logger.Debug("Processing protocol confusion (client: %s)", sess.clientID)
 
-	// Find magic marker
-	magicPos := bytes.Index(buf[:totalRead], []byte("\x00\x00TIRED"))
-	if magicPos < 0 {
-		magicPos = bytes.Index(buf[:totalRead], []byte("TIRED"))
+	// First sealed frame: the mode byte and what follows it.
+	sess.raw.SetReadDeadline(time.Now().Add(confusionAuthTimeout))
+	first, err := conn.ReadFrame()
+	sess.raw.SetReadDeadline(time.Time{})
+	if err != nil {
+		logger.Debug("Confusion: first frame read failed: %v", err)
+		return
 	}
-
-	if magicPos < 0 {
-		logger.Debug("Magic marker not found in %d bytes", totalRead)
-		serveFakeWebsite(conn, cfg, logger)
+	if len(first) == 0 {
+		logger.Debug("Confusion: empty first frame")
 		return
 	}
 
-	logger.Debug("Found magic at position %d", magicPos)
-
-	// Extract real data - format after TIRED: [length:4][data:N]
-	// If magic is "\x00\x00TIRED", dataStart is magicPos + 7
-	// If magic is "TIRED", dataStart is magicPos + 5
-	dataStart := magicPos + 5
-	if buf[magicPos] == 0x00 {
-		dataStart = magicPos + 7
-	}
-
-	if dataStart+4 > totalRead {
-		logger.Debug("Insufficient data after magic")
+	// TUN mode
+	if first[0] == 0x02 {
+		logger.Info("Confusion TUN mode detected (client: %s)", sess.clientID)
+		handleConfusionTUNMode(sess, first[1:], srvCtx, logger)
 		return
 	}
 
-	// Read embedded data length
-	dataLen := binary.BigEndian.Uint32(buf[dataStart : dataStart+4])
-	logger.Debug("Embedded data length: %d", dataLen)
-
-	// Extract embedded address from confusion packet
-	// The embedded data IS the target address in format: [mode:1][...] where mode=0x02 is TUN,
-	// otherwise [addrLen:2][addr:N]
-	embeddedStart := dataStart + 4
-	if embeddedStart+2 > totalRead {
-		logger.Debug("Insufficient embedded data")
+	if len(first) < 2 {
+		logger.Debug("Confusion: truncated target address")
 		return
 	}
-
-	// Check for TUN mode (first byte = 0x02)
-	if buf[embeddedStart] == 0x02 {
-		logger.Info("Confusion TUN mode detected")
-		// Confirm understanding
-		if _, err := conn.Write([]byte("TIRED")); err != nil {
-			logger.Warn("Failed to write confusion TUN ack: %v", err)
-			return
-		}
-		// Auth phase complete: hand the socket over to kTLS for the byte-relay phase.
-		// At this point the TLS stack's read buffer is empty (we read the magic
-		// + embedded data block to completion) and tls.Conn.Write has written
-		// the ack synchronously to the kernel send buffer.
-		conn = ktls.TryEnable(conn, "tired-confusion")
-		handleConfusionTUNMode(conn, buf[embeddedStart+1:totalRead], srvCtx, logger)
-		return
-	}
-
-	addrLen := int(buf[embeddedStart])<<8 | int(buf[embeddedStart+1])
-	if addrLen > 256 || addrLen < 3 || embeddedStart+2+addrLen > totalRead {
+	addrLen := int(first[0])<<8 | int(first[1])
+	if addrLen > 256 || addrLen < 3 || 2+addrLen > len(first) {
 		logger.Debug("Invalid embedded address length: %d", addrLen)
 		return
 	}
-	targetAddr := string(buf[embeddedStart+2 : embeddedStart+2+addrLen])
-	logger.Info("Confusion tunnel to: %s", targetAddr)
-
-	// Confirm understanding
-	conn.Write([]byte("TIRED"))
+	targetAddr := string(first[2 : 2+addrLen])
+	logger.Info("Confusion tunnel to: %s (client: %s)", targetAddr, sess.clientID)
 
 	// Connect to target (via upstream if configured)
 	var targetConn net.Conn
-	var err error
 	if srvCtx.upstreamDialer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr)
@@ -2911,36 +2894,22 @@ func handleProtocolConfusion(conn net.Conn, srvCtx *serverContext, logger *log.L
 	}
 	if err != nil {
 		logger.Warn("Failed to connect to %s: %v", targetAddr, err)
-		conn.Write([]byte{0x00, 0x00, 0x00, 0x01, 0x01}) // Send failure
+		conn.Write([]byte{0x01}) // Send failure
 		return
 	}
 	defer targetConn.Close()
 
-	// Send success (length-prefixed as client expects)
-	if _, err := conn.Write([]byte{0x00, 0x00, 0x00, 0x01, 0x00}); err != nil {
+	// Send success. This is the first byte the server emits on the connection,
+	// and it goes out sealed, inside the answering carrier.
+	if _, err := conn.Write([]byte{0x00}); err != nil {
 		logger.Warn("Failed to write confusion tunnel ack: %v", err)
 		return
 	}
 	logger.Debug("Connected to target, starting confusion relay")
 
-	// Auth phase complete: hand the socket over to kTLS for the byte-relay phase.
-	// At this point the TLS stack's read buffer is empty (we read the magic
-	// + embedded data block to completion) and tls.Conn.Write has written
-	// the ack synchronously to the kernel send buffer.
-	conn = ktls.TryEnable(conn, "tired-confusion")
-
-	// Burst reshaping wraps the payload phase only: the mode byte, the target
-	// address and the success ack above are this tunnel's own control preamble,
-	// and a reshaper that sees them mistakes the one-byte mode read for the
-	// client's first application burst and holds the ack behind a nudge.
-	//
-	// With the feature off this returns conn unchanged, so the kTLS/splice fast
-	// path below is untouched in the default configuration. With it on the
-	// wrapper stays in the path and that fast path is given up - the exchange
-	// needs to see the first write in each direction, which splice would hide.
-	conn = strategy.ReshapeServerStream(conn, burstReshapeConfig(srvCtx.cfg))
-
-	// Relay data
+	// Relay data. The sealed frame boundary is the message boundary, so a
+	// control message still arrives as one message rather than as whatever
+	// happened to land in a read.
 	var wg sync.WaitGroup
 	var bytesUp, bytesDown int64
 
@@ -2948,23 +2917,14 @@ func handleProtocolConfusion(conn net.Conn, srvCtx *serverContext, logger *log.L
 
 	go func() {
 		defer wg.Done()
-		// Read length-prefixed data from client
 		for {
-			lenBuf := make([]byte, 4)
-			if _, err := io.ReadFull(conn, lenBuf); err != nil {
-				logger.Debug("Confusion relay: read length error: %v", err)
+			data, err := conn.ReadFrame()
+			if err != nil {
+				logger.Debug("Confusion relay: read error: %v", err)
 				return
 			}
-			pktLen := binary.BigEndian.Uint32(lenBuf)
-			logger.Debug("Confusion relay: received pktLen=%d", pktLen)
-			if pktLen > 65536 || pktLen == 0 {
-				logger.Debug("Confusion relay: invalid pktLen, closing")
-				return
-			}
-			data := make([]byte, pktLen)
-			if _, err := io.ReadFull(conn, data); err != nil {
-				logger.Debug("Confusion relay: read data error: %v", err)
-				return
+			if len(data) == 0 {
+				continue
 			}
 
 			// Check for control message
@@ -2990,16 +2950,8 @@ func handleProtocolConfusion(conn net.Conn, srvCtx *serverContext, logger *log.L
 				logger.Debug("Confusion relay: target read error: %v", err)
 				return
 			}
-			logger.Debug("Confusion relay: sending %d bytes to client", n)
-			// Send length-prefixed response
-			lenBuf := make([]byte, 4)
-			binary.BigEndian.PutUint32(lenBuf, uint32(n))
-			if _, err := conn.Write(lenBuf); err != nil {
-				logger.Debug("Confusion relay: write len error: %v", err)
-				return
-			}
 			if _, err := conn.Write(buf[:n]); err != nil {
-				logger.Debug("Confusion relay: write data error: %v", err)
+				logger.Debug("Confusion relay: write error: %v", err)
 				return
 			}
 			atomic.AddInt64(&bytesDown, int64(n))
@@ -3017,15 +2969,21 @@ func handleProtocolConfusion(conn net.Conn, srvCtx *serverContext, logger *log.L
 
 // handleConfusionTUNMode handles TUN mode over protocol confusion
 // Now uses shared TUN instead of userspace NAT
-func handleConfusionTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverContext, logger *log.Logger) {
+//
+// Reached only from handleProtocolConfusion, which is reached only from
+// classifyConfusion, so the peer holding an address out of the pool has proved
+// it holds a secret. That was not true before 1.11.0: the identity came from
+// the peer's address and the allocation happened for anyone who asked.
+func handleConfusionTUNMode(sess *confusionSession, remainingData []byte, srvCtx *serverContext, logger *log.Logger) {
 	cfg := srvCtx.cfg
+	conn := sess.conn
 	logger.Debug("Processing Confusion TUN mode, remaining data: %d bytes", len(remainingData))
 
 	// Parse TUN handshake from remaining data: [localIP:4][mtu:2][version:1]
 	// Version byte is optional (v1 clients send 6 bytes, v2 clients send 7 bytes)
 	if len(remainingData) < 6 {
 		logger.Debug("Confusion TUN handshake too short: %d bytes", len(remainingData))
-		conn.Write([]byte{0x00, 0x00, 0x00, 0x01, 0x01})
+		conn.Write([]byte{0x01})
 		return
 	}
 
@@ -3033,17 +2991,15 @@ func handleConfusionTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverC
 	// only an exit needs the shared device here.
 	if srvCtx == nil || (srvCtx.sharedTUN == nil && srvCtx.upstreamDialer == nil) {
 		logger.Error("Shared TUN not initialized")
-		conn.Write([]byte{0x00, 0x00, 0x00, 0x01, 0x01})
+		conn.Write([]byte{0x01})
 		return
 	}
 
 	requestedIP := net.IP(remainingData[0:4])
-	// Use only client IP (without port) for clientID to prevent IP pool exhaustion
-	// when client reconnects on different ports (e.g., port hopping)
-	clientHost, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
-	// Behind a relay this is the relay's address, the same for every client
-	// it forwards, so it cannot key a lease on its own.
-	clientID := sharedIdentity(fmt.Sprintf("confusion:%s", clientHost))
+	// The identity is the one the marker proved, not the peer's address.
+	// Behind a relay every forwarded client shares the relay's address, so the
+	// old derivation gave them all one identity and one lease.
+	clientID := sess.clientID
 
 	// Check for version byte (v2 clients send 7 bytes total)
 	var clientVersion uint8 = 1 // Default to v1 for backwards compatibility
@@ -3077,7 +3033,7 @@ func handleConfusionTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverC
 			})
 		if err != nil {
 			logger.Warn("Confusion TUN relay: upstream dial failed: %v", err)
-			conn.Write([]byte{0x00, 0x00, 0x00, 0x01, 0x01})
+			conn.Write([]byte{0x01})
 			return
 		}
 		sink, serverIP, clientIP = relaySink, upServerIP, upClientIP
@@ -3091,7 +3047,7 @@ func handleConfusionTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverC
 			allocatedIP, err := srvCtx.ipPool.Allocate(allocationKey(clientID, originOf(conn.RemoteAddr())), requestedIP, "")
 			if err != nil {
 				logger.Error("Failed to allocate IP from pool: %v", err)
-				conn.Write([]byte{0x00, 0x00, 0x00, 0x01, 0x01})
+				conn.Write([]byte{0x01})
 				return
 			}
 			clientIP = allocatedIP
@@ -3112,12 +3068,14 @@ func handleConfusionTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverC
 		}()
 	}
 
-	// Send success response with length prefix: [length:4][payload]
-	// Confusion protocol uses length-prefixed frames for all data after "TIRED" magic.
+	// Send the handshake response bare, the way every other transport does.
+	// It used to carry an extra [length:4] in front, because the old client
+	// stripped one prefix in its first read and none after; now the sealed
+	// frame carries the boundary and confusion needs no shape of its own.
 	// Local exit: v6 addrs from our pool. Relay: v6 addrs assigned by the
 	// upstream exit (absent when the exit did not negotiate dual-stack).
 	dual := downstreamDualStackAddrs(sink, cfg.IPPoolV6, clientIP)
-	resp := frameConfusionTUNResponse(buildTUNHandshakeResponse(clientVersion, serverIP, clientIP, tunHandshakeCaps{}, dual))
+	resp := buildTUNHandshakeResponse(clientVersion, serverIP, clientIP, tunHandshakeCaps{}, dual)
 	recordDualStackSession(srvCtx, clientVersion, dual)
 	if err := writeConfusionFrame(resp); err != nil {
 		logger.Debug("Confusion TUN handshake response write failed: %v", err)
@@ -3170,24 +3128,14 @@ func handleConfusionTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverC
 			sink.UpdateActivity()
 		}
 
-		// Check for double framing from ConfusedConn
-		// ConfusedConn.Write adds [length:4] to every write, but VPN client
-		// already adds [length:4][packet] framing, resulting in:
-		// [outerLen:4][innerLen:4][packet]
-		// We need to strip the inner length prefix if present
-		actualPkt := pkt
-		if len(pkt) >= 4 {
-			innerLen := binary.BigEndian.Uint32(pkt[:4])
-			if innerLen+4 == uint32(len(pkt)) && innerLen >= 20 {
-				// Found double framing - strip inner length prefix
-				if pktUp <= 5 || pktUp%100 == 0 {
-					logger.Debug("Confusion TUN: stripped double framing (outer=%d, inner=%d)", pktLen, innerLen)
-				}
-				actualPkt = pkt[4:]
-			}
-		}
-
-		if err := sink.WritePacket(actualPkt); err != nil {
+		// No double-framing strip any more. The old client's Write put a
+		// [length:4] in front of every write, on top of the one the VPN layer
+		// had already put there, and the server guessed which of the two it was
+		// looking at by comparing the inner number against the outer length - a
+		// guess that corrupts any packet whose first four bytes happen to hold
+		// its own length minus four. The sealed frame carries the boundary now,
+		// so there is exactly one length prefix and nothing to guess.
+		if err := sink.WritePacket(pkt); err != nil {
 			logger.Debug("Confusion TUN sink write error: %v", err)
 		}
 	}
@@ -4170,31 +4118,10 @@ func verifyFullKnockSequence(conn net.Conn, secret []byte, logger *log.Logger) b
 	return true
 }
 
-func detectConfusionMagic(data []byte) bool {
-	// TIRED magic anywhere in peeked data — catches all confusion types once enough
-	// bytes are buffered
-	if bytes.Contains(data, []byte("TIRED")) {
-		return true
-	}
-
-	// DNS-over-TCP confusion: [len:2][txid:2][flags:0x0100...] — query with RD bit
-	// len(data) >= 6 covers the 2-byte TCP length prefix + 4 bytes of DNS header
-	if len(data) >= 6 && data[4] == 0x01 && data[5] == 0x00 {
-		return true
-	}
-
-	// SSH banner — will need to read more to find TIRED marker
-	if bytes.HasPrefix(data, []byte("SSH-2.0-")) {
-		return true
-	}
-
-	// SMTP client EHLO — will need to read more to find TIRED marker
-	if bytes.HasPrefix(data, []byte("EHLO ")) {
-		return true
-	}
-
-	return false
-}
+// detectConfusionMagic and the rest of the confusion admission path now live in
+// confusion_auth.go, where the parse and the marker check sit next to each
+// other. Splitting them was how the old detector ended up routing a connection
+// into the relay on the strength of two bytes.
 
 // authClockSkewGraceMinutes bounds how many 1-minute buckets on either side of
 // "now" verifyH2Auth/verifyMorphAuth accept, tolerating client/server clock

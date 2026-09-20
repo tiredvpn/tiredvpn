@@ -67,7 +67,7 @@ func TestDetectSSHCamouflage(t *testing.T) {
 	}{
 		{"real banner", strategy.SSHBanner, true},
 		{"minimal banner", "SSH-2.0-x\r\n", true},
-		{"confusion variant with TIRED marker", "SSH-2.0-OpenSSH_9.6p1\r\nTIRED\x00\x01", false},
+		{"confusion carrier banner", strategy.ConfusionSSHBanner + "\r\n", false},
 		{"SSH 1.99", "SSH-1.99-OpenSSH_9.6\r\n", false},
 		{"IMAP greeting", strategy.IMAPGreeting, false},
 		{"HTTP request", "GET / HTTP/1.1\r\n", false},

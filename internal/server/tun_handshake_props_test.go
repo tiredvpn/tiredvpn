@@ -359,30 +359,3 @@ func TestDownstreamDualStackAddrsPartialRelayBlock(t *testing.T) {
 		})
 	}
 }
-
-// TestFrameConfusionTUNResponseLengthPrefix pins the confusion framing across
-// every payload size the builder can produce: the length prefix must always
-// describe exactly the bytes that follow, since the client slices the frame by
-// that number before parsing the handshake.
-func TestFrameConfusionTUNResponseLengthPrefix(t *testing.T) {
-	payloads := [][]byte{
-		nil,
-		{},
-		buildTUNHandshakeResponse(0x00, hsServerIP, hsClientIP, tunHandshakeCaps{}, nil),
-		buildTUNHandshakeResponse(0x04, hsServerIP, hsClientIP, tunHandshakeCaps{}, nil),
-		buildTUNHandshakeResponse(0x04, hsServerIP, hsClientIP, portHopCaps(), dualTestAddrs()),
-	}
-
-	for i, payload := range payloads {
-		frame := frameConfusionTUNResponse(payload)
-		if len(frame) != 4+len(payload) {
-			t.Errorf("payload %d: frame = %d bytes, want %d", i, len(frame), 4+len(payload))
-		}
-		if n := binary.BigEndian.Uint32(frame[:4]); int(n) != len(payload) {
-			t.Errorf("payload %d: length prefix = %d, want %d", i, n, len(payload))
-		}
-		if !bytes.Equal(frame[4:], payload) {
-			t.Errorf("payload %d: body = %x, want %x", i, frame[4:], payload)
-		}
-	}
-}

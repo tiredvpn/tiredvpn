@@ -786,11 +786,6 @@ func (v *VPNClient) performHandshake(conn net.Conn) error {
 		}
 	}
 
-	// Enable raw mode for ConfusedConn if applicable
-	if confusedConn, ok := conn.(*strategy.ConfusedConn); ok {
-		confusedConn.SetRawMode(true)
-	}
-
 	log.Debug("VPN: port hop handshake successful")
 	return nil
 }
@@ -846,13 +841,11 @@ func (v *VPNClient) connect(parent context.Context) error {
 	assignedIP := net.IP(resp[5:9])
 	log.Info("VPN connected via %s (server IP: %s, assigned IP: %s)", strat.Name(), serverIP, assignedIP)
 
-	// Enable raw mode for ConfusedConn - VPN mode handles framing itself.
-	// Without this, ConfusedConn.Read() strips length prefix, then vpn.go tries to read it again.
-	if confusedConn, ok := conn.(*strategy.ConfusedConn); ok {
-		confusedConn.SetRawMode(true)
-		log.Debug("Enabled raw mode for ConfusedConn (VPN mode)")
-	}
-
+	// No raw-mode switch for the confusion transport any more. It existed
+	// because ConfusedConn's Read stripped a length prefix that the VPN layer
+	// then needed back, so the tunnel had to ask for a passthrough mode in
+	// which user packets reached the socket unencrypted. The sealed record
+	// layer replaced both halves: one framing, and no plaintext path to turn on.
 	caps, hasCaps := parseServerCapabilities(resp, n)
 
 	// Publish the new connection under the lock. If Stop() ran while we were

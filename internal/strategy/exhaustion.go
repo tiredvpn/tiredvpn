@@ -28,6 +28,7 @@ func SetAndroidMode(enabled bool) {
 type StateExhaustionStrategy struct {
 	manager   *Manager // Reference to Manager for IPv6/IPv4 support
 	baseStrat Strategy
+	secret    []byte // keys the confusion carrier the fallback path speaks
 
 	// Attack parameters
 	decoyCount    int           // Number of decoy connections
@@ -41,9 +42,10 @@ type StateExhaustionStrategy struct {
 
 // NewStateExhaustionStrategy creates a new state exhaustion strategy
 // manager is required for IPv6/IPv4 transport layer support
-func NewStateExhaustionStrategy(manager *Manager) *StateExhaustionStrategy {
+func NewStateExhaustionStrategy(manager *Manager, secret []byte) *StateExhaustionStrategy {
 	return &StateExhaustionStrategy{
 		manager:       manager,
+		secret:        secret,
 		baseStrat:     nil,  // No base strategy - works independently
 		decoyCount:    1000, // Number of decoy SYNs per batch
 		decoyInterval: 5 * time.Second,
@@ -94,6 +96,13 @@ func (s *StateExhaustionStrategy) Probe(ctx context.Context, target string) erro
 }
 
 func (s *StateExhaustionStrategy) Connect(ctx context.Context, target string) (net.Conn, error) {
+	// The fallback path below speaks the confusion carrier, which is keyed, so
+	// the dial's secret is read before anything is opened rather than after.
+	secret := dialSecret(ctx, s.secret)
+	if len(secret) == 0 && s.baseStrat == nil {
+		return nil, errConfusionNoSecret
+	}
+
 	// Check if we can use raw sockets
 	canUseRaw := !androidModeEnabled
 	if canUseRaw {
@@ -139,7 +148,12 @@ func (s *StateExhaustionStrategy) Connect(ctx context.Context, target string) (n
 	}
 
 	// Wrap with Confusion protocol so server recognizes us
-	return NewConfusedConn(conn, ConfusionHTTPoverTLS), nil
+	cc, err := NewConfusedConn(conn, ConfusionHTTPoverTLS, secret)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return cc, nil
 }
 
 // launchDecoyFlood sends decoy SYN packets to fill DPI state table
