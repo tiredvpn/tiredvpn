@@ -195,6 +195,33 @@ func TestRegisterServerFlags_REALITYB1(t *testing.T) {
 	}
 }
 
+// TestRegisterServerFlags_RequireDataV2Default pins the S6 change: the server
+// defaults to requiring the authenticated v2 data layer. A false default is the
+// silent-downgrade hole (a v1 client, or a MITM who strips the v2 signal, lands
+// on the malleable unauthenticated keystream), so this must stay true; v1 is
+// reachable only by explicitly passing =false for a pre-1.11 fleet.
+func TestRegisterServerFlags_RequireDataV2Default(t *testing.T) {
+	cfg := &server.Config{}
+	fs := flag.NewFlagSet("server", flag.ContinueOnError)
+	registerServerFlags(fs, cfg)
+	if err := fs.Parse(nil); err != nil {
+		t.Fatalf("parse (defaults): %v", err)
+	}
+	if !cfg.REALITYRequireDataV2 {
+		t.Error("default -reality-require-data-v2 = false; the server would silently accept the downgraded v1 data layer")
+	}
+
+	cfg = &server.Config{}
+	fs = flag.NewFlagSet("server", flag.ContinueOnError)
+	registerServerFlags(fs, cfg)
+	if err := fs.Parse([]string{"-reality-require-data-v2=false"}); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.REALITYRequireDataV2 {
+		t.Error("-reality-require-data-v2=false did not take; the compat escape hatch is broken")
+	}
+}
+
 // TestRegisterClientFlags_REALITYServerPubKey checks the client half of the
 // pair. Empty means the legacy transport, so the default carries meaning.
 func TestRegisterClientFlags_REALITYServerPubKey(t *testing.T) {
