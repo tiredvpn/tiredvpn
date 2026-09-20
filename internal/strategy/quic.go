@@ -452,20 +452,16 @@ func (s *QUICStrategy) Connect(ctx context.Context, target string) (net.Conn, er
 	return quicConn, nil
 }
 
-// selectSNI chooses a whitelisted SNI for the connection
-func (s *QUICStrategy) selectSNI() string {
-	// Whitelisted domains that use QUIC and shouldn't be blocked
-	snis := []string{
-		"www.google.com",
-		"www.youtube.com",
-		"drive.google.com",
-		"docs.google.com",
-		"mail.google.com",
-	}
+// quicSNIRotator draws the ClientHello SNI from the shared whitelist. The old
+// list was five hardcoded Google domains selected by hour-of-day, which pinned
+// every client to the same SNI within any given hour - a synchronised signal -
+// and never used the vetted pool other strategies share. StrategyRandom picks
+// per connection so independent clients do not move in lockstep.
+var quicSNIRotator = evasion.NewSNIRotator(evasion.StrategyRandom)
 
-	// Deterministic selection based on time (changes hourly)
-	hour := time.Now().Hour()
-	return snis[hour%len(snis)]
+// selectSNI chooses a whitelisted SNI for the connection, fresh each call.
+func (s *QUICStrategy) selectSNI() string {
+	return quicSNIRotator.Next()
 }
 
 // extractHost extracts hostname from target address
