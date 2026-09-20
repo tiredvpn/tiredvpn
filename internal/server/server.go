@@ -4286,11 +4286,16 @@ func (bc *bufferedConn) Unwrap() net.Conn { return bc.Conn }
 // Ensure interface compliance
 var _ net.Conn = (*bufferedConn)(nil)
 
-// detectWebSocketPadded detects WebSocket Padded protocol by X-Salamander-Version header
+// detectWebSocketPadded detects a WebSocket Padded upgrade by the keyed
+// X-Auth-Token it carries, not by any product-named header. X-Auth-Token is the
+// per-client HMAC the handler verifies below; keying detection off it means the
+// only header we look for is one whose value is a proof of the secret, and its
+// name is a common API convention rather than a self-report like the old
+// X-Salamander-Version.
 func detectWebSocketPadded(data []byte) bool {
 	return bytes.Contains(data, []byte("GET ")) &&
 		bytes.Contains(data, []byte("Upgrade: websocket")) &&
-		bytes.Contains(data, []byte("X-Salamander-Version:"))
+		bytes.Contains(data, []byte("X-Auth-Token:"))
 }
 
 // handleWebSocketConnection handles WebSocket connection with ALPN routing
@@ -4321,60 +4326,50 @@ func handleWebSocketPadded(conn net.Conn, srvCtx *serverContext, logger *log.Log
 		return
 	}
 
-	_, hasSalamander := headers["X-Salamander-Version"]
-	if !hasSalamander {
-		logger.Error("WebSocket Padded: Missing X-Salamander-Version")
+	// The keyed X-Auth-Token is the sole discriminator and the authentication.
+	// There is no product-named header to require and no tokenless fallback: a
+	// 1.11.0 client always sends the token, so anything without one is not ours
+	// and gets a fast rejection rather than a guessed global-secret session.
+	authTokenHex, hasAuthToken := headers["X-Auth-Token"]
+	if !hasAuthToken {
+		logger.Error("WebSocket Padded: Missing X-Auth-Token")
 		return
 	}
 
-	// Verify X-Auth-Token against per-client secrets and global secret
-	authTokenHex, hasAuthToken := headers["X-Auth-Token"]
+	authToken, err := hex.DecodeString(authTokenHex)
+	if err != nil {
+		logger.Error("WebSocket Padded: Invalid X-Auth-Token format: %v", err)
+		return
+	}
+
 	var usedSecret []byte
 	var clientID clientIdentity
 
-	if hasAuthToken {
-		authToken, err := hex.DecodeString(authTokenHex)
-		if err != nil {
-			logger.Error("WebSocket Padded: Invalid X-Auth-Token format: %v", err)
-			return
-		}
-
-		// 1. Try per-client secrets from registry
-		if srvCtx.registry != nil {
-			clients := srvCtx.registry.ListClients()
-			for _, client := range clients {
-				if verifyMorphAuth(authToken, []byte(client.Secret)) {
-					logger.Info("WebSocket Padded authenticated (client: %s, id: %s)", client.Name, client.ID)
-					usedSecret = []byte(client.Secret)
-					clientID = registryIdentity(client.ID)
-					break
-				}
+	// 1. Try per-client secrets from registry
+	if srvCtx.registry != nil {
+		clients := srvCtx.registry.ListClients()
+		for _, client := range clients {
+			if verifyMorphAuth(authToken, []byte(client.Secret)) {
+				logger.Info("WebSocket Padded authenticated (client: %s, id: %s)", client.Name, client.ID)
+				usedSecret = []byte(client.Secret)
+				clientID = registryIdentity(client.ID)
+				break
 			}
 		}
+	}
 
-		// 2. Fallback to global secret
-		if usedSecret == nil && len(srvCtx.cfg.Secret) > 0 {
-			if verifyMorphAuth(authToken, srvCtx.cfg.Secret) {
-				logger.Info("WebSocket Padded authenticated (global secret)")
-				usedSecret = srvCtx.cfg.Secret
-				clientID = sharedIdentity(globalClientID)
-			}
-		}
-
-		if usedSecret == nil {
-			logger.Error("WebSocket Padded: Authentication failed - invalid token")
-			return
-		}
-	} else {
-		// No auth token - fallback to global secret for backward compatibility
-		if len(srvCtx.cfg.Secret) > 0 {
+	// 2. Fallback to global secret
+	if usedSecret == nil && len(srvCtx.cfg.Secret) > 0 {
+		if verifyMorphAuth(authToken, srvCtx.cfg.Secret) {
+			logger.Info("WebSocket Padded authenticated (global secret)")
 			usedSecret = srvCtx.cfg.Secret
-			clientID = sharedIdentity("global-legacy")
-			logger.Debug("WebSocket Padded: No auth token, using global secret (legacy mode)")
-		} else {
-			logger.Error("WebSocket Padded: No auth token and no global secret configured")
-			return
+			clientID = sharedIdentity(globalClientID)
 		}
+	}
+
+	if usedSecret == nil {
+		logger.Error("WebSocket Padded: Authentication failed - invalid token")
+		return
 	}
 
 	logger.Debug("WebSocket Padded: Valid upgrade request, key=%s, clientID=%s", wsKey, clientID)

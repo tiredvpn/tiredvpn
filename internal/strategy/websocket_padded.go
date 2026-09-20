@@ -22,6 +22,11 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/protocol"
 )
 
+// browserUserAgent is a plausible desktop-browser User-Agent for the WebSocket
+// upgrade. The point is to name a real browser, not the product: the old
+// "TiredVPN/2.0" was a self-report a header scan could match on directly.
+const browserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
 // WebSocketPaddedStrategy implements WebSocket transport with Salamander padding
 // Priority 8 (high, between HTTP/2 Stego and Traffic Morph)
 type WebSocketPaddedStrategy struct {
@@ -142,9 +147,8 @@ func (s *WebSocketPaddedStrategy) Connect(ctx context.Context, target string) (n
 			"Connection: Upgrade\r\n"+
 			"Sec-WebSocket-Key: %s\r\n"+
 			"Sec-WebSocket-Version: 13\r\n"+
-			"X-Salamander-Version: 1.0\r\n"+
 			"X-Auth-Token: %s\r\n"+
-			"User-Agent: Mozilla/5.0 (compatible; TiredVPN/2.0)\r\n"+
+			"User-Agent: "+browserUserAgent+"\r\n"+
 			"\r\n",
 		s.wsPath, s.wsHost, wsKey, hex.EncodeToString(authToken))
 

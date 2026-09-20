@@ -180,9 +180,8 @@ func (g *GenevaStrategy) Connect(ctx context.Context, target string) (net.Conn, 
 			"Connection: Upgrade\r\n"+
 			"Sec-WebSocket-Key: %s\r\n"+
 			"Sec-WebSocket-Version: 13\r\n"+
-			"X-Salamander-Version: 1.0\r\n"+
 			"X-Auth-Token: %s\r\n"+
-			"User-Agent: Mozilla/5.0 (compatible; TiredVPN/2.0)\r\n"+
+			"User-Agent: "+browserUserAgent+"\r\n"+
 			"\r\n",
 		g.wsPath, g.wsHost, wsKey, hex.EncodeToString(authToken))
 

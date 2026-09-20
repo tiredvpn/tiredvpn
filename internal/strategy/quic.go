@@ -285,7 +285,11 @@ func (s *QUICStrategy) Connect(ctx context.Context, target string) (net.Conn, er
 	tlsConfig := &tls.Config{
 		InsecureSkipVerify: true,
 		ServerName:         s.selectSNI(),
-		NextProtos:         []string{"tiredvpn"},
+		// Advertise the RFC 9114 HTTP/3 token: the ALPN in a QUIC ClientHello is
+		// readable one Initial-decrypt away, so it must name a protocol other
+		// peers use, not the deployment. The tunnel discriminator moved into the
+		// encrypted 1-RTT stream (the keyed auth-frame marker above).
+		NextProtos: []string{"h3"},
 	}
 
 	// If using Salamander, create wrapped UDP connection
@@ -680,7 +684,9 @@ func (s *QUICServer) Start(ctx context.Context, handler func(net.Conn)) error {
 
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{"tiredvpn"},
+		// Match a real HTTP/3 endpoint's ALPN; the tunnel is told apart by the
+		// keyed marker inside the encrypted stream, not by this token.
+		NextProtos: []string{"h3"},
 	}
 
 	quicConfig := &quic.Config{
