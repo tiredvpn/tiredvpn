@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 	"time"
 
@@ -242,6 +243,76 @@ func SameGaps(a, b *Dump, dir Direction, skip int, tol time.Duration) (Finding, 
 	return Finding{
 		Where:   fmt.Sprintf("%s %s gaps %v", a.Layer, dir, x[skip:]),
 		Excerpt: fmt.Sprintf("inter-chunk delays repeat within %v", tol),
+	}, true
+}
+
+// LenSample pairs one carried payload's plaintext length with the length of the
+// record that carried it.
+type LenSample struct {
+	Inner  int // plaintext / inner packet length
+	Record int // observed record (framing) length
+}
+
+// LengthTracksPayload reports whether the record length betrays the inner packet
+// length: it splits the samples at the midpoint inner size and fires when the
+// record-length range of the small-packet half is disjoint from the large-packet
+// half. Disjoint ranges mean a censor can read the packet size straight off the
+// record size - the packet-length distribution (which fingerprints the traffic:
+// bulk vs interactive vs tunnel) leaks through a padding scheme that only ever
+// adds a fixed offset. Overlapping ranges mean the record size no longer pins
+// the packet size.
+//
+// It is deliberately a range-overlap test, not a Pearson correlation: additive
+// random padding leaves correlation near 1 while genuinely bucketed padding lets
+// a small packet occasionally occupy a large record, which is exactly the
+// overlap this looks for.
+func LengthTracksPayload(samples []LenSample) (Finding, bool) {
+	if len(samples) < 8 {
+		return Finding{}, false
+	}
+	minInner, maxInner := math.MaxInt, math.MinInt
+	for _, s := range samples {
+		if s.Inner < minInner {
+			minInner = s.Inner
+		}
+		if s.Inner > maxInner {
+			maxInner = s.Inner
+		}
+	}
+	if maxInner == minInner {
+		return Finding{}, false // no spread of inner sizes to separate
+	}
+	threshold := (minInner + maxInner) / 2
+
+	smallMin, smallMax := math.MaxInt, math.MinInt
+	largeMin, largeMax := math.MaxInt, math.MinInt
+	for _, s := range samples {
+		if s.Inner <= threshold {
+			if s.Record < smallMin {
+				smallMin = s.Record
+			}
+			if s.Record > smallMax {
+				smallMax = s.Record
+			}
+		} else {
+			if s.Record < largeMin {
+				largeMin = s.Record
+			}
+			if s.Record > largeMax {
+				largeMax = s.Record
+			}
+		}
+	}
+	if smallMax < smallMin || largeMax < largeMin {
+		return Finding{}, false // one half empty
+	}
+	if smallMin <= largeMax && largeMin <= smallMax {
+		return Finding{}, false // ranges overlap: record size does not pin packet size
+	}
+	return Finding{
+		Where: "framing record length vs inner packet length",
+		Excerpt: fmt.Sprintf("small packets occupy records %d..%d, large packets %d..%d (disjoint): "+
+			"the record length reveals the packet length", smallMin, smallMax, largeMin, largeMax),
 	}, true
 }
 

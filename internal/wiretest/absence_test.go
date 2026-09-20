@@ -537,6 +537,99 @@ func TestStegoMarkerLengthSpansItsRange(t *testing.T) {
 		len(payloads), len(seen), seen)
 }
 
+// driveStegoTunMixed runs one stego connection in the default tun path
+// (NaivePaddingMinimal, the deployment default) writing the given packet sizes
+// in order, and pairs each write with the length of the covert DATA frame that
+// carried it.
+func driveStegoTunMixed(t *testing.T, sizes []int) []wiretest.LenSample {
+	t.Helper()
+	ln := wiretest.Listen(t, "stego-tun", wiretest.LayerFraming)
+	srvReady := make(chan struct{})
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		srv := strategy.NewHTTP2StegoConn(c, testSecret, false, strategy.NaivePaddingMinimal)
+		if err := srv.Handshake(); err != nil {
+			return
+		}
+		close(srvReady)
+		_, _ = io.Copy(io.Discard, srv)
+	}()
+
+	raw, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer raw.Close()
+
+	cli := strategy.NewHTTP2StegoConn(raw, testSecret, true, strategy.NaivePaddingMinimal)
+	if err := cli.Handshake(); err != nil {
+		t.Fatalf("stego tun client handshake: %v", err)
+	}
+	<-srvReady
+
+	for i, sz := range sizes {
+		if _, err := cli.Write(make([]byte, sz)); err != nil {
+			t.Fatalf("stego tun write %d: %v", i, err)
+		}
+	}
+
+	waitFor(t, 10*time.Second, "covert tun DATA frames", func() bool {
+		return len(stegoDataPayloads(ln.First(), wiretest.C2S)) >= len(sizes)
+	})
+
+	payloads := stegoDataPayloads(ln.First(), wiretest.C2S)
+	var out []wiretest.LenSample
+	for i := 0; i < len(sizes) && i < len(payloads); i++ {
+		out = append(out, wiretest.LenSample{Inner: sizes[i], Record: len(payloads[i])})
+	}
+	return out
+}
+
+// TestStegoTunRecordLengthDoesNotTrackPacketLength is the inverted form of the
+// 1.10.0 fixation for the default tun path.
+//
+// Before: the fast/tun path appended no cover, so every DATA frame length was a
+// fixed offset from the packet it carried and the record-length distribution was
+// a copy of the packet-length distribution. Now each frame is grown to a random
+// size bucket, so small packets sometimes occupy the same record length as
+// full-size ones and the record length no longer separates them.
+//
+// The positive control is a synthetic stream whose record length equals the
+// packet length (what the no-padding path produced): the same matcher must fire
+// on it, or its silence on the live capture would be vacuous (verification rule
+// 2). To confirm the matcher against the real broken shape, the padding line in
+// writeViaDataFast was temporarily reverted during development and this test went
+// red, as required by verification rule 1.
+func TestStegoTunRecordLengthDoesNotTrackPacketLength(t *testing.T) {
+	var control []wiretest.LenSample
+	for i := 0; i < 100; i++ {
+		control = append(control, wiretest.LenSample{Inner: 40, Record: 40})
+		control = append(control, wiretest.LenSample{Inner: 1200, Record: 1200})
+	}
+	if _, ok := wiretest.LengthTracksPayload(control); !ok {
+		t.Fatal("control: matcher does not fire when record length equals packet length; " +
+			"its silence on the live capture below would mean nothing")
+	}
+
+	// Live default-path capture: interleave small and full-size packets.
+	var sizes []int
+	for i := 0; i < 150; i++ {
+		sizes = append(sizes, 40, 1200)
+	}
+	samples := driveStegoTunMixed(t, sizes)
+	if len(samples) < 100 {
+		t.Fatalf("only %d covert tun DATA frames captured; too few to measure", len(samples))
+	}
+
+	if f, ok := wiretest.LengthTracksPayload(samples); ok {
+		t.Fatalf("the tun-path record length still tracks the packet length: %s", f)
+	}
+	t.Log("tun-path record length no longer separates small packets from full-size ones")
+}
+
 // ---------------------------------------------------------------------------
 // WebSocket Padded and Geneva: the product headers (S8)
 // ---------------------------------------------------------------------------
