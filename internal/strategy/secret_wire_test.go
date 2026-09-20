@@ -116,28 +116,27 @@ func awaitCredential(t *testing.T, ch <-chan any) any {
 	}
 }
 
-// TestSSHCamouflageAuthenticatesWithTheDialSecret reads the token the fake SSH
-// KEX_ECDH_INIT carries and checks it belongs to the endpoint's secret.
+// sshWireCredential is the token the client proved itself with plus the session
+// it was bound to; the token alone means nothing without the session.
+type sshWireCredential struct {
+	token     []byte
+	sessionID []byte
+}
+
+// TestSSHCamouflageAuthenticatesWithTheDialSecret runs the server half of the
+// SSH transport, pulls the client's userauth token out of the encrypted
+// channel, and checks it belongs to the endpoint's secret.
 func TestSSHCamouflageAuthenticatesWithTheDialSecret(t *testing.T) {
-	addr, tokens := acceptOne(t, func(conn net.Conn) (any, error) {
-		br := bufio.NewReader(conn)
-		if _, err := br.ReadString('\n'); err != nil { // client banner
-			return nil, err
-		}
-		if _, err := conn.Write([]byte(SSHBanner)); err != nil {
-			return nil, err
-		}
-		if _, err := ReadSSHPacket(br); err != nil { // client KEXINIT
-			return nil, err
-		}
-		if err := WriteSSHPacket(conn, BuildSSHKexInit()); err != nil {
-			return nil, err
-		}
-		payload, err := ReadSSHPacket(br) // ECDH init carrying the token
+	addr, creds := acceptOne(t, func(conn net.Conn) (any, error) {
+		tr, err := SSHServerHandshake(conn, SSHHostKey([]byte(wireDialSecret)))
 		if err != nil {
 			return nil, err
 		}
-		return ParseSSHKexPubKey(payload, sshMsgKexECDHInit)
+		token, err := SSHServerReadAuth(tr)
+		if err != nil {
+			return nil, err
+		}
+		return sshWireCredential{token: token, sessionID: tr.SessionID()}, nil
 	})
 
 	m := managerAt(t, addr)
@@ -145,11 +144,11 @@ func TestSSHCamouflageAuthenticatesWithTheDialSecret(t *testing.T) {
 	m.Register(s)
 	dialAndIgnore(t, m, addr)
 
-	token := awaitCredential(t, tokens).([]byte)
-	if !VerifySSHAuthToken(token, []byte(wireDialSecret)) {
+	got := awaitCredential(t, creds).(sshWireCredential)
+	if !VerifySSHAuthToken(got.token, []byte(wireDialSecret), got.sessionID, SSHAuthClientToServer) {
 		t.Fatal("the SSH token does not verify under the endpoint's secret")
 	}
-	if VerifySSHAuthToken(token, []byte(wireBuiltSecret)) {
+	if VerifySSHAuthToken(got.token, []byte(wireBuiltSecret), got.sessionID, SSHAuthClientToServer) {
 		t.Fatal("the SSH token verifies under the construction secret too; this test cannot tell them apart")
 	}
 }
