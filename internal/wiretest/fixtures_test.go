@@ -3,6 +3,7 @@ package wiretest_test
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -174,7 +175,23 @@ func fakeREALITYServer(t *testing.T, ln *wiretest.Listener, secret []byte) {
 				if err != nil {
 					return
 				}
-				serverExt, err := customtls.NewServerREALITYExtension(secret, serverPriv, clientExt.PubKey)
+
+				// Answer data-layer v2, which is what the shipped binary
+				// requires (requireDataV2 defaults true there; the constructor
+				// alone leaves it false). Answering v1 would have the client
+				// fall back to a path nobody ships, and every shape assertion
+				// below would then be about the wrong data layer - rule 9.
+				clientSalt, ok := customtls.ParseClientDataV2(secret, clientExt.PubKey, clientExt.Extra)
+				if !ok {
+					t.Errorf("fake reality server: client did not offer data-layer v2")
+					return
+				}
+				var serverSalt [32]byte
+				if _, err := rand.Read(serverSalt[:]); err != nil {
+					return
+				}
+				serverExt, err := customtls.NewServerREALITYExtensionDataV2(
+					secret, serverPriv, clientExt.PubKey, clientSalt, serverSalt)
 				if err != nil {
 					return
 				}
@@ -183,9 +200,10 @@ func fakeREALITYServer(t *testing.T, ln *wiretest.Listener, secret []byte) {
 				}
 
 				// Everything after this point is the client's post-handshake
-				// traffic: the dispatch byte, then whatever smux says. Drain it
-				// with a large buffer so the recorded boundaries are the ones
-				// the kernel delivered, not ones this reader invented.
+				// traffic: the encrypted dispatch record, then whatever smux
+				// says. Drain it with a large buffer so the recorded boundaries
+				// are the ones the kernel delivered, not ones this reader
+				// invented.
 				buf := make([]byte, 4096)
 				for {
 					if _, err := conn.Read(buf); err != nil {
@@ -195,6 +213,48 @@ func fakeREALITYServer(t *testing.T, ln *wiretest.Listener, secret []byte) {
 			}(conn)
 		}
 	}()
+}
+
+// realityHandshakes runs n REALITY connections against the fake server and
+// returns the captures that got past the ServerHello.
+//
+// requireDataV2 is turned on here because the shipped binary turns it on and
+// the constructor does not: without it the client would silently take the v1
+// data layer, and every shape assertion about the encrypted records would be
+// about a path nobody deploys.
+//
+// More than one connection is taken on purpose. The observations downstream are
+// segment-boundary-sensitive and read() may merge two writes, so a single noisy
+// sample is not enough to conclude from.
+func realityHandshakes(t *testing.T, n int) []*wiretest.Dump {
+	t.Helper()
+	ln := wiretest.Listen(t, "reality", wiretest.LayerTCP)
+	fakeREALITYServer(t, ln, testSecret)
+
+	m := managerAt(t, ln.Addr())
+	s := strategy.NewREALITYStrategy(m, testSecret)
+	s.SetRequireDataV2(true)
+
+	for i := 0; i < n; i++ {
+		ctx, cancel := context.WithTimeout(t.Context(), 8*time.Second)
+		conn, err := s.Connect(ctx, "wiretest")
+		if err == nil {
+			conn.Close()
+		}
+		cancel()
+	}
+
+	var out []*wiretest.Dump
+	for _, d := range ln.Dumps() {
+		c2s := d.Bytes(wiretest.C2S)
+		if h := reassembledHelloLen(c2s); h > 0 && len(c2s) > h {
+			out = append(out, d)
+		}
+	}
+	if len(out) == 0 {
+		t.Fatal("no REALITY handshake got past the ServerHello — the harness, not the code, is broken")
+	}
+	return out
 }
 
 // fakeIMAPServer answers the client side of the IMAP camouflage handshake using

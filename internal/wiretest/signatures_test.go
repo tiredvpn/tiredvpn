@@ -70,97 +70,67 @@ func serveWSUpgrade(t *testing.T, ln *wiretest.Listener, readDispatch bool) <-ch
 }
 
 // ---------------------------------------------------------------------------
-// REALITY: the lone 0x08 after ServerHello, and the 200-byte ClientHello grid
+// REALITY: the 200-byte ClientHello grid, and the record that replaced the
+// dispatch byte
 // ---------------------------------------------------------------------------
 
-// TestSignatureREALITYWireShape fixes two shape fingerprints of the REALITY
-// handshake. Both are observable without decrypting anything.
+// TestSignatureREALITYWireShape fixes what the REALITY handshake still shows an
+// observer who decrypts nothing.
 //
-//   - The mux dispatch byte. Right after the ServerHello the client writes a
-//     single 0x08 to a NODELAY socket, so a lone one-byte TCP segment carrying
-//     a constant lands between the handshake and the first data record. Real
-//     TLS never puts a one-byte record there.
-//   - The 200-byte ClientHello grid. reality.go splits the first flight
-//     mid-SNI and then emits fixed 200-byte chunks, so the segment boundaries
-//     sit on a regular pitch no browser produces.
+//   - The 200-byte ClientHello grid. reality.go splits the first flight mid-SNI
+//     and then emits fixed 200-byte chunks, so the segment boundaries sit on a
+//     regular pitch no browser produces. S10 has not landed, so this is still a
+//     positive control.
+//   - The length of the first record the client sends after the ServerHello.
+//     S5 moved the mux discriminator inside the encrypted layer, which removed
+//     the lone 0x08 (see absence_test.go) and put a constant-length Application
+//     Data record in its place. Rule 8 of the verification rules: a masking fix
+//     has to say how it was checked for a new signature of its own. This is
+//     that check, and it currently finds one - the length is single-valued.
 //
 // The server here is a reconstruction (see fakeREALITYServer) — the client is
 // the shipped artifact and the bytes under test are its.
-//
-// Both observations are boundary-sensitive, and read() may merge two segments.
-// The loop takes the first connection that shows the boundary cleanly rather
-// than asserting on a single noisy sample; the byte-value check underneath is
-// coalescing-proof and runs on every attempt.
 func TestSignatureREALITYWireShape(t *testing.T) {
-	ln := wiretest.Listen(t, "reality", wiretest.LayerTCP)
-	fakeREALITYServer(t, ln, testSecret)
+	dumps := realityHandshakes(t, 6)
 
-	m := managerAt(t, ln.Addr())
-	s := strategy.NewREALITYStrategy(m, testSecret)
-
-	const attempts = 6
-	var (
-		dispatch   wiretest.Finding
-		grid       wiretest.Finding
-		gotDisp    bool
-		gotGrid    bool
-		handshakes int
-	)
-
-	for i := 0; i < attempts && (!gotDisp || !gotGrid); i++ {
-		ctx, cancel := context.WithTimeout(t.Context(), 8*time.Second)
-		conn, err := s.Connect(ctx, "wiretest")
-		if err == nil {
-			conn.Close()
-		}
-		cancel()
-
-		dumps := ln.Dumps()
-		if len(dumps) <= i {
-			continue
-		}
-		d := dumps[i]
-
-		// The client only writes the dispatch byte once it has accepted the
-		// ServerHello, so its presence is also the proof the fake server got
-		// far enough to exercise the real handshake path.
-		c2s := d.Bytes(wiretest.C2S)
-		helloLen := reassembledHelloLen(c2s)
-		if helloLen <= 0 || len(c2s) <= helloLen {
-			continue
-		}
-		handshakes++
-		if c2s[helloLen] != 0x08 {
-			t.Fatalf("attempt %d: byte after ClientHello is 0x%02x, want the mux dispatch 0x08",
-				i, c2s[helloLen])
-		}
-
-		if !gotDisp {
-			if f, ok := wiretest.LoneByte(d, wiretest.C2S, 0x08, helloLen); ok {
-				dispatch, gotDisp = f, true
-			}
-		}
-		if !gotGrid {
-			if f, ok := wiretest.Grid(d, wiretest.C2S, 200, 3); ok {
-				grid, gotGrid = f, true
-			}
+	var grid wiretest.Finding
+	gotGrid := false
+	for _, d := range dumps {
+		if f, ok := wiretest.Grid(d, wiretest.C2S, 200, 3); ok {
+			grid, gotGrid = f, true
+			break
 		}
 	}
-
-	if handshakes == 0 {
-		t.Fatal("no REALITY handshake completed against the fixture — the harness, not the code, is broken")
-	}
-	if !gotDisp {
-		t.Fatalf("expected a lone 0x08 segment after the ServerHello in %d handshakes; "+
-			"if the dispatch byte was folded into the record layer on purpose, invert this assertion", handshakes)
-	}
-	t.Logf("mux dispatch byte found at %s", dispatch)
-
 	if !gotGrid {
 		t.Fatalf("expected the ClientHello to be written on a 200-byte grid in %d handshakes; "+
-			"if the fragment size was randomised on purpose, invert this assertion", handshakes)
+			"if the fragment size was randomised on purpose, invert this assertion", len(dumps))
 	}
 	t.Logf("200-byte ClientHello grid found at %s", grid)
+
+	lengths := map[int]int{}
+	for i, d := range dumps {
+		c2s := d.Bytes(wiretest.C2S)
+		off := reassembledHelloLen(c2s)
+		if len(c2s) < off+5 {
+			t.Fatalf("handshake %d: only %d bytes after the ClientHello, no record header",
+				i, len(c2s)-off)
+		}
+		if c2s[off] != 0x17 {
+			t.Fatalf("handshake %d: first post-handshake record type is 0x%02x, want 0x17",
+				i, c2s[off])
+		}
+		lengths[int(c2s[off+3])<<8|int(c2s[off+4])]++
+	}
+	if len(lengths) != 1 {
+		t.Fatalf("first post-handshake record length is no longer single-valued: %v; "+
+			"if it was given a variable size on purpose that is an improvement - "+
+			"replace this with the distribution it now has", lengths)
+	}
+	for n := range lengths {
+		t.Logf("first post-handshake record is always %d bytes over %d handshakes: "+
+			"the dispatch byte is encrypted, but its record is still a constant-length one",
+			n, len(dumps))
+	}
 }
 
 // reassembledHelloLen returns the length of the leading TLS record in a stream,

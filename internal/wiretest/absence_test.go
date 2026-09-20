@@ -859,3 +859,71 @@ func TestQUICMarkerLengthSpansItsRange(t *testing.T) {
 	t.Logf("QUIC marker length over %d connections: %d distinct values, histogram %v",
 		conns, len(seen), seen)
 }
+
+// ---------------------------------------------------------------------------
+// REALITY: the mux dispatch byte
+// ---------------------------------------------------------------------------
+
+// legacyREALITYDispatchDump rebuilds the 1.10.0 post-ServerHello shape: the
+// ClientHello written as a mid-SNI first fragment plus 200-byte chunks, then a
+// bare one-byte write carrying protocol.TypeMux, then the first smux bytes.
+//
+// Taken from connect() as it stood before "feat(reality): carry the dispatch
+// byte inside the encrypted layer": WriteDispatch(tcpConn, TypeMux) ran on the
+// raw socket, between validateServerHello and wrapDataLayer.
+func legacyREALITYDispatchDump() (*wiretest.Dump, int) {
+	body := bytes.Repeat([]byte{0xa5}, 1024)
+	hello := make([]byte, 0, 5+len(body))
+	hello = append(hello, 0x16, 0x03, 0x01, byte(len(body)>>8), byte(len(body)))
+	hello = append(hello, body...)
+
+	d := wiretest.NewDump("reality-1.10.0", wiretest.LayerTCP)
+	d.Record(wiretest.C2S, hello[:130]) // first fragment ends mid-SNI
+	for off := 130; off < len(hello); off += 200 {
+		d.Record(wiretest.C2S, hello[off:min(off+200, len(hello))])
+	}
+	d.Record(wiretest.C2S, []byte{0x08})                         // the bare discriminator
+	d.Record(wiretest.C2S, []byte{0x00, 0x01, 0x00, 0x00, 0x00}) // smux SYN, in the clear
+	return d, len(hello)
+}
+
+// TestREALITYDispatchByteIsNoLongerOnTheWire is the inverted form of the 1.10.0
+// fixation.
+//
+// Before: a lone one-byte TCP segment carrying 0x08 sat between the ServerHello
+// and the first data record. 0x08 is not a TLS content type at all, so a single
+// stateless rule - "one-byte segment, invalid record type, right after a
+// handshake" - identified the protocol without decrypting anything. S5 moved
+// the discriminator inside the encrypted layer, where it is an ordinary
+// Application Data record.
+//
+// Positive control: the 1.10.0 segment layout, which wiretest.LoneByte must
+// still find in this run. Without it, a LoneByte that had quietly stopped
+// scanning would produce exactly the same green as a fixed protocol.
+func TestREALITYDispatchByteIsNoLongerOnTheWire(t *testing.T) {
+	legacy, legacyHelloLen := legacyREALITYDispatchDump()
+	f, ok := wiretest.LoneByte(legacy, wiretest.C2S, 0x08, legacyHelloLen)
+	if !ok {
+		t.Fatal("control: LoneByte does not find the bare 0x08 in the 1.10.0 layout, " +
+			"so its silence below would mean nothing")
+	}
+	t.Logf("control: the bare dispatch byte still matched at %s", f)
+
+	for i, d := range realityHandshakes(t, 6) {
+		c2s := d.Bytes(wiretest.C2S)
+		off := reassembledHelloLen(c2s)
+
+		if f, ok := wiretest.LoneByte(d, wiretest.C2S, 0x08, off); ok {
+			t.Fatalf("handshake %d: the bare mux dispatch byte is back on the wire at %s", i, f)
+		}
+		// The byte that replaced it has to be a TLS content type, not some other
+		// bare discriminator: "no 0x08" alone would also hold for 0x09.
+		switch b := c2s[off]; b {
+		case 0x14, 0x15, 0x16, 0x17:
+		default:
+			t.Fatalf("handshake %d: byte after the ClientHello is 0x%02x, "+
+				"which is not a TLS content type - something bare is still on the wire", i, b)
+		}
+	}
+	t.Log("the discriminator now rides inside an Application Data record")
+}
