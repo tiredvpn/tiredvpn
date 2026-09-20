@@ -553,9 +553,15 @@ func (m *Manager) ProbeAll(ctx context.Context, target string) []Result {
 
 			results[idx] = result
 
-			// Update stored results
+			// Update stored results. A probe is (almost always) a bare TCP
+			// connect - it says the address is reachable, not that the strategy's
+			// handshake survives DPI. Feed it into the reachability/confidence
+			// stats (which influence ordering) but NOT into the circuit breaker:
+			// a censor that keeps 443 open while killing the handshake would
+			// otherwise let every probe "recover" a strategy the real Connect
+			// cannot use. Only Connect records success/failure in the breaker.
 			m.mu.Lock()
-			m.updateConfidence(strat.ID(), err == nil)
+			m.updateConfidenceStats(strat.ID(), err == nil, latency)
 			m.mu.Unlock()
 		}(i, s)
 	}
@@ -1130,8 +1136,10 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			log.Debug("Skipping excluded strategy: %s", s.Name())
 			continue
 		}
-		// Check circuit breaker
-		if !m.circuitBreakers.Allow(s.ID()) {
+		// Check circuit breaker. This only assembles the candidate list, so use
+		// the non-mutating CanTry - the half-open slot is occupied later, at the
+		// actual dial, so listing a strategy never burns a recovery attempt.
+		if !m.circuitBreakers.CanTry(s.ID()) {
 			log.Debug("Skipping strategy %s (circuit breaker open)", s.Name())
 			continue
 		}
@@ -1193,7 +1201,13 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			if androidMode {
 				log.Info("Fast QUIC fallback: %d TCP timeouts, skipping remaining TCP strategies", scan.timeouts)
 				for _, qs := range quicStrategies {
-					if excludeMap[qs.ID()] || !m.circuitBreakers.Allow(qs.ID()) {
+					if excludeMap[qs.ID()] || !m.circuitBreakers.CanTry(qs.ID()) {
+						continue
+					}
+					// About to really dial this QUIC strategy: occupy a half-open
+					// slot now, at the dial, not during list assembly.
+					if !m.circuitBreakers.BeginHalfOpenAttempt(qs.ID()) {
+						log.Debug("Skipping QUIC fallback %s (circuit breaker half-open slots exhausted)", qs.Name())
 						continue
 					}
 
@@ -1237,6 +1251,15 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 
 		log.Debug("Trying strategy %d/%d: %s (confidence=%.2f)%s",
 			i+1, len(strategies), s.Name(), confidence, modeStr)
+
+		// About to really dial this strategy: occupy a half-open probe slot here,
+		// at the dial, not during list assembly (which used CanTry). One slot per
+		// logical strategy attempt, mirroring the single breaker record on
+		// exhaustion below - retries do not each take a slot.
+		if !m.circuitBreakers.BeginHalfOpenAttempt(s.ID()) {
+			log.Debug("Skipping strategy %s (circuit breaker half-open slots exhausted)", s.Name())
+			continue
+		}
 
 		// Tracks whether the strategy's final failing attempt was a timeout, so
 		// the single circuit-breaker record on exhaustion reflects the right
@@ -2605,8 +2628,10 @@ func (m *Manager) HasAvailableStrategies() bool {
 	defer m.mu.RUnlock()
 
 	for _, s := range m.strategies {
-		// Check circuit breaker
-		if !m.circuitBreakers.Allow(s.ID()) {
+		// Check circuit breaker. Availability probe only - use the non-mutating
+		// CanTry so repeatedly asking "is anything available" never spends a
+		// strategy's half-open recovery slots.
+		if !m.circuitBreakers.CanTry(s.ID()) {
 			continue
 		}
 
