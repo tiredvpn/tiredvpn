@@ -4761,6 +4761,17 @@ func decodeClientSecret(secretStr string) []byte {
 	return []byte(secretStr)
 }
 
+// pollingServerMaxRequests / pollingServerKeepaliveIdle bound connection reuse
+// on the server side. They mirror the client's bounds: reuse amortises the TLS
+// handshake across a burst of active polls, but a meek connection is never held
+// open indefinitely (TSPU throttles long-lived flows). Past the request count,
+// or if the next keep-alive request does not arrive within the idle window, the
+// server closes and the client dials afresh.
+const (
+	pollingServerMaxRequests   = 64
+	pollingServerKeepaliveIdle = 15 * time.Second
+)
+
 // handleHTTPPollingWithALPN handles HTTP polling connections via ALPN routing
 // This is the kTLS-compatible entry point for tired-polling ALPN
 func handleHTTPPollingWithALPN(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
@@ -4779,14 +4790,58 @@ func handleHTTPPollingWithALPN(conn net.Conn, srvCtx *serverContext, logger *log
 	handleHTTPPolling(conn, srvCtx, buf[:n], logger)
 }
 
-// handleHTTPPolling handles HTTP polling requests (one request per connection)
-func handleHTTPPolling(conn net.Conn, srvCtx *serverContext, request []byte, logger *log.Logger) {
-	reader := bufio.NewReader(conn)
-	processHTTPPollingRequest(conn, reader, srvCtx, request, logger)
+// handleHTTPPolling serves HTTP polling requests on one connection, looping for
+// keep-alive so a client can amortise the TLS handshake across a burst of polls.
+// firstRequest is whatever the caller already read off the socket; the rest is
+// pulled from conn through a single persistent reader so the stream stays
+// aligned across requests.
+func handleHTTPPolling(conn net.Conn, srvCtx *serverContext, firstRequest []byte, logger *log.Logger) {
+	defer conn.Close()
+	reader := bufio.NewReader(io.MultiReader(bytes.NewReader(firstRequest), conn))
+
+	for i := 0; i < pollingServerMaxRequests; i++ {
+		if i > 0 {
+			// Wait a bounded time for the next keep-alive request.
+			conn.SetReadDeadline(time.Now().Add(pollingServerKeepaliveIdle))
+		}
+		head, err := readPollingRequestHead(reader)
+		conn.SetReadDeadline(time.Time{})
+		if err != nil {
+			// Client closed the connection or went idle past the window - normal
+			// end of a keep-alive burst, not an error worth logging loudly.
+			if i == 0 {
+				logger.Debug("HTTP Polling: failed to read request head: %v", err)
+			}
+			return
+		}
+		if !processHTTPPollingRequest(conn, reader, srvCtx, head, logger) {
+			return
+		}
+	}
 }
 
-// processHTTPPollingRequest processes a single HTTP polling request
-func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serverContext, request []byte, logger *log.Logger) {
+// readPollingRequestHead reads one HTTP request's header block (up to and
+// including the terminating blank line) from reader.
+func readPollingRequestHead(reader *bufio.Reader) ([]byte, error) {
+	var head []byte
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			return nil, err
+		}
+		head = append(head, line...)
+		if len(head) > 16*1024 {
+			return nil, errors.New("polling request head too large")
+		}
+		if bytes.Equal(line, []byte("\r\n")) || bytes.Equal(line, []byte("\n")) {
+			return head, nil
+		}
+	}
+}
+
+// processHTTPPollingRequest processes a single HTTP polling request and reports
+// whether the client asked to keep the connection open for a further request.
+func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serverContext, request []byte, logger *log.Logger) (keepAliveOut bool) {
 	// Parse headers from request
 	lines := bytes.Split(request, []byte("\r\n"))
 	var sessionID, authToken string
@@ -4815,32 +4870,22 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 	if sessionID == "" {
 		logger.Debug("HTTP Polling: Missing session ID")
 		sendHTTPPollingError(conn, "Missing session ID")
-		return
+		return false
 	}
 
-	// Read body if present
+	// Read body if present. request is the header block only; the body follows on
+	// the persistent reader (which spans keep-alive requests), so read exactly
+	// contentLength bytes to keep the stream aligned for the next request.
 	var body []byte
 	if contentLength > 0 {
-		// Find body start (after \r\n\r\n)
-		bodyStart := bytes.Index(request, []byte("\r\n\r\n"))
-		if bodyStart != -1 {
-			bodyStart += 4
-			existingBody := request[bodyStart:]
-			if len(existingBody) < contentLength {
-				// Need to read more body data from connection
-				remaining := make([]byte, contentLength-len(existingBody))
-				conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-				_, err := io.ReadFull(conn, remaining)
-				conn.SetReadDeadline(time.Time{})
-				if err != nil {
-					logger.Debug("HTTP Polling: Failed to read body: %v", err)
-					sendHTTPPollingError(conn, "Failed to read body")
-					return
-				}
-				body = append(existingBody, remaining...)
-			} else if len(existingBody) >= contentLength {
-				body = existingBody[:contentLength]
-			}
+		body = make([]byte, contentLength)
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		_, err := io.ReadFull(reader, body)
+		conn.SetReadDeadline(time.Time{})
+		if err != nil {
+			logger.Debug("HTTP Polling: Failed to read body: %v", err)
+			sendHTTPPollingError(conn, "Failed to read body")
+			return false
 		}
 	}
 
@@ -4874,7 +4919,7 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 			}
 
 			sendHTTPPollingError(conn, "Authentication failed")
-			return
+			return false
 		}
 	} else {
 		// New session - authenticate by trying registered clients, then global secret
@@ -4903,7 +4948,7 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 		if usedSecret == nil {
 			logger.Debug("HTTP Polling: Authentication failed for new session %s", sessionID[:8])
 			sendHTTPPollingError(conn, "Authentication failed")
-			return
+			return false
 		}
 	}
 
@@ -4926,7 +4971,7 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 
 		// Start background relay goroutine for this session
 		go runPollingSessionRelay(sess, srvCtx, logger)
-		return
+		return keepAlive
 	}
 
 	// Existing session - exchange data
@@ -4945,6 +4990,7 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 	}
 
 	sendHTTPPollingResponse(conn, toClient, keepAlive)
+	return keepAlive
 }
 
 // runPollingSessionRelay handles the relay for a polling session
