@@ -116,9 +116,15 @@ func TestVerifySSHAuth(t *testing.T) {
 	if _, _, ok := verifySSHAuth(reflected, session, srvCtx); ok {
 		t.Error("a server-to-client token was accepted as a client token")
 	}
-	// An IMAP token must not open an SSH session either.
-	if _, _, ok := verifySSHAuth(strategy.GenerateIMAPAuthToken(global), session, srvCtx); ok {
-		t.Error("an IMAP auth token was accepted by the SSH verifier")
+	// A credential minted by the IMAP transport under the same secret must not
+	// open an SSH session. Note what this does and does not prove: the IMAP
+	// digest is 16 bytes and the SSH token is 32, so the length gate alone
+	// disqualifies it and the contexts are never compared. It is kept as a
+	// regression guard for the day someone makes the verifier length-agnostic;
+	// the assertion that actually pins domain separation is the server-to-client
+	// token above, which is the same length and the same secret.
+	if _, _, ok := verifySSHAuth(strategy.IMAPAuthResponse(global, imapTestChallenge, imapTestBinding()), session, srvCtx); ok {
+		t.Error("an IMAP auth digest was accepted by the SSH verifier")
 	}
 }
 
