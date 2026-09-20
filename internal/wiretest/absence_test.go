@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
+	"github.com/tiredvpn/tiredvpn/internal/server"
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
 	"github.com/tiredvpn/tiredvpn/internal/wiretest"
 	"golang.org/x/net/http2"
@@ -926,4 +927,230 @@ func TestREALITYDispatchByteIsNoLongerOnTheWire(t *testing.T) {
 		}
 	}
 	t.Log("the discriminator now rides inside an Application Data record")
+}
+
+// ---------------------------------------------------------------------------
+// Anti-Probe: the knock no longer repeats across connections
+// ---------------------------------------------------------------------------
+
+// legacyKnockDump rebuilds the 1.10.0 knock as the plaintext behind TLS: the
+// dispatch byte, then five packets whose sizes and bodies are a pure function of
+// the secret (HMAC(secret,"knock-sequence") for the sizes, HMAC(secret,[i]) for
+// the bodies). Two of these are byte-identical, which is exactly what SameSizes
+// and SameStream must fire on.
+func legacyKnockDump() *wiretest.Dump {
+	seqHash := hmac.New(sha256.New, testSecret)
+	seqHash.Write([]byte("knock-sequence"))
+	sum := seqHash.Sum(nil)
+
+	d := wiretest.NewDump("antiprobe-1.10.0", wiretest.LayerTLSPlaintext)
+	d.Record(wiretest.C2S, []byte{0x07}) // TypeAntiProbe dispatch byte
+	for i := 0; i < 5; i++ {
+		size := 10 + int(sum[i+5])%90
+		pkt := make([]byte, size)
+		pkt[0] = byte(i)
+		h := hmac.New(sha256.New, testSecret)
+		h.Write([]byte{byte(i)})
+		body := h.Sum(nil)
+		for j := 1; j < size; j++ {
+			pkt[j] = body[(j-1)%len(body)]
+		}
+		d.Record(wiretest.C2S, pkt)
+	}
+	return d
+}
+
+// antiprobeKnock drives one real anti-probe Connect against a TLS server that
+// only drains the knock and ACKs it, and returns the decrypted client-side
+// stream. The client is the shipped artifact; the fixture proves nothing about
+// the server.
+func antiprobeKnock(t *testing.T) *wiretest.Dump {
+	t.Helper()
+	ln := wiretest.Listen(t, "antiprobe", wiretest.LayerTCP)
+	sessions := serveTLS(t, ln, func(c net.Conn) {
+		var one [1]byte
+		if _, err := io.ReadFull(c, one[:]); err != nil {
+			return
+		}
+		buf := make([]byte, 4096)
+		for {
+			_ = c.SetReadDeadline(time.Now().Add(400 * time.Millisecond))
+			if _, err := c.Read(buf); err != nil {
+				break
+			}
+		}
+		_ = c.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		_, _ = c.Write([]byte{0x01})
+	})
+
+	m := managerAt(t, ln.Addr())
+	s := strategy.NewAntiProbeStrategy(m, testSecret)
+	go func() {
+		if conn, err := s.Connect(testCtx(t), "wiretest"); err == nil {
+			conn.Close()
+		}
+	}()
+	select {
+	case sess := <-sessions:
+		return sess.Plain
+	case <-time.After(20 * time.Second):
+		t.Fatal("knock never completed")
+		return nil
+	}
+}
+
+// knockNonce pulls the per-connection nonce out of the decrypted knock stream:
+// [dispatch:1][seq:1][bucket:8][nonce:16]...
+func knockNonce(t *testing.T, d *wiretest.Dump) []byte {
+	t.Helper()
+	c2s := d.Bytes(wiretest.C2S)
+	off := 1 + 1 + 8 // dispatch + seq + bucket
+	if len(c2s) < off+strategy.KnockNonceLen {
+		t.Fatalf("knock stream too short for a nonce: %d bytes", len(c2s))
+	}
+	return c2s[off : off+strategy.KnockNonceLen]
+}
+
+// verifyKnockTag confirms the bytes after the header are the keyed tag for this
+// connection's nonce and bucket — i.e. we captured a real knock, not noise.
+func verifyKnockTag(t *testing.T, d *wiretest.Dump) {
+	t.Helper()
+	c2s := d.Bytes(wiretest.C2S)
+	// After the dispatch byte, packet 0 is [seq:1][bucket:8][nonce:16][tag:16].
+	p0 := c2s[1:]
+	if len(p0) < strategy.KnockHeaderLen+strategy.KnockTagLen {
+		t.Fatalf("knock packet 0 too short: %d bytes", len(p0))
+	}
+	bucket := int64(binary.BigEndian.Uint64(p0[1:9]))
+	nonce := p0[9:strategy.KnockHeaderLen]
+	want := strategy.KnockTag(testSecret, nonce, bucket)
+	got := p0[strategy.KnockHeaderLen : strategy.KnockHeaderLen+strategy.KnockTagLen]
+	if !hmac.Equal(got, want) {
+		t.Fatal("the keyed knock tag did not verify against the secret")
+	}
+}
+
+// TestAntiProbeKnockVariesPerConnection is the inverted form of the 1.10.0
+// knock fixation. In v1 the sizes, delays and bodies were a pure function of the
+// secret, so two dials of one client repeated byte for byte and a censor could
+// link them (or replay them) without touching the TLS wrapper. v2 mixes a fresh
+// nonce into the schedule, so nothing repeats.
+//
+// Positive control: two identical 1.10.0 knocks, on which SameSizes and
+// SameStream must still fire. Without it, a matcher that had stopped working
+// would produce the same green as a fixed knock.
+func TestAntiProbeKnockVariesPerConnection(t *testing.T) {
+	legacyA, legacyB := legacyKnockDump(), legacyKnockDump()
+	if _, ok := wiretest.SameSizes(legacyA, legacyB, wiretest.C2S, 1); !ok {
+		t.Fatal("control: SameSizes does not fire on two identical 1.10.0 knocks")
+	}
+	if _, ok := wiretest.SameStream(legacyA, legacyB, wiretest.C2S, legacyA.Len(wiretest.C2S)); !ok {
+		t.Fatal("control: SameStream does not fire on two identical 1.10.0 knocks")
+	}
+	t.Log("control: both matchers fire on the deterministic 1.10.0 knock")
+
+	a, b := antiprobeKnock(t), antiprobeKnock(t)
+	if len(a.Sizes(wiretest.C2S)) < 2 || len(b.Sizes(wiretest.C2S)) < 2 {
+		t.Fatalf("knock capture too short: %v / %v", a.Sizes(wiretest.C2S), b.Sizes(wiretest.C2S))
+	}
+
+	if f, ok := wiretest.SameSizes(a, b, wiretest.C2S, 1); ok {
+		t.Fatalf("knock packet sizes still repeat across two connections at %s", f)
+	}
+	n := min(a.Len(wiretest.C2S), b.Len(wiretest.C2S))
+	if f, ok := wiretest.SameStream(a, b, wiretest.C2S, n); ok {
+		t.Fatalf("knock payload still identical across two connections at %s", f)
+	}
+
+	verifyKnockTag(t, a)
+	verifyKnockTag(t, b)
+	if bytes.Equal(knockNonce(t, a), knockNonce(t, b)) {
+		t.Fatal("two connections chose the same nonce; the knock opening repeats")
+	}
+	t.Log("the knock schedule, tag and bodies differ across two connections and the tag still verifies")
+}
+
+// ---------------------------------------------------------------------------
+// REALITY: the ClientHello is no longer written on a 200-byte grid
+// ---------------------------------------------------------------------------
+
+// legacyREALITYGridDump rebuilds the 1.10.0 ClientHello fragmentation: a first
+// fragment that ends mid-SNI, then fixed 200-byte chunks. The Grid matcher must
+// fire on this.
+func legacyREALITYGridDump() *wiretest.Dump {
+	d := wiretest.NewDump("reality-grid-1.10.0", wiretest.LayerTCP)
+	body := bytes.Repeat([]byte{0xa5}, 900)
+	hello := append([]byte{0x16, 0x03, 0x01, byte(len(body) >> 8), byte(len(body))}, body...)
+	d.Record(wiretest.C2S, hello[:130]) // first fragment ends mid-SNI
+	for off := 130; off < len(hello); off += 200 {
+		d.Record(wiretest.C2S, hello[off:min(off+200, len(hello))])
+	}
+	return d
+}
+
+// TestREALITYClientHelloNotOn200Grid is the inverted form of the 1.10.0 grid
+// fixation. reality.go used to emit fixed 200-byte ClientHello fragments, a
+// pitch no browser produces; S10 draws each fragment size from a CSPRNG per
+// connection.
+//
+// Distribution note (verification rules 3, 4, 8): no browser fragments its
+// ClientHello at the record level at all — Chrome sends one record — so there is
+// no donor fragment-size distribution to match, recorded here as "сверять не с
+// чем". The point of the change is only to remove the fixed 200-byte grid; the
+// sizes are drawn flat from a CSPRNG. TestREALITYFragmentSizesVaryAndCarryHello
+// pins that they vary and that every hello still reassembles.
+//
+// Positive control: a synthetic 200-byte grid, on which Grid must still fire.
+func TestREALITYClientHelloNotOn200Grid(t *testing.T) {
+	if _, ok := wiretest.Grid(legacyREALITYGridDump(), wiretest.C2S, 200, 3); !ok {
+		t.Fatal("control: Grid does not find the 200-byte pitch in the 1.10.0 layout, " +
+			"so its silence below would mean nothing")
+	}
+	t.Log("control: the 200-byte grid still matched on the 1.10.0 sample")
+
+	dumps := realityHandshakes(t, 6)
+	for i, d := range dumps {
+		if f, ok := wiretest.Grid(d, wiretest.C2S, 200, 3); ok {
+			t.Fatalf("handshake %d: the ClientHello is still on a 200-byte grid at %s", i, f)
+		}
+	}
+	t.Log("no handshake writes the ClientHello on a 200-byte grid")
+}
+
+// TestREALITYFragmentSizesVaryAndCarryHello checks two things the grid flip
+// leans on: the fragment sizes actually vary between connections (so "no grid"
+// is not just read() coalescing), and every hello still reassembles into a
+// record the server routes into the REALITY path (the >= 64-byte padding
+// invariant, checked against the real server detector).
+func TestREALITYFragmentSizesVaryAndCarryHello(t *testing.T) {
+	dumps := realityHandshakes(t, 6)
+
+	// Every generated ClientHello must still be recognised by the server, or the
+	// padding profile has dropped below the 64-byte routing gate and ~99% of prod
+	// traffic would go to the fake site.
+	for i, d := range dumps {
+		c2s := d.Bytes(wiretest.C2S)
+		off := reassembledHelloLen(c2s)
+		if off <= 0 {
+			t.Fatalf("handshake %d: no complete ClientHello record captured", i)
+		}
+		if !server.DetectREALITYExtension(c2s[:off]) {
+			t.Fatalf("handshake %d: the server no longer routes this ClientHello into REALITY "+
+				"(padding extension fell below the 64-byte gate)", i)
+		}
+	}
+	t.Logf("all %d generated ClientHellos still route into the REALITY path", len(dumps))
+
+	// The ClientHello fragment boundaries must differ across connections: collect
+	// the leading-fragment size vector for each and require at least two distinct
+	// vectors. A fixed grid would make them all identical.
+	seen := map[string]int{}
+	for _, d := range dumps {
+		seen[fmt.Sprintf("%v", d.Sizes(wiretest.C2S))]++
+	}
+	if len(seen) < 2 {
+		t.Fatalf("fragment size vectors are identical across %d handshakes (%v); "+
+			"the fragmentation is not per-connection", len(dumps), seen)
+	}
+	t.Logf("fragment size vectors over %d handshakes: %d distinct", len(dumps), len(seen))
 }
