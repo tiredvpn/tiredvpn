@@ -1,6 +1,7 @@
 package wiretest_test
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -8,10 +9,13 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -191,6 +195,137 @@ func fakeREALITYServer(t *testing.T, ln *wiretest.Listener, secret []byte) {
 			}(conn)
 		}
 	}()
+}
+
+// fakeIMAPServer answers the client side of the IMAP camouflage handshake using
+// only exported strategy helpers, then drains the TLS session so the recorder
+// keeps seeing bytes.
+//
+// Like the REALITY fixture this is a reconstruction of the server; the client is
+// the shipped artifact and the assertions are about its bytes. What the fixture
+// does contribute is the TLS upgrade, which is what the absence assertions lean
+// on - and that part is the standard library, not our code.
+func fakeIMAPServer(t *testing.T, ln *wiretest.Listener, secret []byte) {
+	t.Helper()
+	cert := testCert(t)
+	go func() {
+		for {
+			raw, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(raw net.Conn) {
+				defer raw.Close()
+				_ = raw.SetDeadline(time.Now().Add(20 * time.Second))
+				if err := imapServerHandshake(raw, cert, secret); err != nil {
+					t.Errorf("fake imap server: %v", err)
+				}
+			}(raw)
+		}
+	}()
+}
+
+func imapServerHandshake(raw net.Conn, cert tls.Certificate, secret []byte) error {
+	br := bufio.NewReader(raw)
+	line := func() (string, error) { return br.ReadString('\n') }
+	tagOf := func(s string) string { return strings.Fields(s)[0] }
+
+	greeting, err := line()
+	if err != nil {
+		return err
+	}
+	if !strings.HasPrefix(greeting, "* OK") {
+		return fmt.Errorf("not an IMAP greeting: %q", greeting)
+	}
+
+	capLine, err := line()
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(raw, "%s%s OK Pre-login capabilities listed.\r\n",
+		strategy.IMAPPreLoginCaps(), tagOf(capLine)); err != nil {
+		return err
+	}
+
+	tlsLine, err := line()
+	if err != nil {
+		return err
+	}
+	if !strings.Contains(strings.ToUpper(tlsLine), "STARTTLS") {
+		return fmt.Errorf("expected STARTTLS, got %q", tlsLine)
+	}
+	if _, err := fmt.Fprintf(raw, "%s OK Begin TLS negotiation now.\r\n", tagOf(tlsLine)); err != nil {
+		return err
+	}
+
+	tlsConn := tls.Server(raw, &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	})
+	if err := tlsConn.Handshake(); err != nil {
+		return fmt.Errorf("TLS: %w", err)
+	}
+	binding, err := strategy.IMAPChannelBinding(tlsConn.ConnectionState())
+	if err != nil {
+		return err
+	}
+	br = bufio.NewReader(tlsConn)
+
+	capLine, err = line()
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(tlsConn, "%s%s OK Capabilities listed.\r\n",
+		strategy.IMAPPostSTARTTLSCaps(), tagOf(capLine)); err != nil {
+		return err
+	}
+
+	authLine, err := line()
+	if err != nil {
+		return err
+	}
+	challenge, err := strategy.NewIMAPAuthChallenge()
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(tlsConn, "+ %s\r\n",
+		base64.StdEncoding.EncodeToString([]byte(challenge))); err != nil {
+		return err
+	}
+	respLine, err := line()
+	if err != nil {
+		return err
+	}
+	rawResp, err := base64.StdEncoding.DecodeString(strings.TrimSpace(respLine))
+	if err != nil {
+		return err
+	}
+	_, digest, err := strategy.ParseIMAPAuthResponse(rawResp)
+	if err != nil {
+		return err
+	}
+	if !strategy.VerifyIMAPAuthResponse(digest, secret, challenge, binding) {
+		return fmt.Errorf("client digest did not verify")
+	}
+	if _, err := fmt.Fprintf(tlsConn, "%s%s OK [CAPABILITY %s] Logged in\r\n",
+		strategy.IMAPPostLoginCaps(), tagOf(authLine), strategy.IMAPCapsInline()); err != nil {
+		return err
+	}
+
+	selectLine, err := line()
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(tlsConn, "* 1234 EXISTS\r\n* 0 RECENT\r\n"+
+		"* OK [UIDVALIDITY 1234567890] UIDs valid\r\n"+
+		"%s OK [READ-WRITE] Select completed.\r\n", tagOf(selectLine)); err != nil {
+		return err
+	}
+
+	// Keep pulling TLS records so the tunnel bytes the client writes actually
+	// cross the recorded socket instead of sitting in a send buffer.
+	_, _ = io.Copy(io.Discard, tlsConn)
+	return nil
 }
 
 // readTLSRecord reads one complete TLS record (5-byte header + body).

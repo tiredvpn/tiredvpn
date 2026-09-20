@@ -88,11 +88,13 @@ jobs:
             ./internal/mux/ \
             ./internal/integration/
 
-  # Wire-signature detectors. Own job on purpose: these tests assert that our
-  # strategies still carry the fingerprints the audit is removing, so a red here
-  # means either "a marker was removed and the assertion was not inverted" or
-  # "a marker came back". Buried in the unit-test job that distinction would be
-  # unreadable.
+  # Wire-signature detectors. Own job on purpose, because a red here says
+  # something specific about the audit rather than about the code in general.
+  # The package holds two kinds of test: fingerprints not yet removed, asserted
+  # present, and fingerprints already removed, asserted absent alongside a
+  # positive control that the matcher still works. So a failure is one of
+  # "a marker was removed without moving its test", "a marker came back", or
+  # "a matcher went blind" - all three worth reading at a glance.
   wire_signatures:
     runs-on: ubuntu-latest
     if: github.event_name != 'schedule'

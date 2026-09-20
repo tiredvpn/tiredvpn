@@ -1,11 +1,13 @@
-// signatures_test.go fixes the on-wire fingerprints the strategy audit is
-// about. Every test here asserts that a marker IS present, because it is
+// signatures_test.go fixes the on-wire fingerprints the strategy audit has not
+// reached yet. Every test here asserts that a marker IS present, because it is
 // present in the code under test and the detector has to be shown finding it
 // before its silence can mean anything (verification.md, rule 2).
 //
-// When a marker is removed, invert the assertion in the same change: flip
-// `if !ok { t.Fatal(...) }` to `if ok { t.Fatal(...) }` and reword the comment.
-// A test deleted instead of inverted leaves the regression unguarded.
+// When a marker is removed, the test moves to absence_test.go and gains a
+// positive control on a synthetic 1.10.0 sample - the confusion TIRED detector
+// went that way when the sealed carrier landed. Inverting in place without the
+// control turns "the marker is gone" into "the matcher stopped working", which
+// looks identical from here.
 package wiretest_test
 
 import (
@@ -40,56 +42,6 @@ func testCtx(t *testing.T) context.Context {
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	t.Cleanup(cancel)
 	return ctx
-}
-
-// ---------------------------------------------------------------------------
-// Protocol Confusion: the "TIRED" marker
-// ---------------------------------------------------------------------------
-
-// TestSignatureConfusionTIREDMarker fixes the plaintext marker that protocol
-// confusion puts in its first packet.
-//
-// confusion.go writes the literal \x00\x00TIRED into the DNS-shaped preamble
-// and the bare TIRED into the HTTP/SSH/SMTP ones, on a raw TCP socket with no
-// encryption at all. Five ASCII bytes at a near-fixed offset of the first
-// packet is the cheapest possible signature: one substring rule on the first
-// segment of every new flow, no state, no parsing.
-func TestSignatureConfusionTIREDMarker(t *testing.T) {
-	ln := wiretest.Listen(t, "confusion", wiretest.LayerTCP)
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func() { _, _ = io.Copy(io.Discard, c) }()
-		}
-	}()
-
-	m := managerAt(t, ln.Addr())
-	s := strategy.NewProtocolConfusionStrategy(m, strategy.ConfusionDNSoverTLS)
-
-	conn, err := s.Connect(testCtx(t), "wiretest")
-	if err != nil {
-		t.Fatalf("confusion connect: %v", err)
-	}
-	defer conn.Close()
-
-	if _, err := conn.Write([]byte("first-payload")); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-
-	waitFor(t, 5*time.Second, "confusion preamble", func() bool {
-		d := ln.First()
-		return d != nil && d.Len(wiretest.C2S) > 0
-	})
-
-	f, ok := wiretest.LiteralWithin(ln.First(), wiretest.C2S, "TIRED", 256)
-	if !ok {
-		t.Fatal("expected the TIRED marker in the first 256 bytes of the confusion preamble; " +
-			"if it is gone on purpose, invert this assertion")
-	}
-	t.Logf("TIRED marker found at %s", f)
 }
 
 // ---------------------------------------------------------------------------
