@@ -392,7 +392,7 @@ func TestMorphedConn_ShapedWriteBenchmarkRegression(t *testing.T) {
 	if testing.Short() {
 		t.Skip("perf-sensitive smoke test")
 	}
-	const payloadSize = 64 * 1024
+	const payloadSize = 63 * 1024 // one morph frame, just under the 65535-byte cap
 	payload := make([]byte, payloadSize)
 
 	// Baseline: NoopShaper end-to-end on net.Pipe.

@@ -90,8 +90,22 @@ func runRealisticBench(b *testing.B, clientShaper, serverShaper shaper.Shaper) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	var written int64
+	// A single Write becomes one morph frame, so feed the payload in chunks
+	// under the 65535-byte frame cap - the same way a real caller (smux frames
+	// are <=65535) does. One 16 MiB Write would exceed the cap the receiver now
+	// enforces.
+	const writeChunk = 63 * 1024
+	writeAll := func() error {
+		for off := 0; off < len(payload); off += writeChunk {
+			end := min(off+writeChunk, len(payload))
+			if _, err := client.Write(payload[off:end]); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	for b.Loop() {
-		if _, err := client.Write(payload); err != nil {
+		if err := writeAll(); err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
 				break
 			}

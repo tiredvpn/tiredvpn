@@ -10,10 +10,11 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
 )
 
-// payload size shared by all shaper benchmarks. 64 KiB is large enough that
+// payload size shared by all shaper benchmarks. Kept just under the 65535-byte
+// morph frame cap (a single Write becomes one frame): large enough that
 // per-Write fixed overhead is amortized but small enough to run thousands of
 // iterations within the default benchmark budget.
-const benchPayloadBytes = 64 * 1024
+const benchPayloadBytes = 63 * 1024
 
 func benchPayload() []byte {
 	p := make([]byte, benchPayloadBytes)
