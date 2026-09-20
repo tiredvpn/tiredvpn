@@ -386,44 +386,14 @@ func handleREALITYAuthenticated(conn net.Conn, srvCtx *serverContext, logger *lo
 
 	logger.Info("REALITY: Tunnel established for %s (client: %s)", conn.RemoteAddr(), clientID)
 
-	// Read negotiation byte: TypeMux (0x08) → smux session, anything else → legacy raw tunnel.
-	var negBuf [1]byte
-	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	_, err = io.ReadFull(conn, negBuf[:])
-	conn.SetReadDeadline(time.Time{})
-	if err != nil {
-		logger.Debug("REALITY: Failed to read negotiation byte: %v", err)
-		return true, nil
-	}
-
-	if negBuf[0] == protocol.TypeMux {
-		logger.Debug("REALITY: Client requested smux multiplexing (data layer v%d)", dataLayerVersion(dataV2))
-		handleREALITYMuxSession(conn, srvCtx, logger, clientID, usedSecret, realityExt.PubKey, dataParams)
-		return true, nil
-	}
-
-	// Legacy mode: prepend the peeked byte and handle as raw tunnel.
-	handleRawTunnel(&realityPrependConn{Conn: conn, first: negBuf[0]}, srvCtx, logger, clientID)
+	// The dispatch byte is the first *encrypted* data-layer record now, not a
+	// cleartext byte after ServerHello. handleREALITYSession wraps the conn,
+	// decrypts the discriminator, and rejects anything that is not TypeMux.
+	// There is no raw-tunnel fallthrough: on an authenticated, encrypted channel
+	// an unknown discriminator is corruption or a probe, and dropping into
+	// handleRawTunnel on it would silently corrupt the stream rather than fail.
+	handleREALITYSession(conn, srvCtx, logger, clientID, usedSecret, realityExt.PubKey, dataParams, dataV2)
 	return true, nil
-}
-
-// realityPrependConn is a net.Conn that prepends a single already-read byte to the first Read call.
-type realityPrependConn struct {
-	net.Conn
-	first byte
-	used  bool
-}
-
-func (c *realityPrependConn) Read(b []byte) (int, error) {
-	if !c.used {
-		c.used = true
-		if len(b) == 0 {
-			return 0, nil
-		}
-		b[0] = c.first
-		return 1, nil
-	}
-	return c.Conn.Read(b)
 }
 
 // dataLayerVersion maps the negotiated flag to the version number used in logs.
@@ -434,14 +404,21 @@ func dataLayerVersion(v2 bool) int {
 	return 1
 }
 
-// handleREALITYMuxSession runs a smux server over the post-auth REALITY connection.
-// Each stream is handled as an independent raw tunnel request.
+// handleREALITYSession wraps the post-auth REALITY connection in the same
+// TLS-record data layer the client applies, reads the encrypted dispatch byte,
+// and — only for TypeMux — runs a smux server over it. Each stream is handled as
+// an independent raw tunnel request.
 //
-// The connection is wrapped in the same TLS-record framing the client applies
-// after its TypeMux write. params non-nil selects the v2 AEAD layer keyed by
-// this connection's X25519 exchange; nil is a v1 client, still keyed by
-// HKDF(secret, salt=clientPubKey).
-func handleREALITYMuxSession(conn net.Conn, srvCtx *serverContext, logger *log.Logger, clientID clientIdentity, usedSecret []byte, clientPubKey [32]byte, params *strategy.RealityV2Params) {
+// params non-nil selects the v2 AEAD layer keyed by this connection's X25519
+// exchange; nil is a v1 client, still keyed by HKDF(secret, salt=clientPubKey).
+//
+// The dispatch byte arrives as the first Application Data record, so it is read
+// through dataConn (decrypted). Anything other than TypeMux on this
+// authenticated, encrypted channel is treated as an error and the connection is
+// closed: there is deliberately no raw-tunnel fallthrough, because forwarding a
+// desynchronised stream into handleRawTunnel would corrupt data silently
+// instead of failing.
+func handleREALITYSession(conn net.Conn, srvCtx *serverContext, logger *log.Logger, clientID clientIdentity, usedSecret []byte, clientPubKey [32]byte, params *strategy.RealityV2Params, dataV2 bool) {
 	// Mirror the client-side wrap: server is !isClient so write/read keys are reversed.
 	var (
 		dataConn net.Conn
@@ -456,6 +433,19 @@ func handleREALITYMuxSession(conn net.Conn, srvCtx *serverContext, logger *log.L
 		logger.Error("REALITY: data conn init failed: %v", err)
 		return
 	}
+
+	// Dispatch discriminator, decrypted from the first data-layer record.
+	protoType, err := protocol.ReadDispatch(dataConn)
+	if err != nil {
+		logger.Debug("REALITY: failed to read encrypted dispatch: %v", err)
+		return
+	}
+	if protoType != protocol.TypeMux {
+		logger.Info("REALITY: unexpected dispatch 0x%02x on encrypted channel from %s, closing", protoType, conn.RemoteAddr())
+		return
+	}
+
+	logger.Debug("REALITY: Client requested smux multiplexing (data layer v%d)", dataLayerVersion(dataV2))
 
 	sess, err := smux.Server(dataConn, smux.DefaultConfig())
 	if err != nil {

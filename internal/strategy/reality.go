@@ -581,12 +581,6 @@ func (r *REALITYStrategy) connect(ctx context.Context, target string, wrapFirstF
 		return nil, fmt.Errorf("reality: validation failed: %w", err)
 	}
 
-	// Negotiate smux mode with the server.
-	if err := protocol.WriteDispatch(tcpConn, protocol.TypeMux); err != nil {
-		tcpConn.Close()
-		return nil, fmt.Errorf("reality: mux negotiate: %w", err)
-	}
-
 	// Wrap TCP in an encrypted TLS-record framing layer so TSPU sees a normal
 	// TLS Application Data stream instead of raw smux bytes. Without this, TSPU
 	// throttles the connection after ~600 bytes.
@@ -594,6 +588,17 @@ func (r *REALITYStrategy) connect(ctx context.Context, target string, wrapFirstF
 	if err != nil {
 		tcpConn.Close()
 		return nil, fmt.Errorf("reality: data conn init: %w", err)
+	}
+
+	// Negotiate smux mode with the server. The discriminator is the first
+	// *encrypted* record inside the data layer, not a cleartext byte after
+	// ServerHello: written in the clear it put a lone 0x08 on the wire, an
+	// invalid TLS record type between ServerHello and the first Application Data
+	// record, which is a one-line DPI signature. Inside wrapDataLayer it is just
+	// another 0x17 Application Data record.
+	if err := protocol.WriteDispatch(dataConn, protocol.TypeMux); err != nil {
+		tcpConn.Close()
+		return nil, fmt.Errorf("reality: mux negotiate: %w", err)
 	}
 
 	smuxCfg := smux.DefaultConfig()
