@@ -1,11 +1,13 @@
 package tls
 
 import (
+	"bytes"
 	"crypto/hkdf"
 	"crypto/hmac"
 	"crypto/sha512"
 	stdtls "crypto/tls"
 	"crypto/x509"
+	"encoding/asn1"
 	"errors"
 	"fmt"
 )
@@ -66,11 +68,25 @@ import (
 // point of the client: signature_algorithms is part of JA3 and JA4.
 //
 // ECDSA P-256 is advertised by every profile we ship. Its signature is
-// variable-length DER rather than a fixed tail, which costs us only that the
-// length has to be read rather than assumed.
+// variable-length DER rather than a fixed tail, so the field cannot simply be
+// painted over: the overlay re-encodes the certificate around a MAC of fixed
+// width. The width has to be fixed rather than copied from the signature it
+// replaces — see certMACLen.
 
 // certMACInfo separates the certificate MAC from every other use of authKey.
 const certMACInfo = "tiredvpn-reality-cert-v1"
+
+// certMACLen is the width of the MAC, fixed and checked before anything is
+// derived.
+//
+// It used to be whatever the peer's signature field happened to be, because the
+// verifier expanded the MAC to len(cert.Signature) and then compared the two.
+// That hands the security parameter to the attacker: a one-byte signature is
+// guessed once in 256 tries, and a zero-length one always passes, since
+// hmac.Equal of two empty slices is true. Deriving at a fixed width and
+// rejecting every other width first closes both, and costs the certificate
+// nothing that anyone reads.
+const certMACLen = 32
 
 var (
 	// ErrCertNone reports an empty certificate list.
@@ -80,23 +96,35 @@ var (
 	// not carry our MAC. The peer does not hold the server's static key.
 	ErrCertHMACMismatch = errors.New("reality cert: certificate HMAC mismatch")
 
+	// ErrCertHMACLen reports a signature field that is not the MAC's width.
+	//
+	// It wraps ErrCertHMACMismatch because that is what it is — a certificate
+	// that does not carry our MAC — and because every caller upstream only asks
+	// whether the peer authenticated. The distinct sentinel exists so the log
+	// line says which check refused it.
+	ErrCertHMACLen = fmt.Errorf("%w: signature field is not %d bytes", ErrCertHMACMismatch, certMACLen)
+
 	// ErrCertNoLeaf reports a certificate handed to the overlay without its
 	// parsed leaf, which the overlay needs to locate the signature.
 	ErrCertNoLeaf = errors.New("reality cert: certificate has no parsed leaf")
 )
 
 // certMAC derives the bytes that go in the signature field: HMAC-SHA512 over
-// the certificate's SubjectPublicKeyInfo, expanded to the signature's length.
+// the certificate's SubjectPublicKeyInfo, expanded to certMACLen.
 //
-// Expanded rather than truncated or padded so that the whole field varies per
-// connection. Leaving a few trailing bytes of the original signature in place
-// would be a constant across every connection to one SNI — small, but it is
-// exactly the kind of fixed remnant this project keeps finding in its own
-// traffic.
-func certMAC(authKey, spki []byte, n int) ([]byte, error) {
+// The width is the constant, not an argument. HKDF output is prefix-consistent
+// — the 31-byte expansion is the first 31 bytes of the 32-byte one — so a
+// derivation whose length comes from the wire lets a peer pick how many bytes
+// of the same stream it has to produce.
+//
+// The whole field is the MAC rather than a MAC padded into it: leaving trailing
+// bytes of the original ECDSA signature in place would be a constant across
+// every connection to one SNI — small, but it is exactly the kind of fixed
+// remnant this project keeps finding in its own traffic.
+func certMAC(authKey, spki []byte) ([]byte, error) {
 	mac := hmac.New(sha512.New, authKey)
 	mac.Write(spki)
-	out, err := hkdf.Expand(sha512.New, mac.Sum(nil), certMACInfo, n)
+	out, err := hkdf.Expand(sha512.New, mac.Sum(nil), certMACInfo, certMACLen)
 	if err != nil {
 		return nil, fmt.Errorf("reality cert: expand MAC: %w", err)
 	}
@@ -108,7 +136,7 @@ func certMAC(authKey, spki []byte, n int) ([]byte, error) {
 //
 // It takes a minted certificate rather than minting one, so the expensive part
 // — key generation and DER encoding — stays cached per SNI by whoever owns the
-// minting, and the per-connection cost is one HMAC and one copy.
+// minting, and the per-connection cost is one HMAC and one re-encode.
 //
 // cert.Leaf must be set. The server's minter parses the certificate back after
 // creating it anyway, so this costs nothing there, and it saves a parse on
@@ -125,27 +153,15 @@ func CertHMACOverlay(cert *stdtls.Certificate, authKey []byte) (*stdtls.Certific
 		return nil, ErrCertNoLeaf
 	}
 
-	der := cert.Certificate[0]
-	sigLen := len(cert.Leaf.Signature)
-	if sigLen == 0 || sigLen > len(der) {
-		return nil, fmt.Errorf("reality cert: implausible signature length %d", sigLen)
-	}
-	// signatureValue is the last field of the Certificate SEQUENCE, so it is the
-	// tail of the DER. Checked rather than assumed: if this ever stops holding,
-	// it fails here instead of producing certificates that silently fail to
-	// authenticate.
-	if !hmac.Equal(cert.Leaf.Signature, der[len(der)-sigLen:]) {
-		return nil, errors.New("reality cert: signature is not the DER tail, cannot overwrite in place")
-	}
-
-	mac, err := certMAC(authKey, cert.Leaf.RawSubjectPublicKeyInfo, sigLen)
+	mac, err := certMAC(authKey, cert.Leaf.RawSubjectPublicKeyInfo)
 	if err != nil {
 		return nil, err
 	}
 
-	out := make([]byte, len(der))
-	copy(out, der)
-	copy(out[len(out)-sigLen:], mac)
+	out, err := replaceSignature(cert.Certificate[0], mac)
+	if err != nil {
+		return nil, err
+	}
 
 	// Only the leaf is replaced; the private key and any chain carry over.
 	chain := make([][]byte, len(cert.Certificate))
@@ -161,6 +177,12 @@ func CertHMACOverlay(cert *stdtls.Certificate, authKey []byte) (*stdtls.Certific
 	if err != nil {
 		return nil, fmt.Errorf("reality cert: reparse after overlay: %w", err)
 	}
+	// The overlay has to land in the field the client reads and disturb nothing
+	// the MAC is computed over. Checked rather than assumed: the failure mode it
+	// guards is certificates that look fine and silently fail to authenticate.
+	if !hmac.Equal(leaf.Signature, mac) || !bytes.Equal(leaf.RawSubjectPublicKeyInfo, cert.Leaf.RawSubjectPublicKeyInfo) {
+		return nil, errors.New("reality cert: overlay did not land in the signature field")
+	}
 
 	return &stdtls.Certificate{
 		Certificate:                  chain,
@@ -170,6 +192,40 @@ func CertHMACOverlay(cert *stdtls.Certificate, authKey []byte) (*stdtls.Certific
 		OCSPStaple:                   cert.OCSPStaple,
 		SignedCertificateTimestamps:  cert.SignedCertificateTimestamps,
 	}, nil
+}
+
+// rawCertificate is RFC 5280's Certificate with the two signed parts left
+// opaque. They are carried through byte for byte; only signatureValue is ours.
+type rawCertificate struct {
+	TBSCertificate     asn1.RawValue
+	SignatureAlgorithm asn1.RawValue
+	SignatureValue     asn1.BitString
+}
+
+// replaceSignature re-encodes der with sig in the signatureValue field.
+//
+// The MAC is not the width of the ECDSA signature it replaces, so the field
+// cannot be painted over where it lies: the BIT STRING's length changes, and
+// the enclosing SEQUENCE's along with it, possibly changing length form.
+// Re-encoding keeps the two in agreement. Hand-patching the length bytes works
+// until the first certificate that crosses a boundary, and then produces
+// certificates that fail to parse on the client.
+func replaceSignature(der, sig []byte) ([]byte, error) {
+	var c rawCertificate
+	rest, err := asn1.Unmarshal(der, &c)
+	if err != nil {
+		return nil, fmt.Errorf("reality cert: parse DER for overlay: %w", err)
+	}
+	if len(rest) != 0 {
+		return nil, fmt.Errorf("reality cert: %d trailing bytes after certificate", len(rest))
+	}
+
+	c.SignatureValue = asn1.BitString{Bytes: sig, BitLength: len(sig) * 8}
+	out, err := asn1.Marshal(c)
+	if err != nil {
+		return nil, fmt.Errorf("reality cert: re-encode after overlay: %w", err)
+	}
+	return out, nil
 }
 
 // VerifyCertHMAC is the client's check, for use inside
@@ -192,7 +248,13 @@ func VerifyCertHMAC(rawCerts [][]byte, authKey []byte) error {
 		return fmt.Errorf("reality cert: parse peer certificate: %w", err)
 	}
 
-	want, err := certMAC(authKey, cert.RawSubjectPublicKeyInfo, len(cert.Signature))
+	// Before the MAC is derived, not after: the length of the comparison is the
+	// number of bytes a forger has to produce, and it arrives from the wire.
+	if len(cert.Signature) != certMACLen {
+		return ErrCertHMACLen
+	}
+
+	want, err := certMAC(authKey, cert.RawSubjectPublicKeyInfo)
 	if err != nil {
 		return err
 	}

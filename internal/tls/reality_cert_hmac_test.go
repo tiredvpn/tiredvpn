@@ -6,11 +6,15 @@ import (
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
+	"crypto/hkdf"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha512"
 	stdtls "crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"errors"
+	"fmt"
 	"math/big"
 	"net"
 	"testing"
@@ -142,11 +146,90 @@ func TestVerifyCertHMACRejectsMalformed(t *testing.T) {
 	})
 }
 
+// certMACStream reproduces the derivation at an arbitrary width, so a test can
+// mint the certificate the hole allowed: the right bytes of the right stream,
+// the wrong number of them.
+//
+// Spelled out rather than calling certMAC, which no longer takes a width — a
+// test that asked the implementation for the expected bytes would agree with it
+// whatever it did. HKDF output is prefix-consistent, so the n-byte expansion is
+// the first n bytes of the 32-byte one, which is precisely why a width taken
+// from the wire is exploitable.
+func certMACStream(t *testing.T, authKey, spki []byte, n int) []byte {
+	t.Helper()
+	if n == 0 {
+		return []byte{}
+	}
+	mac := hmac.New(sha512.New, authKey)
+	mac.Write(spki)
+	out, err := hkdf.Expand(sha512.New, mac.Sum(nil), certMACInfo, n)
+	if err != nil {
+		t.Fatalf("hkdf.Expand(%d): %v", n, err)
+	}
+	return out
+}
+
+// certWithSignature re-encodes cert carrying sig in its signature field,
+// producing the DER a peer would put on the wire.
+func certWithSignature(t *testing.T, cert *stdtls.Certificate, sig []byte) []byte {
+	t.Helper()
+	der, err := replaceSignature(cert.Certificate[0], sig)
+	if err != nil {
+		t.Fatalf("replaceSignature(%d bytes): %v", len(sig), err)
+	}
+	return der
+}
+
+// TestVerifyCertHMACRejectsOtherSignatureLengths closes the hole where the peer
+// chose how many bytes it had to get right.
+//
+// The verifier used to expand the MAC to len(cert.Signature) and compare. Since
+// the expansion is prefix-consistent, a peer that truncated the field only had
+// to produce that many bytes: one byte is a 1-in-256 guess per attempt, and a
+// zero-length field needs no guess at all, because hmac.Equal of two empty
+// slices is true.
+//
+// Each certificate here carries the genuine MAC stream at the wrong width, so
+// nothing but the length check can refuse it. Restore the old
+// certMAC(..., len(cert.Signature)) and every subtest below goes green — which
+// is the point of writing them this way.
+func TestVerifyCertHMACRejectsOtherSignatureLengths(t *testing.T) {
+	cert := mintTestCert(t, "github.com")
+	authKey := testAuthKey(t)
+	spki := cert.Leaf.RawSubjectPublicKeyInfo
+
+	for _, n := range []int{0, 1, 31, 33} {
+		t.Run(fmt.Sprintf("%d bytes", n), func(t *testing.T) {
+			der := certWithSignature(t, cert, certMACStream(t, authKey, spki, n))
+			if err := VerifyCertHMAC([][]byte{der}, authKey); !errors.Is(err, ErrCertHMACLen) {
+				t.Fatalf("a %d-byte signature was accepted or refused for the wrong reason: err = %v", n, err)
+			}
+		})
+	}
+
+	// The positive control: the same construction at the right width must pass,
+	// or the four above would prove only that the helper builds broken
+	// certificates.
+	t.Run("32 bytes", func(t *testing.T) {
+		der := certWithSignature(t, cert, certMACStream(t, authKey, spki, certMACLen))
+		if err := VerifyCertHMAC([][]byte{der}, authKey); err != nil {
+			t.Fatalf("a correct %d-byte MAC was refused: %v", certMACLen, err)
+		}
+	})
+
+	// A wrong-length field must not be treated as a mere mismatch by callers
+	// that only ask whether the peer authenticated.
+	if !errors.Is(ErrCertHMACLen, ErrCertHMACMismatch) {
+		t.Fatal("ErrCertHMACLen does not read as an authentication failure")
+	}
+}
+
 // TestCertsDifferOnlyInTheSignature is the observable property an inspector can
 // check: two connections to one SNI get certificates that are byte-identical
 // apart from the signature field.
 func TestCertsDifferOnlyInTheSignature(t *testing.T) {
 	cert := mintTestCert(t, "github.com")
+	blank := bytes.Clone(cert.Certificate[0])
 
 	first := mustOverlay(t, cert, testAuthKey(t))
 	second := mustOverlay(t, cert, testAuthKey(t))
@@ -154,7 +237,9 @@ func TestCertsDifferOnlyInTheSignature(t *testing.T) {
 	if len(first) != len(second) {
 		t.Fatalf("certificate lengths differ: %d vs %d", len(first), len(second))
 	}
-	body := len(first) - len(cert.Leaf.Signature)
+	// Both MACs are certMACLen wide, so the signature field sits at the same
+	// offset in both and everything ahead of it must match byte for byte.
+	body := len(first) - certMACLen
 	if !bytes.Equal(first[:body], second[:body]) {
 		t.Fatal("certificates differ outside the signature field")
 	}
@@ -162,43 +247,49 @@ func TestCertsDifferOnlyInTheSignature(t *testing.T) {
 		t.Fatal("two connections got the same signature; the MAC is not per-connection")
 	}
 
-	// And the blank itself must be untouched, or the two would race.
-	if !bytes.Equal(cert.Certificate[0][:body], first[:body]) {
+	// And the blank itself must be untouched, or the two would race. Compared
+	// against a copy taken before the overlays rather than against a prefix of
+	// the result: the overlay re-encodes, so the result is not a prefix match.
+	if !bytes.Equal(blank, cert.Certificate[0]) {
 		t.Fatal("the overlay mutated the cached certificate")
 	}
 }
 
-// TestCertBlankSignatureIsTheDERTail pins the layout assumption the overlay
-// rests on: signatureValue is the last field of the certificate, so it is the
-// tail of the DER and can be replaced in place. ECDSA makes its length vary,
-// which is why the blank records the length instead of assuming one.
-func TestCertBlankSignatureIsTheDERTail(t *testing.T) {
+// TestCertOverlayReplacesOnlyTheSignature pins what the overlay guarantees
+// about the bytes it produces: the signed body goes through untouched and the
+// only field that moves is signatureValue, now a fixed-width MAC rather than
+// the variable-length ECDSA signature it replaces.
+//
+// The previous version of this test pinned the opposite — that the signature
+// keeps its original length and can be painted over the DER tail in place. That
+// is what let the peer choose the width of the comparison; see certMACLen.
+func TestCertOverlayReplacesOnlyTheSignature(t *testing.T) {
 	cert := mintTestCert(t, "api.github.com")
 	parsed := cert.Leaf
-	der := cert.Certificate[0]
-	sigLen := len(parsed.Signature)
-	if sigLen == 0 {
+	if len(parsed.Signature) == 0 {
 		t.Fatal("certificate has no signature")
 	}
-	if !bytes.Equal(parsed.Signature, der[len(der)-sigLen:]) {
-		t.Fatal("signature is not the DER tail")
-	}
 
-	// After the overlay, the parsed signature must be our MAC — i.e. the
-	// certificate still parses and the field we replaced is the one x509 reads.
-	authKey := testAuthKey(t)
-	withMAC, err := x509.ParseCertificate(mustOverlay(t, cert, authKey))
+	withMAC, err := x509.ParseCertificate(mustOverlay(t, cert, testAuthKey(t)))
 	if err != nil {
 		t.Fatalf("ParseCertificate after overlay: %v", err)
+	}
+	if len(withMAC.Signature) != certMACLen {
+		t.Fatalf("signature is %d bytes after the overlay, want %d", len(withMAC.Signature), certMACLen)
 	}
 	if bytes.Equal(withMAC.Signature, parsed.Signature) {
 		t.Fatal("the overlay did not change the signature field x509 reads")
 	}
+	// The MAC is computed over the SPKI and CertificateVerify is checked against
+	// it, so nothing in the signed body may shift.
+	if !bytes.Equal(withMAC.RawTBSCertificate, parsed.RawTBSCertificate) {
+		t.Fatal("the overlay disturbed the signed body of the certificate")
+	}
 	if !bytes.Equal(withMAC.RawSubjectPublicKeyInfo, parsed.RawSubjectPublicKeyInfo) {
 		t.Fatal("the overlay disturbed the public key")
 	}
-	if len(withMAC.Signature) != sigLen {
-		t.Fatalf("the overlay changed the signature length to %d", len(withMAC.Signature))
+	if withMAC.SignatureAlgorithm != parsed.SignatureAlgorithm {
+		t.Fatalf("signature algorithm changed from %v to %v", parsed.SignatureAlgorithm, withMAC.SignatureAlgorithm)
 	}
 }
 
