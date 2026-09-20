@@ -150,6 +150,7 @@ type Manager struct {
 	fastReconnectStrategy string
 	fastReconnectCount    int
 	fastReconnectFirst    time.Time
+	fastReconnectLast     time.Time // when the previous counted attempt happened
 
 	// Connectivity checker for pre-flight checks
 	connectivityChecker  *ConnectivityChecker
@@ -209,6 +210,7 @@ type Manager struct {
 const (
 	fastReconnectLimit  = 3               // fast reconnects of one strategy allowed before forcing a full scan
 	fastReconnectWindow = 5 * time.Minute // window over which fast reconnects are counted
+	fastReconnectGap    = 30 * time.Second // max pause between counted reconnects; a longer one means the session held
 )
 
 // errStrategyScanFailed marks the one failure mode that says something about
@@ -287,14 +289,21 @@ func (m *Manager) applyUDPGate(udpOK bool) {
 // strategy that fast-reconnects more than fastReconnectLimit times inside
 // fastReconnectWindow is looping on a tunnel that connects but will not hold;
 // the full scan then gives the storm detector and other strategies a chance.
-// A different strategy, or an expired window, restarts the count.
+// A different strategy, an expired window, or a pause of fastReconnectGap or
+// more since the previous counted attempt (the previous session held - not a
+// loop) restarts the count. The gap clause matters because long-lived traffic
+// rides the same fast path: every proxied CONNECT re-enters connectWithRTT,
+// and counting those trips as looping flagged ordinary traffic as a storm.
 // Caller must hold m.mu.
 func (m *Manager) shouldSkipFastReconnect(strategyID string, now time.Time) bool {
-	if m.fastReconnectStrategy != strategyID || now.Sub(m.fastReconnectFirst) > fastReconnectWindow {
+	if m.fastReconnectStrategy != strategyID ||
+		now.Sub(m.fastReconnectFirst) > fastReconnectWindow ||
+		!m.fastReconnectLast.IsZero() && now.Sub(m.fastReconnectLast) >= fastReconnectGap {
 		m.fastReconnectStrategy = strategyID
 		m.fastReconnectCount = 0
 		m.fastReconnectFirst = now
 	}
+	m.fastReconnectLast = now
 	m.fastReconnectCount++
 	return m.fastReconnectCount > fastReconnectLimit
 }
