@@ -58,7 +58,13 @@ func TestH2StegoHandshakeOverTLS(t *testing.T) {
 	}
 	defer clientTLS.Close()
 
-	stegoConn := strategy.NewHTTP2StegoConn(clientTLS, secret, true, strategy.NaivePaddingMinimal)
+	// Bind the client's auth token to this TLS session's exporter, matching the
+	// server's handleHTTP2WithALPN side (S22).
+	clientEKM, err := exporterBindingKey(clientTLS)
+	if err != nil {
+		t.Fatalf("client exporter: %v", err)
+	}
+	stegoConn := strategy.NewHTTP2StegoConn(clientTLS, secret, true, strategy.NaivePaddingMinimal, clientEKM)
 
 	handshakeDone := make(chan error, 1)
 	go func() {

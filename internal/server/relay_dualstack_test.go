@@ -300,7 +300,7 @@ func TestRelayChainForwardsDualStack(t *testing.T) {
 		var authSecret []byte
 		var tunnel *h2TunnelState
 		var connTracked bool
-		runH2FrameLoop(&conn, &framer, hpackDec, relayCtx, logger, &authenticated, &authClientID, &authSecret, &connTracked, &tunnel, nil)
+		runH2FrameLoop(&conn, &framer, hpackDec, relayCtx, logger, &authenticated, &authClientID, &authSecret, &connTracked, &tunnel, nil, nil)
 	}()
 
 	// Downstream client.
@@ -310,7 +310,7 @@ func TestRelayChainForwardsDualStack(t *testing.T) {
 	}
 	defer clientConn.Close()
 
-	stegoConn := strategy.NewHTTP2StegoConn(clientConn, secret, true, strategy.NaivePaddingMinimal)
+	stegoConn := strategy.NewHTTP2StegoConn(clientConn, secret, true, strategy.NaivePaddingMinimal, nil)
 	if err := stegoConn.Handshake(); err != nil {
 		t.Fatalf("client handshake: %v", err)
 	}

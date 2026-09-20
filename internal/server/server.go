@@ -1622,7 +1622,17 @@ func handleHTTP2WithALPN(conn net.Conn, srvCtx *serverContext, logger *log.Logge
 
 	defer func() { cleanupH2Conn(conn, srvCtx, &tunnel, &connTracked, &authClientID) }()
 
-	runH2FrameLoop(&conn, &framer, hpackDec, srvCtx, logger, &authenticated, &authClientID, &authSecret, &connTracked, &tunnel, nil)
+	// Session binding (S22): the auth token is bound to this TLS session's
+	// exporter. Pull it before the frame loop; the stego path never hands the
+	// socket to kTLS, so conn stays a userspace *tls.Conn and the exporter is
+	// reachable. An unavailable exporter yields nil, which no bound client token
+	// matches — a fast rejection, not a silent unbound accept.
+	ekm, ekmErr := exporterBindingKey(conn)
+	if ekmErr != nil {
+		logger.Debug("HTTP/2 stego (ALPN): exporter unavailable: %v", ekmErr)
+	}
+
+	runH2FrameLoop(&conn, &framer, hpackDec, srvCtx, logger, &authenticated, &authClientID, &authSecret, &connTracked, &tunnel, nil, ekm)
 }
 
 // handleMorphConnectionWithALPN handles Morph protocol when ALPN was used
@@ -1675,7 +1685,17 @@ func handleHTTP2(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
 	var connTracked bool
 	defer cleanupH2Conn(conn, srvCtx, &tunnel, &connTracked, &authClientID)
 
-	runH2FrameLoop(&conn, &framer, hpackDec, srvCtx, logger, &authenticated, &authClientID, &authSecret, &connTracked, &tunnel, nil)
+	// Session binding (S22): bind the auth token to this TLS session's exporter.
+	// On the TLS entry path (handleTLSConnectionLegacy) conn wraps a *tls.Conn
+	// and the exporter is available; on the plaintext entry path
+	// (handleConnection) there is no TLS session, ekm is nil, and no bound client
+	// token matches — which is correct, since our clients always run over TLS.
+	ekm, ekmErr := exporterBindingKey(conn)
+	if ekmErr != nil {
+		logger.Debug("HTTP/2 stego: exporter unavailable: %v", ekmErr)
+	}
+
+	runH2FrameLoop(&conn, &framer, hpackDec, srvCtx, logger, &authenticated, &authClientID, &authSecret, &connTracked, &tunnel, nil, ekm)
 }
 
 // initH2Framer reads the HTTP/2 preface, creates a framer and sends server SETTINGS.
@@ -1715,7 +1735,7 @@ func cleanupH2Conn(conn net.Conn, srvCtx *serverContext, tunnel **h2TunnelState,
 // (legacy non-ALPN path), in which case no kTLS upgrade happens. When set, it
 // is invoked exactly once — immediately after auth succeeds — and returns the
 // connection and framer to use for the subsequent relay phase.
-func runH2FrameLoop(connPtr *net.Conn, framerPtr **http2.Framer, hpackDec *hpack.Decoder, srvCtx *serverContext, logger *log.Logger, authenticated *bool, authClientID *clientIdentity, authSecret *[]byte, connTracked *bool, tunnel **h2TunnelState, handover func(net.Conn) (net.Conn, *http2.Framer)) {
+func runH2FrameLoop(connPtr *net.Conn, framerPtr **http2.Framer, hpackDec *hpack.Decoder, srvCtx *serverContext, logger *log.Logger, authenticated *bool, authClientID *clientIdentity, authSecret *[]byte, connTracked *bool, tunnel **h2TunnelState, handover func(net.Conn) (net.Conn, *http2.Framer), ekm []byte) {
 	for {
 		conn := *connPtr
 		framer := *framerPtr
@@ -1737,7 +1757,7 @@ func runH2FrameLoop(connPtr *net.Conn, framerPtr **http2.Framer, hpackDec *hpack
 			}
 		case *http2.HeadersFrame:
 			wasAuthed := *authenticated
-			processH2HeadersFrame(conn, f, framer, hpackDec, srvCtx, logger, authenticated, authClientID, authSecret, connTracked)
+			processH2HeadersFrame(conn, f, framer, hpackDec, srvCtx, logger, authenticated, authClientID, authSecret, connTracked, ekm)
 			// Auth just succeeded on this frame: perform the kTLS handover
 			// now, before reading any further frames. The auth ack has been
 			// written through the TLS stack and flushed; the client is parked
@@ -1762,7 +1782,7 @@ func runH2FrameLoop(connPtr *net.Conn, framerPtr **http2.Framer, hpackDec *hpack
 }
 
 // processH2HeadersFrame extracts auth headers and, if valid, marks the connection authenticated.
-func processH2HeadersFrame(conn net.Conn, f *http2.HeadersFrame, framer *http2.Framer, hpackDec *hpack.Decoder, srvCtx *serverContext, logger *log.Logger, authenticated *bool, authClientID *clientIdentity, authSecret *[]byte, connTracked *bool) {
+func processH2HeadersFrame(conn net.Conn, f *http2.HeadersFrame, framer *http2.Framer, hpackDec *hpack.Decoder, srvCtx *serverContext, logger *log.Logger, authenticated *bool, authClientID *clientIdentity, authSecret *[]byte, connTracked *bool, ekm []byte) {
 	var apiKey, requestID string
 	hpackDec.SetEmitFunc(func(hf hpack.HeaderField) {
 		logger.Debug("  Header: %s = %s", hf.Name, truncate(hf.Value, 50))
@@ -1779,7 +1799,7 @@ func processH2HeadersFrame(conn net.Conn, f *http2.HeadersFrame, framer *http2.F
 		return
 	}
 
-	ok, clientID, secret := verifyH2AuthMulti(srvCtx, apiKey, requestID, logger)
+	ok, clientID, secret := verifyH2AuthMulti(srvCtx, apiKey, requestID, ekm, logger)
 	if !ok {
 		logger.Warn("HTTP/2 steganography auth FAILED")
 		return
@@ -1801,16 +1821,16 @@ func processH2HeadersFrame(conn net.Conn, f *http2.HeadersFrame, framer *http2.F
 
 // verifyH2AuthMulti checks per-client secrets then global secret for HTTP/2 stego auth.
 // Returns (ok, clientID, usedSecret).
-func verifyH2AuthMulti(srvCtx *serverContext, apiKey, requestID string, logger *log.Logger) (bool, clientIdentity, []byte) {
+func verifyH2AuthMulti(srvCtx *serverContext, apiKey, requestID string, ekm []byte, logger *log.Logger) (bool, clientIdentity, []byte) {
 	if srvCtx.registry != nil {
 		for _, client := range srvCtx.registry.ListClients() {
-			if verifyH2Auth(apiKey, requestID, []byte(client.Secret)) {
+			if verifyH2Auth(apiKey, requestID, []byte(client.Secret), ekm) {
 				logger.Info("HTTP/2 steganography authenticated (client: %s, id: %s)", client.Name, client.ID)
 				return true, registryIdentity(client.ID), []byte(client.Secret)
 			}
 		}
 	}
-	if len(srvCtx.cfg.Secret) > 0 && verifyH2Auth(apiKey, requestID, srvCtx.cfg.Secret) {
+	if len(srvCtx.cfg.Secret) > 0 && verifyH2Auth(apiKey, requestID, srvCtx.cfg.Secret, ekm) {
 		logger.Info("HTTP/2 steganography authenticated (global secret)")
 		return true, sharedIdentity(globalClientID), srvCtx.cfg.Secret
 	}
@@ -2046,6 +2066,14 @@ func writeMorphShapedFrames(conn net.Conn, sh shaper.Shaper, frames [][]byte) er
 func handleMorphConnection(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
 	logger.Debug("Processing Morph connection")
 
+	// Session binding (S22): capture the TLS exporter before kTLS offload (which
+	// happens after auth, below). nil on the plaintext entry path — our clients
+	// always run over TLS, so a nil exporter simply fails to match a bound token.
+	ekm, ekmErr := exporterBindingKey(conn)
+	if ekmErr != nil {
+		logger.Debug("Morph: exporter unavailable: %v", ekmErr)
+	}
+
 	// Read MRPH magic (4 bytes) + nameLen (1 byte)
 	mrphHeader := make([]byte, 5)
 	if _, err := io.ReadFull(conn, mrphHeader); err != nil {
@@ -2089,7 +2117,7 @@ func handleMorphConnection(conn net.Conn, srvCtx *serverContext, logger *log.Log
 		for _, client := range clients {
 			secretBytes := []byte(client.Secret)
 			logger.Debug("Traffic Morph: trying client '%s' (secret len=%d)", client.Name, len(client.Secret))
-			if verifyMorphAuth(authToken, secretBytes) {
+			if verifyMorphAuth(authToken, secretBytes, ekm) {
 				logger.Info("Traffic Morph authenticated (client: %s, id: %s)", client.Name, client.ID)
 				authenticated = true
 				usedSecret = secretBytes
@@ -2103,7 +2131,7 @@ func handleMorphConnection(conn net.Conn, srvCtx *serverContext, logger *log.Log
 
 	// 2. Fallback to global secret (if not found in registry and global secret exists)
 	if !authenticated && len(srvCtx.cfg.Secret) > 0 {
-		if verifyMorphAuth(authToken, srvCtx.cfg.Secret) {
+		if verifyMorphAuth(authToken, srvCtx.cfg.Secret, ekm) {
 			logger.Info("Traffic Morph authenticated (global secret)")
 			authenticated = true
 			usedSecret = srvCtx.cfg.Secret
@@ -4279,7 +4307,12 @@ func verifyFullKnockSequence(conn net.Conn, secret []byte, srvCtx *serverContext
 // here fixes clients whose clock drifts by more than the original 1 minute.
 const authClockSkewGraceMinutes int64 = 10
 
-func verifyH2Auth(apiKey, requestID string, secret []byte) bool {
+// verifyH2Auth checks the HTTP/2 stego auth token. ekm is the TLS session
+// exporter this connection authenticates over; it is folded into the HMAC so a
+// token captured on another TLS session is rejected here (S22 session binding).
+// The client derives the matching token from the exporter of the same handshake
+// (internal/strategy/stego.go generateAuthTokenBound).
+func verifyH2Auth(apiKey, requestID string, secret, ekm []byte) bool {
 	// Decode hex values
 	apiKeyBytes := decodeHex(apiKey)
 	requestIDBytes := decodeHex(requestID)
@@ -4303,6 +4336,7 @@ func verifyH2Auth(apiKey, requestID string, secret []byte) bool {
 		h := hmac.New(sha256.New, secret)
 		h.Write(timestamp)
 		h.Write([]byte("http2-stego-auth"))
+		h.Write(ekm) // TLS-session binding; must match the client's exporter
 		expectedToken := h.Sum(nil)[:32]
 
 		if hmac.Equal(receivedToken, expectedToken) {
@@ -4312,7 +4346,10 @@ func verifyH2Auth(apiKey, requestID string, secret []byte) bool {
 	return false
 }
 
-func verifyMorphAuth(receivedToken, secret []byte) bool {
+// verifyMorphAuth checks the Morph / WebSocket-Padded / Geneva auth token. ekm
+// is the TLS session exporter this connection authenticates over, folded into
+// the HMAC for S22 session binding (see verifyH2Auth).
+func verifyMorphAuth(receivedToken, secret, ekm []byte) bool {
 	if len(receivedToken) != 32 {
 		return false
 	}
@@ -4329,6 +4366,7 @@ func verifyMorphAuth(receivedToken, secret []byte) bool {
 		h := hmac.New(sha256.New, secret)
 		h.Write(timestamp)
 		h.Write([]byte("http2-stego-auth")) // Use same context as H2 Stego for consistency
+		h.Write(ekm)                        // TLS-session binding; must match the client's exporter
 		expectedToken := h.Sum(nil)[:32]
 
 		if hmac.Equal(receivedToken, expectedToken) {
@@ -4469,6 +4507,15 @@ func handleWebSocketPadded(conn net.Conn, srvCtx *serverContext, logger *log.Log
 
 	logger.Debug("WebSocket Padded: Processing connection from %s", conn.RemoteAddr())
 
+	// Session binding (S22): the WebSocket-Padded and Geneva clients both bind
+	// their X-Auth-Token to this TLS session's exporter. kTLS offload happens
+	// after auth, so conn is still a userspace *tls.Conn here. WS has no
+	// plaintext entry path, so the exporter is always available.
+	ekm, ekmErr := exporterBindingKey(conn)
+	if ekmErr != nil {
+		logger.Debug("WebSocket Padded: exporter unavailable: %v", ekmErr)
+	}
+
 	// Read upgrade request byte-exactly so no bytes past \r\n\r\n are
 	// consumed into an internal buffer. bufio.NewReader would pre-fetch
 	// past the empty line and lose those bytes when kTLS takes over.
@@ -4508,7 +4555,7 @@ func handleWebSocketPadded(conn net.Conn, srvCtx *serverContext, logger *log.Log
 	if srvCtx.registry != nil {
 		clients := srvCtx.registry.ListClients()
 		for _, client := range clients {
-			if verifyMorphAuth(authToken, []byte(client.Secret)) {
+			if verifyMorphAuth(authToken, []byte(client.Secret), ekm) {
 				logger.Info("WebSocket Padded authenticated (client: %s, id: %s)", client.Name, client.ID)
 				usedSecret = []byte(client.Secret)
 				clientID = registryIdentity(client.ID)
@@ -4519,7 +4566,7 @@ func handleWebSocketPadded(conn net.Conn, srvCtx *serverContext, logger *log.Log
 
 	// 2. Fallback to global secret
 	if usedSecret == nil && len(srvCtx.cfg.Secret) > 0 {
-		if verifyMorphAuth(authToken, srvCtx.cfg.Secret) {
+		if verifyMorphAuth(authToken, srvCtx.cfg.Secret, ekm) {
 			logger.Info("WebSocket Padded authenticated (global secret)")
 			usedSecret = srvCtx.cfg.Secret
 			clientID = sharedIdentity(globalClientID)
@@ -4831,9 +4878,15 @@ func (s *HTTPPollingSession) ReadToClient(ackSeq int64) []byte {
 	return result
 }
 
-// verifyPollingAuth verifies the HMAC auth token for polling requests
-func verifyPollingAuth(authToken, sessionID string, secret []byte) bool {
-	// Auth token is generated as: HMAC(secret, sessionID:timestamp)[:16]
+// verifyPollingAuth verifies the HMAC auth token for polling requests. ekm is
+// the TLS session exporter of the connection the request arrived on, folded
+// into the HMAC for S22 session binding: a token captured on one poll session
+// is rejected on any other. Keep-alive reuses one TLS session, so its exporter
+// is stable across the burst of requests and the token keeps verifying; a fresh
+// dial gets a fresh exporter and the client rederives the token to match (see
+// internal/strategy/http_polling.go generateAuthTokenForConn).
+func verifyPollingAuth(authToken, sessionID string, secret, ekm []byte) bool {
+	// Auth token is generated as: HMAC(secret, sessionID:timestamp || ekm)[:16]
 	// We allow tokens from last 60 seconds
 	now := time.Now().Unix()
 
@@ -4841,6 +4894,7 @@ func verifyPollingAuth(authToken, sessionID string, secret []byte) bool {
 		data := fmt.Sprintf("%s:%d", sessionID, now-delta)
 		h := hmac.New(sha256.New, secret)
 		h.Write([]byte(data))
+		h.Write(ekm) // TLS-session binding; must match the client's exporter
 		expected := base64.StdEncoding.EncodeToString(h.Sum(nil))[:16]
 		if hmac.Equal([]byte(authToken), []byte(expected)) {
 			return true
@@ -4901,6 +4955,16 @@ func handleHTTPPolling(conn net.Conn, srvCtx *serverContext, firstRequest []byte
 	defer conn.Close()
 	reader := bufio.NewReader(io.MultiReader(bytes.NewReader(firstRequest), conn))
 
+	// Session binding (S22): every request on this connection authenticates
+	// against the same TLS session exporter. Keep-alive reuses one *tls.Conn for
+	// the whole burst, so the exporter is constant across the loop and the
+	// client's per-request token keeps verifying. Polling has no plaintext entry
+	// path, so the exporter is available.
+	ekm, ekmErr := exporterBindingKey(conn)
+	if ekmErr != nil {
+		logger.Debug("HTTP Polling: exporter unavailable: %v", ekmErr)
+	}
+
 	for i := 0; i < pollingServerMaxRequests; i++ {
 		if i > 0 {
 			// Wait a bounded time for the next keep-alive request.
@@ -4916,7 +4980,7 @@ func handleHTTPPolling(conn net.Conn, srvCtx *serverContext, firstRequest []byte
 			}
 			return
 		}
-		if !processHTTPPollingRequest(conn, reader, srvCtx, head, logger) {
+		if !processHTTPPollingRequest(conn, reader, srvCtx, head, ekm, logger) {
 			return
 		}
 	}
@@ -4943,7 +5007,7 @@ func readPollingRequestHead(reader *bufio.Reader) ([]byte, error) {
 
 // processHTTPPollingRequest processes a single HTTP polling request and reports
 // whether the client asked to keep the connection open for a further request.
-func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serverContext, request []byte, logger *log.Logger) (keepAliveOut bool) {
+func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serverContext, request, ekm []byte, logger *log.Logger) (keepAliveOut bool) {
 	// Parse headers from request
 	lines := bytes.Split(request, []byte("\r\n"))
 	var sessionID, authToken string
@@ -4999,7 +5063,7 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 
 	if existingSess != nil {
 		// Session exists - verify auth against session's secret
-		if verifyPollingAuth(authToken, sessionID, existingSess.Secret) {
+		if verifyPollingAuth(authToken, sessionID, existingSess.Secret, ekm) {
 			usedSecret = existingSess.Secret
 			clientID = existingSess.ClientID
 		} else {
@@ -5011,12 +5075,12 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 				clients := srvCtx.registry.ListClients()
 				for _, c := range clients {
 					secretBytes := []byte(c.Secret)
-					if verifyPollingAuth(authToken, sessionID, secretBytes) {
+					if verifyPollingAuth(authToken, sessionID, secretBytes, ekm) {
 						logger.Debug("HTTP Polling: Token would match client '%s'", c.Name)
 					}
 				}
 			}
-			if verifyPollingAuth(authToken, sessionID, srvCtx.cfg.Secret) {
+			if verifyPollingAuth(authToken, sessionID, srvCtx.cfg.Secret, ekm) {
 				logger.Debug("HTTP Polling: Token would match global secret")
 			}
 
@@ -5030,7 +5094,7 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 			for _, c := range clients {
 				// Use secret as-is (client uses ASCII bytes of hex string)
 				secretBytes := []byte(c.Secret)
-				if verifyPollingAuth(authToken, sessionID, secretBytes) {
+				if verifyPollingAuth(authToken, sessionID, secretBytes, ekm) {
 					usedSecret = secretBytes
 					clientID = registryIdentity(c.ID)
 					logger.Debug("HTTP Polling: Auth matched client '%s' (id=%s)", c.Name, c.ID)
@@ -5040,7 +5104,7 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 		}
 
 		if usedSecret == nil && len(srvCtx.cfg.Secret) > 0 {
-			if verifyPollingAuth(authToken, sessionID, srvCtx.cfg.Secret) {
+			if verifyPollingAuth(authToken, sessionID, srvCtx.cfg.Secret, ekm) {
 				usedSecret = srvCtx.cfg.Secret
 				clientID = sharedIdentity(globalClientID)
 				logger.Debug("HTTP Polling: Auth matched global secret")

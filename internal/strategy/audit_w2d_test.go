@@ -135,7 +135,7 @@ func TestPollingReusesConnection(t *testing.T) {
 	ctx := context.Background()
 	const n = 8
 	for i := 0; i < n; i++ {
-		if _, err := conn.doRequest(ctx, "tok", nil, 0); err != nil {
+		if _, err := conn.doRequest(ctx, nil, 0); err != nil {
 			t.Fatalf("doRequest %d: %v", i, err)
 		}
 	}
@@ -205,7 +205,7 @@ func TestStegoAuthorityTracksCoverHost(t *testing.T) {
 	defer c.Close()
 	defer srv.Close()
 
-	conn := NewHTTP2StegoConn(c, []byte("auth-secret"), true, NaivePaddingMinimal)
+	conn := NewHTTP2StegoConn(c, []byte("auth-secret"), true, NaivePaddingMinimal, nil)
 	conn.coverHost = "vk.com"
 	if got := conn.authority(); got != "vk.com" {
 		t.Fatalf("authority()=%q, want it to track coverHost vk.com", got)

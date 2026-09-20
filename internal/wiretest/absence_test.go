@@ -445,7 +445,7 @@ func driveStego(t *testing.T, writes, size int) *wiretest.Dump {
 		if err != nil {
 			return
 		}
-		srv := strategy.NewHTTP2StegoConn(c, testSecret, false, strategy.NaivePaddingStandard)
+		srv := strategy.NewHTTP2StegoConn(c, testSecret, false, strategy.NaivePaddingStandard, nil)
 		if err := srv.Handshake(); err != nil {
 			return
 		}
@@ -459,7 +459,7 @@ func driveStego(t *testing.T, writes, size int) *wiretest.Dump {
 	}
 	defer raw.Close()
 
-	cli := strategy.NewHTTP2StegoConn(raw, testSecret, true, strategy.NaivePaddingStandard)
+	cli := strategy.NewHTTP2StegoConn(raw, testSecret, true, strategy.NaivePaddingStandard, nil)
 	if err := cli.Handshake(); err != nil {
 		t.Fatalf("stego client handshake: %v", err)
 	}
@@ -550,7 +550,7 @@ func driveStegoTunMixed(t *testing.T, sizes []int) []wiretest.LenSample {
 		if err != nil {
 			return
 		}
-		srv := strategy.NewHTTP2StegoConn(c, testSecret, false, strategy.NaivePaddingMinimal)
+		srv := strategy.NewHTTP2StegoConn(c, testSecret, false, strategy.NaivePaddingMinimal, nil)
 		if err := srv.Handshake(); err != nil {
 			return
 		}
@@ -564,7 +564,7 @@ func driveStegoTunMixed(t *testing.T, sizes []int) []wiretest.LenSample {
 	}
 	defer raw.Close()
 
-	cli := strategy.NewHTTP2StegoConn(raw, testSecret, true, strategy.NaivePaddingMinimal)
+	cli := strategy.NewHTTP2StegoConn(raw, testSecret, true, strategy.NaivePaddingMinimal, nil)
 	if err := cli.Handshake(); err != nil {
 		t.Fatalf("stego tun client handshake: %v", err)
 	}

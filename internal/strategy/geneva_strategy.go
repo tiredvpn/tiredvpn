@@ -171,8 +171,15 @@ func (g *GenevaStrategy) Connect(ctx context.Context, target string) (net.Conn, 
 	log.Debug("Geneva: TLS handshake complete, manipulation: %s", genevaConn.GetManipulation())
 
 	// Step 5: Perform WebSocket upgrade (same format as WebSocket Salamander) with auth token
+	// bound to this TLS session (S22): a token lifted from another session fails
+	// verification on the server, which derives the same exporter from its side.
+	ekm, err := sessionExporterKey(tlsConn)
+	if err != nil {
+		tlsConn.Close()
+		return nil, fmt.Errorf("geneva: export keying material: %w", err)
+	}
 	wsKey := generateWebSocketKey()
-	authToken := generateAuthToken(secret)
+	authToken := generateAuthTokenBound(secret, ekm)
 	upgradeReq := fmt.Sprintf(
 		"GET %s HTTP/1.1\r\n"+
 			"Host: %s\r\n"+

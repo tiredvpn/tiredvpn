@@ -22,6 +22,7 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/protect"
 	"github.com/tiredvpn/tiredvpn/internal/protocol"
+	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 	"golang.org/x/crypto/hkdf"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
@@ -228,6 +229,15 @@ func (s *HTTP2StegoStrategy) Connect(ctx context.Context, target string) (net.Co
 		return nil, fmt.Errorf("stego dispatch: %w", err)
 	}
 
+	// Capture the TLS session exporter for auth-token binding (S22) BEFORE the
+	// kTLS handover — once the kernel owns the socket the *tls.Conn no longer
+	// reflects live keys.
+	ekm, err := sessionExporterKey(conn)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("stego: export keying material: %w", err)
+	}
+
 	// Try to enable kTLS for kernel TLS offload (reduces CPU usage)
 	var finalConn net.Conn = conn
 	if ktlsConn := ktls.Enable(conn); ktlsConn != nil {
@@ -236,7 +246,7 @@ func (s *HTTP2StegoStrategy) Connect(ctx context.Context, target string) (net.Co
 	}
 
 	// Create steganographic connection with padding mode
-	stegoConn := NewHTTP2StegoConn(finalConn, secret, true, s.paddingMode)
+	stegoConn := NewHTTP2StegoConn(finalConn, secret, true, s.paddingMode, ekm)
 	stegoConn.coverHost = coverHost // :authority tracks the SNI we opened with
 
 	// Perform initial handshake, bounded by the caller's context so a
@@ -260,6 +270,12 @@ type HTTP2StegoConn struct {
 	isClient    bool
 	paddingMode NaivePaddingMode
 	coverHost   string // HTTP/2 :authority; set to the SNI so the two agree
+
+	// ekm is the TLS session exporter the auth token is bound to (S22). It is
+	// captured from the *tls.Conn before any kTLS offload and set via the
+	// constructor. nil only for the non-TLS test pipes, where both ends agree
+	// on nil; a live TLS session must always carry its exporter here.
+	ekm []byte
 
 	// HTTP/2 framing
 	framer *http2.Framer
@@ -293,13 +309,19 @@ type HTTP2StegoConn struct {
 	recvConsumed int64
 }
 
-// NewHTTP2StegoConn creates a new steganographic HTTP/2 connection
-func NewHTTP2StegoConn(conn net.Conn, secret []byte, isClient bool, paddingMode NaivePaddingMode) *HTTP2StegoConn {
+// NewHTTP2StegoConn creates a new steganographic HTTP/2 connection.
+//
+// ekm is the TLS session exporter the auth token is bound to (S22). Callers over
+// a real TLS session must capture it from the *tls.Conn before any kTLS offload
+// (see sessionExporterKey) and pass it here; the non-TLS test pipes pass nil on
+// both ends.
+func NewHTTP2StegoConn(conn net.Conn, secret []byte, isClient bool, paddingMode NaivePaddingMode, ekm []byte) *HTTP2StegoConn {
 	sc := &HTTP2StegoConn{
 		Conn:        conn,
 		secret:      secret,
 		isClient:    isClient,
 		paddingMode: paddingMode,
+		ekm:         ekm,
 	}
 
 	// Initialize HTTP/2 framer
@@ -375,8 +397,8 @@ func (sc *HTTP2StegoConn) HandshakeContext(ctx context.Context) error {
 func (sc *HTTP2StegoConn) sendCovertHandshake() error {
 	streamID := sc.allocateStreamID()
 
-	// Generate auth token
-	authToken := generateAuthToken(sc.secret)
+	// Generate auth token bound to this TLS session (S22).
+	authToken := generateAuthTokenBound(sc.secret, sc.ekm)
 
 	// Encode in HEADERS
 	sc.hpackBuf.Reset()
@@ -553,7 +575,7 @@ func (sc *HTTP2StegoConn) verifyClientAuth(f *http2.HeadersFrame) bool {
 
 	receivedToken := append(apiKeyBytes[:16], requestIDBytes[:16]...)
 
-	return verifyAuthToken(sc.secret, receivedToken)
+	return verifyAuthTokenBound(sc.secret, sc.ekm, receivedToken)
 }
 
 // sendServerAck sends acknowledgment to client
@@ -1218,32 +1240,83 @@ func deriveKey(secret []byte, context string) []byte {
 // the stego-as-server path used by the relay and the tests.
 const stegoAuthSkewBuckets = 1
 
-func generateAuthToken(secret []byte) []byte {
-	return generateAuthTokenAt(secret, uint64(time.Now().Unix()/60)) // 1-minute window
+// generateAuthTokenBound derives the shared strategy auth token for the current
+// 1-minute bucket, bound to the TLS session's exporter keying material (ekm).
+//
+// Folding ekm into the HMAC is the S22 session binding: a token lifted off one
+// TLS session carries that session's exporter, so it fails verification on any
+// other session even under the same secret and time bucket. The
+// geneva/morph/websocket_padded/stego clients all feed it the exporter of the
+// *tls.Conn they authenticate over (see sessionExporterKey).
+//
+// ekm==nil reproduces the pre-binding token. That path is intended only for
+// transports with no TLS session of their own (the non-TLS test pipes, where
+// both ends pass nil and still agree); a client that authenticates over TLS and
+// passes nil here silently ships an unbound token, which is the regression this
+// function exists to prevent.
+func generateAuthTokenBound(secret, ekm []byte) []byte {
+	return generateAuthTokenBoundAt(secret, ekm, uint64(time.Now().Unix()/60)) // 1-minute window
 }
 
-// generateAuthTokenAt derives the auth token for a specific 1-minute bucket.
-func generateAuthTokenAt(secret []byte, bucket uint64) []byte {
+// generateAuthTokenBoundAt derives the session-bound auth token for a specific
+// 1-minute bucket.
+func generateAuthTokenBoundAt(secret, ekm []byte, bucket uint64) []byte {
 	timestamp := make([]byte, 8)
 	binary.BigEndian.PutUint64(timestamp, bucket)
 
 	h := hmac.New(sha256.New, secret)
 	h.Write(timestamp)
 	h.Write([]byte("http2-stego-auth"))
+	h.Write(ekm) // TLS-session binding
 	return h.Sum(nil)[:32]
 }
 
-// verifyAuthToken reports whether receivedToken matches the token for any
-// bucket within +-stegoAuthSkewBuckets of now. The comparison is constant-time
-// (hmac.Equal) so it leaks nothing about how many leading bytes matched.
-func verifyAuthToken(secret, receivedToken []byte) bool {
+// verifyAuthTokenBound reports whether receivedToken matches the session-bound
+// token for any bucket within +-stegoAuthSkewBuckets of now, on the TLS session
+// whose exporter is ekm. The comparison is constant-time (hmac.Equal) so it
+// leaks nothing about how many leading bytes matched.
+func verifyAuthTokenBound(secret, ekm, receivedToken []byte) bool {
 	now := time.Now().Unix() / 60
 	for offset := int64(-stegoAuthSkewBuckets); offset <= stegoAuthSkewBuckets; offset++ {
-		if hmac.Equal(receivedToken, generateAuthTokenAt(secret, uint64(now+offset))) {
+		if hmac.Equal(receivedToken, generateAuthTokenBoundAt(secret, ekm, uint64(now+offset))) {
 			return true
 		}
 	}
 	return false
+}
+
+// sessionExporterKey pulls the RFC 8446 §7.5 exporter out of a handshaked
+// *tls.Conn for auth-token session binding.
+//
+// It must be called while the userspace TLS stack still owns the connection:
+// once kTLS offloads the socket the *tls.Conn is no longer the thing on the
+// wire and ConnectionState no longer reflects live keys. Every caller here
+// captures the exporter right after the handshake and before ktls.Enable.
+func sessionExporterKey(conn *tls.Conn) ([]byte, error) {
+	state := conn.ConnectionState()
+	return customtls.ExportBindingKey(&state)
+}
+
+// connExporterKey is the best-effort form of sessionExporterKey for callers that
+// hold a net.Conn which may or may not be a handshaked *tls.Conn (the composed
+// morph path, whose base transport is another strategy). It unwraps one
+// NetConn() layer and returns nil when no TLS session is reachable — a nil the
+// caller and its peer must agree on, exactly as with a non-TLS test pipe.
+func connExporterKey(conn net.Conn) []byte {
+	tc, ok := conn.(*tls.Conn)
+	if !ok {
+		if nc, hasNetConn := conn.(interface{ NetConn() net.Conn }); hasNetConn {
+			tc, ok = nc.NetConn().(*tls.Conn)
+		}
+	}
+	if !ok || tc == nil {
+		return nil
+	}
+	ekm, err := sessionExporterKey(tc)
+	if err != nil {
+		return nil
+	}
+	return ekm
 }
 
 // stegoAckNonceLen is the per-connection nonce the server prefixes to its ack

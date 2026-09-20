@@ -151,8 +151,17 @@ func (d *UpstreamDialer) connectStego(ctx context.Context) (net.Conn, *tls.Conn,
 		return nil, nil, err
 	}
 
+	// Bind the relay's auth token to this TLS session (S22): capture the
+	// exporter before the stego handshake so the token the upstream verifies
+	// matches the exporter the upstream derives from its own side.
+	ekm, err := exporterBindingKey(tlsConn)
+	if err != nil {
+		tlsConn.Close()
+		return nil, nil, fmt.Errorf("upstream: export keying material: %w", err)
+	}
+
 	// Create HTTP/2 Stego connection (reuse client implementation)
-	stegoConn := strategy.NewHTTP2StegoConn(tlsConn, d.upstreamSecret, true, strategy.NaivePaddingStandard)
+	stegoConn := strategy.NewHTTP2StegoConn(tlsConn, d.upstreamSecret, true, strategy.NaivePaddingStandard, ekm)
 
 	// Perform handshake (sends auth headers)
 	if err := stegoConn.Handshake(); err != nil {

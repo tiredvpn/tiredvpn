@@ -213,7 +213,11 @@ func TestWebSocketPaddedAuthenticatesWithTheDialSecret(t *testing.T) {
 				return nil, err
 			}
 			if v, ok := strings.CutPrefix(line, "X-Auth-Token: "); ok {
-				return hex.DecodeString(strings.TrimSpace(v))
+				tok, err := hex.DecodeString(strings.TrimSpace(v))
+				if err != nil {
+					return nil, err
+				}
+				return wireAuthCred{token: tok, ekm: connExporterKey(conn)}, nil
 			}
 			if strings.TrimSpace(line) == "" {
 				return nil, io.ErrUnexpectedEOF
@@ -226,7 +230,7 @@ func TestWebSocketPaddedAuthenticatesWithTheDialSecret(t *testing.T) {
 	m.Register(s)
 	dialAndIgnore(t, m, addr)
 
-	assertAuthTokenSecret(t, awaitCredential(t, tokens).([]byte), "WebSocket upgrade")
+	assertAuthTokenSecret(t, awaitCredential(t, tokens).(wireAuthCred), "WebSocket upgrade")
 }
 
 // TestTrafficMorphAuthenticatesWithTheDialSecret reads the 32-byte token out of
@@ -252,7 +256,7 @@ func TestTrafficMorphAuthenticatesWithTheDialSecret(t *testing.T) {
 		if _, err := io.ReadFull(conn, rest); err != nil {
 			return nil, err
 		}
-		return rest[int(head[4]) : int(head[4])+32], nil
+		return wireAuthCred{token: rest[int(head[4]) : int(head[4])+32], ekm: connExporterKey(conn)}, nil
 	})
 
 	m := managerAt(t, addr)
@@ -260,42 +264,62 @@ func TestTrafficMorphAuthenticatesWithTheDialSecret(t *testing.T) {
 	m.Register(s)
 	dialAndIgnore(t, m, addr)
 
-	assertAuthTokenSecret(t, awaitCredential(t, tokens).([]byte), "MRPH handshake")
+	assertAuthTokenSecret(t, awaitCredential(t, tokens).(wireAuthCred), "MRPH handshake")
 }
 
-// assertAuthTokenSecret checks a generateAuthToken value against both secrets.
+// wireAuthCred is the credential a strategy put on the wire: the auth token plus
+// the server-side TLS exporter it must be bound to (S22). The token alone means
+// nothing without the session it was minted on.
+type wireAuthCred struct {
+	token []byte
+	ekm   []byte
+}
+
+// assertAuthTokenSecret checks a generateAuthTokenBound value against both
+// secrets, on the session exporter the server observed.
 //
 // The token is bucketed to the minute, so a run that straddles a boundary would
 // otherwise flake; neighbouring buckets are accepted, which is what the server
 // does too.
-func assertAuthTokenSecret(t *testing.T, token []byte, what string) {
+func assertAuthTokenSecret(t *testing.T, cred wireAuthCred, what string) {
 	t.Helper()
-	if !authTokenMatches(token, []byte(wireDialSecret)) {
+	if cred.ekm == nil {
+		t.Fatalf("the %s server could not read the TLS exporter; test cannot check the binding", what)
+	}
+	if !authTokenMatches(cred.token, []byte(wireDialSecret), cred.ekm) {
 		t.Fatalf("the %s token does not verify under the endpoint's secret", what)
 	}
-	if authTokenMatches(token, []byte(wireBuiltSecret)) {
+	if authTokenMatches(cred.token, []byte(wireBuiltSecret), cred.ekm) {
 		t.Fatalf("the %s token verifies under the construction secret too", what)
+	}
+	// Positive control for the binding itself: the same token minted on this
+	// session must NOT verify on a different exporter.
+	otherEKM := append([]byte("other-"), cred.ekm...)
+	if authTokenMatches(cred.token, []byte(wireDialSecret), otherEKM) {
+		t.Fatalf("the %s token verifies on a different session exporter; not session-bound", what)
 	}
 }
 
-func authTokenMatches(token, secret []byte) bool {
+func authTokenMatches(token, secret, ekm []byte) bool {
 	for _, skew := range []time.Duration{0, -time.Minute, time.Minute} {
-		if bytes.Equal(token, authTokenAt(secret, time.Now().Add(skew))) {
+		if bytes.Equal(token, authTokenAt(secret, ekm, time.Now().Add(skew))) {
 			return true
 		}
 	}
 	return false
 }
 
-// authTokenAt mirrors generateAuthToken at a chosen time. Spelled out rather
-// than calling generateAuthToken, which can only answer for the current minute
-// and would otherwise make this test compare a function against itself.
-func authTokenAt(secret []byte, at time.Time) []byte {
+// authTokenAt mirrors generateAuthTokenBound at a chosen time. Spelled out
+// rather than calling generateAuthTokenBound, which can only answer for the
+// current minute and would otherwise make this test compare a function against
+// itself.
+func authTokenAt(secret, ekm []byte, at time.Time) []byte {
 	bucket := make([]byte, 8)
 	binary.BigEndian.PutUint64(bucket, uint64(at.Unix()/60))
 	h := hmac.New(sha256.New, secret)
 	h.Write(bucket)
 	h.Write([]byte("http2-stego-auth"))
+	h.Write(ekm)
 	return h.Sum(nil)[:32]
 }
 
@@ -403,7 +427,11 @@ func TestGenevaAuthenticatesWithTheDialSecret(t *testing.T) {
 				return nil, err
 			}
 			if v, ok := strings.CutPrefix(line, "X-Auth-Token: "); ok {
-				return hex.DecodeString(strings.TrimSpace(v))
+				tok, err := hex.DecodeString(strings.TrimSpace(v))
+				if err != nil {
+					return nil, err
+				}
+				return wireAuthCred{token: tok, ekm: connExporterKey(conn)}, nil
 			}
 		}
 	})
@@ -413,5 +441,5 @@ func TestGenevaAuthenticatesWithTheDialSecret(t *testing.T) {
 	m.Register(g)
 	dialAndIgnore(t, m, addr)
 
-	assertAuthTokenSecret(t, awaitCredential(t, tokens).([]byte), "Geneva upgrade")
+	assertAuthTokenSecret(t, awaitCredential(t, tokens).(wireAuthCred), "Geneva upgrade")
 }
