@@ -12,7 +12,6 @@ import (
 	stdtls "crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"io"
@@ -117,28 +116,27 @@ func awaitCredential(t *testing.T, ch <-chan any) any {
 	}
 }
 
-// TestSSHCamouflageAuthenticatesWithTheDialSecret reads the token the fake SSH
-// KEX_ECDH_INIT carries and checks it belongs to the endpoint's secret.
+// sshWireCredential is the token the client proved itself with plus the session
+// it was bound to; the token alone means nothing without the session.
+type sshWireCredential struct {
+	token     []byte
+	sessionID []byte
+}
+
+// TestSSHCamouflageAuthenticatesWithTheDialSecret runs the server half of the
+// SSH transport, pulls the client's userauth token out of the encrypted
+// channel, and checks it belongs to the endpoint's secret.
 func TestSSHCamouflageAuthenticatesWithTheDialSecret(t *testing.T) {
-	addr, tokens := acceptOne(t, func(conn net.Conn) (any, error) {
-		br := bufio.NewReader(conn)
-		if _, err := br.ReadString('\n'); err != nil { // client banner
-			return nil, err
-		}
-		if _, err := conn.Write([]byte(SSHBanner)); err != nil {
-			return nil, err
-		}
-		if _, err := ReadSSHPacket(br); err != nil { // client KEXINIT
-			return nil, err
-		}
-		if err := WriteSSHPacket(conn, BuildSSHKexInit()); err != nil {
-			return nil, err
-		}
-		payload, err := ReadSSHPacket(br) // ECDH init carrying the token
+	addr, creds := acceptOne(t, func(conn net.Conn) (any, error) {
+		tr, err := SSHServerHandshake(conn, SSHHostKey([]byte(wireDialSecret)))
 		if err != nil {
 			return nil, err
 		}
-		return ParseSSHKexPubKey(payload, sshMsgKexECDHInit)
+		token, err := SSHServerReadAuth(tr)
+		if err != nil {
+			return nil, err
+		}
+		return sshWireCredential{token: token, sessionID: tr.SessionID()}, nil
 	})
 
 	m := managerAt(t, addr)
@@ -146,65 +144,54 @@ func TestSSHCamouflageAuthenticatesWithTheDialSecret(t *testing.T) {
 	m.Register(s)
 	dialAndIgnore(t, m, addr)
 
-	token := awaitCredential(t, tokens).([]byte)
-	if !VerifySSHAuthToken(token, []byte(wireDialSecret)) {
+	got := awaitCredential(t, creds).(sshWireCredential)
+	if !VerifySSHAuthToken(got.token, []byte(wireDialSecret), got.sessionID, SSHAuthClientToServer) {
 		t.Fatal("the SSH token does not verify under the endpoint's secret")
 	}
-	if VerifySSHAuthToken(token, []byte(wireBuiltSecret)) {
+	if VerifySSHAuthToken(got.token, []byte(wireBuiltSecret), got.sessionID, SSHAuthClientToServer) {
 		t.Fatal("the SSH token verifies under the construction secret too; this test cannot tell them apart")
 	}
 }
 
-// imapLogin is what the fake IMAP server pulls out of the LOGIN line.
-type imapLogin struct {
-	user  string
-	token []byte
-}
-
 // TestIMAPCamouflageAuthenticatesWithTheDialSecret covers both credentials the
-// IMAP camouflage derives: the token in the password field and the username,
-// which is the first four bytes of the secret in hex.
+// IMAP camouflage derives inside its TLS session: the SASL digest and the login
+// address. Both must come from the endpoint's secret, not the one the strategy
+// was constructed with.
 func TestIMAPCamouflageAuthenticatesWithTheDialSecret(t *testing.T) {
-	addr, logins := acceptOne(t, func(conn net.Conn) (any, error) {
-		br := bufio.NewReader(conn)
-		for {
-			line, err := br.ReadString('\n')
-			if err != nil {
-				return nil, err
-			}
-			switch {
-			case strings.HasPrefix(line, "A001 CAPABILITY"):
-				if _, err := conn.Write([]byte("* CAPABILITY IMAP4rev1\r\nA001 OK done\r\n")); err != nil {
-					return nil, err
-				}
-			case strings.HasPrefix(line, "A002 LOGIN "):
-				fields := strings.Fields(strings.TrimSpace(line))
-				if len(fields) != 4 {
-					return nil, io.ErrUnexpectedEOF
-				}
-				tok, err := base64.StdEncoding.DecodeString(fields[3])
-				if err != nil {
-					return nil, err
-				}
-				return imapLogin{user: fields[2], token: tok}, nil
-			}
+	addr, observations := acceptOne(t, func(conn net.Conn) (any, error) {
+		// secret=nil: this server records the credential instead of checking
+		// it, so the assertions below decide which secret produced it.
+		_, _, obs, err := fakeIMAPServerHandshake(t, conn, nil)
+		if err != nil {
+			return nil, err
 		}
+		return obs, nil
 	})
 
 	m := managerAt(t, addr)
 	s := NewIMAPCamouflageStrategy(m, []byte(wireBuiltSecret))
 	m.Register(s)
-	dialAndIgnore(t, m, addr)
+	// Unlike the other recorders here, this server answers the whole exchange
+	// (the credential only exists inside the TLS session), so the dial
+	// succeeds and the connection has to be closed rather than ignored.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if conn, _, err := m.Connect(ctx, addr); err == nil {
+		conn.Close()
+	}
 
-	got := awaitCredential(t, logins).(imapLogin)
-	if !VerifyIMAPAuthToken(got.token, []byte(wireDialSecret)) {
-		t.Fatal("the IMAP token does not verify under the endpoint's secret")
+	got := awaitCredential(t, observations).(imapServerObservation)
+	if !VerifyIMAPAuthResponse(got.digest, []byte(wireDialSecret), got.challenge, got.binding) {
+		t.Fatal("the IMAP digest does not verify under the endpoint's secret")
 	}
-	if VerifyIMAPAuthToken(got.token, []byte(wireBuiltSecret)) {
-		t.Fatal("the IMAP token verifies under the construction secret too")
+	if VerifyIMAPAuthResponse(got.digest, []byte(wireBuiltSecret), got.challenge, got.binding) {
+		t.Fatal("the IMAP digest verifies under the construction secret too")
 	}
-	if want := imapUsername([]byte(wireDialSecret)); got.user != want {
-		t.Fatalf("LOGIN user = %q, want %q (derived from the endpoint's secret)", got.user, want)
+	if want := imapUsername([]byte(wireDialSecret), got.challenge); got.user != want {
+		t.Fatalf("login address = %q, want %q (derived from the endpoint's secret)", got.user, want)
+	}
+	if got.user == imapUsername([]byte(wireBuiltSecret), got.challenge) {
+		t.Fatal("the login address matches the construction secret too; this test cannot tell them apart")
 	}
 }
 
@@ -226,7 +213,11 @@ func TestWebSocketPaddedAuthenticatesWithTheDialSecret(t *testing.T) {
 				return nil, err
 			}
 			if v, ok := strings.CutPrefix(line, "X-Auth-Token: "); ok {
-				return hex.DecodeString(strings.TrimSpace(v))
+				tok, err := hex.DecodeString(strings.TrimSpace(v))
+				if err != nil {
+					return nil, err
+				}
+				return wireAuthCred{token: tok, ekm: connExporterKey(conn)}, nil
 			}
 			if strings.TrimSpace(line) == "" {
 				return nil, io.ErrUnexpectedEOF
@@ -239,7 +230,7 @@ func TestWebSocketPaddedAuthenticatesWithTheDialSecret(t *testing.T) {
 	m.Register(s)
 	dialAndIgnore(t, m, addr)
 
-	assertAuthTokenSecret(t, awaitCredential(t, tokens).([]byte), "WebSocket upgrade")
+	assertAuthTokenSecret(t, awaitCredential(t, tokens).(wireAuthCred), "WebSocket upgrade")
 }
 
 // TestTrafficMorphAuthenticatesWithTheDialSecret reads the 32-byte token out of
@@ -265,7 +256,7 @@ func TestTrafficMorphAuthenticatesWithTheDialSecret(t *testing.T) {
 		if _, err := io.ReadFull(conn, rest); err != nil {
 			return nil, err
 		}
-		return rest[int(head[4]) : int(head[4])+32], nil
+		return wireAuthCred{token: rest[int(head[4]) : int(head[4])+32], ekm: connExporterKey(conn)}, nil
 	})
 
 	m := managerAt(t, addr)
@@ -273,42 +264,62 @@ func TestTrafficMorphAuthenticatesWithTheDialSecret(t *testing.T) {
 	m.Register(s)
 	dialAndIgnore(t, m, addr)
 
-	assertAuthTokenSecret(t, awaitCredential(t, tokens).([]byte), "MRPH handshake")
+	assertAuthTokenSecret(t, awaitCredential(t, tokens).(wireAuthCred), "MRPH handshake")
 }
 
-// assertAuthTokenSecret checks a generateAuthToken value against both secrets.
+// wireAuthCred is the credential a strategy put on the wire: the auth token plus
+// the server-side TLS exporter it must be bound to (S22). The token alone means
+// nothing without the session it was minted on.
+type wireAuthCred struct {
+	token []byte
+	ekm   []byte
+}
+
+// assertAuthTokenSecret checks a generateAuthTokenBound value against both
+// secrets, on the session exporter the server observed.
 //
 // The token is bucketed to the minute, so a run that straddles a boundary would
 // otherwise flake; neighbouring buckets are accepted, which is what the server
 // does too.
-func assertAuthTokenSecret(t *testing.T, token []byte, what string) {
+func assertAuthTokenSecret(t *testing.T, cred wireAuthCred, what string) {
 	t.Helper()
-	if !authTokenMatches(token, []byte(wireDialSecret)) {
+	if cred.ekm == nil {
+		t.Fatalf("the %s server could not read the TLS exporter; test cannot check the binding", what)
+	}
+	if !authTokenMatches(cred.token, []byte(wireDialSecret), cred.ekm) {
 		t.Fatalf("the %s token does not verify under the endpoint's secret", what)
 	}
-	if authTokenMatches(token, []byte(wireBuiltSecret)) {
+	if authTokenMatches(cred.token, []byte(wireBuiltSecret), cred.ekm) {
 		t.Fatalf("the %s token verifies under the construction secret too", what)
+	}
+	// Positive control for the binding itself: the same token minted on this
+	// session must NOT verify on a different exporter.
+	otherEKM := append([]byte("other-"), cred.ekm...)
+	if authTokenMatches(cred.token, []byte(wireDialSecret), otherEKM) {
+		t.Fatalf("the %s token verifies on a different session exporter; not session-bound", what)
 	}
 }
 
-func authTokenMatches(token, secret []byte) bool {
+func authTokenMatches(token, secret, ekm []byte) bool {
 	for _, skew := range []time.Duration{0, -time.Minute, time.Minute} {
-		if bytes.Equal(token, authTokenAt(secret, time.Now().Add(skew))) {
+		if bytes.Equal(token, authTokenAt(secret, ekm, time.Now().Add(skew))) {
 			return true
 		}
 	}
 	return false
 }
 
-// authTokenAt mirrors generateAuthToken at a chosen time. Spelled out rather
-// than calling generateAuthToken, which can only answer for the current minute
-// and would otherwise make this test compare a function against itself.
-func authTokenAt(secret []byte, at time.Time) []byte {
+// authTokenAt mirrors generateAuthTokenBound at a chosen time. Spelled out
+// rather than calling generateAuthTokenBound, which can only answer for the
+// current minute and would otherwise make this test compare a function against
+// itself.
+func authTokenAt(secret, ekm []byte, at time.Time) []byte {
 	bucket := make([]byte, 8)
 	binary.BigEndian.PutUint64(bucket, uint64(at.Unix()/60))
 	h := hmac.New(sha256.New, secret)
 	h.Write(bucket)
 	h.Write([]byte("http2-stego-auth"))
+	h.Write(ekm)
 	return h.Sum(nil)[:32]
 }
 
@@ -416,7 +427,11 @@ func TestGenevaAuthenticatesWithTheDialSecret(t *testing.T) {
 				return nil, err
 			}
 			if v, ok := strings.CutPrefix(line, "X-Auth-Token: "); ok {
-				return hex.DecodeString(strings.TrimSpace(v))
+				tok, err := hex.DecodeString(strings.TrimSpace(v))
+				if err != nil {
+					return nil, err
+				}
+				return wireAuthCred{token: tok, ekm: connExporterKey(conn)}, nil
 			}
 		}
 	})
@@ -426,5 +441,5 @@ func TestGenevaAuthenticatesWithTheDialSecret(t *testing.T) {
 	m.Register(g)
 	dialAndIgnore(t, m, addr)
 
-	assertAuthTokenSecret(t, awaitCredential(t, tokens).([]byte), "Geneva upgrade")
+	assertAuthTokenSecret(t, awaitCredential(t, tokens).(wireAuthCred), "Geneva upgrade")
 }

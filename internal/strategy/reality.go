@@ -40,19 +40,24 @@ type REALITYStrategy struct {
 	recentDests map[string]time.Time
 	destMu      sync.RWMutex
 
-	// donors caches the donor pool derived for a secret other than r.secret,
-	// keyed by that secret. The pool is a function of the key (see derivePool),
-	// so a client walking endpoints with different keys must not carry one
-	// endpoint's donor set onto another - that set is exactly the thing
-	// derivePool exists to keep per-user. Deriving costs an HKDF plus a sort, so
-	// it is done once per secret rather than once per dial.
-	donors   map[string]*donorSet
-	donorsMu sync.Mutex
+	// shared holds the handshake gate and the per-secret donor pool/rotator
+	// cache, shared across every REALITY strategy built over the same Manager
+	// (the baseline strategy and the one seqovl rides on). Without sharing, each
+	// instance would enforce the per-SNI handshake ceiling independently and the
+	// real limit to one donor SNI would double. The pool is a function of the
+	// key (see derivePool), so a client walking endpoints with different keys
+	// still gets a distinct set per key - the cache keys on the secret.
+	shared *realityShared
 
 	// requireDataV2 refuses to fall back to the v1 data layer when the server
-	// does not confirm v2. Off by default because during the rollout (exits →
-	// relays → clients) a new client still meets old servers; turn it on once
-	// every server in the deployment is upgraded.
+	// does not confirm v2. The shipped binary sets it true by default (see the
+	// -reality-require-data-v2 flag): a silent v1 fallback is a downgrade to the
+	// malleable, unauthenticated ChaCha20 stream, and the v2 confirmation rides
+	// in the ServerHello padding *before* encryption, so an active middlebox can
+	// strip it and force the downgrade with no error shown to the user. v1 is
+	// only reachable by explicitly passing -reality-require-data-v2=false to talk
+	// to a pre-1.11 server. The struct zero value stays false so direct callers
+	// (tests) opt in explicitly.
 	requireDataV2 bool
 
 	// fingerprint names the uTLS browser profile used to build the ClientHello.
@@ -115,20 +120,12 @@ func NewREALITYStrategy(manager *Manager, secret []byte) *REALITYStrategy {
 	// real server address — so TLS ClientHello with github.com SNI reaches the
 	// VPN server without being RST'd. Microsoft/Azure domains are blocked
 	// because TSPU whitelists their IP ranges and rejects mismatches.
-	developerPool := make([]string, 0, 8)
-	for _, entry := range evasion.WhitelistedSNIs {
-		if entry.Category == "developer" {
-			developerPool = append(developerPool, entry.SNI)
-		}
-	}
-	subPool := derivePool(developerPool, secret, len(developerPool))
-	if len(subPool) == 0 {
-		// Fallback to the legacy Tier 1 list if derivation yields nothing.
-		subPool = getRussianSNIsStatic()
-	}
-
-	// Use cooldown strategy for destination selection over the derived subpool
-	sniRotator := evasion.NewSNIRotatorWithPool(subPool, evasion.StrategyCooldown)
+	// The handshake gate and the derived donor pool/rotator are shared across
+	// every REALITY instance of this Manager, so the baseline strategy and the
+	// seqovl one enforce the same per-SNI ceiling and walk the same rotator
+	// instead of each running its own.
+	shared := sharedRealityState(manager)
+	base := shared.donorSetFor(secret)
 
 	// No key pair here on purpose: the X25519 key is generated per connection in
 	// connect(). A process-wide key made the data-layer key a constant, so every
@@ -136,12 +133,12 @@ func NewREALITYStrategy(manager *Manager, secret []byte) *REALITYStrategy {
 	return &REALITYStrategy{
 		manager:     manager,
 		secret:      secret,
-		sniRotator:  sniRotator,
-		destPool:    subPool,
+		sniRotator:  base.rotator,
+		destPool:    base.pool,
 		recentDests: make(map[string]time.Time),
-		donors:      make(map[string]*donorSet),
+		shared:      shared,
 		fingerprint: customtls.DefaultFingerprintName,
-		gate:        newHandshakeGate(),
+		gate:        shared.gate,
 	}
 }
 
@@ -163,27 +160,9 @@ func (r *REALITYStrategy) donorsFor(secret []byte) ([]string, *evasion.SNIRotato
 		return r.destPool, r.sniRotator
 	}
 
-	r.donorsMu.Lock()
-	defer r.donorsMu.Unlock()
-	if d, ok := r.donors[string(secret)]; ok {
-		return d.pool, d.rotator
-	}
-
-	developerPool := make([]string, 0, 8)
-	for _, entry := range evasion.WhitelistedSNIs {
-		if entry.Category == "developer" {
-			developerPool = append(developerPool, entry.SNI)
-		}
-	}
-	pool := derivePool(developerPool, secret, len(developerPool))
-	if len(pool) == 0 {
-		pool = getRussianSNIsStatic()
-	}
-	d := &donorSet{pool: pool, rotator: evasion.NewSNIRotatorWithPool(pool, evasion.StrategyCooldown)}
-	if r.donors == nil {
-		r.donors = make(map[string]*donorSet)
-	}
-	r.donors[string(secret)] = d
+	// Other secrets get their own set, derived on first use and cached in the
+	// shared state so both REALITY instances of this Manager reuse it.
+	d := r.shared.donorSetFor(secret)
 	return d.pool, d.rotator
 }
 
@@ -515,9 +494,19 @@ func (r *REALITYStrategy) connect(ctx context.Context, target string, wrapFirstF
 	// Strategy: split the first fragment so it ends in the MIDDLE of the SNI
 	// hostname. No single segment contains the complete SNI string, so DPI
 	// doing per-segment SNI matching (Russia's TSPU style) cannot identify it.
-	const chelloFragmentSize = 200
+	//
+	// The remaining fragments used to be fixed 200-byte chunks. A regular
+	// 200-byte pitch is a fingerprint no browser produces (see the grid detector
+	// in internal/wiretest); the sizes now come from a CSPRNG per connection.
+	//
+	// Distribution note (verification.md rules 3, 4): there is no measured donor
+	// distribution to match here, because no browser fragments its ClientHello at
+	// the record level at all — Chrome sends a single record. So this cannot
+	// imitate a real client's fragmentation; it only removes the fixed grid.
+	// Sizes are drawn flat over [chelloFragMin, chelloFragMin+chelloFragSpan).
+	// Recorded as "сверять не с чем".
 	sniHost, _, _ := net.SplitHostPort(dest)
-	firstFragEnd := sniFragmentSplitPoint(clientHello, sniHost, chelloFragmentSize)
+	firstFragEnd := sniFragmentSplitPoint(clientHello, sniHost, realityFragmentSize())
 
 	// Route the ClientHello first flight through the optional wrapper (seqovl
 	// prepends its decoy record here). Plain REALITY writes straight to tcpConn.
@@ -536,14 +525,14 @@ func (r *REALITYStrategy) connect(ctx context.Context, target string, wrapFirstF
 		return werr
 	}
 
-	// First fragment: ends mid-SNI (or before extensions if SNI not found)
+	// First fragment: ends mid-SNI (or a random size in if SNI not found)
 	if err := sendFrag(clientHello[:firstFragEnd]); err != nil {
 		tcpConn.Close()
 		return nil, fmt.Errorf("reality: clienthello send failed: %w", err)
 	}
-	// Remaining fragments: 200-byte chunks
-	for start := firstFragEnd; start < len(clientHello); start += chelloFragmentSize {
-		end := start + chelloFragmentSize
+	// Remaining fragments: random-sized chunks, no fixed grid.
+	for start := firstFragEnd; start < len(clientHello); {
+		end := start + realityFragmentSize()
 		if end > len(clientHello) {
 			end = len(clientHello)
 		}
@@ -551,6 +540,7 @@ func (r *REALITYStrategy) connect(ctx context.Context, target string, wrapFirstF
 			tcpConn.Close()
 			return nil, fmt.Errorf("reality: clienthello send failed: %w", err)
 		}
+		start = end
 	}
 
 	log.Debug("REALITY: ClientHello written=%d bytes (requested=%d, fragments=%d, firstFrag=%d)", totalWritten, len(clientHello), fragments, firstFragEnd)
@@ -581,12 +571,6 @@ func (r *REALITYStrategy) connect(ctx context.Context, target string, wrapFirstF
 		return nil, fmt.Errorf("reality: validation failed: %w", err)
 	}
 
-	// Negotiate smux mode with the server.
-	if err := protocol.WriteDispatch(tcpConn, protocol.TypeMux); err != nil {
-		tcpConn.Close()
-		return nil, fmt.Errorf("reality: mux negotiate: %w", err)
-	}
-
 	// Wrap TCP in an encrypted TLS-record framing layer so TSPU sees a normal
 	// TLS Application Data stream instead of raw smux bytes. Without this, TSPU
 	// throttles the connection after ~600 bytes.
@@ -594,6 +578,17 @@ func (r *REALITYStrategy) connect(ctx context.Context, target string, wrapFirstF
 	if err != nil {
 		tcpConn.Close()
 		return nil, fmt.Errorf("reality: data conn init: %w", err)
+	}
+
+	// Negotiate smux mode with the server. The discriminator is the first
+	// *encrypted* record inside the data layer, not a cleartext byte after
+	// ServerHello: written in the clear it put a lone 0x08 on the wire, an
+	// invalid TLS record type between ServerHello and the first Application Data
+	// record, which is a one-line DPI signature. Inside wrapDataLayer it is just
+	// another 0x17 Application Data record.
+	if err := protocol.WriteDispatch(dataConn, protocol.TypeMux); err != nil {
+		tcpConn.Close()
+		return nil, fmt.Errorf("reality: mux negotiate: %w", err)
 	}
 
 	smuxCfg := smux.DefaultConfig()
@@ -825,7 +820,10 @@ func (r *REALITYStrategy) buildClientHello(dest string, clientPrivKey, clientSal
 		Fingerprint:        r.fingerprint,
 		ALPN:               []string{"h2", "http/1.1"},
 		InsecureSkipVerify: true,
-		PaddingLen:         customtls.MinPaddingSize, // 256 bytes for REALITY + random
+		// Per-connection padding-extension body length, floored well above the
+		// server's 64-byte routing gate. Replaces the constant 256, which was a
+		// single-valued signature. See realityPaddingLen for the distribution note.
+		PaddingLen: realityPaddingLen(clientSalt),
 	}
 
 	clientHello, err := customtls.BuildClientHelloBytes(config, fp)
@@ -950,10 +948,11 @@ func (r *REALITYStrategy) validateServerHello(serverHello []byte, clientPubKey [
 // covers both public keys and both salts, so only a peer holding the shared
 // secret can produce it, and an active middlebox cannot substitute its own key
 // share while replaying the server's auth token. If the confirmation is absent
-// the server is still on v1 and we fall back — unless requireDataV2 is set.
-//
-// Even the fallback is safe from the v1 keystream reuse this change is about:
-// the key there is derived from clientPubKey, which is now fresh per connection.
+// or fails, requireDataV2 (true in the shipped binary) makes this an error
+// rather than a silent v1 fallback: the confirmation travels in the cleartext
+// ServerHello padding, so an on-path attacker who flips a few bytes there would
+// otherwise force a downgrade to the malleable v1 stream with no visible error.
+// v1 is reached only when the operator explicitly turns requireDataV2 off.
 func (r *REALITYStrategy) wrapDataLayer(tcpConn net.Conn, serverExt *customtls.REALITYExtension, clientPrivKey, clientPubKey, clientSalt [32]byte, secret []byte) (net.Conn, error) {
 	serverSalt, ok := customtls.ParseServerDataV2(secret, clientPubKey, serverExt.PubKey, clientSalt, serverExt.Extra)
 	if !ok {
@@ -998,6 +997,43 @@ func randomInt(max int) int {
 	var b [8]byte
 	cryptorand.Read(b[:]) //nolint:errcheck // crypto/rand.Read never fails on Linux
 	return int(uint32(b[0])|uint32(b[1])<<8|uint32(b[2])<<16|uint32(b[3])<<24) % max
+}
+
+const (
+	// ClientHello fragment sizes are drawn flat over [chelloFragMin,
+	// chelloFragMin+chelloFragSpan) per connection, replacing the fixed 200-byte
+	// grid. No browser fragments at the record level, so there is no donor
+	// distribution to match (verification.md rules 3, 4): this only removes the
+	// grid, it does not imitate anything.
+	chelloFragMin  = 48
+	chelloFragSpan = 208 // [48, 256)
+
+	// realityPaddingBase is the floor for the padding-extension body. It carries
+	// the 64-byte REALITY core plus the 64-byte data-v2 block, and sits well above
+	// the server's 64-byte routing gate (DetectREALITYExtension / findREALITY-
+	// Extension), so the >= 64 invariant holds by a wide margin at every length.
+	realityPaddingBase = customtls.REALITYExtensionLength + customtls.DataV2ExtraLength // 128
+	realityPaddingSpan = 256                                                            // body length flat over [128, 384)
+)
+
+// realityFragmentSize returns one CSPRNG-drawn ClientHello fragment size.
+func realityFragmentSize() int {
+	return chelloFragMin + randomInt(chelloFragSpan)
+}
+
+// realityPaddingLen picks this connection's padding-extension body length from
+// the per-connection salt. The v1 code forced a constant 256 on every hello,
+// which is itself a signature ("always exactly 256"); this varies the length so
+// it is no longer single-valued while staying above the routing gate.
+//
+// Distribution note (verification.md rules 3, 4, 8): Chrome's own padding pads
+// the ClientHello to a 512-byte boundary and so emits nothing at all for a
+// modern post-quantum hello — a profile we cannot use, because REALITY has to
+// hide >= 64 bytes here. There is thus no browser padding-length distribution to
+// match; the length is drawn flat over [realityPaddingBase, +realityPaddingSpan)
+// and recorded as "сверять не с чем".
+func realityPaddingLen(salt [32]byte) int {
+	return realityPaddingBase + int(salt[0])%realityPaddingSpan
 }
 
 func randRead(b []byte) {

@@ -8,6 +8,7 @@ import (
 	"io"
 	"math/rand"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -687,7 +688,7 @@ func (v *VPNClient) seamlessPortHop(newPort int) {
 	if err != nil {
 		host = v.serverAddr
 	}
-	newTarget := fmt.Sprintf("%s:%d", host, newPort)
+	newTarget := net.JoinHostPort(host, strconv.Itoa(newPort))
 
 	// Try to establish new connection (make)
 	var newConn net.Conn
@@ -786,11 +787,6 @@ func (v *VPNClient) performHandshake(conn net.Conn) error {
 		}
 	}
 
-	// Enable raw mode for ConfusedConn if applicable
-	if confusedConn, ok := conn.(*strategy.ConfusedConn); ok {
-		confusedConn.SetRawMode(true)
-	}
-
 	log.Debug("VPN: port hop handshake successful")
 	return nil
 }
@@ -846,13 +842,11 @@ func (v *VPNClient) connect(parent context.Context) error {
 	assignedIP := net.IP(resp[5:9])
 	log.Info("VPN connected via %s (server IP: %s, assigned IP: %s)", strat.Name(), serverIP, assignedIP)
 
-	// Enable raw mode for ConfusedConn - VPN mode handles framing itself.
-	// Without this, ConfusedConn.Read() strips length prefix, then vpn.go tries to read it again.
-	if confusedConn, ok := conn.(*strategy.ConfusedConn); ok {
-		confusedConn.SetRawMode(true)
-		log.Debug("Enabled raw mode for ConfusedConn (VPN mode)")
-	}
-
+	// No raw-mode switch for the confusion transport any more. It existed
+	// because ConfusedConn's Read stripped a length prefix that the VPN layer
+	// then needed back, so the tunnel had to ask for a passthrough mode in
+	// which user packets reached the socket unencrypted. The sealed record
+	// layer replaced both halves: one framing, and no plaintext path to turn on.
 	caps, hasCaps := parseServerCapabilities(resp, n)
 
 	// Publish the new connection under the lock. If Stop() ran while we were
@@ -1606,11 +1600,16 @@ func (v *VPNClient) handleDisconnect() {
 					v.manager.ResetForNetworkChange()
 				}
 				log.Warn("No network connectivity, waiting for network to restore...")
-				v.waitForNetworkRestore()
-				// After network restore, reset backoff
+				if !v.waitForNetworkRestore() {
+					return
+				}
+				// After the wait, reset backoff and fall through to a real
+				// connect attempt. Falling through instead of continue is the
+				// point: the probe that said "no network" can itself be wrong,
+				// so every wait must end in an actual dial rather than in
+				// another probe round that parks again.
 				currentDelay = reconnectInitialDelay
-				consecutiveFailures = 0
-				continue
+				consecutiveFailures = 1
 			}
 		}
 
@@ -1703,22 +1702,74 @@ func (v *VPNClient) checkNetworkConnectivity() bool {
 	return internetReachable()
 }
 
-// internetReachable reports whether anything outside answers, using a public
-// resolver as the reference point. It is deliberately NOT a check of our own
-// server: the caller needs to tell a dead link apart from a blocked endpoint,
-// and only a third party can do that.
-func internetReachable() bool {
-	conn, err := net.DialTimeout("tcp", "8.8.8.8:53", networkCheckTimeout)
-	if err != nil {
-		return false
-	}
-	conn.Close()
-	return true
+// errMeansPathAlive reports whether a dial error still suggests the path is
+// up rather than silently dead. An immediate refusal usually means an RST
+// came back - packets flowed both ways. A local firewall can fake that with a
+// REJECT rule, but the caller only uses "alive" to keep retrying the
+// connection instead of parking, which is the safe direction to err in.
+// Refusals matter because the gate dials the default-route gateway, and
+// consumer routers routinely have port 53 closed.
+func errMeansPathAlive(err error) bool {
+	return errors.Is(err, syscall.ECONNREFUSED)
 }
 
-// waitForNetworkRestore waits until network connectivity is restored
-func (v *VPNClient) waitForNetworkRestore() {
+// dialMeansAlive dials addr and treats both a completed connect and an
+// immediate refusal as "the path answers".
+func dialMeansAlive(addr string) bool {
+	conn, err := net.DialTimeout("tcp", addr, networkCheckTimeout)
+	if err == nil {
+		conn.Close()
+		return true
+	}
+	return errMeansPathAlive(err)
+}
+
+// publicFallbackProbes are the last-resort dial targets when no physical
+// gateway was resolved (non-Linux platforms, exotic setups). These addresses
+// are routinely part of the installed TUN routes, so while the tunnel is down
+// they black-hole - which is why they are probes of last resort, not first.
+var publicFallbackProbes = []string{"8.8.8.8:53", "1.1.1.1:53"}
+
+// internetReachable reports whether anything outside answers. It must never
+// probe through the VPN tunnel itself: while the tunnel is down its routes
+// stay installed, and a probe routed into a dead TUN device reads as "no
+// network" - the exact false negative that used to park the reconnect loop
+// forever while the physical link was fine (8.8.8.8, 8.8.4.8, 9.9.9.9 and
+// 1.1.1.1 are all part of the installed tunnel routes). The default-route
+// gateway is probed first precisely because it cannot take the tunnel; public
+// resolvers remain the fallback for setups where no gateway was resolved.
+// It is deliberately NOT a check of our own server: the caller needs to tell
+// a dead link apart from a blocked endpoint, and only a third party can do
+// that.
+func internetReachable() bool {
+	for _, addr := range physicalGateAddrs() {
+		if dialMeansAlive(addr) {
+			return true
+		}
+	}
+	for _, addr := range publicFallbackProbes {
+		conn, err := net.DialTimeout("tcp", addr, networkCheckTimeout)
+		if err == nil {
+			conn.Close()
+			return true
+		}
+	}
+	return false
+}
+
+// networkParkTimeout caps one wait for "network restore". The wait's own probe
+// can be wrong about the network being down, so parking must stay bounded:
+// past the cap the caller retries the real connection instead of trusting the
+// probe indefinitely.
+const networkParkTimeout = 2 * time.Minute
+
+// waitForNetworkRestore waits until network connectivity is restored, at most
+// networkParkTimeout. Returns false only when the client was stopped; a
+// timeout returns true so the caller goes straight to a real connect attempt -
+// the negative verdict that caused the wait can itself be wrong.
+func (v *VPNClient) waitForNetworkRestore() bool {
 	checkInterval := 5 * time.Second
+	deadline := time.Now().Add(networkParkTimeout)
 	attempt := 0
 
 	for atomic.LoadInt32(&v.running) == 1 {
@@ -1729,15 +1780,21 @@ func (v *VPNClient) waitForNetworkRestore() {
 
 		select {
 		case <-v.stopCh:
-			return
+			return false
 		case <-time.After(checkInterval):
 		}
 
 		if v.checkNetworkConnectivity() {
 			log.Info("Network connectivity restored after %d checks", attempt)
-			return
+			return true
+		}
+
+		if time.Now().After(deadline) {
+			log.Warn("Network still considered down after %v - retrying connection anyway", networkParkTimeout)
+			return true
 		}
 	}
+	return false
 }
 
 // addJitter adds random jitter to a duration (+/- jitterFactor)

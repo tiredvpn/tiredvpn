@@ -86,6 +86,72 @@ func helloWithPadding(t *testing.T, sni string, total int) []byte {
 	return append(rec, hs...)
 }
 
+// helloWithPaddingBody builds a minimal TLS 1.3 ClientHello whose padding
+// extension body is exactly bodyLen bytes, so a test can probe the detector at a
+// precise padding length.
+func helloWithPaddingBody(t *testing.T, sni string, bodyLen int) []byte {
+	t.Helper()
+
+	var exts []byte
+	if sni != "" {
+		name := []byte(sni)
+		sniBody := []byte{0x00}
+		sniBody = binary.BigEndian.AppendUint16(sniBody, uint16(len(name)))
+		sniBody = append(sniBody, name...)
+		list := binary.BigEndian.AppendUint16(nil, uint16(len(sniBody)))
+		list = append(list, sniBody...)
+		exts = binary.BigEndian.AppendUint16(exts, 0x0000)
+		exts = binary.BigEndian.AppendUint16(exts, uint16(len(list)))
+		exts = append(exts, list...)
+	}
+	sv := []byte{0x02, 0x03, 0x04}
+	exts = binary.BigEndian.AppendUint16(exts, 0x002b)
+	exts = binary.BigEndian.AppendUint16(exts, uint16(len(sv)))
+	exts = append(exts, sv...)
+
+	exts = binary.BigEndian.AppendUint16(exts, 0x0015)
+	exts = binary.BigEndian.AppendUint16(exts, uint16(bodyLen))
+	exts = append(exts, make([]byte, bodyLen)...)
+
+	b := []byte{0x03, 0x03}
+	b = append(b, bytes.Repeat([]byte{0x42}, 32)...)
+	b = append(b, 32)
+	b = append(b, bytes.Repeat([]byte{0x43}, 32)...)
+	b = binary.BigEndian.AppendUint16(b, 2)
+	b = binary.BigEndian.AppendUint16(b, 0x1301)
+	b = append(b, 1, 0)
+	b = binary.BigEndian.AppendUint16(b, uint16(len(exts)))
+	b = append(b, exts...)
+
+	hs := append([]byte{0x01, byte(len(b) >> 16), byte(len(b) >> 8), byte(len(b))}, b...)
+	return append([]byte{0x16, 0x03, 0x01, byte(len(hs) >> 8), byte(len(hs))}, hs...)
+}
+
+// TestDetectREALITYExtensionGateAt64 pins the routing invariant S10's padding
+// profile must never cross: a padding body of 64 bytes routes the connection
+// into REALITY, 63 does not. If the client's padding ever fell below 64,
+// DetectREALITYExtension would return false here and ~99% of prod traffic would
+// be sent to the fake site instead of the tunnel.
+//
+// The 63/false leg is the negative control (verification rule 2): it proves the
+// detector is not simply always-true, so the 64/true leg means something.
+func TestDetectREALITYExtensionGateAt64(t *testing.T) {
+	for _, tc := range []struct {
+		body int
+		want bool
+	}{
+		{63, false},
+		{64, true},
+		{128, true}, // the REALITY v2 payload floor
+		{384, true}, // top of the S10 padding range
+	} {
+		hello := helloWithPaddingBody(t, "www.microsoft.com", tc.body)
+		if got := DetectREALITYExtension(hello); got != tc.want {
+			t.Fatalf("padding body %d: DetectREALITYExtension = %v, want %v", tc.body, got, tc.want)
+		}
+	}
+}
+
 // answersClientHello sends raw ClientHello bytes to a server and reports
 // whether anything came back before the peer closed.
 func answersClientHello(t *testing.T, srvCtx *serverContext, hello []byte) (answered bool, first []byte) {

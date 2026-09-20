@@ -360,7 +360,14 @@ func (s *TrafficMorphStrategy) Connect(ctx context.Context, target string) (net.
 		// over a socket whose TLS receive buffer is empty and whose record
 		// sequence counter matches the next byte on the wire.
 		profileName := []byte(s.profile.Name)
-		authToken := generateAuthToken(secret)
+		// Bind the auth token to this TLS session (S22): captured before the
+		// kTLS handover below so the exporter still reflects live keys.
+		ekm, ekmErr := sessionExporterKey(tlsConn)
+		if ekmErr != nil {
+			tcpConn.Close()
+			return nil, fmt.Errorf("morph: export keying material: %w", ekmErr)
+		}
+		authToken := generateAuthTokenBound(secret, ekm)
 		// Layout: MRPH(4) + nameLen(1) + name(N) + auth(32) + shaperID(1).
 		// The trailing shaperID byte is the wire-protocol v2 addition; servers
 		// that predate it ignore the extra byte, and a server that expects it
@@ -523,8 +530,11 @@ func newMorphedConnWithShaperID(conn net.Conn, profile *TrafficProfile, secret [
 	magic := []byte("MRPH")
 	profileName := []byte(profile.Name)
 
-	// Generate auth token (same as HTTP/2 Stego)
-	authToken := generateAuthToken(secret)
+	// Generate auth token (same as HTTP/2 Stego), bound to the underlying TLS
+	// session when the base transport exposes one (S22). The composed base path
+	// may hand us a non-TLS conn, in which case both ends agree on a nil
+	// exporter — see connExporterKey.
+	authToken := generateAuthTokenBound(secret, connExporterKey(conn))
 
 	handshake := make([]byte, 5+len(profileName)+32+1)
 	copy(handshake[0:4], magic)
@@ -713,6 +723,13 @@ func (mc *MorphedConn) Read(p []byte) (int, error) {
 		return 0, err
 	}
 	dataLen, paddingLen := readFrameHeader(header)
+
+	// Mirror the server cap (server.go: dataLen > 65535) before allocating.
+	// dataLen is 32 bits off the wire; on a 32-bit int it can even come back
+	// negative, so guard both ends before totalPayload feeds acquirePacketBuf.
+	if dataLen < 0 || dataLen > 65535 {
+		return 0, fmt.Errorf("morph frame data length %d out of range", dataLen)
+	}
 
 	// Handle dummy packets (dataLen = 0) - these are keepalive responses
 	if dataLen == 0 {

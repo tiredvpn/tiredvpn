@@ -52,10 +52,11 @@ func TestH2StegoHandshakeEndToEnd(t *testing.T) {
 		hpackDec := hpack.NewDecoder(4096, nil)
 		authenticated := false
 		var authClientID clientIdentity
+		var authSecret []byte
 		var tunnel *h2TunnelState
 		var connTracked bool
 		serverErr <- nil
-		runH2FrameLoop(&serverConn, &framer, hpackDec, srvCtx, logger, &authenticated, &authClientID, &connTracked, &tunnel, nil)
+		runH2FrameLoop(&serverConn, &framer, hpackDec, srvCtx, logger, &authenticated, &authClientID, &authSecret, &connTracked, &tunnel, nil, nil)
 	}()
 
 	clientConn, err := net.Dial("tcp", ln.Addr().String())
@@ -64,7 +65,7 @@ func TestH2StegoHandshakeEndToEnd(t *testing.T) {
 	}
 	defer clientConn.Close()
 
-	stegoConn := strategy.NewHTTP2StegoConn(clientConn, secret, true, strategy.NaivePaddingMinimal)
+	stegoConn := strategy.NewHTTP2StegoConn(clientConn, secret, true, strategy.NaivePaddingMinimal, nil)
 
 	handshakeDone := make(chan error, 1)
 	go func() {

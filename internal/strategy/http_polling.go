@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
@@ -35,6 +36,32 @@ import (
 const (
 	pollingKeepaliveFeed   = 10 * time.Second // inject a keepalive frame this often while idle
 	pollingPollHealthGrace = 20 * time.Second // stop feeding if no poll has succeeded within this
+)
+
+// maxPollBody caps the response Content-Length we will allocate for. A poll
+// response carries at most one relay buffer (tens of KB); 1 MiB leaves headroom
+// while keeping a hostile server from naming a length that OOMs the client (or,
+// if it announces a negative value, panics make()).
+const maxPollBody = 1 << 20
+
+// Idle polling backoff and connection-reuse bounds. The 1.10.x transport polled
+// every 50ms round the clock (the numWorkers==1 turn condition was always true)
+// and opened a fresh TCP+TLS connection with Connection: close on every request
+// - a fixed-rate metronome plus ~20 handshakes/second even on a silent tunnel.
+const (
+	// pollIdleMax is the ceiling the poll interval backs off to while nothing is
+	// moving. When data appears (Write -> sendSignal, or a poll that received
+	// bytes) the interval snaps back to pollInterval.
+	pollIdleMax = 4 * time.Second
+
+	// pollingMaxReuse / pollingReuseMaxAge bound how far a single connection is
+	// reused. Reuse amortises the TLS handshake across a burst of active polls,
+	// but is deliberately bounded so a meek session never becomes one long-lived
+	// flow - the pattern this transport exists to avoid, since TSPU throttles
+	// persistent connections. Past either bound the request asks Connection:
+	// close and the next poll dials afresh.
+	pollingMaxReuse    = 16
+	pollingReuseMaxAge = 20 * time.Second
 )
 
 // HTTPPollingStrategy implements meek-style HTTP polling transport
@@ -189,6 +216,16 @@ type HTTPPollingConn struct {
 	// TLS session resumption
 	tlsSessionCache tls.ClientSessionCache
 
+	// Connection reuse. A poll normally reuses the previous request's TLS
+	// connection (HTTP/1.1 keep-alive) instead of dialling a fresh one, up to
+	// pollingMaxReuse requests / pollingReuseMaxAge. reuseMu serialises the
+	// whole request against the single poll worker and the init() call.
+	reuseMu     sync.Mutex
+	reuseConn   *tls.Conn
+	reuseReader *bufio.Reader
+	reuseCount  int
+	reuseOpened time.Time
+
 	// Stats for adaptive behavior
 	successfulPolls int64
 	failedPolls     int64
@@ -220,11 +257,12 @@ type HTTPPollingConn struct {
 
 // init performs initial handshake to establish session
 func (c *HTTPPollingConn) init(ctx context.Context) error {
-	// Send init request with session ID (no body - SOCKS handler writes target later)
-	authToken := c.generateAuthToken()
+	// Send init request with session ID (no body - SOCKS handler writes target later).
+	// The auth token is derived inside doRequest, once the TLS connection this
+	// request rides is known, so it binds to that session's exporter (S22).
 
 	// Make first request to establish session on server (ackSeq=0 for init)
-	resp, err := c.doRequest(ctx, authToken, nil, 0)
+	resp, err := c.doRequest(ctx, nil, 0)
 	if err != nil {
 		return err
 	}
@@ -237,15 +275,11 @@ func (c *HTTPPollingConn) init(ctx context.Context) error {
 	return nil
 }
 
-// pollWorker is a parallel poll worker with adaptive timing
+// pollWorker drives the poll loop with a data-aware interval: it polls fast
+// while bytes are moving and backs off exponentially toward pollIdleMax while
+// the tunnel is silent, instead of the old fixed 50ms metronome. A Write signals
+// sendSignal, which polls immediately and snaps the interval back to fast.
 func (c *HTTPPollingConn) pollWorker(workerID int) {
-	// Each worker polls at base interval, staggered from others
-	ticker := time.NewTicker(c.pollInterval)
-	defer ticker.Stop()
-
-	consecutiveFailures := 0
-	maxBackoff := 2 * time.Second
-
 	// Wait for first data to be written before polling
 	// (SOCKS handler needs to write destination address first)
 	select {
@@ -255,43 +289,91 @@ func (c *HTTPPollingConn) pollWorker(workerID int) {
 		// Data available, start polling
 	}
 
+	consecutiveFailures := 0
+	maxBackoff := 2 * time.Second
+	idleRounds := 0
+
+	timer := time.NewTimer(jitterDuration(c.pollInterval))
+	defer timer.Stop()
+
 	for {
 		select {
 		case <-c.closed:
 			return
-		case <-ticker.C:
-			// Only poll if there's data to send OR it's our turn
-			c.sendLock.Lock()
-			hasData := c.sendBuf.Len() > 0
-			c.sendLock.Unlock()
-
-			// Poll if we have data or if it's our turn (based on workerID to distribute load)
-			shouldPoll := hasData || (time.Now().UnixMilli()/100)%int64(c.numWorkers) == int64(workerID)
-
-			if shouldPoll {
-				success := c.poll()
-				if success {
-					consecutiveFailures = 0
-					ticker.Reset(c.pollInterval)
-				} else {
-					consecutiveFailures++
-					// Exponential backoff on failure
-					backoff := time.Duration(consecutiveFailures*consecutiveFailures) * 100 * time.Millisecond
-					if backoff > maxBackoff {
-						backoff = maxBackoff
-					}
-					ticker.Reset(c.pollInterval + backoff)
+		case <-c.sendSignal:
+			// New outbound data: poll now and return to the fast interval.
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
 				}
 			}
-		case <-c.sendSignal:
-			// Immediate poll when data available
 			c.poll()
+			idleRounds = 0
+			timer.Reset(jitterDuration(c.pollInterval))
+		case <-timer.C:
+			ok, moved := c.poll()
+			switch {
+			case !ok:
+				consecutiveFailures++
+				backoff := time.Duration(consecutiveFailures*consecutiveFailures) * 100 * time.Millisecond
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+				timer.Reset(jitterDuration(c.pollInterval + backoff))
+			case moved:
+				// Data flowed: stay fast.
+				consecutiveFailures = 0
+				idleRounds = 0
+				timer.Reset(jitterDuration(c.pollInterval))
+			default:
+				// Successful but empty poll: the tunnel is idle, back off.
+				consecutiveFailures = 0
+				idleRounds++
+				timer.Reset(jitterDuration(c.idleInterval(idleRounds)))
+			}
 		}
 	}
 }
 
-// poll does one poll cycle, returns true on success
-func (c *HTTPPollingConn) poll() bool {
+// idleInterval grows the poll interval geometrically from pollInterval toward
+// pollIdleMax as consecutive polls come back empty.
+func (c *HTTPPollingConn) idleInterval(rounds int) time.Duration {
+	d := c.pollInterval
+	for i := 0; i < rounds && d < pollIdleMax; i++ {
+		d *= 2
+	}
+	if d > pollIdleMax {
+		d = pollIdleMax
+	}
+	return d
+}
+
+// jitterDuration applies ±25% multiplicative jitter from crypto/rand.
+//
+// Purpose (verification rules 3 and 8): break the exact metronome and keep
+// independent clients from polling in phase. It is NOT an attempt to mimic a
+// measured inter-request distribution - there is no such measured population to
+// match, so "what distribution is this checked against" is "nothing", recorded
+// here on purpose. Rule 8 warns that smearing silence with uniform jitter is
+// itself a shape; the real anti-metronome move here is idleInterval, which
+// stretches the gap, and the jitter is only a small decorrelation on top.
+func jitterDuration(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return d
+	}
+	frac := float64(binary.BigEndian.Uint32(b[:])) / float64(1<<32) // [0,1)
+	return time.Duration(float64(d) * (0.75 + 0.5*frac))
+}
+
+// poll does one poll cycle. ok reports the request succeeded; moved reports the
+// cycle actually carried tunnel bytes (sent or received), which the caller uses
+// to tell an active tunnel from an idle keepalive round.
+func (c *HTTPPollingConn) poll() (ok bool, moved bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
@@ -322,9 +404,9 @@ func (c *HTTPPollingConn) poll() bool {
 	ackSeq := c.ackSeq
 	c.ackLock.Unlock()
 
-	// Do request with ack sequence
-	authToken := c.generateAuthToken()
-	resp, err := c.doRequest(ctx, authToken, sendData, ackSeq)
+	// Do request with ack sequence. The auth token is derived inside doRequest,
+	// bound to the exporter of the TLS session the request actually rides (S22).
+	resp, err := c.doRequest(ctx, sendData, ackSeq)
 	if err != nil {
 		log.Debug("HTTP Polling: poll error: %v", err)
 		c.statsMu.Lock()
@@ -339,7 +421,7 @@ func (c *HTTPPollingConn) poll() bool {
 			c.sendBuf.Write(newBuf.Bytes())
 			c.sendLock.Unlock()
 		}
-		return false
+		return false, false
 	}
 
 	// Buffer received data and update ack sequence
@@ -369,7 +451,7 @@ func (c *HTTPPollingConn) poll() bool {
 	// proof the meek transport is alive even when no tunnel payload is flowing.
 	c.lastPollOK.Store(time.Now().UnixNano())
 
-	return true
+	return true, len(sendData) > 0 || len(resp) > 0
 }
 
 // runKeepaliveFeeder keeps the TUN relay's read deadline fed while the poll
@@ -401,21 +483,65 @@ func (c *HTTPPollingConn) runKeepaliveFeeder() {
 	}
 }
 
-// doRequest performs a single HTTP request (new connection per request)
-func (c *HTTPPollingConn) doRequest(ctx context.Context, authToken string, data []byte, ackSeq int64) ([]byte, error) {
-	// Get server address (IPv6/IPv4 with automatic fallback)
-	serverAddr := c.manager.GetServerAddr(ctx)
+// doRequest performs one HTTP poll request, reusing the previous request's TLS
+// connection (HTTP/1.1 keep-alive) when one is live and within the reuse bounds,
+// otherwise dialling fresh. reuseMu serialises the whole exchange.
+func (c *HTTPPollingConn) doRequest(ctx context.Context, data []byte, ackSeq int64) ([]byte, error) {
+	c.reuseMu.Lock()
+	defer c.reuseMu.Unlock()
 
-	// Establish TLS connection (new connection each time - TSPU throttles persistent connections)
-	// Use protected dialer to avoid VPN routing loop on Android
+	tlsConn, reader, err := c.acquireConn(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Bind the auth token to the exporter of the TLS session this request rides
+	// (S22). Derived here, after acquireConn, so a reused keep-alive session and
+	// a freshly dialled one each get a token that matches their own exporter.
+	authToken, err := c.generateAuthTokenForConn(tlsConn)
+	if err != nil {
+		c.dropReuseLocked()
+		return nil, fmt.Errorf("http_polling: export keying material: %w", err)
+	}
+
+	c.reuseCount++
+	keepAlive := c.reuseCount < pollingMaxReuse && time.Since(c.reuseOpened) < pollingReuseMaxAge
+	connHeader := "keep-alive"
+	if !keepAlive {
+		connHeader = "close"
+	}
+
+	resp, err := c.exchange(tlsConn, reader, authToken, data, ackSeq, connHeader)
+	if err != nil {
+		// Drop the connection; poll() re-queues any send data and the next poll
+		// dials fresh. We do NOT retry here - a retry on a half-sent request
+		// would double-write client bytes into the server's fromClient stream.
+		c.dropReuseLocked()
+		return nil, err
+	}
+	if !keepAlive {
+		c.dropReuseLocked()
+	}
+	return resp, nil
+}
+
+// acquireConn returns the reusable connection, dialling and handshaking a new
+// one (and sending the once-per-connection protocol dispatch) if none is live.
+// Caller holds reuseMu.
+func (c *HTTPPollingConn) acquireConn(ctx context.Context) (*tls.Conn, *bufio.Reader, error) {
+	if c.reuseConn != nil {
+		return c.reuseConn, c.reuseReader, nil
+	}
+
+	serverAddr := c.manager.GetServerAddr(ctx)
+	// Protected dialer avoids the VPN routing loop on Android.
 	protectedDialer := &protect.ProtectDialer{
 		Dialer: &net.Dialer{Timeout: 3 * time.Second},
 	}
 	tcpConn, err := protectedDialer.DialContext(ctx, "tcp", serverAddr)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	defer tcpConn.Close()
 
 	tlsConfig := &tls.Config{
 		ServerName:         c.host,
@@ -424,19 +550,31 @@ func (c *HTTPPollingConn) doRequest(ctx context.Context, authToken string, data 
 		NextProtos:         []string{"http/1.1"},
 		ClientSessionCache: c.tlsSessionCache, // TLS session resumption
 	}
-
 	tlsConn := tls.Client(tcpConn, tlsConfig)
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		return nil, err
+		tcpConn.Close()
+		return nil, nil, err
 	}
-	defer tlsConn.Close()
 
-	// Send protocol discriminator (encrypted, not visible to DPI)
+	// Protocol discriminator, once per connection (encrypted, not visible to DPI).
+	// It precedes the first HTTP request; keep-alive then carries further
+	// requests over the same already-dispatched connection.
 	if err := protocol.WriteDispatch(tlsConn, protocol.TypePolling); err != nil {
-		return nil, fmt.Errorf("http_polling: dispatch failed: %w", err)
+		tlsConn.Close()
+		return nil, nil, fmt.Errorf("http_polling: dispatch failed: %w", err)
 	}
 
-	// Build HTTP request
+	c.reuseConn = tlsConn
+	c.reuseReader = bufio.NewReader(tlsConn)
+	c.reuseOpened = time.Now()
+	c.reuseCount = 0
+	return tlsConn, c.reuseReader, nil
+}
+
+// exchange writes one request and reads its response on an already-established
+// connection. reader must be the persistent reader for that connection so the
+// stream stays aligned for the next keep-alive request. Caller holds reuseMu.
+func (c *HTTPPollingConn) exchange(tlsConn *tls.Conn, reader *bufio.Reader, authToken string, data []byte, ackSeq int64, connHeader string) ([]byte, error) {
 	var body []byte
 	if len(data) > 0 {
 		body = data
@@ -450,14 +588,14 @@ func (c *HTTPPollingConn) doRequest(ctx context.Context, authToken string, data 
 			"X-Session-ID: %s\r\n"+
 			"X-Auth-Token: %s\r\n"+
 			"X-Ack: %d\r\n"+
-			"Connection: close\r\n"+
+			"Connection: %s\r\n"+
 			"\r\n",
-		c.path, c.host, len(body), c.sessionID, authToken, ackSeq)
+		c.path, c.host, len(body), c.sessionID, authToken, ackSeq, connHeader)
 
-	// Set deadline
+	// Refresh the deadline every request - a reused connection may have sat idle
+	// past the previous request's deadline.
 	tlsConn.SetDeadline(time.Now().Add(3 * time.Second))
 
-	// Send request
 	if _, err := tlsConn.Write([]byte(req)); err != nil {
 		return nil, err
 	}
@@ -467,9 +605,14 @@ func (c *HTTPPollingConn) doRequest(ctx context.Context, authToken string, data 
 		}
 	}
 
-	// Read response
-	reader := bufio.NewReader(tlsConn)
+	return readPollResponse(reader)
+}
 
+// readPollResponse reads the status line, headers and body of one poll response
+// off reader. It caps the peer-announced Content-Length before allocating, so a
+// hostile server cannot name a length that OOMs the client (or, if negative,
+// panics make()).
+func readPollResponse(reader *bufio.Reader) ([]byte, error) {
 	// Read status line
 	statusLine, err := reader.ReadString('\n')
 	if err != nil {
@@ -494,7 +637,11 @@ func (c *HTTPPollingConn) doRequest(ctx context.Context, authToken string, data 
 		}
 	}
 
-	// Read body
+	// Read exactly Content-Length body bytes so the reader is aligned for the
+	// next keep-alive response.
+	if contentLength > maxPollBody {
+		return nil, fmt.Errorf("poll response Content-Length %d exceeds the %d byte cap", contentLength, maxPollBody)
+	}
 	if contentLength > 0 {
 		respBody := make([]byte, contentLength)
 		if _, err := io.ReadFull(reader, respBody); err != nil {
@@ -502,18 +649,38 @@ func (c *HTTPPollingConn) doRequest(ctx context.Context, authToken string, data 
 		}
 		return respBody, nil
 	}
-
 	return nil, nil
 }
 
-// generateAuthToken creates HMAC auth token
-func (c *HTTPPollingConn) generateAuthToken() string {
+// dropReuseLocked closes and forgets the reusable connection. Caller holds
+// reuseMu.
+func (c *HTTPPollingConn) dropReuseLocked() {
+	if c.reuseConn != nil {
+		c.reuseConn.Close()
+		c.reuseConn = nil
+		c.reuseReader = nil
+	}
+}
+
+// generateAuthTokenForConn creates the HMAC auth token bound to tlsConn's
+// session exporter (S22). Folding the exporter into the HMAC makes a token
+// captured on one poll session useless on another; the server rederives it from
+// its own side of the same session (server.go verifyPollingAuth). Unlike the
+// stego/morph family this token keys on sessionID plus a per-second timestamp,
+// which the server tolerates to 60s — the exporter binding rides on top.
+func (c *HTTPPollingConn) generateAuthTokenForConn(tlsConn *tls.Conn) (string, error) {
+	ekm, err := sessionExporterKey(tlsConn)
+	if err != nil {
+		return "", err
+	}
+
 	timestamp := time.Now().Unix()
 	data := fmt.Sprintf("%s:%d", c.sessionID, timestamp)
 
 	h := hmac.New(sha256.New, c.secret)
 	h.Write([]byte(data))
-	return base64.StdEncoding.EncodeToString(h.Sum(nil))[:16]
+	h.Write(ekm) // TLS-session binding
+	return base64.StdEncoding.EncodeToString(h.Sum(nil))[:16], nil
 }
 
 // Read implements net.Conn.
@@ -606,6 +773,10 @@ func (c *HTTPPollingConn) Close() error {
 		c.recvLock.Lock()
 		c.recvCond.Broadcast()
 		c.recvLock.Unlock()
+		// Tear down any reused keep-alive connection.
+		c.reuseMu.Lock()
+		c.dropReuseLocked()
+		c.reuseMu.Unlock()
 	})
 	return nil
 }

@@ -3,15 +3,21 @@ package strategy
 import (
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"time"
 
+	"golang.org/x/crypto/hkdf"
+
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/protocol"
+	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 )
 
 // AntiProbeStrategy implements resistance to active probing
@@ -159,7 +165,7 @@ func (s *AntiProbeStrategy) Connect(ctx context.Context, target string) (net.Con
 	}
 
 	// Phase 4: Verify server response
-	if err := s.verifyServerAuth(tlsConn); err != nil {
+	if err := s.verifyServerAuth(tlsConn, secret); err != nil {
 		tlsConn.Close()
 		return nil, err
 	}
@@ -167,21 +173,74 @@ func (s *AntiProbeStrategy) Connect(ctx context.Context, target string) (net.Con
 	return tlsConn, nil
 }
 
-// timingKnock performs timing-based knock sequence
+// Knock v2 wire constants. The v1 knock derived five sizes, five delays and
+// every body byte from HMAC(secret, "knock-sequence") alone: nothing
+// per-connection entered it, so two dials of one client produced byte-identical
+// packets with identical timing. Sizes and inter-packet gaps survive the TLS
+// wrapper, so that was both a stable fingerprint and a replayable credential.
+//
+// v2 mixes a fresh 16-byte nonce and a coarse time bucket into an HKDF, so the
+// whole schedule and every body byte change per connection. The nonce and
+// bucket travel in the clear at the head of packet 0 (the server needs them to
+// recompute the schedule), followed by a keyed tag the server matches to pick
+// the secret without trying to read a secret-dependent length first. The bucket
+// bounds a replay window; the server also keeps a nonce cache inside it.
+//
+// Distribution note (verification.md rule 3): the knock imitates no real
+// protocol, so there is no measured population its sizes or delays are checked
+// against — recorded here as "сверять не с чем". The sizes are drawn flat over
+// [KnockSizeMin, KnockSizeMin+knockSizeSpan) from a CSPRNG-seeded HKDF; the
+// delays are flat over [knockDelayMinMs, +knockDelaySpanMs) ms. The delays are
+// uniform jitter on the time axis, which rule 3 warns has no natural shape; the
+// server does not verify timing at all (it reads with per-packet deadlines), so
+// the gaps are spacing, not a checked credential. They are kept per-connection
+// only so they stop repeating; their absolute shape is not claimed to match
+// anything.
+const (
+	KnockPackets   = 5                     // packets in a knock
+	KnockNonceLen  = 16                    // per-connection nonce, carried in packet 0
+	KnockTagLen    = 16                    // keyed tag after the header in packet 0
+	KnockHeaderLen = 1 + 8 + KnockNonceLen // seq(1) + bucket(8) + nonce(16) = 25
+
+	knockBucketSeconds = 30 // time-bucket granularity (seconds)
+	// KnockBucketGrace is how many buckets on each side of "now" the server
+	// accepts, bounding the replay window to (2*grace+1) buckets.
+	KnockBucketGrace = 2
+
+	knockSizeMin     = 48 // packet 0 must hold header(25)+tag(16)=41, so min > 41
+	knockSizeSpan    = 88 // sizes flat over [48,136)
+	knockDelayMinMs  = 20
+	knockDelaySpanMs = 80 // delays flat over [20,100) ms
+
+	knockScheduleLabel = "tiredvpn-knock-v2-schedule"
+	knockTagLabel      = "tiredvpn-knock-v2-tag"
+	knockBodyLabel     = "tiredvpn-knock-v2-body"
+)
+
+// timingKnock performs the per-connection knock sequence.
 func (s *AntiProbeStrategy) timingKnock(conn net.Conn, secret []byte) error {
-	// Generate timing sequence from secret
-	sequence := generateKnockSequence(secret)
+	nonce := make([]byte, KnockNonceLen)
+	if _, err := rand.Read(nonce); err != nil {
+		return err
+	}
+	bucket := KnockBucketNow()
+	seq := knockSchedule(secret, nonce, bucket)
+	tag := KnockTag(secret, nonce, bucket)
 
-	// Send packets with specific timing
-	for i, delay := range sequence.Delays {
-		time.Sleep(delay)
+	for i := 0; i < KnockPackets; i++ {
+		time.Sleep(seq.Delays[i])
 
-		// Send packet of specific size
-		packet := make([]byte, sequence.Sizes[i])
-		packet[0] = byte(i) // Sequence number
+		packet := make([]byte, seq.Sizes[i])
+		packet[0] = byte(i) // sequence number
 
-		// Fill with deterministic data based on secret
-		fillPacketData(packet, i, secret)
+		if i == 0 {
+			binary.BigEndian.PutUint64(packet[1:9], uint64(bucket))
+			copy(packet[9:KnockHeaderLen], nonce)
+			copy(packet[KnockHeaderLen:KnockHeaderLen+KnockTagLen], tag)
+			copy(packet[KnockHeaderLen+KnockTagLen:], KnockBody(secret, nonce, bucket, 0, seq.Sizes[0]-KnockHeaderLen-KnockTagLen))
+		} else {
+			copy(packet[1:], KnockBody(secret, nonce, bucket, i, seq.Sizes[i]-1))
+		}
 
 		if _, err := conn.Write(packet); err != nil {
 			return err
@@ -203,42 +262,122 @@ func (s *AntiProbeStrategy) timingKnock(conn net.Conn, secret []byte) error {
 	return nil
 }
 
-// generateKnockSequence creates timing sequence from secret
-func generateKnockSequence(secret []byte) *KnockSequence {
-	h := hmac.New(sha256.New, secret)
-	h.Write([]byte("knock-sequence"))
-	hash := h.Sum(nil)
+// KnockBucketNow returns the current knock time bucket.
+func KnockBucketNow() int64 { return time.Now().Unix() / knockBucketSeconds }
 
-	// Generate 5 delays (50-200ms each) and 5 sizes (10-100 bytes)
-	delays := make([]time.Duration, 5)
-	sizes := make([]int, 5)
+// KnockBucketFresh reports whether bucket is inside the accepted replay window
+// around the current time. The client sends its own bucket; the server both
+// derives the schedule from it and rejects it once it drifts outside the window.
+func KnockBucketFresh(bucket int64) bool {
+	now := time.Now().Unix() / knockBucketSeconds
+	return bucket >= now-KnockBucketGrace && bucket <= now+KnockBucketGrace
+}
 
-	for i := 0; i < 5; i++ {
-		// Delay: 50ms + (hash[i] % 150)ms
-		delays[i] = time.Duration(50+int(hash[i])%150) * time.Millisecond
+func knockBucketBytes(bucket int64) []byte {
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint64(b, uint64(bucket))
+	return b
+}
 
-		// Size: 10 + (hash[i+5] % 90)
-		sizes[i] = 10 + int(hash[i+5])%90
+func knockInfo(label string, bucket int64) []byte {
+	info := make([]byte, 0, len(label)+8)
+	info = append(info, label...)
+	return append(info, knockBucketBytes(bucket)...)
+}
+
+// knockSchedule derives this connection's packet sizes and inter-packet delays
+// from the secret, the per-connection nonce and the time bucket.
+func knockSchedule(secret, nonce []byte, bucket int64) *KnockSequence {
+	r := hkdf.New(sha256.New, secret, nonce, knockInfo(knockScheduleLabel, bucket))
+	raw := make([]byte, 2*KnockPackets)
+	_, _ = io.ReadFull(r, raw)
+
+	sizes := make([]int, KnockPackets)
+	delays := make([]time.Duration, KnockPackets)
+	for i := 0; i < KnockPackets; i++ {
+		sizes[i] = knockSizeMin + int(raw[i])%knockSizeSpan
+		delays[i] = time.Duration(knockDelayMinMs+int(raw[KnockPackets+i])%knockDelaySpanMs) * time.Millisecond
 	}
-
 	return &KnockSequence{Delays: delays, Sizes: sizes}
 }
 
-// fillPacketData fills packet with deterministic data
-func fillPacketData(packet []byte, seqNum int, secret []byte) {
-	h := hmac.New(sha256.New, secret)
-	h.Write([]byte{byte(seqNum)})
-	hash := h.Sum(nil)
-
-	// Use (i-1) to match server's verification: expected[(i-1)%len(expected)]
-	for i := 1; i < len(packet); i++ {
-		packet[i] = hash[(i-1)%len(hash)]
-	}
+// KnockScheduleFor exposes the per-connection sizes and delays so the server and
+// the wire tests can recompute the schedule from a captured nonce and bucket.
+func KnockScheduleFor(secret, nonce []byte, bucket int64) *KnockSequence {
+	return knockSchedule(secret, nonce, bucket)
 }
 
-// verifyServerAuth verifies server recognized us
-// After timing knock ACK, server is ready for tunnel - just return success
-func (s *AntiProbeStrategy) verifyServerAuth(conn *tls.Conn) error {
-	// Server already sent 0x01 ACK in timingKnock, now ready for tunnel
+// KnockTag derives the keyed tag that sits after the header in packet 0. The
+// server matches it to pick the client's secret without first having to read a
+// secret-dependent packet length.
+func KnockTag(secret, nonce []byte, bucket int64) []byte {
+	r := hkdf.New(sha256.New, secret, nonce, knockInfo(knockTagLabel, bucket))
+	out := make([]byte, KnockTagLen)
+	_, _ = io.ReadFull(r, out)
+	return out
+}
+
+// KnockBody derives the body bytes for packet seqNum. Each packet uses an
+// independent HKDF stream keyed by the nonce, bucket and sequence number, so the
+// bodies are per-connection and per-packet.
+func KnockBody(secret, nonce []byte, bucket int64, seqNum, bodyLen int) []byte {
+	if bodyLen <= 0 {
+		return nil
+	}
+	info := knockInfo(knockBodyLabel, bucket)
+	info = append(info, byte(seqNum))
+	r := hkdf.New(sha256.New, secret, nonce, info)
+	out := make([]byte, bodyLen)
+	_, _ = io.ReadFull(r, out)
+	return out
+}
+
+// AntiProbeServerProofLabel domain-separates the server proof HMAC from any
+// other use of the same secret and exporter.
+const AntiProbeServerProofLabel = "tiredvpn-antiprobe-server-proof"
+
+// AntiProbeProofLen is the size of the server proof (HMAC-SHA256).
+const AntiProbeProofLen = 32
+
+// AntiProbeServerProof binds the server's proof of holding the secret to the
+// TLS-session exporter (RFC 8446 §7.5). Both ends derive identical keying
+// material only if they completed the same handshake with the same keys, so a
+// MITM that terminates TLS gets different material on each side and cannot
+// produce this MAC whatever certificate it presents. This is what makes the
+// strategy's InsecureSkipVerify safe: the certificate is not trusted, the
+// shared secret over the shared session is.
+func AntiProbeServerProof(secret, ekm []byte) [AntiProbeProofLen]byte {
+	mac := hmac.New(sha256.New, secret)
+	mac.Write([]byte(AntiProbeServerProofLabel))
+	mac.Write(ekm)
+	var out [AntiProbeProofLen]byte
+	copy(out[:], mac.Sum(nil))
+	return out
+}
+
+// verifyServerAuth checks the server's proof that it holds the knock secret and
+// shares this exact TLS session. The knock (Phase 3) authenticates the client
+// to the server; without this step nothing authenticates the server to the
+// client, and with InsecureSkipVerify any peer answering 0x01 would pass. The
+// proof is an HMAC over the TLS exporter, so a proof lifted from one session is
+// worthless on another.
+func (s *AntiProbeStrategy) verifyServerAuth(conn *tls.Conn, secret []byte) error {
+	state := conn.ConnectionState()
+	ekm, err := customtls.ExportBindingKey(&state)
+	if err != nil {
+		return fmt.Errorf("antiprobe: export keying material: %w", err)
+	}
+
+	proof := make([]byte, AntiProbeProofLen)
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	if _, err := io.ReadFull(conn, proof); err != nil {
+		return fmt.Errorf("antiprobe: read server proof: %w", err)
+	}
+	conn.SetReadDeadline(time.Time{})
+
+	want := AntiProbeServerProof(secret, ekm)
+	if !hmac.Equal(proof, want[:]) {
+		return errors.New("antiprobe: server proof mismatch")
+	}
 	return nil
 }

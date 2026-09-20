@@ -300,3 +300,33 @@ func TestManager_ReconnectSkipsParkedStrategy(t *testing.T) {
 
 // ensure the helper compiles against the real signature
 var _ = func() time.Duration { return stormCooldown }
+
+// Long-lived sessions ride the same fast path as a reconnect storm (every
+// proxied CONNECT re-enters connectWithRTT). A pause of fastReconnectGap or
+// more between attempts means the previous session held, so the guard must
+// restart its count instead of flagging ordinary traffic as a storm.
+func TestManager_FastReconnectIgnoresHeldSessions(t *testing.T) {
+	m := NewManager()
+	const id = "reality"
+
+	now := time.Unix(1_700_000_000, 0)
+	// Pauses of exactly fastReconnectGap and longer both restart the count
+	// (the boundary is >=).
+	for i := range 100 {
+		at := now.Add(time.Duration(i) * fastReconnectGap)
+		if m.shouldSkipFastReconnect(id, at) {
+			t.Fatalf("fast reconnect %d after a session that held >=gap must not force a full scan", i)
+		}
+	}
+
+	// Within the gap the count still trips: that is the storm it exists for.
+	for i := range fastReconnectLimit + 1 {
+		skip := m.shouldSkipFastReconnect(id, now.Add(time.Hour+time.Duration(i)*time.Second))
+		if i < fastReconnectLimit && skip {
+			t.Fatalf("fast reconnect %d within the gap should NOT be skipped yet", i+1)
+		}
+		if i == fastReconnectLimit && !skip {
+			t.Fatal("tight fast-reconnect loop must be pushed to a full scan")
+		}
+	}
+}

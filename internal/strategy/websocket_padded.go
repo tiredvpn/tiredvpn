@@ -22,6 +22,18 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/protocol"
 )
 
+// browserUserAgent is a plausible desktop-browser User-Agent for the WebSocket
+// upgrade. The point is to name a real browser, not the product: the old
+// "TiredVPN/2.0" was a self-report a header scan could match on directly.
+const browserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+// maxWSFrameLen caps a payload length announced in a WebSocket frame header.
+// Tunnel frames are one relay buffer (tens of KB); 1 MiB leaves headroom while
+// keeping a hostile peer from naming a length we would allocate. Without it the
+// 64-bit extended length turns into an OOM (or, once it exceeds 2^63, a
+// negative int and a make() panic).
+const maxWSFrameLen = 1 << 20
+
 // WebSocketPaddedStrategy implements WebSocket transport with Salamander padding
 // Priority 8 (high, between HTTP/2 Stego and Traffic Morph)
 type WebSocketPaddedStrategy struct {
@@ -132,9 +144,16 @@ func (s *WebSocketPaddedStrategy) Connect(ctx context.Context, target string) (n
 		tc.SetKeepAlivePeriod(30 * time.Second)
 	}
 
-	// 2. Send WebSocket upgrade request with auth token
+	// 2. Send WebSocket upgrade request with auth token bound to this TLS session
+	// (S22): a token captured on another session fails on the server, which
+	// derives the same exporter from its own side of this handshake.
+	ekm, err := sessionExporterKey(tlsConn)
+	if err != nil {
+		tlsConn.Close()
+		return nil, fmt.Errorf("websocket_padded: export keying material: %w", err)
+	}
 	wsKey := generateWebSocketKey()
-	authToken := generateAuthToken(secret)
+	authToken := generateAuthTokenBound(secret, ekm)
 	upgradeReq := fmt.Sprintf(
 		"GET %s HTTP/1.1\r\n"+
 			"Host: %s\r\n"+
@@ -142,9 +161,8 @@ func (s *WebSocketPaddedStrategy) Connect(ctx context.Context, target string) (n
 			"Connection: Upgrade\r\n"+
 			"Sec-WebSocket-Key: %s\r\n"+
 			"Sec-WebSocket-Version: 13\r\n"+
-			"X-Salamander-Version: 1.0\r\n"+
 			"X-Auth-Token: %s\r\n"+
-			"User-Agent: Mozilla/5.0 (compatible; TiredVPN/2.0)\r\n"+
+			"User-Agent: "+browserUserAgent+"\r\n"+
 			"\r\n",
 		s.wsPath, s.wsHost, wsKey, hex.EncodeToString(authToken))
 
@@ -382,6 +400,12 @@ func (sc *SalamanderConn) readWebSocketFrame() ([]byte, error) {
 			return nil, err
 		}
 		payloadLen = int(binary.BigEndian.Uint64(extLen))
+	}
+
+	// Cap the peer-announced length before allocating. A 64-bit length past
+	// 2^63 wraps to a negative int (make panics); anything huge is an OOM.
+	if payloadLen < 0 || payloadLen > maxWSFrameLen {
+		return nil, fmt.Errorf("websocket frame length %d exceeds the %d byte cap", payloadLen, maxWSFrameLen)
 	}
 
 	// Read masking key if present (server → client has no mask)

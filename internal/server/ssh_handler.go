@@ -1,8 +1,8 @@
 package server
 
 import (
-	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"net"
 	"time"
@@ -11,110 +11,186 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
 )
 
-// DetectSSHCamouflage reports whether the peeked bytes are the start of an SSH
-// camouflage session. It matches the "SSH-2.0" identification prefix but rejects
-// the legacy protocol-confusion SSH variant, which embeds the "TIRED" marker in
-// its very first segment. The camouflage client sends only the banner line first
-// (an interactive handshake), so a TIRED marker here means it is confusion, not us.
-func DetectSSHCamouflage(peek []byte) bool {
+// DetectSSHCamouflage reports whether the peeked bytes open an ssh_camouflage
+// session rather than the confusion transport's SSH carrier.
+//
+// Both transports open with the same OpenSSH identification string, so the
+// banner no longer tells them apart the way it did before 1.11.0 - and the
+// "TIRED" literal an even earlier build keyed on is long gone. What separates
+// them is the keyed marker the confusion carrier bears in its first flight:
+// that carrier arrives whole in one flight, so its marker is already in this
+// peek, while the ssh_camouflage client has sent only its banner and is waiting
+// for the server to speak. A peek that starts with the SSH banner but carries
+// no marker matching a secret we hold is ssh_camouflage; one whose marker does
+// match is the confusion transport and is dispatched there instead.
+//
+// This never reads from the connection. An incomplete SSH carrier - what the
+// ssh_camouflage client's lone banner also looks like - returns true, so the
+// caller reaches the interactive handshake. Before deciding, the dispatcher
+// gives a possibly-fragmented carrier a short window to finish
+// (reassembleSSHCarrierPeek), so a carrier split across TCP segments is not
+// classified here as camouflage and pushed into a handshake it will fail.
+func DetectSSHCamouflage(peek []byte, srvCtx *serverContext) bool {
 	if !bytes.HasPrefix(peek, []byte("SSH-2.0")) {
 		return false
 	}
-	if bytes.Contains(peek, []byte("TIRED")) {
-		return false
-	}
-	return true
+	return !peekBearsConfusionSSHMarker(peek, srvCtx)
 }
 
-// handleSSHCamouflage drives the server side of the fake SSH handshake and then
-// delegates the tunnel phase to handleRawTunnel over an SSH-framed connection.
+// peekBearsConfusionSSHMarker reports whether peek is a complete confusion SSH
+// carrier whose client marker matches one of the server's secrets. A truncated
+// or foreign SSH opening returns false.
+func peekBearsConfusionSSHMarker(peek []byte, srvCtx *serverContext) bool {
+	req, err := strategy.ParseConfusionRequest(peek)
+	if err != nil {
+		return false
+	}
+	if req.Variant != byte(strategy.ConfusionSSHoverTLS) {
+		return false
+	}
+	_, _, ok := matchConfusionSecret(req, srvCtx)
+	return ok
+}
+
+// sshCarrierReassembleTimeout bounds how long the dispatcher waits for the rest
+// of a fragmented SSH carrier first flight. A confusion carrier sends its whole
+// flight at once, so the remainder arrives within about one RTT and this window
+// is far above that. It is also the most an ssh_camouflage (S2) client waits
+// before the server greets it - that client sends only its banner and then
+// blocks on the server - so the window is kept short to keep that handshake
+// prompt.
+const sshCarrierReassembleTimeout = 500 * time.Millisecond
+
+// sshCarrierPeekCap bounds the reassembly buffer. A confusion SSH carrier is a
+// banner, three handshake packets (the largest a ~1.5 KB KEXINIT) and one sealed
+// body packet; 16 KiB is well above that and stops a dribbling peer from growing
+// the buffer without end.
+const sshCarrierPeekCap = 16 * 1024
+
+// reassembleSSHCarrierPeek completes a confusion SSH carrier whose first flight
+// arrived split across TCP segments, so the dispatcher classifies a whole flight
+// rather than a truncated one that would be mistaken for the bare-banner
+// ssh_camouflage client.
+//
+// It returns at once when the buffer is already a structurally complete carrier
+// (or a definite non-carrier), and otherwise reads on until a short deadline. An
+// ssh_camouflage (S2) client, which sends only its banner and then waits for the
+// server, contributes no more bytes and simply waits out the window; it is never
+// held for the confusion auth timeout. Every byte read is returned so the caller
+// can replay it in front of the handshake that follows.
+func reassembleSSHCarrierPeek(conn net.Conn, peek []byte, logger *log.Logger) []byte {
+	// Already complete, or already definitely not a carrier: nothing to wait for.
+	if _, err := strategy.ParseConfusionRequest(peek); err == nil || !errors.Is(err, strategy.ErrConfusionNeedMore) {
+		return peek
+	}
+
+	buf := make([]byte, len(peek), len(peek)+2048)
+	copy(buf, peek)
+
+	conn.SetReadDeadline(time.Now().Add(sshCarrierReassembleTimeout))
+	defer conn.SetReadDeadline(time.Time{})
+
+	for len(buf) < sshCarrierPeekCap {
+		chunk := make([]byte, 2048)
+		n, err := conn.Read(chunk)
+		if n > 0 {
+			buf = append(buf, chunk[:n]...)
+			if _, perr := strategy.ParseConfusionRequest(buf); perr == nil || !errors.Is(perr, strategy.ErrConfusionNeedMore) {
+				return buf
+			}
+			continue
+		}
+		if err != nil {
+			logger.Debug("SSH carrier reassembly stopped after %d bytes: %v", len(buf), err)
+			return buf
+		}
+	}
+	return buf
+}
+
+// handleSSHCamouflage drives the server side of the SSH transport and then
+// delegates the tunnel phase to handleRawTunnel over the encrypted channel.
 func handleSSHCamouflage(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
 	logger.Debug("Processing SSH camouflage connection")
 
-	clientID, err := sshServerHandshake(conn, srvCtx, logger)
+	transport, clientID, err := sshServerHandshake(conn, srvCtx, logger)
 	if err != nil {
 		logger.Debug("SSH camouflage handshake failed: %v", err)
-		serveFakeWebsite(conn, srvCtx.cfg, logger)
+		// A rejection that happened after NEWKEYS has already been answered in
+		// SSH's own terms. Following it with an HTTP page would put a decoy
+		// response in the middle of an encrypted SSH stream, which is a
+		// stronger signal than the probe it is meant to deflect.
+		if !errors.Is(err, strategy.SSHAuthRejectedError()) {
+			serveFakeWebsite(conn, srvCtx.cfg, logger)
+		}
 		return
 	}
 
 	logger.Info("SSH camouflage authenticated (clientID=%s)", clientID)
 
-	// The post-handshake stream is a clean byte channel once SSH packet framing
-	// is stripped, so handleRawTunnel (which already supports both SOCKS proxy
-	// and TUN mode) can run over it unchanged.
-	sshConn := strategy.NewSSHCamouflageConn(conn)
+	// The post-auth stream is a clean byte channel once SSH channel framing is
+	// stripped, so handleRawTunnel (which already supports both SOCKS proxy and
+	// TUN mode) can run over it unchanged.
+	sshConn := strategy.NewSSHCamouflageConn(transport)
 	handleRawTunnel(sshConn, srvCtx, logger, clientID)
 }
 
-// sshServerHandshake performs banner exchange, KEXINIT negotiation and the ECDH
-// round trip, verifying the client auth token. On success it returns the matched
-// client ID (or "global" for the global secret).
-func sshServerHandshake(conn net.Conn, srvCtx *serverContext, logger *log.Logger) (clientIdentity, error) {
+// sshServerHandshake performs the SSH transport handshake and then verifies the
+// client's auth token inside the encrypted channel. On success it returns the
+// established transport and the matched client ID (or "global" for the global
+// secret).
+func sshServerHandshake(conn net.Conn, srvCtx *serverContext, logger *log.Logger) (*strategy.SSHTransport, clientIdentity, error) {
 	conn.SetDeadline(time.Now().Add(15 * time.Second))
-	defer conn.SetDeadline(time.Time{})
 
-	br := bufio.NewReader(conn)
-
-	// 1. Read the client banner line.
-	line, err := br.ReadString('\n')
+	hostKey := strategy.SSHHostKey(srvCtx.cfg.Secret)
+	transport, err := strategy.SSHServerHandshake(conn, hostKey)
 	if err != nil {
-		return clientIdentity{}, fmt.Errorf("reading client banner: %w", err)
-	}
-	if !bytes.HasPrefix([]byte(line), []byte("SSH-2.0")) {
-		return clientIdentity{}, fmt.Errorf("not an SSH-2.0 banner")
-	}
-	// 2. Send our banner.
-	if _, err := conn.Write([]byte(strategy.SSHBanner)); err != nil {
-		return clientIdentity{}, err
-	}
-	// 3. Read the client KEXINIT (discard contents).
-	if _, err := strategy.ReadSSHPacket(br); err != nil {
-		return clientIdentity{}, fmt.Errorf("reading client KEXINIT: %w", err)
-	}
-	// 4. Send our KEXINIT.
-	if err := strategy.WriteSSHPacket(conn, strategy.BuildSSHKexInit()); err != nil {
-		return clientIdentity{}, err
-	}
-	// 5. Read the client ECDH init carrying the auth token.
-	payload, err := strategy.ReadSSHPacket(br)
-	if err != nil {
-		return clientIdentity{}, fmt.Errorf("reading client ECDH init: %w", err)
-	}
-	token, err := strategy.ParseSSHKexPubKey(payload, 30) // SSH_MSG_KEX_ECDH_INIT
-	if err != nil {
-		return clientIdentity{}, err
+		conn.SetDeadline(time.Time{})
+		return nil, clientIdentity{}, err
 	}
 
-	clientID, secret, ok := verifySSHAuth(token, srvCtx)
+	token, err := strategy.SSHServerReadAuth(transport)
+	if err != nil {
+		if errors.Is(err, strategy.SSHAuthRejectedError()) {
+			strategy.SSHServerRejectAuth(transport)
+		}
+		conn.SetDeadline(time.Time{})
+		return nil, clientIdentity{}, fmt.Errorf("reading SSH auth: %w", err)
+	}
+
+	clientID, secret, ok := verifySSHAuth(token, transport.SessionID(), srvCtx)
 	if !ok {
-		return clientIdentity{}, fmt.Errorf("auth token verification failed")
+		strategy.SSHServerRejectAuth(transport)
+		conn.SetDeadline(time.Time{})
+		return nil, clientIdentity{}, fmt.Errorf("%w: token does not match any secret", strategy.SSHAuthRejectedError())
 	}
 
-	// 6. Send the ECDH reply carrying our token derived from the same secret so
-	//    the client can confirm the server understands the protocol.
-	serverToken := strategy.GenerateSSHAuthToken(secret)
-	if err := strategy.WriteSSHPacket(conn, strategy.BuildSSHKexECDH(31, serverToken)); err != nil { // SSH_MSG_KEX_ECDH_REPLY
-		return clientIdentity{}, err
+	// The answering token uses the server-to-client context, so a man in the
+	// middle cannot reflect the client's own token back at it, and it is bound
+	// to this session's exchange hash, so it cannot be replayed into another.
+	if err := strategy.SSHServerAcceptAuth(transport, secret); err != nil {
+		conn.SetDeadline(time.Time{})
+		return nil, clientIdentity{}, err
 	}
 
 	conn.SetDeadline(time.Time{})
-	return clientID, nil
+	return transport, clientID, nil
 }
 
 // verifySSHAuth checks the token against per-client secrets (registry) and then
 // the global secret. Returns the matched client ID, the secret used, and whether
-// authentication succeeded.
-func verifySSHAuth(token []byte, srvCtx *serverContext) (clientIdentity, []byte, bool) {
+// authentication succeeded. sessionID is the exchange hash the token is bound to.
+func verifySSHAuth(token, sessionID []byte, srvCtx *serverContext) (clientIdentity, []byte, bool) {
 	if srvCtx.registry != nil {
 		for _, client := range srvCtx.registry.ListClients() {
 			secret := []byte(client.Secret)
-			if strategy.VerifySSHAuthToken(token, secret) {
+			if strategy.VerifySSHAuthToken(token, secret, sessionID, strategy.SSHAuthClientToServer) {
 				return registryIdentity(client.ID), secret, true
 			}
 		}
 	}
-	if len(srvCtx.cfg.Secret) > 0 && strategy.VerifySSHAuthToken(token, srvCtx.cfg.Secret) {
+	if len(srvCtx.cfg.Secret) > 0 &&
+		strategy.VerifySSHAuthToken(token, srvCtx.cfg.Secret, sessionID, strategy.SSHAuthClientToServer) {
 		return sharedIdentity(globalClientID), srvCtx.cfg.Secret, true
 	}
 	return clientIdentity{}, nil, false

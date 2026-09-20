@@ -78,7 +78,7 @@ func TestCalculateNaivePadding(t *testing.T) {
 			defer client.Close()
 			defer server.Close()
 
-			conn := NewHTTP2StegoConn(client, secret, true, tt.mode)
+			conn := NewHTTP2StegoConn(client, secret, true, tt.mode, nil)
 
 			// Test multiple iterations to account for variability
 			for i := 0; i < 20; i++ {
@@ -94,30 +94,33 @@ func TestCalculateNaivePadding(t *testing.T) {
 	}
 }
 
-// TestNaivePaddingConsistency tests that padding is deterministic for same counter
-func TestNaivePaddingConsistency(t *testing.T) {
+// TestNaivePaddingHasEntropy pins that padding is drawn from crypto/rand, not
+// derived from length and counter.
+//
+// This inverts the old TestNaivePaddingConsistency, which asserted padding was
+// deterministic for a given counter - which was precisely the audited defect:
+// a deterministic offset lets a passive observer subtract the padding back out
+// and recover the plaintext length. At a fixed counter and length the value
+// must now vary between draws.
+func TestNaivePaddingHasEntropy(t *testing.T) {
 	secret := []byte("test-consistency-secret-key-xyz")
 
 	client, server := net.Pipe()
 	defer client.Close()
 	defer server.Close()
 
-	conn1 := NewHTTP2StegoConn(client, secret, true, NaivePaddingStandard)
-	conn2 := NewHTTP2StegoConn(server, secret, false, NaivePaddingStandard)
+	conn := NewHTTP2StegoConn(client, secret, true, NaivePaddingStandard, nil)
 
-	dataLen := 1000
-
-	for i := 0; i < 10; i++ {
-		conn1.methodCounter = uint32(i)
-		conn2.methodCounter = uint32(i)
-
-		padding1 := conn1.calculateNaivePadding(dataLen)
-		padding2 := conn2.calculateNaivePadding(dataLen)
-
-		if padding1 != padding2 {
-			t.Errorf("Iteration %d: padding mismatch: conn1=%d, conn2=%d",
-				i, padding1, padding2)
-		}
+	const dataLen = 1000
+	seen := map[int]bool{}
+	for i := 0; i < 64; i++ {
+		conn.methodCounter = 7 // fixed: any variation below is from crypto/rand, not the counter
+		seen[conn.calculateNaivePadding(dataLen)] = true
+	}
+	if len(seen) < 3 {
+		t.Fatalf("padding produced %d distinct values at a fixed counter/length; a "+
+			"deterministic offset is the recoverable-length defect this replaced (values %v)",
+			len(seen), seen)
 	}
 }
 
@@ -129,7 +132,7 @@ func TestNaivePaddingVariability(t *testing.T) {
 	defer client.Close()
 	defer server.Close()
 
-	conn := NewHTTP2StegoConn(client, secret, true, NaivePaddingStandard)
+	conn := NewHTTP2StegoConn(client, secret, true, NaivePaddingStandard, nil)
 
 	dataLen := 1000
 	paddingSizes := make(map[int]bool)
@@ -162,7 +165,7 @@ func TestNaivePaddingZeroLength(t *testing.T) {
 
 	for _, mode := range modes {
 		t.Run(mode.String(), func(t *testing.T) {
-			conn := NewHTTP2StegoConn(client, secret, true, mode)
+			conn := NewHTTP2StegoConn(client, secret, true, mode, nil)
 
 			// Zero-length data should still get some padding
 			padding := conn.calculateNaivePadding(0)
@@ -198,7 +201,7 @@ func TestNaivePaddingLargeData(t *testing.T) {
 
 	for _, tt := range modes {
 		t.Run(tt.mode.String(), func(t *testing.T) {
-			conn := NewHTTP2StegoConn(client, secret, true, tt.mode)
+			conn := NewHTTP2StegoConn(client, secret, true, tt.mode, nil)
 
 			for i := 0; i < 10; i++ {
 				conn.methodCounter = uint32(i)
@@ -229,7 +232,7 @@ func BenchmarkCalculateNaivePadding(b *testing.B) {
 
 	for _, mode := range modes {
 		b.Run(mode.String(), func(b *testing.B) {
-			conn := NewHTTP2StegoConn(client, secret, true, mode)
+			conn := NewHTTP2StegoConn(client, secret, true, mode, nil)
 
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
@@ -256,8 +259,8 @@ func TestHTTP2StegoWithNaivePadding(t *testing.T) {
 			defer client.Close()
 			defer server.Close()
 
-			clientConn := NewHTTP2StegoConn(client, secret, true, mode)
-			serverConn := NewHTTP2StegoConn(server, secret, false, mode)
+			clientConn := NewHTTP2StegoConn(client, secret, true, mode, nil)
+			serverConn := NewHTTP2StegoConn(server, secret, false, mode, nil)
 
 			// Test data
 			testData := make([]byte, 2048)

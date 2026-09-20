@@ -74,13 +74,39 @@ jobs:
           go-version: '1.26'
           cache: true
 
+      # -tags=integration_e2e is what makes internal/integration actually run.
+      # Without it tunnel_e2e_test.go does not compile into the binary at all,
+      # and the package's only other file was covered solely by the -short pass
+      # in `test`, which skips its wallclock case. The suite had therefore never
+      # run in CI since it was written.
       - name: Integration Tests
         run: |
-          go test -race -timeout 10m -count=1 -v \
+          go test -race -timeout 10m -count=1 -v -tags=integration_e2e \
             ./internal/strategy/ \
             ./internal/porthopping/ \
             ./internal/server/ \
-            ./internal/mux/
+            ./internal/mux/ \
+            ./internal/integration/
+
+  # Wire-signature detectors. Own job on purpose, because a red here says
+  # something specific about the audit rather than about the code in general.
+  # The package holds two kinds of test: fingerprints not yet removed, asserted
+  # present, and fingerprints already removed, asserted absent alongside a
+  # positive control that the matcher still works. So a failure is one of
+  # "a marker was removed without moving its test", "a marker came back", or
+  # "a matcher went blind" - all three worth reading at a glance.
+  wire_signatures:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: On-wire signature detectors
+        run: go test -race -timeout 5m -count=1 -v ./internal/wiretest/
 
   benchmark:
     runs-on: ubuntu-latest

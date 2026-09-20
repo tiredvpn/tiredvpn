@@ -117,6 +117,63 @@ func TestBuildClientHelloRotatesKeyMaterial(t *testing.T) {
 	}
 }
 
+// TestREALITYPaddingLengthSpansItsRange records the padding-extension body
+// length the client actually produces across many connections, and pins the
+// >= 64-byte routing invariant at every one.
+//
+// The v1 code forced a constant 256, which is single-valued and so a signature
+// in its own right. S10 draws the length per connection from the salt. There is
+// no browser padding-length distribution to match (Chrome pads to a 512-byte
+// boundary and emits nothing for a modern post-quantum hello, which REALITY
+// cannot use), so this only pins what the implementation produces and documents
+// it as "сверять не с чем" - a later change that narrows or re-pins the length
+// shows up as a diff, not an opinion.
+func TestREALITYPaddingLengthSpansItsRange(t *testing.T) {
+	t.Parallel()
+
+	secret := []byte("shared-secret")
+	r := NewREALITYStrategy(nil, secret)
+
+	const conns = 48
+	seen := map[int]int{}
+	for i := 0; i < conns; i++ {
+		priv, _, err := customtls.GenerateX25519KeyPair()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var salt [32]byte
+		if _, err := rand.Read(salt[:]); err != nil {
+			t.Fatal(err)
+		}
+		hello, err := r.buildClientHello("github.com:443", priv, salt, r.secret)
+		if err != nil {
+			t.Fatal(err)
+		}
+		padding, ok := paddingExtensionBody(hello)
+		if !ok {
+			t.Fatalf("connection %d: no padding extension", i)
+		}
+		// The invariant that keeps ~99% of prod traffic on the REALITY path: the
+		// padding body must never fall below the server's 64-byte routing gate.
+		if len(padding) < customtls.REALITYExtensionLength {
+			t.Fatalf("connection %d: padding body %d < 64-byte routing gate", i, len(padding))
+		}
+		// Documented range floor: it must also hold the full 128-byte v2 block.
+		if len(padding) < realityPaddingBase || len(padding) >= realityPaddingBase+realityPaddingSpan {
+			t.Fatalf("connection %d: padding body %d outside documented [%d,%d)",
+				i, len(padding), realityPaddingBase, realityPaddingBase+realityPaddingSpan)
+		}
+		seen[len(padding)]++
+	}
+
+	if len(seen) < 8 {
+		t.Fatalf("padding length is too concentrated: %d distinct values over %d connections (%v); "+
+			"the constant-256 signature may be back", len(seen), conns, seen)
+	}
+	t.Logf("padding body length over %d connections: %d distinct values in [%d,%d)",
+		conns, len(seen), realityPaddingBase, realityPaddingBase+realityPaddingSpan)
+}
+
 // paddingExtensionBody walks the ClientHello properly - record header, handshake
 // header, then the extension list - and returns the body of extension 0x0015.
 //

@@ -2,6 +2,8 @@ package server
 
 import (
 	"bufio"
+	"bytes"
+	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"net"
@@ -56,31 +58,72 @@ func TestDetectIMAPCamouflage(t *testing.T) {
 	}
 }
 
-// TestDetectSSHCamouflage pins the SSH classifier, including the TIRED-marker
-// carve-out: the legacy protocol-confusion transport also opens with an SSH
-// banner, and routing it into the camouflage handshake would hang it.
+// buildConfusionSSHCarrier assembles a complete SSH-carrier first flight bearing
+// a client marker keyed to secret, the way the confusion transport dials.
+func buildConfusionSSHCarrier(t *testing.T, secret []byte) []byte {
+	t.Helper()
+	nonce := bytes.Repeat([]byte{0xa5}, strategy.ConfusionNonceLen)
+	variant := byte(strategy.ConfusionSSHoverTLS)
+	marker := strategy.ConfusionClientMarker(secret, nonce, variant)
+	// The sealed body is opaque to the classifier; only the marker is checked.
+	carrier, err := strategy.BuildConfusionRequest(variant, nonce, marker, bytes.Repeat([]byte{0x11}, 48))
+	if err != nil {
+		t.Fatalf("building confusion SSH carrier: %v", err)
+	}
+	return carrier
+}
+
+// TestDetectSSHCamouflage pins the SSH classifier. Since 1.11.0 the confusion
+// carrier and ssh_camouflage open with the same OpenSSH banner, so the banner
+// no longer separates them; the keyed marker the carrier bears does. A bare
+// banner (all the ssh_camouflage client sends first) reads as camouflage; a
+// complete carrier whose marker matches a secret we hold reads as confusion.
 func TestDetectSSHCamouflage(t *testing.T) {
+	srvCtx := camouflageCtx(t)
+
+	validCarrier := buildConfusionSSHCarrier(t, []byte(camouflageTestSecret))
+	foreignCarrier := buildConfusionSSHCarrier(t, []byte("some-other-secret-not-ours-32byte"))
+
 	tests := []struct {
 		name string
-		peek string
+		peek []byte
 		want bool
 	}{
-		{"real banner", strategy.SSHBanner, true},
-		{"minimal banner", "SSH-2.0-x\r\n", true},
-		{"confusion variant with TIRED marker", "SSH-2.0-OpenSSH_9.6p1\r\nTIRED\x00\x01", false},
-		{"SSH 1.99", "SSH-1.99-OpenSSH_9.6\r\n", false},
-		{"IMAP greeting", strategy.IMAPGreeting, false},
-		{"HTTP request", "GET / HTTP/1.1\r\n", false},
-		{"empty", "", false},
-		{"prefix shorter than the match", "SSH-2", false},
+		{"bare banner is camouflage", []byte(strategy.SSHBanner), true},
+		{"minimal banner is camouflage", []byte("SSH-2.0-x\r\n"), true},
+		{"carrier with our marker is confusion", validCarrier, false},
+		{"carrier with a foreign marker is camouflage", foreignCarrier, true},
+		{"SSH 1.99", []byte("SSH-1.99-OpenSSH_9.6\r\n"), false},
+		{"IMAP greeting", []byte(strategy.IMAPGreeting), false},
+		{"HTTP request", []byte("GET / HTTP/1.1\r\n"), false},
+		{"empty", []byte(""), false},
+		{"prefix shorter than the banner", []byte("SSH-2"), false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := DetectSSHCamouflage([]byte(tt.peek)); got != tt.want {
+			if got := DetectSSHCamouflage(tt.peek, srvCtx); got != tt.want {
 				t.Errorf("DetectSSHCamouflage(%q) = %v, want %v", tt.peek, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestSSHCarrierBannerMatchesCamouflage is the passive-observer check: the SSH
+// carrier and ssh_camouflage must present one and the same OpenSSH version, so
+// two connections opened by the two transports are indistinguishable by banner.
+// It reddens if the carrier's banner drifts from SSHBanner (e.g. reverts to the
+// old 8.9p1 string), which is what makes the collision observable again.
+func TestSSHCarrierBannerMatchesCamouflage(t *testing.T) {
+	carrier := buildConfusionSSHCarrier(t, []byte(camouflageTestSecret))
+	nl := bytes.Index(carrier, []byte("\r\n"))
+	if nl < 0 {
+		t.Fatal("carrier has no identification line")
+	}
+	gotBanner := string(carrier[:nl+2])
+	if gotBanner != strategy.SSHBanner {
+		t.Errorf("SSH carrier banner = %q, ssh_camouflage banner = %q; a passive prober reads two versions from one port",
+			gotBanner, strategy.SSHBanner)
 	}
 }
 
@@ -191,8 +234,20 @@ func TestBuildIMAPSelectResponse(t *testing.T) {
 	}
 }
 
+// imapTestChallenge and imapTestBinding stand in for the per-session inputs
+// the real handshake derives: the server's SASL challenge and the RFC 9266 TLS
+// exporter. Both have to reach the verifier, which is what the subtests below
+// check one at a time.
+const imapTestChallenge = "<1896.697170952@mail.icloud.com>"
+
+func imapTestBinding() []byte { return bytes.Repeat([]byte{0x4D}, 32) }
+
+func imapDigest(secret string) []byte {
+	return strategy.IMAPAuthResponse([]byte(secret), imapTestChallenge, imapTestBinding())
+}
+
 // TestVerifyIMAPAuth covers secret matching against both the registry and the
-// global secret. A token that verifies against the wrong secret would let one
+// global secret. A digest that verifies against the wrong secret would let one
 // client's credentials open another's session.
 func TestVerifyIMAPAuth(t *testing.T) {
 	global := []byte(camouflageTestSecret)
@@ -205,9 +260,9 @@ func TestVerifyIMAPAuth(t *testing.T) {
 	srvCtx.registry = r
 
 	t.Run("per-client secret wins its own ID", func(t *testing.T) {
-		id, secret, ok := verifyIMAPAuth(strategy.GenerateIMAPAuthToken([]byte(perClient)), srvCtx)
+		id, secret, ok := verifyIMAPAuth(imapDigest(perClient), imapTestChallenge, imapTestBinding(), srvCtx)
 		if !ok {
-			t.Fatal("a token minted from a registered client's secret was rejected")
+			t.Fatal("a digest minted from a registered client's secret was rejected")
 		}
 		if id.id != "c1" {
 			t.Errorf("clientID = %q, want c1", id.id)
@@ -221,9 +276,9 @@ func TestVerifyIMAPAuth(t *testing.T) {
 	})
 
 	t.Run("global secret falls back to \"global\"", func(t *testing.T) {
-		id, secret, ok := verifyIMAPAuth(strategy.GenerateIMAPAuthToken(global), srvCtx)
+		id, secret, ok := verifyIMAPAuth(imapDigest(camouflageTestSecret), imapTestChallenge, imapTestBinding(), srvCtx)
 		if !ok {
-			t.Fatal("a token minted from the global secret was rejected")
+			t.Fatal("a digest minted from the global secret was rejected")
 		}
 		if id.id != "global" {
 			t.Errorf("clientID = %q, want global", id.id)
@@ -237,100 +292,134 @@ func TestVerifyIMAPAuth(t *testing.T) {
 	})
 
 	t.Run("unknown secret", func(t *testing.T) {
-		if id, _, ok := verifyIMAPAuth(strategy.GenerateIMAPAuthToken([]byte("some-other-secret-entirely!!!")), srvCtx); ok {
-			t.Errorf("a token from an unknown secret authenticated as %q", id)
+		if id, _, ok := verifyIMAPAuth(imapDigest("some-other-secret-entirely!!!"), imapTestChallenge, imapTestBinding(), srvCtx); ok {
+			t.Errorf("a digest from an unknown secret authenticated as %q", id)
 		}
 	})
 
-	t.Run("garbage and empty tokens", func(t *testing.T) {
-		for _, tok := range [][]byte{nil, {}, []byte("short"), make([]byte, 32)} {
-			if _, _, ok := verifyIMAPAuth(tok, srvCtx); ok {
-				t.Errorf("token %x authenticated", tok)
+	t.Run("garbage and empty digests", func(t *testing.T) {
+		for _, d := range [][]byte{nil, {}, []byte("short"), make([]byte, 16), make([]byte, 32)} {
+			if _, _, ok := verifyIMAPAuth(d, imapTestChallenge, imapTestBinding(), srvCtx); ok {
+				t.Errorf("digest %x authenticated", d)
 			}
+		}
+	})
+
+	t.Run("digest from another session does not travel", func(t *testing.T) {
+		d := imapDigest(camouflageTestSecret)
+		other := bytes.Repeat([]byte{0x9E}, 32)
+		if _, _, ok := verifyIMAPAuth(d, "<1.2@mail.icloud.com>", imapTestBinding(), srvCtx); ok {
+			t.Error("a digest replayed under a different challenge authenticated")
+		}
+		if _, _, ok := verifyIMAPAuth(d, imapTestChallenge, other, srvCtx); ok {
+			t.Error("a digest replayed under a different channel binding authenticated")
+		}
+	})
+
+	t.Run("missing session inputs are refused", func(t *testing.T) {
+		if _, _, ok := verifyIMAPAuth(strategy.IMAPAuthResponse(global, "", imapTestBinding()), "", imapTestBinding(), srvCtx); ok {
+			t.Error("an empty challenge authenticated")
+		}
+		if _, _, ok := verifyIMAPAuth(strategy.IMAPAuthResponse(global, imapTestChallenge, nil), imapTestChallenge, nil, srvCtx); ok {
+			t.Error("a missing channel binding authenticated")
 		}
 	})
 
 	t.Run("server with no secret at all rejects everything", func(t *testing.T) {
 		empty := newTestServerContext(t)
-		if _, _, ok := verifyIMAPAuth(strategy.GenerateIMAPAuthToken(global), empty); ok {
+		if _, _, ok := verifyIMAPAuth(imapDigest(camouflageTestSecret), imapTestChallenge, imapTestBinding(), empty); ok {
 			t.Error("a server with no configured secret authenticated a client")
 		}
 	})
 }
 
-// TestVerifySSHAuth mirrors TestVerifyIMAPAuth for the SSH transport.
-func TestVerifySSHAuth(t *testing.T) {
-	global := []byte(camouflageTestSecret)
-	perClient := "per-client-secret-also-32-bytes!"
-
-	srvCtx := newTestServerContext(t)
-	srvCtx.cfg.Secret = global
-	r := NewClientRegistry(nil)
-	r.byID["c1"] = &ClientConfig{ID: "c1", Secret: perClient, Enabled: true}
-	srvCtx.registry = r
-
-	if id, _, ok := verifySSHAuth(strategy.GenerateSSHAuthToken([]byte(perClient)), srvCtx); !ok || id.id != "c1" || !id.perClient {
-		t.Errorf("per-client token: id=%q perClient=%v ok=%v, want c1/true/true", id.id, id.perClient, ok)
+// camouflageTLSCtx returns a server context that can actually complete the
+// STARTTLS upgrade: a global secret plus a throwaway leaf certificate.
+func camouflageTLSCtx(t *testing.T) *serverContext {
+	t.Helper()
+	srvCtx := camouflageCtx(t)
+	cert, err := mintLeafCertificate(defaultCertParams("imap.example.net"))
+	if err != nil {
+		t.Fatalf("minting a test certificate: %v", err)
 	}
-	if id, _, ok := verifySSHAuth(strategy.GenerateSSHAuthToken(global), srvCtx); !ok || id.id != "global" || id.perClient {
-		t.Errorf("global token: id=%q perClient=%v ok=%v, want global/false/true", id.id, id.perClient, ok)
+	srvCtx.tlsConfig = &tls.Config{
+		Certificates: []tls.Certificate{*cert},
+		MinVersion:   tls.VersionTLS12,
 	}
-	if _, _, ok := verifySSHAuth(strategy.GenerateSSHAuthToken([]byte("nope-nope-nope-nope-nope-nope!!")), srvCtx); ok {
-		t.Error("an unknown secret authenticated")
-	}
-	// An IMAP token must not open an SSH session: the two derivations are
-	// separate contexts and cross-acceptance would widen the auth surface.
-	if _, _, ok := verifySSHAuth(strategy.GenerateIMAPAuthToken(global), srvCtx); ok {
-		t.Error("an IMAP auth token was accepted by the SSH verifier")
-	}
+	return srvCtx
 }
 
-// imapClientScript drives the client half of the fake IMAP session against
-// imapServerHandshake running on the other end of a pipe.
-func imapClientScript(t *testing.T, conn net.Conn, token string, sendSelect bool) {
+// imapClientToTLS drives the plaintext half of the exchange and hands back the
+// secured connection, positioned right after the post-STARTTLS CAPABILITY.
+func imapClientToTLS(t *testing.T, conn net.Conn) (*tls.Conn, *bufio.Reader) {
 	t.Helper()
 	br := bufio.NewReader(conn)
 
-	write := func(s string) {
-		t.Helper()
-		if _, err := conn.Write([]byte(s)); err != nil {
-			t.Errorf("client write %q: %v", s, err)
-		}
+	if _, err := conn.Write([]byte(strategy.IMAPGreeting)); err != nil {
+		t.Fatalf("client greeting: %v", err)
 	}
-	// readUntilTag drains untagged "*" lines and returns the tagged response.
-	readUntilTag := func(tag string) string {
-		t.Helper()
-		for {
-			line, err := br.ReadString('\n')
-			if err != nil {
-				t.Fatalf("client read while waiting for %s: %v", tag, err)
-			}
-			if strings.HasPrefix(line, tag+" ") {
-				return line
-			}
-		}
+	if _, err := conn.Write([]byte("a001 CAPABILITY\r\n")); err != nil {
+		t.Fatalf("client CAPABILITY: %v", err)
 	}
-
-	write(strategy.IMAPGreeting)
-
-	write("a001 CAPABILITY\r\n")
-	if resp := readUntilTag("a001"); !strings.Contains(resp, "OK") {
-		t.Errorf("CAPABILITY response = %q, want OK", resp)
+	if resp := drainUntilTag(t, br, "a001"); !strings.Contains(resp, "OK") {
+		t.Fatalf("CAPABILITY response = %q, want OK", resp)
+	}
+	if _, err := conn.Write([]byte("a002 STARTTLS\r\n")); err != nil {
+		t.Fatalf("client STARTTLS: %v", err)
+	}
+	if resp := drainUntilTag(t, br, "a002"); !strings.Contains(resp, "OK") {
+		t.Fatalf("STARTTLS response = %q, want OK", resp)
+	}
+	if br.Buffered() != 0 {
+		t.Fatalf("the server sent %d bytes after the STARTTLS OK", br.Buffered())
 	}
 
-	write(fmt.Sprintf("a002 LOGIN user@example.com %s\r\n", token))
-	if resp := readUntilTag("a002"); !strings.Contains(resp, "OK") {
-		t.Errorf("LOGIN response = %q, want OK", resp)
-		return
+	tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12})
+	if err := tlsConn.Handshake(); err != nil {
+		t.Fatalf("client TLS handshake: %v", err)
 	}
+	br = bufio.NewReader(tlsConn)
 
-	if !sendSelect {
-		return
+	if _, err := tlsConn.Write([]byte("a003 CAPABILITY\r\n")); err != nil {
+		t.Fatalf("client CAPABILITY over TLS: %v", err)
 	}
-	write("a003 SELECT INBOX\r\n")
-	if resp := readUntilTag("a003"); !strings.Contains(resp, "OK [READ-WRITE]") {
-		t.Errorf("SELECT response = %q, want OK [READ-WRITE]", resp)
+	if resp := drainUntilTag(t, br, "a003"); !strings.Contains(resp, "OK") {
+		t.Fatalf("CAPABILITY (TLS) response = %q, want OK", resp)
 	}
+	return tlsConn, br
+}
+
+// imapClientSASL runs the SASL leg and returns the challenge the server chose.
+func imapClientSASL(t *testing.T, tlsConn *tls.Conn, br *bufio.Reader, secret []byte) string {
+	t.Helper()
+	if _, err := tlsConn.Write([]byte("a004 AUTHENTICATE CRAM-MD5\r\n")); err != nil {
+		t.Fatalf("client AUTHENTICATE: %v", err)
+	}
+	line, err := br.ReadString('\n')
+	if err != nil {
+		t.Fatalf("reading the SASL challenge: %v", err)
+	}
+	if !strings.HasPrefix(line, "+ ") {
+		t.Fatalf("expected a SASL continuation, got %q", line)
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(line[2:]))
+	if err != nil {
+		t.Fatalf("decoding the SASL challenge: %v", err)
+	}
+	challenge := string(raw)
+
+	binding, err := strategy.IMAPChannelBinding(tlsConn.ConnectionState())
+	if err != nil {
+		t.Fatalf("channel binding: %v", err)
+	}
+	resp := strategy.FormatIMAPAuthResponse(
+		"someone@icloud.com",
+		strategy.IMAPAuthResponse(secret, challenge, binding),
+	)
+	if _, err := fmt.Fprintf(tlsConn, "%s\r\n", resp); err != nil {
+		t.Fatalf("client SASL response: %v", err)
+	}
+	return challenge
 }
 
 // TestIMAPServerHandshakeSuccess drives the full server-side handshake against
@@ -338,7 +427,7 @@ func imapClientScript(t *testing.T, conn net.Conn, token string, sendSelect bool
 // any divergence from Dovecot's exchange is what a censor's active probe looks
 // for.
 func TestIMAPServerHandshakeSuccess(t *testing.T) {
-	srvCtx := camouflageCtx(t)
+	srvCtx := camouflageTLSCtx(t)
 	serverConn, clientConn := net.Pipe()
 	defer serverConn.Close()
 	defer clientConn.Close()
@@ -349,16 +438,24 @@ func TestIMAPServerHandshakeSuccess(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		id, br, err := imapServerHandshake(serverConn, srvCtx, testLogger(t))
-		if err == nil && br == nil {
-			err = fmt.Errorf("handshake succeeded but returned a nil reader")
+		id, tlsConn, br, err := imapServerHandshake(serverConn, srvCtx, testLogger(t))
+		if err == nil && (br == nil || tlsConn == nil) {
+			err = fmt.Errorf("handshake succeeded but returned a nil connection or reader")
 		}
 		done <- result{id, err}
 	}()
 
-	token := base64.StdEncoding.EncodeToString(
-		strategy.GenerateIMAPAuthToken([]byte(camouflageTestSecret)))
-	imapClientScript(t, clientConn, token, true)
+	tlsConn, br := imapClientToTLS(t, clientConn)
+	imapClientSASL(t, tlsConn, br, []byte(camouflageTestSecret))
+	if resp := drainUntilTag(t, br, "a004"); !strings.Contains(resp, "OK") {
+		t.Fatalf("AUTHENTICATE response = %q, want OK", resp)
+	}
+	if _, err := tlsConn.Write([]byte("a005 SELECT INBOX\r\n")); err != nil {
+		t.Fatalf("client SELECT: %v", err)
+	}
+	if resp := drainUntilTag(t, br, "a005"); !strings.Contains(resp, "OK [READ-WRITE]") {
+		t.Errorf("SELECT response = %q, want OK [READ-WRITE]", resp)
+	}
 
 	select {
 	case res := <-done:
@@ -377,8 +474,8 @@ func TestIMAPServerHandshakeSuccess(t *testing.T) {
 }
 
 // TestIMAPServerHandshakeRejections covers each way the exchange can go wrong.
-// Every one must return an error so the caller falls through to the fake
-// website rather than leaving a half-open session an attacker can probe.
+// Every one must return an error so the caller drops the connection rather than
+// leaving a half-open session an attacker can probe.
 func TestIMAPServerHandshakeRejections(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -404,67 +501,104 @@ func TestIMAPServerHandshakeRejections(t *testing.T) {
 			},
 		},
 		{
-			name: "malformed LOGIN command",
+			// A pre-1.11.0 client goes straight to LOGIN here. It must get a
+			// tagged rejection at once: its own reader treats NO as a failed
+			// command, so it fails instead of waiting out the deadline.
+			name: "a 1.10.x client sends LOGIN instead of STARTTLS",
 			script: func(t *testing.T, conn net.Conn) {
 				br := bufio.NewReader(conn)
 				conn.Write([]byte(strategy.IMAPGreeting))
 				conn.Write([]byte("a001 CAPABILITY\r\n"))
 				drainUntilTag(t, br, "a001")
-				conn.Write([]byte("a002 LOGIN onlyuser\r\n"))
+				conn.Write([]byte("a002 LOGIN deadbeef@icloud.com c29tZXRva2Vu\r\n"))
+				line := drainUntilTag(t, br, "a002")
+				if !strings.Contains(line, "NO [PRIVACYREQUIRED]") {
+					t.Errorf("rejection = %q, want a Dovecot-shaped PRIVACYREQUIRED", line)
+				}
 			},
 		},
 		{
-			name: "LOGIN token is not base64",
+			name: "client pipelines past the STARTTLS boundary",
 			script: func(t *testing.T, conn net.Conn) {
 				br := bufio.NewReader(conn)
 				conn.Write([]byte(strategy.IMAPGreeting))
 				conn.Write([]byte("a001 CAPABILITY\r\n"))
 				drainUntilTag(t, br, "a001")
-				conn.Write([]byte("a002 LOGIN user !!!not-base64!!!\r\n"))
+				conn.Write([]byte("a002 STARTTLS\r\na003 CAPABILITY\r\n"))
 			},
 		},
 		{
-			name: "LOGIN token from the wrong secret",
+			name: "no SASL exchange, a plain command instead",
 			script: func(t *testing.T, conn net.Conn) {
-				br := bufio.NewReader(conn)
-				conn.Write([]byte(strategy.IMAPGreeting))
-				conn.Write([]byte("a001 CAPABILITY\r\n"))
-				drainUntilTag(t, br, "a001")
-				bad := base64.StdEncoding.EncodeToString(
-					strategy.GenerateIMAPAuthToken([]byte("the-wrong-secret-entirely!!!!!!")))
-				fmt.Fprintf(conn, "a002 LOGIN user %s\r\n", bad)
-				// The server answers with a realistic rejection before bailing.
-				if line := drainUntilTag(t, br, "a002"); !strings.Contains(line, "NO [AUTHENTICATIONFAILED]") {
+				tlsConn, _ := imapClientToTLS(t, conn)
+				tlsConn.Write([]byte("a004 LOGIN user pass\r\n"))
+			},
+		},
+		{
+			name: "SASL response is not base64",
+			script: func(t *testing.T, conn net.Conn) {
+				tlsConn, br := imapClientToTLS(t, conn)
+				tlsConn.Write([]byte("a004 AUTHENTICATE CRAM-MD5\r\n"))
+				if _, err := br.ReadString('\n'); err != nil {
+					t.Fatalf("challenge: %v", err)
+				}
+				tlsConn.Write([]byte("!!!not-base64!!!\r\n"))
+				if line := drainUntilTag(t, br, "a004"); !strings.Contains(line, "NO [AUTHENTICATIONFAILED]") {
 					t.Errorf("rejection = %q, want a Dovecot-shaped AUTHENTICATIONFAILED", line)
 				}
 			},
 		},
 		{
-			name: "fourth command is not SELECT",
+			name: "SASL digest from the wrong secret",
 			script: func(t *testing.T, conn net.Conn) {
-				br := bufio.NewReader(conn)
-				conn.Write([]byte(strategy.IMAPGreeting))
-				conn.Write([]byte("a001 CAPABILITY\r\n"))
-				drainUntilTag(t, br, "a001")
-				token := base64.StdEncoding.EncodeToString(
-					strategy.GenerateIMAPAuthToken([]byte(camouflageTestSecret)))
-				fmt.Fprintf(conn, "a002 LOGIN user %s\r\n", token)
-				drainUntilTag(t, br, "a002")
-				conn.Write([]byte("a003 LOGOUT\r\n"))
+				tlsConn, br := imapClientToTLS(t, conn)
+				imapClientSASL(t, tlsConn, br, []byte("the-wrong-secret-entirely!!!!!!"))
+				if line := drainUntilTag(t, br, "a004"); !strings.Contains(line, "NO [AUTHENTICATIONFAILED]") {
+					t.Errorf("rejection = %q, want a Dovecot-shaped AUTHENTICATIONFAILED", line)
+				}
+			},
+		},
+		{
+			name: "SASL digest replayed from another session",
+			script: func(t *testing.T, conn net.Conn) {
+				tlsConn, br := imapClientToTLS(t, conn)
+				tlsConn.Write([]byte("a004 AUTHENTICATE CRAM-MD5\r\n"))
+				if _, err := br.ReadString('\n'); err != nil {
+					t.Fatalf("challenge: %v", err)
+				}
+				// A digest computed over a challenge and binding this session
+				// never used: exactly what a capture from an earlier session
+				// would give an attacker.
+				stale := strategy.IMAPAuthResponse([]byte(camouflageTestSecret),
+					imapTestChallenge, imapTestBinding())
+				fmt.Fprintf(tlsConn, "%s\r\n",
+					strategy.FormatIMAPAuthResponse("someone@icloud.com", stale))
+				if line := drainUntilTag(t, br, "a004"); !strings.Contains(line, "NO [AUTHENTICATIONFAILED]") {
+					t.Errorf("rejection = %q, want a Dovecot-shaped AUTHENTICATIONFAILED", line)
+				}
+			},
+		},
+		{
+			name: "command after login is not SELECT",
+			script: func(t *testing.T, conn net.Conn) {
+				tlsConn, br := imapClientToTLS(t, conn)
+				imapClientSASL(t, tlsConn, br, []byte(camouflageTestSecret))
+				drainUntilTag(t, br, "a004")
+				tlsConn.Write([]byte("a005 LOGOUT\r\n"))
 			},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			srvCtx := camouflageCtx(t)
+			srvCtx := camouflageTLSCtx(t)
 			serverConn, clientConn := net.Pipe()
 			defer serverConn.Close()
 			defer clientConn.Close()
 
 			errCh := make(chan error, 1)
 			go func() {
-				_, _, err := imapServerHandshake(serverConn, srvCtx, testLogger(t))
+				_, _, _, err := imapServerHandshake(serverConn, srvCtx, testLogger(t))
 				errCh <- err
 			}()
 
@@ -483,6 +617,82 @@ func TestIMAPServerHandshakeRejections(t *testing.T) {
 	}
 }
 
+// TestIMAPServerMintsAFreshChallengePerSession checks the call site, not the
+// generator: NewIMAPAuthChallenge is provably fresh on its own, and a server
+// that called it once and cached the result would still pass that test while
+// handing every session the same input to sign.
+func TestIMAPServerMintsAFreshChallengePerSession(t *testing.T) {
+	run := func() string {
+		t.Helper()
+		srvCtx := camouflageTLSCtx(t)
+		serverConn, clientConn := net.Pipe()
+		defer serverConn.Close()
+		defer clientConn.Close()
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			_, _, _, _ = imapServerHandshake(serverConn, srvCtx, testLogger(t))
+		}()
+
+		tlsConn, br := imapClientToTLS(t, clientConn)
+		challenge := imapClientSASL(t, tlsConn, br, []byte(camouflageTestSecret))
+		drainUntilTag(t, br, "a004")
+		tlsConn.Write([]byte("a005 SELECT INBOX\r\n"))
+		drainUntilTag(t, br, "a005")
+		clientConn.Close()
+		<-done
+		return challenge
+	}
+
+	a, b := run(), run()
+	if a == b {
+		t.Fatalf("both sessions were challenged with %q: the challenge is not minted per session", a)
+	}
+}
+
+// TestIMAPServerHandshakeWithoutTLSConfig pins the guard that keeps the
+// upgrade from being skipped: without a certificate there is no secured
+// session to authenticate in, and the handshake must fail rather than fall
+// back to the cleartext exchange it replaced.
+func TestIMAPServerHandshakeWithoutTLSConfig(t *testing.T) {
+	srvCtx := camouflageCtx(t) // no tlsConfig
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, tlsConn, _, err := imapServerHandshake(serverConn, srvCtx, testLogger(t))
+		if tlsConn != nil {
+			t.Error("a TLS connection came back from a context with no certificate")
+		}
+		errCh <- err
+	}()
+
+	br := bufio.NewReader(clientConn)
+	clientConn.Write([]byte(strategy.IMAPGreeting))
+	clientConn.Write([]byte("a001 CAPABILITY\r\n"))
+	drainUntilTag(t, br, "a001")
+	clientConn.Write([]byte("a002 STARTTLS\r\n"))
+	clientConn.Close()
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("the handshake succeeded without a TLS configuration")
+		}
+		// The message matters: without the explicit guard the failure comes
+		// out of crypto/tls instead, which means the upgrade was attempted
+		// and the operator is left reading a handshake error.
+		if !strings.Contains(err.Error(), "no TLS configuration") {
+			t.Errorf("error = %v, want the missing-configuration refusal", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("imapServerHandshake did not return")
+	}
+}
+
 // drainUntilTag reads lines until the given tag's response arrives.
 func drainUntilTag(t *testing.T, br *bufio.Reader, tag string) string {
 	t.Helper()
@@ -494,161 +704,5 @@ func drainUntilTag(t *testing.T, br *bufio.Reader, tag string) string {
 		if strings.HasPrefix(line, tag+" ") {
 			return line
 		}
-	}
-}
-
-// TestSSHServerHandshakeSuccess drives the fake SSH handshake end to end:
-// banner, KEXINIT, and the ECDH round trip carrying the auth token. The reply
-// token must be derived from the same secret, which is how the client confirms
-// it reached a real tiredvpn exit rather than a probe.
-func TestSSHServerHandshakeSuccess(t *testing.T) {
-	srvCtx := camouflageCtx(t)
-	serverConn, clientConn := net.Pipe()
-	defer serverConn.Close()
-	defer clientConn.Close()
-
-	type result struct {
-		clientID clientIdentity
-		err      error
-	}
-	done := make(chan result, 1)
-	go func() {
-		id, err := sshServerHandshake(serverConn, srvCtx, testLogger(t))
-		done <- result{id, err}
-	}()
-
-	br := bufio.NewReader(clientConn)
-
-	if _, err := clientConn.Write([]byte(strategy.SSHBanner)); err != nil {
-		t.Fatalf("write banner: %v", err)
-	}
-	banner, err := br.ReadString('\n')
-	if err != nil {
-		t.Fatalf("read server banner: %v", err)
-	}
-	if !strings.HasPrefix(banner, "SSH-2.0") {
-		t.Errorf("server banner = %q, want an SSH-2.0 identification line", banner)
-	}
-
-	if err := strategy.WriteSSHPacket(clientConn, strategy.BuildSSHKexInit()); err != nil {
-		t.Fatalf("write client KEXINIT: %v", err)
-	}
-	if _, err := strategy.ReadSSHPacket(br); err != nil {
-		t.Fatalf("read server KEXINIT: %v", err)
-	}
-
-	secret := []byte(camouflageTestSecret)
-	token := strategy.GenerateSSHAuthToken(secret)
-	if err := strategy.WriteSSHPacket(clientConn, strategy.BuildSSHKexECDH(30, token)); err != nil {
-		t.Fatalf("write ECDH init: %v", err)
-	}
-
-	reply, err := strategy.ReadSSHPacket(br)
-	if err != nil {
-		t.Fatalf("read ECDH reply: %v", err)
-	}
-	serverToken, err := strategy.ParseSSHKexPubKey(reply, 31)
-	if err != nil {
-		t.Fatalf("parse ECDH reply: %v", err)
-	}
-	if !strategy.VerifySSHAuthToken(serverToken, secret) {
-		t.Error("the server's reply token does not verify against the shared secret")
-	}
-
-	select {
-	case res := <-done:
-		if res.err != nil {
-			t.Fatalf("sshServerHandshake: %v", res.err)
-		}
-		if res.clientID.id != "global" {
-			t.Errorf("clientID = %q, want global", res.clientID.id)
-		}
-		if res.clientID.perClient {
-			t.Error("the global secret must not come back marked per-client")
-		}
-	case <-time.After(15 * time.Second):
-		t.Fatal("sshServerHandshake did not return")
-	}
-}
-
-// TestSSHServerHandshakeRejections covers the failure modes; each has to error
-// so the caller serves the fake website instead.
-func TestSSHServerHandshakeRejections(t *testing.T) {
-	tests := []struct {
-		name   string
-		script func(t *testing.T, conn net.Conn)
-	}{
-		{
-			name: "client hangs up before the banner",
-			script: func(t *testing.T, conn net.Conn) {
-				conn.Close()
-			},
-		},
-		{
-			name: "not an SSH-2.0 banner",
-			script: func(t *testing.T, conn net.Conn) {
-				conn.Write([]byte("SSH-1.5-ancient\r\n"))
-			},
-		},
-		{
-			name: "hangs up after the banner",
-			script: func(t *testing.T, conn net.Conn) {
-				br := bufio.NewReader(conn)
-				conn.Write([]byte(strategy.SSHBanner))
-				br.ReadString('\n')
-				conn.Close()
-			},
-		},
-		{
-			name: "ECDH init carries the wrong message type",
-			script: func(t *testing.T, conn net.Conn) {
-				br := bufio.NewReader(conn)
-				conn.Write([]byte(strategy.SSHBanner))
-				br.ReadString('\n')
-				strategy.WriteSSHPacket(conn, strategy.BuildSSHKexInit())
-				strategy.ReadSSHPacket(br)
-				token := strategy.GenerateSSHAuthToken([]byte(camouflageTestSecret))
-				strategy.WriteSSHPacket(conn, strategy.BuildSSHKexECDH(99, token))
-			},
-		},
-		{
-			name: "auth token from the wrong secret",
-			script: func(t *testing.T, conn net.Conn) {
-				br := bufio.NewReader(conn)
-				conn.Write([]byte(strategy.SSHBanner))
-				br.ReadString('\n')
-				strategy.WriteSSHPacket(conn, strategy.BuildSSHKexInit())
-				strategy.ReadSSHPacket(br)
-				bad := strategy.GenerateSSHAuthToken([]byte("the-wrong-secret-entirely!!!!!!"))
-				strategy.WriteSSHPacket(conn, strategy.BuildSSHKexECDH(30, bad))
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			srvCtx := camouflageCtx(t)
-			serverConn, clientConn := net.Pipe()
-			defer serverConn.Close()
-			defer clientConn.Close()
-
-			errCh := make(chan error, 1)
-			go func() {
-				_, err := sshServerHandshake(serverConn, srvCtx, testLogger(t))
-				errCh <- err
-			}()
-
-			tt.script(t, clientConn)
-			clientConn.Close()
-
-			select {
-			case err := <-errCh:
-				if err == nil {
-					t.Error("handshake succeeded, want a rejection")
-				}
-			case <-time.After(20 * time.Second):
-				t.Fatal("sshServerHandshake did not return")
-			}
-		})
 	}
 }

@@ -20,7 +20,92 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/padding"
 	"github.com/tiredvpn/tiredvpn/internal/protect"
+	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
+	"golang.org/x/crypto/hkdf"
 )
+
+// The QUIC auth frame and ack, version 2.
+//
+// v1 opened the first stream with the ASCII literal "QVPN" and answered with
+// "QACK". Constant magic in the first four bytes a peer reads is a fingerprint
+// to anyone terminating the stream, and it made the ALPN "tiredvpn" (below) a
+// matching giveaway one Initial-decrypt away.
+//
+// v2 removes both literals. The client frame is [nonce][marker][token]: the
+// nonce is fresh per connection so the opening bytes are never repeated, the
+// marker is HKDF(secret, nonce) and proves knowledge of the secret, and the
+// 32-byte time-boxed token stays for the replay window it already gave. The
+// server answers [marker][proof] with a marker derived the other direction so a
+// captured client marker cannot be echoed back to pass for the server.
+//
+// The marker LENGTH is derived from the nonce alone, not from (secret, nonce)
+// as the confusion marker is. Two constraints force this: the server has to
+// parse the frame before it knows which of several candidate secrets it is,
+// and the QUIC stream is fully encrypted so there is no observer to hide the
+// length from. The confusion marker hides its length because it sits in a
+// cleartext carrier; here there is nothing to hide it from, and a length the
+// server can compute from the public nonce lets it read exactly the right
+// number of bytes without over-reading into the tunnel stream.
+//
+// There is no transitional mode. A 1.10.x client sends "QVPN", the marker check
+// fails, and the connection is dropped.
+const (
+	quicNonceLen   = 16
+	quicMarkerMin  = 16
+	quicMarkerSpan = 16
+
+	quicClientMarkerLabel = "tiredvpn-quic-client-marker-v2"
+	quicServerMarkerLabel = "tiredvpn-quic-server-marker-v2"
+)
+
+// quicMarkerLen derives the marker length from the nonce. It is flat over
+// [16,32) because nonce[0] is uniform; there is no measured population to check
+// that shape against (verification rule 3), recorded here on purpose.
+func quicMarkerLen(nonce []byte) int {
+	if len(nonce) == 0 {
+		return quicMarkerMin
+	}
+	return quicMarkerMin + int(nonce[0])%quicMarkerSpan
+}
+
+// quicMarker derives the keyed marker for one direction from the secret and the
+// connection's nonce.
+func quicMarker(secret, nonce []byte, label string) []byte {
+	if len(secret) == 0 {
+		return nil
+	}
+	r := hkdf.New(sha256.New, secret, nonce, []byte(label))
+	out := make([]byte, quicMarkerLen(nonce))
+	if _, err := io.ReadFull(r, out); err != nil {
+		return nil
+	}
+	return out
+}
+
+func quicClientMarker(secret, nonce []byte) []byte {
+	return quicMarker(secret, nonce, quicClientMarkerLabel)
+}
+
+func quicServerMarker(secret, nonce []byte) []byte {
+	return quicMarker(secret, nonce, quicServerMarkerLabel)
+}
+
+// QUICNonceLen is the per-connection nonce length, exported for the wire tests.
+const QUICNonceLen = quicNonceLen
+
+// QUICMarkerLen returns the marker length for a captured nonce. Exported so the
+// wire-signature tests can locate the marker and pin its length distribution.
+func QUICMarkerLen(nonce []byte) int { return quicMarkerLen(nonce) }
+
+// QUICClientMarker recomputes the client->server marker for a nonce.
+func QUICClientMarker(secret, nonce []byte) []byte {
+	return quicMarker(secret, nonce, quicClientMarkerLabel)
+}
+
+// QUICServerMarker recomputes the server->client marker for a nonce.
+func QUICServerMarker(secret, nonce []byte) []byte {
+	return quicMarker(secret, nonce, quicServerMarkerLabel)
+}
 
 // QUICStrategy implements QUIC-based tunneling with DPI evasion
 // QUIC is harder to block because:
@@ -101,7 +186,7 @@ func (s *QUICStrategy) Description() string {
 	if s.useSalamander {
 		return "QUIC with Salamander padding - default server mode, per-client secret support"
 	}
-	return "QUIC-based tunnel over UDP with version spoofing (uses draft-29 to bypass TSPU)"
+	return "QUIC-based tunnel over UDP (QUIC v1, h3 ALPN)"
 }
 
 func (s *QUICStrategy) RequiresServer() bool {
@@ -149,16 +234,51 @@ func (s *QUICStrategy) Probe(ctx context.Context, target string) error {
 	return nil
 }
 
-// buildProbePacket creates a QUIC-like probe that won't trigger DPI
+// quicProbeLen is the datagram size of the reachability probe. RFC 9000 §14.1
+// requires a client Initial-carrying datagram to be at least 1200 bytes; the old
+// probe was 100 bytes, which is a malformed Initial and stands out on its own.
+const quicProbeLen = 1200
+
+// buildProbePacket builds a well-formed QUIC v1 long-header Initial padded to the
+// RFC 9000 minimum, with randomized connection IDs, packet number and payload.
+//
+// The old probe was a 100-byte packet stamped with draft-29 (0xff00001d) while
+// the real Connect path speaks v1 - two different fingerprints from one
+// strategy, and neither a legal Initial. This one is indistinguishable in
+// size/version/shape from a real v1 client's first flight.
+//
+// Verification rule 2: this is only used for a negative reachability signal (no
+// ICMP unreachable within the timeout). We cannot get a positive control from
+// our own server, which speaks Salamander-wrapped QUIC and silently drops a raw
+// Initial - so the probe detects a hard-closed port / blocked route, not a
+// working QUIC path. That limitation is inherent to probing our own obfuscated
+// listener and is documented rather than papered over.
 func (s *QUICStrategy) buildProbePacket() []byte {
-	packet := make([]byte, 100)
+	packet := make([]byte, quicProbeLen)
 
-	// Use draft-29 version (less likely to be blocked)
-	packet[0] = 0xc0                                    // Long header, Initial
-	binary.BigEndian.PutUint32(packet[1:5], 0xff00001d) // QUIC draft-29
+	// Long header, fixed bit set, Initial type (0b00), 4-byte packet number.
+	packet[0] = 0xc3
+	binary.BigEndian.PutUint32(packet[1:5], 0x00000001) // QUIC v1
 
-	// Random connection IDs
-	rand.Read(packet[5:])
+	off := 5
+	packet[off] = 8 // DCID length
+	off++
+	rand.Read(packet[off : off+8]) // random DCID
+	off += 8
+	packet[off] = 8 // SCID length
+	off++
+	rand.Read(packet[off : off+8]) // random SCID
+	off += 8
+	packet[off] = 0x00 // Token length varint = 0
+	off++
+
+	// Length varint (2-byte form): covers packet number + payload = the rest.
+	remaining := quicProbeLen - (off + 2)
+	binary.BigEndian.PutUint16(packet[off:off+2], 0x4000|uint16(remaining))
+	off += 2
+
+	// Packet number + payload are random (a real Initial's are AEAD ciphertext).
+	rand.Read(packet[off:])
 
 	return packet
 }
@@ -201,7 +321,11 @@ func (s *QUICStrategy) Connect(ctx context.Context, target string) (net.Conn, er
 	tlsConfig := &tls.Config{
 		InsecureSkipVerify: true,
 		ServerName:         s.selectSNI(),
-		NextProtos:         []string{"tiredvpn"},
+		// Advertise the RFC 9114 HTTP/3 token: the ALPN in a QUIC ClientHello is
+		// readable one Initial-decrypt away, so it must name a protocol other
+		// peers use, not the deployment. The tunnel discriminator moved into the
+		// encrypted 1-RTT stream (the keyed auth-frame marker above).
+		NextProtos: []string{"h3"},
 	}
 
 	// If using Salamander, create wrapped UDP connection
@@ -364,20 +488,16 @@ func (s *QUICStrategy) Connect(ctx context.Context, target string) (net.Conn, er
 	return quicConn, nil
 }
 
-// selectSNI chooses a whitelisted SNI for the connection
-func (s *QUICStrategy) selectSNI() string {
-	// Whitelisted domains that use QUIC and shouldn't be blocked
-	snis := []string{
-		"www.google.com",
-		"www.youtube.com",
-		"drive.google.com",
-		"docs.google.com",
-		"mail.google.com",
-	}
+// quicSNIRotator draws the ClientHello SNI from the shared whitelist. The old
+// list was five hardcoded Google domains selected by hour-of-day, which pinned
+// every client to the same SNI within any given hour - a synchronised signal -
+// and never used the vetted pool other strategies share. StrategyRandom picks
+// per connection so independent clients do not move in lockstep.
+var quicSNIRotator = evasion.NewSNIRotator(evasion.StrategyRandom)
 
-	// Deterministic selection based on time (changes hourly)
-	hour := time.Now().Hour()
-	return snis[hour%len(snis)]
+// selectSNI chooses a whitelisted SNI for the connection, fresh each call.
+func (s *QUICStrategy) selectSNI() string {
+	return quicSNIRotator.Next()
 }
 
 // extractHost extracts hostname from target address
@@ -401,33 +521,53 @@ type QUICConn struct {
 
 // Handshake performs authentication
 func (c *QUICConn) Handshake() error {
-	// Generate time-based auth token
-	token := c.generateAuthToken()
+	// Generate time-based auth token bound to this QUIC connection's TLS session
+	// exporter (S22): a token lifted from another connection carries that
+	// connection's exporter and fails the server's check.
+	ekm, err := quicExporterKey(c.Conn)
+	if err != nil {
+		return fmt.Errorf("quic: export keying material: %w", err)
+	}
+	token := c.generateAuthToken(ekm)
 
-	// Send auth frame: [MAGIC:4][TOKEN:32]
-	authFrame := make([]byte, 36)
-	copy(authFrame[0:4], []byte("QVPN"))
-	copy(authFrame[4:36], token)
+	// Fresh per-connection nonce keys the marker and never repeats the opening
+	// bytes across connections.
+	var nonce [quicNonceLen]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return fmt.Errorf("auth nonce: %w", err)
+	}
+	marker := quicClientMarker(c.secret, nonce[:])
+	if marker == nil {
+		return errors.New("auth marker derivation failed")
+	}
+
+	// Send auth frame: [nonce:16][marker:L][token:32]
+	authFrame := make([]byte, 0, len(nonce)+len(marker)+len(token))
+	authFrame = append(authFrame, nonce[:]...)
+	authFrame = append(authFrame, marker...)
+	authFrame = append(authFrame, token...)
 
 	c.stream.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	if _, err := c.stream.Write(authFrame); err != nil {
 		return fmt.Errorf("auth write failed: %w", err)
 	}
 
-	// Read server ack: [ACK:4][DERIVED:16]
+	// Read server ack: [marker:L][proof:16]. The marker length is derived from
+	// our own nonce, so we know exactly how many bytes to read.
+	markerLen := quicMarkerLen(nonce[:])
 	c.stream.SetReadDeadline(time.Now().Add(10 * time.Second))
-	ack := make([]byte, 20)
+	ack := make([]byte, markerLen+16)
 	if _, err := io.ReadFull(c.stream, ack); err != nil {
 		return fmt.Errorf("auth read failed: %w", err)
 	}
 
-	// Verify ack
-	if string(ack[0:4]) != "QACK" {
+	// Verify the server's answering marker and its keyed proof.
+	expectedMarker := quicServerMarker(c.secret, nonce[:])
+	if expectedMarker == nil || !hmac.Equal(ack[:markerLen], expectedMarker) {
 		return errors.New("invalid server ack")
 	}
-
 	expectedDerived := c.deriveKey("server-ack")[:16]
-	if !hmacEqual(ack[4:20], expectedDerived) {
+	if !hmac.Equal(ack[markerLen:markerLen+16], expectedDerived) {
 		return errors.New("server verification failed")
 	}
 
@@ -437,14 +577,30 @@ func (c *QUICConn) Handshake() error {
 	return nil
 }
 
-func (c *QUICConn) generateAuthToken() []byte {
-	// Time-based token (1-minute window)
-	timestamp := make([]byte, 8)
-	binary.BigEndian.PutUint64(timestamp, uint64(time.Now().Unix()/60))
+func (c *QUICConn) generateAuthToken(ekm []byte) []byte {
+	return quicAuthToken(c.secret, ekm, 0)
+}
 
-	h := hmac.New(sha256.New, c.secret)
+// quicExporterKey pulls the RFC 8446 §7.5 exporter out of a QUIC connection's
+// underlying TLS 1.3 session for auth-token binding. quic-go surfaces the
+// crypto/tls state via Conn.ConnectionState().TLS, whose ExportKeyingMaterial
+// is populated for a completed handshake.
+func quicExporterKey(conn *quic.Conn) ([]byte, error) {
+	state := conn.ConnectionState().TLS
+	return customtls.ExportBindingKey(&state)
+}
+
+// quicAuthToken derives the QUIC auth token for the given 1-minute bucket
+// offset, bound to the session exporter ekm (S22). Both ends compute it the
+// same way over the same exporter.
+func quicAuthToken(secret, ekm []byte, minuteOffset int64) []byte {
+	timestamp := make([]byte, 8)
+	binary.BigEndian.PutUint64(timestamp, uint64(time.Now().Unix()/60+minuteOffset))
+
+	h := hmac.New(sha256.New, secret)
 	h.Write(timestamp)
 	h.Write([]byte("quic-auth"))
+	h.Write(ekm) // TLS-session binding
 	return h.Sum(nil)
 }
 
@@ -582,7 +738,9 @@ func (s *QUICServer) Start(ctx context.Context, handler func(net.Conn)) error {
 
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{"tiredvpn"},
+		// Match a real HTTP/3 endpoint's ALPN; the tunnel is told apart by the
+		// keyed marker inside the encrypted stream, not by this token.
+		NextProtos: []string{"h3"},
 	}
 
 	quicConfig := &quic.Config{
@@ -853,25 +1011,40 @@ type QUICServerConn struct {
 
 // VerifyClient verifies client authentication against per-client secrets and global secret
 func (c *QUICServerConn) VerifyClient() error {
-	// Read auth frame: [MAGIC:4][TOKEN:32]
+	// Read auth frame: [nonce:16][marker:L][token:32]. The nonce comes first and
+	// its byte fixes the marker length, so the frame can be parsed before any
+	// secret is known.
 	c.stream.SetReadDeadline(time.Now().Add(10 * time.Second))
-	authFrame := make([]byte, 36)
-	if _, err := io.ReadFull(c.stream, authFrame); err != nil {
+	var nonce [quicNonceLen]byte
+	if _, err := io.ReadFull(c.stream, nonce[:]); err != nil {
 		return fmt.Errorf("auth read failed: %w", err)
 	}
+	markerLen := quicMarkerLen(nonce[:])
+	rest := make([]byte, markerLen+32)
+	if _, err := io.ReadFull(c.stream, rest); err != nil {
+		return fmt.Errorf("auth read failed: %w", err)
+	}
+	clientMarker := rest[:markerLen]
+	clientToken := rest[markerLen : markerLen+32]
 
-	// Verify magic
-	if string(authFrame[0:4]) != "QVPN" {
-		return errors.New("invalid auth magic")
+	// Session binding (S22): the client bound its token to this QUIC
+	// connection's TLS session exporter. Derive the same exporter from our side
+	// so a token replayed from another connection fails below.
+	ekm, err := quicExporterKey(c.Conn)
+	if err != nil {
+		return fmt.Errorf("quic: export keying material: %w", err)
 	}
 
-	clientToken := authFrame[4:36]
-
-	// Helper to verify token with a specific secret
+	// A secret authenticates only if it produces both the keyed marker and a
+	// token inside the time window: the marker binds the connection's nonce,
+	// the token bounds replay and is bound to this session's exporter.
 	verifyWithSecret := func(secret []byte) bool {
+		want := quicClientMarker(secret, nonce[:])
+		if want == nil || !hmac.Equal(clientMarker, want) {
+			return false
+		}
 		for offset := int64(-1); offset <= 1; offset++ {
-			expectedToken := c.generateAuthTokenWithSecret(secret, offset)
-			if hmac.Equal(clientToken, expectedToken) {
+			if hmac.Equal(clientToken, quicAuthToken(secret, ekm, offset)) {
 				return true
 			}
 		}
@@ -887,7 +1060,7 @@ func (c *QUICServerConn) VerifyClient() error {
 				c.ClientIDFromRegistry = true
 				c.ClientName = info.Name
 				log.Info("QUIC authenticated (client: %s, id: %s)", info.Name, info.ClientID)
-				return c.sendAck()
+				return c.sendAck(nonce[:])
 			}
 		}
 	}
@@ -898,17 +1071,22 @@ func (c *QUICServerConn) VerifyClient() error {
 		c.ClientID = "global"
 		c.ClientName = "global"
 		log.Info("QUIC authenticated (global secret)")
-		return c.sendAck()
+		return c.sendAck(nonce[:])
 	}
 
 	return errors.New("token verification failed")
 }
 
-// sendAck sends the authentication acknowledgment
-func (c *QUICServerConn) sendAck() error {
-	ack := make([]byte, 20)
-	copy(ack[0:4], []byte("QACK"))
-	copy(ack[4:20], c.deriveKey("server-ack")[:16])
+// sendAck sends the authentication acknowledgment: [marker:L][proof:16], keyed
+// to the same nonce the client chose but derived in the server direction.
+func (c *QUICServerConn) sendAck(nonce []byte) error {
+	marker := quicServerMarker(c.secret, nonce)
+	if marker == nil {
+		return errors.New("server marker derivation failed")
+	}
+	ack := make([]byte, 0, len(marker)+16)
+	ack = append(ack, marker...)
+	ack = append(ack, c.deriveKey("server-ack")[:16]...)
 
 	c.stream.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	if _, err := c.stream.Write(ack); err != nil {
@@ -917,20 +1095,6 @@ func (c *QUICServerConn) sendAck() error {
 
 	c.stream.SetDeadline(time.Time{})
 	return nil
-}
-
-func (c *QUICServerConn) generateAuthToken(minuteOffset int64) []byte {
-	return c.generateAuthTokenWithSecret(c.secret, minuteOffset)
-}
-
-func (c *QUICServerConn) generateAuthTokenWithSecret(secret []byte, minuteOffset int64) []byte {
-	timestamp := make([]byte, 8)
-	binary.BigEndian.PutUint64(timestamp, uint64(time.Now().Unix()/60+minuteOffset))
-
-	h := hmac.New(sha256.New, secret)
-	h.Write(timestamp)
-	h.Write([]byte("quic-auth"))
-	return h.Sum(nil)
 }
 
 func (c *QUICServerConn) deriveKey(context string) []byte {

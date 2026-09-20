@@ -1,12 +1,10 @@
 package strategy
 
 import (
-	"bytes"
 	"context"
-	"crypto/rand"
+	"crypto/hmac"
 	"encoding/binary"
-	"fmt"
-	"io"
+	"errors"
 	mathrand "math/rand"
 	"net"
 	"sync"
@@ -15,48 +13,55 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/log"
 )
 
-// confusionDiscardPool provides reusable scratch buffers for draining the tail
-// of oversized server frames in ConfusedConn.Read without allocating per call.
-var confusionDiscardPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, 4096)
-		return &b
-	},
-}
-
 // ProtocolConfusionStrategy crafts packets that look like different protocols
-// to different parsers (DPI vs real server)
+// to different parsers (DPI vs real server).
+//
+// The secret is not decoration here. It keys the marker the server
+// authenticates on and the record layer that carries every byte after it, so a
+// strategy built without one cannot connect at all - which is why registration
+// is gated on having one, exactly like the other fifteen strategies.
 type ProtocolConfusionStrategy struct {
 	manager       *Manager // Reference to Manager for IPv6/IPv4 support
 	confusionType ConfusionType
+	secret        []byte
 }
 
 // ConfusionType defines which protocol confusion to use
 type ConfusionType int
 
 const (
-	// ConfusionDNSoverTLS - Packet looks like DNS to DPI, TLS to server
+	// ConfusionDNSoverTLS - carried in an EDNS0 option of a DNS-over-TCP query
 	ConfusionDNSoverTLS ConfusionType = iota
 
-	// ConfusionHTTPoverTLS - HTTP request prefix, but actually TLS
+	// ConfusionHTTPoverTLS - carried in the body of an HTTP/1.1 POST
 	ConfusionHTTPoverTLS
 
-	// ConfusionSSHoverTLS - SSH banner prefix, then TLS
+	// ConfusionSSHoverTLS - carried in an SSH string inside a binary packet
 	ConfusionSSHoverTLS
 
-	// ConfusionSMTPoverTLS - SMTP EHLO prefix, then TLS
+	// ConfusionSMTPoverTLS - carried in a SASL initial response
 	ConfusionSMTPoverTLS
 
-	// ConfusionMultiLayer - Multiple protocol headers stacked
+	// ConfusionMultiLayer - carried in a gRPC-Web message over HTTP/1.1
 	ConfusionMultiLayer
 )
 
+// errConfusionServerAuth is what a client reports when the answering carrier
+// does not carry the marker only our server can produce. It covers both an
+// impostor and an old server that still answers with the literal "TIRED".
+var errConfusionServerAuth = errors.New("confusion: server did not prove the secret")
+
+// errConfusionNoSecret guards the one path that could otherwise put an
+// unauthenticated confusion connection on the wire.
+var errConfusionNoSecret = errors.New("confusion: no secret configured")
+
 // NewProtocolConfusionStrategy creates a new confusion strategy
 // manager is required for IPv6/IPv4 transport layer support
-func NewProtocolConfusionStrategy(manager *Manager, confType ConfusionType) *ProtocolConfusionStrategy {
+func NewProtocolConfusionStrategy(manager *Manager, confType ConfusionType, secret []byte) *ProtocolConfusionStrategy {
 	return &ProtocolConfusionStrategy{
 		manager:       manager,
 		confusionType: confType,
+		secret:        secret,
 	}
 }
 
@@ -103,18 +108,29 @@ func (s *ProtocolConfusionStrategy) Probe(ctx context.Context, target string) er
 }
 
 func (s *ProtocolConfusionStrategy) Connect(ctx context.Context, target string) (net.Conn, error) {
+	secret := dialSecret(ctx, s.secret)
+	if len(secret) == 0 {
+		return nil, errConfusionNoSecret
+	}
+
 	serverAddr := s.manager.GetServerAddr(ctx)
 	log.Debug("Protocol Confusion: Connecting to %s (raw TCP, no TLS)", serverAddr)
 
-	// Confusion operates on raw TCP — the confused preamble IS the transport layer.
-	// No TLS wrapper; DPI sees DNS/HTTP/SSH/SMTP, server detects TIRED marker.
+	// Confusion operates on raw TCP — the confused carrier IS the transport
+	// layer. No TLS wrapper; DPI sees a well-formed DNS/HTTP/SSH/SMTP/gRPC-Web
+	// exchange, the server sees a keyed marker it can authenticate.
 	dialer := &net.Dialer{}
 	conn, err := dialer.DialContext(ctx, "tcp", serverAddr)
 	if err != nil {
 		return nil, err
 	}
 
-	return NewConfusedConn(conn, s.confusionType), nil
+	cc, err := NewConfusedConn(conn, s.confusionType, secret)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return cc, nil
 }
 
 // ConfusedConn wraps connection with protocol confusion
@@ -129,109 +145,6 @@ var confusionDomains = []string{
 
 func getRandomConfusionDomain() string {
 	return confusionDomains[mathrand.Intn(len(confusionDomains))]
-}
-
-type ConfusedConn struct {
-	net.Conn
-	confType    ConfusionType
-	headerSent  bool
-	headerRead  bool
-	serverMagic []byte
-	rawMode     bool // When true, Read() passes data through without deframing (for VPN mode)
-}
-
-// NewConfusedConn creates a confused connection
-func NewConfusedConn(conn net.Conn, confType ConfusionType) *ConfusedConn {
-	return &ConfusedConn{
-		Conn:        conn,
-		confType:    confType,
-		serverMagic: []byte("TIRED"), // Server responds with this to confirm
-	}
-}
-
-// SetRawMode enables raw mode where Read() passes data through without deframing.
-// This is required for VPN mode where the caller (vpn.go) handles framing itself.
-func (c *ConfusedConn) SetRawMode(raw bool) {
-	c.rawMode = raw
-}
-
-// Write prepends confusion header to first write, adds length-prefix to subsequent writes
-func (c *ConfusedConn) Write(p []byte) (int, error) {
-	if !c.headerSent {
-		c.headerSent = true
-
-		// Build confused packet
-		confusedData := c.buildConfusedPacket(p)
-		_, err := c.Conn.Write(confusedData)
-		if err != nil {
-			return 0, err
-		}
-		return len(p), nil
-	}
-
-	// Subsequent writes: add length prefix (server expects length-prefixed data)
-	frame := make([]byte, 4+len(p))
-	binary.BigEndian.PutUint32(frame[:4], uint32(len(p)))
-	copy(frame[4:], p)
-	_, err := c.Conn.Write(frame)
-	if err != nil {
-		return 0, err
-	}
-	return len(p), nil
-}
-
-// buildConfusedPacket creates a packet that confuses DPI
-func (c *ConfusedConn) buildConfusedPacket(realData []byte) []byte {
-	switch c.confType {
-	case ConfusionDNSoverTLS:
-		return c.buildDNSConfusion(realData)
-	case ConfusionHTTPoverTLS:
-		return c.buildHTTPConfusion(realData)
-	case ConfusionSSHoverTLS:
-		return c.buildSSHConfusion(realData)
-	case ConfusionSMTPoverTLS:
-		return c.buildSMTPConfusion(realData)
-	case ConfusionMultiLayer:
-		return c.buildMultiLayerConfusion(realData)
-	default:
-		return realData
-	}
-}
-
-// buildDNSConfusion makes packet look like a DNS-over-TCP query.
-// DNS-over-TCP format: [length:2][dns-message], flags=0x0100 (standard query, RD set).
-func (c *ConfusedConn) buildDNSConfusion(realData []byte) []byte {
-	var dns bytes.Buffer
-
-	// Random transaction ID
-	txid := make([]byte, 2)
-	rand.Read(txid)
-	dns.Write(txid)
-	// Flags: standard query (0x0100) - not a response
-	dns.Write([]byte{0x01, 0x00})
-	// Questions: 1, Answers: 0, Authority: 0, Additional: 0
-	dns.Write([]byte{0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
-
-	// Question: encode getRandomConfusionDomain() as DNS labels
-	domain := getRandomConfusionDomain()
-	labels := encodeDNSName(domain)
-	dns.Write(labels)
-	// Type: A (0x0001), Class: IN (0x0001)
-	dns.Write([]byte{0x00, 0x01, 0x00, 0x01})
-
-	// Magic marker + length + real data embedded after question
-	dns.Write([]byte{0x00, 0x00, 0x54, 0x49, 0x52, 0x45, 0x44}) // \0\0TIRED
-	lenBytes := make([]byte, 4)
-	binary.BigEndian.PutUint32(lenBytes, uint32(len(realData)))
-	dns.Write(lenBytes)
-	dns.Write(realData)
-
-	// DNS-over-TCP 2-byte length prefix
-	msg := dns.Bytes()
-	var buf bytes.Buffer
-	buf.Write([]byte{byte(len(msg) >> 8), byte(len(msg))})
-	buf.Write(msg)
-	return buf.Bytes()
 }
 
 // encodeDNSName encodes a dotted domain into DNS label format.
@@ -252,235 +165,185 @@ func encodeDNSName(domain string) []byte {
 	return out
 }
 
-// buildHTTPConfusion makes packet look like HTTP request
-func (c *ConfusedConn) buildHTTPConfusion(realData []byte) []byte {
-	var buf bytes.Buffer
-
-	// Fake HTTP request header
-	buf.WriteString("GET / HTTP/1.1\r\n")
-	fmt.Fprintf(&buf, "Host: %s\r\n", getRandomConfusionDomain())
-	buf.WriteString("User-Agent: Mozilla/5.0\r\n")
-	buf.WriteString("Accept: */*\r\n")
-	buf.WriteString("\r\n") // End of headers
-
-	// Magic marker in body
-	buf.Write([]byte{0x54, 0x49, 0x52, 0x45, 0x44}) // TIRED
-
-	// Length
-	lenBytes := make([]byte, 4)
-	binary.BigEndian.PutUint32(lenBytes, uint32(len(realData)))
-	buf.Write(lenBytes)
-
-	// Real data
-	buf.Write(realData)
-
-	return buf.Bytes()
+// confusionPushback lets the carrier reader hand bytes it over-read back to the
+// record layer that comes after it.
+type confusionPushback struct {
+	net.Conn
+	pre []byte
 }
 
-// buildSSHConfusion starts with SSH banner followed by a well-formed KEXINIT packet.
-// SSH-2.0 binary packet format: [uint32 packet_length][uint8 padding_length][payload][random padding]
-// where packet_length = 1 (padding_length) + len(payload) + padding_length.
-func (c *ConfusedConn) buildSSHConfusion(realData []byte) []byte {
-	var buf bytes.Buffer
-
-	// SSH banner
-	buf.WriteString("SSH-2.0-OpenSSH_8.9\r\n")
-
-	// Build KEXINIT payload:
-	//   0x14 (SSH_MSG_KEXINIT) + 16-byte cookie + kex name-lists + reserved uint32
-	// We use empty name-lists (each is a uint32-length-prefixed string with length 0).
-	// There are 10 name-list fields in KEXINIT plus 1 boolean (first_kex_packet_follows).
-	// Minimal payload: 1 + 16 + 10*4 + 1 + 4 = 62 bytes
-	var payload bytes.Buffer
-	payload.WriteByte(0x14) // SSH_MSG_KEXINIT
-
-	// 16-byte random cookie - must not contain the TIRED marker (\x00\x00TIRED)
-	// because the server scans the stream for that sequence to detect our traffic.
-	tiredMarker := []byte{0x00, 0x00, 0x54, 0x49, 0x52, 0x45, 0x44} // \0\0TIRED
-	cookie := make([]byte, 16)
-	for {
-		rand.Read(cookie)
-		if !bytes.Contains(cookie, tiredMarker) {
-			break
+func (c *confusionPushback) Read(p []byte) (int, error) {
+	if len(c.pre) > 0 {
+		n := copy(p, c.pre)
+		c.pre = c.pre[n:]
+		if len(c.pre) == 0 {
+			c.pre = nil
 		}
-	}
-	payload.Write(cookie)
-
-	// 10 empty name-list fields (each: uint32 length = 0, no data)
-	emptyList := []byte{0x00, 0x00, 0x00, 0x00}
-	for i := 0; i < 10; i++ {
-		payload.Write(emptyList)
-	}
-	payload.WriteByte(0x00)  // first_kex_packet_follows = false
-	payload.Write(emptyList) // reserved uint32 = 0
-
-	payloadBytes := payload.Bytes()
-
-	// Compute padding: total (1 + len(payload) + padding) must be multiple of 8, min padding 4
-	blockSize := 8
-	// packetLen field covers: 1 byte padding_length + len(payload) + padding_length bytes
-	baseLen := 1 + len(payloadBytes)
-	paddingLen := blockSize - (baseLen % blockSize)
-	if paddingLen < 4 {
-		paddingLen += blockSize
-	}
-
-	// packet_length = 1 (padding_length field) + len(payload) + paddingLen
-	packetLength := uint32(1 + len(payloadBytes) + paddingLen)
-
-	pktLenBytes := make([]byte, 4)
-	binary.BigEndian.PutUint32(pktLenBytes, packetLength)
-	buf.Write(pktLenBytes)
-	buf.WriteByte(byte(paddingLen))
-	buf.Write(payloadBytes)
-
-	padding := make([]byte, paddingLen)
-	rand.Read(padding)
-	buf.Write(padding)
-
-	// Magic marker + length + real data (appended after the SSH packet)
-	buf.Write([]byte{0x54, 0x49, 0x52, 0x45, 0x44}) // TIRED
-
-	lenBytes := make([]byte, 4)
-	binary.BigEndian.PutUint32(lenBytes, uint32(len(realData)))
-	buf.Write(lenBytes)
-
-	buf.Write(realData)
-
-	return buf.Bytes()
-}
-
-// buildSMTPConfusion opens with SMTP client role (EHLO only, no server 220 greeting).
-func (c *ConfusedConn) buildSMTPConfusion(realData []byte) []byte {
-	var buf bytes.Buffer
-
-	// Client starts the conversation: EHLO followed by the magic marker
-	fmt.Fprintf(&buf, "EHLO %s\r\n", getRandomConfusionDomain())
-
-	// Magic marker + length + real data
-	buf.Write([]byte{0x00, 0x00})
-	buf.Write([]byte("TIRED"))
-
-	lenBytes := make([]byte, 4)
-	binary.BigEndian.PutUint32(lenBytes, uint32(len(realData)))
-	buf.Write(lenBytes)
-	buf.Write(realData)
-
-	return buf.Bytes()
-}
-
-// buildMultiLayerConfusion stacks multiple protocol headers
-func (c *ConfusedConn) buildMultiLayerConfusion(realData []byte) []byte {
-	var buf bytes.Buffer
-
-	// Layer 1: HTTP
-	buf.WriteString("POST /api HTTP/1.1\r\n")
-	buf.WriteString("Host: googleapis.com\r\n")
-	buf.WriteString("Content-Type: application/grpc\r\n")
-	buf.WriteString("\r\n")
-
-	// Layer 2: gRPC frame header
-	buf.Write([]byte{0x00})                   // No compression
-	buf.Write([]byte{0x00, 0x00, 0x00, 0x00}) // Placeholder length
-
-	// Layer 3: Protocol buffers-like structure
-	buf.Write([]byte{0x0a}) // Field 1, wire type 2 (length-delimited)
-
-	// Magic in "field value"
-	buf.Write([]byte{0x05})                         // Length 5
-	buf.Write([]byte{0x54, 0x49, 0x52, 0x45, 0x44}) // TIRED
-
-	// Real data length
-	lenBytes := make([]byte, 4)
-	binary.BigEndian.PutUint32(lenBytes, uint32(len(realData)))
-	buf.Write(lenBytes)
-
-	// Real data
-	buf.Write(realData)
-
-	return buf.Bytes()
-}
-
-// Read handles server response, stripping confusion headers
-// After initial handshake (server magic), reads length-prefixed frames from server
-// In rawMode, passes data through without deframing (for VPN mode where caller handles framing)
-func (c *ConfusedConn) Read(p []byte) (int, error) {
-	if !c.headerRead {
-		// First read - expect server magic
-		magic := make([]byte, len(c.serverMagic))
-		_, err := io.ReadFull(c.Conn, magic)
-		if err != nil {
-			return 0, err
-		}
-
-		if !bytes.Equal(magic, c.serverMagic) {
-			// Server doesn't understand protocol, fall back
-			// Return magic as data
-			copy(p, magic)
-			c.headerRead = true
-			return len(magic), nil
-		}
-
-		c.headerRead = true
-	}
-
-	// In raw mode, pass data through without deframing
-	// This is for VPN mode where vpn.go handles [len:4][data] framing itself
-	if c.rawMode {
-		return c.Conn.Read(p)
-	}
-
-	// Read length-prefixed frame from server
-	// Format: [4 bytes length (big-endian)][data]
-	var lenBuf [4]byte
-	if _, err := io.ReadFull(c.Conn, lenBuf[:]); err != nil {
-		return 0, err
-	}
-
-	pktLen := binary.BigEndian.Uint32(lenBuf[:])
-	if pktLen == 0 {
-		// Zero-length packet, return empty read
-		return 0, nil
-	}
-	if pktLen > 64*1024 {
-		// Sanity check - max 64KB per frame
-		return 0, io.ErrUnexpectedEOF
-	}
-
-	// Read exactly pktLen bytes
-	if int(pktLen) > len(p) {
-		// Buffer too small - read what we can, discard rest
-		// This shouldn't happen with normal usage
-		n, err := io.ReadFull(c.Conn, p)
-		if err != nil {
-			return n, err
-		}
-		// Discard remaining bytes using a pooled scratch buffer so an
-		// oversized frame doesn't allocate proportional to its length.
-		remaining := int(pktLen) - len(p)
-		bufPtr := confusionDiscardPool.Get().(*[]byte)
-		scratch := *bufPtr
-		for remaining > 0 {
-			chunk := remaining
-			if chunk > len(scratch) {
-				chunk = len(scratch)
-			}
-			rn, rerr := io.ReadFull(c.Conn, scratch[:chunk])
-			remaining -= rn
-			if rerr != nil {
-				break
-			}
-		}
-		confusionDiscardPool.Put(bufPtr)
 		return n, nil
 	}
+	return c.Conn.Read(p)
+}
 
-	return io.ReadFull(c.Conn, p[:pktLen])
+// ConfusedConn is the client end of the confusion wire.
+//
+// The first write goes out inside the carrier; the first read expects the
+// answering carrier and refuses to continue unless it proves the secret.
+// Everything after that is the sealed record layer, so there is no mode where
+// user bytes reach the socket unencrypted - which is what the old rawMode
+// switch amounted to, and why it is gone.
+type ConfusedConn struct {
+	net.Conn // the raw socket
+
+	variant byte
+	secret  []byte
+	nonce   [ConfusionNonceLen]byte
+
+	pb     *confusionPushback
+	sealed *ConfusionConn
+
+	wMu         sync.Mutex
+	sentCarrier bool
+
+	rMu        sync.Mutex
+	gotCarrier bool
+}
+
+// NewConfusedConn creates a confused connection over an already-dialled socket.
+func NewConfusedConn(conn net.Conn, confType ConfusionType, secret []byte) (*ConfusedConn, error) {
+	if len(secret) == 0 {
+		return nil, errConfusionNoSecret
+	}
+	nonce, err := NewConfusionNonce()
+	if err != nil {
+		return nil, err
+	}
+
+	variant := byte(confType)
+	pb := &confusionPushback{Conn: conn}
+	sealed, err := NewConfusionConn(pb, secret, nonce[:], variant, true)
+	if err != nil {
+		return nil, err
+	}
+
+	return &ConfusedConn{
+		Conn:    conn,
+		variant: variant,
+		secret:  secret,
+		nonce:   nonce,
+		pb:      pb,
+		sealed:  sealed,
+	}, nil
+}
+
+// Write seals p and, on the first call, wraps the first sealed frame in the
+// carrier for this variant.
+func (c *ConfusedConn) Write(p []byte) (int, error) {
+	c.wMu.Lock()
+	defer c.wMu.Unlock()
+
+	if c.sentCarrier {
+		return c.sealed.Write(p)
+	}
+
+	frames := c.sealed.SealFrames(p)
+	first, rest := splitFirstConfusionFrame(frames)
+
+	marker := ConfusionClientMarker(c.secret, c.nonce[:], c.variant)
+	if len(marker) == 0 {
+		return 0, errConfusionNoSecret
+	}
+	carrier, err := BuildConfusionRequest(c.variant, c.nonce[:], marker, first)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := c.Conn.Write(carrier); err != nil {
+		return 0, err
+	}
+	if len(rest) > 0 {
+		if _, err := c.Conn.Write(rest); err != nil {
+			return 0, err
+		}
+	}
+	c.sentCarrier = true
+	return len(p), nil
+}
+
+// Read consumes the answering carrier once, verifies the server's marker, and
+// then reads the sealed stream.
+func (c *ConfusedConn) Read(p []byte) (int, error) {
+	c.rMu.Lock()
+	if !c.gotCarrier {
+		if err := c.readServerCarrier(); err != nil {
+			c.rMu.Unlock()
+			return 0, err
+		}
+		c.gotCarrier = true
+	}
+	c.rMu.Unlock()
+
+	return c.sealed.Read(p)
+}
+
+// ReadFrame returns one sealed message, preserving the boundary the peer wrote.
+func (c *ConfusedConn) ReadFrame() ([]byte, error) {
+	c.rMu.Lock()
+	if !c.gotCarrier {
+		if err := c.readServerCarrier(); err != nil {
+			c.rMu.Unlock()
+			return nil, err
+		}
+		c.gotCarrier = true
+	}
+	c.rMu.Unlock()
+
+	return c.sealed.ReadFrame()
+}
+
+func (c *ConfusedConn) readServerCarrier() error {
+	carrier, leftover, _, err := ReadConfusionCarrier(c.Conn, nil, func(b []byte) (*ConfusionCarrier, error) {
+		return ParseConfusionResponse(c.variant, b)
+	})
+	if err != nil {
+		if errors.Is(err, ErrConfusionNotCarrier) {
+			// A server that answers in some other shape is not ours. Say so
+			// rather than handing its bytes up as if they were payload, which
+			// is what the old fall-through did.
+			return errConfusionServerAuth
+		}
+		return err
+	}
+
+	want := ConfusionServerMarker(c.secret, c.nonce[:], c.variant)
+	if len(want) == 0 || len(carrier.Body) < len(want) || !hmac.Equal(carrier.Body[:len(want)], want) {
+		return errConfusionServerAuth
+	}
+
+	// carrier.Body and leftover both point into the reader's buffer, so the
+	// remainder is copied out rather than appended in place.
+	rest := make([]byte, 0, len(carrier.Body)-len(want)+len(leftover))
+	rest = append(rest, carrier.Body[len(want):]...)
+	rest = append(rest, leftover...)
+	c.pb.pre = rest
+	return nil
+}
+
+// splitFirstConfusionFrame peels one sealed frame off the front. Only the first
+// frame rides inside the carrier; anything beyond it follows on the wire, where
+// it is indistinguishable from the rest of the sealed stream.
+func splitFirstConfusionFrame(frames []byte) ([]byte, []byte) {
+	if len(frames) < 2 {
+		return frames, nil
+	}
+	n := int(binary.BigEndian.Uint16(frames[:2]))
+	if 2+n > len(frames) {
+		return frames, nil
+	}
+	return frames[:2+n], frames[2+n:]
 }
 
 // AllConfusionTypes returns all available confusion strategies
 // manager is required for IPv6/IPv4 transport layer support
-func AllConfusionTypes(manager *Manager) []*ProtocolConfusionStrategy {
+func AllConfusionTypes(manager *Manager, secret []byte) []*ProtocolConfusionStrategy {
 	types := []ConfusionType{
 		ConfusionDNSoverTLS,
 		ConfusionHTTPoverTLS,
@@ -491,7 +354,7 @@ func AllConfusionTypes(manager *Manager) []*ProtocolConfusionStrategy {
 
 	strategies := make([]*ProtocolConfusionStrategy, len(types))
 	for i, t := range types {
-		strategies[i] = NewProtocolConfusionStrategy(manager, t)
+		strategies[i] = NewProtocolConfusionStrategy(manager, t, secret)
 	}
 	return strategies
 }

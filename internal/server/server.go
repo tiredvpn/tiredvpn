@@ -36,13 +36,14 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/shaper"
 	"github.com/tiredvpn/tiredvpn/internal/shaper/presets"
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
+	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 	"github.com/tiredvpn/tiredvpn/internal/tun"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 )
 
 var (
-	Version     = "1.10.0"
+	Version     = "1.11.0"
 	connCounter uint64
 )
 
@@ -465,11 +466,54 @@ type serverContext struct {
 	cfg            *Config
 	registry       *ClientRegistry
 	store          *RedisStore
-	upstreamDialer *UpstreamDialer // for multi-hop mode
-	metrics        *Metrics        // Prometheus metrics
-	tlsConfig      *tls.Config     // TLS config for non-REALITY connections
-	ipPool         *IPPool         // IP pool for TUN mode
-	sharedTUN      *SharedTUN      // Shared TUN device for all clients
+	upstreamDialer *UpstreamDialer  // for multi-hop mode
+	metrics        *Metrics         // Prometheus metrics
+	tlsConfig      *tls.Config      // TLS config for non-REALITY connections
+	ipPool         *IPPool          // IP pool for TUN mode
+	sharedTUN      *SharedTUN       // Shared TUN device for all clients
+	knockReplay    knockReplayGuard // anti-probe knock replay window (zero value usable)
+}
+
+// knockReplayGuard remembers the per-connection knock nonces seen inside the
+// replay window, so a censor who captures a client's knock cannot replay the
+// exact bytes to be let in. The zero value is usable; the map is created on
+// first use. Nonces expire after knockReplayTTL, which covers the bucket grace
+// window on both sides.
+type knockReplayGuard struct {
+	mu   sync.Mutex
+	seen map[string]int64 // nonce -> expiry (unix nanos)
+}
+
+// knockReplayTTL bounds how long a nonce is remembered. It only has to exceed
+// the bucket freshness window (a captured knock stops matching once its bucket
+// drifts out of KnockBucketFresh anyway); three minutes comfortably covers the
+// grace window on both sides and keeps the cache small.
+const knockReplayTTL = 3 * time.Minute
+
+// checkAndRecord reports whether nonce is fresh (not seen inside the window) and
+// records it. A false return means a replay.
+func (g *knockReplayGuard) checkAndRecord(nonce []byte, ttl time.Duration) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	nowNanos := time.Now().UnixNano()
+	if g.seen == nil {
+		g.seen = make(map[string]int64)
+	}
+	// Opportunistic cleanup: the cache never holds more than the window's worth
+	// of live knocks, and probes that fail the tag never reach here.
+	for k, exp := range g.seen {
+		if nowNanos > exp {
+			delete(g.seen, k)
+		}
+	}
+
+	key := string(nonce)
+	if exp, ok := g.seen[key]; ok && nowNanos <= exp {
+		return false // replay inside the window
+	}
+	g.seen[key] = time.Now().Add(ttl).UnixNano()
+	return true
 }
 
 // Run starts the server with the given configuration
@@ -1315,18 +1359,60 @@ func handleConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 		return
 	}
 
-	// Non-TLS connections: check for timing knock (anti-probe) with per-client secrets
-	if matched, secret, clientID := detectTimingKnockWithRegistry(peekBuf, srvCtx); matched {
-		logger.Debug("Detected timing knock pattern (client: %s)", clientID)
-		handleAntiProbeAuth(buffConn, srvCtx, secret, clientID, logger)
+	// Non-TLS connections: check for timing knock (anti-probe) with per-client secrets.
+	// There is no TLS session to bind the server proof to on this path, and the
+	// current client always dials anti-probe over TLS, so a knock arriving in the
+	// clear cannot complete the session-bound handshake — serve the decoy.
+	if matched, _, clientID := detectTimingKnockWithRegistry(peekBuf, srvCtx); matched {
+		logger.Debug("Detected plaintext timing knock with no TLS session to bind (client: %s); serving decoy", clientID)
+		serveFakeWebsite(buffConn, srvCtx.cfg, logger)
 		return
 	}
 
-	// SSH camouflage: plaintext SSH-2.0 banner with no TIRED marker. Must be
-	// checked before protocol confusion (which also matches "SSH-2.0-") and
-	// before TLS, since the SSH handshake is plaintext.
-	if DetectSSHCamouflage(peekBuf) {
-		logger.Debug("Detected SSH camouflage")
+	// SSH: the confusion transport's SSH carrier and the ssh_camouflage
+	// transport both open with the same OpenSSH banner, so a passive prober
+	// reads one version from the port. They are told apart by the keyed marker
+	// the confusion carrier bears in its first flight, checked over the bytes
+	// already peeked - the ssh_camouflage client has sent only its banner and
+	// is waiting for the server, so reading on to assemble a carrier would
+	// block it until the auth timeout. Must precede protocol confusion (which
+	// also matches "SSH-2.0-") and TLS, since the SSH handshake is plaintext.
+	if bytes.HasPrefix(peekBuf, []byte("SSH-2.0")) {
+		// The confusion carrier sends its whole first flight at once (banner,
+		// KEXINIT, KEX_ECDH, NEWKEYS, sealed body); the ssh_camouflage (S2) client
+		// sends only its banner and then waits for the server. When the peek stops
+		// mid-carrier - a first flight split across TCP segments - finish it under
+		// a short window before deciding, so a fragmented carrier is not taken for
+		// the bare-banner S2 client and pushed into the camouflage handshake, where
+		// it would fail auth and cost a decoy and a retry. The S2 client sends
+		// nothing more and only waits out that short window, never the auth
+		// timeout. Bytes read are folded back into peekBuf for replay.
+		peekBuf = reassembleSSHCarrierPeek(conn, peekBuf, logger)
+		buffConn = &bufferedConn{
+			Conn:   conn,
+			reader: io.MultiReader(bytes.NewReader(peekBuf), conn),
+		}
+		if DetectSSHCamouflage(peekBuf, srvCtx) {
+			logger.Debug("Detected SSH camouflage")
+			handleSSHCamouflage(buffConn, srvCtx, logger)
+			return
+		}
+		// A confusion SSH carrier whose marker we recognize. Entry point 1 of 3
+		// into the confusion funnel; all three authenticate in classifyConfusion.
+		if sess, consumed, ok := classifyConfusion(buffConn, peekBuf, srvCtx, logger); ok {
+			logger.Debug("Detected SSH-carried protocol confusion")
+			handleProtocolConfusion(sess, srvCtx, logger)
+			return
+		} else if len(consumed) > 0 {
+			buffConn = &bufferedConn{
+				Conn:   conn,
+				reader: io.MultiReader(bytes.NewReader(consumed), conn),
+			}
+		}
+		// The peek bore a valid marker but the full carrier did not classify (a
+		// truncated first flight): hand it to the camouflage handshake rather
+		// than dropping it. A real ssh_camouflage client ends up here too.
+		logger.Debug("SSH carrier did not classify; treating as SSH camouflage")
 		handleSSHCamouflage(buffConn, srvCtx, logger)
 		return
 	}
@@ -1341,11 +1427,20 @@ func handleConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 		return
 	}
 
-	// Raw TCP protocol confusion: DNS-over-TCP / HTTP / SSH / SMTP preamble + TIRED marker
-	if detectConfusionMagic(peekBuf) {
+	// Raw TCP protocol confusion. Entry point 1 of 3 into the confusion funnel;
+	// all three authenticate here, before the handler sees anything.
+	if sess, consumed, ok := classifyConfusion(buffConn, peekBuf, srvCtx, logger); ok {
 		logger.Debug("Detected raw TCP protocol confusion")
-		handleProtocolConfusion(buffConn, srvCtx, logger)
+		handleProtocolConfusion(sess, srvCtx, logger)
 		return
+	} else if len(consumed) > 0 {
+		// Not ours after all. Replay every byte we read so the fake website
+		// answers exactly the same connection it would have answered if this
+		// detector had never looked.
+		buffConn = &bufferedConn{
+			Conn:   conn,
+			reader: io.MultiReader(bytes.NewReader(consumed), conn),
+		}
 	}
 
 	// Unknown protocol - serve fake website
@@ -1376,7 +1471,10 @@ func handleTLSConnection(conn *tls.Conn, srvCtx *serverContext, connID uint64) {
 	case protocol.TypeRaw:
 		handleRawTunnel(conn, srvCtx, logger, clientIdentity{})
 	case protocol.TypeConfusion:
-		handleProtocolConfusion(conn, srvCtx, logger)
+		// Entry point 2 of 3. Nothing in the tree writes this discriminator, so
+		// the only peer that arrives here is one that chose to - which is
+		// exactly why it has to authenticate like the other two.
+		handleConfusionDispatch(conn, srvCtx, logger)
 	case protocol.TypeAntiProbe:
 		handleAntiProbeDispatch(conn, srvCtx, logger)
 	case protocol.TypeMorph:
@@ -1443,15 +1541,28 @@ func handleTLSConnectionLegacy(conn net.Conn, srvCtx *serverContext, connID uint
 	// Check for timing knock sequence (anti-probe over TLS) with per-client secrets
 	if matched, secret, clientID := detectTimingKnockWithRegistry(peekBuf, srvCtx); matched {
 		logger.Debug("Detected timing knock pattern over TLS (client: %s)", clientID)
-		handleAntiProbeAuth(buffConn, srvCtx, secret, clientID, logger)
+		ekm, err := exporterBindingKey(buffConn)
+		if err != nil {
+			logger.Debug("Anti-probe over TLS: exporter unavailable: %v", err)
+			serveFakeWebsite(buffConn, srvCtx.cfg, logger)
+			return
+		}
+		handleAntiProbeAuth(buffConn, srvCtx, secret, clientID, ekm, logger)
 		return
 	}
 
-	// Check for protocol confusion magic
-	if detectConfusionMagic(peekBuf) {
-		logger.Debug("Detected protocol confusion magic over TLS")
-		handleProtocolConfusion(buffConn, srvCtx, logger)
+	// Check for protocol confusion. Entry point 3 of 3. On a failed match the
+	// consumed bytes are replayed, so the WebSocket and HTTP/1 detectors below
+	// still see the connection they would have seen.
+	if sess, consumed, ok := classifyConfusion(buffConn, peekBuf, srvCtx, logger); ok {
+		logger.Debug("Detected protocol confusion over TLS")
+		handleProtocolConfusion(sess, srvCtx, logger)
 		return
+	} else if len(consumed) > 0 {
+		buffConn = &bufferedConn{
+			Conn:   conn,
+			reader: io.MultiReader(bytes.NewReader(consumed), conn),
+		}
 	}
 
 	// Check for WebSocket Padded
@@ -1509,6 +1620,7 @@ func handleHTTP2WithALPN(conn net.Conn, srvCtx *serverContext, logger *log.Logge
 	hpackDec := hpack.NewDecoder(4096, nil)
 	authenticated := false
 	var authClientID clientIdentity
+	var authSecret []byte
 	var tunnel *h2TunnelState
 	var connTracked bool
 
@@ -1524,7 +1636,17 @@ func handleHTTP2WithALPN(conn net.Conn, srvCtx *serverContext, logger *log.Logge
 
 	defer func() { cleanupH2Conn(conn, srvCtx, &tunnel, &connTracked, &authClientID) }()
 
-	runH2FrameLoop(&conn, &framer, hpackDec, srvCtx, logger, &authenticated, &authClientID, &connTracked, &tunnel, nil)
+	// Session binding (S22): the auth token is bound to this TLS session's
+	// exporter. Pull it before the frame loop; the stego path never hands the
+	// socket to kTLS, so conn stays a userspace *tls.Conn and the exporter is
+	// reachable. An unavailable exporter yields nil, which no bound client token
+	// matches — a fast rejection, not a silent unbound accept.
+	ekm, ekmErr := exporterBindingKey(conn)
+	if ekmErr != nil {
+		logger.Debug("HTTP/2 stego (ALPN): exporter unavailable: %v", ekmErr)
+	}
+
+	runH2FrameLoop(&conn, &framer, hpackDec, srvCtx, logger, &authenticated, &authClientID, &authSecret, &connTracked, &tunnel, nil, ekm)
 }
 
 // handleMorphConnectionWithALPN handles Morph protocol when ALPN was used
@@ -1540,7 +1662,8 @@ type h2TunnelState struct {
 	targetConn      net.Conn
 	streamID        uint32
 	clientID        clientIdentity // Client identity for IP pool allocation
-	remoteAddr      string // Peer host, used to qualify the IP-pool lease key
+	secret          []byte         // Authenticated client secret, keys the stego markers
+	remoteAddr      string         // Peer host, used to qualify the IP-pool lease key
 	mu              sync.Mutex
 	sharedTUNWriter *ClientWriter // For shared TUN mode
 	sharedTUN       *SharedTUN    // Reference to shared TUN
@@ -1571,11 +1694,22 @@ func handleHTTP2(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
 
 	authenticated := false
 	var authClientID clientIdentity
+	var authSecret []byte
 	var tunnel *h2TunnelState
 	var connTracked bool
 	defer cleanupH2Conn(conn, srvCtx, &tunnel, &connTracked, &authClientID)
 
-	runH2FrameLoop(&conn, &framer, hpackDec, srvCtx, logger, &authenticated, &authClientID, &connTracked, &tunnel, nil)
+	// Session binding (S22): bind the auth token to this TLS session's exporter.
+	// On the TLS entry path (handleTLSConnectionLegacy) conn wraps a *tls.Conn
+	// and the exporter is available; on the plaintext entry path
+	// (handleConnection) there is no TLS session, ekm is nil, and no bound client
+	// token matches — which is correct, since our clients always run over TLS.
+	ekm, ekmErr := exporterBindingKey(conn)
+	if ekmErr != nil {
+		logger.Debug("HTTP/2 stego: exporter unavailable: %v", ekmErr)
+	}
+
+	runH2FrameLoop(&conn, &framer, hpackDec, srvCtx, logger, &authenticated, &authClientID, &authSecret, &connTracked, &tunnel, nil, ekm)
 }
 
 // initH2Framer reads the HTTP/2 preface, creates a framer and sends server SETTINGS.
@@ -1615,8 +1749,7 @@ func cleanupH2Conn(conn net.Conn, srvCtx *serverContext, tunnel **h2TunnelState,
 // (legacy non-ALPN path), in which case no kTLS upgrade happens. When set, it
 // is invoked exactly once — immediately after auth succeeds — and returns the
 // connection and framer to use for the subsequent relay phase.
-func runH2FrameLoop(connPtr *net.Conn, framerPtr **http2.Framer, hpackDec *hpack.Decoder, srvCtx *serverContext, logger *log.Logger, authenticated *bool, authClientID *clientIdentity, connTracked *bool, tunnel **h2TunnelState, handover func(net.Conn) (net.Conn, *http2.Framer)) {
-	cfg := srvCtx.cfg
+func runH2FrameLoop(connPtr *net.Conn, framerPtr **http2.Framer, hpackDec *hpack.Decoder, srvCtx *serverContext, logger *log.Logger, authenticated *bool, authClientID *clientIdentity, authSecret *[]byte, connTracked *bool, tunnel **h2TunnelState, handover func(net.Conn) (net.Conn, *http2.Framer), ekm []byte) {
 	for {
 		conn := *connPtr
 		framer := *framerPtr
@@ -1638,7 +1771,7 @@ func runH2FrameLoop(connPtr *net.Conn, framerPtr **http2.Framer, hpackDec *hpack
 			}
 		case *http2.HeadersFrame:
 			wasAuthed := *authenticated
-			processH2HeadersFrame(conn, f, framer, hpackDec, srvCtx, logger, authenticated, authClientID, connTracked)
+			processH2HeadersFrame(conn, f, framer, hpackDec, srvCtx, logger, authenticated, authClientID, authSecret, connTracked, ekm)
 			// Auth just succeeded on this frame: perform the kTLS handover
 			// now, before reading any further frames. The auth ack has been
 			// written through the TLS stack and flushed; the client is parked
@@ -1653,7 +1786,7 @@ func runH2FrameLoop(connPtr *net.Conn, framerPtr **http2.Framer, hpackDec *hpack
 				logger.Debug("Received DATA before auth, ignoring")
 				continue
 			}
-			handleH2DataFrame(conn, f, framer, cfg, srvCtx, *tunnel, *authClientID, logger, tunnel)
+			handleH2DataFrame(conn, f, framer, srvCtx, *tunnel, *authClientID, *authSecret, logger, tunnel)
 		case *http2.WindowUpdateFrame:
 			// Ignore
 		case *http2.PingFrame:
@@ -1663,7 +1796,7 @@ func runH2FrameLoop(connPtr *net.Conn, framerPtr **http2.Framer, hpackDec *hpack
 }
 
 // processH2HeadersFrame extracts auth headers and, if valid, marks the connection authenticated.
-func processH2HeadersFrame(conn net.Conn, f *http2.HeadersFrame, framer *http2.Framer, hpackDec *hpack.Decoder, srvCtx *serverContext, logger *log.Logger, authenticated *bool, authClientID *clientIdentity, connTracked *bool) {
+func processH2HeadersFrame(conn net.Conn, f *http2.HeadersFrame, framer *http2.Framer, hpackDec *hpack.Decoder, srvCtx *serverContext, logger *log.Logger, authenticated *bool, authClientID *clientIdentity, authSecret *[]byte, connTracked *bool, ekm []byte) {
 	var apiKey, requestID string
 	hpackDec.SetEmitFunc(func(hf hpack.HeaderField) {
 		logger.Debug("  Header: %s = %s", hf.Name, truncate(hf.Value, 50))
@@ -1680,7 +1813,7 @@ func processH2HeadersFrame(conn net.Conn, f *http2.HeadersFrame, framer *http2.F
 		return
 	}
 
-	ok, clientID, secret := verifyH2AuthMulti(srvCtx, apiKey, requestID, logger)
+	ok, clientID, secret := verifyH2AuthMulti(srvCtx, apiKey, requestID, ekm, logger)
 	if !ok {
 		logger.Warn("HTTP/2 steganography auth FAILED")
 		return
@@ -1688,6 +1821,7 @@ func processH2HeadersFrame(conn net.Conn, f *http2.HeadersFrame, framer *http2.F
 
 	*authenticated = true
 	*authClientID = clientID
+	*authSecret = secret
 	sendH2AuthAck(framer, f.StreamID, secret)
 
 	if !*connTracked && srvCtx.registry != nil && clientID.id != "" {
@@ -1701,16 +1835,16 @@ func processH2HeadersFrame(conn net.Conn, f *http2.HeadersFrame, framer *http2.F
 
 // verifyH2AuthMulti checks per-client secrets then global secret for HTTP/2 stego auth.
 // Returns (ok, clientID, usedSecret).
-func verifyH2AuthMulti(srvCtx *serverContext, apiKey, requestID string, logger *log.Logger) (bool, clientIdentity, []byte) {
+func verifyH2AuthMulti(srvCtx *serverContext, apiKey, requestID string, ekm []byte, logger *log.Logger) (bool, clientIdentity, []byte) {
 	if srvCtx.registry != nil {
 		for _, client := range srvCtx.registry.ListClients() {
-			if verifyH2Auth(apiKey, requestID, []byte(client.Secret)) {
+			if verifyH2Auth(apiKey, requestID, []byte(client.Secret), ekm) {
 				logger.Info("HTTP/2 steganography authenticated (client: %s, id: %s)", client.Name, client.ID)
 				return true, registryIdentity(client.ID), []byte(client.Secret)
 			}
 		}
 	}
-	if len(srvCtx.cfg.Secret) > 0 && verifyH2Auth(apiKey, requestID, srvCtx.cfg.Secret) {
+	if len(srvCtx.cfg.Secret) > 0 && verifyH2Auth(apiKey, requestID, srvCtx.cfg.Secret, ekm) {
 		logger.Info("HTTP/2 steganography authenticated (global secret)")
 		return true, sharedIdentity(globalClientID), srvCtx.cfg.Secret
 	}
@@ -1718,25 +1852,28 @@ func verifyH2AuthMulti(srvCtx *serverContext, apiKey, requestID string, logger *
 }
 
 // handleH2DataFrame processes an authenticated HTTP/2 DATA frame.
-func handleH2DataFrame(conn net.Conn, f *http2.DataFrame, framer *http2.Framer, cfg *Config, srvCtx *serverContext, _ *h2TunnelState, authClientID clientIdentity, logger *log.Logger, tunnelPtr **h2TunnelState) {
+func handleH2DataFrame(conn net.Conn, f *http2.DataFrame, framer *http2.Framer, srvCtx *serverContext, _ *h2TunnelState, authClientID clientIdentity, authSecret []byte, logger *log.Logger, tunnelPtr **h2TunnelState) {
 	data := f.Data()
 	logger.Debug("Received DATA: %d bytes", len(data))
 
-	if len(data) < 7 || !bytes.Equal(data[0:4], []byte("TIRD")) {
+	// Keyed marker keeps the frame recognisable only to a peer holding the
+	// authenticated secret; a 1.10.x client's literal "TIRD" fails here.
+	off, ok := strategy.MatchStegoClientFrame(authSecret, data)
+	if !ok || len(data) < off+3 {
 		return
 	}
 
-	flags := data[4]
-	length := binary.BigEndian.Uint16(data[5:7])
+	flags := data[off]
+	length := int(binary.BigEndian.Uint16(data[off+1 : off+3]))
 	logger.Debug("Stego frame: flags=%02x, length=%d", flags, length)
 
-	if int(length) > len(data)-7 {
+	if length > len(data)-off-3 {
 		return
 	}
 
-	payload := data[7 : 7+length]
+	payload := data[off+3 : off+3+length]
 	if flags&0x01 != 0 {
-		paddingKey := deriveKey(cfg.Secret, "padding-key")
+		paddingKey := deriveKey(authSecret, "padding-key")
 		for i := range payload {
 			payload[i] ^= paddingKey[i%len(paddingKey)]
 		}
@@ -1745,7 +1882,7 @@ func handleH2DataFrame(conn net.Conn, f *http2.DataFrame, framer *http2.Framer, 
 
 	tunnel := *tunnelPtr
 	if tunnel == nil {
-		t := &h2TunnelState{streamID: f.StreamID, clientID: authClientID, remoteAddr: originOf(conn.RemoteAddr())}
+		t := &h2TunnelState{streamID: f.StreamID, clientID: authClientID, secret: authSecret, remoteAddr: originOf(conn.RemoteAddr())}
 		setupH2Tunnel(t, framer, payload, srvCtx, logger)
 		*tunnelPtr = t
 		return
@@ -1791,7 +1928,7 @@ func forwardH2TUNPacket(tunnel *h2TunnelState, streamID uint32, payload []byte, 
 						binary.BigEndian.PutUint32(frame[:4], uint32(len(reply)))
 						copy(frame[4:], reply)
 						tunnel.mu.Lock()
-						sendStegoResponse(h2c.framer, tunnel.streamID, frame, h2c.cfg)
+						sendStegoResponse(h2c.framer, tunnel.streamID, frame, h2c.secret)
 						tunnel.mu.Unlock()
 						logger.Debug("Auto-MTU: H2 echoed PROBE_REPLY size=%d", len(reply))
 					}
@@ -1813,7 +1950,7 @@ func forwardH2TUNPacket(tunnel *h2TunnelState, streamID uint32, payload []byte, 
 			if h2c, ok := tunnel.targetConn.(*h2TunConn); ok {
 				logger.Debug("H2 TUN: received keepalive, echoing back")
 				tunnel.mu.Lock()
-				sendStegoResponse(h2c.framer, tunnel.streamID, []byte{0, 0, 0, 0}, h2c.cfg)
+				sendStegoResponse(h2c.framer, tunnel.streamID, []byte{0, 0, 0, 0}, h2c.secret)
 				tunnel.mu.Unlock()
 			}
 			tunnel.sink.UpdateActivity()
@@ -1943,6 +2080,14 @@ func writeMorphShapedFrames(conn net.Conn, sh shaper.Shaper, frames [][]byte) er
 func handleMorphConnection(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
 	logger.Debug("Processing Morph connection")
 
+	// Session binding (S22): capture the TLS exporter before kTLS offload (which
+	// happens after auth, below). nil on the plaintext entry path — our clients
+	// always run over TLS, so a nil exporter simply fails to match a bound token.
+	ekm, ekmErr := exporterBindingKey(conn)
+	if ekmErr != nil {
+		logger.Debug("Morph: exporter unavailable: %v", ekmErr)
+	}
+
 	// Read MRPH magic (4 bytes) + nameLen (1 byte)
 	mrphHeader := make([]byte, 5)
 	if _, err := io.ReadFull(conn, mrphHeader); err != nil {
@@ -1986,7 +2131,7 @@ func handleMorphConnection(conn net.Conn, srvCtx *serverContext, logger *log.Log
 		for _, client := range clients {
 			secretBytes := []byte(client.Secret)
 			logger.Debug("Traffic Morph: trying client '%s' (secret len=%d)", client.Name, len(client.Secret))
-			if verifyMorphAuth(authToken, secretBytes) {
+			if verifyMorphAuth(authToken, secretBytes, ekm) {
 				logger.Info("Traffic Morph authenticated (client: %s, id: %s)", client.Name, client.ID)
 				authenticated = true
 				usedSecret = secretBytes
@@ -2000,7 +2145,7 @@ func handleMorphConnection(conn net.Conn, srvCtx *serverContext, logger *log.Log
 
 	// 2. Fallback to global secret (if not found in registry and global secret exists)
 	if !authenticated && len(srvCtx.cfg.Secret) > 0 {
-		if verifyMorphAuth(authToken, srvCtx.cfg.Secret) {
+		if verifyMorphAuth(authToken, srvCtx.cfg.Secret, ekm) {
 			logger.Info("Traffic Morph authenticated (global secret)")
 			authenticated = true
 			usedSecret = srvCtx.cfg.Secret
@@ -2750,12 +2895,27 @@ func handleWebSocket(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
 func handleAntiProbeDispatch(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
 	cfg := srvCtx.cfg
 
-	// Peek the first knock packet so detectTimingKnockWithRegistry can match a
-	// secret. The first packet is at most 99 bytes (10 + hash%90); reading 99
-	// bytes covers it without blocking on the inter-packet client sleeps.
-	peekBuf := make([]byte, 99)
+	// Peek the head of the first knock packet so detectTimingKnockWithRegistry
+	// can match a secret against its keyed tag. The tag sits at a fixed offset
+	// (header + tag = KnockHeaderLen+KnockTagLen bytes), so reading that many is
+	// enough to pick the secret without knowing the secret-dependent packet
+	// length yet. The buffer is generous enough to hold the whole first packet
+	// (<= knockSizeMin+span) when it arrives in one read; verifyFullKnockSequence
+	// reads the rest from the replayed stream.
+	// Pull the TLS exporter before wrapping the conn: the server proof written
+	// after the knock ACK is an HMAC over this keying material, which binds it
+	// to this exact handshake (see strategy.AntiProbeServerProof). conn is the
+	// raw *tls.Conn here; the bufferedConn wrapper below would hide the method.
+	ekm, ekmErr := exporterBindingKey(conn)
+	if ekmErr != nil {
+		logger.Debug("Anti-probe dispatch: exporter unavailable: %v", ekmErr)
+		serveFakeWebsite(conn, cfg, logger)
+		return
+	}
+
+	peekBuf := make([]byte, 160)
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	n, err := io.ReadAtLeast(conn, peekBuf, 10)
+	n, err := io.ReadAtLeast(conn, peekBuf, strategy.KnockHeaderLen+strategy.KnockTagLen)
 	if err != nil {
 		logger.Debug("Anti-probe dispatch: failed to peek knock: %v (read %d)", err, n)
 		serveFakeWebsite(conn, cfg, logger)
@@ -2776,23 +2936,49 @@ func handleAntiProbeDispatch(conn net.Conn, srvCtx *serverContext, logger *log.L
 		Conn:   conn,
 		reader: io.MultiReader(bytes.NewReader(peekBuf), conn),
 	}
-	handleAntiProbeAuth(buffConn, srvCtx, secret, clientID, logger)
+	handleAntiProbeAuth(buffConn, srvCtx, secret, clientID, ekm, logger)
+}
+
+// exporterBindingKey pulls the RFC 8446 §7.5 exporter out of a TLS connection,
+// unwrapping the bufferedConn the detector paths wrap it in first. bufferedConn
+// embeds net.Conn, so ConnectionState is not promoted through it and the type
+// assertion must run against the wrapped conn directly.
+func exporterBindingKey(conn net.Conn) ([]byte, error) {
+	if bc, ok := conn.(*bufferedConn); ok {
+		conn = bc.Conn
+	}
+	tc, ok := conn.(interface {
+		ConnectionState() tls.ConnectionState
+	})
+	if !ok {
+		return nil, errors.New("connection is not TLS")
+	}
+	state := tc.ConnectionState()
+	return customtls.ExportBindingKey(&state)
 }
 
 // handleAntiProbeAuth handles anti-probe authenticated connections
-func handleAntiProbeAuth(conn net.Conn, srvCtx *serverContext, secret []byte, clientID clientIdentity, logger *log.Logger) {
+func handleAntiProbeAuth(conn net.Conn, srvCtx *serverContext, secret []byte, clientID clientIdentity, ekm []byte, logger *log.Logger) {
 	cfg := srvCtx.cfg
 	logger.Debug("Processing anti-probe authentication (client: %s)", clientID)
 
 	// Verify knock sequence with the matched secret
-	if !verifyFullKnockSequence(conn, secret, logger) {
+	if !verifyFullKnockSequence(conn, secret, srvCtx, logger) {
 		logger.Warn("Knock sequence verification failed")
 		serveFakeWebsite(conn, cfg, logger)
 		return
 	}
 
-	// Send ACK
+	// Send ACK, then prove to the client that we hold the secret over this exact
+	// TLS session. The client waits for both bytes in Phase 3/4; without the
+	// proof a MITM answering 0x01 would pass, since InsecureSkipVerify trusts no
+	// certificate.
 	conn.Write([]byte{0x01})
+	proof := strategy.AntiProbeServerProof(secret, ekm)
+	if _, err := conn.Write(proof[:]); err != nil {
+		logger.Debug("Anti-probe: server proof write failed: %v", err)
+		return
+	}
 	logger.Info("Anti-probe authenticated (client: %s)", clientID)
 
 	// Now expect TLS handshake with auth token
@@ -2800,108 +2986,72 @@ func handleAntiProbeAuth(conn net.Conn, srvCtx *serverContext, secret []byte, cl
 	handleRawTunnel(conn, srvCtx, logger, clientID)
 }
 
-// handleProtocolConfusion handles protocol confusion connections
-func handleProtocolConfusion(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
-	cfg := srvCtx.cfg
-	logger.Debug("Processing protocol confusion")
-
-	// Read enough data to find the magic marker (TIRED is at ~offset 50 in DNS confusion)
-	// Use multiple reads to gather data since bufferedConn may return peeked data first
-	buf := make([]byte, 4096)
-	totalRead := 0
-
-	for totalRead < 256 { // Read at least 256 bytes to find marker
-		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		n, err := conn.Read(buf[totalRead:])
-		if err != nil {
-			if totalRead > 0 {
-				break // Use what we have
+// handleConfusionDispatch is the entry from the encrypted 1-byte discriminator,
+// which arrives with no peek of its own. It authenticates the same way the two
+// detector-driven entries do and falls back to the fake website, so choosing the
+// discriminator buys a peer nothing.
+func handleConfusionDispatch(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
+	sess, consumed, ok := classifyConfusion(conn, nil, srvCtx, logger)
+	if !ok {
+		replay := conn
+		if len(consumed) > 0 {
+			replay = &bufferedConn{
+				Conn:   conn,
+				reader: io.MultiReader(bytes.NewReader(consumed), conn),
 			}
-			logger.Debug("Failed to read confusion data: %v", err)
-			return
 		}
-		totalRead += n
-
-		// Check if we found the marker
-		if bytes.Contains(buf[:totalRead], []byte("TIRED")) {
-			break
-		}
+		serveFakeWebsite(replay, srvCtx.cfg, logger)
+		return
 	}
-	conn.SetReadDeadline(time.Time{})
+	handleProtocolConfusion(sess, srvCtx, logger)
+}
 
-	logger.Debug("Read %d bytes for confusion detection", totalRead)
+// handleProtocolConfusion serves an authenticated confusion connection.
+//
+// It is reached only through classifyConfusion, so by the time the first byte of
+// this function runs the peer has proved it holds a secret this server knows,
+// the record layer is keyed to that secret and a fresh per-connection nonce, and
+// nothing has been written back. The target address is read out of a sealed
+// frame rather than off the wire, which is the difference between "a peer asked
+// us to dial this" and "anyone can make us dial anything".
+func handleProtocolConfusion(sess *confusionSession, srvCtx *serverContext, logger *log.Logger) {
+	conn := sess.conn
+	logger.Debug("Processing protocol confusion (client: %s)", sess.clientID)
 
-	// Find magic marker
-	magicPos := bytes.Index(buf[:totalRead], []byte("\x00\x00TIRED"))
-	if magicPos < 0 {
-		magicPos = bytes.Index(buf[:totalRead], []byte("TIRED"))
+	// First sealed frame: the mode byte and what follows it.
+	sess.raw.SetReadDeadline(time.Now().Add(confusionAuthTimeout))
+	first, err := conn.ReadFrame()
+	sess.raw.SetReadDeadline(time.Time{})
+	if err != nil {
+		logger.Debug("Confusion: first frame read failed: %v", err)
+		return
 	}
-
-	if magicPos < 0 {
-		logger.Debug("Magic marker not found in %d bytes", totalRead)
-		serveFakeWebsite(conn, cfg, logger)
+	if len(first) == 0 {
+		logger.Debug("Confusion: empty first frame")
 		return
 	}
 
-	logger.Debug("Found magic at position %d", magicPos)
-
-	// Extract real data - format after TIRED: [length:4][data:N]
-	// If magic is "\x00\x00TIRED", dataStart is magicPos + 7
-	// If magic is "TIRED", dataStart is magicPos + 5
-	dataStart := magicPos + 5
-	if buf[magicPos] == 0x00 {
-		dataStart = magicPos + 7
-	}
-
-	if dataStart+4 > totalRead {
-		logger.Debug("Insufficient data after magic")
+	// TUN mode
+	if first[0] == 0x02 {
+		logger.Info("Confusion TUN mode detected (client: %s)", sess.clientID)
+		handleConfusionTUNMode(sess, first[1:], srvCtx, logger)
 		return
 	}
 
-	// Read embedded data length
-	dataLen := binary.BigEndian.Uint32(buf[dataStart : dataStart+4])
-	logger.Debug("Embedded data length: %d", dataLen)
-
-	// Extract embedded address from confusion packet
-	// The embedded data IS the target address in format: [mode:1][...] where mode=0x02 is TUN,
-	// otherwise [addrLen:2][addr:N]
-	embeddedStart := dataStart + 4
-	if embeddedStart+2 > totalRead {
-		logger.Debug("Insufficient embedded data")
+	if len(first) < 2 {
+		logger.Debug("Confusion: truncated target address")
 		return
 	}
-
-	// Check for TUN mode (first byte = 0x02)
-	if buf[embeddedStart] == 0x02 {
-		logger.Info("Confusion TUN mode detected")
-		// Confirm understanding
-		if _, err := conn.Write([]byte("TIRED")); err != nil {
-			logger.Warn("Failed to write confusion TUN ack: %v", err)
-			return
-		}
-		// Auth phase complete: hand the socket over to kTLS for the byte-relay phase.
-		// At this point the TLS stack's read buffer is empty (we read the magic
-		// + embedded data block to completion) and tls.Conn.Write has written
-		// the ack synchronously to the kernel send buffer.
-		conn = ktls.TryEnable(conn, "tired-confusion")
-		handleConfusionTUNMode(conn, buf[embeddedStart+1:totalRead], srvCtx, logger)
-		return
-	}
-
-	addrLen := int(buf[embeddedStart])<<8 | int(buf[embeddedStart+1])
-	if addrLen > 256 || addrLen < 3 || embeddedStart+2+addrLen > totalRead {
+	addrLen := int(first[0])<<8 | int(first[1])
+	if addrLen > 256 || addrLen < 3 || 2+addrLen > len(first) {
 		logger.Debug("Invalid embedded address length: %d", addrLen)
 		return
 	}
-	targetAddr := string(buf[embeddedStart+2 : embeddedStart+2+addrLen])
-	logger.Info("Confusion tunnel to: %s", targetAddr)
-
-	// Confirm understanding
-	conn.Write([]byte("TIRED"))
+	targetAddr := string(first[2 : 2+addrLen])
+	logger.Info("Confusion tunnel to: %s (client: %s)", targetAddr, sess.clientID)
 
 	// Connect to target (via upstream if configured)
 	var targetConn net.Conn
-	var err error
 	if srvCtx.upstreamDialer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr)
@@ -2911,36 +3061,22 @@ func handleProtocolConfusion(conn net.Conn, srvCtx *serverContext, logger *log.L
 	}
 	if err != nil {
 		logger.Warn("Failed to connect to %s: %v", targetAddr, err)
-		conn.Write([]byte{0x00, 0x00, 0x00, 0x01, 0x01}) // Send failure
+		conn.Write([]byte{0x01}) // Send failure
 		return
 	}
 	defer targetConn.Close()
 
-	// Send success (length-prefixed as client expects)
-	if _, err := conn.Write([]byte{0x00, 0x00, 0x00, 0x01, 0x00}); err != nil {
+	// Send success. This is the first byte the server emits on the connection,
+	// and it goes out sealed, inside the answering carrier.
+	if _, err := conn.Write([]byte{0x00}); err != nil {
 		logger.Warn("Failed to write confusion tunnel ack: %v", err)
 		return
 	}
 	logger.Debug("Connected to target, starting confusion relay")
 
-	// Auth phase complete: hand the socket over to kTLS for the byte-relay phase.
-	// At this point the TLS stack's read buffer is empty (we read the magic
-	// + embedded data block to completion) and tls.Conn.Write has written
-	// the ack synchronously to the kernel send buffer.
-	conn = ktls.TryEnable(conn, "tired-confusion")
-
-	// Burst reshaping wraps the payload phase only: the mode byte, the target
-	// address and the success ack above are this tunnel's own control preamble,
-	// and a reshaper that sees them mistakes the one-byte mode read for the
-	// client's first application burst and holds the ack behind a nudge.
-	//
-	// With the feature off this returns conn unchanged, so the kTLS/splice fast
-	// path below is untouched in the default configuration. With it on the
-	// wrapper stays in the path and that fast path is given up - the exchange
-	// needs to see the first write in each direction, which splice would hide.
-	conn = strategy.ReshapeServerStream(conn, burstReshapeConfig(srvCtx.cfg))
-
-	// Relay data
+	// Relay data. The sealed frame boundary is the message boundary, so a
+	// control message still arrives as one message rather than as whatever
+	// happened to land in a read.
 	var wg sync.WaitGroup
 	var bytesUp, bytesDown int64
 
@@ -2948,23 +3084,14 @@ func handleProtocolConfusion(conn net.Conn, srvCtx *serverContext, logger *log.L
 
 	go func() {
 		defer wg.Done()
-		// Read length-prefixed data from client
 		for {
-			lenBuf := make([]byte, 4)
-			if _, err := io.ReadFull(conn, lenBuf); err != nil {
-				logger.Debug("Confusion relay: read length error: %v", err)
+			data, err := conn.ReadFrame()
+			if err != nil {
+				logger.Debug("Confusion relay: read error: %v", err)
 				return
 			}
-			pktLen := binary.BigEndian.Uint32(lenBuf)
-			logger.Debug("Confusion relay: received pktLen=%d", pktLen)
-			if pktLen > 65536 || pktLen == 0 {
-				logger.Debug("Confusion relay: invalid pktLen, closing")
-				return
-			}
-			data := make([]byte, pktLen)
-			if _, err := io.ReadFull(conn, data); err != nil {
-				logger.Debug("Confusion relay: read data error: %v", err)
-				return
+			if len(data) == 0 {
+				continue
 			}
 
 			// Check for control message
@@ -2990,16 +3117,8 @@ func handleProtocolConfusion(conn net.Conn, srvCtx *serverContext, logger *log.L
 				logger.Debug("Confusion relay: target read error: %v", err)
 				return
 			}
-			logger.Debug("Confusion relay: sending %d bytes to client", n)
-			// Send length-prefixed response
-			lenBuf := make([]byte, 4)
-			binary.BigEndian.PutUint32(lenBuf, uint32(n))
-			if _, err := conn.Write(lenBuf); err != nil {
-				logger.Debug("Confusion relay: write len error: %v", err)
-				return
-			}
 			if _, err := conn.Write(buf[:n]); err != nil {
-				logger.Debug("Confusion relay: write data error: %v", err)
+				logger.Debug("Confusion relay: write error: %v", err)
 				return
 			}
 			atomic.AddInt64(&bytesDown, int64(n))
@@ -3017,15 +3136,21 @@ func handleProtocolConfusion(conn net.Conn, srvCtx *serverContext, logger *log.L
 
 // handleConfusionTUNMode handles TUN mode over protocol confusion
 // Now uses shared TUN instead of userspace NAT
-func handleConfusionTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverContext, logger *log.Logger) {
+//
+// Reached only from handleProtocolConfusion, which is reached only from
+// classifyConfusion, so the peer holding an address out of the pool has proved
+// it holds a secret. That was not true before 1.11.0: the identity came from
+// the peer's address and the allocation happened for anyone who asked.
+func handleConfusionTUNMode(sess *confusionSession, remainingData []byte, srvCtx *serverContext, logger *log.Logger) {
 	cfg := srvCtx.cfg
+	conn := sess.conn
 	logger.Debug("Processing Confusion TUN mode, remaining data: %d bytes", len(remainingData))
 
 	// Parse TUN handshake from remaining data: [localIP:4][mtu:2][version:1]
 	// Version byte is optional (v1 clients send 6 bytes, v2 clients send 7 bytes)
 	if len(remainingData) < 6 {
 		logger.Debug("Confusion TUN handshake too short: %d bytes", len(remainingData))
-		conn.Write([]byte{0x00, 0x00, 0x00, 0x01, 0x01})
+		conn.Write([]byte{0x01})
 		return
 	}
 
@@ -3033,17 +3158,15 @@ func handleConfusionTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverC
 	// only an exit needs the shared device here.
 	if srvCtx == nil || (srvCtx.sharedTUN == nil && srvCtx.upstreamDialer == nil) {
 		logger.Error("Shared TUN not initialized")
-		conn.Write([]byte{0x00, 0x00, 0x00, 0x01, 0x01})
+		conn.Write([]byte{0x01})
 		return
 	}
 
 	requestedIP := net.IP(remainingData[0:4])
-	// Use only client IP (without port) for clientID to prevent IP pool exhaustion
-	// when client reconnects on different ports (e.g., port hopping)
-	clientHost, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
-	// Behind a relay this is the relay's address, the same for every client
-	// it forwards, so it cannot key a lease on its own.
-	clientID := sharedIdentity(fmt.Sprintf("confusion:%s", clientHost))
+	// The identity is the one the marker proved, not the peer's address.
+	// Behind a relay every forwarded client shares the relay's address, so the
+	// old derivation gave them all one identity and one lease.
+	clientID := sess.clientID
 
 	// Check for version byte (v2 clients send 7 bytes total)
 	var clientVersion uint8 = 1 // Default to v1 for backwards compatibility
@@ -3077,7 +3200,7 @@ func handleConfusionTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverC
 			})
 		if err != nil {
 			logger.Warn("Confusion TUN relay: upstream dial failed: %v", err)
-			conn.Write([]byte{0x00, 0x00, 0x00, 0x01, 0x01})
+			conn.Write([]byte{0x01})
 			return
 		}
 		sink, serverIP, clientIP = relaySink, upServerIP, upClientIP
@@ -3091,7 +3214,7 @@ func handleConfusionTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverC
 			allocatedIP, err := srvCtx.ipPool.Allocate(allocationKey(clientID, originOf(conn.RemoteAddr())), requestedIP, "")
 			if err != nil {
 				logger.Error("Failed to allocate IP from pool: %v", err)
-				conn.Write([]byte{0x00, 0x00, 0x00, 0x01, 0x01})
+				conn.Write([]byte{0x01})
 				return
 			}
 			clientIP = allocatedIP
@@ -3112,12 +3235,14 @@ func handleConfusionTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverC
 		}()
 	}
 
-	// Send success response with length prefix: [length:4][payload]
-	// Confusion protocol uses length-prefixed frames for all data after "TIRED" magic.
+	// Send the handshake response bare, the way every other transport does.
+	// It used to carry an extra [length:4] in front, because the old client
+	// stripped one prefix in its first read and none after; now the sealed
+	// frame carries the boundary and confusion needs no shape of its own.
 	// Local exit: v6 addrs from our pool. Relay: v6 addrs assigned by the
 	// upstream exit (absent when the exit did not negotiate dual-stack).
 	dual := downstreamDualStackAddrs(sink, cfg.IPPoolV6, clientIP)
-	resp := frameConfusionTUNResponse(buildTUNHandshakeResponse(clientVersion, serverIP, clientIP, tunHandshakeCaps{}, dual))
+	resp := buildTUNHandshakeResponse(clientVersion, serverIP, clientIP, tunHandshakeCaps{}, dual)
 	recordDualStackSession(srvCtx, clientVersion, dual)
 	if err := writeConfusionFrame(resp); err != nil {
 		logger.Debug("Confusion TUN handshake response write failed: %v", err)
@@ -3170,24 +3295,14 @@ func handleConfusionTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverC
 			sink.UpdateActivity()
 		}
 
-		// Check for double framing from ConfusedConn
-		// ConfusedConn.Write adds [length:4] to every write, but VPN client
-		// already adds [length:4][packet] framing, resulting in:
-		// [outerLen:4][innerLen:4][packet]
-		// We need to strip the inner length prefix if present
-		actualPkt := pkt
-		if len(pkt) >= 4 {
-			innerLen := binary.BigEndian.Uint32(pkt[:4])
-			if innerLen+4 == uint32(len(pkt)) && innerLen >= 20 {
-				// Found double framing - strip inner length prefix
-				if pktUp <= 5 || pktUp%100 == 0 {
-					logger.Debug("Confusion TUN: stripped double framing (outer=%d, inner=%d)", pktLen, innerLen)
-				}
-				actualPkt = pkt[4:]
-			}
-		}
-
-		if err := sink.WritePacket(actualPkt); err != nil {
+		// No double-framing strip any more. The old client's Write put a
+		// [length:4] in front of every write, on top of the one the VPN layer
+		// had already put there, and the server guessed which of the two it was
+		// looking at by comparing the inner number against the outer length - a
+		// guess that corrupts any packet whose first four bytes happen to hold
+		// its own length minus four. The sealed frame carries the boundary now,
+		// so there is exactly one length prefix and nothing to guess.
+		if err := sink.WritePacket(pkt); err != nil {
 			logger.Debug("Confusion TUN sink write error: %v", err)
 		}
 	}
@@ -3797,7 +3912,6 @@ func copyWithActivity(dst io.Writer, src io.Reader, lastActivity *atomic.Int64) 
 
 // setupH2Tunnel establishes the tunnel connection for HTTP/2 stego
 func setupH2Tunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, srvCtx *serverContext, logger *log.Logger) {
-	cfg := srvCtx.cfg
 	logger.Debug("Setting up HTTP/2 stego tunnel: %d bytes", len(data))
 
 	// Parse target address from data
@@ -3835,7 +3949,7 @@ func setupH2Tunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, srv
 	if err != nil {
 		logger.Warn("Failed to connect to %s: %v", targetAddr, err)
 		// Send failure response
-		sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, cfg)
+		sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, tunnel.secret)
 		return
 	}
 
@@ -3843,7 +3957,7 @@ func setupH2Tunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, srv
 	tunnel.targetConn = targetConn
 
 	// Send success response
-	sendStegoResponse(framer, tunnel.streamID, []byte{0x00}, cfg)
+	sendStegoResponse(framer, tunnel.streamID, []byte{0x00}, tunnel.secret)
 	logger.Debug("Connected to target, starting HTTP/2 stego relay")
 
 	// Start goroutine to read from target and send via HTTP/2
@@ -3856,29 +3970,42 @@ func setupH2Tunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, srv
 				return
 			}
 			tunnel.mu.Lock()
-			sendStegoResponse(framer, tunnel.streamID, buf[:n], cfg)
+			sendStegoResponse(framer, tunnel.streamID, buf[:n], tunnel.secret)
 			tunnel.mu.Unlock()
 		}
 	}()
 }
 
-// sendStegoResponse sends data via HTTP/2 steganography
-func sendStegoResponse(framer *http2.Framer, streamID uint32, data []byte, cfg *Config) {
-	// Frame format: [TIRD:4][flags:1][length:2][data:N][cover:M]
-	coverLen := 30
-	response := make([]byte, 7+len(data)+coverLen)
-	copy(response[0:4], []byte("TIRD"))
-	response[4] = 0x00 // Raw data flag
-	binary.BigEndian.PutUint16(response[5:7], uint16(len(data)))
-	copy(response[7:7+len(data)], data)
-	rand.Read(response[7+len(data):]) // Cover traffic
+// sendStegoResponse sends data via HTTP/2 steganography, keyed to the
+// authenticated client secret so the frame opens with a per-frame keyed marker
+// instead of the old constant "TIRD".
+func sendStegoResponse(framer *http2.Framer, streamID uint32, data []byte, secret []byte) {
+	// Frame format: [nonce][marker][flags:1][length:2][data:N][cover:M]
+	hdr, err := strategy.BuildStegoServerFrameHeader(secret)
+	if err != nil {
+		return
+	}
+	h := len(hdr)
+	// Bucketed cover instead of a fixed 30 bytes, so the server->client record
+	// length no longer tracks the packet it carries (the client recovers the
+	// real length from the Length field and drops the trailing cover).
+	base := h + 3 + len(data)
+	coverLen := strategy.StegoTunCoverLen(base)
+	response := make([]byte, base+coverLen)
+	copy(response[0:h], hdr)
+	response[h] = 0x00 // Raw data flag
+	binary.BigEndian.PutUint16(response[h+1:h+3], uint16(len(data)))
+	copy(response[h+3:base], data)
+	if coverLen > 0 {
+		rand.Read(response[base:]) // Cover traffic
+	}
 
 	framer.WriteData(streamID, false, response)
 }
 
 // h2StegoFrameFunc creates framing function for H2 Stego TUN->Client packets
 // Format: [len:4][packet:N]
-func h2StegoFrameFunc(framer *http2.Framer, streamID *uint32, cfg *Config, mu *sync.Mutex) func([]byte) []byte {
+func h2StegoFrameFunc(framer *http2.Framer, streamID *uint32, secret []byte, mu *sync.Mutex) func([]byte) []byte {
 	return func(pkt []byte) []byte {
 		// Frame packet: [len:4][packet:N]
 		framed := make([]byte, 4+len(pkt))
@@ -3887,7 +4014,7 @@ func h2StegoFrameFunc(framer *http2.Framer, streamID *uint32, cfg *Config, mu *s
 
 		// Send via H2 stego
 		mu.Lock()
-		sendStegoResponse(framer, *streamID, framed, cfg)
+		sendStegoResponse(framer, *streamID, framed, secret)
 		mu.Unlock()
 
 		return nil // Already sent
@@ -3911,7 +4038,7 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 	// Version byte is optional (v1 clients send 6 bytes, v2 clients send 7 bytes)
 	if len(data) < 6 {
 		logger.Debug("H2 TUN handshake too short: %d bytes", len(data))
-		sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, cfg)
+		sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, tunnel.secret)
 		return
 	}
 
@@ -3919,7 +4046,7 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 	// only an exit needs the shared device here.
 	if srvCtx == nil || (srvCtx.sharedTUN == nil && srvCtx.upstreamDialer == nil) {
 		logger.Error("Shared TUN not initialized")
-		sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, cfg)
+		sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, tunnel.secret)
 		return
 	}
 
@@ -3939,6 +4066,7 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 		framer:   framer,
 		streamID: &tunnel.streamID, // Pointer so it can be updated
 		cfg:      cfg,
+		secret:   tunnel.secret,
 		mu:       &tunnel.mu,
 		done:     make(chan struct{}),
 	}
@@ -3951,7 +4079,7 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 		copy(framed[4:], pkt)
 
 		tunnel.mu.Lock()
-		sendStegoResponse(framer, tunnel.streamID, framed, cfg)
+		sendStegoResponse(framer, tunnel.streamID, framed, tunnel.secret)
 		tunnel.mu.Unlock()
 		return nil
 	}
@@ -3963,7 +4091,7 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, data, origin, sendPacketDown)
 		if err != nil {
 			logger.Warn("H2 TUN relay: upstream dial failed: %v", err)
-			sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, cfg)
+			sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, tunnel.secret)
 			return
 		}
 		clientIP, serverIP = upClientIP, upServerIP
@@ -3975,7 +4103,7 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 			allocatedIP, err := srvCtx.ipPool.Allocate(leaseKey, requestedIP, "")
 			if err != nil {
 				logger.Error("Failed to allocate IP from pool: %v", err)
-				sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, cfg)
+				sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, tunnel.secret)
 				return
 			}
 			clientIP = allocatedIP
@@ -4007,7 +4135,7 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 	dual := downstreamDualStackAddrs(tunnel.sink, cfg.IPPoolV6, clientIP)
 	resp := buildTUNHandshakeResponse(clientVersion, serverIP, clientIP, tunHandshakeCaps{}, dual)
 	recordDualStackSession(srvCtx, clientVersion, dual)
-	sendStegoResponse(framer, tunnel.streamID, resp, cfg)
+	sendStegoResponse(framer, tunnel.streamID, resp, tunnel.secret)
 
 	logger.Info("H2 TUN mode established (client=%s, server=%s)", clientIP, serverIP)
 }
@@ -4017,6 +4145,7 @@ type h2TunConn struct {
 	framer   *http2.Framer
 	streamID *uint32
 	cfg      *Config
+	secret   []byte // Authenticated client secret, keys the stego markers
 	mu       *sync.Mutex
 	clientIP net.IP
 	done     chan struct{}
@@ -4062,43 +4191,27 @@ func handleConfusionData(conn net.Conn, data []byte, srvCtx *serverContext, logg
 
 // Helper functions
 
+// detectTimingKnock matches the head of the first knock packet against secret.
+//
+// v2 layout of packet 0: [seq=0][bucket:8][nonce:16][tag:16][body...]. The
+// nonce and bucket are in the clear; the tag is HKDF(secret, nonce, bucket), so
+// a peer that does not hold the secret cannot produce it. Matching the tag lets
+// the server pick the right secret from a fixed-length prefix, without first
+// reading a secret-dependent packet length. A stale bucket is rejected before
+// any HKDF work, so garbage costs nothing.
 func detectTimingKnock(data []byte, secret []byte) bool {
-	// Check if first byte could be sequence number 0
-	if len(data) < 10 || data[0] != 0x00 {
+	if len(data) < strategy.KnockHeaderLen+strategy.KnockTagLen || data[0] != 0x00 {
 		return false
 	}
 
-	// Calculate expected first packet size (same as generateKnockSequence)
-	seqHash := hmac.New(sha256.New, secret)
-	seqHash.Write([]byte("knock-sequence"))
-	seqHashSum := seqHash.Sum(nil)
-	firstPacketSize := 10 + int(seqHashSum[5])%90
-
-	// Verify first packet content matches expected
-	h := hmac.New(sha256.New, secret)
-	h.Write([]byte{0x00})
-	expected := h.Sum(nil)
-
-	// Debug: log expected vs received
-	log.Debug("Timing knock check - expected first packet size: %d", firstPacketSize)
-	log.Debug("Timing knock check - expected first 8 bytes: %x", expected[:8])
-	log.Debug("Timing knock check - received bytes 1-9: %x", data[1:9])
-
-	// Only check up to firstPacketSize bytes (not all peeked data)
-	checkLen := firstPacketSize
-	if checkLen > len(data) {
-		checkLen = len(data)
+	bucket := int64(binary.BigEndian.Uint64(data[1:9]))
+	if !strategy.KnockBucketFresh(bucket) {
+		return false
 	}
 
-	for i := 1; i < checkLen; i++ {
-		if data[i] != expected[(i-1)%len(expected)] {
-			log.Debug("Timing knock mismatch at position %d: expected %02x, got %02x",
-				i, expected[(i-1)%len(expected)], data[i])
-			return false
-		}
-	}
-
-	return true
+	nonce := data[9:strategy.KnockHeaderLen]
+	expectedTag := strategy.KnockTag(secret, nonce, bucket)
+	return hmac.Equal(data[strategy.KnockHeaderLen:strategy.KnockHeaderLen+strategy.KnockTagLen], expectedTag)
 }
 
 // detectTimingKnockWithRegistry checks timing knock against per-client secrets and global secret
@@ -4123,78 +4236,83 @@ func detectTimingKnockWithRegistry(data []byte, srvCtx *serverContext) (bool, []
 	return false, nil, clientIdentity{}
 }
 
-func verifyFullKnockSequence(conn net.Conn, secret []byte, logger *log.Logger) bool {
-	// Generate expected knock sequence (same as client)
-	seqHash := hmac.New(sha256.New, secret)
-	seqHash.Write([]byte("knock-sequence"))
-	seqHashSum := seqHash.Sum(nil)
-
-	sizes := make([]int, 5)
-	for i := 0; i < 5; i++ {
-		sizes[i] = 10 + int(seqHashSum[i+5])%90
+// verifyFullKnockSequence reads and verifies all knock packets from conn.
+//
+// It is self-contained: it reads packet 0's fixed header, recovers the nonce and
+// bucket, rejects a stale bucket and a replayed nonce (the replay window lives in
+// srvCtx.knockReplay), then recomputes the whole schedule and every body byte
+// from (secret, nonce, bucket) and checks them. The v1 version derived
+// everything from the secret alone, so a captured knock could be replayed
+// verbatim; here the nonce is single-use inside the window.
+func verifyFullKnockSequence(conn net.Conn, secret []byte, srvCtx *serverContext, logger *log.Logger) bool {
+	hdr := make([]byte, strategy.KnockHeaderLen)
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(conn, hdr); err != nil {
+		logger.Debug("Knock header read error: %v", err)
+		return false
+	}
+	if hdr[0] != 0x00 {
+		logger.Debug("Knock packet 0: wrong sequence number (got %d)", hdr[0])
+		return false
 	}
 
-	logger.Debug("Verifying knock sequence, packet sizes: %v", sizes)
+	bucket := int64(binary.BigEndian.Uint64(hdr[1:9]))
+	if !strategy.KnockBucketFresh(bucket) {
+		logger.Debug("Knock bucket %d outside freshness window", bucket)
+		return false
+	}
+	nonce := append([]byte(nil), hdr[9:strategy.KnockHeaderLen]...)
 
-	// Read ALL 5 packets (peek doesn't consume, so we start from packet 0)
-	for i := 0; i < 5; i++ {
-		// Read exact packet size
-		buf := make([]byte, sizes[i])
+	if !srvCtx.knockReplay.checkAndRecord(nonce, knockReplayTTL) {
+		logger.Warn("Knock replay rejected (nonce seen inside the window)")
+		return false
+	}
+
+	seq := strategy.KnockScheduleFor(secret, nonce, bucket)
+	logger.Debug("Verifying knock sequence, packet sizes: %v", seq.Sizes)
+
+	// Packet 0 remainder: [tag:16][body0]. body0 length = size0 - header - tag.
+	rest0 := make([]byte, seq.Sizes[0]-strategy.KnockHeaderLen)
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(conn, rest0); err != nil {
+		logger.Debug("Knock packet 0 body read error: %v", err)
+		return false
+	}
+	if !hmac.Equal(rest0[:strategy.KnockTagLen], strategy.KnockTag(secret, nonce, bucket)) {
+		logger.Debug("Knock packet 0: tag mismatch")
+		return false
+	}
+	body0 := strategy.KnockBody(secret, nonce, bucket, 0, seq.Sizes[0]-strategy.KnockHeaderLen-strategy.KnockTagLen)
+	if !hmac.Equal(rest0[strategy.KnockTagLen:], body0) {
+		logger.Debug("Knock packet 0: body mismatch")
+		return false
+	}
+
+	for i := 1; i < strategy.KnockPackets; i++ {
+		buf := make([]byte, seq.Sizes[i])
 		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-		_, err := io.ReadFull(conn, buf)
-		if err != nil {
+		if _, err := io.ReadFull(conn, buf); err != nil {
 			logger.Debug("Knock packet %d read error: %v", i, err)
 			return false
 		}
-
 		if buf[0] != byte(i) {
 			logger.Debug("Knock packet %d: wrong sequence number (got %d, expected %d)", i, buf[0], i)
 			return false
 		}
-
-		// Verify packet content
-		h := hmac.New(sha256.New, secret)
-		h.Write([]byte{byte(i)})
-		expected := h.Sum(nil)
-
-		for j := 1; j < len(buf); j++ {
-			if buf[j] != expected[(j-1)%len(expected)] {
-				logger.Debug("Knock packet %d: content mismatch at byte %d", i, j)
-				return false
-			}
+		if !hmac.Equal(buf[1:], strategy.KnockBody(secret, nonce, bucket, i, seq.Sizes[i]-1)) {
+			logger.Debug("Knock packet %d: body mismatch", i)
+			return false
 		}
-
-		logger.Debug("Knock packet %d: OK (%d bytes)", i, sizes[i])
+		logger.Debug("Knock packet %d: OK (%d bytes)", i, seq.Sizes[i])
 	}
 
 	return true
 }
 
-func detectConfusionMagic(data []byte) bool {
-	// TIRED magic anywhere in peeked data — catches all confusion types once enough
-	// bytes are buffered
-	if bytes.Contains(data, []byte("TIRED")) {
-		return true
-	}
-
-	// DNS-over-TCP confusion: [len:2][txid:2][flags:0x0100...] — query with RD bit
-	// len(data) >= 6 covers the 2-byte TCP length prefix + 4 bytes of DNS header
-	if len(data) >= 6 && data[4] == 0x01 && data[5] == 0x00 {
-		return true
-	}
-
-	// SSH banner — will need to read more to find TIRED marker
-	if bytes.HasPrefix(data, []byte("SSH-2.0-")) {
-		return true
-	}
-
-	// SMTP client EHLO — will need to read more to find TIRED marker
-	if bytes.HasPrefix(data, []byte("EHLO ")) {
-		return true
-	}
-
-	return false
-}
+// detectConfusionMagic and the rest of the confusion admission path now live in
+// confusion_auth.go, where the parse and the marker check sit next to each
+// other. Splitting them was how the old detector ended up routing a connection
+// into the relay on the strength of two bytes.
 
 // authClockSkewGraceMinutes bounds how many 1-minute buckets on either side of
 // "now" verifyH2Auth/verifyMorphAuth accept, tolerating client/server clock
@@ -4203,7 +4321,12 @@ func detectConfusionMagic(data []byte) bool {
 // here fixes clients whose clock drifts by more than the original 1 minute.
 const authClockSkewGraceMinutes int64 = 10
 
-func verifyH2Auth(apiKey, requestID string, secret []byte) bool {
+// verifyH2Auth checks the HTTP/2 stego auth token. ekm is the TLS session
+// exporter this connection authenticates over; it is folded into the HMAC so a
+// token captured on another TLS session is rejected here (S22 session binding).
+// The client derives the matching token from the exporter of the same handshake
+// (internal/strategy/stego.go generateAuthTokenBound).
+func verifyH2Auth(apiKey, requestID string, secret, ekm []byte) bool {
 	// Decode hex values
 	apiKeyBytes := decodeHex(apiKey)
 	requestIDBytes := decodeHex(requestID)
@@ -4227,6 +4350,7 @@ func verifyH2Auth(apiKey, requestID string, secret []byte) bool {
 		h := hmac.New(sha256.New, secret)
 		h.Write(timestamp)
 		h.Write([]byte("http2-stego-auth"))
+		h.Write(ekm) // TLS-session binding; must match the client's exporter
 		expectedToken := h.Sum(nil)[:32]
 
 		if hmac.Equal(receivedToken, expectedToken) {
@@ -4236,7 +4360,10 @@ func verifyH2Auth(apiKey, requestID string, secret []byte) bool {
 	return false
 }
 
-func verifyMorphAuth(receivedToken, secret []byte) bool {
+// verifyMorphAuth checks the Morph / WebSocket-Padded / Geneva auth token. ekm
+// is the TLS session exporter this connection authenticates over, folded into
+// the HMAC for S22 session binding (see verifyH2Auth).
+func verifyMorphAuth(receivedToken, secret, ekm []byte) bool {
 	if len(receivedToken) != 32 {
 		return false
 	}
@@ -4253,6 +4380,7 @@ func verifyMorphAuth(receivedToken, secret []byte) bool {
 		h := hmac.New(sha256.New, secret)
 		h.Write(timestamp)
 		h.Write([]byte("http2-stego-auth")) // Use same context as H2 Stego for consistency
+		h.Write(ekm)                        // TLS-session binding; must match the client's exporter
 		expectedToken := h.Sum(nil)[:32]
 
 		if hmac.Equal(receivedToken, expectedToken) {
@@ -4269,10 +4397,20 @@ func sendH2AuthAck(framer *http2.Framer, streamID uint32, secret []byte) {
 	enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
 	enc.WriteField(hpack.HeaderField{Name: "content-type", Value: "application/grpc"})
 
-	ackKey := deriveKey(secret, "server-ack")[:16]
+	// Bind the ack to a fresh per-connection nonce: value = hex(nonce || proof).
+	// deriveKey(secret,"server-ack") produced one static proof for the whole
+	// life of the secret, replayable across connections; the client verifies
+	// this format in stego.go verifyServerAckHeaders.
+	var ackNonce [stegoAckNonceLen]byte
+	if _, err := rand.Read(ackNonce[:]); err != nil {
+		return
+	}
+	ackVal := make([]byte, 0, stegoAckNonceLen+16)
+	ackVal = append(ackVal, ackNonce[:]...)
+	ackVal = append(ackVal, serverAckProof(secret, ackNonce[:])[:16]...)
 	enc.WriteField(hpack.HeaderField{
 		Name:  "x-goog-correlation-id",
-		Value: encodeHex(ackKey),
+		Value: encodeHex(ackVal),
 	})
 
 	framer.WriteHeaders(http2.HeadersFrameParam{
@@ -4286,6 +4424,20 @@ func sendH2AuthAck(framer *http2.Framer, streamID uint32, secret []byte) {
 func deriveKey(secret []byte, context string) []byte {
 	h := hmac.New(sha256.New, secret)
 	h.Write([]byte(context))
+	return h.Sum(nil)
+}
+
+// stegoAckNonceLen is the per-connection nonce the server prefixes to its H2
+// stego ack proof. Must match strategy.stegoAckNonceLen (the client decoder).
+const stegoAckNonceLen = 8
+
+// serverAckProof derives the H2 stego ack proof from the secret and a
+// per-connection nonce, so the proof differs between connections instead of
+// being a single static value. Must match strategy.serverAckMaterial.
+func serverAckProof(secret, nonce []byte) []byte {
+	h := hmac.New(sha256.New, secret)
+	h.Write(nonce)
+	h.Write([]byte("server-ack"))
 	return h.Sum(nil)
 }
 
@@ -4345,11 +4497,16 @@ func (bc *bufferedConn) Unwrap() net.Conn { return bc.Conn }
 // Ensure interface compliance
 var _ net.Conn = (*bufferedConn)(nil)
 
-// detectWebSocketPadded detects WebSocket Padded protocol by X-Salamander-Version header
+// detectWebSocketPadded detects a WebSocket Padded upgrade by the keyed
+// X-Auth-Token it carries, not by any product-named header. X-Auth-Token is the
+// per-client HMAC the handler verifies below; keying detection off it means the
+// only header we look for is one whose value is a proof of the secret, and its
+// name is a common API convention rather than a self-report like the old
+// X-Salamander-Version.
 func detectWebSocketPadded(data []byte) bool {
 	return bytes.Contains(data, []byte("GET ")) &&
 		bytes.Contains(data, []byte("Upgrade: websocket")) &&
-		bytes.Contains(data, []byte("X-Salamander-Version:"))
+		bytes.Contains(data, []byte("X-Auth-Token:"))
 }
 
 // handleWebSocketConnection handles WebSocket connection with ALPN routing
@@ -4363,6 +4520,15 @@ func handleWebSocketPadded(conn net.Conn, srvCtx *serverContext, logger *log.Log
 	defer conn.Close()
 
 	logger.Debug("WebSocket Padded: Processing connection from %s", conn.RemoteAddr())
+
+	// Session binding (S22): the WebSocket-Padded and Geneva clients both bind
+	// their X-Auth-Token to this TLS session's exporter. kTLS offload happens
+	// after auth, so conn is still a userspace *tls.Conn here. WS has no
+	// plaintext entry path, so the exporter is always available.
+	ekm, ekmErr := exporterBindingKey(conn)
+	if ekmErr != nil {
+		logger.Debug("WebSocket Padded: exporter unavailable: %v", ekmErr)
+	}
 
 	// Read upgrade request byte-exactly so no bytes past \r\n\r\n are
 	// consumed into an internal buffer. bufio.NewReader would pre-fetch
@@ -4380,60 +4546,50 @@ func handleWebSocketPadded(conn net.Conn, srvCtx *serverContext, logger *log.Log
 		return
 	}
 
-	_, hasSalamander := headers["X-Salamander-Version"]
-	if !hasSalamander {
-		logger.Error("WebSocket Padded: Missing X-Salamander-Version")
+	// The keyed X-Auth-Token is the sole discriminator and the authentication.
+	// There is no product-named header to require and no tokenless fallback: a
+	// 1.11.0 client always sends the token, so anything without one is not ours
+	// and gets a fast rejection rather than a guessed global-secret session.
+	authTokenHex, hasAuthToken := headers["X-Auth-Token"]
+	if !hasAuthToken {
+		logger.Error("WebSocket Padded: Missing X-Auth-Token")
 		return
 	}
 
-	// Verify X-Auth-Token against per-client secrets and global secret
-	authTokenHex, hasAuthToken := headers["X-Auth-Token"]
+	authToken, err := hex.DecodeString(authTokenHex)
+	if err != nil {
+		logger.Error("WebSocket Padded: Invalid X-Auth-Token format: %v", err)
+		return
+	}
+
 	var usedSecret []byte
 	var clientID clientIdentity
 
-	if hasAuthToken {
-		authToken, err := hex.DecodeString(authTokenHex)
-		if err != nil {
-			logger.Error("WebSocket Padded: Invalid X-Auth-Token format: %v", err)
-			return
-		}
-
-		// 1. Try per-client secrets from registry
-		if srvCtx.registry != nil {
-			clients := srvCtx.registry.ListClients()
-			for _, client := range clients {
-				if verifyMorphAuth(authToken, []byte(client.Secret)) {
-					logger.Info("WebSocket Padded authenticated (client: %s, id: %s)", client.Name, client.ID)
-					usedSecret = []byte(client.Secret)
-					clientID = registryIdentity(client.ID)
-					break
-				}
+	// 1. Try per-client secrets from registry
+	if srvCtx.registry != nil {
+		clients := srvCtx.registry.ListClients()
+		for _, client := range clients {
+			if verifyMorphAuth(authToken, []byte(client.Secret), ekm) {
+				logger.Info("WebSocket Padded authenticated (client: %s, id: %s)", client.Name, client.ID)
+				usedSecret = []byte(client.Secret)
+				clientID = registryIdentity(client.ID)
+				break
 			}
 		}
+	}
 
-		// 2. Fallback to global secret
-		if usedSecret == nil && len(srvCtx.cfg.Secret) > 0 {
-			if verifyMorphAuth(authToken, srvCtx.cfg.Secret) {
-				logger.Info("WebSocket Padded authenticated (global secret)")
-				usedSecret = srvCtx.cfg.Secret
-				clientID = sharedIdentity(globalClientID)
-			}
-		}
-
-		if usedSecret == nil {
-			logger.Error("WebSocket Padded: Authentication failed - invalid token")
-			return
-		}
-	} else {
-		// No auth token - fallback to global secret for backward compatibility
-		if len(srvCtx.cfg.Secret) > 0 {
+	// 2. Fallback to global secret
+	if usedSecret == nil && len(srvCtx.cfg.Secret) > 0 {
+		if verifyMorphAuth(authToken, srvCtx.cfg.Secret, ekm) {
+			logger.Info("WebSocket Padded authenticated (global secret)")
 			usedSecret = srvCtx.cfg.Secret
-			clientID = sharedIdentity("global-legacy")
-			logger.Debug("WebSocket Padded: No auth token, using global secret (legacy mode)")
-		} else {
-			logger.Error("WebSocket Padded: No auth token and no global secret configured")
-			return
+			clientID = sharedIdentity(globalClientID)
 		}
+	}
+
+	if usedSecret == nil {
+		logger.Error("WebSocket Padded: Authentication failed - invalid token")
+		return
 	}
 
 	logger.Debug("WebSocket Padded: Valid upgrade request, key=%s, clientID=%s", wsKey, clientID)
@@ -4736,9 +4892,15 @@ func (s *HTTPPollingSession) ReadToClient(ackSeq int64) []byte {
 	return result
 }
 
-// verifyPollingAuth verifies the HMAC auth token for polling requests
-func verifyPollingAuth(authToken, sessionID string, secret []byte) bool {
-	// Auth token is generated as: HMAC(secret, sessionID:timestamp)[:16]
+// verifyPollingAuth verifies the HMAC auth token for polling requests. ekm is
+// the TLS session exporter of the connection the request arrived on, folded
+// into the HMAC for S22 session binding: a token captured on one poll session
+// is rejected on any other. Keep-alive reuses one TLS session, so its exporter
+// is stable across the burst of requests and the token keeps verifying; a fresh
+// dial gets a fresh exporter and the client rederives the token to match (see
+// internal/strategy/http_polling.go generateAuthTokenForConn).
+func verifyPollingAuth(authToken, sessionID string, secret, ekm []byte) bool {
+	// Auth token is generated as: HMAC(secret, sessionID:timestamp || ekm)[:16]
 	// We allow tokens from last 60 seconds
 	now := time.Now().Unix()
 
@@ -4746,6 +4908,7 @@ func verifyPollingAuth(authToken, sessionID string, secret []byte) bool {
 		data := fmt.Sprintf("%s:%d", sessionID, now-delta)
 		h := hmac.New(sha256.New, secret)
 		h.Write([]byte(data))
+		h.Write(ekm) // TLS-session binding; must match the client's exporter
 		expected := base64.StdEncoding.EncodeToString(h.Sum(nil))[:16]
 		if hmac.Equal([]byte(authToken), []byte(expected)) {
 			return true
@@ -4768,6 +4931,17 @@ func decodeClientSecret(secretStr string) []byte {
 	return []byte(secretStr)
 }
 
+// pollingServerMaxRequests / pollingServerKeepaliveIdle bound connection reuse
+// on the server side. They mirror the client's bounds: reuse amortises the TLS
+// handshake across a burst of active polls, but a meek connection is never held
+// open indefinitely (TSPU throttles long-lived flows). Past the request count,
+// or if the next keep-alive request does not arrive within the idle window, the
+// server closes and the client dials afresh.
+const (
+	pollingServerMaxRequests   = 64
+	pollingServerKeepaliveIdle = 15 * time.Second
+)
+
 // handleHTTPPollingWithALPN handles HTTP polling connections via ALPN routing
 // This is the kTLS-compatible entry point for tired-polling ALPN
 func handleHTTPPollingWithALPN(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
@@ -4786,14 +4960,68 @@ func handleHTTPPollingWithALPN(conn net.Conn, srvCtx *serverContext, logger *log
 	handleHTTPPolling(conn, srvCtx, buf[:n], logger)
 }
 
-// handleHTTPPolling handles HTTP polling requests (one request per connection)
-func handleHTTPPolling(conn net.Conn, srvCtx *serverContext, request []byte, logger *log.Logger) {
-	reader := bufio.NewReader(conn)
-	processHTTPPollingRequest(conn, reader, srvCtx, request, logger)
+// handleHTTPPolling serves HTTP polling requests on one connection, looping for
+// keep-alive so a client can amortise the TLS handshake across a burst of polls.
+// firstRequest is whatever the caller already read off the socket; the rest is
+// pulled from conn through a single persistent reader so the stream stays
+// aligned across requests.
+func handleHTTPPolling(conn net.Conn, srvCtx *serverContext, firstRequest []byte, logger *log.Logger) {
+	defer conn.Close()
+	reader := bufio.NewReader(io.MultiReader(bytes.NewReader(firstRequest), conn))
+
+	// Session binding (S22): every request on this connection authenticates
+	// against the same TLS session exporter. Keep-alive reuses one *tls.Conn for
+	// the whole burst, so the exporter is constant across the loop and the
+	// client's per-request token keeps verifying. Polling has no plaintext entry
+	// path, so the exporter is available.
+	ekm, ekmErr := exporterBindingKey(conn)
+	if ekmErr != nil {
+		logger.Debug("HTTP Polling: exporter unavailable: %v", ekmErr)
+	}
+
+	for i := 0; i < pollingServerMaxRequests; i++ {
+		if i > 0 {
+			// Wait a bounded time for the next keep-alive request.
+			conn.SetReadDeadline(time.Now().Add(pollingServerKeepaliveIdle))
+		}
+		head, err := readPollingRequestHead(reader)
+		conn.SetReadDeadline(time.Time{})
+		if err != nil {
+			// Client closed the connection or went idle past the window - normal
+			// end of a keep-alive burst, not an error worth logging loudly.
+			if i == 0 {
+				logger.Debug("HTTP Polling: failed to read request head: %v", err)
+			}
+			return
+		}
+		if !processHTTPPollingRequest(conn, reader, srvCtx, head, ekm, logger) {
+			return
+		}
+	}
 }
 
-// processHTTPPollingRequest processes a single HTTP polling request
-func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serverContext, request []byte, logger *log.Logger) {
+// readPollingRequestHead reads one HTTP request's header block (up to and
+// including the terminating blank line) from reader.
+func readPollingRequestHead(reader *bufio.Reader) ([]byte, error) {
+	var head []byte
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			return nil, err
+		}
+		head = append(head, line...)
+		if len(head) > 16*1024 {
+			return nil, errors.New("polling request head too large")
+		}
+		if bytes.Equal(line, []byte("\r\n")) || bytes.Equal(line, []byte("\n")) {
+			return head, nil
+		}
+	}
+}
+
+// processHTTPPollingRequest processes a single HTTP polling request and reports
+// whether the client asked to keep the connection open for a further request.
+func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serverContext, request, ekm []byte, logger *log.Logger) (keepAliveOut bool) {
 	// Parse headers from request
 	lines := bytes.Split(request, []byte("\r\n"))
 	var sessionID, authToken string
@@ -4822,32 +5050,22 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 	if sessionID == "" {
 		logger.Debug("HTTP Polling: Missing session ID")
 		sendHTTPPollingError(conn, "Missing session ID")
-		return
+		return false
 	}
 
-	// Read body if present
+	// Read body if present. request is the header block only; the body follows on
+	// the persistent reader (which spans keep-alive requests), so read exactly
+	// contentLength bytes to keep the stream aligned for the next request.
 	var body []byte
 	if contentLength > 0 {
-		// Find body start (after \r\n\r\n)
-		bodyStart := bytes.Index(request, []byte("\r\n\r\n"))
-		if bodyStart != -1 {
-			bodyStart += 4
-			existingBody := request[bodyStart:]
-			if len(existingBody) < contentLength {
-				// Need to read more body data from connection
-				remaining := make([]byte, contentLength-len(existingBody))
-				conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-				_, err := io.ReadFull(conn, remaining)
-				conn.SetReadDeadline(time.Time{})
-				if err != nil {
-					logger.Debug("HTTP Polling: Failed to read body: %v", err)
-					sendHTTPPollingError(conn, "Failed to read body")
-					return
-				}
-				body = append(existingBody, remaining...)
-			} else if len(existingBody) >= contentLength {
-				body = existingBody[:contentLength]
-			}
+		body = make([]byte, contentLength)
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		_, err := io.ReadFull(reader, body)
+		conn.SetReadDeadline(time.Time{})
+		if err != nil {
+			logger.Debug("HTTP Polling: Failed to read body: %v", err)
+			sendHTTPPollingError(conn, "Failed to read body")
+			return false
 		}
 	}
 
@@ -4859,7 +5077,7 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 
 	if existingSess != nil {
 		// Session exists - verify auth against session's secret
-		if verifyPollingAuth(authToken, sessionID, existingSess.Secret) {
+		if verifyPollingAuth(authToken, sessionID, existingSess.Secret, ekm) {
 			usedSecret = existingSess.Secret
 			clientID = existingSess.ClientID
 		} else {
@@ -4871,17 +5089,17 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 				clients := srvCtx.registry.ListClients()
 				for _, c := range clients {
 					secretBytes := []byte(c.Secret)
-					if verifyPollingAuth(authToken, sessionID, secretBytes) {
+					if verifyPollingAuth(authToken, sessionID, secretBytes, ekm) {
 						logger.Debug("HTTP Polling: Token would match client '%s'", c.Name)
 					}
 				}
 			}
-			if verifyPollingAuth(authToken, sessionID, srvCtx.cfg.Secret) {
+			if verifyPollingAuth(authToken, sessionID, srvCtx.cfg.Secret, ekm) {
 				logger.Debug("HTTP Polling: Token would match global secret")
 			}
 
 			sendHTTPPollingError(conn, "Authentication failed")
-			return
+			return false
 		}
 	} else {
 		// New session - authenticate by trying registered clients, then global secret
@@ -4890,7 +5108,7 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 			for _, c := range clients {
 				// Use secret as-is (client uses ASCII bytes of hex string)
 				secretBytes := []byte(c.Secret)
-				if verifyPollingAuth(authToken, sessionID, secretBytes) {
+				if verifyPollingAuth(authToken, sessionID, secretBytes, ekm) {
 					usedSecret = secretBytes
 					clientID = registryIdentity(c.ID)
 					logger.Debug("HTTP Polling: Auth matched client '%s' (id=%s)", c.Name, c.ID)
@@ -4900,7 +5118,7 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 		}
 
 		if usedSecret == nil && len(srvCtx.cfg.Secret) > 0 {
-			if verifyPollingAuth(authToken, sessionID, srvCtx.cfg.Secret) {
+			if verifyPollingAuth(authToken, sessionID, srvCtx.cfg.Secret, ekm) {
 				usedSecret = srvCtx.cfg.Secret
 				clientID = sharedIdentity(globalClientID)
 				logger.Debug("HTTP Polling: Auth matched global secret")
@@ -4910,7 +5128,7 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 		if usedSecret == nil {
 			logger.Debug("HTTP Polling: Authentication failed for new session %s", sessionID[:8])
 			sendHTTPPollingError(conn, "Authentication failed")
-			return
+			return false
 		}
 	}
 
@@ -4933,7 +5151,7 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 
 		// Start background relay goroutine for this session
 		go runPollingSessionRelay(sess, srvCtx, logger)
-		return
+		return keepAlive
 	}
 
 	// Existing session - exchange data
@@ -4952,6 +5170,7 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 	}
 
 	sendHTTPPollingResponse(conn, toClient, keepAlive)
+	return keepAlive
 }
 
 // runPollingSessionRelay handles the relay for a polling session

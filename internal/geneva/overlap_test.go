@@ -2,9 +2,51 @@ package geneva
 
 import (
 	"bytes"
+	"crypto/hmac"
+	cryptorand "crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"testing"
 )
+
+// testOverlapNonceLen is the nonce prefix length used by the test markers,
+// matching the production layout ([nonce:8][HMAC:24]).
+const testOverlapNonceLen = 8
+
+var testOverlapSalt = []byte("test-overlap-salt")
+
+// testMarkerFromNonce derives a self-describing [nonce||HMAC(secret,salt||nonce)]
+// marker, the same layout the client uses. Shared by the minter and the verifier
+// so the two agree.
+func testMarkerFromNonce(secret, nonce []byte) []byte {
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(testOverlapSalt)
+	mac.Write(nonce)
+	tag := mac.Sum(nil)
+	out := make([]byte, 0, OverlapMarkerLen)
+	out = append(out, nonce...)
+	out = append(out, tag[:OverlapMarkerLen-testOverlapNonceLen]...)
+	return out
+}
+
+// testMintFn returns a minter that produces a fresh per-call marker under secret.
+func testMintFn(secret []byte) func() []byte {
+	return func() []byte {
+		nonce := make([]byte, testOverlapNonceLen)
+		_, _ = cryptorand.Read(nonce)
+		return testMarkerFromNonce(secret, nonce)
+	}
+}
+
+// createClientHelloPacketPort is createClientHelloPacket with a configurable
+// source port, so distinct connections (distinct 4-tuples) can be built.
+func createClientHelloPacketPort(seq uint32, payloadLen int, srcPort uint16) []byte {
+	packet := createClientHelloPacket(seq, payloadLen)
+	binary.BigEndian.PutUint16(packet[20:22], srcPort)
+	recalculateIPChecksum(packet)
+	recalculateTCPChecksum(packet)
+	return packet
+}
 
 // createClientHelloPacket builds a TCP data segment whose payload looks like a
 // TLS ClientHello record, for exercising OverlapPrimitive.
@@ -246,6 +288,125 @@ func TestNewOverlapPrimitiveDefaults(t *testing.T) {
 	strat := NewOverlapStrategy(prim)
 	if strat.Trigger.Protocol != "TCP" {
 		t.Errorf("overlap strategy trigger protocol = %q, want TCP", strat.Trigger.Protocol)
+	}
+}
+
+// markerOf extracts the OverlapMarkerLen-byte marker from a fake segment.
+func markerOf(t *testing.T, fake []byte) []byte {
+	t.Helper()
+	if len(fake) < 40+OverlapMarkerLen {
+		t.Fatalf("fake too short (%d) to hold a marker", len(fake))
+	}
+	return append([]byte(nil), fake[40:40+OverlapMarkerLen]...)
+}
+
+// TestOverlapPrimitivePerConnectionNonce is the per-connection guarantee: two
+// distinct connections (distinct 4-tuples) must get DIFFERENT fake markers when
+// the primitive mints per connection. The broken-code control below shows a
+// single static marker (the pre-fix per-injector nonce) makes them IDENTICAL, so
+// this test would go red on that regression.
+func TestOverlapPrimitivePerConnectionNonce(t *testing.T) {
+	secret := []byte("per-conn-secret")
+
+	// Two connections differ only by source port.
+	pkt1 := createClientHelloPacketPort(100000, 300, 40001)
+	pkt2 := createClientHelloPacketPort(100000, 300, 40002)
+
+	t.Run("minted_per_connection_differs", func(t *testing.T) {
+		prim := NewOverlapPrimitiveMinted(testMintFn(secret))
+
+		out1, err := prim.Apply(pkt1)
+		if err != nil || len(out1) != 2 {
+			t.Fatalf("conn1 Apply: out=%d err=%v", len(out1), err)
+		}
+		out2, err := prim.Apply(pkt2)
+		if err != nil || len(out2) != 2 {
+			t.Fatalf("conn2 Apply: out=%d err=%v", len(out2), err)
+		}
+
+		m1, m2 := markerOf(t, out1[0]), markerOf(t, out2[0])
+		if bytes.Equal(m1, m2) {
+			t.Fatal("two connections carry the SAME packet marker; per-connection nonce is not applied")
+		}
+
+		// Positive control: both markers must verify under the matching verifier.
+		v := OverlapMarkerVerifier{NonceLen: testOverlapNonceLen, Mint: func(n []byte) []byte {
+			return testMarkerFromNonce(secret, n)
+		}}
+		if !v.Matches(m1) || !v.Matches(m2) {
+			t.Fatal("minted markers do not verify under the matching verifier")
+		}
+	})
+
+	// Broken-code control (rule 1): a single static marker shared across
+	// connections - exactly what a per-injector (not per-connection) nonce would
+	// produce - makes the two markers identical. Flipping the production path back
+	// to a static marker turns the assertion above red; this proves it discriminates.
+	t.Run("static_marker_is_identical", func(t *testing.T) {
+		static := testMarkerFromNonce(secret, bytes.Repeat([]byte{0x11}, testOverlapNonceLen))
+		prim := &OverlapPrimitive{OverlapLen: 64, Marker: static, Once: true}
+
+		out1, _ := prim.Apply(createClientHelloPacketPort(100000, 300, 41001))
+		out2, _ := prim.Apply(createClientHelloPacketPort(100000, 300, 41002))
+		if len(out1) != 2 || len(out2) != 2 {
+			t.Fatalf("expected a fake per connection, got %d and %d", len(out1), len(out2))
+		}
+		if !bytes.Equal(markerOf(t, out1[0]), markerOf(t, out2[0])) {
+			t.Fatal("static marker unexpectedly differed across connections")
+		}
+	})
+}
+
+// TestOverlapServerDropperClassify is the server-side packet verification: the
+// dropper's decision function must DROP a fake carrying a valid marker and ACCEPT
+// everything else. Negative controls (rule 2): a corrupted MAC and a marker under
+// the wrong secret must NOT be dropped.
+func TestOverlapServerDropperClassify(t *testing.T) {
+	secret := []byte("dropper-secret")
+	verify := AnyOverlapVerifier(OverlapMarkerVerifier{
+		NonceLen: testOverlapNonceLen,
+		Mint:     func(n []byte) []byte { return testMarkerFromNonce(secret, n) },
+	})
+
+	// Build a fake segment via the primitive (same path the client emits).
+	prim := NewOverlapPrimitiveMinted(testMintFn(secret))
+	out, err := prim.Apply(createClientHelloPacketPort(200000, 300, 42001))
+	if err != nil || len(out) != 2 {
+		t.Fatalf("Apply: out=%d err=%v", len(out), err)
+	}
+	fake, real := out[0], out[1]
+
+	// Positive control: the fake is recognised and dropped.
+	if !overlapPacketIsFake(fake, verify) {
+		t.Fatal("valid fake segment was not recognised (would not be dropped)")
+	}
+	// The real ClientHello must pass through (not dropped).
+	if overlapPacketIsFake(real, verify) {
+		t.Fatal("real segment falsely recognised as a fake (would be dropped)")
+	}
+
+	// Negative control 1: corrupt the MAC portion of the marker -> must not drop.
+	corrupt := append([]byte(nil), fake...)
+	corrupt[40+OverlapMarkerLen-1] ^= 0xFF // last MAC byte
+	if overlapPacketIsFake(corrupt, verify) {
+		t.Fatal("fake with corrupted MAC was recognised (must not be)")
+	}
+
+	// Negative control 2: a marker minted under a DIFFERENT secret must not verify.
+	wrongPrim := NewOverlapPrimitiveMinted(testMintFn([]byte("other-secret")))
+	wrongOut, _ := wrongPrim.Apply(createClientHelloPacketPort(200000, 300, 42002))
+	if overlapPacketIsFake(wrongOut[0], verify) {
+		t.Fatal("fake under a different secret was recognised (must not be)")
+	}
+
+	// A non-TCP / no-payload packet is never a fake.
+	ack := make([]byte, 40)
+	ack[0] = 0x45
+	binary.BigEndian.PutUint16(ack[2:4], 40)
+	ack[9] = 6
+	ack[32] = 0x50
+	if overlapPacketIsFake(ack, verify) {
+		t.Fatal("empty ACK recognised as a fake")
 	}
 }
 

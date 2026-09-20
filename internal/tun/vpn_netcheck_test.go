@@ -2,8 +2,10 @@ package tun
 
 import (
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -110,5 +112,40 @@ func TestCheckNetworkConnectivityWithoutAGate(t *testing.T) {
 	}
 	if n := waitAccepts(t, server, 1); n == 0 {
 		t.Fatal("the server address was never dialled")
+	}
+}
+
+// A dial that comes back with ECONNREFUSED still proves the path is alive:
+// something answered with an RST. Only silence (timeout) means "down". The
+// network check relies on this because its physical probe dials the
+// default-route gateway, whose port 53 is usually closed.
+func TestErrMeansPathAlive(t *testing.T) {
+	refused := &net.OpError{Op: "dial", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}
+	if !errMeansPathAlive(refused) {
+		t.Fatal("ECONNREFUSED must count as an alive path")
+	}
+	for _, errno := range []syscall.Errno{syscall.ETIMEDOUT, syscall.EHOSTUNREACH, syscall.ENETUNREACH} {
+		unreachable := &net.OpError{Op: "dial", Err: os.NewSyscallError("connect", errno)}
+		if errMeansPathAlive(unreachable) {
+			t.Fatalf("%v must not count as an alive path", errno)
+		}
+	}
+	if errMeansPathAlive(nil) {
+		t.Fatal("nil error must not count as an alive path via the error path")
+	}
+}
+
+func TestDialMeansAliveRefusedCountsAsAlive(t *testing.T) {
+	// Grab a port the kernel just released; dialing it must come back with
+	// ECONNREFUSED on loopback, which dialMeansAlive reports as alive.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+
+	if !dialMeansAlive(addr) {
+		t.Fatal("connection refused on loopback must be reported as an alive path")
 	}
 }

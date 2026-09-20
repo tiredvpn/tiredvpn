@@ -151,7 +151,7 @@ func TestTrafficMorphProfile(t *testing.T) {
 
 // TestProtocolConfusionTypes tests all confusion types exist
 func TestProtocolConfusionTypes(t *testing.T) {
-	strategies := AllConfusionTypes(NewManager())
+	strategies := AllConfusionTypes(NewManager(), []byte("test-secret"))
 
 	if len(strategies) != 5 {
 		t.Errorf("Expected 5 confusion types, got %d", len(strategies))
@@ -167,14 +167,20 @@ func TestProtocolConfusionTypes(t *testing.T) {
 	}
 }
 
-// TestConfusedConnWrite tests protocol confusion packet building
+// TestConfusedConnWrite pins what the first packet must look like: a carrier
+// that parses as the protocol it imitates, a marker only the secret produces,
+// and no sign of the payload in the clear.
 func TestConfusedConnWrite(t *testing.T) {
 	// Create a pipe for testing
 	client, server := net.Pipe()
 	defer client.Close()
 	defer server.Close()
 
-	cc := NewConfusedConn(client, ConfusionDNSoverTLS)
+	secret := []byte("test-secret")
+	cc, err := NewConfusedConn(client, ConfusionDNSoverTLS, secret)
+	if err != nil {
+		t.Fatalf("NewConfusedConn: %v", err)
+	}
 
 	testData := []byte("hello world")
 
@@ -186,7 +192,7 @@ func TestConfusedConnWrite(t *testing.T) {
 	}()
 
 	// Read from server side
-	buf := make([]byte, 1024)
+	buf := make([]byte, 4096)
 	n, err := server.Read(buf)
 	if err != nil {
 		t.Fatalf("Read failed: %v", err)
@@ -196,14 +202,24 @@ func TestConfusedConnWrite(t *testing.T) {
 		t.Fatalf("Write failed: %v", writeErr)
 	}
 
-	// Should contain DNS header and our data
-	if n < len(testData)+12 {
-		t.Errorf("Packet too short: %d bytes", n)
+	carrier, err := ParseConfusionRequest(buf[:n])
+	if err != nil {
+		t.Fatalf("first packet does not parse as a carrier: %v", err)
 	}
-
-	// Check for TIRED magic marker
-	if !bytes.Contains(buf[:n], []byte("TIRED")) {
-		t.Error("Missing TIRED magic marker")
+	if carrier.Variant != confusionVariantDNS {
+		t.Errorf("variant = %d, want %d", carrier.Variant, confusionVariantDNS)
+	}
+	if _, ok := MatchConfusionClientMarker(secret, carrier.Nonce, carrier.Variant, carrier.Body); !ok {
+		t.Error("marker does not verify against the secret that wrote it")
+	}
+	if _, ok := MatchConfusionClientMarker([]byte("other-secret"), carrier.Nonce, carrier.Variant, carrier.Body); ok {
+		t.Error("marker verified against a secret that did not write it")
+	}
+	if bytes.Contains(buf[:n], testData) {
+		t.Error("payload is on the wire in the clear")
+	}
+	if bytes.Contains(buf[:n], []byte("TIRED")) {
+		t.Error("the literal TIRED marker is back on the wire")
 	}
 }
 
@@ -246,32 +262,27 @@ func TestMeshRelayNodeSelection(t *testing.T) {
 	}
 }
 
-// TestAntiProbeKnockSequence tests knock sequence generation
+// TestAntiProbeKnockSequence tests per-connection knock schedule generation.
 func TestAntiProbeKnockSequence(t *testing.T) {
 	secret := []byte("test-secret")
-	strat := NewAntiProbeStrategy(NewManager(), secret)
+	nonce := make([]byte, KnockNonceLen)
+	seq := knockSchedule(secret, nonce, KnockBucketNow())
 
-	seq := generateKnockSequence(strat.knockSecret)
-
-	if len(seq.Delays) != 5 {
-		t.Errorf("Expected 5 delays, got %d", len(seq.Delays))
+	if len(seq.Delays) != KnockPackets {
+		t.Errorf("expected %d delays, got %d", KnockPackets, len(seq.Delays))
 	}
-
-	if len(seq.Sizes) != 5 {
-		t.Errorf("Expected 5 sizes, got %d", len(seq.Sizes))
+	if len(seq.Sizes) != KnockPackets {
+		t.Errorf("expected %d sizes, got %d", KnockPackets, len(seq.Sizes))
 	}
-
-	// Verify delays are in expected range (50-200ms)
 	for i, d := range seq.Delays {
-		if d < 50*time.Millisecond || d > 200*time.Millisecond {
-			t.Errorf("Delay %d out of range: %v", i, d)
+		ms := d.Milliseconds()
+		if ms < knockDelayMinMs || ms >= knockDelayMinMs+knockDelaySpanMs {
+			t.Errorf("delay %d out of range: %v", i, d)
 		}
 	}
-
-	// Verify sizes are in expected range (10-100)
 	for i, s := range seq.Sizes {
-		if s < 10 || s > 100 {
-			t.Errorf("Size %d out of range: %d", i, s)
+		if s < knockSizeMin || s >= knockSizeMin+knockSizeSpan {
+			t.Errorf("size %d out of range: %d", i, s)
 		}
 	}
 }

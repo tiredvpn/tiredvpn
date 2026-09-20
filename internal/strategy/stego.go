@@ -17,10 +17,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/tiredvpn/tiredvpn/internal/evasion"
 	"github.com/tiredvpn/tiredvpn/internal/ktls"
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/protect"
 	"github.com/tiredvpn/tiredvpn/internal/protocol"
+	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
+	"golang.org/x/crypto/hkdf"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 )
@@ -68,9 +71,6 @@ type HTTP2StegoStrategy struct {
 // NewHTTP2StegoStrategy creates a new HTTP/2 steganography strategy
 // manager is required for IPv6/IPv4 transport layer support
 func NewHTTP2StegoStrategy(manager *Manager, secret []byte, coverHost string) *HTTP2StegoStrategy {
-	if coverHost == "" {
-		coverHost = "www.googleapis.com"
-	}
 	return &HTTP2StegoStrategy{
 		manager:     manager,
 		secret:      secret,
@@ -82,9 +82,6 @@ func NewHTTP2StegoStrategy(manager *Manager, secret []byte, coverHost string) *H
 // NewHTTP2StegoStrategyWithPadding creates a strategy with specific padding mode
 // manager is required for IPv6/IPv4 transport layer support
 func NewHTTP2StegoStrategyWithPadding(manager *Manager, secret []byte, coverHost string, mode NaivePaddingMode) *HTTP2StegoStrategy {
-	if coverHost == "" {
-		coverHost = "www.googleapis.com"
-	}
 	return &HTTP2StegoStrategy{
 		manager:     manager,
 		secret:      secret,
@@ -96,9 +93,6 @@ func NewHTTP2StegoStrategyWithPadding(manager *Manager, secret []byte, coverHost
 // NewHTTP2StegoStrategyWithECH creates a strategy with ECH support
 // manager is required for IPv6/IPv4 transport layer support
 func NewHTTP2StegoStrategyWithECH(manager *Manager, secret []byte, coverHost string, echConfigList []byte, echPublicName string) *HTTP2StegoStrategy {
-	if coverHost == "" {
-		coverHost = "www.googleapis.com"
-	}
 	return &HTTP2StegoStrategy{
 		manager:       manager,
 		secret:        secret,
@@ -154,14 +148,25 @@ func (s *HTTP2StegoStrategy) Connect(ctx context.Context, target string) (net.Co
 	// Get server address (IPv6/IPv4 with automatic fallback)
 	serverAddr := s.manager.GetServerAddr(ctx)
 	secret := dialSecret(ctx, s.secret)
-	log.Debug("HTTP/2 Stego: Using server address: %s", serverAddr)
+
+	// Cover host doubles as the TLS SNI and the HTTP/2 :authority. Picking it per
+	// connection from the shared whitelist (rather than a build-time constant or
+	// an hour-of-day index that moves every client at once) keeps the SNI a
+	// donor TSPU does not IP-range-check against us, and keeps the two views of
+	// the same name - the cleartext SNI and the encrypted :authority - agreeing.
+	// A caller that pinned a cover host in config keeps it.
+	coverHost := s.coverHost
+	if coverHost == "" {
+		coverHost = stegoCoverRotator.Next()
+	}
+	log.Debug("HTTP/2 Stego: Using server address: %s (cover %s)", serverAddr, coverHost)
 
 	// Establish TLS connection with standard ALPN.
 	// Protocol type is sent as the first encrypted byte after handshake,
 	// so DPI sees no "tired-*" fingerprint in the ClientHello.
 	tlsConfig := &tls.Config{
 		InsecureSkipVerify: true,
-		ServerName:         s.coverHost,
+		ServerName:         coverHost,
 		NextProtos:         []string{"h2", "http/1.1"},
 		ClientSessionCache: s.manager.TLSSessionCache(), // resume across reconnects
 	}
@@ -224,6 +229,15 @@ func (s *HTTP2StegoStrategy) Connect(ctx context.Context, target string) (net.Co
 		return nil, fmt.Errorf("stego dispatch: %w", err)
 	}
 
+	// Capture the TLS session exporter for auth-token binding (S22) BEFORE the
+	// kTLS handover — once the kernel owns the socket the *tls.Conn no longer
+	// reflects live keys.
+	ekm, err := sessionExporterKey(conn)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("stego: export keying material: %w", err)
+	}
+
 	// Try to enable kTLS for kernel TLS offload (reduces CPU usage)
 	var finalConn net.Conn = conn
 	if ktlsConn := ktls.Enable(conn); ktlsConn != nil {
@@ -232,7 +246,8 @@ func (s *HTTP2StegoStrategy) Connect(ctx context.Context, target string) (net.Co
 	}
 
 	// Create steganographic connection with padding mode
-	stegoConn := NewHTTP2StegoConn(finalConn, secret, true, s.paddingMode)
+	stegoConn := NewHTTP2StegoConn(finalConn, secret, true, s.paddingMode, ekm)
+	stegoConn.coverHost = coverHost // :authority tracks the SNI we opened with
 
 	// Perform initial handshake, bounded by the caller's context so a
 	// non-responding server can't hold this strategy past the strategy
@@ -254,6 +269,13 @@ type HTTP2StegoConn struct {
 	secret      []byte
 	isClient    bool
 	paddingMode NaivePaddingMode
+	coverHost   string // HTTP/2 :authority; set to the SNI so the two agree
+
+	// ekm is the TLS session exporter the auth token is bound to (S22). It is
+	// captured from the *tls.Conn before any kTLS offload and set via the
+	// constructor. nil only for the non-TLS test pipes, where both ends agree
+	// on nil; a live TLS session must always carry its exporter here.
+	ekm []byte
 
 	// HTTP/2 framing
 	framer *http2.Framer
@@ -287,13 +309,19 @@ type HTTP2StegoConn struct {
 	recvConsumed int64
 }
 
-// NewHTTP2StegoConn creates a new steganographic HTTP/2 connection
-func NewHTTP2StegoConn(conn net.Conn, secret []byte, isClient bool, paddingMode NaivePaddingMode) *HTTP2StegoConn {
+// NewHTTP2StegoConn creates a new steganographic HTTP/2 connection.
+//
+// ekm is the TLS session exporter the auth token is bound to (S22). Callers over
+// a real TLS session must capture it from the *tls.Conn before any kTLS offload
+// (see sessionExporterKey) and pass it here; the non-TLS test pipes pass nil on
+// both ends.
+func NewHTTP2StegoConn(conn net.Conn, secret []byte, isClient bool, paddingMode NaivePaddingMode, ekm []byte) *HTTP2StegoConn {
 	sc := &HTTP2StegoConn{
 		Conn:        conn,
 		secret:      secret,
 		isClient:    isClient,
 		paddingMode: paddingMode,
+		ekm:         ekm,
 	}
 
 	// Initialize HTTP/2 framer
@@ -369,8 +397,8 @@ func (sc *HTTP2StegoConn) HandshakeContext(ctx context.Context) error {
 func (sc *HTTP2StegoConn) sendCovertHandshake() error {
 	streamID := sc.allocateStreamID()
 
-	// Generate auth token
-	authToken := generateAuthToken(sc.secret)
+	// Generate auth token bound to this TLS session (S22).
+	authToken := generateAuthTokenBound(sc.secret, sc.ekm)
 
 	// Encode in HEADERS
 	sc.hpackBuf.Reset()
@@ -379,7 +407,7 @@ func (sc *HTTP2StegoConn) sendCovertHandshake() error {
 	sc.hpackEnc.WriteField(hpack.HeaderField{Name: ":method", Value: "POST"})
 	sc.hpackEnc.WriteField(hpack.HeaderField{Name: ":scheme", Value: "https"})
 	sc.hpackEnc.WriteField(hpack.HeaderField{Name: ":path", Value: "/grpc.health.v1.Health/Check"})
-	sc.hpackEnc.WriteField(hpack.HeaderField{Name: ":authority", Value: "api.googleapis.com"})
+	sc.hpackEnc.WriteField(hpack.HeaderField{Name: ":authority", Value: sc.authority()})
 
 	// Standard headers
 	sc.hpackEnc.WriteField(hpack.HeaderField{Name: "content-type", Value: "application/grpc"})
@@ -450,9 +478,13 @@ func (sc *HTTP2StegoConn) verifyServerAckHeaders(f *http2.HeadersFrame) bool {
 
 	sc.hpackDec.SetEmitFunc(func(hf hpack.HeaderField) {
 		if hf.Name == "x-goog-correlation-id" {
-			expectedAck := encodeToHex(deriveKey(sc.secret, "server-ack")[:16])
-			if hf.Value == expectedAck {
-				foundAck = true
+			raw := decodeFromHex(hf.Value)
+			if len(raw) >= stegoAckNonceLen+16 {
+				nonce := raw[:stegoAckNonceLen]
+				proof := raw[stegoAckNonceLen : stegoAckNonceLen+16]
+				if hmac.Equal(proof, serverAckMaterial(sc.secret, nonce)[:16]) {
+					foundAck = true
+				}
 			}
 		}
 	})
@@ -464,9 +496,10 @@ func (sc *HTTP2StegoConn) verifyServerAckHeaders(f *http2.HeadersFrame) bool {
 // verifyServerAckData checks DATA frame for ack magic
 func (sc *HTTP2StegoConn) verifyServerAckData(f *http2.DataFrame) bool {
 	data := f.Data()
-	if len(data) >= 8 {
-		expectedMagic := deriveKey(sc.secret, "server-ack")[:8]
-		return bytes.Equal(data[:8], expectedMagic)
+	if len(data) >= stegoAckNonceLen+8 {
+		nonce := data[:stegoAckNonceLen]
+		proof := data[stegoAckNonceLen : stegoAckNonceLen+8]
+		return hmac.Equal(proof, serverAckMaterial(sc.secret, nonce)[:8])
 	}
 	return false
 }
@@ -541,9 +574,8 @@ func (sc *HTTP2StegoConn) verifyClientAuth(f *http2.HeadersFrame) bool {
 	}
 
 	receivedToken := append(apiKeyBytes[:16], requestIDBytes[:16]...)
-	expectedToken := generateAuthToken(sc.secret)
 
-	return bytes.Equal(receivedToken, expectedToken)
+	return verifyAuthTokenBound(sc.secret, sc.ekm, receivedToken)
 }
 
 // sendServerAck sends acknowledgment to client
@@ -553,9 +585,19 @@ func (sc *HTTP2StegoConn) sendServerAck(streamID uint32) error {
 
 	sc.hpackEnc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
 	sc.hpackEnc.WriteField(hpack.HeaderField{Name: "content-type", Value: "application/grpc"})
+
+	// Bind the ack to a fresh nonce: value = hex(nonce || proof). A static
+	// deriveKey(secret,"server-ack") was one proof for the life of the secret.
+	var ackNonce [stegoAckNonceLen]byte
+	if _, err := rand.Read(ackNonce[:]); err != nil {
+		return err
+	}
+	ackVal := make([]byte, 0, stegoAckNonceLen+16)
+	ackVal = append(ackVal, ackNonce[:]...)
+	ackVal = append(ackVal, serverAckMaterial(sc.secret, ackNonce[:])[:16]...)
 	sc.hpackEnc.WriteField(hpack.HeaderField{
 		Name:  "x-goog-correlation-id",
-		Value: encodeToHex(deriveKey(sc.secret, "server-ack")[:16]),
+		Value: encodeToHex(ackVal),
 	})
 
 	return sc.framer.WriteHeaders(http2.HeadersFrameParam{
@@ -706,7 +748,7 @@ func (sc *HTTP2StegoConn) writeViaHeaders(data []byte) (int, error) {
 	sc.hpackEnc.WriteField(hpack.HeaderField{Name: ":method", Value: "POST"})
 	sc.hpackEnc.WriteField(hpack.HeaderField{Name: ":scheme", Value: "https"})
 	sc.hpackEnc.WriteField(hpack.HeaderField{Name: ":path", Value: "/api/v1/telemetry"})
-	sc.hpackEnc.WriteField(hpack.HeaderField{Name: ":authority", Value: "telemetry.googleapis.com"})
+	sc.hpackEnc.WriteField(hpack.HeaderField{Name: ":authority", Value: sc.authority()})
 
 	// Standard headers
 	sc.hpackEnc.WriteField(hpack.HeaderField{Name: "content-type", Value: "application/json"})
@@ -747,6 +789,157 @@ func (sc *HTTP2StegoConn) writeViaHeaders(data []byte) (int, error) {
 	return offset, nil
 }
 
+// The stego DATA-frame marker, version 2.
+//
+// v1 opened every covert DATA frame with the ASCII literal "TIRD". A literal at
+// offset 0 of every DATA payload is a constant that anything seeing the HTTP/2
+// framing (our own server, a TLS-terminating middlebox, a CDN we tunnel
+// through) reads without decrypting a session key. Real gRPC - which this is
+// dressed as - opens with a 1-byte compressed flag and a 4-byte length, not a
+// four-byte tag repeated on every frame.
+//
+// v2 replaces the literal with [nonce][marker] where marker is HKDF(secret,
+// nonce) of a length ALSO derived from (secret, nonce). The reader holds the one
+// authenticated secret for the connection and always has the full DATA-frame
+// payload in hand (the framer delivers a whole frame), so it recomputes the
+// marker and checks the prefix; a foreign or cover DATA frame simply fails the
+// match and is dropped, exactly as a non-"TIRD" frame was dropped before. The
+// nonce is fresh per frame, so no two frames - and no two connections - open
+// with the same bytes.
+//
+// There is no transitional mode. A 1.10.x client opens with "TIRD", the frame
+// fails the marker check, and its payload is dropped.
+const (
+	// stegoNonceLen is the per-frame nonce prefix. 8 bytes keeps the per-frame
+	// overhead small while making a repeated opening prefix astronomically
+	// unlikely.
+	stegoNonceLen = 8
+
+	// stegoMarkerMinLen / stegoMarkerSpan bound the marker length. The length is
+	// derived from (secret, nonce), so it is not a field on the wire; the marker
+	// is flat over [8,24). Like the confusion marker, there is no measured
+	// population of "real" opaque-body lengths to check that shape against - the
+	// marker sits inside an HTTP/2 DATA payload that also carries our own cover
+	// padding - so the answer to "what distribution is this checked against" is
+	// "nothing", recorded here on purpose (verification rule 3).
+	stegoMarkerMinLen = 8
+	stegoMarkerSpan   = 16
+
+	stegoC2SMarkerLabel = "tiredvpn-stego-c2s-marker-v2"
+	stegoS2CMarkerLabel = "tiredvpn-stego-s2c-marker-v2"
+)
+
+// stegoMarker derives the variable-length keyed marker for one direction from
+// the secret and a per-frame nonce.
+func stegoMarker(secret, nonce []byte, label string) []byte {
+	if len(secret) == 0 {
+		return nil
+	}
+	r := hkdf.New(sha256.New, secret, nonce, []byte(label))
+	var lenByte [1]byte
+	if _, err := io.ReadFull(r, lenByte[:]); err != nil {
+		return nil
+	}
+	markerLen := stegoMarkerMinLen + int(lenByte[0])%stegoMarkerSpan
+	out := make([]byte, markerLen)
+	if _, err := io.ReadFull(r, out); err != nil {
+		return nil
+	}
+	return out
+}
+
+// stegoFrameHeader returns a fresh [nonce][marker] prefix for one direction.
+func stegoFrameHeader(secret []byte, label string) ([]byte, error) {
+	if len(secret) == 0 {
+		return nil, errors.New("stego: empty secret")
+	}
+	var nonce [stegoNonceLen]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return nil, err
+	}
+	marker := stegoMarker(secret, nonce[:], label)
+	if marker == nil {
+		return nil, errors.New("stego: marker derivation failed")
+	}
+	hdr := make([]byte, 0, stegoNonceLen+len(marker))
+	hdr = append(hdr, nonce[:]...)
+	hdr = append(hdr, marker...)
+	return hdr, nil
+}
+
+// matchStegoFrame checks the keyed prefix of a DATA-frame payload for one
+// direction and returns the offset past [nonce][marker]. It returns the offset
+// rather than taking a length because the marker length is itself derived from
+// the secret: a peer without the secret cannot say where the marker ends.
+func matchStegoFrame(secret, data []byte, label string) (int, bool) {
+	if len(secret) == 0 || len(data) < stegoNonceLen+stegoMarkerMinLen {
+		return 0, false
+	}
+	nonce := data[:stegoNonceLen]
+	want := stegoMarker(secret, nonce, label)
+	if len(want) == 0 {
+		return 0, false
+	}
+	off := stegoNonceLen + len(want)
+	if len(data) < off {
+		return 0, false
+	}
+	if !hmac.Equal(data[stegoNonceLen:off], want) {
+		return 0, false
+	}
+	return off, true
+}
+
+// StegoNonceLen is the per-frame nonce prefix length, exported so the server's
+// manual DATA-frame path and the wire tests can locate the nonce.
+const StegoNonceLen = stegoNonceLen
+
+// StegoTunCoverLen is stegoTunCoverLen exported for the server's manual
+// server->client DATA-frame path, so both directions quantise record lengths
+// the same way instead of the server appending a fixed 30-byte cover run.
+func StegoTunCoverLen(baseLen int) int { return stegoTunCoverLen(baseLen) }
+
+// StegoClientMarker recomputes the client->server (c2s) marker for a captured
+// nonce. Exported for the wire-signature tests that pin the length distribution.
+func StegoClientMarker(secret, nonce []byte) []byte {
+	return stegoMarker(secret, nonce, stegoC2SMarkerLabel)
+}
+
+// StegoServerMarker recomputes the server->client (s2c) marker for a nonce.
+func StegoServerMarker(secret, nonce []byte) []byte {
+	return stegoMarker(secret, nonce, stegoS2CMarkerLabel)
+}
+
+// BuildStegoServerFrameHeader returns a fresh server->client [nonce][marker]
+// prefix. The server's manual HTTP/2 path (which does not use HTTP2StegoConn)
+// calls this so its frames carry the same keyed marker a client expects.
+func BuildStegoServerFrameHeader(secret []byte) ([]byte, error) {
+	return stegoFrameHeader(secret, stegoS2CMarkerLabel)
+}
+
+// MatchStegoClientFrame checks the keyed prefix of a client->server DATA-frame
+// payload and returns the offset past [nonce][marker]. Used by the server's
+// manual HTTP/2 path to recognise an authenticated client's covert frames.
+func MatchStegoClientFrame(secret, data []byte) (int, bool) {
+	return matchStegoFrame(secret, data, stegoC2SMarkerLabel)
+}
+
+// writeMarkerLabel / readMarkerLabel pick the direction label so a client keys
+// its outbound frames c2s and reads inbound s2c, and a server does the reverse.
+func (sc *HTTP2StegoConn) writeMarkerLabel() string {
+	if sc.isClient {
+		return stegoC2SMarkerLabel
+	}
+	return stegoS2CMarkerLabel
+}
+
+func (sc *HTTP2StegoConn) readMarkerLabel() string {
+	if sc.isClient {
+		return stegoS2CMarkerLabel
+	}
+	return stegoC2SMarkerLabel
+}
+
 // writeViaPaddedData sends data in DATA frames with cover traffic
 func (sc *HTTP2StegoConn) writeViaPaddedData(data []byte) (int, error) {
 	var streamID uint32
@@ -773,18 +966,23 @@ func (sc *HTTP2StegoConn) writeViaPaddedData(data []byte) (int, error) {
 		obfuscated[i] = data[i] ^ sc.paddingKey[i%len(sc.paddingKey)]
 	}
 
-	// Create frame: [Magic:4][Flags:1][Length:2][ObfuscatedData:N][NaivePadding:M]
+	// Create frame: [nonce][marker][Flags:1][Length:2][ObfuscatedData:N][NaivePadding:M]
 	coverLen := sc.calculateNaivePadding(chunkSize)
 	if coverLen < 10 {
 		coverLen = 10 // Minimum padding
 	}
-	frame := make([]byte, 7+chunkSize+coverLen)
+	hdr, err := stegoFrameHeader(sc.secret, sc.writeMarkerLabel())
+	if err != nil {
+		return 0, err
+	}
+	h := len(hdr)
+	frame := make([]byte, h+3+chunkSize+coverLen)
 
-	copy(frame[0:4], []byte("TIRD"))                          // Magic
-	frame[4] = 0x01                                           // Flag: obfuscated
-	binary.BigEndian.PutUint16(frame[5:7], uint16(chunkSize)) // Length
-	copy(frame[7:7+chunkSize], obfuscated)                    // Obfuscated data
-	rand.Read(frame[7+chunkSize:])                            // Cover data
+	copy(frame[0:h], hdr)                                         // Keyed marker
+	frame[h] = 0x01                                               // Flag: obfuscated
+	binary.BigEndian.PutUint16(frame[h+1:h+3], uint16(chunkSize)) // Length
+	copy(frame[h+3:h+3+chunkSize], obfuscated)                    // Obfuscated data
+	rand.Read(frame[h+3+chunkSize:])                              // Cover data
 
 	if err := sc.framer.WriteData(streamID, false, frame); err != nil {
 		return 0, err
@@ -812,17 +1010,22 @@ func (sc *HTTP2StegoConn) writeViaData(data []byte) (int, error) {
 
 	chunkSize := minInt(len(data), 1400)
 
-	// Create framed data: [Magic:4][Flags:1][Length:2][Data:N][NaivePadding:M]
+	// Create framed data: [nonce][marker][Flags:1][Length:2][Data:N][NaivePadding:M]
 	coverLen := sc.calculateNaivePadding(chunkSize)
 	if coverLen < 10 {
 		coverLen = 10 // Minimum padding
 	}
-	frame := make([]byte, 7+chunkSize+coverLen)
-	copy(frame[0:4], []byte("TIRD"))                          // Magic
-	frame[4] = 0x00                                           // Flag: raw
-	binary.BigEndian.PutUint16(frame[5:7], uint16(chunkSize)) // Length
-	copy(frame[7:7+chunkSize], data[:chunkSize])
-	rand.Read(frame[7+chunkSize:])
+	hdr, err := stegoFrameHeader(sc.secret, sc.writeMarkerLabel())
+	if err != nil {
+		return 0, err
+	}
+	h := len(hdr)
+	frame := make([]byte, h+3+chunkSize+coverLen)
+	copy(frame[0:h], hdr)                                         // Keyed marker
+	frame[h] = 0x00                                               // Flag: raw
+	binary.BigEndian.PutUint16(frame[h+1:h+3], uint16(chunkSize)) // Length
+	copy(frame[h+3:h+3+chunkSize], data[:chunkSize])
+	rand.Read(frame[h+3+chunkSize:])
 
 	if err := sc.framer.WriteData(streamID, false, frame); err != nil {
 		return 0, err
@@ -848,13 +1051,27 @@ func (sc *HTTP2StegoConn) writeViaDataFast(data []byte) (int, error) {
 	// This allows small responses to be sent immediately
 	chunkSize := len(data)
 
-	// Minimal framing: [Magic:4][Flags:1][Length:2][Data:N]
-	// No padding in fast mode - prioritize latency
-	frame := make([]byte, 7+chunkSize)
-	copy(frame[0:4], []byte("TIRD"))                          // Magic
-	frame[4] = 0x00                                           // Flag: raw
-	binary.BigEndian.PutUint16(frame[5:7], uint16(chunkSize)) // Length
-	copy(frame[7:], data[:chunkSize])
+	// Framing: [nonce][marker][Flags:1][Length:2][Data:N][cover:M]. The cover run
+	// grows the DATA frame to a randomly chosen size bucket so the record length
+	// stops tracking the inner packet length (the reader recovers exactly N from
+	// the Length field and ignores the trailing cover). This used to be the
+	// "no padding" fast path, which made every record length a fixed offset from
+	// the packet it carried.
+	hdr, err := stegoFrameHeader(sc.secret, sc.writeMarkerLabel())
+	if err != nil {
+		return 0, err
+	}
+	h := len(hdr)
+	base := h + 3 + chunkSize
+	coverLen := stegoTunCoverLen(base)
+	frame := make([]byte, base+coverLen)
+	copy(frame[0:h], hdr)                                         // Keyed marker
+	frame[h] = 0x00                                               // Flag: raw
+	binary.BigEndian.PutUint16(frame[h+1:h+3], uint16(chunkSize)) // Length
+	copy(frame[h+3:base], data[:chunkSize])
+	if coverLen > 0 {
+		rand.Read(frame[base:]) // cover data, dropped by the reader via Length
+	}
 
 	if err := sc.framer.WriteData(streamID, false, frame); err != nil {
 		return 0, err
@@ -871,7 +1088,7 @@ func (sc *HTTP2StegoConn) sendCoverHeaders(streamID uint32) error {
 	sc.hpackEnc.WriteField(hpack.HeaderField{Name: ":method", Value: "POST"})
 	sc.hpackEnc.WriteField(hpack.HeaderField{Name: ":scheme", Value: "https"})
 	sc.hpackEnc.WriteField(hpack.HeaderField{Name: ":path", Value: "/grpc.health.v1.Health/Check"})
-	sc.hpackEnc.WriteField(hpack.HeaderField{Name: ":authority", Value: "api.googleapis.com"})
+	sc.hpackEnc.WriteField(hpack.HeaderField{Name: ":authority", Value: sc.authority()})
 	sc.hpackEnc.WriteField(hpack.HeaderField{Name: "content-type", Value: "application/grpc"})
 	sc.hpackEnc.WriteField(hpack.HeaderField{Name: "user-agent", Value: "grpc-go/1.60.0"})
 	sc.hpackEnc.WriteField(hpack.HeaderField{Name: "te", Value: "trailers"})
@@ -951,28 +1168,28 @@ func (sc *HTTP2StegoConn) extractCovertData(frame http2.Frame) []byte {
 func (sc *HTTP2StegoConn) extractFromData(f *http2.DataFrame) []byte {
 	data := f.Data()
 
-	// Check for magic header
-	if len(data) >= 7 && bytes.Equal(data[0:4], []byte("TIRD")) {
-		flags := data[4]
-		length := binary.BigEndian.Uint16(data[5:7])
+	// Check for the keyed marker at the head of the payload.
+	off, ok := matchStegoFrame(sc.secret, data, sc.readMarkerLabel())
+	if !ok || len(data) < off+3 {
+		return nil
+	}
+	flags := data[off]
+	length := int(binary.BigEndian.Uint16(data[off+1 : off+3]))
+	if length > len(data)-off-3 {
+		return nil
+	}
+	payload := data[off+3 : off+3+length]
 
-		if int(length) <= len(data)-7 {
-			payload := data[7 : 7+length]
-
-			// De-obfuscate if needed
-			if flags&0x01 != 0 {
-				deobfuscated := make([]byte, len(payload))
-				for i := range payload {
-					deobfuscated[i] = payload[i] ^ sc.paddingKey[i%len(sc.paddingKey)]
-				}
-				return deobfuscated
-			}
-
-			return payload
+	// De-obfuscate if needed
+	if flags&0x01 != 0 {
+		deobfuscated := make([]byte, len(payload))
+		for i := range payload {
+			deobfuscated[i] = payload[i] ^ sc.paddingKey[i%len(sc.paddingKey)]
 		}
+		return deobfuscated
 	}
 
-	return nil
+	return payload
 }
 
 // extractFromHeaders extracts data from custom headers
@@ -1016,14 +1233,106 @@ func deriveKey(secret []byte, context string) []byte {
 	return h.Sum(nil)
 }
 
-func generateAuthToken(secret []byte) []byte {
+// stegoAuthSkewBuckets is how many 1-minute buckets on either side of "now"
+// verifyClientAuth accepts, so a client whose clock drifts by up to a minute
+// still authenticates (SSH and IMAP camouflage tolerate the same +-1). The
+// live server path (server.go verifyH2Auth) tolerates a wider window; this is
+// the stego-as-server path used by the relay and the tests.
+const stegoAuthSkewBuckets = 1
+
+// generateAuthTokenBound derives the shared strategy auth token for the current
+// 1-minute bucket, bound to the TLS session's exporter keying material (ekm).
+//
+// Folding ekm into the HMAC is the S22 session binding: a token lifted off one
+// TLS session carries that session's exporter, so it fails verification on any
+// other session even under the same secret and time bucket. The
+// geneva/morph/websocket_padded/stego clients all feed it the exporter of the
+// *tls.Conn they authenticate over (see sessionExporterKey).
+//
+// ekm==nil reproduces the pre-binding token. That path is intended only for
+// transports with no TLS session of their own (the non-TLS test pipes, where
+// both ends pass nil and still agree); a client that authenticates over TLS and
+// passes nil here silently ships an unbound token, which is the regression this
+// function exists to prevent.
+func generateAuthTokenBound(secret, ekm []byte) []byte {
+	return generateAuthTokenBoundAt(secret, ekm, uint64(time.Now().Unix()/60)) // 1-minute window
+}
+
+// generateAuthTokenBoundAt derives the session-bound auth token for a specific
+// 1-minute bucket.
+func generateAuthTokenBoundAt(secret, ekm []byte, bucket uint64) []byte {
 	timestamp := make([]byte, 8)
-	binary.BigEndian.PutUint64(timestamp, uint64(time.Now().Unix()/60)) // 1-minute window
+	binary.BigEndian.PutUint64(timestamp, bucket)
 
 	h := hmac.New(sha256.New, secret)
 	h.Write(timestamp)
 	h.Write([]byte("http2-stego-auth"))
+	h.Write(ekm) // TLS-session binding
 	return h.Sum(nil)[:32]
+}
+
+// verifyAuthTokenBound reports whether receivedToken matches the session-bound
+// token for any bucket within +-stegoAuthSkewBuckets of now, on the TLS session
+// whose exporter is ekm. The comparison is constant-time (hmac.Equal) so it
+// leaks nothing about how many leading bytes matched.
+func verifyAuthTokenBound(secret, ekm, receivedToken []byte) bool {
+	now := time.Now().Unix() / 60
+	for offset := int64(-stegoAuthSkewBuckets); offset <= stegoAuthSkewBuckets; offset++ {
+		if hmac.Equal(receivedToken, generateAuthTokenBoundAt(secret, ekm, uint64(now+offset))) {
+			return true
+		}
+	}
+	return false
+}
+
+// sessionExporterKey pulls the RFC 8446 §7.5 exporter out of a handshaked
+// *tls.Conn for auth-token session binding.
+//
+// It must be called while the userspace TLS stack still owns the connection:
+// once kTLS offloads the socket the *tls.Conn is no longer the thing on the
+// wire and ConnectionState no longer reflects live keys. Every caller here
+// captures the exporter right after the handshake and before ktls.Enable.
+func sessionExporterKey(conn *tls.Conn) ([]byte, error) {
+	state := conn.ConnectionState()
+	return customtls.ExportBindingKey(&state)
+}
+
+// connExporterKey is the best-effort form of sessionExporterKey for callers that
+// hold a net.Conn which may or may not be a handshaked *tls.Conn (the composed
+// morph path, whose base transport is another strategy). It unwraps one
+// NetConn() layer and returns nil when no TLS session is reachable — a nil the
+// caller and its peer must agree on, exactly as with a non-TLS test pipe.
+func connExporterKey(conn net.Conn) []byte {
+	tc, ok := conn.(*tls.Conn)
+	if !ok {
+		if nc, hasNetConn := conn.(interface{ NetConn() net.Conn }); hasNetConn {
+			tc, ok = nc.NetConn().(*tls.Conn)
+		}
+	}
+	if !ok || tc == nil {
+		return nil
+	}
+	ekm, err := sessionExporterKey(tc)
+	if err != nil {
+		return nil
+	}
+	return ekm
+}
+
+// stegoAckNonceLen is the per-connection nonce the server prefixes to its ack
+// proof so the proof differs between connections instead of being one static
+// value for the whole life of the secret.
+const stegoAckNonceLen = 8
+
+// serverAckMaterial derives the server's ack proof from the secret and a
+// per-connection nonce. Binding to the nonce is what makes two connections'
+// acks differ; callers take the prefix they need (16 bytes in HEADERS, 8 in
+// the DATA fallback).
+func serverAckMaterial(secret, nonce []byte) []byte {
+	h := hmac.New(sha256.New, secret)
+	h.Write(nonce)
+	h.Write([]byte("server-ack"))
+	return h.Sum(nil)
 }
 
 // encodeToHex encodes bytes to a lowercase hex string.
@@ -1049,27 +1358,92 @@ func minInt(a, b int) int {
 	return b
 }
 
-// calculateNaivePadding computes padding size based on NaiveProxy-style mode
+// calculateNaivePadding computes padding size based on NaiveProxy-style mode.
+//
+// The amount is drawn from crypto/rand inside the mode's declared percentage
+// band (getNaivePaddingRange, which this now actually consumes - it used to be
+// dead and advertised ranges the old counter arithmetic never produced). Two
+// frames of the same length no longer pad by the same amount, so a passive
+// observer cannot subtract a fixed overhead to recover the plaintext length.
+//
+// Distribution (verification rule 3): the percentage is uniform over the band.
+// There is no measured population of real HTTP/2 DATA-frame padding to match
+// its shape against - servers rarely pad DATA frames at all - so "what
+// distribution is this checked against" is "nothing", recorded here on purpose.
 func (sc *HTTP2StegoConn) calculateNaivePadding(dataLen int) int {
-	switch sc.paddingMode {
-	case NaivePaddingMinimal:
-		// 5-10% padding (optimized for speed)
-		overhead := dataLen / 20                   // 5% base
-		variability := int(sc.methodCounter%6) - 3 // ±3% variation
-		return overhead + variability
-	case NaivePaddingStandard:
-		// 15-25% padding (balanced)
-		overhead := dataLen / 6                     // ~16% base
-		variability := int(sc.methodCounter%10) - 5 // ±5% variation
-		return overhead + variability
-	case NaivePaddingParanoid:
-		// 30-50% padding (maximum security)
-		overhead := dataLen * 2 / 5                  // 40% base
-		variability := int(sc.methodCounter%20) - 10 // ±10% variation
-		return overhead + variability
-	default:
-		return dataLen / 6 // Standard fallback
+	minPct, maxPct := sc.paddingMode.getNaivePaddingRange()
+	pct := minPct
+	if maxPct > minPct {
+		pct += randIntn(maxPct - minPct + 1)
 	}
+	return dataLen * pct / 100
+}
+
+// stegoTunBuckets are the padded frame-payload targets for the default tun path.
+// A frame is grown to a bucket drawn at random from those large enough to hold
+// it, so (a) many inner packet lengths land on the same record length and (b) a
+// small packet can, on any given frame, occupy the same record length as a
+// full-size one. The record length therefore no longer tracks the inner IP
+// packet length - the property the length-correlation detector in wiretest
+// pins. The top bucket clears a full 1400-byte MTU packet plus framing.
+var stegoTunBuckets = []int{128, 256, 512, 1024, 1500}
+
+// stegoTunCoverLen returns how many cover bytes to append after a tun-path frame
+// whose pre-cover length is baseLen, so the padded payload lands on a randomly
+// chosen bucket >= baseLen.
+//
+// Distribution (verification rule 3): the bucket is chosen uniformly among the
+// fitting buckets from crypto/rand, not from a counter. There is no measured
+// distribution of real H2 DATA padding to match, so the target here is
+// decorrelation (record length independent of packet length), recorded as
+// "nothing to check against". Rule 8: quantising to a handful of sizes is itself
+// a shape a passive observer could notice ("record lengths cluster near five
+// values"); it is a deliberate trade - a coarse, packet-length-free size signal
+// instead of a 1:1 copy of the packet-length distribution.
+func stegoTunCoverLen(baseLen int) int {
+	fits := make([]int, 0, len(stegoTunBuckets))
+	for _, b := range stegoTunBuckets {
+		if b >= baseLen {
+			fits = append(fits, b)
+		}
+	}
+	if len(fits) == 0 {
+		// Larger than the top bucket (shouldn't happen under a 1400 MTU); round up
+		// to the next bucket step so the length is still quantised, not a copy.
+		step := stegoTunBuckets[len(stegoTunBuckets)-1]
+		padded := ((baseLen / step) + 1) * step
+		return padded - baseLen
+	}
+	return fits[randIntn(len(fits))] - baseLen
+}
+
+// randIntn returns a uniform int in [0,n) from crypto/rand, or 0 if the source
+// fails (padding then degrades to the band minimum rather than panicking).
+func randIntn(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return 0
+	}
+	return int(binary.BigEndian.Uint32(b[:]) % uint32(n))
+}
+
+// stegoCoverRotator supplies the per-connection cover host (SNI and :authority)
+// when the caller left it unset. StrategyRandom keeps independent clients from
+// all landing on the same donor at the same time (the old hour-of-day index
+// moved every client in lockstep).
+var stegoCoverRotator = evasion.NewSNIRotator(evasion.StrategyRandom)
+
+// authority returns the HTTP/2 :authority for cover HEADERS. It is the cover
+// host chosen for this connection, so the encrypted :authority matches the
+// cleartext SNI; a mismatch is exactly what an active prober compares.
+func (sc *HTTP2StegoConn) authority() string {
+	if sc.coverHost != "" {
+		return sc.coverHost
+	}
+	return "www.googleapis.com"
 }
 
 // getNaivePaddingRange returns min/max padding for a given mode

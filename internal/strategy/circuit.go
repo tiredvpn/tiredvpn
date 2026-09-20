@@ -119,6 +119,11 @@ type CircuitBreaker struct {
 
 	// Network-down suppression (set by manager)
 	networkDown bool
+
+	// now is the clock used for all time math. It defaults to time.Now; tests in
+	// this package override it (and rebase lastStateChange onto it) to drive the
+	// time-based half-open exit deterministically.
+	now func() time.Time
 }
 
 // NewCircuitBreaker creates a new circuit breaker
@@ -155,15 +160,17 @@ func NewCircuitBreaker(config CircuitBreakerConfig) *CircuitBreaker {
 		config.FailureThreshold = 5
 	}
 
-	return &CircuitBreaker{
+	cb := &CircuitBreaker{
 		config:              config,
 		state:               CircuitClosed,
-		lastStateChange:     time.Now(),
 		currentResetTimeout: config.ResetTimeout,
 		window:              make([]windowEntry, 0, config.WindowSize),
 		rttSamples:          make([]time.Duration, 0, config.WindowSize),
 		networkStable:       true,
+		now:                 time.Now,
 	}
+	cb.lastStateChange = cb.now()
+	return cb
 }
 
 // State returns current circuit state
@@ -173,40 +180,95 @@ func (cb *CircuitBreaker) State() CircuitState {
 	return cb.getStateWithTimeCheck()
 }
 
-// getStateWithTimeCheck checks if Open circuit should transition to HalfOpen.
-// Uses currentResetTimeout which grows with exponential backoff.
-// Must be called with at least read lock held.
+// getStateWithTimeCheck reports the effective circuit state, converting an Open
+// circuit to HalfOpen once currentResetTimeout (grown by exponential backoff)
+// has elapsed. It is a pure read: it never mutates state and never occupies a
+// half-open slot, so it is safe under a read lock and safe to call from paths
+// that do not actually dial. The half-open probe window is renewed (and its
+// slots reset) by BeginHalfOpenAttempt, which is the only mutating admission
+// path. Must be called with at least the read lock held.
 func (cb *CircuitBreaker) getStateWithTimeCheck() CircuitState {
 	if cb.state == CircuitOpen {
-		if time.Since(cb.lastStateChange) >= cb.currentResetTimeout {
+		if cb.now().Sub(cb.lastStateChange) >= cb.currentResetTimeout {
 			return CircuitHalfOpen
 		}
 	}
 	return cb.state
 }
 
-// Allow checks if a request should be allowed through
-func (cb *CircuitBreaker) Allow() bool {
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
+// halfOpenWindowElapsed reports whether a half-open probe window has burned all
+// its slots yet its timer has run out without the circuit resolving. When true
+// the strategy must not stay excluded: the window is renewed on the next real
+// dial. This is the time-based exit from half-open. Must be called with at least
+// the read lock held.
+func (cb *CircuitBreaker) halfOpenWindowElapsed() bool {
+	return cb.halfOpenCount >= cb.config.HalfOpenMax &&
+		cb.now().Sub(cb.lastStateChange) >= cb.currentResetTimeout
+}
 
-	state := cb.getStateWithTimeCheck()
+// CanTry reports whether a dial would be permitted right now WITHOUT mutating
+// any state or occupying a half-open slot. Use it from candidate assembly and
+// availability checks that do not themselves dial. A dial that actually
+// proceeds must still call BeginHalfOpenAttempt to occupy a half-open slot.
+func (cb *CircuitBreaker) CanTry() bool {
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
+	return cb.canTryLocked()
+}
 
-	switch state {
+// canTryLocked is the pure admission check. Must hold at least the read lock.
+func (cb *CircuitBreaker) canTryLocked() bool {
+	switch cb.getStateWithTimeCheck() {
 	case CircuitClosed:
 		return true
 	case CircuitOpen:
 		return false
 	case CircuitHalfOpen:
-		// Transition to half-open if coming from open
-		if cb.state == CircuitOpen {
+		// Slots left in the current probe window?
+		if cb.halfOpenCount < cb.config.HalfOpenMax {
+			return true
+		}
+		// Exhausted window: retriable once its timer elapses, so a half-open that
+		// never resolved does not exclude the strategy forever.
+		return cb.halfOpenWindowElapsed()
+	}
+	return true
+}
+
+// BeginHalfOpenAttempt occupies a half-open probe slot immediately before a real
+// dial and reports whether the dial may proceed. Call it ONLY at the point of an
+// actual connect attempt - never from candidate assembly or availability checks,
+// which use CanTry. For a Closed circuit it is a no-op that returns true. It is
+// the sole path that materializes an Open->HalfOpen transition and renews an
+// exhausted half-open window whose timer has elapsed.
+func (cb *CircuitBreaker) BeginHalfOpenAttempt() bool {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	switch cb.getStateWithTimeCheck() {
+	case CircuitClosed:
+		return true
+	case CircuitOpen:
+		return false
+	case CircuitHalfOpen:
+		now := cb.now()
+		switch {
+		case cb.state == CircuitOpen:
+			// First test request after the Open backoff expired.
 			cb.state = CircuitHalfOpen
 			cb.halfOpenCount = 0
 			cb.halfOpenSuccess = 0
-			cb.lastStateChange = time.Now()
+			cb.lastStateChange = now
 			log.Info("Circuit breaker transitioning to half-open (allowing %d test requests)", cb.config.HalfOpenMax)
+		case cb.halfOpenWindowElapsed():
+			// Stalled half-open: its slots were spent but the circuit never
+			// resolved and the timer ran out. Renew the window instead of
+			// excluding the strategy permanently (time-based half-open exit).
+			cb.halfOpenCount = 0
+			cb.halfOpenSuccess = 0
+			cb.lastStateChange = now
+			log.Info("Circuit breaker half-open window renewed after timeout (allowing %d test requests)", cb.config.HalfOpenMax)
 		}
-		// Allow limited test requests in half-open
 		if cb.halfOpenCount < cb.config.HalfOpenMax {
 			cb.halfOpenCount++
 			return true
@@ -214,6 +276,13 @@ func (cb *CircuitBreaker) Allow() bool {
 		return false
 	}
 	return true
+}
+
+// Allow is retained for backward compatibility and is equivalent to
+// BeginHalfOpenAttempt: it both checks admission and occupies a half-open slot.
+// Call sites that only need a non-mutating check must use CanTry instead.
+func (cb *CircuitBreaker) Allow() bool {
+	return cb.BeginHalfOpenAttempt()
 }
 
 // RecordSuccess records a successful request
@@ -259,7 +328,7 @@ func (cb *CircuitBreaker) handleHalfOpenSuccess() {
 	if cb.halfOpenSuccess >= cb.config.HalfOpenSuccessReq {
 		// Graduated recovery: enough successes to close
 		cb.state = CircuitClosed
-		cb.lastStateChange = time.Now()
+		cb.lastStateChange = cb.now()
 		// Reset backoff on successful recovery
 		cb.currentResetTimeout = cb.config.ResetTimeout
 		cb.openCount = 0
@@ -278,7 +347,7 @@ func (cb *CircuitBreaker) RecordFailure() {
 
 	cb.consecutiveFail++
 	cb.consecutiveTimeout = 0
-	cb.lastFailure = time.Now()
+	cb.lastFailure = cb.now()
 
 	cb.addWindowEntry(outcomeFailure, 0)
 
@@ -299,7 +368,7 @@ func (cb *CircuitBreaker) RecordTimeout() {
 
 	cb.consecutiveFail++
 	cb.consecutiveTimeout++
-	cb.lastFailure = time.Now()
+	cb.lastFailure = cb.now()
 
 	cb.addWindowEntry(outcomeTimeout, 0)
 
@@ -317,7 +386,7 @@ func (cb *CircuitBreaker) RecordTimeout() {
 // Must be called with lock held.
 func (cb *CircuitBreaker) openCircuit() {
 	cb.state = CircuitOpen
-	cb.lastStateChange = time.Now()
+	cb.lastStateChange = cb.now()
 	cb.openCount++
 
 	// Exponential backoff: 30s -> 1m -> 2m -> 4m -> 5m (capped)
@@ -347,7 +416,7 @@ func (cb *CircuitBreaker) handleHalfOpenFailure() {
 	// If it's impossible to reach the success threshold with remaining attempts, re-open
 	if remaining < needed {
 		cb.state = CircuitOpen
-		cb.lastStateChange = time.Now()
+		cb.lastStateChange = cb.now()
 		cb.openCount++
 
 		// Exponential backoff
@@ -378,7 +447,7 @@ func (cb *CircuitBreaker) Reset() {
 	cb.consecutiveTimeout = 0
 	cb.halfOpenCount = 0
 	cb.halfOpenSuccess = 0
-	cb.lastStateChange = time.Now()
+	cb.lastStateChange = cb.now()
 	cb.currentResetTimeout = cb.config.ResetTimeout
 	cb.openCount = 0
 	cb.window = cb.window[:0]
@@ -407,7 +476,7 @@ func (cb *CircuitBreaker) AllowRecoveryProbe() bool {
 	cb.state = CircuitHalfOpen
 	cb.halfOpenCount = 0
 	cb.halfOpenSuccess = 0
-	cb.lastStateChange = time.Now()
+	cb.lastStateChange = cb.now()
 	return true
 }
 
@@ -458,7 +527,7 @@ type CircuitStats struct {
 
 // addWindowEntry appends an outcome and trims the window
 func (cb *CircuitBreaker) addWindowEntry(oc outcomeType, rtt time.Duration) {
-	now := time.Now()
+	now := cb.now()
 	cb.window = append(cb.window, windowEntry{
 		outcome:   oc,
 		timestamp: now,
@@ -662,9 +731,22 @@ func (m *CircuitBreakerManager) Get(strategyID string) *CircuitBreaker {
 	return cb
 }
 
-// Allow checks if strategy is allowed to be used
+// Allow checks if strategy is allowed to be used.
+// Deprecated: equivalent to BeginHalfOpenAttempt (checks AND occupies a slot).
+// Non-dialing call sites must use CanTry.
 func (m *CircuitBreakerManager) Allow(strategyID string) bool {
 	return m.Get(strategyID).Allow()
+}
+
+// CanTry reports whether the strategy's circuit permits a dial without occupying
+// a half-open slot. Use for candidate assembly and availability checks.
+func (m *CircuitBreakerManager) CanTry(strategyID string) bool {
+	return m.Get(strategyID).CanTry()
+}
+
+// BeginHalfOpenAttempt occupies a half-open probe slot right before a real dial.
+func (m *CircuitBreakerManager) BeginHalfOpenAttempt(strategyID string) bool {
+	return m.Get(strategyID).BeginHalfOpenAttempt()
 }
 
 // RecordSuccess records success for strategy and clears network-down

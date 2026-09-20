@@ -1024,7 +1024,6 @@ func (cs *ControlServer) doAutoReconnect(reason string) {
 		// Check network connectivity periodically
 		if consecutiveFailures%5 == 0 || time.Since(lastNetworkCheck) > 30*time.Second {
 			if !cs.checkNetworkConnectivity() {
-				lastNetworkCheck = time.Now()
 				log.Warn("No network connectivity, waiting...")
 
 				// Wait for network with periodic checks
@@ -1036,11 +1035,13 @@ func (cs *ControlServer) doAutoReconnect(reason string) {
 					return
 				}
 
-				// Network restored, reset backoff
+				// Network restored - or the wait timed out, because the "no
+				// network" verdict can itself be wrong. Reset backoff and fall
+				// through to a real reconnect attempt instead of looping back
+				// into the probe, which would just park again.
 				currentDelay = autoReconnectInitialDelay
-				consecutiveFailures = 0
-				log.Info("Network restored, resuming reconnect")
-				continue
+				consecutiveFailures = 1
+				log.Info("Resuming reconnect after network wait")
 			}
 			lastNetworkCheck = time.Now()
 		}
@@ -1185,28 +1186,21 @@ func (cs *ControlServer) attemptReconnect(ctx context.Context) bool {
 
 // checkNetworkConnectivity performs a quick TCP check
 func (cs *ControlServer) checkNetworkConnectivity() bool {
-	// Try Google DNS as a quick connectivity check
-	conn, err := net.DialTimeout("tcp", "8.8.8.8:53", 3*time.Second)
-	if err == nil {
-		conn.Close()
-		return true
-	}
-
-	// Try Cloudflare DNS
-	conn, err = net.DialTimeout("tcp", "1.1.1.1:53", 3*time.Second)
-	if err == nil {
-		conn.Close()
-		return true
-	}
-
-	return false
+	// Shared with the reconnect loop. The probe must not enter the tunnel:
+	// 8.8.8.8 and 1.1.1.1 are routinely part of the installed TUN routes, so
+	// dials to them black-hole while the tunnel is down and read as "no
+	// network".
+	return internetReachable()
 }
 
-// waitForNetwork waits until network connectivity is restored
-// Returns false if stopCh is closed
-// Listens to networkAvailableChan for immediate signal from Android
+// waitForNetwork waits until network connectivity is restored, at most
+// networkParkTimeout. Returns false if stopCh is closed; a timeout returns
+// true so the caller retries the real connection - the negative verdict that
+// caused the wait can itself be wrong (its probes used to enter the dead
+// tunnel). Listens to networkAvailableChan for immediate signal from Android.
 func (cs *ControlServer) waitForNetwork(stopCh chan struct{}) bool {
 	checkInterval := 5 * time.Second
+	deadline := time.Now().Add(networkParkTimeout)
 	attempt := 0
 
 	for {
@@ -1229,6 +1223,11 @@ func (cs *ControlServer) waitForNetwork(stopCh chan struct{}) bool {
 		}
 
 		if cs.checkNetworkConnectivity() {
+			return true
+		}
+
+		if time.Now().After(deadline) {
+			log.Warn("Network still considered down after %v - retrying reconnect anyway", networkParkTimeout)
 			return true
 		}
 	}

@@ -36,6 +36,9 @@ type MultiSecretSalamanderPacketConn struct {
 	addrSecrets  map[string][]byte
 	addrLastSeen map[string]time.Time // TTL tracking
 
+	// frags collects the chunks of payloads too large for one datagram.
+	frags *fragReassembler
+
 	done chan struct{}
 }
 
@@ -51,6 +54,7 @@ func NewMultiSecretSalamanderPacketConn(conn net.PacketConn, globalSecret []byte
 		padderCache:    make(map[string]*SalamanderPadder),
 		addrSecrets:    make(map[string][]byte),
 		addrLastSeen:   make(map[string]time.Time),
+		frags:          newFragReassembler(),
 		done:           make(chan struct{}),
 	}
 	go s.cleanupLoop()
@@ -91,25 +95,44 @@ func (s *MultiSecretSalamanderPacketConn) getPadder(secret []byte) *SalamanderPa
 }
 
 // tryDecrypt attempts to decrypt with a specific padder using the tag-verified
-// UDP framing. It returns the recovered payload and true only when the embedded
+// UDP framing. It returns the recovered frame and true only when the embedded
 // keyed tag matches the padder's secret, so a wrong secret can never
 // false-accept and poison the per-address secret cache.
-func (s *MultiSecretSalamanderPacketConn) tryDecrypt(padder *SalamanderPadder, encrypted []byte) ([]byte, bool) {
-	return padder.DecryptUDP(encrypted)
+func (s *MultiSecretSalamanderPacketConn) tryDecrypt(padder *SalamanderPadder, encrypted []byte) (udpFrame, bool) {
+	return padder.decryptUDPFrame(encrypted)
 }
 
 // ReadFrom reads a packet and decrypts it with Salamander
 // Tries global secret first, then per-client secrets
 // Tracks which secret worked for each address to use on responses
+//
+// A datagram that matches no secret is dropped and the read continues with the
+// next one. Returning an error would be fatal to the whole listener rather than
+// to the one datagram: quic-go tears a transport down on any read error that is
+// not a temporary net.Error, so one unsolicited packet on the port would kill
+// every live session. Since the server listens on a public port and unmatched
+// packets are routine there, that made the error path the common path. Only
+// errors from the underlying socket propagate. See
+// TestMultiSecretReadFromSurvivesGarbage.
 func (s *MultiSecretSalamanderPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
-	// Read encrypted packet from underlying connection
-	buf := make([]byte, 65536)
-	n, addr, err = s.PacketConn.ReadFrom(buf)
-	if err != nil {
-		return 0, nil, err
-	}
+	buf := make([]byte, maxUDPPayload+1)
+	for {
+		n, addr, err = s.PacketConn.ReadFrom(buf)
+		if err != nil {
+			return 0, addr, err
+		}
 
-	encrypted := buf[:n]
+		if payload, ok := s.decryptOne(buf[:n], addr); ok {
+			return copy(p, payload), addr, nil
+		}
+	}
+}
+
+// decryptOne resolves one datagram to a payload, trialling the address's known
+// secret, the global secret and then the registry. It returns false when the
+// datagram matched nothing, or when it was one chunk of a payload that is still
+// incomplete.
+func (s *MultiSecretSalamanderPacketConn) decryptOne(encrypted []byte, addr net.Addr) ([]byte, bool) {
 	addrStr := addr.String()
 
 	s.mu.Lock()
@@ -118,19 +141,22 @@ func (s *MultiSecretSalamanderPacketConn) ReadFrom(p []byte) (n int, addr net.Ad
 	// 0. Check if we already know this address's secret
 	if knownSecret, ok := s.addrSecrets[addrStr]; ok {
 		padder := s.getPadder(knownSecret)
-		if decrypted, ok := s.tryDecrypt(padder, encrypted); ok {
+		if frame, ok := s.tryDecrypt(padder, encrypted); ok {
 			s.addrLastSeen[addrStr] = time.Now()
-			return copy(p, decrypted), addr, nil
+			return s.assemble(addrStr, frame)
 		}
-		// Secret didn't work - client might have changed, continue trying others
+		// Secret didn't work - client might have changed, continue trying others.
+		// Its half-assembled payloads were framed under the old secret and can
+		// no longer be joined to what follows.
 		delete(s.addrSecrets, addrStr)
 		delete(s.addrLastSeen, addrStr)
+		s.frags.drop(addrStr)
 	}
 
 	// 1. Try global secret first (most common case)
-	if decrypted, ok := s.tryDecrypt(s.globalPadder, encrypted); ok {
+	if frame, ok := s.tryDecrypt(s.globalPadder, encrypted); ok {
 		s.recordAddr(addrStr, s.globalSecret)
-		return copy(p, decrypted), addr, nil
+		return s.assemble(addrStr, frame)
 	}
 
 	// 2. Try per-client secrets
@@ -138,17 +164,26 @@ func (s *MultiSecretSalamanderPacketConn) ReadFrom(p []byte) (n int, addr net.Ad
 		secrets := s.secretProvider()
 		for _, secret := range secrets {
 			padder := s.getPadder(secret)
-			if decrypted, ok := s.tryDecrypt(padder, encrypted); ok {
+			if frame, ok := s.tryDecrypt(padder, encrypted); ok {
 				log.Debug("QUIC Salamander: decrypted with client secret for %s", addrStr)
 				s.recordAddr(addrStr, secret)
-				return copy(p, decrypted), addr, nil
+				return s.assemble(addrStr, frame)
 			}
 		}
 	}
 
 	// No matching secret found - drop packet to prevent misdecryption
 	log.Debug("QUIC Salamander: no matching secret for %s, dropping packet", addrStr)
-	return 0, addr, fmt.Errorf("salamander: no matching secret for %s", addrStr)
+	return nil, false
+}
+
+// assemble returns a whole payload directly and feeds a chunk to the
+// reassembler, which yields the payload once the group is complete.
+func (s *MultiSecretSalamanderPacketConn) assemble(addrStr string, frame udpFrame) ([]byte, bool) {
+	if !frame.frag {
+		return frame.data, true
+	}
+	return s.frags.add(addrStr, frame)
 }
 
 // recordAddr stores the secret association for an address, enforcing maxAddrEntries.
@@ -175,8 +210,8 @@ func (s *MultiSecretSalamanderPacketConn) recordAddr(addrStr string, secret []by
 // WriteTo encrypts a packet with Salamander and writes it
 // Uses the same secret that was used to decrypt packets from this address
 func (s *MultiSecretSalamanderPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
-	if len(p) > 65535 {
-		return 0, fmt.Errorf("salamander: payload too large (%d > 65535)", len(p))
+	if len(p) > maxUDPPayload {
+		return 0, fmt.Errorf("salamander: payload too large (%d > %d)", len(p), maxUDPPayload)
 	}
 
 	s.mu.Lock()
@@ -188,16 +223,17 @@ func (s *MultiSecretSalamanderPacketConn) WriteTo(p []byte, addr net.Addr) (n in
 	} else {
 		padder = s.globalPadder
 	}
-	encrypted, err := padder.EncryptUDP(p)
+	datagrams, err := padder.EncryptUDPDatagrams(p)
 	s.mu.Unlock()
 
 	if err != nil {
 		return 0, err
 	}
 
-	_, err = s.PacketConn.WriteTo(encrypted, addr)
-	if err != nil {
-		return 0, err
+	for _, d := range datagrams {
+		if _, err = s.PacketConn.WriteTo(d, addr); err != nil {
+			return 0, err
+		}
 	}
 
 	return len(p), nil

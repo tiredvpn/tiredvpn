@@ -91,8 +91,9 @@ func mockWebSocketPaddedServer(listener net.Listener, secret []byte, tlsCert tls
 
 			request := string(buf[:n])
 
-			// Check for X-Salamander-Version header
-			if !contains(request, "X-Salamander-Version: 1.0") {
+			// Check for the keyed X-Auth-Token header (the discriminator that
+			// replaced the product-named X-Salamander-Version).
+			if !contains(request, "X-Auth-Token:") {
 				return
 			}
 
