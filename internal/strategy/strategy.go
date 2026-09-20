@@ -553,9 +553,15 @@ func (m *Manager) ProbeAll(ctx context.Context, target string) []Result {
 
 			results[idx] = result
 
-			// Update stored results
+			// Update stored results. A probe is (almost always) a bare TCP
+			// connect - it says the address is reachable, not that the strategy's
+			// handshake survives DPI. Feed it into the reachability/confidence
+			// stats (which influence ordering) but NOT into the circuit breaker:
+			// a censor that keeps 443 open while killing the handshake would
+			// otherwise let every probe "recover" a strategy the real Connect
+			// cannot use. Only Connect records success/failure in the breaker.
 			m.mu.Lock()
-			m.updateConfidence(strat.ID(), err == nil)
+			m.updateConfidenceStats(strat.ID(), err == nil, latency)
 			m.mu.Unlock()
 		}(i, s)
 	}
