@@ -146,7 +146,23 @@ func (s *Strategy) Apply(packet []byte, isOutbound bool) ([][]byte, error) {
 	return tree.Execute(packet)
 }
 
-// Execute executes the action tree on a packet
+// Execute executes the action tree on a packet.
+//
+// Without branches the root chain's results are returned unchanged. With
+// branches the tree follows Geneva's duplicate semantics: result i goes to
+// branch i and to no other. A root of duplicate therefore hands branch 0 the
+// original packet and branch 1 the copy, which is the only way to manipulate a
+// duplicate WITHOUT manipulating the packet it was copied from.
+//
+// Chaining primitives on the root instead - NewActionTree(dup, tamper) - does
+// the opposite: ActionNode.Execute applies every following primitive to every
+// result, so the tamper lands on the original as well as on the copy. Every
+// packet-level strategy in strategies.go was built that way and consequently
+// broke the connection it was meant to protect.
+//
+// When the root yields more results than there are branches the surplus goes to
+// the last branch, so duplicate{count=N} with two branches still means "the
+// original down one branch, all N copies down the other".
 func (t *ActionTree) Execute(packet []byte) ([][]byte, error) {
 	if t == nil || t.Root == nil {
 		return [][]byte{packet}, nil
@@ -158,22 +174,23 @@ func (t *ActionTree) Execute(packet []byte) ([][]byte, error) {
 		return nil, err
 	}
 
-	// If there are branches, execute them on each result
-	if len(t.Branches) > 0 {
-		var finalResults [][]byte
-		for _, branch := range t.Branches {
-			for _, pkt := range results {
-				branchResults, err := branch.Execute(pkt)
-				if err != nil {
-					return nil, err
-				}
-				finalResults = append(finalResults, branchResults...)
-			}
-		}
-		return finalResults, nil
+	if len(t.Branches) == 0 {
+		return results, nil
 	}
 
-	return results, nil
+	var finalResults [][]byte
+	for i, pkt := range results {
+		idx := i
+		if idx >= len(t.Branches) {
+			idx = len(t.Branches) - 1
+		}
+		branchResults, err := t.Branches[idx].Execute(pkt)
+		if err != nil {
+			return nil, err
+		}
+		finalResults = append(finalResults, branchResults...)
+	}
+	return finalResults, nil
 }
 
 // Execute executes the action node (and following nodes) on a packet

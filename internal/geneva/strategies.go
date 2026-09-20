@@ -3,6 +3,36 @@ package geneva
 // Pre-discovered Geneva strategies for various censorship systems
 // Based on academic research and real-world testing
 
+// decoyThenReal builds the tree every packet-level strategy here needs: one
+// duplicate, the decoy manipulated, the real packet sent untouched.
+//
+// The chained form these strategies used before - NewActionTree(dup, tamper) -
+// cannot express that. ActionNode.Execute applies each following primitive to
+// every result of the one before, so the tamper hit the original as well as the
+// copy: Russia TSPU 1 put TTL=8 on the real SYN, which then expired before
+// reaching the server; TSPU 3 turned the real PSH-ACK into an RST; China GFW 2
+// and Turkey 1 tampered first and duplicated afterwards, so the untouched
+// packet was never sent at all. Branch routing is what keeps the two apart, see
+// ActionTree.Execute.
+//
+// The decoy goes out first. The point of all of these is to put a packet in
+// front of the middlebox before the real one arrives - a low-TTL SYN it
+// processes and the server never sees, an RST that poisons its flow table, a
+// SYN-ACK that desynchronises its state machine. Behind the real packet a decoy
+// has nothing left to poison.
+//
+// Branch 0 receives the original and branch 1 the copy, but at this point the
+// two are byte-identical, so tampering "the original" and tampering the copy
+// are the same operation. What matters is that exactly one of the two is
+// manipulated. TamperPrimitive.Apply writes into a fresh buffer, so the packet
+// handed to Apply is never modified in place.
+func decoyThenReal(decoy Primitive) *ActionTree {
+	tree := NewActionTree(NewDuplicatePrimitive(1))
+	tree.AddBranch(NewActionTree(decoy))            // result 0: the decoy
+	tree.AddBranch(NewActionTree(&SendPrimitive{})) // result 1: the real packet
+	return tree
+}
+
 // ChinaGFWStrategy1 - Effective against China's GFW
 // Strategy: "[TCP:flags:S]-duplicate(tamper{TTL:10})-|"
 // Description: Duplicate SYN packets with low TTL to exhaust middlebox state
@@ -13,17 +43,15 @@ func ChinaGFWStrategy1() *Strategy {
 		Value:    uint8(TCPFlagSYN),
 		Operator: "&",
 		Metadata: map[string]string{
-			"name":         "China GFW Strategy 1",
-			"description":  "Duplicate SYN with low TTL",
-			"success_rate": "75%",
+			"name":        "China GFW Strategy 1",
+			"description": "Duplicate SYN with low TTL",
 		},
 	}
 
-	// Outbound: duplicate packet and tamper TTL on duplicate
+	// Outbound: a low-TTL decoy SYN, then the real SYN untouched
 	tamperTTL := NewTamperPrimitive("ttl", uint8(10))
-	dupTamper := NewActionTree(NewDuplicatePrimitive(1), tamperTTL)
 
-	return NewStrategy(trigger, dupTamper, nil)
+	return NewStrategy(trigger, decoyThenReal(tamperTTL), nil)
 }
 
 // ChinaGFWStrategy2 - Alternative GFW bypass
@@ -36,18 +64,15 @@ func ChinaGFWStrategy2() *Strategy {
 		Value:    uint8(TCPFlagSYN),
 		Operator: "&",
 		Metadata: map[string]string{
-			"name":         "China GFW Strategy 2",
-			"description":  "Fake SYN-ACK confusion",
-			"success_rate": "70%",
+			"name":        "China GFW Strategy 2",
+			"description": "Fake SYN-ACK confusion",
 		},
 	}
 
-	// Outbound: tamper flags to SYN-ACK, then duplicate
+	// Outbound: a fake SYN-ACK decoy, then the real SYN untouched
 	tamperFlags := NewTamperPrimitive("flags", uint8(TCPFlagSYN|TCPFlagACK))
-	dup := NewDuplicatePrimitive(1)
-	outbound := NewActionTree(tamperFlags, dup)
 
-	return NewStrategy(trigger, outbound, nil)
+	return NewStrategy(trigger, decoyThenReal(tamperFlags), nil)
 }
 
 // ChinaGFWStrategy3 - Fragment-based evasion
@@ -60,9 +85,8 @@ func ChinaGFWStrategy3() *Strategy {
 		Value:    uint8(TCPFlagPSH | TCPFlagACK),
 		Operator: "&",
 		Metadata: map[string]string{
-			"name":         "China GFW Strategy 3",
-			"description":  "Fragment PSH-ACK packets",
-			"success_rate": "80%",
+			"name":        "China GFW Strategy 3",
+			"description": "Fragment PSH-ACK packets",
 		},
 	}
 
@@ -83,18 +107,15 @@ func IranDPIStrategy1() *Strategy {
 		Value:    uint8(TCPFlagSYN),
 		Operator: "&",
 		Metadata: map[string]string{
-			"name":         "Iran DPI Strategy 1",
-			"description":  "Sequence number tampering",
-			"success_rate": "65%",
+			"name":        "Iran DPI Strategy 1",
+			"description": "Sequence number tampering",
 		},
 	}
 
-	// Outbound: tamper seq, then duplicate
+	// Outbound: a decoy with a desynchronising seq, then the real SYN untouched
 	tamperSeq := NewTamperPrimitive("seq", uint32(10000))
-	dup := NewDuplicatePrimitive(1)
-	outbound := NewActionTree(tamperSeq, dup)
 
-	return NewStrategy(trigger, outbound, nil)
+	return NewStrategy(trigger, decoyThenReal(tamperSeq), nil)
 }
 
 // IranDPIStrategy2 - Alternative Iranian bypass
@@ -107,9 +128,8 @@ func IranDPIStrategy2() *Strategy {
 		Value:    uint8(TCPFlagPSH | TCPFlagACK),
 		Operator: "&",
 		Metadata: map[string]string{
-			"name":         "Iran DPI Strategy 2",
-			"description":  "Fragment HTTP requests",
-			"success_rate": "70%",
+			"name":        "Iran DPI Strategy 2",
+			"description": "Fragment HTTP requests",
 		},
 	}
 
@@ -130,18 +150,15 @@ func RussiaTSPUStrategy1() *Strategy {
 		Value:    uint8(TCPFlagSYN),
 		Operator: "&",
 		Metadata: map[string]string{
-			"name":         "Russia TSPU Strategy 1",
-			"description":  "Low TTL SYN duplicate",
-			"success_rate": "85%",
+			"name":        "Russia TSPU Strategy 1",
+			"description": "Low TTL SYN duplicate",
 		},
 	}
 
-	// Outbound: duplicate with TTL=8
+	// Outbound: a TTL=8 decoy SYN, then the real SYN untouched
 	tamperTTL := NewTamperPrimitive("ttl", uint8(8))
-	dup := NewDuplicatePrimitive(1)
-	outbound := NewActionTree(dup, tamperTTL)
 
-	return NewStrategy(trigger, outbound, nil)
+	return NewStrategy(trigger, decoyThenReal(tamperTTL), nil)
 }
 
 // RussiaTSPUStrategy2 - Alternative TSPU bypass
@@ -154,9 +171,8 @@ func RussiaTSPUStrategy2() *Strategy {
 		Value:    uint8(TCPFlagPSH | TCPFlagACK),
 		Operator: "&",
 		Metadata: map[string]string{
-			"name":         "Russia TSPU Strategy 2",
-			"description":  "Single-byte fragment for SNI evasion",
-			"success_rate": "90%",
+			"name":        "Russia TSPU Strategy 2",
+			"description": "Single-byte fragment for SNI evasion",
 		},
 	}
 
@@ -177,18 +193,15 @@ func RussiaTSPUStrategy3() *Strategy {
 		Value:    uint8(TCPFlagPSH | TCPFlagACK),
 		Operator: "&",
 		Metadata: map[string]string{
-			"name":         "Russia TSPU Strategy 3",
-			"description":  "RST poisoning",
-			"success_rate": "80%",
+			"name":        "Russia TSPU Strategy 3",
+			"description": "RST poisoning",
 		},
 	}
 
-	// Outbound: duplicate packet with RST flag
+	// Outbound: an RST decoy, then the real PSH-ACK untouched
 	tamperFlags := NewTamperPrimitive("flags", uint8(TCPFlagRST))
-	dup := NewDuplicatePrimitive(1)
-	outbound := NewActionTree(dup, tamperFlags)
 
-	return NewStrategy(trigger, outbound, nil)
+	return NewStrategy(trigger, decoyThenReal(tamperFlags), nil)
 }
 
 // TurkeyDPIStrategy1 - Effective against Turkish DPI
@@ -201,18 +214,15 @@ func TurkeyDPIStrategy1() *Strategy {
 		Value:    uint8(TCPFlagSYN),
 		Operator: "&",
 		Metadata: map[string]string{
-			"name":         "Turkey DPI Strategy 1",
-			"description":  "Zero sequence number confusion",
-			"success_rate": "60%",
+			"name":        "Turkey DPI Strategy 1",
+			"description": "Zero sequence number confusion",
 		},
 	}
 
-	// Outbound: tamper seq to 0, then duplicate
+	// Outbound: a zero-seq decoy, then the real SYN untouched
 	tamperSeq := NewTamperPrimitive("seq", uint32(0))
-	dup := NewDuplicatePrimitive(1)
-	outbound := NewActionTree(tamperSeq, dup)
 
-	return NewStrategy(trigger, outbound, nil)
+	return NewStrategy(trigger, decoyThenReal(tamperSeq), nil)
 }
 
 // GenericFragmentStrategy - Generic fragmentation bypass
@@ -225,9 +235,8 @@ func GenericFragmentStrategy() *Strategy {
 		Value:    uint8(TCPFlagPSH | TCPFlagACK),
 		Operator: "&",
 		Metadata: map[string]string{
-			"name":         "Generic Fragment Strategy",
-			"description":  "Basic payload fragmentation",
-			"success_rate": "50%",
+			"name":        "Generic Fragment Strategy",
+			"description": "Basic payload fragmentation",
 		},
 	}
 
@@ -248,9 +257,8 @@ func GenericDuplicateStrategy() *Strategy {
 		Value:    uint8(TCPFlagSYN),
 		Operator: "&",
 		Metadata: map[string]string{
-			"name":         "Generic Duplicate Strategy",
-			"description":  "Simple SYN duplication",
-			"success_rate": "40%",
+			"name":        "Generic Duplicate Strategy",
+			"description": "Simple SYN duplication",
 		},
 	}
 
@@ -320,12 +328,19 @@ func GetStrategiesByCountry(country string) []*Strategy {
 	return result
 }
 
-// GetSuccessRate returns the estimated success rate for a strategy
+// GetSuccessRate reports how often a strategy is expected to work.
+//
+// It always returns "unmeasured". Every strategy here used to carry a hardcoded
+// percentage in its metadata - 85% for Russia TSPU 1, 90% for TSPU 2, 75% for
+// China GFW 1 - with nothing behind any of them: no capture, no run against a
+// live DPI, no cited source. They also described the packet-level behaviour as
+// it was before decoyThenReal, which tampered the real packet along with the
+// decoy and so could not have worked at all.
+//
+// The numbers are removed rather than corrected, because correcting them needs
+// a measurement nobody has made. Callers that print this string now say so.
 func (s *Strategy) GetSuccessRate() string {
-	if s.Trigger.Metadata != nil {
-		return s.Trigger.Metadata["success_rate"]
-	}
-	return "unknown"
+	return "unmeasured"
 }
 
 // GetName returns the strategy name
