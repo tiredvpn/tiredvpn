@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/protocol"
+	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 )
 
 // verifyServerKnock mirrors server.verifyFullKnockSequence for the v2 knock: it
@@ -124,8 +125,27 @@ func TestAntiProbeEndToEndHandshake(t *testing.T) {
 			serverResult <- false
 			return
 		}
-		// Send ACK the client waits for in timingKnock.
+		// Send ACK the client waits for in timingKnock, then the server proof
+		// the client verifies in verifyServerAuth: an HMAC over this session's
+		// exporter, matching the production handleAntiProbeAuth path.
 		conn.Write([]byte{0x01})
+		tc, ok := conn.(interface {
+			ConnectionState() tls.ConnectionState
+		})
+		if !ok {
+			t.Log("server: connection is not TLS")
+			serverResult <- false
+			return
+		}
+		state := tc.ConnectionState()
+		ekm, err := customtls.ExportBindingKey(&state)
+		if err != nil {
+			t.Logf("server: exporter failed: %v", err)
+			serverResult <- false
+			return
+		}
+		proof := AntiProbeServerProof(secret, ekm)
+		conn.Write(proof[:])
 		serverResult <- true
 	}()
 

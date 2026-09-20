@@ -2,11 +2,13 @@ package strategy
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"time"
@@ -15,6 +17,7 @@ import (
 
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/protocol"
+	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 )
 
 // AntiProbeStrategy implements resistance to active probing
@@ -162,7 +165,7 @@ func (s *AntiProbeStrategy) Connect(ctx context.Context, target string) (net.Con
 	}
 
 	// Phase 4: Verify server response
-	if err := s.verifyServerAuth(tlsConn); err != nil {
+	if err := s.verifyServerAuth(tlsConn, secret); err != nil {
 		tlsConn.Close()
 		return nil, err
 	}
@@ -329,9 +332,52 @@ func KnockBody(secret, nonce []byte, bucket int64, seqNum, bodyLen int) []byte {
 	return out
 }
 
-// verifyServerAuth verifies server recognized us
-// After timing knock ACK, server is ready for tunnel - just return success
-func (s *AntiProbeStrategy) verifyServerAuth(conn *tls.Conn) error {
-	// Server already sent 0x01 ACK in timingKnock, now ready for tunnel
+// AntiProbeServerProofLabel domain-separates the server proof HMAC from any
+// other use of the same secret and exporter.
+const AntiProbeServerProofLabel = "tiredvpn-antiprobe-server-proof"
+
+// AntiProbeProofLen is the size of the server proof (HMAC-SHA256).
+const AntiProbeProofLen = 32
+
+// AntiProbeServerProof binds the server's proof of holding the secret to the
+// TLS-session exporter (RFC 8446 §7.5). Both ends derive identical keying
+// material only if they completed the same handshake with the same keys, so a
+// MITM that terminates TLS gets different material on each side and cannot
+// produce this MAC whatever certificate it presents. This is what makes the
+// strategy's InsecureSkipVerify safe: the certificate is not trusted, the
+// shared secret over the shared session is.
+func AntiProbeServerProof(secret, ekm []byte) [AntiProbeProofLen]byte {
+	mac := hmac.New(sha256.New, secret)
+	mac.Write([]byte(AntiProbeServerProofLabel))
+	mac.Write(ekm)
+	var out [AntiProbeProofLen]byte
+	copy(out[:], mac.Sum(nil))
+	return out
+}
+
+// verifyServerAuth checks the server's proof that it holds the knock secret and
+// shares this exact TLS session. The knock (Phase 3) authenticates the client
+// to the server; without this step nothing authenticates the server to the
+// client, and with InsecureSkipVerify any peer answering 0x01 would pass. The
+// proof is an HMAC over the TLS exporter, so a proof lifted from one session is
+// worthless on another.
+func (s *AntiProbeStrategy) verifyServerAuth(conn *tls.Conn, secret []byte) error {
+	state := conn.ConnectionState()
+	ekm, err := customtls.ExportBindingKey(&state)
+	if err != nil {
+		return fmt.Errorf("antiprobe: export keying material: %w", err)
+	}
+
+	proof := make([]byte, AntiProbeProofLen)
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	if _, err := io.ReadFull(conn, proof); err != nil {
+		return fmt.Errorf("antiprobe: read server proof: %w", err)
+	}
+	conn.SetReadDeadline(time.Time{})
+
+	want := AntiProbeServerProof(secret, ekm)
+	if !hmac.Equal(proof, want[:]) {
+		return errors.New("antiprobe: server proof mismatch")
+	}
 	return nil
 }

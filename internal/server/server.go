@@ -36,6 +36,7 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/shaper"
 	"github.com/tiredvpn/tiredvpn/internal/shaper/presets"
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
+	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 	"github.com/tiredvpn/tiredvpn/internal/tun"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
@@ -1358,10 +1359,13 @@ func handleConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 		return
 	}
 
-	// Non-TLS connections: check for timing knock (anti-probe) with per-client secrets
-	if matched, secret, clientID := detectTimingKnockWithRegistry(peekBuf, srvCtx); matched {
-		logger.Debug("Detected timing knock pattern (client: %s)", clientID)
-		handleAntiProbeAuth(buffConn, srvCtx, secret, clientID, logger)
+	// Non-TLS connections: check for timing knock (anti-probe) with per-client secrets.
+	// There is no TLS session to bind the server proof to on this path, and the
+	// current client always dials anti-probe over TLS, so a knock arriving in the
+	// clear cannot complete the session-bound handshake — serve the decoy.
+	if matched, _, clientID := detectTimingKnockWithRegistry(peekBuf, srvCtx); matched {
+		logger.Debug("Detected plaintext timing knock with no TLS session to bind (client: %s); serving decoy", clientID)
+		serveFakeWebsite(buffConn, srvCtx.cfg, logger)
 		return
 	}
 
@@ -1498,7 +1502,13 @@ func handleTLSConnectionLegacy(conn net.Conn, srvCtx *serverContext, connID uint
 	// Check for timing knock sequence (anti-probe over TLS) with per-client secrets
 	if matched, secret, clientID := detectTimingKnockWithRegistry(peekBuf, srvCtx); matched {
 		logger.Debug("Detected timing knock pattern over TLS (client: %s)", clientID)
-		handleAntiProbeAuth(buffConn, srvCtx, secret, clientID, logger)
+		ekm, err := exporterBindingKey(buffConn)
+		if err != nil {
+			logger.Debug("Anti-probe over TLS: exporter unavailable: %v", err)
+			serveFakeWebsite(buffConn, srvCtx.cfg, logger)
+			return
+		}
+		handleAntiProbeAuth(buffConn, srvCtx, secret, clientID, ekm, logger)
 		return
 	}
 
@@ -2825,6 +2835,17 @@ func handleAntiProbeDispatch(conn net.Conn, srvCtx *serverContext, logger *log.L
 	// length yet. The buffer is generous enough to hold the whole first packet
 	// (<= knockSizeMin+span) when it arrives in one read; verifyFullKnockSequence
 	// reads the rest from the replayed stream.
+	// Pull the TLS exporter before wrapping the conn: the server proof written
+	// after the knock ACK is an HMAC over this keying material, which binds it
+	// to this exact handshake (see strategy.AntiProbeServerProof). conn is the
+	// raw *tls.Conn here; the bufferedConn wrapper below would hide the method.
+	ekm, ekmErr := exporterBindingKey(conn)
+	if ekmErr != nil {
+		logger.Debug("Anti-probe dispatch: exporter unavailable: %v", ekmErr)
+		serveFakeWebsite(conn, cfg, logger)
+		return
+	}
+
 	peekBuf := make([]byte, 160)
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	n, err := io.ReadAtLeast(conn, peekBuf, strategy.KnockHeaderLen+strategy.KnockTagLen)
@@ -2848,11 +2869,29 @@ func handleAntiProbeDispatch(conn net.Conn, srvCtx *serverContext, logger *log.L
 		Conn:   conn,
 		reader: io.MultiReader(bytes.NewReader(peekBuf), conn),
 	}
-	handleAntiProbeAuth(buffConn, srvCtx, secret, clientID, logger)
+	handleAntiProbeAuth(buffConn, srvCtx, secret, clientID, ekm, logger)
+}
+
+// exporterBindingKey pulls the RFC 8446 §7.5 exporter out of a TLS connection,
+// unwrapping the bufferedConn the detector paths wrap it in first. bufferedConn
+// embeds net.Conn, so ConnectionState is not promoted through it and the type
+// assertion must run against the wrapped conn directly.
+func exporterBindingKey(conn net.Conn) ([]byte, error) {
+	if bc, ok := conn.(*bufferedConn); ok {
+		conn = bc.Conn
+	}
+	tc, ok := conn.(interface {
+		ConnectionState() tls.ConnectionState
+	})
+	if !ok {
+		return nil, errors.New("connection is not TLS")
+	}
+	state := tc.ConnectionState()
+	return customtls.ExportBindingKey(&state)
 }
 
 // handleAntiProbeAuth handles anti-probe authenticated connections
-func handleAntiProbeAuth(conn net.Conn, srvCtx *serverContext, secret []byte, clientID clientIdentity, logger *log.Logger) {
+func handleAntiProbeAuth(conn net.Conn, srvCtx *serverContext, secret []byte, clientID clientIdentity, ekm []byte, logger *log.Logger) {
 	cfg := srvCtx.cfg
 	logger.Debug("Processing anti-probe authentication (client: %s)", clientID)
 
@@ -2863,8 +2902,16 @@ func handleAntiProbeAuth(conn net.Conn, srvCtx *serverContext, secret []byte, cl
 		return
 	}
 
-	// Send ACK
+	// Send ACK, then prove to the client that we hold the secret over this exact
+	// TLS session. The client waits for both bytes in Phase 3/4; without the
+	// proof a MITM answering 0x01 would pass, since InsecureSkipVerify trusts no
+	// certificate.
 	conn.Write([]byte{0x01})
+	proof := strategy.AntiProbeServerProof(secret, ekm)
+	if _, err := conn.Write(proof[:]); err != nil {
+		logger.Debug("Anti-probe: server proof write failed: %v", err)
+		return
+	}
 	logger.Info("Anti-probe authenticated (client: %s)", clientID)
 
 	// Now expect TLS handshake with auth token
