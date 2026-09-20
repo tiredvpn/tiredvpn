@@ -185,7 +185,7 @@ func (s *QUICStrategy) Description() string {
 	if s.useSalamander {
 		return "QUIC with Salamander padding - default server mode, per-client secret support"
 	}
-	return "QUIC-based tunnel over UDP with version spoofing (uses draft-29 to bypass TSPU)"
+	return "QUIC-based tunnel over UDP (QUIC v1, h3 ALPN)"
 }
 
 func (s *QUICStrategy) RequiresServer() bool {
@@ -233,16 +233,51 @@ func (s *QUICStrategy) Probe(ctx context.Context, target string) error {
 	return nil
 }
 
-// buildProbePacket creates a QUIC-like probe that won't trigger DPI
+// quicProbeLen is the datagram size of the reachability probe. RFC 9000 §14.1
+// requires a client Initial-carrying datagram to be at least 1200 bytes; the old
+// probe was 100 bytes, which is a malformed Initial and stands out on its own.
+const quicProbeLen = 1200
+
+// buildProbePacket builds a well-formed QUIC v1 long-header Initial padded to the
+// RFC 9000 minimum, with randomized connection IDs, packet number and payload.
+//
+// The old probe was a 100-byte packet stamped with draft-29 (0xff00001d) while
+// the real Connect path speaks v1 - two different fingerprints from one
+// strategy, and neither a legal Initial. This one is indistinguishable in
+// size/version/shape from a real v1 client's first flight.
+//
+// Verification rule 2: this is only used for a negative reachability signal (no
+// ICMP unreachable within the timeout). We cannot get a positive control from
+// our own server, which speaks Salamander-wrapped QUIC and silently drops a raw
+// Initial - so the probe detects a hard-closed port / blocked route, not a
+// working QUIC path. That limitation is inherent to probing our own obfuscated
+// listener and is documented rather than papered over.
 func (s *QUICStrategy) buildProbePacket() []byte {
-	packet := make([]byte, 100)
+	packet := make([]byte, quicProbeLen)
 
-	// Use draft-29 version (less likely to be blocked)
-	packet[0] = 0xc0                                    // Long header, Initial
-	binary.BigEndian.PutUint32(packet[1:5], 0xff00001d) // QUIC draft-29
+	// Long header, fixed bit set, Initial type (0b00), 4-byte packet number.
+	packet[0] = 0xc3
+	binary.BigEndian.PutUint32(packet[1:5], 0x00000001) // QUIC v1
 
-	// Random connection IDs
-	rand.Read(packet[5:])
+	off := 5
+	packet[off] = 8 // DCID length
+	off++
+	rand.Read(packet[off : off+8]) // random DCID
+	off += 8
+	packet[off] = 8 // SCID length
+	off++
+	rand.Read(packet[off : off+8]) // random SCID
+	off += 8
+	packet[off] = 0x00 // Token length varint = 0
+	off++
+
+	// Length varint (2-byte form): covers packet number + payload = the rest.
+	remaining := quicProbeLen - (off + 2)
+	binary.BigEndian.PutUint16(packet[off:off+2], 0x4000|uint16(remaining))
+	off += 2
+
+	// Packet number + payload are random (a real Initial's are AEAD ciphertext).
+	rand.Read(packet[off:])
 
 	return packet
 }
