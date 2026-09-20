@@ -50,9 +50,14 @@ type REALITYStrategy struct {
 	donorsMu sync.Mutex
 
 	// requireDataV2 refuses to fall back to the v1 data layer when the server
-	// does not confirm v2. Off by default because during the rollout (exits →
-	// relays → clients) a new client still meets old servers; turn it on once
-	// every server in the deployment is upgraded.
+	// does not confirm v2. The shipped binary sets it true by default (see the
+	// -reality-require-data-v2 flag): a silent v1 fallback is a downgrade to the
+	// malleable, unauthenticated ChaCha20 stream, and the v2 confirmation rides
+	// in the ServerHello padding *before* encryption, so an active middlebox can
+	// strip it and force the downgrade with no error shown to the user. v1 is
+	// only reachable by explicitly passing -reality-require-data-v2=false to talk
+	// to a pre-1.11 server. The struct zero value stays false so direct callers
+	// (tests) opt in explicitly.
 	requireDataV2 bool
 
 	// fingerprint names the uTLS browser profile used to build the ClientHello.
@@ -581,12 +586,6 @@ func (r *REALITYStrategy) connect(ctx context.Context, target string, wrapFirstF
 		return nil, fmt.Errorf("reality: validation failed: %w", err)
 	}
 
-	// Negotiate smux mode with the server.
-	if err := protocol.WriteDispatch(tcpConn, protocol.TypeMux); err != nil {
-		tcpConn.Close()
-		return nil, fmt.Errorf("reality: mux negotiate: %w", err)
-	}
-
 	// Wrap TCP in an encrypted TLS-record framing layer so TSPU sees a normal
 	// TLS Application Data stream instead of raw smux bytes. Without this, TSPU
 	// throttles the connection after ~600 bytes.
@@ -594,6 +593,17 @@ func (r *REALITYStrategy) connect(ctx context.Context, target string, wrapFirstF
 	if err != nil {
 		tcpConn.Close()
 		return nil, fmt.Errorf("reality: data conn init: %w", err)
+	}
+
+	// Negotiate smux mode with the server. The discriminator is the first
+	// *encrypted* record inside the data layer, not a cleartext byte after
+	// ServerHello: written in the clear it put a lone 0x08 on the wire, an
+	// invalid TLS record type between ServerHello and the first Application Data
+	// record, which is a one-line DPI signature. Inside wrapDataLayer it is just
+	// another 0x17 Application Data record.
+	if err := protocol.WriteDispatch(dataConn, protocol.TypeMux); err != nil {
+		tcpConn.Close()
+		return nil, fmt.Errorf("reality: mux negotiate: %w", err)
 	}
 
 	smuxCfg := smux.DefaultConfig()
@@ -950,10 +960,11 @@ func (r *REALITYStrategy) validateServerHello(serverHello []byte, clientPubKey [
 // covers both public keys and both salts, so only a peer holding the shared
 // secret can produce it, and an active middlebox cannot substitute its own key
 // share while replaying the server's auth token. If the confirmation is absent
-// the server is still on v1 and we fall back — unless requireDataV2 is set.
-//
-// Even the fallback is safe from the v1 keystream reuse this change is about:
-// the key there is derived from clientPubKey, which is now fresh per connection.
+// or fails, requireDataV2 (true in the shipped binary) makes this an error
+// rather than a silent v1 fallback: the confirmation travels in the cleartext
+// ServerHello padding, so an on-path attacker who flips a few bytes there would
+// otherwise force a downgrade to the malleable v1 stream with no visible error.
+// v1 is reached only when the operator explicitly turns requireDataV2 off.
 func (r *REALITYStrategy) wrapDataLayer(tcpConn net.Conn, serverExt *customtls.REALITYExtension, clientPrivKey, clientPubKey, clientSalt [32]byte, secret []byte) (net.Conn, error) {
 	serverSalt, ok := customtls.ParseServerDataV2(secret, clientPubKey, serverExt.PubKey, clientSalt, serverExt.Extra)
 	if !ok {

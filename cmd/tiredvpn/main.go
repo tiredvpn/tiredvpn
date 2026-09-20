@@ -218,7 +218,7 @@ REALITY OPTIONS:
   -reality-mirror string
         Mirror the handshake to the real donor for sources that have not authenticated: off, adaptive, always (default "adaptive")
   -reality-require-data-v2
-        Reject REALITY clients still on the v1 data layer (turn on after every client is upgraded)
+        Reject REALITY clients still on the v1 data layer (default true; =false only to accept pre-1.11 clients)
 
 NODE CEILINGS (address reputation):
   -node-max-clients int
@@ -388,7 +388,7 @@ ADVANCED EVASION:
   -cover string
         Cover host for traffic mimicry (default "api.googleapis.com")
   -reality-require-data-v2
-        Refuse REALITY servers still on the v1 data layer instead of falling back
+        Refuse REALITY servers still on the v1 data layer instead of silently falling back (default true; =false only for pre-1.11 servers)
   -reality-server-pubkey string
         Server's static REALITY public key, base64. Set it to speak the B1 transport; empty uses the legacy one.
 
@@ -485,7 +485,7 @@ func registerServerFlags(fs *flag.FlagSet, cfg *server.Config) *serverFlagOpts {
 	fs.IntVar(&cfg.NodeMaxClients, "node-max-clients", 0, "Cap distinct authenticated clients on this node (0 = off). Address reputation is the one blocking vector that ignores traffic shape; 200 users on one address bought two hours in the Iranian experiment, 5-7 bought two days. NOTE: transports that authenticate against a single shared secret carry no client id and are not counted, so the real number on this node can exceed the cap.")
 	fs.Int64Var(&cfg.NodeMaxBytesPerWindow, "node-max-bytes", 0, "Cap bytes carried per window on this node (0 = off). This is the ceiling that means something on a relay, where peers are downstream nodes rather than people.")
 	fs.DurationVar(&cfg.NodeWindow, "node-window", time.Hour, "Sliding window the traffic ceiling is measured over")
-	fs.BoolVar(&cfg.REALITYRequireDataV2, "reality-require-data-v2", false, "Reject REALITY clients that do not negotiate the v2 data layer (per-connection keys + AEAD). Turn on only after every client is upgraded.")
+	fs.BoolVar(&cfg.REALITYRequireDataV2, "reality-require-data-v2", true, "Reject REALITY clients that do not negotiate the v2 data layer (per-connection keys + AEAD). On by default in 1.11.0; set =false only to accept pre-1.11 clients on the malleable v1 layer.")
 	// B1 transport. -reality-b1 defaults to off while the B1 handler is still
 	// a stub: with it on, a server without a static key refuses to start, and
 	// that is not a thing to hand every existing deployment in exchange for a
@@ -696,7 +696,7 @@ func runClient(args []string) {
 
 	// Seqovl level-A packet overlap (Linux only, requires CAP_NET_ADMIN + OUTPUT NFQUEUE rule)
 	fs.BoolVar(&cfg.SeqovlPacketEnabled, "seqovl-packet", false, "Enable packet-level TCP sequence overlap for seqovl (Linux + CAP_NET_ADMIN; additive to the app-framing decoy)")
-	fs.BoolVar(&cfg.REALITYRequireDataV2, "reality-require-data-v2", false, "Refuse REALITY servers still on the v1 data layer instead of falling back (turn on once every server is upgraded)")
+	fs.BoolVar(&cfg.REALITYRequireDataV2, "reality-require-data-v2", true, "Refuse REALITY servers still on the v1 data layer instead of silently falling back. On by default in 1.11.0; set =false only to reach pre-1.11 servers on the malleable v1 layer.")
 	fs.StringVar(&cfg.BurstReshape, "burst-reshape", "off", "Split the inner TLS handshake with a nudge/ack exchange so the nDPI burst heuristic stops matching: off, on. MUST match the server setting - a one-sided 'on' corrupts streams.")
 	fs.IntVar(&cfg.BurstReshapePadFlight, "burst-reshape-pad-flight", 0, "Extra bytes the server adds to its flight (0 = off). Must match the server.")
 	registerClientREALITYFlags(fs, cfg)
