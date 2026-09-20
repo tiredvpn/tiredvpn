@@ -27,6 +27,13 @@ import (
 // "TiredVPN/2.0" was a self-report a header scan could match on directly.
 const browserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
+// maxWSFrameLen caps a payload length announced in a WebSocket frame header.
+// Tunnel frames are one relay buffer (tens of KB); 1 MiB leaves headroom while
+// keeping a hostile peer from naming a length we would allocate. Without it the
+// 64-bit extended length turns into an OOM (or, once it exceeds 2^63, a
+// negative int and a make() panic).
+const maxWSFrameLen = 1 << 20
+
 // WebSocketPaddedStrategy implements WebSocket transport with Salamander padding
 // Priority 8 (high, between HTTP/2 Stego and Traffic Morph)
 type WebSocketPaddedStrategy struct {
@@ -386,6 +393,12 @@ func (sc *SalamanderConn) readWebSocketFrame() ([]byte, error) {
 			return nil, err
 		}
 		payloadLen = int(binary.BigEndian.Uint64(extLen))
+	}
+
+	// Cap the peer-announced length before allocating. A 64-bit length past
+	// 2^63 wraps to a negative int (make panics); anything huge is an OOM.
+	if payloadLen < 0 || payloadLen > maxWSFrameLen {
+		return nil, fmt.Errorf("websocket frame length %d exceeds the %d byte cap", payloadLen, maxWSFrameLen)
 	}
 
 	// Read masking key if present (server → client has no mask)

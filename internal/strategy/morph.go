@@ -714,6 +714,13 @@ func (mc *MorphedConn) Read(p []byte) (int, error) {
 	}
 	dataLen, paddingLen := readFrameHeader(header)
 
+	// Mirror the server cap (server.go: dataLen > 65535) before allocating.
+	// dataLen is 32 bits off the wire; on a 32-bit int it can even come back
+	// negative, so guard both ends before totalPayload feeds acquirePacketBuf.
+	if dataLen < 0 || dataLen > 65535 {
+		return 0, fmt.Errorf("morph frame data length %d out of range", dataLen)
+	}
+
 	// Handle dummy packets (dataLen = 0) - these are keepalive responses
 	if dataLen == 0 {
 		// Discard padding

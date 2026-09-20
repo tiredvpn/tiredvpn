@@ -38,6 +38,12 @@ const (
 	pollingPollHealthGrace = 20 * time.Second // stop feeding if no poll has succeeded within this
 )
 
+// maxPollBody caps the response Content-Length we will allocate for. A poll
+// response carries at most one relay buffer (tens of KB); 1 MiB leaves headroom
+// while keeping a hostile server from naming a length that OOMs the client (or,
+// if it announces a negative value, panics make()).
+const maxPollBody = 1 << 20
+
 // Idle polling backoff and connection-reuse bounds. The 1.10.x transport polled
 // every 50ms round the clock (the numWorkers==1 turn condition was always true)
 // and opened a fresh TCP+TLS connection with Connection: close on every request
@@ -589,6 +595,14 @@ func (c *HTTPPollingConn) exchange(tlsConn *tls.Conn, reader *bufio.Reader, auth
 		}
 	}
 
+	return readPollResponse(reader)
+}
+
+// readPollResponse reads the status line, headers and body of one poll response
+// off reader. It caps the peer-announced Content-Length before allocating, so a
+// hostile server cannot name a length that OOMs the client (or, if negative,
+// panics make()).
+func readPollResponse(reader *bufio.Reader) ([]byte, error) {
 	// Read status line
 	statusLine, err := reader.ReadString('\n')
 	if err != nil {
@@ -615,6 +629,9 @@ func (c *HTTPPollingConn) exchange(tlsConn *tls.Conn, reader *bufio.Reader, auth
 
 	// Read exactly Content-Length body bytes so the reader is aligned for the
 	// next keep-alive response.
+	if contentLength > maxPollBody {
+		return nil, fmt.Errorf("poll response Content-Length %d exceeds the %d byte cap", contentLength, maxPollBody)
+	}
 	if contentLength > 0 {
 		respBody := make([]byte, contentLength)
 		if _, err := io.ReadFull(reader, respBody); err != nil {
