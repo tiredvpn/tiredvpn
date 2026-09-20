@@ -99,7 +99,11 @@ func TestMorphKTLSHandover(t *testing.T) {
 	// Build morph handshake: MRPH(4) + nameLen(1) + name + auth(32).
 	// Profile name "test" — the server doesn't check the name, only auth.
 	profileName := []byte("test")
-	authToken := computeMorphAuthForTest(t, srvCtx.cfg.Secret)
+	clientEKM, err := exporterBindingKey(clientTLS)
+	if err != nil {
+		t.Fatalf("client exporter: %v", err)
+	}
+	authToken := computeMorphAuthForTest(t, srvCtx.cfg.Secret, clientEKM)
 	hs := []byte("MRPH")
 	hs = append(hs, byte(len(profileName)))
 	hs = append(hs, profileName...)
@@ -230,7 +234,7 @@ func TestMorphKTLSHandover(t *testing.T) {
 //
 // Production source: internal/strategy/stego.go:generateAuthToken
 // Wire-protocol verifier: internal/server/server.go:verifyMorphAuth
-func computeMorphAuthForTest(t *testing.T, secret []byte) []byte {
+func computeMorphAuthForTest(t *testing.T, secret, ekm []byte) []byte {
 	t.Helper()
 
 	timestamp := make([]byte, 8)
@@ -239,5 +243,6 @@ func computeMorphAuthForTest(t *testing.T, secret []byte) []byte {
 	h := hmac.New(sha256.New, secret)
 	h.Write(timestamp)
 	h.Write([]byte("http2-stego-auth"))
+	h.Write(ekm) // S22 session binding, matches verifyMorphAuth
 	return h.Sum(nil)[:32]
 }

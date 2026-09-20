@@ -257,11 +257,12 @@ type HTTPPollingConn struct {
 
 // init performs initial handshake to establish session
 func (c *HTTPPollingConn) init(ctx context.Context) error {
-	// Send init request with session ID (no body - SOCKS handler writes target later)
-	authToken := c.generateAuthToken()
+	// Send init request with session ID (no body - SOCKS handler writes target later).
+	// The auth token is derived inside doRequest, once the TLS connection this
+	// request rides is known, so it binds to that session's exporter (S22).
 
 	// Make first request to establish session on server (ackSeq=0 for init)
-	resp, err := c.doRequest(ctx, authToken, nil, 0)
+	resp, err := c.doRequest(ctx, nil, 0)
 	if err != nil {
 		return err
 	}
@@ -403,9 +404,9 @@ func (c *HTTPPollingConn) poll() (ok bool, moved bool) {
 	ackSeq := c.ackSeq
 	c.ackLock.Unlock()
 
-	// Do request with ack sequence
-	authToken := c.generateAuthToken()
-	resp, err := c.doRequest(ctx, authToken, sendData, ackSeq)
+	// Do request with ack sequence. The auth token is derived inside doRequest,
+	// bound to the exporter of the TLS session the request actually rides (S22).
+	resp, err := c.doRequest(ctx, sendData, ackSeq)
 	if err != nil {
 		log.Debug("HTTP Polling: poll error: %v", err)
 		c.statsMu.Lock()
@@ -485,13 +486,22 @@ func (c *HTTPPollingConn) runKeepaliveFeeder() {
 // doRequest performs one HTTP poll request, reusing the previous request's TLS
 // connection (HTTP/1.1 keep-alive) when one is live and within the reuse bounds,
 // otherwise dialling fresh. reuseMu serialises the whole exchange.
-func (c *HTTPPollingConn) doRequest(ctx context.Context, authToken string, data []byte, ackSeq int64) ([]byte, error) {
+func (c *HTTPPollingConn) doRequest(ctx context.Context, data []byte, ackSeq int64) ([]byte, error) {
 	c.reuseMu.Lock()
 	defer c.reuseMu.Unlock()
 
 	tlsConn, reader, err := c.acquireConn(ctx)
 	if err != nil {
 		return nil, err
+	}
+
+	// Bind the auth token to the exporter of the TLS session this request rides
+	// (S22). Derived here, after acquireConn, so a reused keep-alive session and
+	// a freshly dialled one each get a token that matches their own exporter.
+	authToken, err := c.generateAuthTokenForConn(tlsConn)
+	if err != nil {
+		c.dropReuseLocked()
+		return nil, fmt.Errorf("http_polling: export keying material: %w", err)
 	}
 
 	c.reuseCount++
@@ -652,14 +662,25 @@ func (c *HTTPPollingConn) dropReuseLocked() {
 	}
 }
 
-// generateAuthToken creates HMAC auth token
-func (c *HTTPPollingConn) generateAuthToken() string {
+// generateAuthTokenForConn creates the HMAC auth token bound to tlsConn's
+// session exporter (S22). Folding the exporter into the HMAC makes a token
+// captured on one poll session useless on another; the server rederives it from
+// its own side of the same session (server.go verifyPollingAuth). Unlike the
+// stego/morph family this token keys on sessionID plus a per-second timestamp,
+// which the server tolerates to 60s — the exporter binding rides on top.
+func (c *HTTPPollingConn) generateAuthTokenForConn(tlsConn *tls.Conn) (string, error) {
+	ekm, err := sessionExporterKey(tlsConn)
+	if err != nil {
+		return "", err
+	}
+
 	timestamp := time.Now().Unix()
 	data := fmt.Sprintf("%s:%d", c.sessionID, timestamp)
 
 	h := hmac.New(sha256.New, c.secret)
 	h.Write([]byte(data))
-	return base64.StdEncoding.EncodeToString(h.Sum(nil))[:16]
+	h.Write(ekm) // TLS-session binding
+	return base64.StdEncoding.EncodeToString(h.Sum(nil))[:16], nil
 }
 
 // Read implements net.Conn.

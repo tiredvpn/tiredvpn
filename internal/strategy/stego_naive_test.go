@@ -78,7 +78,7 @@ func TestCalculateNaivePadding(t *testing.T) {
 			defer client.Close()
 			defer server.Close()
 
-			conn := NewHTTP2StegoConn(client, secret, true, tt.mode)
+			conn := NewHTTP2StegoConn(client, secret, true, tt.mode, nil)
 
 			// Test multiple iterations to account for variability
 			for i := 0; i < 20; i++ {
@@ -109,7 +109,7 @@ func TestNaivePaddingHasEntropy(t *testing.T) {
 	defer client.Close()
 	defer server.Close()
 
-	conn := NewHTTP2StegoConn(client, secret, true, NaivePaddingStandard)
+	conn := NewHTTP2StegoConn(client, secret, true, NaivePaddingStandard, nil)
 
 	const dataLen = 1000
 	seen := map[int]bool{}
@@ -132,7 +132,7 @@ func TestNaivePaddingVariability(t *testing.T) {
 	defer client.Close()
 	defer server.Close()
 
-	conn := NewHTTP2StegoConn(client, secret, true, NaivePaddingStandard)
+	conn := NewHTTP2StegoConn(client, secret, true, NaivePaddingStandard, nil)
 
 	dataLen := 1000
 	paddingSizes := make(map[int]bool)
@@ -165,7 +165,7 @@ func TestNaivePaddingZeroLength(t *testing.T) {
 
 	for _, mode := range modes {
 		t.Run(mode.String(), func(t *testing.T) {
-			conn := NewHTTP2StegoConn(client, secret, true, mode)
+			conn := NewHTTP2StegoConn(client, secret, true, mode, nil)
 
 			// Zero-length data should still get some padding
 			padding := conn.calculateNaivePadding(0)
@@ -201,7 +201,7 @@ func TestNaivePaddingLargeData(t *testing.T) {
 
 	for _, tt := range modes {
 		t.Run(tt.mode.String(), func(t *testing.T) {
-			conn := NewHTTP2StegoConn(client, secret, true, tt.mode)
+			conn := NewHTTP2StegoConn(client, secret, true, tt.mode, nil)
 
 			for i := 0; i < 10; i++ {
 				conn.methodCounter = uint32(i)
@@ -232,7 +232,7 @@ func BenchmarkCalculateNaivePadding(b *testing.B) {
 
 	for _, mode := range modes {
 		b.Run(mode.String(), func(b *testing.B) {
-			conn := NewHTTP2StegoConn(client, secret, true, mode)
+			conn := NewHTTP2StegoConn(client, secret, true, mode, nil)
 
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
@@ -259,8 +259,8 @@ func TestHTTP2StegoWithNaivePadding(t *testing.T) {
 			defer client.Close()
 			defer server.Close()
 
-			clientConn := NewHTTP2StegoConn(client, secret, true, mode)
-			serverConn := NewHTTP2StegoConn(server, secret, false, mode)
+			clientConn := NewHTTP2StegoConn(client, secret, true, mode, nil)
+			serverConn := NewHTTP2StegoConn(server, secret, false, mode, nil)
 
 			// Test data
 			testData := make([]byte, 2048)

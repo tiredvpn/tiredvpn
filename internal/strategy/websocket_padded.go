@@ -144,9 +144,16 @@ func (s *WebSocketPaddedStrategy) Connect(ctx context.Context, target string) (n
 		tc.SetKeepAlivePeriod(30 * time.Second)
 	}
 
-	// 2. Send WebSocket upgrade request with auth token
+	// 2. Send WebSocket upgrade request with auth token bound to this TLS session
+	// (S22): a token captured on another session fails on the server, which
+	// derives the same exporter from its own side of this handshake.
+	ekm, err := sessionExporterKey(tlsConn)
+	if err != nil {
+		tlsConn.Close()
+		return nil, fmt.Errorf("websocket_padded: export keying material: %w", err)
+	}
 	wsKey := generateWebSocketKey()
-	authToken := generateAuthToken(secret)
+	authToken := generateAuthTokenBound(secret, ekm)
 	upgradeReq := fmt.Sprintf(
 		"GET %s HTTP/1.1\r\n"+
 			"Host: %s\r\n"+
