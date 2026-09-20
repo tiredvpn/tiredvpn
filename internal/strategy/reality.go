@@ -40,14 +40,14 @@ type REALITYStrategy struct {
 	recentDests map[string]time.Time
 	destMu      sync.RWMutex
 
-	// donors caches the donor pool derived for a secret other than r.secret,
-	// keyed by that secret. The pool is a function of the key (see derivePool),
-	// so a client walking endpoints with different keys must not carry one
-	// endpoint's donor set onto another - that set is exactly the thing
-	// derivePool exists to keep per-user. Deriving costs an HKDF plus a sort, so
-	// it is done once per secret rather than once per dial.
-	donors   map[string]*donorSet
-	donorsMu sync.Mutex
+	// shared holds the handshake gate and the per-secret donor pool/rotator
+	// cache, shared across every REALITY strategy built over the same Manager
+	// (the baseline strategy and the one seqovl rides on). Without sharing, each
+	// instance would enforce the per-SNI handshake ceiling independently and the
+	// real limit to one donor SNI would double. The pool is a function of the
+	// key (see derivePool), so a client walking endpoints with different keys
+	// still gets a distinct set per key - the cache keys on the secret.
+	shared *realityShared
 
 	// requireDataV2 refuses to fall back to the v1 data layer when the server
 	// does not confirm v2. The shipped binary sets it true by default (see the
@@ -120,20 +120,12 @@ func NewREALITYStrategy(manager *Manager, secret []byte) *REALITYStrategy {
 	// real server address — so TLS ClientHello with github.com SNI reaches the
 	// VPN server without being RST'd. Microsoft/Azure domains are blocked
 	// because TSPU whitelists their IP ranges and rejects mismatches.
-	developerPool := make([]string, 0, 8)
-	for _, entry := range evasion.WhitelistedSNIs {
-		if entry.Category == "developer" {
-			developerPool = append(developerPool, entry.SNI)
-		}
-	}
-	subPool := derivePool(developerPool, secret, len(developerPool))
-	if len(subPool) == 0 {
-		// Fallback to the legacy Tier 1 list if derivation yields nothing.
-		subPool = getRussianSNIsStatic()
-	}
-
-	// Use cooldown strategy for destination selection over the derived subpool
-	sniRotator := evasion.NewSNIRotatorWithPool(subPool, evasion.StrategyCooldown)
+	// The handshake gate and the derived donor pool/rotator are shared across
+	// every REALITY instance of this Manager, so the baseline strategy and the
+	// seqovl one enforce the same per-SNI ceiling and walk the same rotator
+	// instead of each running its own.
+	shared := sharedRealityState(manager)
+	base := shared.donorSetFor(secret)
 
 	// No key pair here on purpose: the X25519 key is generated per connection in
 	// connect(). A process-wide key made the data-layer key a constant, so every
@@ -141,12 +133,12 @@ func NewREALITYStrategy(manager *Manager, secret []byte) *REALITYStrategy {
 	return &REALITYStrategy{
 		manager:     manager,
 		secret:      secret,
-		sniRotator:  sniRotator,
-		destPool:    subPool,
+		sniRotator:  base.rotator,
+		destPool:    base.pool,
 		recentDests: make(map[string]time.Time),
-		donors:      make(map[string]*donorSet),
+		shared:      shared,
 		fingerprint: customtls.DefaultFingerprintName,
-		gate:        newHandshakeGate(),
+		gate:        shared.gate,
 	}
 }
 
@@ -168,27 +160,9 @@ func (r *REALITYStrategy) donorsFor(secret []byte) ([]string, *evasion.SNIRotato
 		return r.destPool, r.sniRotator
 	}
 
-	r.donorsMu.Lock()
-	defer r.donorsMu.Unlock()
-	if d, ok := r.donors[string(secret)]; ok {
-		return d.pool, d.rotator
-	}
-
-	developerPool := make([]string, 0, 8)
-	for _, entry := range evasion.WhitelistedSNIs {
-		if entry.Category == "developer" {
-			developerPool = append(developerPool, entry.SNI)
-		}
-	}
-	pool := derivePool(developerPool, secret, len(developerPool))
-	if len(pool) == 0 {
-		pool = getRussianSNIsStatic()
-	}
-	d := &donorSet{pool: pool, rotator: evasion.NewSNIRotatorWithPool(pool, evasion.StrategyCooldown)}
-	if r.donors == nil {
-		r.donors = make(map[string]*donorSet)
-	}
-	r.donors[string(secret)] = d
+	// Other secrets get their own set, derived on first use and cached in the
+	// shared state so both REALITY instances of this Manager reuse it.
+	d := r.shared.donorSetFor(secret)
 	return d.pool, d.rotator
 }
 

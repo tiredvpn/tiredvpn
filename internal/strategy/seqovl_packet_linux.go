@@ -5,6 +5,7 @@ package strategy
 import (
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 
 	"github.com/tiredvpn/tiredvpn/internal/capabilities"
 	"github.com/tiredvpn/tiredvpn/internal/geneva"
@@ -45,7 +46,14 @@ func (s *SeqovlStrategy) tryStartPacketOverlap(secret []byte) bool {
 	}
 
 	s.injectorOnce.Do(func() {
-		marker := seqovlPacketMarker(secret)
+		// Fresh nonce per injector session so the marker is not the same 32 bytes
+		// on every connection's fake segments (see seqovlPacketMarker).
+		nonce := make([]byte, seqovlPacketNonceLen)
+		if _, err := cryptorand.Read(nonce); err != nil {
+			log.Debug("Seqovl: packet-level nonce generation failed: %v - staying on level B", err)
+			return
+		}
+		marker := seqovlPacketMarker(secret, nonce)
 		prim := geneva.NewOverlapPrimitive(marker)
 		strat := geneva.NewOverlapStrategy(prim)
 

@@ -18,12 +18,34 @@ import (
 // never share a marker.
 const seqovlPacketSalt = "tiredvpn-seqovl-packet-v1"
 
-// seqovlPacketMarker derives the OverlapMarkerLen-byte marker embedded in the
-// packet-level fake segment: HMAC-SHA256(secret, packetSalt)[:32].
-func seqovlPacketMarker(secret []byte) []byte {
+// seqovlPacketNonceLen is the nonce prefixed to the packet marker. 8 bytes is
+// enough to make the marker non-repeating without eating the MAC's strength
+// (the remaining 24 bytes of the 32-byte marker are still keyed HMAC).
+const seqovlPacketNonceLen = 8
+
+// seqovlPacketMarker derives the OverlapMarkerLen-byte marker embedded at the
+// start of the packet-level fake segment, laid out [nonce][HMAC(secret,
+// salt||nonce)] just like the level-B decoy. The nonce is what stops the marker
+// from being one fixed value for the life of the secret - the old
+// HMAC(secret,salt) put the identical 32 bytes on every fake segment of every
+// connection, a keyed-but-constant pattern a censor can fingerprint. It is also
+// self-describing, so a server-side dropper verifies the MAC over the embedded
+// nonce instead of matching a precomputed static list.
+//
+// One NFQUEUE hook serves the whole process, so this nonce is fresh per injector
+// session, not per connection; minting one per fake segment would need
+// geneva.OverlapPrimitive to generate it, which the level-A injector cannot do
+// from here (see the blocker noted in tryStartPacketOverlap's package).
+func seqovlPacketMarker(secret, nonce []byte) []byte {
 	mac := hmac.New(sha256.New, secret)
 	mac.Write([]byte(seqovlPacketSalt))
-	return mac.Sum(nil)[:geneva.OverlapMarkerLen]
+	mac.Write(nonce)
+	tag := mac.Sum(nil)
+
+	marker := make([]byte, 0, geneva.OverlapMarkerLen)
+	marker = append(marker, nonce...)
+	marker = append(marker, tag[:geneva.OverlapMarkerLen-len(nonce)]...)
+	return marker
 }
 
 // seqovlDecoySalt is the HMAC domain separator for the seqovl decoy marker.
