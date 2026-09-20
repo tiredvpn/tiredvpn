@@ -1,10 +1,10 @@
 package strategy
 
 import (
+	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
 	"crypto/tls"
+	"encoding/binary"
 	"io"
 	"net"
 	"testing"
@@ -13,21 +13,46 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/protocol"
 )
 
-// verifyServerKnock mirrors server.verifyFullKnockSequence: it reads the 5
-// timing-knock packets the client sends and validates sequence numbers and
-// HMAC-derived content. Returns true on a fully matching knock.
+// verifyServerKnock mirrors server.verifyFullKnockSequence for the v2 knock: it
+// reads packet 0's fixed header, recovers the per-connection nonce and bucket,
+// then recomputes the schedule, tag and every body byte from those and checks
+// them. Returns true on a fully matching knock.
 func verifyServerKnock(conn net.Conn, secret []byte, t *testing.T) bool {
-	seqHash := hmac.New(sha256.New, secret)
-	seqHash.Write([]byte("knock-sequence"))
-	seqHashSum := seqHash.Sum(nil)
+	hdr := make([]byte, KnockHeaderLen)
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(conn, hdr); err != nil {
+		t.Logf("knock header read error: %v", err)
+		return false
+	}
+	if hdr[0] != 0x00 {
+		t.Logf("knock packet 0: wrong seq number %d", hdr[0])
+		return false
+	}
+	bucket := int64(binary.BigEndian.Uint64(hdr[1:9]))
+	if !KnockBucketFresh(bucket) {
+		t.Logf("knock bucket %d not fresh", bucket)
+		return false
+	}
+	nonce := append([]byte(nil), hdr[9:KnockHeaderLen]...)
+	seq := KnockScheduleFor(secret, nonce, bucket)
 
-	sizes := make([]int, 5)
-	for i := 0; i < 5; i++ {
-		sizes[i] = 10 + int(seqHashSum[i+5])%90
+	rest0 := make([]byte, seq.Sizes[0]-KnockHeaderLen)
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(conn, rest0); err != nil {
+		t.Logf("knock packet 0 body read error: %v", err)
+		return false
+	}
+	if !bytes.Equal(rest0[:KnockTagLen], KnockTag(secret, nonce, bucket)) {
+		t.Log("knock packet 0: tag mismatch")
+		return false
+	}
+	if !bytes.Equal(rest0[KnockTagLen:], KnockBody(secret, nonce, bucket, 0, seq.Sizes[0]-KnockHeaderLen-KnockTagLen)) {
+		t.Log("knock packet 0: body mismatch")
+		return false
 	}
 
-	for i := 0; i < 5; i++ {
-		buf := make([]byte, sizes[i])
+	for i := 1; i < KnockPackets; i++ {
+		buf := make([]byte, seq.Sizes[i])
 		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 		if _, err := io.ReadFull(conn, buf); err != nil {
 			t.Logf("knock packet %d read error: %v", i, err)
@@ -37,14 +62,9 @@ func verifyServerKnock(conn net.Conn, secret []byte, t *testing.T) bool {
 			t.Logf("knock packet %d: wrong seq number got %d want %d", i, buf[0], i)
 			return false
 		}
-		h := hmac.New(sha256.New, secret)
-		h.Write([]byte{byte(i)})
-		expected := h.Sum(nil)
-		for j := 1; j < len(buf); j++ {
-			if buf[j] != expected[(j-1)%len(expected)] {
-				t.Logf("knock packet %d: content mismatch at byte %d", i, j)
-				return false
-			}
+		if !bytes.Equal(buf[1:], KnockBody(secret, nonce, bucket, i, seq.Sizes[i]-1)) {
+			t.Logf("knock packet %d: body mismatch", i)
+			return false
 		}
 	}
 	conn.SetReadDeadline(time.Time{})

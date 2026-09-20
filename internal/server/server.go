@@ -465,11 +465,54 @@ type serverContext struct {
 	cfg            *Config
 	registry       *ClientRegistry
 	store          *RedisStore
-	upstreamDialer *UpstreamDialer // for multi-hop mode
-	metrics        *Metrics        // Prometheus metrics
-	tlsConfig      *tls.Config     // TLS config for non-REALITY connections
-	ipPool         *IPPool         // IP pool for TUN mode
-	sharedTUN      *SharedTUN      // Shared TUN device for all clients
+	upstreamDialer *UpstreamDialer  // for multi-hop mode
+	metrics        *Metrics         // Prometheus metrics
+	tlsConfig      *tls.Config      // TLS config for non-REALITY connections
+	ipPool         *IPPool          // IP pool for TUN mode
+	sharedTUN      *SharedTUN       // Shared TUN device for all clients
+	knockReplay    knockReplayGuard // anti-probe knock replay window (zero value usable)
+}
+
+// knockReplayGuard remembers the per-connection knock nonces seen inside the
+// replay window, so a censor who captures a client's knock cannot replay the
+// exact bytes to be let in. The zero value is usable; the map is created on
+// first use. Nonces expire after knockReplayTTL, which covers the bucket grace
+// window on both sides.
+type knockReplayGuard struct {
+	mu   sync.Mutex
+	seen map[string]int64 // nonce -> expiry (unix nanos)
+}
+
+// knockReplayTTL bounds how long a nonce is remembered. It only has to exceed
+// the bucket freshness window (a captured knock stops matching once its bucket
+// drifts out of KnockBucketFresh anyway); three minutes comfortably covers the
+// grace window on both sides and keeps the cache small.
+const knockReplayTTL = 3 * time.Minute
+
+// checkAndRecord reports whether nonce is fresh (not seen inside the window) and
+// records it. A false return means a replay.
+func (g *knockReplayGuard) checkAndRecord(nonce []byte, ttl time.Duration) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	nowNanos := time.Now().UnixNano()
+	if g.seen == nil {
+		g.seen = make(map[string]int64)
+	}
+	// Opportunistic cleanup: the cache never holds more than the window's worth
+	// of live knocks, and probes that fail the tag never reach here.
+	for k, exp := range g.seen {
+		if nowNanos > exp {
+			delete(g.seen, k)
+		}
+	}
+
+	key := string(nonce)
+	if exp, ok := g.seen[key]; ok && nowNanos <= exp {
+		return false // replay inside the window
+	}
+	g.seen[key] = time.Now().Add(ttl).UnixNano()
+	return true
 }
 
 // Run starts the server with the given configuration
@@ -2775,12 +2818,16 @@ func handleWebSocket(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
 func handleAntiProbeDispatch(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
 	cfg := srvCtx.cfg
 
-	// Peek the first knock packet so detectTimingKnockWithRegistry can match a
-	// secret. The first packet is at most 99 bytes (10 + hash%90); reading 99
-	// bytes covers it without blocking on the inter-packet client sleeps.
-	peekBuf := make([]byte, 99)
+	// Peek the head of the first knock packet so detectTimingKnockWithRegistry
+	// can match a secret against its keyed tag. The tag sits at a fixed offset
+	// (header + tag = KnockHeaderLen+KnockTagLen bytes), so reading that many is
+	// enough to pick the secret without knowing the secret-dependent packet
+	// length yet. The buffer is generous enough to hold the whole first packet
+	// (<= knockSizeMin+span) when it arrives in one read; verifyFullKnockSequence
+	// reads the rest from the replayed stream.
+	peekBuf := make([]byte, 160)
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	n, err := io.ReadAtLeast(conn, peekBuf, 10)
+	n, err := io.ReadAtLeast(conn, peekBuf, strategy.KnockHeaderLen+strategy.KnockTagLen)
 	if err != nil {
 		logger.Debug("Anti-probe dispatch: failed to peek knock: %v (read %d)", err, n)
 		serveFakeWebsite(conn, cfg, logger)
@@ -2810,7 +2857,7 @@ func handleAntiProbeAuth(conn net.Conn, srvCtx *serverContext, secret []byte, cl
 	logger.Debug("Processing anti-probe authentication (client: %s)", clientID)
 
 	// Verify knock sequence with the matched secret
-	if !verifyFullKnockSequence(conn, secret, logger) {
+	if !verifyFullKnockSequence(conn, secret, srvCtx, logger) {
 		logger.Warn("Knock sequence verification failed")
 		serveFakeWebsite(conn, cfg, logger)
 		return
@@ -4024,43 +4071,27 @@ func handleConfusionData(conn net.Conn, data []byte, srvCtx *serverContext, logg
 
 // Helper functions
 
+// detectTimingKnock matches the head of the first knock packet against secret.
+//
+// v2 layout of packet 0: [seq=0][bucket:8][nonce:16][tag:16][body...]. The
+// nonce and bucket are in the clear; the tag is HKDF(secret, nonce, bucket), so
+// a peer that does not hold the secret cannot produce it. Matching the tag lets
+// the server pick the right secret from a fixed-length prefix, without first
+// reading a secret-dependent packet length. A stale bucket is rejected before
+// any HKDF work, so garbage costs nothing.
 func detectTimingKnock(data []byte, secret []byte) bool {
-	// Check if first byte could be sequence number 0
-	if len(data) < 10 || data[0] != 0x00 {
+	if len(data) < strategy.KnockHeaderLen+strategy.KnockTagLen || data[0] != 0x00 {
 		return false
 	}
 
-	// Calculate expected first packet size (same as generateKnockSequence)
-	seqHash := hmac.New(sha256.New, secret)
-	seqHash.Write([]byte("knock-sequence"))
-	seqHashSum := seqHash.Sum(nil)
-	firstPacketSize := 10 + int(seqHashSum[5])%90
-
-	// Verify first packet content matches expected
-	h := hmac.New(sha256.New, secret)
-	h.Write([]byte{0x00})
-	expected := h.Sum(nil)
-
-	// Debug: log expected vs received
-	log.Debug("Timing knock check - expected first packet size: %d", firstPacketSize)
-	log.Debug("Timing knock check - expected first 8 bytes: %x", expected[:8])
-	log.Debug("Timing knock check - received bytes 1-9: %x", data[1:9])
-
-	// Only check up to firstPacketSize bytes (not all peeked data)
-	checkLen := firstPacketSize
-	if checkLen > len(data) {
-		checkLen = len(data)
+	bucket := int64(binary.BigEndian.Uint64(data[1:9]))
+	if !strategy.KnockBucketFresh(bucket) {
+		return false
 	}
 
-	for i := 1; i < checkLen; i++ {
-		if data[i] != expected[(i-1)%len(expected)] {
-			log.Debug("Timing knock mismatch at position %d: expected %02x, got %02x",
-				i, expected[(i-1)%len(expected)], data[i])
-			return false
-		}
-	}
-
-	return true
+	nonce := data[9:strategy.KnockHeaderLen]
+	expectedTag := strategy.KnockTag(secret, nonce, bucket)
+	return hmac.Equal(data[strategy.KnockHeaderLen:strategy.KnockHeaderLen+strategy.KnockTagLen], expectedTag)
 }
 
 // detectTimingKnockWithRegistry checks timing knock against per-client secrets and global secret
@@ -4085,48 +4116,74 @@ func detectTimingKnockWithRegistry(data []byte, srvCtx *serverContext) (bool, []
 	return false, nil, clientIdentity{}
 }
 
-func verifyFullKnockSequence(conn net.Conn, secret []byte, logger *log.Logger) bool {
-	// Generate expected knock sequence (same as client)
-	seqHash := hmac.New(sha256.New, secret)
-	seqHash.Write([]byte("knock-sequence"))
-	seqHashSum := seqHash.Sum(nil)
-
-	sizes := make([]int, 5)
-	for i := 0; i < 5; i++ {
-		sizes[i] = 10 + int(seqHashSum[i+5])%90
+// verifyFullKnockSequence reads and verifies all knock packets from conn.
+//
+// It is self-contained: it reads packet 0's fixed header, recovers the nonce and
+// bucket, rejects a stale bucket and a replayed nonce (the replay window lives in
+// srvCtx.knockReplay), then recomputes the whole schedule and every body byte
+// from (secret, nonce, bucket) and checks them. The v1 version derived
+// everything from the secret alone, so a captured knock could be replayed
+// verbatim; here the nonce is single-use inside the window.
+func verifyFullKnockSequence(conn net.Conn, secret []byte, srvCtx *serverContext, logger *log.Logger) bool {
+	hdr := make([]byte, strategy.KnockHeaderLen)
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(conn, hdr); err != nil {
+		logger.Debug("Knock header read error: %v", err)
+		return false
+	}
+	if hdr[0] != 0x00 {
+		logger.Debug("Knock packet 0: wrong sequence number (got %d)", hdr[0])
+		return false
 	}
 
-	logger.Debug("Verifying knock sequence, packet sizes: %v", sizes)
+	bucket := int64(binary.BigEndian.Uint64(hdr[1:9]))
+	if !strategy.KnockBucketFresh(bucket) {
+		logger.Debug("Knock bucket %d outside freshness window", bucket)
+		return false
+	}
+	nonce := append([]byte(nil), hdr[9:strategy.KnockHeaderLen]...)
 
-	// Read ALL 5 packets (peek doesn't consume, so we start from packet 0)
-	for i := 0; i < 5; i++ {
-		// Read exact packet size
-		buf := make([]byte, sizes[i])
+	if !srvCtx.knockReplay.checkAndRecord(nonce, knockReplayTTL) {
+		logger.Warn("Knock replay rejected (nonce seen inside the window)")
+		return false
+	}
+
+	seq := strategy.KnockScheduleFor(secret, nonce, bucket)
+	logger.Debug("Verifying knock sequence, packet sizes: %v", seq.Sizes)
+
+	// Packet 0 remainder: [tag:16][body0]. body0 length = size0 - header - tag.
+	rest0 := make([]byte, seq.Sizes[0]-strategy.KnockHeaderLen)
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(conn, rest0); err != nil {
+		logger.Debug("Knock packet 0 body read error: %v", err)
+		return false
+	}
+	if !hmac.Equal(rest0[:strategy.KnockTagLen], strategy.KnockTag(secret, nonce, bucket)) {
+		logger.Debug("Knock packet 0: tag mismatch")
+		return false
+	}
+	body0 := strategy.KnockBody(secret, nonce, bucket, 0, seq.Sizes[0]-strategy.KnockHeaderLen-strategy.KnockTagLen)
+	if !hmac.Equal(rest0[strategy.KnockTagLen:], body0) {
+		logger.Debug("Knock packet 0: body mismatch")
+		return false
+	}
+
+	for i := 1; i < strategy.KnockPackets; i++ {
+		buf := make([]byte, seq.Sizes[i])
 		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-		_, err := io.ReadFull(conn, buf)
-		if err != nil {
+		if _, err := io.ReadFull(conn, buf); err != nil {
 			logger.Debug("Knock packet %d read error: %v", i, err)
 			return false
 		}
-
 		if buf[0] != byte(i) {
 			logger.Debug("Knock packet %d: wrong sequence number (got %d, expected %d)", i, buf[0], i)
 			return false
 		}
-
-		// Verify packet content
-		h := hmac.New(sha256.New, secret)
-		h.Write([]byte{byte(i)})
-		expected := h.Sum(nil)
-
-		for j := 1; j < len(buf); j++ {
-			if buf[j] != expected[(j-1)%len(expected)] {
-				logger.Debug("Knock packet %d: content mismatch at byte %d", i, j)
-				return false
-			}
+		if !hmac.Equal(buf[1:], strategy.KnockBody(secret, nonce, bucket, i, seq.Sizes[i]-1)) {
+			logger.Debug("Knock packet %d: body mismatch", i)
+			return false
 		}
-
-		logger.Debug("Knock packet %d: OK (%d bytes)", i, sizes[i])
+		logger.Debug("Knock packet %d: OK (%d bytes)", i, seq.Sizes[i])
 	}
 
 	return true

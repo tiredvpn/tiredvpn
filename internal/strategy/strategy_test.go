@@ -262,32 +262,27 @@ func TestMeshRelayNodeSelection(t *testing.T) {
 	}
 }
 
-// TestAntiProbeKnockSequence tests knock sequence generation
+// TestAntiProbeKnockSequence tests per-connection knock schedule generation.
 func TestAntiProbeKnockSequence(t *testing.T) {
 	secret := []byte("test-secret")
-	strat := NewAntiProbeStrategy(NewManager(), secret)
+	nonce := make([]byte, KnockNonceLen)
+	seq := knockSchedule(secret, nonce, KnockBucketNow())
 
-	seq := generateKnockSequence(strat.knockSecret)
-
-	if len(seq.Delays) != 5 {
-		t.Errorf("Expected 5 delays, got %d", len(seq.Delays))
+	if len(seq.Delays) != KnockPackets {
+		t.Errorf("expected %d delays, got %d", KnockPackets, len(seq.Delays))
 	}
-
-	if len(seq.Sizes) != 5 {
-		t.Errorf("Expected 5 sizes, got %d", len(seq.Sizes))
+	if len(seq.Sizes) != KnockPackets {
+		t.Errorf("expected %d sizes, got %d", KnockPackets, len(seq.Sizes))
 	}
-
-	// Verify delays are in expected range (50-200ms)
 	for i, d := range seq.Delays {
-		if d < 50*time.Millisecond || d > 200*time.Millisecond {
-			t.Errorf("Delay %d out of range: %v", i, d)
+		ms := d.Milliseconds()
+		if ms < knockDelayMinMs || ms >= knockDelayMinMs+knockDelaySpanMs {
+			t.Errorf("delay %d out of range: %v", i, d)
 		}
 	}
-
-	// Verify sizes are in expected range (10-100)
 	for i, s := range seq.Sizes {
-		if s < 10 || s > 100 {
-			t.Errorf("Size %d out of range: %d", i, s)
+		if s < knockSizeMin || s >= knockSizeMin+knockSizeSpan {
+			t.Errorf("size %d out of range: %d", i, s)
 		}
 	}
 }
