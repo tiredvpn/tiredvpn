@@ -80,7 +80,7 @@ func TestWrapWithMuxReuseClosesOrphanConn(t *testing.T) {
 	carrier := m.muxConn
 
 	orphan := &closeTrackingConn{}
-	stream, err := m.wrapWithMux(orphan, mux.DefaultConfig())
+	stream, err := m.wrapWithMux(orphan, mux.DefaultConfig(), nil)
 	if err != nil {
 		t.Fatalf("wrapWithMux reuse: %v", err)
 	}

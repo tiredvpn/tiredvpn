@@ -115,6 +115,13 @@ type Manager struct {
 	emergencyReprobeStop    chan struct{}
 	lastEmergencyReprobe    time.Time
 
+	// Manager lifecycle. Background goroutines the manager spawns on its own
+	// (e.g. the emergency reprobe fired from a failed scan) hang off lifeCtx so
+	// Close cancels them instead of leaving them to run out their own budget
+	// after the manager is discarded. Set once in NewManager, never mutated.
+	lifeCtx    context.Context
+	lifeCancel context.CancelFunc
+
 	// RTT Masking
 	rttMaskingEnabled bool
 	rttProfile        *RTTProfile
@@ -124,6 +131,7 @@ type Manager struct {
 	muxConfig           *mux.Config
 	muxClient           *mux.Client
 	muxConn             net.Conn   // underlying connection for mux
+	muxStrategy         Strategy   // strategy that established the live mux carrier (under muxMu)
 	muxMu               sync.Mutex // separate mutex for mux operations
 	recyclingInProgress bool       // true while budget recycling goroutine is running (under muxMu)
 
@@ -308,9 +316,22 @@ func NewManager() *Manager {
 		tcpFailuresBeforeQUIC: 3, // Switch to QUIC after 3 TCP timeouts
 		tlsSessionCache:       tls.NewLRUClientSessionCache(64),
 	}
+	m.lifeCtx, m.lifeCancel = context.WithCancel(context.Background())
 	log.Debug("Strategy Manager created (probeTimeout=%v, connectTimeout=%v, maxRetries=%d)",
 		m.probeTimeout, m.connectTimeout, m.maxRetries)
 	return m
+}
+
+// Close tears the manager's background goroutines down: it cancels the
+// lifecycle context (stopping any manager-spawned emergency reprobe) and stops
+// the periodic reprobe and port-hop checker. Safe to call more than once.
+func (m *Manager) Close() {
+	if m.lifeCancel != nil {
+		m.lifeCancel()
+	}
+	m.StopEmergencyReprobe()
+	m.StopPeriodicReprobe()
+	m.StopPortHopChecker()
 }
 
 // Register adds a strategy to the manager
@@ -760,7 +781,7 @@ func (m *Manager) Connect(ctx context.Context, target string) (net.Conn, Strateg
 	m.muxMu.Unlock()
 
 	if muxEnabled {
-		muxConn, muxErr := m.wrapWithMux(conn, muxConfig)
+		muxConn, muxErr := m.wrapWithMux(conn, muxConfig, strategy)
 		if muxErr != nil {
 			log.Warn("Mux wrap failed, using direct connection: %v", muxErr)
 			// Fallback to direct connection without mux
@@ -1011,36 +1032,19 @@ type scanState struct {
 
 // ConnectExcluding tries strategies excluding specified ones (for fallback)
 func (m *Manager) ConnectExcluding(ctx context.Context, target string, excludeIDs []string) (net.Conn, Strategy, error) {
-	scan := &scanState{}
-
-	// First pass: try all strategies WITHOUT RTT masking
-	conn, strategy, err := m.connectWithRTTScan(ctx, target, excludeIDs, false, scan)
-	if err == nil {
-		return conn, strategy, nil
-	}
-
-	// Second pass: if RTT masking is enabled, retry all strategies WITH RTT masking
 	m.mu.RLock()
 	rttEnabled := m.rttMaskingEnabled
 	m.mu.RUnlock()
 
-	// Two cases where the second pass is pure cost. A cancelled context has
-	// nobody left to hand a connection to - on Android the service has already
-	// given up and is tearing this client down, and the log still showed a
-	// fresh 21-strategy scan starting underneath it. And RTT masking reshapes
-	// the timing of an established session; it cannot make an address that
-	// answered nothing answer, so repeating the whole scan against a silent
-	// address doubles the time before the endpoint layer hears the verdict.
-	if ctx.Err() != nil || errors.Is(err, errAddrSilent) {
-		return nil, nil, err
-	}
-
-	if rttEnabled {
-		log.Info("All strategies failed, retrying with RTT masking enabled...")
-		return m.connectWithRTTScan(ctx, target, excludeIDs, true, scan)
-	}
-
-	return nil, nil, err
+	// One scan, not two. RTT masking is a post-success wrapper (WrapWithRTTMasking
+	// on an already-connected conn); it never changes whether a strategy connects.
+	// The old code scanned once WITHOUT masking and, on total failure, scanned the
+	// whole list AGAIN with masking on - a full second round of connectTimeouts and
+	// the same DPI fingerprint, unable by construction to reach any conn the first
+	// round did not. Decide masking up front and make a single pass, so a
+	// successful connection is wrapped when masking is on and a failed scan is not
+	// paid for twice.
+	return m.connectWithRTTScan(ctx, target, excludeIDs, rttEnabled, &scanState{})
 }
 
 // connectWithRTT is the internal connect method with optional RTT masking. It
@@ -1063,15 +1067,32 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 	lastSuccessfulTime := m.lastSuccessfulTime
 	androidMode := m.androidMode
 	tcpFailuresThreshold := m.tcpFailuresBeforeQUIC
+	excludeUDP := m.excludeUDPStrategies
 	m.mu.RUnlock()
 
-	// Try last successful strategy first if it was recent (within 5 minutes).
-	// Skip it in auto-mode if it is parked for a storm - that is precisely the
-	// strategy we want to move away from. In forced mode there is no
-	// alternative, so we still use it.
-	if lastSuccessful != nil && time.Since(lastSuccessfulTime) < 5*time.Minute &&
-		(m.forced || !m.stormDetector.IsParked(lastSuccessful.ID())) {
+	// Exclusion set, built once: the fast-reconnect gate and the full scan below
+	// both consult it.
+	excludeMap := make(map[string]bool, len(excludeIDs))
+	for _, id := range excludeIDs {
+		excludeMap[id] = true
+	}
 
+	// Try last successful strategy first if it was recent (within 5 minutes), but
+	// only if it clears the same gates the full scan applies to every other
+	// candidate: not on the caller's exclusion list, not a UDP transport while UDP
+	// is blocked, not storm-parked (auto mode), and admitted by its circuit
+	// breaker. The fast path used to skip all of these and dial straight through,
+	// so a strategy the caller had just excluded, one riding a dead UDP path, or
+	// one whose circuit was open still cost a full connectTimeout on every
+	// reconnect. Forced mode keeps its single strategy regardless of parking.
+	fastEligible := lastSuccessful != nil &&
+		time.Since(lastSuccessfulTime) < 5*time.Minute &&
+		!excludeMap[lastSuccessful.ID()] &&
+		(!excludeUDP || !isUDPBasedStrategy(lastSuccessful)) &&
+		(m.forced || !m.stormDetector.IsParked(lastSuccessful.ID())) &&
+		m.circuitBreakers.CanTry(lastSuccessful.ID())
+
+	if fastEligible {
 		// Loop guard: a strategy that connects but whose tunnel dies seconds later
 		// can ride this fast path in a tight reconnect loop without ever being
 		// parked. After too many fast reconnects in a short window, fall through
@@ -1080,10 +1101,15 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 		skipFast := !m.forced && m.shouldSkipFastReconnect(lastSuccessful.ID(), time.Now())
 		m.mu.Unlock()
 
-		if skipFast {
+		switch {
+		case skipFast:
 			log.Warn("Fast reconnect via %s exceeded %d attempts within %v - forcing full strategy scan",
 				lastSuccessful.Name(), fastReconnectLimit, fastReconnectWindow)
-		} else {
+		case !m.circuitBreakers.BeginHalfOpenAttempt(lastSuccessful.ID()):
+			// Half-open slots were taken between the CanTry check and here; let the
+			// full scan decide, exactly as it would for any other strategy.
+			log.Debug("Fast reconnect via %s skipped (circuit breaker half-open slots exhausted)", lastSuccessful.Name())
+		default:
 			log.Info("Trying last successful strategy first: %s", lastSuccessful.Name())
 
 			connectCtx, cancel := context.WithTimeout(ctx, m.connectTimeout)
@@ -1093,7 +1119,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			cancel()
 
 			if err == nil {
-				// Success - update stats
+				// Success - update stats (also records the breaker success)
 				m.mu.Lock()
 				m.lastSuccessfulTime = time.Now()
 				m.consecutiveTCPTimeouts = 0 // Reset TCP timeout counter on success
@@ -1111,19 +1137,24 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 				log.Info("Fast reconnect via %s (latency=%v)", lastSuccessful.Name(), latency)
 				return conn, lastSuccessful, nil
 			}
+
+			// Record the failure so a fast reconnect that keeps failing feeds the
+			// breaker and confidence stats instead of looping invisibly past them.
+			// Mirror the scan: one record per attempt, timeout counted as timeout.
+			m.mu.Lock()
+			m.updateConfidenceStats(lastSuccessful.ID(), false, 0)
+			if isTimeoutError(err) {
+				m.circuitBreakers.RecordTimeout(lastSuccessful.ID())
+			} else {
+				m.circuitBreakers.RecordFailure(lastSuccessful.ID())
+			}
+			m.mu.Unlock()
 			log.Debug("Last successful strategy failed: %v, falling back to full strategy list", err)
 		}
 	}
 
 	m.mu.RLock()
 	// Filter out disabled strategies (priority <= 0) and excluded strategies
-	excludeMap := make(map[string]bool)
-	for _, id := range excludeIDs {
-		excludeMap[id] = true
-	}
-
-	excludeUDP := m.excludeUDPStrategies
-
 	var strategies []Strategy
 	var quicStrategies []Strategy // Collect QUIC strategies separately for fast fallback
 
@@ -1387,8 +1418,10 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 
 	log.Error("All %d strategies failed after %d attempts%s", len(strategies), attemptCount, modeStr)
 
-	// Trigger emergency reprobe to recover from network outage
-	go m.TriggerEmergencyReprobe(context.Background())
+	// Trigger emergency reprobe to recover from network outage. Hang it off the
+	// manager lifecycle context, not context.Background(), so Close stops it
+	// instead of leaving it to run out its own attempt budget after teardown.
+	go m.TriggerEmergencyReprobe(m.lifeCtx)
 
 	return nil, nil, fmt.Errorf("%w, last error: %w", errStrategyScanFailed, lastErr)
 }
@@ -2185,11 +2218,11 @@ func (m *Manager) tryMuxFastPath() (net.Conn, Strategy, bool) {
 		return nil, nil, false
 	}
 	active := m.muxClient.NumStreams()
+	// Report the strategy bound to this carrier, not m.lastSuccessfulStrategy:
+	// storm parking clears the latter out from under a live session, and the
+	// caller (pool.go) dereferences the returned strategy.
+	strat := m.muxStrategy
 	m.muxMu.Unlock()
-
-	m.mu.RLock()
-	strat := m.lastSuccessfulStrategy
-	m.mu.RUnlock()
 
 	log.Debug("Mux fast-path: stream on existing session, no new dial (active=%d)", active)
 	return stream, strat, true
@@ -2197,7 +2230,7 @@ func (m *Manager) tryMuxFastPath() (net.Conn, Strategy, bool) {
 
 // wrapWithMux wraps a connection with mux layer and opens a stream
 // If an existing mux session is available and not closed, reuse it
-func (m *Manager) wrapWithMux(conn net.Conn, config *mux.Config) (net.Conn, error) {
+func (m *Manager) wrapWithMux(conn net.Conn, config *mux.Config, strat Strategy) (net.Conn, error) {
 	m.muxMu.Lock()
 	defer m.muxMu.Unlock()
 
@@ -2244,6 +2277,7 @@ func (m *Manager) wrapWithMux(conn net.Conn, config *mux.Config) (net.Conn, erro
 
 	m.muxClient = client
 	m.muxConn = conn
+	m.muxStrategy = strat
 
 	// Open first stream
 	stream, err := client.OpenStream()
@@ -2283,6 +2317,7 @@ func (m *Manager) CloseMuxSession() {
 		m.muxConn.Close()
 		m.muxConn = nil
 	}
+	m.muxStrategy = nil
 	log.Debug("Mux session closed")
 }
 
@@ -2367,7 +2402,8 @@ func (m *Manager) TriggerEmergencyReprobe(ctx context.Context) {
 
 	m.emergencyReprobeRunning = true
 	m.lastEmergencyReprobe = time.Now()
-	m.emergencyReprobeStop = make(chan struct{})
+	stopCh := make(chan struct{})
+	m.emergencyReprobeStop = stopCh
 	m.mu.Unlock()
 
 	log.Warn("EMERGENCY REPROBE: All strategies failed, entering aggressive recovery mode")
@@ -2375,7 +2411,14 @@ func (m *Manager) TriggerEmergencyReprobe(ctx context.Context) {
 	go func() {
 		defer func() {
 			m.mu.Lock()
-			m.emergencyReprobeRunning = false
+			// Clear the running state only if this goroutine still owns the
+			// current stop channel. A StopEmergencyReprobe / ResetForNetworkChange
+			// (or a later Trigger) may have already replaced or nilled it, and
+			// clobbering their state would resurrect a stopped reprobe.
+			if m.emergencyReprobeStop == stopCh {
+				m.emergencyReprobeRunning = false
+				m.emergencyReprobeStop = nil
+			}
 			m.mu.Unlock()
 			log.Info("Emergency reprobe stopped")
 		}()
@@ -2390,7 +2433,7 @@ func (m *Manager) TriggerEmergencyReprobe(ctx context.Context) {
 			select {
 			case <-ctx.Done():
 				return
-			case <-m.emergencyReprobeStop:
+			case <-stopCh:
 				return
 			case <-ticker.C:
 				attempt++
@@ -2447,8 +2490,13 @@ func (m *Manager) StopEmergencyReprobe() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if m.emergencyReprobeRunning && m.emergencyReprobeStop != nil {
+	// Key on the channel, not emergencyReprobeRunning: nil it out after closing
+	// so a second Stop, or a ResetForNetworkChange right after, is a no-op rather
+	// than a close-of-closed-channel panic. Mirrors StopPortHopChecker.
+	if m.emergencyReprobeStop != nil {
 		close(m.emergencyReprobeStop)
+		m.emergencyReprobeStop = nil
+		m.emergencyReprobeRunning = false
 	}
 }
 
@@ -2483,9 +2531,12 @@ func (m *Manager) ResetForNetworkChange() {
 	// Storm state is tied to the old network - clear it after a network change.
 	m.stormDetector.Reset()
 
-	// Stop any running emergency reprobe
-	if m.emergencyReprobeRunning && m.emergencyReprobeStop != nil {
+	// Stop any running emergency reprobe. Nil the channel after closing so a
+	// StopEmergencyReprobe that already fired (or a second network change) does
+	// not close it twice and panic.
+	if m.emergencyReprobeStop != nil {
 		close(m.emergencyReprobeStop)
+		m.emergencyReprobeStop = nil
 		m.emergencyReprobeRunning = false
 	}
 
@@ -2653,7 +2704,7 @@ func (m *Manager) replacePort(target string, newPort int) string {
 		// Target may not have a port, just return as-is
 		return target
 	}
-	return fmt.Sprintf("%s:%d", host, newPort)
+	return net.JoinHostPort(host, strconv.Itoa(newPort))
 }
 
 // triggerReconnect is called when port hopping changes the port
@@ -2703,7 +2754,7 @@ func (m *Manager) performMakeBeforeBreak(newPort int) {
 	if err != nil {
 		host = target
 	}
-	newTarget := fmt.Sprintf("%s:%d", host, newPort)
+	newTarget := net.JoinHostPort(host, strconv.Itoa(newPort))
 
 	log.Debug("Port hop: establishing new connection to %s (make before break)", newTarget)
 
@@ -2753,6 +2804,7 @@ func (m *Manager) performMakeBeforeBreak(newPort int) {
 	// Atomic swap: new connection is ready
 	m.muxClient = newClient
 	m.muxConn = conn
+	m.muxStrategy = lastStrategy
 	m.muxMu.Unlock()
 
 	// Now close old connection (traffic already switched to new one)
@@ -2838,6 +2890,7 @@ func (m *Manager) performBudgetRecycling() {
 	oldConn := m.muxConn
 	m.muxClient = newClient
 	m.muxConn = conn
+	m.muxStrategy = lastStrategy
 	m.muxMu.Unlock()
 
 	log.Info("Budget recycling: carrier swapped, draining old session")
