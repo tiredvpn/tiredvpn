@@ -2,6 +2,8 @@ package strategy
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -11,6 +13,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 )
 
 // MeshRelayStrategy routes traffic through intermediate relays inside Russia
@@ -221,8 +225,18 @@ func (s *MeshRelayStrategy) connectToRelay(ctx context.Context, relay *RelayNode
 		return nil, err
 	}
 
+	// Bind the relay auth to this TLS session: a proof lifted from one session
+	// is worthless on another, which matters because the relay uses a
+	// self-signed cert (InsecureSkipVerify), so the certificate proves nothing.
+	state := tlsConn.ConnectionState()
+	ekm, err := customtls.ExportBindingKey(&state)
+	if err != nil {
+		tlsConn.Close()
+		return nil, fmt.Errorf("mesh relay: export keying material: %w", err)
+	}
+
 	// Authenticate with relay
-	if err := s.authenticateRelay(tlsConn, relay); err != nil {
+	if err := s.authenticateRelay(tlsConn, relay, ekm); err != nil {
 		tlsConn.Close()
 		return nil, err
 	}
@@ -230,29 +244,63 @@ func (s *MeshRelayStrategy) connectToRelay(ctx context.Context, relay *RelayNode
 	return tlsConn, nil
 }
 
-// authenticateRelay performs authentication with relay
-func (s *MeshRelayStrategy) authenticateRelay(conn net.Conn, relay *RelayNode) error {
-	// Simple HMAC-based auth
-	auth := MeshAuthRequest{
-		Secret:    relay.Secret,
-		Timestamp: time.Now().Unix(),
+// Mesh relay challenge-response constants. The v1 auth put the shared secret in
+// a JSON body on the wire, so anyone who could read one handshake (the relay
+// operator, a compromised relay, a passive tap that broke the self-signed TLS)
+// learned the secret verbatim and could reuse it forever. v2 keeps the secret
+// off the wire: the relay sends a fresh challenge, the client answers with an
+// HMAC over the challenge and the TLS-session exporter, and the relay recomputes
+// and compares it.
+const (
+	meshChallengeLen = 32
+	meshProofLen     = 32
+	meshAuthLabel    = "tiredvpn-mesh-relay-auth"
+)
+
+// MeshRelayProof is the client's answer to a relay challenge: HMAC over the
+// challenge and the TLS-session exporter, keyed by the shared secret. Exported
+// so the relay server (out of this repo) and the tests recompute it the same
+// way.
+func MeshRelayProof(secret string, challenge, ekm []byte) [meshProofLen]byte {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(meshAuthLabel))
+	mac.Write(challenge)
+	mac.Write(ekm)
+	var out [meshProofLen]byte
+	copy(out[:], mac.Sum(nil))
+	return out
+}
+
+// authenticateRelay proves knowledge of the relay secret without sending it.
+func (s *MeshRelayStrategy) authenticateRelay(conn net.Conn, relay *RelayNode, ekm []byte) error {
+	// A relay with no secret is a misconfiguration, not a default: refuse rather
+	// than authenticate against "". This is the single choke point every relay
+	// dial passes through, so it covers relays added by AddRelay, AddRelays and
+	// LoadRelaysFromConfig alike.
+	if relay.Secret == "" {
+		return errors.New("mesh relay: empty secret, refusing to authenticate")
 	}
 
-	data, _ := json.Marshal(auth)
-	_, err := conn.Write(append([]byte{byte(len(data))}, data...))
-	if err != nil {
-		return err
+	// The relay speaks first with a fresh challenge.
+	challenge := make([]byte, meshChallengeLen)
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if _, err := io.ReadFull(conn, challenge); err != nil {
+		return fmt.Errorf("mesh relay: read challenge: %w", err)
+	}
+	conn.SetReadDeadline(time.Time{})
+
+	// Answer with the keyed proof; the secret itself never leaves this process.
+	proof := MeshRelayProof(relay.Secret, challenge, ekm)
+	if _, err := conn.Write(proof[:]); err != nil {
+		return fmt.Errorf("mesh relay: write proof: %w", err)
 	}
 
-	// Read response
 	resp := make([]byte, 1)
-	_, err = conn.Read(resp)
-	if err != nil {
-		return err
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		return fmt.Errorf("mesh relay: read auth response: %w", err)
 	}
-
 	if resp[0] != 0x01 {
-		return errors.New("authentication failed")
+		return errors.New("mesh relay: authentication failed")
 	}
 
 	return nil
@@ -323,14 +371,23 @@ func (s *MeshRelayStrategy) checkRelayHealth() {
 			start := time.Now()
 			conn, err := net.DialTimeout("tcp", r.Address, 5*time.Second)
 			if err != nil {
+				// Mutate the relay's fields under the same lock selectBestRelay
+				// and Probe read them with; without it these writes race the
+				// selector (caught by -race in TestMeshHealthCheckNoRace).
+				s.mu.Lock()
 				r.Available = false
+				s.mu.Unlock()
 				return
 			}
 			conn.Close()
 
-			r.Latency = time.Since(start)
+			latency := time.Since(start)
+			now := time.Now()
+			s.mu.Lock()
+			r.Latency = latency
 			r.Available = true
-			r.LastCheck = time.Now()
+			r.LastCheck = now
+			s.mu.Unlock()
 		}(relay)
 	}
 	wg.Wait()
@@ -346,12 +403,6 @@ type MeshConn struct {
 // RelayInfo returns info about the relay being used
 func (mc *MeshConn) RelayInfo() *RelayNode {
 	return mc.relay
-}
-
-// MeshAuthRequest is sent to authenticate with relay
-type MeshAuthRequest struct {
-	Secret    string `json:"secret"`
-	Timestamp int64  `json:"ts"`
 }
 
 // MeshConnectRequest asks relay to connect to target
@@ -383,7 +434,11 @@ func (s *MeshRelayStrategy) LoadRelaysFromConfig(data []byte) error {
 	return nil
 }
 
-// ExampleRelayConfig returns example relay configuration
+// ExampleRelayConfig returns example relay configuration. The Secret fields are
+// left empty on purpose: there is no shipped default. A relay dialed with an
+// empty secret is refused at authenticateRelay, so a config copied from this
+// example fails loudly until the operator fills in a real per-relay secret,
+// rather than silently authenticating against a well-known placeholder.
 func ExampleRelayConfig() string {
 	relays := []*RelayNode{
 		{
@@ -391,14 +446,14 @@ func ExampleRelayConfig() string {
 			Location:  "RU-Moscow-Home",
 			Type:      RelayTypeHome,
 			Available: true,
-			Secret:    "change-me-secret-1",
+			Secret:    "",
 		},
 		{
 			Address:   "10.0.0.5:443",
 			Location:  "RU-SPB-Friend",
 			Type:      RelayTypeFriend,
 			Available: true,
-			Secret:    "change-me-secret-2",
+			Secret:    "",
 		},
 	}
 
