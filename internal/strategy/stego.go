@@ -21,6 +21,7 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/protect"
 	"github.com/tiredvpn/tiredvpn/internal/protocol"
+	"golang.org/x/crypto/hkdf"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 )
@@ -747,6 +748,152 @@ func (sc *HTTP2StegoConn) writeViaHeaders(data []byte) (int, error) {
 	return offset, nil
 }
 
+// The stego DATA-frame marker, version 2.
+//
+// v1 opened every covert DATA frame with the ASCII literal "TIRD". A literal at
+// offset 0 of every DATA payload is a constant that anything seeing the HTTP/2
+// framing (our own server, a TLS-terminating middlebox, a CDN we tunnel
+// through) reads without decrypting a session key. Real gRPC - which this is
+// dressed as - opens with a 1-byte compressed flag and a 4-byte length, not a
+// four-byte tag repeated on every frame.
+//
+// v2 replaces the literal with [nonce][marker] where marker is HKDF(secret,
+// nonce) of a length ALSO derived from (secret, nonce). The reader holds the one
+// authenticated secret for the connection and always has the full DATA-frame
+// payload in hand (the framer delivers a whole frame), so it recomputes the
+// marker and checks the prefix; a foreign or cover DATA frame simply fails the
+// match and is dropped, exactly as a non-"TIRD" frame was dropped before. The
+// nonce is fresh per frame, so no two frames - and no two connections - open
+// with the same bytes.
+//
+// There is no transitional mode. A 1.10.x client opens with "TIRD", the frame
+// fails the marker check, and its payload is dropped.
+const (
+	// stegoNonceLen is the per-frame nonce prefix. 8 bytes keeps the per-frame
+	// overhead small while making a repeated opening prefix astronomically
+	// unlikely.
+	stegoNonceLen = 8
+
+	// stegoMarkerMinLen / stegoMarkerSpan bound the marker length. The length is
+	// derived from (secret, nonce), so it is not a field on the wire; the marker
+	// is flat over [8,24). Like the confusion marker, there is no measured
+	// population of "real" opaque-body lengths to check that shape against - the
+	// marker sits inside an HTTP/2 DATA payload that also carries our own cover
+	// padding - so the answer to "what distribution is this checked against" is
+	// "nothing", recorded here on purpose (verification rule 3).
+	stegoMarkerMinLen = 8
+	stegoMarkerSpan   = 16
+
+	stegoC2SMarkerLabel = "tiredvpn-stego-c2s-marker-v2"
+	stegoS2CMarkerLabel = "tiredvpn-stego-s2c-marker-v2"
+)
+
+// stegoMarker derives the variable-length keyed marker for one direction from
+// the secret and a per-frame nonce.
+func stegoMarker(secret, nonce []byte, label string) []byte {
+	if len(secret) == 0 {
+		return nil
+	}
+	r := hkdf.New(sha256.New, secret, nonce, []byte(label))
+	var lenByte [1]byte
+	if _, err := io.ReadFull(r, lenByte[:]); err != nil {
+		return nil
+	}
+	markerLen := stegoMarkerMinLen + int(lenByte[0])%stegoMarkerSpan
+	out := make([]byte, markerLen)
+	if _, err := io.ReadFull(r, out); err != nil {
+		return nil
+	}
+	return out
+}
+
+// stegoFrameHeader returns a fresh [nonce][marker] prefix for one direction.
+func stegoFrameHeader(secret []byte, label string) ([]byte, error) {
+	if len(secret) == 0 {
+		return nil, errors.New("stego: empty secret")
+	}
+	var nonce [stegoNonceLen]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return nil, err
+	}
+	marker := stegoMarker(secret, nonce[:], label)
+	if marker == nil {
+		return nil, errors.New("stego: marker derivation failed")
+	}
+	hdr := make([]byte, 0, stegoNonceLen+len(marker))
+	hdr = append(hdr, nonce[:]...)
+	hdr = append(hdr, marker...)
+	return hdr, nil
+}
+
+// matchStegoFrame checks the keyed prefix of a DATA-frame payload for one
+// direction and returns the offset past [nonce][marker]. It returns the offset
+// rather than taking a length because the marker length is itself derived from
+// the secret: a peer without the secret cannot say where the marker ends.
+func matchStegoFrame(secret, data []byte, label string) (int, bool) {
+	if len(secret) == 0 || len(data) < stegoNonceLen+stegoMarkerMinLen {
+		return 0, false
+	}
+	nonce := data[:stegoNonceLen]
+	want := stegoMarker(secret, nonce, label)
+	if len(want) == 0 {
+		return 0, false
+	}
+	off := stegoNonceLen + len(want)
+	if len(data) < off {
+		return 0, false
+	}
+	if !hmac.Equal(data[stegoNonceLen:off], want) {
+		return 0, false
+	}
+	return off, true
+}
+
+// StegoNonceLen is the per-frame nonce prefix length, exported so the server's
+// manual DATA-frame path and the wire tests can locate the nonce.
+const StegoNonceLen = stegoNonceLen
+
+// StegoClientMarker recomputes the client->server (c2s) marker for a captured
+// nonce. Exported for the wire-signature tests that pin the length distribution.
+func StegoClientMarker(secret, nonce []byte) []byte {
+	return stegoMarker(secret, nonce, stegoC2SMarkerLabel)
+}
+
+// StegoServerMarker recomputes the server->client (s2c) marker for a nonce.
+func StegoServerMarker(secret, nonce []byte) []byte {
+	return stegoMarker(secret, nonce, stegoS2CMarkerLabel)
+}
+
+// BuildStegoServerFrameHeader returns a fresh server->client [nonce][marker]
+// prefix. The server's manual HTTP/2 path (which does not use HTTP2StegoConn)
+// calls this so its frames carry the same keyed marker a client expects.
+func BuildStegoServerFrameHeader(secret []byte) ([]byte, error) {
+	return stegoFrameHeader(secret, stegoS2CMarkerLabel)
+}
+
+// MatchStegoClientFrame checks the keyed prefix of a client->server DATA-frame
+// payload and returns the offset past [nonce][marker]. Used by the server's
+// manual HTTP/2 path to recognise an authenticated client's covert frames.
+func MatchStegoClientFrame(secret, data []byte) (int, bool) {
+	return matchStegoFrame(secret, data, stegoC2SMarkerLabel)
+}
+
+// writeMarkerLabel / readMarkerLabel pick the direction label so a client keys
+// its outbound frames c2s and reads inbound s2c, and a server does the reverse.
+func (sc *HTTP2StegoConn) writeMarkerLabel() string {
+	if sc.isClient {
+		return stegoC2SMarkerLabel
+	}
+	return stegoS2CMarkerLabel
+}
+
+func (sc *HTTP2StegoConn) readMarkerLabel() string {
+	if sc.isClient {
+		return stegoS2CMarkerLabel
+	}
+	return stegoC2SMarkerLabel
+}
+
 // writeViaPaddedData sends data in DATA frames with cover traffic
 func (sc *HTTP2StegoConn) writeViaPaddedData(data []byte) (int, error) {
 	var streamID uint32
@@ -773,18 +920,23 @@ func (sc *HTTP2StegoConn) writeViaPaddedData(data []byte) (int, error) {
 		obfuscated[i] = data[i] ^ sc.paddingKey[i%len(sc.paddingKey)]
 	}
 
-	// Create frame: [Magic:4][Flags:1][Length:2][ObfuscatedData:N][NaivePadding:M]
+	// Create frame: [nonce][marker][Flags:1][Length:2][ObfuscatedData:N][NaivePadding:M]
 	coverLen := sc.calculateNaivePadding(chunkSize)
 	if coverLen < 10 {
 		coverLen = 10 // Minimum padding
 	}
-	frame := make([]byte, 7+chunkSize+coverLen)
+	hdr, err := stegoFrameHeader(sc.secret, sc.writeMarkerLabel())
+	if err != nil {
+		return 0, err
+	}
+	h := len(hdr)
+	frame := make([]byte, h+3+chunkSize+coverLen)
 
-	copy(frame[0:4], []byte("TIRD"))                          // Magic
-	frame[4] = 0x01                                           // Flag: obfuscated
-	binary.BigEndian.PutUint16(frame[5:7], uint16(chunkSize)) // Length
-	copy(frame[7:7+chunkSize], obfuscated)                    // Obfuscated data
-	rand.Read(frame[7+chunkSize:])                            // Cover data
+	copy(frame[0:h], hdr)                                         // Keyed marker
+	frame[h] = 0x01                                               // Flag: obfuscated
+	binary.BigEndian.PutUint16(frame[h+1:h+3], uint16(chunkSize)) // Length
+	copy(frame[h+3:h+3+chunkSize], obfuscated)                    // Obfuscated data
+	rand.Read(frame[h+3+chunkSize:])                              // Cover data
 
 	if err := sc.framer.WriteData(streamID, false, frame); err != nil {
 		return 0, err
@@ -812,17 +964,22 @@ func (sc *HTTP2StegoConn) writeViaData(data []byte) (int, error) {
 
 	chunkSize := minInt(len(data), 1400)
 
-	// Create framed data: [Magic:4][Flags:1][Length:2][Data:N][NaivePadding:M]
+	// Create framed data: [nonce][marker][Flags:1][Length:2][Data:N][NaivePadding:M]
 	coverLen := sc.calculateNaivePadding(chunkSize)
 	if coverLen < 10 {
 		coverLen = 10 // Minimum padding
 	}
-	frame := make([]byte, 7+chunkSize+coverLen)
-	copy(frame[0:4], []byte("TIRD"))                          // Magic
-	frame[4] = 0x00                                           // Flag: raw
-	binary.BigEndian.PutUint16(frame[5:7], uint16(chunkSize)) // Length
-	copy(frame[7:7+chunkSize], data[:chunkSize])
-	rand.Read(frame[7+chunkSize:])
+	hdr, err := stegoFrameHeader(sc.secret, sc.writeMarkerLabel())
+	if err != nil {
+		return 0, err
+	}
+	h := len(hdr)
+	frame := make([]byte, h+3+chunkSize+coverLen)
+	copy(frame[0:h], hdr)                                         // Keyed marker
+	frame[h] = 0x00                                               // Flag: raw
+	binary.BigEndian.PutUint16(frame[h+1:h+3], uint16(chunkSize)) // Length
+	copy(frame[h+3:h+3+chunkSize], data[:chunkSize])
+	rand.Read(frame[h+3+chunkSize:])
 
 	if err := sc.framer.WriteData(streamID, false, frame); err != nil {
 		return 0, err
@@ -848,13 +1005,18 @@ func (sc *HTTP2StegoConn) writeViaDataFast(data []byte) (int, error) {
 	// This allows small responses to be sent immediately
 	chunkSize := len(data)
 
-	// Minimal framing: [Magic:4][Flags:1][Length:2][Data:N]
-	// No padding in fast mode - prioritize latency
-	frame := make([]byte, 7+chunkSize)
-	copy(frame[0:4], []byte("TIRD"))                          // Magic
-	frame[4] = 0x00                                           // Flag: raw
-	binary.BigEndian.PutUint16(frame[5:7], uint16(chunkSize)) // Length
-	copy(frame[7:], data[:chunkSize])
+	// Minimal framing: [nonce][marker][Flags:1][Length:2][Data:N]
+	// No cover padding in fast mode - prioritize latency
+	hdr, err := stegoFrameHeader(sc.secret, sc.writeMarkerLabel())
+	if err != nil {
+		return 0, err
+	}
+	h := len(hdr)
+	frame := make([]byte, h+3+chunkSize)
+	copy(frame[0:h], hdr)                                         // Keyed marker
+	frame[h] = 0x00                                               // Flag: raw
+	binary.BigEndian.PutUint16(frame[h+1:h+3], uint16(chunkSize)) // Length
+	copy(frame[h+3:], data[:chunkSize])
 
 	if err := sc.framer.WriteData(streamID, false, frame); err != nil {
 		return 0, err
@@ -951,28 +1113,28 @@ func (sc *HTTP2StegoConn) extractCovertData(frame http2.Frame) []byte {
 func (sc *HTTP2StegoConn) extractFromData(f *http2.DataFrame) []byte {
 	data := f.Data()
 
-	// Check for magic header
-	if len(data) >= 7 && bytes.Equal(data[0:4], []byte("TIRD")) {
-		flags := data[4]
-		length := binary.BigEndian.Uint16(data[5:7])
+	// Check for the keyed marker at the head of the payload.
+	off, ok := matchStegoFrame(sc.secret, data, sc.readMarkerLabel())
+	if !ok || len(data) < off+3 {
+		return nil
+	}
+	flags := data[off]
+	length := int(binary.BigEndian.Uint16(data[off+1 : off+3]))
+	if length > len(data)-off-3 {
+		return nil
+	}
+	payload := data[off+3 : off+3+length]
 
-		if int(length) <= len(data)-7 {
-			payload := data[7 : 7+length]
-
-			// De-obfuscate if needed
-			if flags&0x01 != 0 {
-				deobfuscated := make([]byte, len(payload))
-				for i := range payload {
-					deobfuscated[i] = payload[i] ^ sc.paddingKey[i%len(sc.paddingKey)]
-				}
-				return deobfuscated
-			}
-
-			return payload
+	// De-obfuscate if needed
+	if flags&0x01 != 0 {
+		deobfuscated := make([]byte, len(payload))
+		for i := range payload {
+			deobfuscated[i] = payload[i] ^ sc.paddingKey[i%len(sc.paddingKey)]
 		}
+		return deobfuscated
 	}
 
-	return nil
+	return payload
 }
 
 // extractFromHeaders extracts data from custom headers

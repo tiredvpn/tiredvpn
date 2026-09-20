@@ -1528,6 +1528,7 @@ func handleHTTP2WithALPN(conn net.Conn, srvCtx *serverContext, logger *log.Logge
 	hpackDec := hpack.NewDecoder(4096, nil)
 	authenticated := false
 	var authClientID clientIdentity
+	var authSecret []byte
 	var tunnel *h2TunnelState
 	var connTracked bool
 
@@ -1543,7 +1544,7 @@ func handleHTTP2WithALPN(conn net.Conn, srvCtx *serverContext, logger *log.Logge
 
 	defer func() { cleanupH2Conn(conn, srvCtx, &tunnel, &connTracked, &authClientID) }()
 
-	runH2FrameLoop(&conn, &framer, hpackDec, srvCtx, logger, &authenticated, &authClientID, &connTracked, &tunnel, nil)
+	runH2FrameLoop(&conn, &framer, hpackDec, srvCtx, logger, &authenticated, &authClientID, &authSecret, &connTracked, &tunnel, nil)
 }
 
 // handleMorphConnectionWithALPN handles Morph protocol when ALPN was used
@@ -1559,6 +1560,7 @@ type h2TunnelState struct {
 	targetConn      net.Conn
 	streamID        uint32
 	clientID        clientIdentity // Client identity for IP pool allocation
+	secret          []byte         // Authenticated client secret, keys the stego markers
 	remoteAddr      string         // Peer host, used to qualify the IP-pool lease key
 	mu              sync.Mutex
 	sharedTUNWriter *ClientWriter // For shared TUN mode
@@ -1590,11 +1592,12 @@ func handleHTTP2(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
 
 	authenticated := false
 	var authClientID clientIdentity
+	var authSecret []byte
 	var tunnel *h2TunnelState
 	var connTracked bool
 	defer cleanupH2Conn(conn, srvCtx, &tunnel, &connTracked, &authClientID)
 
-	runH2FrameLoop(&conn, &framer, hpackDec, srvCtx, logger, &authenticated, &authClientID, &connTracked, &tunnel, nil)
+	runH2FrameLoop(&conn, &framer, hpackDec, srvCtx, logger, &authenticated, &authClientID, &authSecret, &connTracked, &tunnel, nil)
 }
 
 // initH2Framer reads the HTTP/2 preface, creates a framer and sends server SETTINGS.
@@ -1634,8 +1637,7 @@ func cleanupH2Conn(conn net.Conn, srvCtx *serverContext, tunnel **h2TunnelState,
 // (legacy non-ALPN path), in which case no kTLS upgrade happens. When set, it
 // is invoked exactly once — immediately after auth succeeds — and returns the
 // connection and framer to use for the subsequent relay phase.
-func runH2FrameLoop(connPtr *net.Conn, framerPtr **http2.Framer, hpackDec *hpack.Decoder, srvCtx *serverContext, logger *log.Logger, authenticated *bool, authClientID *clientIdentity, connTracked *bool, tunnel **h2TunnelState, handover func(net.Conn) (net.Conn, *http2.Framer)) {
-	cfg := srvCtx.cfg
+func runH2FrameLoop(connPtr *net.Conn, framerPtr **http2.Framer, hpackDec *hpack.Decoder, srvCtx *serverContext, logger *log.Logger, authenticated *bool, authClientID *clientIdentity, authSecret *[]byte, connTracked *bool, tunnel **h2TunnelState, handover func(net.Conn) (net.Conn, *http2.Framer)) {
 	for {
 		conn := *connPtr
 		framer := *framerPtr
@@ -1657,7 +1659,7 @@ func runH2FrameLoop(connPtr *net.Conn, framerPtr **http2.Framer, hpackDec *hpack
 			}
 		case *http2.HeadersFrame:
 			wasAuthed := *authenticated
-			processH2HeadersFrame(conn, f, framer, hpackDec, srvCtx, logger, authenticated, authClientID, connTracked)
+			processH2HeadersFrame(conn, f, framer, hpackDec, srvCtx, logger, authenticated, authClientID, authSecret, connTracked)
 			// Auth just succeeded on this frame: perform the kTLS handover
 			// now, before reading any further frames. The auth ack has been
 			// written through the TLS stack and flushed; the client is parked
@@ -1672,7 +1674,7 @@ func runH2FrameLoop(connPtr *net.Conn, framerPtr **http2.Framer, hpackDec *hpack
 				logger.Debug("Received DATA before auth, ignoring")
 				continue
 			}
-			handleH2DataFrame(conn, f, framer, cfg, srvCtx, *tunnel, *authClientID, logger, tunnel)
+			handleH2DataFrame(conn, f, framer, srvCtx, *tunnel, *authClientID, *authSecret, logger, tunnel)
 		case *http2.WindowUpdateFrame:
 			// Ignore
 		case *http2.PingFrame:
@@ -1682,7 +1684,7 @@ func runH2FrameLoop(connPtr *net.Conn, framerPtr **http2.Framer, hpackDec *hpack
 }
 
 // processH2HeadersFrame extracts auth headers and, if valid, marks the connection authenticated.
-func processH2HeadersFrame(conn net.Conn, f *http2.HeadersFrame, framer *http2.Framer, hpackDec *hpack.Decoder, srvCtx *serverContext, logger *log.Logger, authenticated *bool, authClientID *clientIdentity, connTracked *bool) {
+func processH2HeadersFrame(conn net.Conn, f *http2.HeadersFrame, framer *http2.Framer, hpackDec *hpack.Decoder, srvCtx *serverContext, logger *log.Logger, authenticated *bool, authClientID *clientIdentity, authSecret *[]byte, connTracked *bool) {
 	var apiKey, requestID string
 	hpackDec.SetEmitFunc(func(hf hpack.HeaderField) {
 		logger.Debug("  Header: %s = %s", hf.Name, truncate(hf.Value, 50))
@@ -1707,6 +1709,7 @@ func processH2HeadersFrame(conn net.Conn, f *http2.HeadersFrame, framer *http2.F
 
 	*authenticated = true
 	*authClientID = clientID
+	*authSecret = secret
 	sendH2AuthAck(framer, f.StreamID, secret)
 
 	if !*connTracked && srvCtx.registry != nil && clientID.id != "" {
@@ -1737,25 +1740,28 @@ func verifyH2AuthMulti(srvCtx *serverContext, apiKey, requestID string, logger *
 }
 
 // handleH2DataFrame processes an authenticated HTTP/2 DATA frame.
-func handleH2DataFrame(conn net.Conn, f *http2.DataFrame, framer *http2.Framer, cfg *Config, srvCtx *serverContext, _ *h2TunnelState, authClientID clientIdentity, logger *log.Logger, tunnelPtr **h2TunnelState) {
+func handleH2DataFrame(conn net.Conn, f *http2.DataFrame, framer *http2.Framer, srvCtx *serverContext, _ *h2TunnelState, authClientID clientIdentity, authSecret []byte, logger *log.Logger, tunnelPtr **h2TunnelState) {
 	data := f.Data()
 	logger.Debug("Received DATA: %d bytes", len(data))
 
-	if len(data) < 7 || !bytes.Equal(data[0:4], []byte("TIRD")) {
+	// Keyed marker keeps the frame recognisable only to a peer holding the
+	// authenticated secret; a 1.10.x client's literal "TIRD" fails here.
+	off, ok := strategy.MatchStegoClientFrame(authSecret, data)
+	if !ok || len(data) < off+3 {
 		return
 	}
 
-	flags := data[4]
-	length := binary.BigEndian.Uint16(data[5:7])
+	flags := data[off]
+	length := int(binary.BigEndian.Uint16(data[off+1 : off+3]))
 	logger.Debug("Stego frame: flags=%02x, length=%d", flags, length)
 
-	if int(length) > len(data)-7 {
+	if length > len(data)-off-3 {
 		return
 	}
 
-	payload := data[7 : 7+length]
+	payload := data[off+3 : off+3+length]
 	if flags&0x01 != 0 {
-		paddingKey := deriveKey(cfg.Secret, "padding-key")
+		paddingKey := deriveKey(authSecret, "padding-key")
 		for i := range payload {
 			payload[i] ^= paddingKey[i%len(paddingKey)]
 		}
@@ -1764,7 +1770,7 @@ func handleH2DataFrame(conn net.Conn, f *http2.DataFrame, framer *http2.Framer, 
 
 	tunnel := *tunnelPtr
 	if tunnel == nil {
-		t := &h2TunnelState{streamID: f.StreamID, clientID: authClientID, remoteAddr: originOf(conn.RemoteAddr())}
+		t := &h2TunnelState{streamID: f.StreamID, clientID: authClientID, secret: authSecret, remoteAddr: originOf(conn.RemoteAddr())}
 		setupH2Tunnel(t, framer, payload, srvCtx, logger)
 		*tunnelPtr = t
 		return
@@ -1810,7 +1816,7 @@ func forwardH2TUNPacket(tunnel *h2TunnelState, streamID uint32, payload []byte, 
 						binary.BigEndian.PutUint32(frame[:4], uint32(len(reply)))
 						copy(frame[4:], reply)
 						tunnel.mu.Lock()
-						sendStegoResponse(h2c.framer, tunnel.streamID, frame, h2c.cfg)
+						sendStegoResponse(h2c.framer, tunnel.streamID, frame, h2c.secret)
 						tunnel.mu.Unlock()
 						logger.Debug("Auto-MTU: H2 echoed PROBE_REPLY size=%d", len(reply))
 					}
@@ -1832,7 +1838,7 @@ func forwardH2TUNPacket(tunnel *h2TunnelState, streamID uint32, payload []byte, 
 			if h2c, ok := tunnel.targetConn.(*h2TunConn); ok {
 				logger.Debug("H2 TUN: received keepalive, echoing back")
 				tunnel.mu.Lock()
-				sendStegoResponse(h2c.framer, tunnel.streamID, []byte{0, 0, 0, 0}, h2c.cfg)
+				sendStegoResponse(h2c.framer, tunnel.streamID, []byte{0, 0, 0, 0}, h2c.secret)
 				tunnel.mu.Unlock()
 			}
 			tunnel.sink.UpdateActivity()
@@ -3745,7 +3751,6 @@ func copyWithActivity(dst io.Writer, src io.Reader, lastActivity *atomic.Int64) 
 
 // setupH2Tunnel establishes the tunnel connection for HTTP/2 stego
 func setupH2Tunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, srvCtx *serverContext, logger *log.Logger) {
-	cfg := srvCtx.cfg
 	logger.Debug("Setting up HTTP/2 stego tunnel: %d bytes", len(data))
 
 	// Parse target address from data
@@ -3783,7 +3788,7 @@ func setupH2Tunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, srv
 	if err != nil {
 		logger.Warn("Failed to connect to %s: %v", targetAddr, err)
 		// Send failure response
-		sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, cfg)
+		sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, tunnel.secret)
 		return
 	}
 
@@ -3791,7 +3796,7 @@ func setupH2Tunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, srv
 	tunnel.targetConn = targetConn
 
 	// Send success response
-	sendStegoResponse(framer, tunnel.streamID, []byte{0x00}, cfg)
+	sendStegoResponse(framer, tunnel.streamID, []byte{0x00}, tunnel.secret)
 	logger.Debug("Connected to target, starting HTTP/2 stego relay")
 
 	// Start goroutine to read from target and send via HTTP/2
@@ -3804,29 +3809,36 @@ func setupH2Tunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, srv
 				return
 			}
 			tunnel.mu.Lock()
-			sendStegoResponse(framer, tunnel.streamID, buf[:n], cfg)
+			sendStegoResponse(framer, tunnel.streamID, buf[:n], tunnel.secret)
 			tunnel.mu.Unlock()
 		}
 	}()
 }
 
-// sendStegoResponse sends data via HTTP/2 steganography
-func sendStegoResponse(framer *http2.Framer, streamID uint32, data []byte, cfg *Config) {
-	// Frame format: [TIRD:4][flags:1][length:2][data:N][cover:M]
+// sendStegoResponse sends data via HTTP/2 steganography, keyed to the
+// authenticated client secret so the frame opens with a per-frame keyed marker
+// instead of the old constant "TIRD".
+func sendStegoResponse(framer *http2.Framer, streamID uint32, data []byte, secret []byte) {
+	// Frame format: [nonce][marker][flags:1][length:2][data:N][cover:M]
+	hdr, err := strategy.BuildStegoServerFrameHeader(secret)
+	if err != nil {
+		return
+	}
+	h := len(hdr)
 	coverLen := 30
-	response := make([]byte, 7+len(data)+coverLen)
-	copy(response[0:4], []byte("TIRD"))
-	response[4] = 0x00 // Raw data flag
-	binary.BigEndian.PutUint16(response[5:7], uint16(len(data)))
-	copy(response[7:7+len(data)], data)
-	rand.Read(response[7+len(data):]) // Cover traffic
+	response := make([]byte, h+3+len(data)+coverLen)
+	copy(response[0:h], hdr)
+	response[h] = 0x00 // Raw data flag
+	binary.BigEndian.PutUint16(response[h+1:h+3], uint16(len(data)))
+	copy(response[h+3:h+3+len(data)], data)
+	rand.Read(response[h+3+len(data):]) // Cover traffic
 
 	framer.WriteData(streamID, false, response)
 }
 
 // h2StegoFrameFunc creates framing function for H2 Stego TUN->Client packets
 // Format: [len:4][packet:N]
-func h2StegoFrameFunc(framer *http2.Framer, streamID *uint32, cfg *Config, mu *sync.Mutex) func([]byte) []byte {
+func h2StegoFrameFunc(framer *http2.Framer, streamID *uint32, secret []byte, mu *sync.Mutex) func([]byte) []byte {
 	return func(pkt []byte) []byte {
 		// Frame packet: [len:4][packet:N]
 		framed := make([]byte, 4+len(pkt))
@@ -3835,7 +3847,7 @@ func h2StegoFrameFunc(framer *http2.Framer, streamID *uint32, cfg *Config, mu *s
 
 		// Send via H2 stego
 		mu.Lock()
-		sendStegoResponse(framer, *streamID, framed, cfg)
+		sendStegoResponse(framer, *streamID, framed, secret)
 		mu.Unlock()
 
 		return nil // Already sent
@@ -3859,7 +3871,7 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 	// Version byte is optional (v1 clients send 6 bytes, v2 clients send 7 bytes)
 	if len(data) < 6 {
 		logger.Debug("H2 TUN handshake too short: %d bytes", len(data))
-		sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, cfg)
+		sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, tunnel.secret)
 		return
 	}
 
@@ -3867,7 +3879,7 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 	// only an exit needs the shared device here.
 	if srvCtx == nil || (srvCtx.sharedTUN == nil && srvCtx.upstreamDialer == nil) {
 		logger.Error("Shared TUN not initialized")
-		sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, cfg)
+		sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, tunnel.secret)
 		return
 	}
 
@@ -3887,6 +3899,7 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 		framer:   framer,
 		streamID: &tunnel.streamID, // Pointer so it can be updated
 		cfg:      cfg,
+		secret:   tunnel.secret,
 		mu:       &tunnel.mu,
 		done:     make(chan struct{}),
 	}
@@ -3899,7 +3912,7 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 		copy(framed[4:], pkt)
 
 		tunnel.mu.Lock()
-		sendStegoResponse(framer, tunnel.streamID, framed, cfg)
+		sendStegoResponse(framer, tunnel.streamID, framed, tunnel.secret)
 		tunnel.mu.Unlock()
 		return nil
 	}
@@ -3911,7 +3924,7 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, data, origin, sendPacketDown)
 		if err != nil {
 			logger.Warn("H2 TUN relay: upstream dial failed: %v", err)
-			sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, cfg)
+			sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, tunnel.secret)
 			return
 		}
 		clientIP, serverIP = upClientIP, upServerIP
@@ -3923,7 +3936,7 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 			allocatedIP, err := srvCtx.ipPool.Allocate(leaseKey, requestedIP, "")
 			if err != nil {
 				logger.Error("Failed to allocate IP from pool: %v", err)
-				sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, cfg)
+				sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, tunnel.secret)
 				return
 			}
 			clientIP = allocatedIP
@@ -3955,7 +3968,7 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 	dual := downstreamDualStackAddrs(tunnel.sink, cfg.IPPoolV6, clientIP)
 	resp := buildTUNHandshakeResponse(clientVersion, serverIP, clientIP, tunHandshakeCaps{}, dual)
 	recordDualStackSession(srvCtx, clientVersion, dual)
-	sendStegoResponse(framer, tunnel.streamID, resp, cfg)
+	sendStegoResponse(framer, tunnel.streamID, resp, tunnel.secret)
 
 	logger.Info("H2 TUN mode established (client=%s, server=%s)", clientIP, serverIP)
 }
@@ -3965,6 +3978,7 @@ type h2TunConn struct {
 	framer   *http2.Framer
 	streamID *uint32
 	cfg      *Config
+	secret   []byte // Authenticated client secret, keys the stego markers
 	mu       *sync.Mutex
 	clientIP net.IP
 	done     chan struct{}

@@ -106,15 +106,16 @@ func (f *fakeTUNExit) serve(conn net.Conn) {
 			}
 		case *http2.DataFrame:
 			data := fr.Data()
-			if len(data) < 7 || !bytes.Equal(data[0:4], []byte("TIRD")) {
+			off, ok := strategy.MatchStegoClientFrame(f.secret, data)
+			if !ok || len(data) < off+3 {
 				continue
 			}
-			length := binary.BigEndian.Uint16(data[5:7])
-			if int(length) > len(data)-7 {
+			length := int(binary.BigEndian.Uint16(data[off+1 : off+3]))
+			if length > len(data)-off-3 {
 				continue
 			}
-			payload := data[7 : 7+length]
-			if data[4]&0x01 != 0 {
+			payload := data[off+3 : off+3+length]
+			if data[off]&0x01 != 0 {
 				for i := range payload {
 					payload[i] ^= paddingKey[i%len(paddingKey)]
 				}
@@ -123,7 +124,7 @@ func (f *fakeTUNExit) serve(conn net.Conn) {
 				continue
 			}
 			resp := f.respond(payload[1:])
-			sendStegoResponse(framer, fr.StreamID, resp, &Config{})
+			sendStegoResponse(framer, fr.StreamID, resp, f.secret)
 		}
 	}
 }
@@ -296,9 +297,10 @@ func TestRelayChainForwardsDualStack(t *testing.T) {
 		hpackDec := hpack.NewDecoder(4096, nil)
 		authenticated := false
 		var authClientID clientIdentity
+		var authSecret []byte
 		var tunnel *h2TunnelState
 		var connTracked bool
-		runH2FrameLoop(&conn, &framer, hpackDec, relayCtx, logger, &authenticated, &authClientID, &connTracked, &tunnel, nil)
+		runH2FrameLoop(&conn, &framer, hpackDec, relayCtx, logger, &authenticated, &authClientID, &authSecret, &connTracked, &tunnel, nil)
 	}()
 
 	// Downstream client.

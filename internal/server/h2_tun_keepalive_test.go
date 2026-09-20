@@ -17,6 +17,10 @@ func TestForwardH2TUNKeepaliveEcho(t *testing.T) {
 	srvCtx := newTestServerContext(t)
 	logger := testLogger(t)
 
+	// The stego response frame opens with a marker keyed to the client secret,
+	// so the echo path needs a non-empty secret to build a header at all.
+	secret := []byte("keepalive-test-secret-0123456789")
+
 	var out bytes.Buffer
 	framer := http2.NewFramer(&out, nil)
 	var sid uint32 = 1
@@ -24,6 +28,7 @@ func TestForwardH2TUNKeepaliveEcho(t *testing.T) {
 		framer:   framer,
 		streamID: &sid,
 		cfg:      srvCtx.cfg,
+		secret:   secret,
 		mu:       &sync.Mutex{},
 	}
 	// A sink must be present to pass the early guard; the keepalive path only
@@ -31,6 +36,7 @@ func TestForwardH2TUNKeepaliveEcho(t *testing.T) {
 	tunnel := &h2TunnelState{
 		targetConn: h2c,
 		streamID:   sid,
+		secret:     secret,
 		sink:       &nopTUNSink{},
 	}
 
