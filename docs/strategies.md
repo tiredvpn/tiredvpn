@@ -5,7 +5,7 @@ server looks like on the wire. The client registers a set of them at startup,
 probes them, and picks one. If the active one dies mid-session, the client moves
 to the next.
 
-This page lists what the engine actually registers in v1.5.1, the exact IDs you
+This page lists what the engine actually registers in v1.11.0, the exact IDs you
 pass to `-strategy`, and where the code is honest about not being finished.
 
 ## Registered strategies
@@ -41,11 +41,14 @@ Sorted by priority. Lower priority = tried earlier.
 | `icmp_tunnel` | ICMP Tunnel | ICMP | 70 | `-icmp-tunnel` |
 
 "always" means: the client has a server address (`-server`, `-server-v6`, or a
-`[[servers]]` list) and a secret. Without both, only `state_exhaustion` and the
-five `confusion_*` entries register, and none of them will get you a tunnel.
+`[[servers]]` list) *and* a secret. Miss either and none of the "always" rows
+register — including `state_exhaustion` and the five `confusion_*` entries, which
+are now gated on the secret they authenticate with. A client with neither
+registers no strategy at all.
 
-`morph_*` needs the secret but not the server address, because it dials through
-the manager's endpoint selector rather than a pinned address.
+`morph_*` is the one exception: it needs the secret but not the server address,
+because it dials through the manager's endpoint selector rather than a pinned
+address.
 
 ### `mesh_relay` is not reachable from the CLI
 
@@ -151,10 +154,14 @@ Salamander should use.
 
 ### HTTP/2 Steganography — `http2_stego`
 
-Carries tunnel data inside HTTP/2 DATA and HEADERS frames shaped like a gRPC
-call to a Google API host, with NaiveProxy-style padding. `-cover` sets the
-authority header (default `api.googleapis.com`). Accepts an ECH config
-(`-ech`, `-ech-config`, `-ech-public-name`) to hide the outer SNI.
+Carries tunnel data inside HTTP/2 DATA frames shaped like a gRPC call to a
+Google API host, with NaiveProxy-style padding. HEADERS frames carry the covert
+authentication handshake and the cover pseudo-headers, not tunnel data — the
+header-based data channel (`writeViaHeaders`) is present in the code but
+unreachable: the sender never selects it and the server does not extract covert
+data from headers. `-cover` sets the authority header (default
+`api.googleapis.com`). Accepts an ECH config (`-ech`, `-ech-config`,
+`-ech-public-name`) to hide the outer SNI.
 
 ### WebSocket Salamander — `websocket_padded`
 
@@ -200,11 +207,16 @@ Accepts the same ECH flags as `http2_stego`.
 
 ### Protocol Confusion — `confusion_0` … `confusion_4`
 
-Raw TCP with a protocol preamble that reads as DNS-over-TCP, HTTP, SSH, SMTP or
-several stacked headers, followed by a `TIRED` marker the server keys on. No TLS
-wrapper — the preamble *is* the transport framing. Its probe is a bare TCP
-connect, so a green probe says the port is open and nothing about whether the
-confusion parses.
+Raw TCP with a protocol preamble that reads as DNS-over-TCP, HTTP/1.1, SSH, SMTP
+or a gRPC-Web message, carrying a marker `HMAC(secret, nonce, variant)` the
+server authenticates. There is no literal `TIRED` marker any more: the server
+recomputes the marker for every secret it knows, drops connections whose marker
+matches none, and refuses a replayed opening nonce. The client, in turn, will
+not continue unless the answering carrier proves the same secret, so an old
+server that still replies with a plaintext `TIRED` fails auth. No TLS wrapper —
+the preamble *is* the transport framing, and every byte after it rides a
+secret-keyed record layer. Its probe is a bare TCP connect, so a green probe
+says the port is open and nothing about whether the confusion authenticates.
 
 ### SSH Camouflage — `ssh_camouflage`
 
@@ -281,10 +293,18 @@ Each strategy has its own breaker with a sliding window of the last 20 outcomes
 over 2 minutes:
 
 - **Closed** — available.
-- **Open** — tripped after 5 consecutive failures, or a failure rate above 70%
-  (85% when RTT variance suggests an unstable link) over at least 5 samples.
-- **Half-open** — after the reset timeout, 3 test requests are allowed and 2 must
-  succeed. The reset timeout backs off 30s → 1m → 2m → 5m.
+- **Open** — tripped only when three conditions hold at the same time: at least 5
+  samples in the window, at least 5 consecutive failures, *and* a window failure
+  rate above 70% (85% when RTT variance suggests an unstable link). Any one of
+  the three short of its threshold keeps the breaker closed. A manager-set
+  network-down flag suppresses opening entirely.
+- **Half-open** — after the reset timeout the breaker admits 3 test requests and
+  needs 2 of them to succeed to close; short of that it re-opens. The reset
+  timeout backs off 30s → 1m → 2m → 4m → 5m (capped), and a clean recovery resets
+  it to 30s.
+
+The half-open recovery path is under active change, so its exact mechanics may
+still shift.
 
 `-circuit-threshold` and `-circuit-reset` are parsed and logged but **not wired
 into the manager**; the breaker uses the fixed defaults above. Same for
