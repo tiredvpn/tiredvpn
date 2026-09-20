@@ -4,15 +4,14 @@ import (
 	"testing"
 )
 
-// TestSNIRotatorCooldownUsesCustomPool verifies that NextWithCooldown respects
-// the custom pool passed to NewSNIRotatorWithPool.
+// TestSNIRotatorCooldownUsesCustomPool guards nextWithCooldown against
+// iterating the global WhitelistedSNIs instead of r.pool, which it used to do:
+// a rotator built by NewSNIRotatorWithPool with a narrowed pool would hand back
+// a donor from the global list the moment the cooldown path was taken, and a
+// caller that had deliberately restricted its SNIs would never find out.
 //
-// Bug: nextWithCooldown at sni_rotation.go:180 iterates global WhitelistedSNIs
-// instead of r.pool. A rotator built with a single custom SNI will still return
-// SNIs from the global list.
-//
-// This test FAILS on current code.
-// After fix: nextWithCooldown iterates r.pool, test passes.
+// The bug is fixed; this is the regression guard. Verified by reintroducing the
+// global-list iteration, on which it reports "got yandex.ru".
 func TestSNIRotatorCooldownUsesCustomPool(t *testing.T) {
 	customSNI := "my-custom-vpn-domain.internal"
 	// This SNI is not in WhitelistedSNIs
@@ -28,11 +27,9 @@ func TestSNIRotatorCooldownUsesCustomPool(t *testing.T) {
 	}
 }
 
-// TestNextWeightedZeroWeightPanic verifies that nextWeighted does not panic
-// when all weights are 0 (totalWeight == 0), which would cause rand.Intn(0) to panic.
-//
-// This test FAILS on current code (panics in rand.Intn(0)).
-// After fix: guard before rand.Intn returns a fallback SNI; test passes.
+// TestNextWeightedZeroWeightPanic guards the totalWeight == 0 case, where
+// nextWeighted would reach rand.Intn(0) and panic. The guard that returns a
+// fallback SNI is in place; this keeps it there.
 func TestNextWeightedZeroWeightPanic(t *testing.T) {
 	rotator := NewSNIRotatorWithPool([]string{"a.example.com", "b.example.com"}, StrategyWeighted)
 	// Override weights to 0 to trigger the bug

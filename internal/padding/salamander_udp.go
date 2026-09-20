@@ -13,6 +13,7 @@ type SalamanderPacketConn struct {
 	net.PacketConn
 	padder *SalamanderPadder
 	mu     sync.Mutex
+	frags  *fragReassembler
 }
 
 // NewSalamanderPacketConn creates a Salamander-wrapped PacketConn
@@ -20,52 +21,73 @@ func NewSalamanderPacketConn(conn net.PacketConn, padder *SalamanderPadder) *Sal
 	return &SalamanderPacketConn{
 		PacketConn: conn,
 		padder:     padder,
+		frags:      newFragReassembler(),
 	}
 }
 
-// ReadFrom reads a packet and decrypts it with Salamander
+// ReadFrom reads a packet and decrypts it with Salamander.
+//
+// A datagram that fails the tag check is dropped and the read continues with
+// the next one. Returning an error instead would be fatal well beyond the one
+// datagram: quic-go's transport read loop treats a read error that is not a
+// temporary net.Error as terminal and tears the listener down, so a single
+// stray packet sent to the port - a scan, a late datagram from a closed
+// session, anything - would take every live connection with it. Only errors
+// from the underlying conn, which are the ones that really are about the
+// socket, propagate. See TestSalamanderReadFromSurvivesGarbage.
 func (s *SalamanderPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
-	// Read encrypted packet from underlying connection
-	buf := make([]byte, 65536) // Max UDP packet size
-	n, addr, err = s.PacketConn.ReadFrom(buf)
-	if err != nil {
-		return 0, nil, err
+	buf := make([]byte, maxUDPPayload+1) // Max UDP packet size
+	for {
+		n, addr, err = s.PacketConn.ReadFrom(buf)
+		if err != nil {
+			return 0, addr, err
+		}
+
+		encrypted := buf[:n]
+
+		// Decrypt with Salamander (tag-verified UDP framing)
+		s.mu.Lock()
+		frame, ok := s.padder.decryptUDPFrame(encrypted)
+		s.mu.Unlock()
+
+		if !ok {
+			continue
+		}
+
+		payload := frame.data
+		if frame.frag {
+			assembled, complete := s.frags.add(addr.String(), frame)
+			if !complete {
+				continue
+			}
+			payload = assembled
+		}
+
+		return copy(p, payload), addr, nil
 	}
-
-	encrypted := buf[:n]
-
-	// Decrypt with Salamander (tag-verified UDP framing)
-	s.mu.Lock()
-	payload, ok := s.padder.DecryptUDP(encrypted)
-	s.mu.Unlock()
-
-	if !ok {
-		return 0, addr, fmt.Errorf("salamander: packet failed secret verification")
-	}
-
-	n = copy(p, payload)
-	return n, addr, nil
 }
 
-// WriteTo encrypts a packet with Salamander and writes it
+// WriteTo encrypts a packet with Salamander and writes it. A payload too large
+// to travel under the datagram ceiling is split across several datagrams rather
+// than sent unpadded at its exact length.
 func (s *SalamanderPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
-	if len(p) > 65535 {
-		return 0, fmt.Errorf("salamander: payload too large (%d > 65535)", len(p))
+	if len(p) > maxUDPPayload {
+		return 0, fmt.Errorf("salamander: payload too large (%d > %d)", len(p), maxUDPPayload)
 	}
 
 	// Encrypt with Salamander (tag-verified UDP framing)
 	s.mu.Lock()
-	encrypted, err := s.padder.EncryptUDP(p)
+	datagrams, err := s.padder.EncryptUDPDatagrams(p)
 	s.mu.Unlock()
 
 	if err != nil {
 		return 0, err
 	}
 
-	// Write encrypted packet to underlying connection
-	_, err = s.PacketConn.WriteTo(encrypted, addr)
-	if err != nil {
-		return 0, err
+	for _, d := range datagrams {
+		if _, err = s.PacketConn.WriteTo(d, addr); err != nil {
+			return 0, err
+		}
 	}
 
 	// Return original payload length

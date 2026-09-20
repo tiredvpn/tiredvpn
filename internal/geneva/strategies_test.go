@@ -118,9 +118,10 @@ func TestChinaGFWStrategy1(t *testing.T) {
 		t.Errorf("GetName() = %q, want non-empty name", name)
 	}
 
-	successRate := strategy.GetSuccessRate()
-	if successRate == "" || successRate == "unknown" {
-		t.Errorf("GetSuccessRate() = %q, want known rate", successRate)
+	// No percentage is claimed any more: the ones that used to be here were
+	// invented, see GetSuccessRate.
+	if rate := strategy.GetSuccessRate(); rate != "unmeasured" {
+		t.Errorf("GetSuccessRate() = %q, want %q - a number here needs a measurement behind it", rate, "unmeasured")
 	}
 
 	desc := strategy.GetDescription()
@@ -330,8 +331,8 @@ func TestStrategyMetadata(t *testing.T) {
 				t.Errorf("GetDescription() = %q, want actual description", desc)
 			}
 
-			if rate == "unknown" {
-				t.Errorf("GetSuccessRate() = %q, want actual rate", rate)
+			if rate != "unmeasured" {
+				t.Errorf("GetSuccessRate() = %q, want %q", rate, "unmeasured")
 			}
 
 			t.Logf("Strategy: %s, Description: %s, Success rate: %s", name, desc, rate)
