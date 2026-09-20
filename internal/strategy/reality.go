@@ -520,9 +520,19 @@ func (r *REALITYStrategy) connect(ctx context.Context, target string, wrapFirstF
 	// Strategy: split the first fragment so it ends in the MIDDLE of the SNI
 	// hostname. No single segment contains the complete SNI string, so DPI
 	// doing per-segment SNI matching (Russia's TSPU style) cannot identify it.
-	const chelloFragmentSize = 200
+	//
+	// The remaining fragments used to be fixed 200-byte chunks. A regular
+	// 200-byte pitch is a fingerprint no browser produces (see the grid detector
+	// in internal/wiretest); the sizes now come from a CSPRNG per connection.
+	//
+	// Distribution note (verification.md rules 3, 4): there is no measured donor
+	// distribution to match here, because no browser fragments its ClientHello at
+	// the record level at all — Chrome sends a single record. So this cannot
+	// imitate a real client's fragmentation; it only removes the fixed grid.
+	// Sizes are drawn flat over [chelloFragMin, chelloFragMin+chelloFragSpan).
+	// Recorded as "сверять не с чем".
 	sniHost, _, _ := net.SplitHostPort(dest)
-	firstFragEnd := sniFragmentSplitPoint(clientHello, sniHost, chelloFragmentSize)
+	firstFragEnd := sniFragmentSplitPoint(clientHello, sniHost, realityFragmentSize())
 
 	// Route the ClientHello first flight through the optional wrapper (seqovl
 	// prepends its decoy record here). Plain REALITY writes straight to tcpConn.
@@ -541,14 +551,14 @@ func (r *REALITYStrategy) connect(ctx context.Context, target string, wrapFirstF
 		return werr
 	}
 
-	// First fragment: ends mid-SNI (or before extensions if SNI not found)
+	// First fragment: ends mid-SNI (or a random size in if SNI not found)
 	if err := sendFrag(clientHello[:firstFragEnd]); err != nil {
 		tcpConn.Close()
 		return nil, fmt.Errorf("reality: clienthello send failed: %w", err)
 	}
-	// Remaining fragments: 200-byte chunks
-	for start := firstFragEnd; start < len(clientHello); start += chelloFragmentSize {
-		end := start + chelloFragmentSize
+	// Remaining fragments: random-sized chunks, no fixed grid.
+	for start := firstFragEnd; start < len(clientHello); {
+		end := start + realityFragmentSize()
 		if end > len(clientHello) {
 			end = len(clientHello)
 		}
@@ -556,6 +566,7 @@ func (r *REALITYStrategy) connect(ctx context.Context, target string, wrapFirstF
 			tcpConn.Close()
 			return nil, fmt.Errorf("reality: clienthello send failed: %w", err)
 		}
+		start = end
 	}
 
 	log.Debug("REALITY: ClientHello written=%d bytes (requested=%d, fragments=%d, firstFrag=%d)", totalWritten, len(clientHello), fragments, firstFragEnd)
@@ -835,7 +846,10 @@ func (r *REALITYStrategy) buildClientHello(dest string, clientPrivKey, clientSal
 		Fingerprint:        r.fingerprint,
 		ALPN:               []string{"h2", "http/1.1"},
 		InsecureSkipVerify: true,
-		PaddingLen:         customtls.MinPaddingSize, // 256 bytes for REALITY + random
+		// Per-connection padding-extension body length, floored well above the
+		// server's 64-byte routing gate. Replaces the constant 256, which was a
+		// single-valued signature. See realityPaddingLen for the distribution note.
+		PaddingLen: realityPaddingLen(clientSalt),
 	}
 
 	clientHello, err := customtls.BuildClientHelloBytes(config, fp)
@@ -1009,6 +1023,43 @@ func randomInt(max int) int {
 	var b [8]byte
 	cryptorand.Read(b[:]) //nolint:errcheck // crypto/rand.Read never fails on Linux
 	return int(uint32(b[0])|uint32(b[1])<<8|uint32(b[2])<<16|uint32(b[3])<<24) % max
+}
+
+const (
+	// ClientHello fragment sizes are drawn flat over [chelloFragMin,
+	// chelloFragMin+chelloFragSpan) per connection, replacing the fixed 200-byte
+	// grid. No browser fragments at the record level, so there is no donor
+	// distribution to match (verification.md rules 3, 4): this only removes the
+	// grid, it does not imitate anything.
+	chelloFragMin  = 48
+	chelloFragSpan = 208 // [48, 256)
+
+	// realityPaddingBase is the floor for the padding-extension body. It carries
+	// the 64-byte REALITY core plus the 64-byte data-v2 block, and sits well above
+	// the server's 64-byte routing gate (DetectREALITYExtension / findREALITY-
+	// Extension), so the >= 64 invariant holds by a wide margin at every length.
+	realityPaddingBase = customtls.REALITYExtensionLength + customtls.DataV2ExtraLength // 128
+	realityPaddingSpan = 256                                                            // body length flat over [128, 384)
+)
+
+// realityFragmentSize returns one CSPRNG-drawn ClientHello fragment size.
+func realityFragmentSize() int {
+	return chelloFragMin + randomInt(chelloFragSpan)
+}
+
+// realityPaddingLen picks this connection's padding-extension body length from
+// the per-connection salt. The v1 code forced a constant 256 on every hello,
+// which is itself a signature ("always exactly 256"); this varies the length so
+// it is no longer single-valued while staying above the routing gate.
+//
+// Distribution note (verification.md rules 3, 4, 8): Chrome's own padding pads
+// the ClientHello to a 512-byte boundary and so emits nothing at all for a
+// modern post-quantum hello — a profile we cannot use, because REALITY has to
+// hide >= 64 bytes here. There is thus no browser padding-length distribution to
+// match; the length is drawn flat over [realityPaddingBase, +realityPaddingSpan)
+// and recorded as "сверять не с чем".
+func realityPaddingLen(salt [32]byte) int {
+	return realityPaddingBase + int(salt[0])%realityPaddingSpan
 }
 
 func randRead(b []byte) {
