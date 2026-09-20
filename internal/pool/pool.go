@@ -205,8 +205,16 @@ func (p *TunnelPool) createConn(ctx context.Context) (*PooledConn, error) {
 		strategy: usedStrategy,
 	}
 
+	// usedStrategy can be nil: the mux fast-path returns the manager's last
+	// successful strategy, which storm parking may have cleared out from under
+	// it. Name() on a nil interface panics, and log arguments are evaluated
+	// unconditionally, so guard it here.
+	strategyName := "unknown"
+	if usedStrategy != nil {
+		strategyName = usedStrategy.Name()
+	}
 	log.Debug("Pool: created new connection (strategy=%s, total=%d)",
-		usedStrategy.Name(), atomic.LoadInt32(&p.totalConns))
+		strategyName, atomic.LoadInt32(&p.totalConns))
 
 	return pc, nil
 }

@@ -151,6 +151,38 @@ func TestDialTargetRetriesOnEOFBeforeAck(t *testing.T) {
 	}
 }
 
+// nilStrategyConnector hands back a live connection but a nil strategy, which is
+// what the mux fast-path returns after storm parking clears the manager's last
+// successful strategy out from under it.
+type nilStrategyConnector struct{}
+
+func (nilStrategyConnector) Connect(context.Context, string) (net.Conn, strategy.Strategy, error) {
+	client, server := net.Pipe()
+	go func() { io.Copy(io.Discard, server); server.Close() }()
+	return client, nil, nil
+}
+
+// TestCreateConnSurvivesNilStrategy guards the log-arg panic: usedStrategy.Name()
+// on a nil interface (evaluated unconditionally as a log argument) crashed Get.
+//
+// Predicated against the broken code: call usedStrategy.Name() directly in the
+// log and this panics with a nil-pointer dereference.
+func TestCreateConnSurvivesNilStrategy(t *testing.T) {
+	p := newTestPool(nilStrategyConnector{})
+
+	conn, err := p.Get(context.Background())
+	if err != nil {
+		t.Fatalf("Get with nil strategy: %v", err)
+	}
+	if conn == nil {
+		t.Fatal("Get returned nil conn")
+	}
+	if conn.Strategy() != nil {
+		t.Fatal("expected the nil strategy to pass through unchanged")
+	}
+	conn.Close()
+}
+
 func TestDialTargetRetriesOnConnectError(t *testing.T) {
 	fc := &fakeConnector{scripts: []attemptScript{
 		{connectErr: true},
