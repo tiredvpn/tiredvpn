@@ -88,6 +88,11 @@ Versions follow [Semantic Versioning](https://semver.org/).
 - Mesh relay fields are updated under the lock the selector reads them with,
   relay auth is challenge-response instead of shipping the secret in JSON, and the
   `change-me-secret` defaults are gone.
+- The reconnect loop no longer parks forever on a false "no network".
+  `internetReachable()` dialled `8.8.8.8:53` through the installed TUN routes, so a
+  dead tunnel with live routes read as "network up" and the client black-holed
+  every CIDR until a manual restart. Now uses default-route detection with
+  link-local zones and a real dial after parking.
 
 ## [1.10.0] - 2026-08-31
 
