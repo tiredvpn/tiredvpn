@@ -1,14 +1,17 @@
 package pool
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
 )
@@ -272,5 +275,407 @@ func TestDialTargetAddressTooLong(t *testing.T) {
 	}
 	if fc.callCount() != 0 {
 		t.Fatalf("Connect called %d times for invalid target, want 0", fc.callCount())
+	}
+}
+
+// --- Get / bookkeeping ---------------------------------------------------
+
+// TestNewTunnelPool checks the documented contract that serverAddr is ignored
+// and a fresh pool reports zero live connections.
+func TestNewTunnelPool(t *testing.T) {
+	p := NewTunnelPool(nil, "ignored.example:443", DefaultConfig())
+	if p == nil {
+		t.Fatal("NewTunnelPool returned nil")
+	}
+	if got := p.Stats(); got != 0 {
+		t.Fatalf("fresh pool Stats()=%d, want 0", got)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+// TestGetEnforcesMaxConnections predicates the MaxConnections guard: with the
+// limit at 1 and one connection outstanding, the second Get must be refused
+// without a connector call. Positive control: with the outstanding connection
+// closed (slot freed), the same Get succeeds - so the refusal is the limit, not
+// a broken connector.
+func TestGetEnforcesMaxConnections(t *testing.T) {
+	fc := &fakeConnector{scripts: []attemptScript{
+		{serverFn: func(s net.Conn) { io.Copy(io.Discard, s) }},
+		{serverFn: func(s net.Conn) { io.Copy(io.Discard, s) }},
+	}}
+	p := newTestPool(fc)
+	p.config.MaxConnections = 1
+
+	first, err := p.Get(context.Background())
+	if err != nil {
+		t.Fatalf("first Get: %v", err)
+	}
+	if got := p.Stats(); got != 1 {
+		t.Fatalf("Stats after first Get=%d, want 1", got)
+	}
+
+	// Limit reached: second Get is refused and never touches the connector.
+	if _, err := p.Get(context.Background()); !errors.Is(err, ErrPoolExhausted) {
+		t.Fatalf("second Get err=%v, want ErrPoolExhausted", err)
+	}
+	if fc.callCount() != 1 {
+		t.Fatalf("connector called %d times, want 1 (refused Get must not dial)", fc.callCount())
+	}
+
+	// Positive control: free the slot, the same call now succeeds.
+	first.Close()
+	if got := p.Stats(); got != 0 {
+		t.Fatalf("Stats after close=%d, want 0", got)
+	}
+	second, err := p.Get(context.Background())
+	if err != nil {
+		t.Fatalf("Get after slot freed: %v", err)
+	}
+	if fc.callCount() != 2 {
+		t.Fatalf("connector called %d times, want 2", fc.callCount())
+	}
+	second.Close()
+}
+
+// TestStatsTracksLiveConns checks the counter rises per handout and falls per
+// Close, and that createConn undoes its increment when the connector errors.
+func TestStatsTracksLiveConns(t *testing.T) {
+	fc := &fakeConnector{scripts: []attemptScript{
+		{serverFn: func(s net.Conn) { io.Copy(io.Discard, s) }},
+		{serverFn: func(s net.Conn) { io.Copy(io.Discard, s) }},
+		{connectErr: true},
+	}}
+	p := newTestPool(fc)
+
+	a, err := p.Get(context.Background())
+	if err != nil {
+		t.Fatalf("Get a: %v", err)
+	}
+	b, err := p.Get(context.Background())
+	if err != nil {
+		t.Fatalf("Get b: %v", err)
+	}
+	if got := p.Stats(); got != 2 {
+		t.Fatalf("Stats=%d, want 2", got)
+	}
+
+	// A failed dial must not leak a slot.
+	if _, err := p.Get(context.Background()); err == nil {
+		t.Fatal("Get with connectErr script: expected error")
+	}
+	if got := p.Stats(); got != 2 {
+		t.Fatalf("Stats after failed dial=%d, want 2 (no leak)", got)
+	}
+
+	a.Close()
+	b.Close()
+	if got := p.Stats(); got != 0 {
+		t.Fatalf("Stats after closing both=%d, want 0", got)
+	}
+}
+
+// TestPoolExhaustedError locks the sentinel's message and errors.Is identity.
+func TestPoolExhaustedError(t *testing.T) {
+	if ErrPoolExhausted.Error() != "pool exhausted" {
+		t.Fatalf("ErrPoolExhausted.Error()=%q", ErrPoolExhausted.Error())
+	}
+	wrapped := fmt.Errorf("get failed: %w", ErrPoolExhausted)
+	if !errors.Is(wrapped, ErrPoolExhausted) {
+		t.Fatal("wrapped ErrPoolExhausted must satisfy errors.Is")
+	}
+}
+
+// TestGetConcurrent hammers createConn from many goroutines under -race: the
+// atomic counter must return to exactly zero after every handed-out connection
+// is closed, and the connector must be called once per successful Get.
+func TestGetConcurrent(t *testing.T) {
+	const n = 64
+	scripts := make([]attemptScript, n)
+	for i := range scripts {
+		scripts[i] = attemptScript{serverFn: func(s net.Conn) { io.Copy(io.Discard, s); s.Close() }}
+	}
+	fc := &fakeConnector{scripts: scripts}
+	p := newTestPool(fc)
+
+	var wg sync.WaitGroup
+	conns := make([]*PooledConn, n)
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			conns[i], errs[i] = p.Get(context.Background())
+		}(i)
+	}
+	wg.Wait()
+
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			t.Fatalf("Get[%d]: %v", i, errs[i])
+		}
+	}
+	if got := p.Stats(); got != n {
+		t.Fatalf("Stats after %d concurrent Get=%d, want %d", n, got, n)
+	}
+	if fc.callCount() != n {
+		t.Fatalf("connector called %d times, want %d", fc.callCount(), n)
+	}
+
+	var cwg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		cwg.Add(1)
+		go func(i int) { defer cwg.Done(); conns[i].Close() }(i)
+	}
+	cwg.Wait()
+	if got := atomic.LoadInt32(&p.totalConns); got != 0 {
+		t.Fatalf("totalConns=%d after closing all, want 0", got)
+	}
+}
+
+// tcpConnector dials a loopback listener so createConn takes the *net.TCPConn
+// keepalive branch that net.Pipe fakes never reach.
+type tcpConnector struct{ addr string }
+
+func (c tcpConnector) Connect(ctx context.Context, _ string) (net.Conn, strategy.Strategy, error) {
+	d := net.Dialer{}
+	conn, err := d.DialContext(ctx, "tcp", c.addr)
+	if err != nil {
+		return nil, nil, err
+	}
+	return conn, fakeStrategy{}, nil
+}
+
+// TestCreateConnEnablesKeepAlive covers the *net.TCPConn keepalive branch with a
+// real loopback socket.
+func TestCreateConnEnablesKeepAlive(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() { io.Copy(io.Discard, c); c.Close() }()
+		}
+	}()
+
+	p := newTestPool(tcpConnector{addr: ln.Addr().String()})
+	conn, err := p.Get(context.Background())
+	if err != nil {
+		t.Fatalf("Get over TCP: %v", err)
+	}
+	if _, ok := conn.Conn.(*net.TCPConn); !ok {
+		t.Fatalf("expected *net.TCPConn, got %T", conn.Conn)
+	}
+	conn.Close()
+	if got := p.Stats(); got != 0 {
+		t.Fatalf("Stats after close=%d, want 0", got)
+	}
+}
+
+// --- isRelayTimeout ------------------------------------------------------
+
+// timeoutErr is a net.Error whose Timeout() answer the test controls.
+type timeoutErr struct{ timeout bool }
+
+func (e timeoutErr) Error() string   { return "timeoutErr" }
+func (e timeoutErr) Timeout() bool   { return e.timeout }
+func (e timeoutErr) Temporary() bool { return false }
+
+// TestIsRelayTimeout locks each branch. The two string cases exist because
+// smux v2's errTimeout does not implement net.Error; drop the string match and
+// those two rows go red.
+func TestIsRelayTimeout(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"net.Error timeout", timeoutErr{timeout: true}, true},
+		{"net.Error non-timeout", timeoutErr{timeout: false}, false},
+		{"smux bare timeout string", errors.New("timeout"), true},
+		{"io timeout string", errors.New("i/o timeout"), true},
+		{"unrelated error", errors.New("connection reset by peer"), false},
+		{"eof is not a timeout", io.EOF, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isRelayTimeout(tc.err); got != tc.want {
+				t.Fatalf("isRelayTimeout(%v)=%v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// --- PooledRelay ---------------------------------------------------------
+
+// relayHarness wires a browser<->relay<->exit chain out of two net.Pipes.
+// clientEnd is the browser side; serverEnd is the exit side.
+type relayHarness struct {
+	clientEnd  net.Conn // test writes/reads as the browser
+	serverEnd  net.Conn // test writes/reads as the exit server
+	pooled     *PooledConn
+	relayLocal net.Conn // the relay's view of the client
+}
+
+func newRelayHarness() *relayHarness {
+	clientLocal, clientEnd := net.Pipe()
+	serverLocal, serverEnd := net.Pipe()
+	return &relayHarness{
+		clientEnd:  clientEnd,
+		serverEnd:  serverEnd,
+		pooled:     &PooledConn{Conn: serverLocal},
+		relayLocal: clientLocal,
+	}
+}
+
+// TestPooledRelayBidirectional checks bytes flow both ways and that a client
+// EOF ends the relay.
+func TestPooledRelayBidirectional(t *testing.T) {
+	h := newRelayHarness()
+	done := make(chan error, 1)
+	go func() { done <- PooledRelay(h.relayLocal, h.pooled, time.Minute) }()
+
+	// browser -> exit
+	up := []byte("GET / HTTP/1.1")
+	go h.clientEnd.Write(up)
+	got := make([]byte, len(up))
+	h.serverEnd.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.ReadFull(h.serverEnd, got); err != nil {
+		t.Fatalf("exit read: %v", err)
+	}
+	if !bytes.Equal(got, up) {
+		t.Fatalf("exit saw %q, want %q", got, up)
+	}
+
+	// exit -> browser
+	down := []byte("HTTP/1.1 200 OK")
+	go h.serverEnd.Write(down)
+	got2 := make([]byte, len(down))
+	h.clientEnd.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.ReadFull(h.clientEnd, got2); err != nil {
+		t.Fatalf("browser read: %v", err)
+	}
+	if !bytes.Equal(got2, down) {
+		t.Fatalf("browser saw %q, want %q", got2, down)
+	}
+
+	// browser hangs up -> relay returns.
+	h.clientEnd.Close()
+	select {
+	case err := <-done:
+		if err != io.EOF {
+			t.Fatalf("relay returned %v, want io.EOF on client hangup", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("relay did not return after client close")
+	}
+}
+
+// TestPooledRelayServerCloseEndsRelay checks the exit side closing terminates
+// the relay too (the other half of the teardown path).
+func TestPooledRelayServerCloseEndsRelay(t *testing.T) {
+	h := newRelayHarness()
+	done := make(chan error, 1)
+	go func() { done <- PooledRelay(h.relayLocal, h.pooled, time.Minute) }()
+
+	h.serverEnd.Close()
+	select {
+	case err := <-done:
+		if err != io.EOF {
+			t.Fatalf("relay returned %v, want io.EOF on server hangup", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("relay did not return after server close")
+	}
+	// The browser side must be closed by the relay on teardown.
+	h.clientEnd.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := h.clientEnd.Read(make([]byte, 1)); err == nil {
+		t.Fatal("relay left the client side open after teardown")
+	}
+}
+
+// --- PooledRelayLengthPrefixed ------------------------------------------
+
+// TestPooledRelayLengthPrefixedFraming checks the 4-byte length framing in both
+// directions.
+func TestPooledRelayLengthPrefixedFraming(t *testing.T) {
+	h := newRelayHarness()
+	done := make(chan error, 1)
+	go func() { done <- PooledRelayLengthPrefixed(h.relayLocal, h.pooled, time.Minute) }()
+
+	// browser -> exit: relay prepends a 4-byte length.
+	up := []byte("abcde")
+	go h.clientEnd.Write(up)
+	lenBuf := make([]byte, 4)
+	h.serverEnd.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.ReadFull(h.serverEnd, lenBuf); err != nil {
+		t.Fatalf("exit read len: %v", err)
+	}
+	if n := binary.BigEndian.Uint32(lenBuf); n != uint32(len(up)) {
+		t.Fatalf("framed length=%d, want %d", n, len(up))
+	}
+	body := make([]byte, len(up))
+	if _, err := io.ReadFull(h.serverEnd, body); err != nil {
+		t.Fatalf("exit read body: %v", err)
+	}
+	if !bytes.Equal(body, up) {
+		t.Fatalf("exit body %q, want %q", body, up)
+	}
+
+	// exit -> browser: relay strips the length prefix.
+	down := []byte("world!")
+	frame := make([]byte, 4+len(down))
+	binary.BigEndian.PutUint32(frame[:4], uint32(len(down)))
+	copy(frame[4:], down)
+	go h.serverEnd.Write(frame)
+	got := make([]byte, len(down))
+	h.clientEnd.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.ReadFull(h.clientEnd, got); err != nil {
+		t.Fatalf("browser read: %v", err)
+	}
+	if !bytes.Equal(got, down) {
+		t.Fatalf("browser saw %q, want %q", got, down)
+	}
+
+	h.clientEnd.Close()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("length-prefixed relay did not return after client close")
+	}
+}
+
+// TestPooledRelayLengthPrefixedRejectsBadFrame checks the length guard. An
+// oversized declared length must end the relay WITHOUT reading the (never sent)
+// body. Predicate against a missing guard: without it the read side blocks in
+// io.ReadFull on a 70000-byte body that never arrives and the relay hangs until
+// the test's 5s deadline fires. A zero length is treated the same way.
+func TestPooledRelayLengthPrefixedRejectsBadFrame(t *testing.T) {
+	for _, declared := range []uint32{0, 70000} {
+		t.Run(map[bool]string{true: "zero", false: "oversized"}[declared == 0], func(t *testing.T) {
+			h := newRelayHarness()
+			done := make(chan error, 1)
+			go func() { done <- PooledRelayLengthPrefixed(h.relayLocal, h.pooled, time.Minute) }()
+
+			lenBuf := make([]byte, 4)
+			binary.BigEndian.PutUint32(lenBuf, declared)
+			go h.serverEnd.Write(lenBuf)
+
+			select {
+			case err := <-done:
+				if err != io.EOF {
+					t.Fatalf("relay returned %v, want io.EOF on bad frame", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("relay did not reject declared length %d", declared)
+			}
+		})
 	}
 }
