@@ -159,6 +159,36 @@ func TestIMAPAuthResponseIsBoundToChallengeAndChannel(t *testing.T) {
 	}
 }
 
+// TestVerifyIMAPAuthResponseRefusesDegenerateInputs pins the guards that keep a
+// caller from silently restoring the predictable input of 1.10.x. A verifier
+// that accepted an empty challenge or a short binding would be back to a MAC
+// over a constant.
+func TestVerifyIMAPAuthResponseRefusesDegenerateInputs(t *testing.T) {
+	binding := bytes.Repeat([]byte{0x5C}, imapChannelBindingLen)
+	chal := "<1.2@mail.example>"
+	good := IMAPAuthResponse(imapTestSecret, chal, binding)
+
+	cases := []struct {
+		name      string
+		digest    []byte
+		secret    []byte
+		challenge string
+		binding   []byte
+	}{
+		{"empty challenge", IMAPAuthResponse(imapTestSecret, "", binding), imapTestSecret, "", binding},
+		{"short binding", IMAPAuthResponse(imapTestSecret, chal, binding[:8]), imapTestSecret, chal, binding[:8]},
+		{"nil binding", IMAPAuthResponse(imapTestSecret, chal, nil), imapTestSecret, chal, nil},
+		{"empty secret", good, nil, chal, binding},
+		{"truncated digest", good[:8], imapTestSecret, chal, binding},
+		{"over-long digest", append(append([]byte{}, good...), 0), imapTestSecret, chal, binding},
+	}
+	for _, c := range cases {
+		if VerifyIMAPAuthResponse(c.digest, c.secret, c.challenge, c.binding) {
+			t.Errorf("%s: verified", c.name)
+		}
+	}
+}
+
 // TestIMAPAuthResponseWireForm pins the field widths RFC 2195 section 2 gives a
 // CRAM-MD5 response: base64 of "<username> <digest in hex>", the digest exactly
 // 32 hex characters wide.
@@ -669,5 +699,88 @@ func TestIMAPHandshakeRejectsPipeliningAcrossSTARTTLS(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("the client neither failed nor completed")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Literal framing limits
+// ---------------------------------------------------------------------------
+
+// TestIMAPReadRefusesOversizedLiteral checks the cap at the allocation site. A
+// literal length is the peer's word for how many bytes to reserve; before
+// 1.11.0 Read passed it straight to make, so one line named any allocation the
+// peer liked.
+func TestIMAPReadRefusesOversizedLiteral(t *testing.T) {
+	cases := []struct {
+		name    string
+		header  string
+		wantErr bool
+	}{
+		{"just over the cap", fmt.Sprintf("* 7 FETCH (BODY[] {%d}\r\n", maxIMAPLiteralLen+1), true},
+		{"absurd", "* 7 FETCH (BODY[] {9000000000}\r\n", true},
+		{"at the cap", fmt.Sprintf("* 7 FETCH (BODY[] {%d}\r\n", maxIMAPLiteralLen), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cli, srv := net.Pipe()
+			defer cli.Close()
+			defer srv.Close()
+
+			go func() {
+				_, _ = srv.Write([]byte(c.header))
+				// Deliberately never send the body: a Read that honoured the
+				// length would block here, and a Read that allocated first
+				// would already have done the damage.
+			}()
+
+			conn := NewIMAPCamouflageConn(cli, nil, false)
+			_ = cli.SetReadDeadline(time.Now().Add(2 * time.Second))
+			_, err := conn.Read(make([]byte, 16))
+			if c.wantErr {
+				if err == nil {
+					t.Fatal("an over-long literal was accepted")
+				}
+				if !strings.Contains(err.Error(), "exceeds the") {
+					t.Fatalf("error = %v, want the literal cap refusal", err)
+				}
+				return
+			}
+			// At the cap the length is legal, so the failure must be the
+			// missing body (timeout), not the cap.
+			if err != nil && strings.Contains(err.Error(), "exceeds the") {
+				t.Fatalf("a literal exactly at the cap was refused: %v", err)
+			}
+		})
+	}
+}
+
+// TestIMAPWriteSplitsAtTheCap makes sure we never announce a literal the read
+// side would refuse: a single large Write has to come out as several frames.
+func TestIMAPWriteSplitsAtTheCap(t *testing.T) {
+	cli, srv := net.Pipe()
+	defer cli.Close()
+	defer srv.Close()
+
+	payload := bytes.Repeat([]byte{0x7E}, maxIMAPLiteralLen+4096)
+	writeErr := make(chan error, 1)
+	go func() {
+		client := NewIMAPCamouflageConn(cli, nil, false)
+		n, err := client.Write(payload)
+		if err == nil && n != len(payload) {
+			err = fmt.Errorf("Write returned %d, want %d", n, len(payload))
+		}
+		writeErr <- err
+	}()
+
+	server := NewIMAPCamouflageConn(srv, nil, true)
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(server, got); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if err := <-writeErr; err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("the split changed the byte stream")
 	}
 }

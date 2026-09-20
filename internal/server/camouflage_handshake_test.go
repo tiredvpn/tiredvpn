@@ -275,6 +275,15 @@ func TestVerifyIMAPAuth(t *testing.T) {
 		}
 	})
 
+	t.Run("missing session inputs are refused", func(t *testing.T) {
+		if _, _, ok := verifyIMAPAuth(strategy.IMAPAuthResponse(global, "", imapTestBinding()), "", imapTestBinding(), srvCtx); ok {
+			t.Error("an empty challenge authenticated")
+		}
+		if _, _, ok := verifyIMAPAuth(strategy.IMAPAuthResponse(global, imapTestChallenge, nil), imapTestChallenge, nil, srvCtx); ok {
+			t.Error("a missing channel binding authenticated")
+		}
+	})
+
 	t.Run("server with no secret at all rejects everything", func(t *testing.T) {
 		empty := newTestServerContext(t)
 		if _, _, ok := verifyIMAPAuth(imapDigest(camouflageTestSecret), imapTestChallenge, imapTestBinding(), empty); ok {

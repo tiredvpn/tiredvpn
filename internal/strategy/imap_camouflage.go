@@ -107,6 +107,12 @@ const (
 	imapChannelBindingLabel = "EXPORTER-Channel-Binding"
 	imapChannelBindingLen   = 32
 
+	// maxIMAPLiteralLen caps a literal length announced by the peer. Tunnel
+	// frames are one relay buffer at most (tens of KB); a megabyte leaves that
+	// an order of magnitude of headroom while keeping a hostile peer from
+	// naming a length we would allocate.
+	maxIMAPLiteralLen = 1 << 20
+
 	// imapHandshakeTimeout bounds the whole pre-tunnel exchange, TLS included.
 	imapHandshakeTimeout = 15 * time.Second
 )
@@ -384,10 +390,14 @@ func IMAPAuthResponse(secret []byte, challenge string, binding []byte) []byte {
 	return imapAuthMAC(secret, imapAuthCtx, challenge, binding)[:imapAuthLen]
 }
 
-// VerifyIMAPAuthResponse checks a received digest against the challenge and
-// channel binding of the session it arrived in.
+// VerifyIMAPAuthResponse checks a received digest. A missing challenge or
+// binding is refused outright: accepting either empty would silently restore
+// the predictable input this replaced.
 func VerifyIMAPAuthResponse(digest, secret []byte, challenge string, binding []byte) bool {
 	if len(digest) != imapAuthLen || len(secret) == 0 {
+		return false
+	}
+	if challenge == "" || len(binding) != imapChannelBindingLen {
 		return false
 	}
 	return hmac.Equal(digest, IMAPAuthResponse(secret, challenge, binding))
@@ -516,6 +526,12 @@ func (c *IMAPCamouflageConn) Read(p []byte) (int, error) {
 		if !ok {
 			continue // keepalive (NOOP / "* OK Still here")
 		}
+		// The length is the peer's word for how much to allocate. Cap it
+		// before the make, and fail the connection rather than resync: a
+		// literal this long means the stream is hostile or already lost.
+		if litLen > maxIMAPLiteralLen {
+			return 0, fmt.Errorf("imap literal of %d bytes exceeds the %d byte cap", litLen, maxIMAPLiteralLen)
+		}
 		data := make([]byte, litLen)
 		if _, err := io.ReadFull(c.br, data); err != nil {
 			return 0, err
@@ -544,6 +560,25 @@ func (c *IMAPCamouflageConn) Write(p []byte) (int, error) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 
+	// Never announce a literal the peer would refuse: split at the same cap
+	// the read side enforces.
+	written := 0
+	for len(p) > 0 {
+		chunk := p
+		if len(chunk) > maxIMAPLiteralLen {
+			chunk = chunk[:maxIMAPLiteralLen]
+		}
+		if err := c.writeFrame(chunk); err != nil {
+			return written, err
+		}
+		written += len(chunk)
+		p = p[len(chunk):]
+	}
+	return written, nil
+}
+
+// writeFrame emits one literal. The caller holds writeMu.
+func (c *IMAPCamouflageConn) writeFrame(p []byte) error {
 	c.seq++
 	var header, trailer string
 	if c.server {
@@ -559,10 +594,8 @@ func (c *IMAPCamouflageConn) Write(p []byte) (int, error) {
 	frame = append(frame, p...)
 	frame = append(frame, trailer...)
 
-	if _, err := c.Conn.Write(frame); err != nil {
-		return 0, err
-	}
-	return len(p), nil
+	_, err := c.Conn.Write(frame)
+	return err
 }
 
 // NetConn exposes the underlying connection so optimizeTCPConn can reach the
