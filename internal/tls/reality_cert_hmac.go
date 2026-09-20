@@ -10,6 +10,7 @@ import (
 	"encoding/asn1"
 	"errors"
 	"fmt"
+	"math/big"
 )
 
 // cert-HMAC: proving the server to the client for zero extra packets.
@@ -69,24 +70,20 @@ import (
 //
 // ECDSA P-256 is advertised by every profile we ship. Its signature is
 // variable-length DER rather than a fixed tail, so the field cannot simply be
-// painted over: the overlay re-encodes the certificate around a MAC of fixed
-// width. The width has to be fixed rather than copied from the signature it
-// replaces — see certMACLen.
+// painted over — and, more to the point, the MAC has to be shaped like one
+// rather than poured into the space one occupied. See certSignature.
 
 // certMACInfo separates the certificate MAC from every other use of authKey.
 const certMACInfo = "tiredvpn-reality-cert-v1"
 
-// certMACLen is the width of the MAC, fixed and checked before anything is
-// derived.
-//
-// It used to be whatever the peer's signature field happened to be, because the
-// verifier expanded the MAC to len(cert.Signature) and then compared the two.
-// That hands the security parameter to the attacker: a one-byte signature is
-// guessed once in 256 tries, and a zero-length one always passes, since
-// hmac.Equal of two empty slices is true. Deriving at a fixed width and
-// rejecting every other width first closes both, and costs the certificate
-// nothing that anyone reads.
-const certMACLen = 32
+const (
+	// certMACHalf is the width of each of the two integers the MAC is cut into.
+	// 32 bytes is the width of r and s in a P-256 signature.
+	certMACHalf = 32
+
+	// certMACLen is what the derivation produces: r and s side by side.
+	certMACLen = 2 * certMACHalf
+)
 
 var (
 	// ErrCertNone reports an empty certificate list.
@@ -96,31 +93,21 @@ var (
 	// not carry our MAC. The peer does not hold the server's static key.
 	ErrCertHMACMismatch = errors.New("reality cert: certificate HMAC mismatch")
 
-	// ErrCertHMACLen reports a signature field that is not the MAC's width.
-	//
-	// It wraps ErrCertHMACMismatch because that is what it is — a certificate
-	// that does not carry our MAC — and because every caller upstream only asks
-	// whether the peer authenticated. The distinct sentinel exists so the log
-	// line says which check refused it.
-	ErrCertHMACLen = fmt.Errorf("%w: signature field is not %d bytes", ErrCertHMACMismatch, certMACLen)
-
 	// ErrCertNoLeaf reports a certificate handed to the overlay without its
 	// parsed leaf, which the overlay needs to locate the signature.
 	ErrCertNoLeaf = errors.New("reality cert: certificate has no parsed leaf")
 )
 
-// certMAC derives the bytes that go in the signature field: HMAC-SHA512 over
-// the certificate's SubjectPublicKeyInfo, expanded to certMACLen.
+// certMAC derives the raw MAC: HMAC-SHA512 over the certificate's
+// SubjectPublicKeyInfo, expanded to certMACLen.
 //
-// The width is the constant, not an argument. HKDF output is prefix-consistent
-// — the 31-byte expansion is the first 31 bytes of the 32-byte one — so a
-// derivation whose length comes from the wire lets a peer pick how many bytes
-// of the same stream it has to produce.
-//
-// The whole field is the MAC rather than a MAC padded into it: leaving trailing
-// bytes of the original ECDSA signature in place would be a constant across
-// every connection to one SNI — small, but it is exactly the kind of fixed
-// remnant this project keeps finding in its own traffic.
+// The width is a constant, never an argument. It used to be the length of the
+// peer's signature field, because the verifier expanded to len(cert.Signature)
+// and then compared the two. HKDF output is prefix-consistent — the 31-byte
+// expansion is the first 31 bytes of the 32-byte one — so that let the peer
+// choose how many bytes of the same stream it had to produce: one byte is a
+// 1-in-256 guess per attempt, and a zero-length field passed unconditionally,
+// since hmac.Equal of two empty slices is true.
 func certMAC(authKey, spki []byte) ([]byte, error) {
 	mac := hmac.New(sha512.New, authKey)
 	mac.Write(spki)
@@ -129,6 +116,47 @@ func certMAC(authKey, spki []byte) ([]byte, error) {
 		return nil, fmt.Errorf("reality cert: expand MAC: %w", err)
 	}
 	return out, nil
+}
+
+// ecdsaSignature is the on-the-wire shape of an ECDSA signature: RFC 3279's
+// Ecdsa-Sig-Value.
+type ecdsaSignature struct {
+	R, S *big.Int
+}
+
+// certSignature derives the signature field: the MAC cut in half and encoded
+// the way a real ECDSA P-256 signature is, as SEQUENCE { INTEGER r, INTEGER s }.
+//
+// Shaped rather than merely sized. A MAC of some constant width would close the
+// same hole, but it would leave a new mark in its place: a real P-256 signature
+// is 70, 71 or 72 bytes with weights near 1/4, 1/2, 1/4 — DER prepends a zero
+// byte to an integer whose top bit is set, which happens to r and to s
+// independently, half the time each. A field that is always the same length has
+// no such distribution, and a flat one has the wrong shape. Encoding two
+// pseudorandom 32-byte integers through the same rules reproduces the
+// distribution because it is the same mechanism producing it, and the field
+// parses as a signature rather than as opaque bytes.
+//
+// r and s are uniform over 32 bytes rather than reduced modulo the group order,
+// so one in about 2^32 lands above it. A signature with r >= n is invalid, not
+// merely unusual, but nothing on the path verifies this signature — that is the
+// premise of the whole file — and at that rate no observer collects one.
+//
+// The length of the result comes from authKey and the SPKI. Nothing about it is
+// read off the wire, which is what closes the hole certMAC describes.
+func certSignature(authKey, spki []byte) ([]byte, error) {
+	mac, err := certMAC(authKey, spki)
+	if err != nil {
+		return nil, err
+	}
+	sig, err := asn1.Marshal(ecdsaSignature{
+		R: new(big.Int).SetBytes(mac[:certMACHalf]),
+		S: new(big.Int).SetBytes(mac[certMACHalf:]),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("reality cert: encode MAC as a signature: %w", err)
+	}
+	return sig, nil
 }
 
 // CertHMACOverlay returns a per-connection copy of cert with the signature
@@ -153,12 +181,12 @@ func CertHMACOverlay(cert *stdtls.Certificate, authKey []byte) (*stdtls.Certific
 		return nil, ErrCertNoLeaf
 	}
 
-	mac, err := certMAC(authKey, cert.Leaf.RawSubjectPublicKeyInfo)
+	sig, err := certSignature(authKey, cert.Leaf.RawSubjectPublicKeyInfo)
 	if err != nil {
 		return nil, err
 	}
 
-	out, err := replaceSignature(cert.Certificate[0], mac)
+	out, err := replaceSignature(cert.Certificate[0], sig)
 	if err != nil {
 		return nil, err
 	}
@@ -180,7 +208,7 @@ func CertHMACOverlay(cert *stdtls.Certificate, authKey []byte) (*stdtls.Certific
 	// The overlay has to land in the field the client reads and disturb nothing
 	// the MAC is computed over. Checked rather than assumed: the failure mode it
 	// guards is certificates that look fine and silently fail to authenticate.
-	if !hmac.Equal(leaf.Signature, mac) || !bytes.Equal(leaf.RawSubjectPublicKeyInfo, cert.Leaf.RawSubjectPublicKeyInfo) {
+	if !hmac.Equal(leaf.Signature, sig) || !bytes.Equal(leaf.RawSubjectPublicKeyInfo, cert.Leaf.RawSubjectPublicKeyInfo) {
 		return nil, errors.New("reality cert: overlay did not land in the signature field")
 	}
 
@@ -204,12 +232,12 @@ type rawCertificate struct {
 
 // replaceSignature re-encodes der with sig in the signatureValue field.
 //
-// The MAC is not the width of the ECDSA signature it replaces, so the field
-// cannot be painted over where it lies: the BIT STRING's length changes, and
-// the enclosing SEQUENCE's along with it, possibly changing length form.
-// Re-encoding keeps the two in agreement. Hand-patching the length bytes works
-// until the first certificate that crosses a boundary, and then produces
-// certificates that fail to parse on the client.
+// Our signature is drawn from the same length distribution as the one it
+// replaces, but that does not make it the same length — three times in four the
+// two differ, and then the BIT STRING's length changes and the enclosing
+// SEQUENCE's with it. Re-encoding keeps the two in agreement. Painting over the
+// tail in place, which is what this used to do, silently required the lengths
+// to match.
 func replaceSignature(der, sig []byte) ([]byte, error) {
 	var c rawCertificate
 	rest, err := asn1.Unmarshal(der, &c)
@@ -248,18 +276,18 @@ func VerifyCertHMAC(rawCerts [][]byte, authKey []byte) error {
 		return fmt.Errorf("reality cert: parse peer certificate: %w", err)
 	}
 
-	// Before the MAC is derived, not after: the length of the comparison is the
-	// number of bytes a forger has to produce, and it arrives from the wire.
-	if len(cert.Signature) != certMACLen {
-		return ErrCertHMACLen
-	}
-
-	want, err := certMAC(authKey, cert.RawSubjectPublicKeyInfo)
+	// want is derived from authKey and the certificate's public key alone. Its
+	// length is therefore ours, not the peer's — cert.Signature is read once, on
+	// the line below, and nothing about the derivation depends on it. That is the
+	// property to preserve here: the version that expanded the MAC to
+	// len(cert.Signature) let a peer pick how many bytes it had to guess.
+	want, err := certSignature(authKey, cert.RawSubjectPublicKeyInfo)
 	if err != nil {
 		return err
 	}
 	// hmac.Equal, not bytes.Equal: this is a MAC comparison, and the upstream
-	// implementation using bytes.Equal here is not a reason to copy it.
+	// implementation using bytes.Equal here is not a reason to copy it. A field
+	// of the wrong length fails here too, since the lengths disagree.
 	if !hmac.Equal(want, cert.Signature) {
 		return ErrCertHMACMismatch
 	}
