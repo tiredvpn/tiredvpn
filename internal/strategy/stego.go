@@ -456,9 +456,13 @@ func (sc *HTTP2StegoConn) verifyServerAckHeaders(f *http2.HeadersFrame) bool {
 
 	sc.hpackDec.SetEmitFunc(func(hf hpack.HeaderField) {
 		if hf.Name == "x-goog-correlation-id" {
-			expectedAck := encodeToHex(deriveKey(sc.secret, "server-ack")[:16])
-			if hf.Value == expectedAck {
-				foundAck = true
+			raw := decodeFromHex(hf.Value)
+			if len(raw) >= stegoAckNonceLen+16 {
+				nonce := raw[:stegoAckNonceLen]
+				proof := raw[stegoAckNonceLen : stegoAckNonceLen+16]
+				if hmac.Equal(proof, serverAckMaterial(sc.secret, nonce)[:16]) {
+					foundAck = true
+				}
 			}
 		}
 	})
@@ -470,9 +474,10 @@ func (sc *HTTP2StegoConn) verifyServerAckHeaders(f *http2.HeadersFrame) bool {
 // verifyServerAckData checks DATA frame for ack magic
 func (sc *HTTP2StegoConn) verifyServerAckData(f *http2.DataFrame) bool {
 	data := f.Data()
-	if len(data) >= 8 {
-		expectedMagic := deriveKey(sc.secret, "server-ack")[:8]
-		return bytes.Equal(data[:8], expectedMagic)
+	if len(data) >= stegoAckNonceLen+8 {
+		nonce := data[:stegoAckNonceLen]
+		proof := data[stegoAckNonceLen : stegoAckNonceLen+8]
+		return hmac.Equal(proof, serverAckMaterial(sc.secret, nonce)[:8])
 	}
 	return false
 }
@@ -547,9 +552,8 @@ func (sc *HTTP2StegoConn) verifyClientAuth(f *http2.HeadersFrame) bool {
 	}
 
 	receivedToken := append(apiKeyBytes[:16], requestIDBytes[:16]...)
-	expectedToken := generateAuthToken(sc.secret)
 
-	return bytes.Equal(receivedToken, expectedToken)
+	return verifyAuthToken(sc.secret, receivedToken)
 }
 
 // sendServerAck sends acknowledgment to client
@@ -559,9 +563,19 @@ func (sc *HTTP2StegoConn) sendServerAck(streamID uint32) error {
 
 	sc.hpackEnc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
 	sc.hpackEnc.WriteField(hpack.HeaderField{Name: "content-type", Value: "application/grpc"})
+
+	// Bind the ack to a fresh nonce: value = hex(nonce || proof). A static
+	// deriveKey(secret,"server-ack") was one proof for the life of the secret.
+	var ackNonce [stegoAckNonceLen]byte
+	if _, err := rand.Read(ackNonce[:]); err != nil {
+		return err
+	}
+	ackVal := make([]byte, 0, stegoAckNonceLen+16)
+	ackVal = append(ackVal, ackNonce[:]...)
+	ackVal = append(ackVal, serverAckMaterial(sc.secret, ackNonce[:])[:16]...)
 	sc.hpackEnc.WriteField(hpack.HeaderField{
 		Name:  "x-goog-correlation-id",
-		Value: encodeToHex(deriveKey(sc.secret, "server-ack")[:16]),
+		Value: encodeToHex(ackVal),
 	})
 
 	return sc.framer.WriteHeaders(http2.HeadersFrameParam{
@@ -1197,14 +1211,55 @@ func deriveKey(secret []byte, context string) []byte {
 	return h.Sum(nil)
 }
 
+// stegoAuthSkewBuckets is how many 1-minute buckets on either side of "now"
+// verifyClientAuth accepts, so a client whose clock drifts by up to a minute
+// still authenticates (SSH and IMAP camouflage tolerate the same +-1). The
+// live server path (server.go verifyH2Auth) tolerates a wider window; this is
+// the stego-as-server path used by the relay and the tests.
+const stegoAuthSkewBuckets = 1
+
 func generateAuthToken(secret []byte) []byte {
+	return generateAuthTokenAt(secret, uint64(time.Now().Unix()/60)) // 1-minute window
+}
+
+// generateAuthTokenAt derives the auth token for a specific 1-minute bucket.
+func generateAuthTokenAt(secret []byte, bucket uint64) []byte {
 	timestamp := make([]byte, 8)
-	binary.BigEndian.PutUint64(timestamp, uint64(time.Now().Unix()/60)) // 1-minute window
+	binary.BigEndian.PutUint64(timestamp, bucket)
 
 	h := hmac.New(sha256.New, secret)
 	h.Write(timestamp)
 	h.Write([]byte("http2-stego-auth"))
 	return h.Sum(nil)[:32]
+}
+
+// verifyAuthToken reports whether receivedToken matches the token for any
+// bucket within +-stegoAuthSkewBuckets of now. The comparison is constant-time
+// (hmac.Equal) so it leaks nothing about how many leading bytes matched.
+func verifyAuthToken(secret, receivedToken []byte) bool {
+	now := time.Now().Unix() / 60
+	for offset := int64(-stegoAuthSkewBuckets); offset <= stegoAuthSkewBuckets; offset++ {
+		if hmac.Equal(receivedToken, generateAuthTokenAt(secret, uint64(now+offset))) {
+			return true
+		}
+	}
+	return false
+}
+
+// stegoAckNonceLen is the per-connection nonce the server prefixes to its ack
+// proof so the proof differs between connections instead of being one static
+// value for the whole life of the secret.
+const stegoAckNonceLen = 8
+
+// serverAckMaterial derives the server's ack proof from the secret and a
+// per-connection nonce. Binding to the nonce is what makes two connections'
+// acks differ; callers take the prefix they need (16 bytes in HEADERS, 8 in
+// the DATA fallback).
+func serverAckMaterial(secret, nonce []byte) []byte {
+	h := hmac.New(sha256.New, secret)
+	h.Write(nonce)
+	h.Write([]byte("server-ack"))
+	return h.Sum(nil)
 }
 
 // encodeToHex encodes bytes to a lowercase hex string.

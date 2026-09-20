@@ -4273,10 +4273,20 @@ func sendH2AuthAck(framer *http2.Framer, streamID uint32, secret []byte) {
 	enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
 	enc.WriteField(hpack.HeaderField{Name: "content-type", Value: "application/grpc"})
 
-	ackKey := deriveKey(secret, "server-ack")[:16]
+	// Bind the ack to a fresh per-connection nonce: value = hex(nonce || proof).
+	// deriveKey(secret,"server-ack") produced one static proof for the whole
+	// life of the secret, replayable across connections; the client verifies
+	// this format in stego.go verifyServerAckHeaders.
+	var ackNonce [stegoAckNonceLen]byte
+	if _, err := rand.Read(ackNonce[:]); err != nil {
+		return
+	}
+	ackVal := make([]byte, 0, stegoAckNonceLen+16)
+	ackVal = append(ackVal, ackNonce[:]...)
+	ackVal = append(ackVal, serverAckProof(secret, ackNonce[:])[:16]...)
 	enc.WriteField(hpack.HeaderField{
 		Name:  "x-goog-correlation-id",
-		Value: encodeHex(ackKey),
+		Value: encodeHex(ackVal),
 	})
 
 	framer.WriteHeaders(http2.HeadersFrameParam{
@@ -4290,6 +4300,20 @@ func sendH2AuthAck(framer *http2.Framer, streamID uint32, secret []byte) {
 func deriveKey(secret []byte, context string) []byte {
 	h := hmac.New(sha256.New, secret)
 	h.Write([]byte(context))
+	return h.Sum(nil)
+}
+
+// stegoAckNonceLen is the per-connection nonce the server prefixes to its H2
+// stego ack proof. Must match strategy.stegoAckNonceLen (the client decoder).
+const stegoAckNonceLen = 8
+
+// serverAckProof derives the H2 stego ack proof from the secret and a
+// per-connection nonce, so the proof differs between connections instead of
+// being a single static value. Must match strategy.serverAckMaterial.
+func serverAckProof(secret, nonce []byte) []byte {
+	h := hmac.New(sha256.New, secret)
+	h.Write(nonce)
+	h.Write([]byte("server-ack"))
 	return h.Sum(nil)
 }
 
