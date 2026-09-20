@@ -76,6 +76,12 @@ func (f *FragmentedWriter) Write(p []byte) (int, error) {
 func (f *FragmentedWriter) writeFragmented(data []byte) (int, error) {
 	totalWritten := 0
 	fragSize := f.config.FragmentSize
+	if fragSize < 1 {
+		// Guard against a caller-supplied FragmentSize of 0 (infinite loop:
+		// offset never advances) or a negative value (data[offset:end] panics
+		// with end < offset). Fall back to single-byte segments.
+		fragSize = 1
+	}
 
 	for offset := 0; offset < len(data); {
 		end := offset + fragSize
