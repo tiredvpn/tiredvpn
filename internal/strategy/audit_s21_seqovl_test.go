@@ -75,3 +75,42 @@ func TestSeqovlPacketMarkerNonceBound(t *testing.T) {
 		t.Fatal("marker verifies under a different secret")
 	}
 }
+
+// The server-side dropper recomputes the MAC over the nonce embedded in the fake
+// segment's marker. This checks the client marker and the geneva verifier agree:
+// a client-minted marker verifies under a verifier bound to the same secret, and
+// a different secret does not (negative control, rule 2).
+func TestSeqovlPacketMarkerServerVerify(t *testing.T) {
+	t.Parallel()
+	secret := []byte("seqovl-verify-secret")
+
+	verify := geneva.OverlapMarkerVerifier{
+		NonceLen: seqovlPacketNonceLen,
+		Mint:     func(nonce []byte) []byte { return seqovlPacketMarker(secret, nonce) },
+	}
+
+	nonce := []byte("nonce123") // seqovlPacketNonceLen (8) bytes
+	marker := seqovlPacketMarker(secret, nonce)
+
+	// A fake payload is [marker][junk]; the verifier reads only the marker prefix.
+	payload := append(append([]byte(nil), marker...), bytes.Repeat([]byte{0x99}, 40)...)
+	if !verify.Matches(payload) {
+		t.Fatal("client marker does not verify under the matching server verifier")
+	}
+
+	// Wrong secret must not verify.
+	wrong := geneva.OverlapMarkerVerifier{
+		NonceLen: seqovlPacketNonceLen,
+		Mint:     func(nonce []byte) []byte { return seqovlPacketMarker([]byte("other"), nonce) },
+	}
+	if wrong.Matches(payload) {
+		t.Fatal("marker verified under a verifier bound to a different secret")
+	}
+
+	// A genuine ClientHello record (>= marker length, so it clears the length gate
+	// and actually exercises the MAC comparison) must not be mistaken for a fake.
+	realCH := append([]byte{0x16, 0x03, 0x03, 0x01, 0x00, 0x01, 0x00, 0x00, 0xfc}, bytes.Repeat([]byte{0x00}, 32)...)
+	if verify.Matches(realCH) {
+		t.Fatal("real ClientHello recognised as a fake marker")
+	}
+}
