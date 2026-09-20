@@ -16,17 +16,23 @@ package wiretest_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"io"
+	"net"
 	"testing"
 	"time"
 
+	"github.com/quic-go/quic-go"
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
 	"github.com/tiredvpn/tiredvpn/internal/wiretest"
+	"golang.org/x/net/http2"
 )
 
 // ---------------------------------------------------------------------------
@@ -378,4 +384,478 @@ func quiesced(d *wiretest.Dump, dir wiretest.Direction) bool {
 		}
 	}
 	return false
+}
+
+// ---------------------------------------------------------------------------
+// HTTP/2 Stego: the "TIRD" DATA-frame magic (S7)
+// ---------------------------------------------------------------------------
+
+// legacyStegoDump rebuilds a 1.10.0 covert DATA frame: [TIRD][flags:1][len:2]
+// [payload], carried in one HTTP/2 DATA frame. It exists to feed the frame
+// matcher something it is known to match; nothing depends on it.
+func legacyStegoDump(t *testing.T) *wiretest.Dump {
+	t.Helper()
+	frame := append([]byte("TIRD"), 0x00) // magic + raw flag
+	var l [2]byte
+	binary.BigEndian.PutUint16(l[:], 4)
+	frame = append(frame, l[:]...)
+	frame = append(frame, []byte("data")...)
+
+	var buf bytes.Buffer
+	fr := http2.NewFramer(&buf, nil)
+	fr.AllowIllegalWrites = true
+	if err := fr.WriteData(1, false, frame); err != nil {
+		t.Fatalf("build legacy stego frame: %v", err)
+	}
+	d := wiretest.NewDump("stego-1.10.0", wiretest.LayerFraming)
+	d.Record(wiretest.C2S, buf.Bytes())
+	return d
+}
+
+// stegoDataPayloads parses the HTTP/2 frames in one direction and returns each
+// DATA frame's payload, so a test can inspect the keyed prefix directly.
+func stegoDataPayloads(d *wiretest.Dump, dir wiretest.Direction) [][]byte {
+	b := bytes.TrimPrefix(d.Bytes(dir), []byte(http2.ClientPreface))
+	fr := http2.NewFramer(io.Discard, bytes.NewReader(b))
+	fr.AllowIllegalReads = true
+	fr.SetMaxReadFrameSize(1 << 20)
+	var out [][]byte
+	for {
+		f, err := fr.ReadFrame()
+		if err != nil {
+			break
+		}
+		if df, ok := f.(*http2.DataFrame); ok {
+			out = append(out, append([]byte(nil), df.Data()...))
+		}
+	}
+	return out
+}
+
+// driveStego runs one stego connection, writes `writes` chunks of `size` bytes,
+// and returns the framing-layer capture once at least `writes` DATA frames have
+// crossed the socket.
+func driveStego(t *testing.T, writes, size int) *wiretest.Dump {
+	t.Helper()
+	ln := wiretest.Listen(t, "stego", wiretest.LayerFraming)
+	srvReady := make(chan struct{})
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		srv := strategy.NewHTTP2StegoConn(c, testSecret, false, strategy.NaivePaddingStandard)
+		if err := srv.Handshake(); err != nil {
+			return
+		}
+		close(srvReady)
+		_, _ = io.Copy(io.Discard, srv)
+	}()
+
+	raw, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer raw.Close()
+
+	cli := strategy.NewHTTP2StegoConn(raw, testSecret, true, strategy.NaivePaddingStandard)
+	if err := cli.Handshake(); err != nil {
+		t.Fatalf("stego client handshake: %v", err)
+	}
+	<-srvReady
+
+	for i := 0; i < writes; i++ {
+		if _, err := cli.Write(make([]byte, size)); err != nil {
+			t.Fatalf("stego write %d: %v", i, err)
+		}
+	}
+
+	waitFor(t, 10*time.Second, "covert DATA frames", func() bool {
+		return len(stegoDataPayloads(ln.First(), wiretest.C2S)) >= writes
+	})
+	return ln.First()
+}
+
+// TestStegoCarriesNoTIRDMagic is the inverted form of the 1.10.0 fixation.
+//
+// Before: every covert DATA frame opened with the ASCII literal "TIRD". Now it
+// opens with [nonce][marker] keyed to the secret. The positive control is a
+// 1.10.0 DATA frame, which the same frame matcher must still find.
+func TestStegoCarriesNoTIRDMagic(t *testing.T) {
+	legacy := legacyStegoDump(t)
+	if _, ok := wiretest.H2DataPayloadPrefix(legacy, wiretest.C2S, "TIRD"); !ok {
+		t.Fatal("control: the TIRD matcher does not fire on a 1.10.0 DATA frame, " +
+			"so its silence below would mean nothing")
+	}
+
+	live := driveStego(t, 1, 1200)
+	if _, ok := wiretest.H2DataPayloadPrefix(live, wiretest.C2S, ""); !ok {
+		t.Fatal("no covert DATA frame captured: 'no TIRD' would be vacuous")
+	}
+	if f, ok := wiretest.H2DataPayloadPrefix(live, wiretest.C2S, "TIRD"); ok {
+		t.Fatalf("the TIRD magic is back at the head of a stego DATA frame at %s", f)
+	}
+	t.Log("covert DATA frames open with a keyed marker, not TIRD")
+}
+
+// TestStegoMarkerLengthSpansItsRange records the marker-length distribution over
+// many DATA frames. The code documents the marker as flat over [8,24) with no
+// measured population to check the shape against; this pins what the
+// implementation actually produces so a later narrowing shows up as a diff.
+func TestStegoMarkerLengthSpansItsRange(t *testing.T) {
+	live := driveStego(t, 80, 500)
+	payloads := stegoDataPayloads(live, wiretest.C2S)
+	if len(payloads) < 16 {
+		t.Fatalf("only %d covert DATA frames captured; too few to measure a distribution", len(payloads))
+	}
+
+	seen := map[int]int{}
+	for i, p := range payloads {
+		if len(p) < strategy.StegoNonceLen {
+			t.Fatalf("frame %d shorter than the nonce", i)
+		}
+		nonce := p[:strategy.StegoNonceLen]
+		marker := strategy.StegoClientMarker(testSecret, nonce)
+		if len(p) < strategy.StegoNonceLen+len(marker) ||
+			!hmac.Equal(p[strategy.StegoNonceLen:strategy.StegoNonceLen+len(marker)], marker) {
+			t.Fatalf("frame %d: the keyed client marker did not verify against the secret", i)
+		}
+		seen[len(marker)]++
+	}
+
+	for n := range seen {
+		if n < 8 || n >= 24 {
+			t.Fatalf("stego marker length %d is outside the documented [8,24)", n)
+		}
+	}
+	if len(seen) < 8 {
+		t.Fatalf("only %d distinct marker lengths over %d frames (%v); "+
+			"a length this concentrated is a fingerprint, not a range", len(seen), len(payloads), seen)
+	}
+	t.Logf("stego marker length over %d frames: %d distinct values, histogram %v",
+		len(payloads), len(seen), seen)
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket Padded and Geneva: the product headers (S8)
+// ---------------------------------------------------------------------------
+
+// legacyWSUpgrade is the 1.10.0 upgrade request head, product headers included.
+const legacyWSUpgrade = "GET /ws HTTP/1.1\r\n" +
+	"Host: chat.openai.com\r\n" +
+	"Upgrade: websocket\r\n" +
+	"Connection: Upgrade\r\n" +
+	"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+	"Sec-WebSocket-Version: 13\r\n" +
+	"X-Salamander-Version: 1.0\r\n" +
+	"X-Auth-Token: deadbeef\r\n" +
+	"User-Agent: Mozilla/5.0 (compatible; TiredVPN/2.0)\r\n" +
+	"\r\n"
+
+// assertNoProductHeaders is the inverted assertUpgradeMarkers: the two product
+// headers must NOT be in the TLS plaintext, but the keyed X-Auth-Token still is.
+func assertNoProductHeaders(t *testing.T, sess session, who string) {
+	t.Helper()
+
+	if _, ok := wiretest.Literal(sess.Plain, wiretest.C2S, "Upgrade: websocket"); !ok {
+		t.Fatalf("%s: no upgrade request reached the plaintext; 'no product headers' would be vacuous", who)
+	}
+	if f, ok := wiretest.Literal(sess.Plain, wiretest.C2S, "X-Salamander-Version"); ok {
+		t.Fatalf("%s: the X-Salamander-Version header is back in the plaintext at %s", who, f)
+	}
+	if f, ok := wiretest.Literal(sess.Plain, wiretest.C2S, "TiredVPN/2.0"); ok {
+		t.Fatalf("%s: the TiredVPN/2.0 self-report is back in the plaintext at %s", who, f)
+	}
+	if _, ok := wiretest.Literal(sess.Plain, wiretest.C2S, "X-Auth-Token:"); !ok {
+		t.Fatalf("%s: the keyed X-Auth-Token discriminator is missing", who)
+	}
+}
+
+// TestWebSocketPaddedDropsProductHeaders is the inverted form of the header
+// fixation. The positive control is the 1.10.0 upgrade text, which the same
+// literal matcher must still find.
+func TestWebSocketPaddedDropsProductHeaders(t *testing.T) {
+	control := wiretest.NewDump("ws-1.10.0", wiretest.LayerTLSPlaintext)
+	control.Record(wiretest.C2S, []byte(legacyWSUpgrade))
+	if _, ok := wiretest.Literal(control, wiretest.C2S, "X-Salamander-Version: 1.0"); !ok {
+		t.Fatal("control: the X-Salamander-Version matcher does not fire on the 1.10.0 upgrade")
+	}
+	if _, ok := wiretest.Literal(control, wiretest.C2S, "TiredVPN/2.0"); !ok {
+		t.Fatal("control: the TiredVPN/2.0 matcher does not fire on the 1.10.0 upgrade")
+	}
+
+	ln := wiretest.Listen(t, "ws-padded", wiretest.LayerTCP)
+	sessions := serveWSUpgrade(t, ln, true)
+	m := managerAt(t, ln.Addr())
+	s := strategy.NewWebSocketPaddedStrategy(m, testSecret)
+	go func() {
+		if conn, err := s.Connect(testCtx(t), "wiretest"); err == nil {
+			conn.Close()
+		}
+	}()
+
+	select {
+	case sess := <-sessions:
+		assertNoProductHeaders(t, sess, "websocket_padded")
+	case <-time.After(15 * time.Second):
+		t.Fatal("websocket_padded upgrade never reached the server")
+	}
+}
+
+// TestGenevaDropsProductHeaders fixes the same two headers on the Geneva path,
+// which sends a byte-for-byte copy of the WebSocket upgrade.
+func TestGenevaDropsProductHeaders(t *testing.T) {
+	ln := wiretest.Listen(t, "geneva", wiretest.LayerTCP)
+	sessions := serveWSUpgrade(t, ln, false)
+	m := managerAt(t, ln.Addr())
+	s := strategy.NewGenevaStrategy(m, testSecret, "russia")
+	defer s.Close()
+	go func() {
+		if conn, err := s.Connect(testCtx(t), "wiretest"); err == nil {
+			conn.Close()
+		}
+	}()
+
+	select {
+	case sess := <-sessions:
+		assertNoProductHeaders(t, sess, "geneva")
+	case <-time.After(15 * time.Second):
+		t.Fatal("geneva upgrade never reached the server")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// QUIC: the "tiredvpn" ALPN and the "QVPN" stream magic (S7 + S8)
+// ---------------------------------------------------------------------------
+
+// driveQUIC runs one QUIC client against a listener that answers h3 and captures
+// the ClientHello ALPN plus the first stream's opening bytes. The fixture never
+// acks, so the client's Handshake times out after writing its auth frame - by
+// which point both observation points are recorded.
+func driveQUIC(t *testing.T) (protos []string, streamHead []byte) {
+	t.Helper()
+	udp, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("udp listen: %v", err)
+	}
+	defer udp.Close()
+
+	alpn := make(chan []string, 4)
+	tlsConf := &tls.Config{
+		Certificates: []tls.Certificate{testCert(t)},
+		MinVersion:   tls.VersionTLS13,
+		NextProtos:   []string{"h3"},
+		GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
+			select {
+			case alpn <- chi.SupportedProtos:
+			default:
+			}
+			return nil, nil
+		},
+	}
+	ln, err := quic.Listen(udp, tlsConf, &quic.Config{MaxIdleTimeout: 20 * time.Second})
+	if err != nil {
+		t.Fatalf("quic listen: %v", err)
+	}
+	defer ln.Close()
+
+	headCh := make(chan []byte, 1)
+	go func() {
+		conn, err := ln.Accept(context.Background())
+		if err != nil {
+			return
+		}
+		st, err := conn.AcceptStream(context.Background())
+		if err != nil {
+			return
+		}
+		buf := make([]byte, 64)
+		n, _ := io.ReadFull(st, buf)
+		headCh <- buf[:n]
+	}()
+
+	m := managerAt(t, udp.LocalAddr())
+	s := strategy.NewQUICStrategy(m, testSecret, 0)
+	go func() {
+		if conn, err := s.Connect(testCtx(t), "wiretest"); err == nil {
+			conn.Close()
+		}
+	}()
+
+	select {
+	case protos = <-alpn:
+	case <-time.After(15 * time.Second):
+		t.Fatal("no QUIC ClientHello reached the server")
+	}
+	select {
+	case streamHead = <-headCh:
+	case <-time.After(15 * time.Second):
+		t.Fatal("no QUIC stream head captured")
+	}
+	return protos, streamHead
+}
+
+// TestQUICAdvertisesH3NotTiredVPN checks the ALPN was renamed to the RFC 9114
+// "h3" token and that our client's advertised ALPN matches a stock quic-go h3
+// client's, so the Initial is compared against a real h3 client rather than
+// against nothing (verification rule 4).
+func TestQUICAdvertisesH3NotTiredVPN(t *testing.T) {
+	if _, ok := wiretest.Contains([]string{"tiredvpn"}, "tiredvpn"); !ok {
+		t.Fatal("control: Contains does not match tiredvpn in a list that holds it")
+	}
+
+	udp, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("udp listen: %v", err)
+	}
+	defer udp.Close()
+
+	alpn := make(chan []string, 8)
+	tlsConf := &tls.Config{
+		Certificates: []tls.Certificate{testCert(t)},
+		MinVersion:   tls.VersionTLS13,
+		NextProtos:   []string{"h3"},
+		GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
+			select {
+			case alpn <- chi.SupportedProtos:
+			default:
+			}
+			return nil, nil
+		},
+	}
+	ln, err := quic.Listen(udp, tlsConf, &quic.Config{MaxIdleTimeout: 20 * time.Second})
+	if err != nil {
+		t.Fatalf("quic listen: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			if _, err := ln.Accept(context.Background()); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Our client.
+	m := managerAt(t, udp.LocalAddr())
+	s := strategy.NewQUICStrategy(m, testSecret, 0)
+	go func() {
+		if conn, err := s.Connect(testCtx(t), "wiretest"); err == nil {
+			conn.Close()
+		}
+	}()
+
+	// Positive control: a stock quic-go client advertising the h3 token.
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		ctrl := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}, ServerName: "localhost"}
+		if c, err := quic.DialAddr(ctx, udp.LocalAddr().String(), ctrl, &quic.Config{}); err == nil {
+			c.CloseWithError(0, "")
+		}
+	}()
+
+	var got [][]string
+	deadline := time.After(20 * time.Second)
+	for len(got) < 2 {
+		select {
+		case p := <-alpn:
+			got = append(got, p)
+		case <-deadline:
+			t.Fatalf("only %d of 2 ClientHellos reached the server: %v", len(got), got)
+		}
+	}
+
+	for _, p := range got {
+		if f, ok := wiretest.Contains(p, "tiredvpn"); ok {
+			t.Fatalf("the tiredvpn ALPN is back in a QUIC ClientHello at %s", f)
+		}
+		if _, ok := wiretest.Contains(p, "h3"); !ok {
+			t.Fatalf("expected the h3 ALPN, got %v", p)
+		}
+	}
+	t.Logf("our client and a stock quic-go h3 client both advertised h3: %v", got)
+}
+
+// TestQUICStreamHeadCarriesNoQVPN is the inverted form of the QVPN fixation.
+func TestQUICStreamHeadCarriesNoQVPN(t *testing.T) {
+	legacy := wiretest.NewDump("quic-1.10.0", wiretest.LayerQUICStream)
+	legacy.Record(wiretest.C2S, append([]byte("QVPN"), make([]byte, 32)...))
+	if _, ok := wiretest.PrefixAt(legacy, wiretest.C2S, "QVPN"); !ok {
+		t.Fatal("control: the QVPN matcher does not fire on a 1.10.0 auth frame")
+	}
+
+	_, head := driveQUIC(t)
+	if len(head) < strategy.QUICNonceLen {
+		t.Fatalf("only %d stream bytes captured: 'no QVPN' would be vacuous", len(head))
+	}
+
+	live := wiretest.NewDump("quic-stream-live", wiretest.LayerQUICStream)
+	live.Record(wiretest.C2S, head)
+	if f, ok := wiretest.PrefixAt(live, wiretest.C2S, "QVPN"); ok {
+		t.Fatalf("the QVPN magic is back at offset 0 of the QUIC stream at %s", f)
+	}
+
+	// The keyed marker must verify where QVPN used to sit.
+	nonce := head[:strategy.QUICNonceLen]
+	marker := strategy.QUICClientMarker(testSecret, nonce)
+	if len(head) < strategy.QUICNonceLen+len(marker) ||
+		!hmac.Equal(head[strategy.QUICNonceLen:strategy.QUICNonceLen+len(marker)], marker) {
+		t.Fatal("the keyed client marker did not verify against the secret")
+	}
+	t.Log("the QUIC stream opens with a fresh nonce and keyed marker, not QVPN")
+}
+
+// TestQUICNonceMakesMarkersDiffer confirms the nonce actually varies the opening
+// bytes: two connections with the same secret must not produce the same marker.
+func TestQUICNonceMakesMarkersDiffer(t *testing.T) {
+	_, a := driveQUIC(t)
+	_, b := driveQUIC(t)
+	if len(a) < strategy.QUICNonceLen || len(b) < strategy.QUICNonceLen {
+		t.Fatalf("stream heads too short: %d, %d", len(a), len(b))
+	}
+	if bytes.Equal(a[:strategy.QUICNonceLen], b[:strategy.QUICNonceLen]) {
+		t.Fatal("two connections chose the same nonce; the opening bytes repeat")
+	}
+	na := strategy.QUICClientMarker(testSecret, a[:strategy.QUICNonceLen])
+	nb := strategy.QUICClientMarker(testSecret, b[:strategy.QUICNonceLen])
+	if bytes.Equal(a[:strategy.QUICNonceLen+len(na)], b[:strategy.QUICNonceLen+len(nb)]) {
+		t.Fatal("two connections produced identical nonce+marker prefixes")
+	}
+}
+
+// TestQUICMarkerLengthSpansItsRange records the QUIC marker-length distribution.
+// The length is derived from the nonce and documented as flat over [16,32) with
+// no measured population to check against; this pins what is produced.
+func TestQUICMarkerLengthSpansItsRange(t *testing.T) {
+	const conns = 24
+	seen := map[int]int{}
+	for i := 0; i < conns; i++ {
+		_, head := driveQUIC(t)
+		if len(head) < strategy.QUICNonceLen {
+			t.Fatalf("connection %d: stream head too short (%d bytes)", i, len(head))
+		}
+		nonce := head[:strategy.QUICNonceLen]
+		marker := strategy.QUICClientMarker(testSecret, nonce)
+		if len(head) < strategy.QUICNonceLen+len(marker) ||
+			!hmac.Equal(head[strategy.QUICNonceLen:strategy.QUICNonceLen+len(marker)], marker) {
+			t.Fatalf("connection %d: the keyed marker did not verify", i)
+		}
+		if got := strategy.QUICMarkerLen(nonce); got != len(marker) {
+			t.Fatalf("connection %d: QUICMarkerLen says %d, marker is %d bytes", i, got, len(marker))
+		}
+		seen[len(marker)]++
+	}
+
+	for n := range seen {
+		if n < 16 || n >= 32 {
+			t.Fatalf("QUIC marker length %d is outside the documented [16,32)", n)
+		}
+	}
+	if len(seen) < 8 {
+		t.Fatalf("only %d distinct marker lengths over %d connections (%v); "+
+			"a length this concentrated is a fingerprint, not a range", len(seen), conns, seen)
+	}
+	t.Logf("QUIC marker length over %d connections: %d distinct values, histogram %v",
+		conns, len(seen), seen)
 }

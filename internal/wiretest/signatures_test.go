@@ -14,13 +14,11 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
-	"crypto/tls"
 	"io"
 	"net"
 	"testing"
 	"time"
 
-	"github.com/quic-go/quic-go"
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
 	"github.com/tiredvpn/tiredvpn/internal/wiretest"
 )
@@ -44,66 +42,12 @@ func testCtx(t *testing.T) context.Context {
 	return ctx
 }
 
-// ---------------------------------------------------------------------------
-// HTTP/2 Stego: the "TIRD" DATA-frame magic
-// ---------------------------------------------------------------------------
-
-// TestSignatureStegoTIRDFrameMagic fixes the four-byte magic that opens every
-// covert DATA frame.
-//
-// stego.go builds [TIRD][flags:1][len:2][payload][cover] and hands it to the
-// HTTP/2 framer. Anything that can see the HTTP/2 framing — our own server, a
-// TLS-terminating middlebox, a CDN we tunnel through — reads a constant at
-// offset 0 of every DATA payload. Real gRPC, which this is dressed as, puts a
-// 1-byte compressed flag and a 4-byte length there.
-//
-// Observation point is the HTTP/2 framing, not the TCP stream: production wraps
-// this in TLS, so the magic is one decrypt away from a passive observer, not
-// visible to one.
-func TestSignatureStegoTIRDFrameMagic(t *testing.T) {
-	ln := wiretest.Listen(t, "stego", wiretest.LayerFraming)
-	srvReady := make(chan struct{})
-	go func() {
-		c, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		srv := strategy.NewHTTP2StegoConn(c, testSecret, false, strategy.NaivePaddingStandard)
-		if err := srv.Handshake(); err != nil {
-			t.Errorf("stego server handshake: %v", err)
-			return
-		}
-		close(srvReady)
-		_, _ = io.Copy(io.Discard, srv)
-	}()
-
-	raw, err := net.Dial("tcp", ln.Addr().String())
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer raw.Close()
-
-	cli := strategy.NewHTTP2StegoConn(raw, testSecret, true, strategy.NaivePaddingStandard)
-	if err := cli.Handshake(); err != nil {
-		t.Fatalf("stego client handshake: %v", err)
-	}
-	<-srvReady
-
-	if _, err := cli.Write(make([]byte, 1200)); err != nil {
-		t.Fatalf("stego write: %v", err)
-	}
-
-	var f wiretest.Finding
-	var ok bool
-	waitFor(t, 5*time.Second, "covert DATA frame", func() bool {
-		f, ok = wiretest.H2DataPayloadPrefix(ln.First(), wiretest.C2S, "TIRD")
-		return ok
-	})
-	t.Logf("TIRD magic found at %s", f)
-}
+// The stego "TIRD" magic, the Salamander upgrade headers, and the QUIC ALPN and
+// "QVPN"/"QACK" magics were fixed in the 1.11.0 audit; their detectors moved to
+// absence_test.go, where each carries its own positive control.
 
 // ---------------------------------------------------------------------------
-// WebSocket Padded and Geneva: the Salamander upgrade headers
+// WebSocket Padded and Geneva: the upgrade fixture (shared with absence_test.go)
 // ---------------------------------------------------------------------------
 
 // serveWSUpgrade answers the WebSocket upgrade both strategies send. readDispatch
@@ -123,204 +67,6 @@ func serveWSUpgrade(t *testing.T, ln *wiretest.Listener, readDispatch bool) <-ch
 		}
 		_, _ = c.Write([]byte(wsUpgradeResponse))
 	})
-}
-
-// TestSignatureWebSocketPaddedHeaders fixes the two constant headers the
-// WebSocket Padded upgrade carries.
-//
-// X-Salamander-Version is not a header any real client sends — the server's own
-// detectWebSocketPadded keys off it, which is exactly the property that makes
-// it a fingerprint. The User-Agent names the product in clear text. Both sit in
-// the TLS plaintext, so a passive box does not see them; anything terminating
-// TLS, including the CDN edges we route through, does.
-func TestSignatureWebSocketPaddedHeaders(t *testing.T) {
-	ln := wiretest.Listen(t, "ws-padded", wiretest.LayerTCP)
-	sessions := serveWSUpgrade(t, ln, true)
-
-	m := managerAt(t, ln.Addr())
-	s := strategy.NewWebSocketPaddedStrategy(m, testSecret)
-
-	go func() {
-		conn, err := s.Connect(testCtx(t), "wiretest")
-		if err == nil {
-			conn.Close()
-		}
-	}()
-
-	var sess session
-	select {
-	case sess = <-sessions:
-	case <-time.After(15 * time.Second):
-		t.Fatal("websocket_padded upgrade never reached the server")
-	}
-
-	assertUpgradeMarkers(t, sess, "websocket_padded")
-}
-
-// TestSignatureGenevaHeaders fixes the same two headers on the Geneva path.
-//
-// Geneva fragments the ClientHello to defeat SNI matching and then sends a
-// byte-for-byte copy of the WebSocket Padded upgrade, product name included.
-// The packet-level evasion and the application-level giveaway are independent:
-// fixing one does nothing for the other.
-func TestSignatureGenevaHeaders(t *testing.T) {
-	ln := wiretest.Listen(t, "geneva", wiretest.LayerTCP)
-	sessions := serveWSUpgrade(t, ln, false)
-
-	m := managerAt(t, ln.Addr())
-	s := strategy.NewGenevaStrategy(m, testSecret, "russia")
-	defer s.Close()
-
-	go func() {
-		conn, err := s.Connect(testCtx(t), "wiretest")
-		if err == nil {
-			conn.Close()
-		}
-	}()
-
-	var sess session
-	select {
-	case sess = <-sessions:
-	case <-time.After(15 * time.Second):
-		t.Fatal("geneva upgrade never reached the server")
-	}
-
-	assertUpgradeMarkers(t, sess, "geneva")
-}
-
-func assertUpgradeMarkers(t *testing.T, sess session, who string) {
-	t.Helper()
-
-	f, ok := wiretest.Literal(sess.Plain, wiretest.C2S, "X-Salamander-Version: 1.0")
-	if !ok {
-		t.Fatalf("%s: expected the X-Salamander-Version header in the TLS plaintext; "+
-			"if it is gone on purpose, invert this assertion", who)
-	}
-	t.Logf("%s: X-Salamander-Version found at %s", who, f)
-
-	f, ok = wiretest.Literal(sess.Plain, wiretest.C2S, "TiredVPN/2.0")
-	if !ok {
-		t.Fatalf("%s: expected the TiredVPN/2.0 User-Agent in the TLS plaintext; "+
-			"if it is gone on purpose, invert this assertion", who)
-	}
-	t.Logf("%s: TiredVPN/2.0 User-Agent found at %s", who, f)
-
-	// Positive control for the layer split: the same bytes must NOT be readable
-	// on the TCP stream. If they were, the capture would be reading the
-	// plaintext twice and every "not on the wire" claim from this harness would
-	// be worthless.
-	if _, hit := wiretest.Literal(sess.Wire, wiretest.C2S, "X-Salamander-Version"); hit {
-		t.Fatalf("%s: the header is readable on the raw TCP stream — "+
-			"the fixture is not actually encrypting, so the layer labels lie", who)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// QUIC: the "tiredvpn" ALPN and the "QVPN" stream magic
-// ---------------------------------------------------------------------------
-
-// TestSignatureQUICALPNAndMagic fixes two QUIC fingerprints at once, because
-// one fixture produces both.
-//
-//   - ALPN "tiredvpn" in the ClientHello. QUIC Initial packets are protected
-//     with keys derived from the published salt in RFC 9001, so any QUIC-aware
-//     box decrypts them without a session key and reads the ALPN. A protocol
-//     name nobody else uses identifies the deployment outright.
-//   - "QVPN" at offset 0 of the first stream. Constant magic in the first four
-//     bytes a peer reads, followed by a fixed 32-byte token.
-//
-// The two are recorded at different points and the test says which: ALPN comes
-// from the server's parse of the ClientHello, QVPN from the stream plaintext.
-// Neither is a raw datagram scan — the datagram capture is kept as a control
-// below, where it must NOT find the literal.
-func TestSignatureQUICALPNAndMagic(t *testing.T) {
-	udp, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("udp listen: %v", err)
-	}
-	defer udp.Close()
-
-	datagrams := wiretest.NewDump("quic", wiretest.LayerQUICDatagram)
-	rec := wiretest.NewPacketConn(udp, datagrams)
-
-	alpn := make(chan []string, 4)
-	tlsConf := &tls.Config{
-		Certificates: []tls.Certificate{testCert(t)},
-		MinVersion:   tls.VersionTLS13,
-		NextProtos:   []string{"tiredvpn"},
-		GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
-			select {
-			case alpn <- chi.SupportedProtos:
-			default:
-			}
-			return nil, nil
-		},
-	}
-
-	ln, err := quic.Listen(rec, tlsConf, &quic.Config{MaxIdleTimeout: 20 * time.Second})
-	if err != nil {
-		t.Fatalf("quic listen: %v", err)
-	}
-	defer ln.Close()
-
-	streamHead := wiretest.NewDump("quic-stream", wiretest.LayerQUICStream)
-	go func() {
-		conn, err := ln.Accept(context.Background())
-		if err != nil {
-			return
-		}
-		st, err := conn.AcceptStream(context.Background())
-		if err != nil {
-			return
-		}
-		buf := make([]byte, 36)
-		n, _ := io.ReadFull(st, buf)
-		streamHead.Record(wiretest.C2S, buf[:n])
-	}()
-
-	m := managerAt(t, udp.LocalAddr())
-	s := strategy.NewQUICStrategy(m, testSecret, 0)
-	go func() {
-		conn, err := s.Connect(testCtx(t), "wiretest")
-		if err == nil {
-			conn.Close()
-		}
-	}()
-
-	var protos []string
-	select {
-	case protos = <-alpn:
-	case <-time.After(15 * time.Second):
-		t.Fatal("no QUIC ClientHello reached the server")
-	}
-
-	f, ok := wiretest.Contains(protos, "tiredvpn")
-	if !ok {
-		t.Fatalf("expected ALPN \"tiredvpn\" in the QUIC ClientHello, got %v; "+
-			"if it was renamed on purpose, invert this assertion", protos)
-	}
-	t.Logf("ALPN tiredvpn found at %s", f)
-
-	waitFor(t, 15*time.Second, "QUIC auth frame", func() bool {
-		return streamHead.Len(wiretest.C2S) >= 4
-	})
-	f, ok = wiretest.PrefixAt(streamHead, wiretest.C2S, "QVPN")
-	if !ok {
-		t.Fatalf("expected the QVPN magic at offset 0 of the first QUIC stream; " +
-			"if it is gone on purpose, invert this assertion")
-	}
-	t.Logf("QVPN magic found at %s", f)
-
-	// Control: header protection means a byte scan of the datagrams finds
-	// nothing. This is what keeps the two observation points honest — if this
-	// ever fires, the ALPN finding above stops meaning "one Initial decrypt
-	// away" and starts meaning "in the clear".
-	if datagrams.Len(wiretest.C2S) == 0 {
-		t.Fatal("no datagrams captured: the packet-conn recorder is not wired up")
-	}
-	if _, hit := wiretest.Literal(datagrams, wiretest.C2S, "tiredvpn"); hit {
-		t.Fatal("ALPN is readable in the raw datagrams without unprotecting the Initial")
-	}
 }
 
 // ---------------------------------------------------------------------------
