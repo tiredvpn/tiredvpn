@@ -20,6 +20,7 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/padding"
 	"github.com/tiredvpn/tiredvpn/internal/protect"
+	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 	"golang.org/x/crypto/hkdf"
 )
 
@@ -520,8 +521,14 @@ type QUICConn struct {
 
 // Handshake performs authentication
 func (c *QUICConn) Handshake() error {
-	// Generate time-based auth token
-	token := c.generateAuthToken()
+	// Generate time-based auth token bound to this QUIC connection's TLS session
+	// exporter (S22): a token lifted from another connection carries that
+	// connection's exporter and fails the server's check.
+	ekm, err := quicExporterKey(c.Conn)
+	if err != nil {
+		return fmt.Errorf("quic: export keying material: %w", err)
+	}
+	token := c.generateAuthToken(ekm)
 
 	// Fresh per-connection nonce keys the marker and never repeats the opening
 	// bytes across connections.
@@ -570,14 +577,30 @@ func (c *QUICConn) Handshake() error {
 	return nil
 }
 
-func (c *QUICConn) generateAuthToken() []byte {
-	// Time-based token (1-minute window)
-	timestamp := make([]byte, 8)
-	binary.BigEndian.PutUint64(timestamp, uint64(time.Now().Unix()/60))
+func (c *QUICConn) generateAuthToken(ekm []byte) []byte {
+	return quicAuthToken(c.secret, ekm, 0)
+}
 
-	h := hmac.New(sha256.New, c.secret)
+// quicExporterKey pulls the RFC 8446 §7.5 exporter out of a QUIC connection's
+// underlying TLS 1.3 session for auth-token binding. quic-go surfaces the
+// crypto/tls state via Conn.ConnectionState().TLS, whose ExportKeyingMaterial
+// is populated for a completed handshake.
+func quicExporterKey(conn *quic.Conn) ([]byte, error) {
+	state := conn.ConnectionState().TLS
+	return customtls.ExportBindingKey(&state)
+}
+
+// quicAuthToken derives the QUIC auth token for the given 1-minute bucket
+// offset, bound to the session exporter ekm (S22). Both ends compute it the
+// same way over the same exporter.
+func quicAuthToken(secret, ekm []byte, minuteOffset int64) []byte {
+	timestamp := make([]byte, 8)
+	binary.BigEndian.PutUint64(timestamp, uint64(time.Now().Unix()/60+minuteOffset))
+
+	h := hmac.New(sha256.New, secret)
 	h.Write(timestamp)
 	h.Write([]byte("quic-auth"))
+	h.Write(ekm) // TLS-session binding
 	return h.Sum(nil)
 }
 
@@ -1004,16 +1027,24 @@ func (c *QUICServerConn) VerifyClient() error {
 	clientMarker := rest[:markerLen]
 	clientToken := rest[markerLen : markerLen+32]
 
+	// Session binding (S22): the client bound its token to this QUIC
+	// connection's TLS session exporter. Derive the same exporter from our side
+	// so a token replayed from another connection fails below.
+	ekm, err := quicExporterKey(c.Conn)
+	if err != nil {
+		return fmt.Errorf("quic: export keying material: %w", err)
+	}
+
 	// A secret authenticates only if it produces both the keyed marker and a
 	// token inside the time window: the marker binds the connection's nonce,
-	// the token bounds replay.
+	// the token bounds replay and is bound to this session's exporter.
 	verifyWithSecret := func(secret []byte) bool {
 		want := quicClientMarker(secret, nonce[:])
 		if want == nil || !hmac.Equal(clientMarker, want) {
 			return false
 		}
 		for offset := int64(-1); offset <= 1; offset++ {
-			if hmac.Equal(clientToken, c.generateAuthTokenWithSecret(secret, offset)) {
+			if hmac.Equal(clientToken, quicAuthToken(secret, ekm, offset)) {
 				return true
 			}
 		}
@@ -1064,20 +1095,6 @@ func (c *QUICServerConn) sendAck(nonce []byte) error {
 
 	c.stream.SetDeadline(time.Time{})
 	return nil
-}
-
-func (c *QUICServerConn) generateAuthToken(minuteOffset int64) []byte {
-	return c.generateAuthTokenWithSecret(c.secret, minuteOffset)
-}
-
-func (c *QUICServerConn) generateAuthTokenWithSecret(secret []byte, minuteOffset int64) []byte {
-	timestamp := make([]byte, 8)
-	binary.BigEndian.PutUint64(timestamp, uint64(time.Now().Unix()/60+minuteOffset))
-
-	h := hmac.New(sha256.New, secret)
-	h.Write(timestamp)
-	h.Write([]byte("quic-auth"))
-	return h.Sum(nil)
 }
 
 func (c *QUICServerConn) deriveKey(context string) []byte {
