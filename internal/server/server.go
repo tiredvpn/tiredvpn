@@ -3872,13 +3872,19 @@ func sendStegoResponse(framer *http2.Framer, streamID uint32, data []byte, secre
 		return
 	}
 	h := len(hdr)
-	coverLen := 30
-	response := make([]byte, h+3+len(data)+coverLen)
+	// Bucketed cover instead of a fixed 30 bytes, so the server->client record
+	// length no longer tracks the packet it carries (the client recovers the
+	// real length from the Length field and drops the trailing cover).
+	base := h + 3 + len(data)
+	coverLen := strategy.StegoTunCoverLen(base)
+	response := make([]byte, base+coverLen)
 	copy(response[0:h], hdr)
 	response[h] = 0x00 // Raw data flag
 	binary.BigEndian.PutUint16(response[h+1:h+3], uint16(len(data)))
-	copy(response[h+3:h+3+len(data)], data)
-	rand.Read(response[h+3+len(data):]) // Cover traffic
+	copy(response[h+3:base], data)
+	if coverLen > 0 {
+		rand.Read(response[base:]) // Cover traffic
+	}
 
 	framer.WriteData(streamID, false, response)
 }

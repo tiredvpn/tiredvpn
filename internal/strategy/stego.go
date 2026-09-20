@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/tiredvpn/tiredvpn/internal/evasion"
 	"github.com/tiredvpn/tiredvpn/internal/ktls"
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/protect"
@@ -69,9 +70,6 @@ type HTTP2StegoStrategy struct {
 // NewHTTP2StegoStrategy creates a new HTTP/2 steganography strategy
 // manager is required for IPv6/IPv4 transport layer support
 func NewHTTP2StegoStrategy(manager *Manager, secret []byte, coverHost string) *HTTP2StegoStrategy {
-	if coverHost == "" {
-		coverHost = "www.googleapis.com"
-	}
 	return &HTTP2StegoStrategy{
 		manager:     manager,
 		secret:      secret,
@@ -83,9 +81,6 @@ func NewHTTP2StegoStrategy(manager *Manager, secret []byte, coverHost string) *H
 // NewHTTP2StegoStrategyWithPadding creates a strategy with specific padding mode
 // manager is required for IPv6/IPv4 transport layer support
 func NewHTTP2StegoStrategyWithPadding(manager *Manager, secret []byte, coverHost string, mode NaivePaddingMode) *HTTP2StegoStrategy {
-	if coverHost == "" {
-		coverHost = "www.googleapis.com"
-	}
 	return &HTTP2StegoStrategy{
 		manager:     manager,
 		secret:      secret,
@@ -97,9 +92,6 @@ func NewHTTP2StegoStrategyWithPadding(manager *Manager, secret []byte, coverHost
 // NewHTTP2StegoStrategyWithECH creates a strategy with ECH support
 // manager is required for IPv6/IPv4 transport layer support
 func NewHTTP2StegoStrategyWithECH(manager *Manager, secret []byte, coverHost string, echConfigList []byte, echPublicName string) *HTTP2StegoStrategy {
-	if coverHost == "" {
-		coverHost = "www.googleapis.com"
-	}
 	return &HTTP2StegoStrategy{
 		manager:       manager,
 		secret:        secret,
@@ -155,14 +147,25 @@ func (s *HTTP2StegoStrategy) Connect(ctx context.Context, target string) (net.Co
 	// Get server address (IPv6/IPv4 with automatic fallback)
 	serverAddr := s.manager.GetServerAddr(ctx)
 	secret := dialSecret(ctx, s.secret)
-	log.Debug("HTTP/2 Stego: Using server address: %s", serverAddr)
+
+	// Cover host doubles as the TLS SNI and the HTTP/2 :authority. Picking it per
+	// connection from the shared whitelist (rather than a build-time constant or
+	// an hour-of-day index that moves every client at once) keeps the SNI a
+	// donor TSPU does not IP-range-check against us, and keeps the two views of
+	// the same name - the cleartext SNI and the encrypted :authority - agreeing.
+	// A caller that pinned a cover host in config keeps it.
+	coverHost := s.coverHost
+	if coverHost == "" {
+		coverHost = stegoCoverRotator.Next()
+	}
+	log.Debug("HTTP/2 Stego: Using server address: %s (cover %s)", serverAddr, coverHost)
 
 	// Establish TLS connection with standard ALPN.
 	// Protocol type is sent as the first encrypted byte after handshake,
 	// so DPI sees no "tired-*" fingerprint in the ClientHello.
 	tlsConfig := &tls.Config{
 		InsecureSkipVerify: true,
-		ServerName:         s.coverHost,
+		ServerName:         coverHost,
 		NextProtos:         []string{"h2", "http/1.1"},
 		ClientSessionCache: s.manager.TLSSessionCache(), // resume across reconnects
 	}
@@ -234,6 +237,7 @@ func (s *HTTP2StegoStrategy) Connect(ctx context.Context, target string) (net.Co
 
 	// Create steganographic connection with padding mode
 	stegoConn := NewHTTP2StegoConn(finalConn, secret, true, s.paddingMode)
+	stegoConn.coverHost = coverHost // :authority tracks the SNI we opened with
 
 	// Perform initial handshake, bounded by the caller's context so a
 	// non-responding server can't hold this strategy past the strategy
@@ -255,6 +259,7 @@ type HTTP2StegoConn struct {
 	secret      []byte
 	isClient    bool
 	paddingMode NaivePaddingMode
+	coverHost   string // HTTP/2 :authority; set to the SNI so the two agree
 
 	// HTTP/2 framing
 	framer *http2.Framer
@@ -380,7 +385,7 @@ func (sc *HTTP2StegoConn) sendCovertHandshake() error {
 	sc.hpackEnc.WriteField(hpack.HeaderField{Name: ":method", Value: "POST"})
 	sc.hpackEnc.WriteField(hpack.HeaderField{Name: ":scheme", Value: "https"})
 	sc.hpackEnc.WriteField(hpack.HeaderField{Name: ":path", Value: "/grpc.health.v1.Health/Check"})
-	sc.hpackEnc.WriteField(hpack.HeaderField{Name: ":authority", Value: "api.googleapis.com"})
+	sc.hpackEnc.WriteField(hpack.HeaderField{Name: ":authority", Value: sc.authority()})
 
 	// Standard headers
 	sc.hpackEnc.WriteField(hpack.HeaderField{Name: "content-type", Value: "application/grpc"})
@@ -707,7 +712,7 @@ func (sc *HTTP2StegoConn) writeViaHeaders(data []byte) (int, error) {
 	sc.hpackEnc.WriteField(hpack.HeaderField{Name: ":method", Value: "POST"})
 	sc.hpackEnc.WriteField(hpack.HeaderField{Name: ":scheme", Value: "https"})
 	sc.hpackEnc.WriteField(hpack.HeaderField{Name: ":path", Value: "/api/v1/telemetry"})
-	sc.hpackEnc.WriteField(hpack.HeaderField{Name: ":authority", Value: "telemetry.googleapis.com"})
+	sc.hpackEnc.WriteField(hpack.HeaderField{Name: ":authority", Value: sc.authority()})
 
 	// Standard headers
 	sc.hpackEnc.WriteField(hpack.HeaderField{Name: "content-type", Value: "application/json"})
@@ -852,6 +857,11 @@ func matchStegoFrame(secret, data []byte, label string) (int, bool) {
 // StegoNonceLen is the per-frame nonce prefix length, exported so the server's
 // manual DATA-frame path and the wire tests can locate the nonce.
 const StegoNonceLen = stegoNonceLen
+
+// StegoTunCoverLen is stegoTunCoverLen exported for the server's manual
+// server->client DATA-frame path, so both directions quantise record lengths
+// the same way instead of the server appending a fixed 30-byte cover run.
+func StegoTunCoverLen(baseLen int) int { return stegoTunCoverLen(baseLen) }
 
 // StegoClientMarker recomputes the client->server (c2s) marker for a captured
 // nonce. Exported for the wire-signature tests that pin the length distribution.
@@ -1005,18 +1015,27 @@ func (sc *HTTP2StegoConn) writeViaDataFast(data []byte) (int, error) {
 	// This allows small responses to be sent immediately
 	chunkSize := len(data)
 
-	// Minimal framing: [nonce][marker][Flags:1][Length:2][Data:N]
-	// No cover padding in fast mode - prioritize latency
+	// Framing: [nonce][marker][Flags:1][Length:2][Data:N][cover:M]. The cover run
+	// grows the DATA frame to a randomly chosen size bucket so the record length
+	// stops tracking the inner packet length (the reader recovers exactly N from
+	// the Length field and ignores the trailing cover). This used to be the
+	// "no padding" fast path, which made every record length a fixed offset from
+	// the packet it carried.
 	hdr, err := stegoFrameHeader(sc.secret, sc.writeMarkerLabel())
 	if err != nil {
 		return 0, err
 	}
 	h := len(hdr)
-	frame := make([]byte, h+3+chunkSize)
+	base := h + 3 + chunkSize
+	coverLen := stegoTunCoverLen(base)
+	frame := make([]byte, base+coverLen)
 	copy(frame[0:h], hdr)                                         // Keyed marker
 	frame[h] = 0x00                                               // Flag: raw
 	binary.BigEndian.PutUint16(frame[h+1:h+3], uint16(chunkSize)) // Length
-	copy(frame[h+3:], data[:chunkSize])
+	copy(frame[h+3:base], data[:chunkSize])
+	if coverLen > 0 {
+		rand.Read(frame[base:]) // cover data, dropped by the reader via Length
+	}
 
 	if err := sc.framer.WriteData(streamID, false, frame); err != nil {
 		return 0, err
@@ -1033,7 +1052,7 @@ func (sc *HTTP2StegoConn) sendCoverHeaders(streamID uint32) error {
 	sc.hpackEnc.WriteField(hpack.HeaderField{Name: ":method", Value: "POST"})
 	sc.hpackEnc.WriteField(hpack.HeaderField{Name: ":scheme", Value: "https"})
 	sc.hpackEnc.WriteField(hpack.HeaderField{Name: ":path", Value: "/grpc.health.v1.Health/Check"})
-	sc.hpackEnc.WriteField(hpack.HeaderField{Name: ":authority", Value: "api.googleapis.com"})
+	sc.hpackEnc.WriteField(hpack.HeaderField{Name: ":authority", Value: sc.authority()})
 	sc.hpackEnc.WriteField(hpack.HeaderField{Name: "content-type", Value: "application/grpc"})
 	sc.hpackEnc.WriteField(hpack.HeaderField{Name: "user-agent", Value: "grpc-go/1.60.0"})
 	sc.hpackEnc.WriteField(hpack.HeaderField{Name: "te", Value: "trailers"})
@@ -1211,27 +1230,92 @@ func minInt(a, b int) int {
 	return b
 }
 
-// calculateNaivePadding computes padding size based on NaiveProxy-style mode
+// calculateNaivePadding computes padding size based on NaiveProxy-style mode.
+//
+// The amount is drawn from crypto/rand inside the mode's declared percentage
+// band (getNaivePaddingRange, which this now actually consumes - it used to be
+// dead and advertised ranges the old counter arithmetic never produced). Two
+// frames of the same length no longer pad by the same amount, so a passive
+// observer cannot subtract a fixed overhead to recover the plaintext length.
+//
+// Distribution (verification rule 3): the percentage is uniform over the band.
+// There is no measured population of real HTTP/2 DATA-frame padding to match
+// its shape against - servers rarely pad DATA frames at all - so "what
+// distribution is this checked against" is "nothing", recorded here on purpose.
 func (sc *HTTP2StegoConn) calculateNaivePadding(dataLen int) int {
-	switch sc.paddingMode {
-	case NaivePaddingMinimal:
-		// 5-10% padding (optimized for speed)
-		overhead := dataLen / 20                   // 5% base
-		variability := int(sc.methodCounter%6) - 3 // ±3% variation
-		return overhead + variability
-	case NaivePaddingStandard:
-		// 15-25% padding (balanced)
-		overhead := dataLen / 6                     // ~16% base
-		variability := int(sc.methodCounter%10) - 5 // ±5% variation
-		return overhead + variability
-	case NaivePaddingParanoid:
-		// 30-50% padding (maximum security)
-		overhead := dataLen * 2 / 5                  // 40% base
-		variability := int(sc.methodCounter%20) - 10 // ±10% variation
-		return overhead + variability
-	default:
-		return dataLen / 6 // Standard fallback
+	minPct, maxPct := sc.paddingMode.getNaivePaddingRange()
+	pct := minPct
+	if maxPct > minPct {
+		pct += randIntn(maxPct - minPct + 1)
 	}
+	return dataLen * pct / 100
+}
+
+// stegoTunBuckets are the padded frame-payload targets for the default tun path.
+// A frame is grown to a bucket drawn at random from those large enough to hold
+// it, so (a) many inner packet lengths land on the same record length and (b) a
+// small packet can, on any given frame, occupy the same record length as a
+// full-size one. The record length therefore no longer tracks the inner IP
+// packet length - the property the length-correlation detector in wiretest
+// pins. The top bucket clears a full 1400-byte MTU packet plus framing.
+var stegoTunBuckets = []int{128, 256, 512, 1024, 1500}
+
+// stegoTunCoverLen returns how many cover bytes to append after a tun-path frame
+// whose pre-cover length is baseLen, so the padded payload lands on a randomly
+// chosen bucket >= baseLen.
+//
+// Distribution (verification rule 3): the bucket is chosen uniformly among the
+// fitting buckets from crypto/rand, not from a counter. There is no measured
+// distribution of real H2 DATA padding to match, so the target here is
+// decorrelation (record length independent of packet length), recorded as
+// "nothing to check against". Rule 8: quantising to a handful of sizes is itself
+// a shape a passive observer could notice ("record lengths cluster near five
+// values"); it is a deliberate trade - a coarse, packet-length-free size signal
+// instead of a 1:1 copy of the packet-length distribution.
+func stegoTunCoverLen(baseLen int) int {
+	fits := make([]int, 0, len(stegoTunBuckets))
+	for _, b := range stegoTunBuckets {
+		if b >= baseLen {
+			fits = append(fits, b)
+		}
+	}
+	if len(fits) == 0 {
+		// Larger than the top bucket (shouldn't happen under a 1400 MTU); round up
+		// to the next bucket step so the length is still quantised, not a copy.
+		step := stegoTunBuckets[len(stegoTunBuckets)-1]
+		padded := ((baseLen / step) + 1) * step
+		return padded - baseLen
+	}
+	return fits[randIntn(len(fits))] - baseLen
+}
+
+// randIntn returns a uniform int in [0,n) from crypto/rand, or 0 if the source
+// fails (padding then degrades to the band minimum rather than panicking).
+func randIntn(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return 0
+	}
+	return int(binary.BigEndian.Uint32(b[:]) % uint32(n))
+}
+
+// stegoCoverRotator supplies the per-connection cover host (SNI and :authority)
+// when the caller left it unset. StrategyRandom keeps independent clients from
+// all landing on the same donor at the same time (the old hour-of-day index
+// moved every client in lockstep).
+var stegoCoverRotator = evasion.NewSNIRotator(evasion.StrategyRandom)
+
+// authority returns the HTTP/2 :authority for cover HEADERS. It is the cover
+// host chosen for this connection, so the encrypted :authority matches the
+// cleartext SNI; a mismatch is exactly what an active prober compares.
+func (sc *HTTP2StegoConn) authority() string {
+	if sc.coverHost != "" {
+		return sc.coverHost
+	}
+	return "www.googleapis.com"
 }
 
 // getNaivePaddingRange returns min/max padding for a given mode

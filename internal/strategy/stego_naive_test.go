@@ -94,30 +94,33 @@ func TestCalculateNaivePadding(t *testing.T) {
 	}
 }
 
-// TestNaivePaddingConsistency tests that padding is deterministic for same counter
-func TestNaivePaddingConsistency(t *testing.T) {
+// TestNaivePaddingHasEntropy pins that padding is drawn from crypto/rand, not
+// derived from length and counter.
+//
+// This inverts the old TestNaivePaddingConsistency, which asserted padding was
+// deterministic for a given counter - which was precisely the audited defect:
+// a deterministic offset lets a passive observer subtract the padding back out
+// and recover the plaintext length. At a fixed counter and length the value
+// must now vary between draws.
+func TestNaivePaddingHasEntropy(t *testing.T) {
 	secret := []byte("test-consistency-secret-key-xyz")
 
 	client, server := net.Pipe()
 	defer client.Close()
 	defer server.Close()
 
-	conn1 := NewHTTP2StegoConn(client, secret, true, NaivePaddingStandard)
-	conn2 := NewHTTP2StegoConn(server, secret, false, NaivePaddingStandard)
+	conn := NewHTTP2StegoConn(client, secret, true, NaivePaddingStandard)
 
-	dataLen := 1000
-
-	for i := 0; i < 10; i++ {
-		conn1.methodCounter = uint32(i)
-		conn2.methodCounter = uint32(i)
-
-		padding1 := conn1.calculateNaivePadding(dataLen)
-		padding2 := conn2.calculateNaivePadding(dataLen)
-
-		if padding1 != padding2 {
-			t.Errorf("Iteration %d: padding mismatch: conn1=%d, conn2=%d",
-				i, padding1, padding2)
-		}
+	const dataLen = 1000
+	seen := map[int]bool{}
+	for i := 0; i < 64; i++ {
+		conn.methodCounter = 7 // fixed: any variation below is from crypto/rand, not the counter
+		seen[conn.calculateNaivePadding(dataLen)] = true
+	}
+	if len(seen) < 3 {
+		t.Fatalf("padding produced %d distinct values at a fixed counter/length; a "+
+			"deterministic offset is the recoverable-length defect this replaced (values %v)",
+			len(seen), seen)
 	}
 }
 
