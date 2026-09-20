@@ -197,6 +197,14 @@ type RTTMaskingConn struct {
 	lastBurstTime time.Time
 	done          chan struct{}
 
+	// writeMu serialises every write to c.Conn - the burst flush from Write, the
+	// ticker Flush, and the simple-delay path. Both the burst flush and the simple
+	// path sleep BEFORE writing; without this lock the ticker could write its own
+	// buffer to c.Conn while a Write sat mid-sleep, interleaving two records on the
+	// wire and breaking the AEAD of the layer above. It is always taken before mu
+	// (never the other way round) so the two locks cannot deadlock.
+	writeMu sync.Mutex
+
 	// Adaptive stats
 	observedRTTs   []time.Duration
 	avgObservedRTT time.Duration
@@ -245,7 +253,10 @@ func (c *RTTMaskingConn) Write(p []byte) (int, error) {
 		return c.writeWithBurst(p, delay)
 	}
 
-	// Simple delay mode
+	// Simple delay mode. Hold writeMu across the sleep+write so a concurrent
+	// Flush (or another Write) cannot slip a write onto c.Conn mid-sleep.
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	if delay > 0 {
 		time.Sleep(delay)
 	}
@@ -255,8 +266,14 @@ func (c *RTTMaskingConn) Write(p []byte) (int, error) {
 
 // writeWithBurst groups packets into bursts
 func (c *RTTMaskingConn) writeWithBurst(p []byte, delay time.Duration) (int, error) {
-	c.mu.Lock()
+	// writeMu is taken before mu and held across the whole call, so this flush and
+	// a concurrent ticker Flush write to c.Conn one after the other, never
+	// interleaved. Whoever holds writeMu also swaps the buffer under mu, so the
+	// records go out in the order they were buffered.
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 
+	c.mu.Lock()
 	shouldFlush := len(c.burstBuffer)+1 >= c.config.BurstSize ||
 		time.Since(c.lastBurstTime) >= c.config.BurstInterval
 
@@ -283,13 +300,19 @@ func (c *RTTMaskingConn) writeWithBurst(p []byte, delay time.Duration) (int, err
 		time.Sleep(delay)
 	}
 
-	// Send all buffered packets quickly (simulating burst)
-	totalWritten := 0
-	for _, data := range buffer {
+	// Send all buffered packets quickly (simulating burst). p is the LAST element
+	// of buffer; earlier entries are prior Writes already reported as complete.
+	// On error before p, none of p went out -> return 0. On error writing p
+	// itself, return only its partial count. Either way n <= len(p), so the
+	// io.Writer contract holds (the old code summed the whole burst and could
+	// return more than len(p)).
+	for i, data := range buffer {
 		n, err := c.Conn.Write(data)
-		totalWritten += n
 		if err != nil {
-			return totalWritten, err
+			if i == len(buffer)-1 {
+				return n, err
+			}
+			return 0, err
 		}
 		// Tiny delay between packets in burst (0.5-2ms)
 		inBurstDelay := c.randomDuration(500*time.Microsecond, 2*time.Millisecond)
@@ -359,6 +382,11 @@ func (c *RTTMaskingConn) Read(p []byte) (int, error) {
 
 // Flush sends any buffered data immediately without waiting for burst
 func (c *RTTMaskingConn) Flush() error {
+	// Same lock order as writeWithBurst (writeMu before mu): serialise the writes
+	// to c.Conn against a concurrent burst flush so records are not interleaved.
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
 	c.mu.Lock()
 	buffer := c.burstBuffer
 	c.burstBuffer = make([][]byte, 0, c.config.BurstSize)
