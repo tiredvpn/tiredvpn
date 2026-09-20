@@ -3,7 +3,9 @@ package padding
 import (
 	"bytes"
 	"crypto/rand"
+	"errors"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -499,7 +501,9 @@ func TestMultiSecretWriteToLargePayloadShouldError(t *testing.T) {
 // calls globalPadder.Decrypt without validation and returns garbage instead of an error.
 //
 // Bug location: salamander_multi.go lines 131-139.
-// After fix: ReadFrom returns error (or drops packet) for unknown secrets.
+// The packet must not reach the caller. It is now dropped rather than turned
+// into a read error - see the ReadFrom comment - so the observable outcome is a
+// read that times out having delivered nothing.
 func TestMultiSecretGlobalFallbackMisdecrypts(t *testing.T) {
 	secretA := []byte("server-secret-A")
 	secretB := []byte("unrelated-client-secret-B")
@@ -527,12 +531,16 @@ func TestMultiSecretGlobalFallbackMisdecrypts(t *testing.T) {
 
 	p := make([]byte, 65536)
 	n, _, readErr := serverConn.ReadFrom(p)
-	_ = n
 
 	// A packet encrypted with an unknown secret must be rejected: the keyed tag
-	// in the UDP framing won't match secretA's keystream.
+	// in the UDP framing won't match secretA's keystream. Rejection shows up as
+	// the read running out its deadline with nothing delivered.
 	if readErr == nil {
-		t.Fatalf("expected ReadFrom to reject packet encrypted with unknown secret, got nil error")
+		t.Fatalf("ReadFrom delivered %d bytes from a packet encrypted with an unknown secret", n)
+	}
+	var netErr net.Error
+	if !errors.As(readErr, &netErr) || !netErr.Timeout() {
+		t.Fatalf("expected the read to time out having dropped the packet, got %v", readErr)
 	}
 }
 
@@ -772,6 +780,12 @@ func TestSalamanderUDPBucketBoundaries(t *testing.T) {
 // The rejection half is paired with an acceptance half using a secret buried in
 // the middle of the registry: "nothing was accepted" would otherwise be
 // satisfied by a ReadFrom that rejects unconditionally.
+//
+// Each rejection round chases the stranger's packet with a sentinel encrypted
+// under the global secret. Since a rejected packet is dropped rather than
+// turned into an error, that sentinel is what makes the rejection observable
+// without waiting out a deadline - and it also checks, per round, that dropping
+// the stranger left the listener able to deliver the next packet.
 func TestMultiSecretManySecretsNoFalseAccept(t *testing.T) {
 	const numSecrets = 512
 
@@ -787,22 +801,36 @@ func TestMultiSecretManySecretsNoFalseAccept(t *testing.T) {
 	stranger := NewSalamanderPadder([]byte("secret-of-nobody-in-the-registry"), Balanced)
 
 	// Rejection: packets from a secret the server does not hold.
+	sentinelPadder := NewSalamanderPadder(globalSecret, Balanced)
+	sentinel := []byte("sentinel payload under the global secret")
+
 	const rounds = 200
 	for i := 0; i < rounds; i++ {
 		enc, err := stranger.EncryptUDP(make([]byte, 1200))
 		if err != nil {
 			t.Fatal(err)
 		}
+		good, err := sentinelPadder.EncryptUDP(sentinel)
+		if err != nil {
+			t.Fatal(err)
+		}
 
 		mc := newChanPacketConn()
 		conn := NewMultiSecretSalamanderPacketConn(mc, globalSecret, Balanced, provider)
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 		mc.inject(enc)
+		mc.inject(good)
 
-		if _, _, err := conn.ReadFrom(make([]byte, 65536)); err == nil {
-			conn.Close()
-			t.Fatalf("round %d: packet from an unregistered secret accepted after %d trials", i, numSecrets)
-		}
+		buf := make([]byte, 65536)
+		n, _, err := conn.ReadFrom(buf)
 		conn.Close()
+		if err != nil {
+			t.Fatalf("round %d: the sentinel behind the stranger's packet was never delivered: %v", i, err)
+		}
+		if !bytes.Equal(buf[:n], sentinel) {
+			t.Fatalf("round %d: packet from an unregistered secret accepted after %d trials (%d bytes delivered)",
+				i, numSecrets, n)
+		}
 	}
 
 	// Acceptance: a secret in the middle of the registry must still be found,
@@ -831,9 +859,19 @@ func TestMultiSecretManySecretsNoFalseAccept(t *testing.T) {
 }
 
 // chanPacketConn is a minimal in-memory net.PacketConn for unit tests.
+//
+// SetReadDeadline is honoured, and honouring it is load-bearing: ReadFrom now
+// drops an unreadable datagram and waits for the next one instead of returning
+// an error, so "the packet was rejected" can only be observed as a read that
+// times out with the listener still usable. A no-op deadline, which is what
+// this mock had while ReadFrom still returned errors, turns that observation
+// into a hang.
 type chanPacketConn struct {
 	packets chan []byte
 	closed  chan struct{}
+
+	mu           sync.Mutex
+	readDeadline time.Time
 }
 
 func newChanPacketConn() *chanPacketConn {
@@ -842,6 +880,14 @@ func newChanPacketConn() *chanPacketConn {
 		closed:  make(chan struct{}),
 	}
 }
+
+// chanTimeout is the net.Error a read past the deadline reports, matching what
+// a real UDP socket returns.
+type chanTimeout struct{}
+
+func (chanTimeout) Error() string   { return "i/o timeout" }
+func (chanTimeout) Timeout() bool   { return true }
+func (chanTimeout) Temporary() bool { return true }
 
 func (c *chanPacketConn) inject(b []byte) {
 	cp := make([]byte, len(b))
@@ -853,9 +899,22 @@ func (c *chanPacketConn) inject(b []byte) {
 }
 
 func (c *chanPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	c.mu.Lock()
+	deadline := c.readDeadline
+	c.mu.Unlock()
+
+	var timeout <-chan time.Time
+	if !deadline.IsZero() {
+		t := time.NewTimer(time.Until(deadline))
+		defer t.Stop()
+		timeout = t.C
+	}
+
 	select {
 	case pkt := <-c.packets:
 		return copy(p, pkt), &chanAddr{}, nil
+	case <-timeout:
+		return 0, nil, chanTimeout{}
 	case <-c.closed:
 		return 0, nil, net.ErrClosed
 	}
@@ -881,9 +940,17 @@ func (c *chanPacketConn) Close() error {
 	return nil
 }
 
-func (c *chanPacketConn) LocalAddr() net.Addr                { return &chanAddr{} }
-func (c *chanPacketConn) SetDeadline(_ time.Time) error      { return nil }
-func (c *chanPacketConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *chanPacketConn) LocalAddr() net.Addr { return &chanAddr{} }
+
+func (c *chanPacketConn) SetDeadline(t time.Time) error { return c.SetReadDeadline(t) }
+
+func (c *chanPacketConn) SetReadDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.readDeadline = t
+	c.mu.Unlock()
+	return nil
+}
+
 func (c *chanPacketConn) SetWriteDeadline(_ time.Time) error { return nil }
 
 type chanAddr struct{}
