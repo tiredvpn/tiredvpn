@@ -69,6 +69,9 @@ func sshServerHandshake(conn net.Conn, srvCtx *serverContext, logger *log.Logger
 
 	token, err := strategy.SSHServerReadAuth(transport)
 	if err != nil {
+		if errors.Is(err, strategy.SSHAuthRejectedError()) {
+			strategy.SSHServerRejectAuth(transport)
+		}
 		conn.SetDeadline(time.Time{})
 		return nil, clientIdentity{}, fmt.Errorf("reading SSH auth: %w", err)
 	}

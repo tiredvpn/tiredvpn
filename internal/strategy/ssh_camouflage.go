@@ -43,6 +43,11 @@ const (
 	sshAuthCtxS2C = "tiredvpn-ssh-auth-s2c-v1"
 	sshAuthLen    = sha256.Size
 
+	// sshMaxAuthTries mirrors OpenSSH's MaxAuthTries default. A login that is
+	// not ours is answered and retried the same number of times a real sshd
+	// allows, and the bound is also what stops a peer from looping here.
+	sshMaxAuthTries = 6
+
 	// sshChannelMaxPacket is the default OpenSSH channel packet size. Chunking
 	// writes at this boundary keeps our CHANNEL_DATA packets in the same size
 	// range a real session produces.
@@ -277,7 +282,7 @@ func SSHClientAuth(t *SSHTransport, secret []byte) error {
 	if err := t.WritePacket(buildSSHServiceRequest()); err != nil {
 		return err
 	}
-	accept, err := t.ReadPacket()
+	accept, err := ReadSSHTransportPacket(t)
 	if err != nil {
 		return fmt.Errorf("reading SERVICE_ACCEPT: %w", err)
 	}
@@ -290,7 +295,7 @@ func SSHClientAuth(t *SSHTransport, secret []byte) error {
 		return err
 	}
 
-	banner, err := t.ReadPacket()
+	banner, err := ReadSSHTransportPacket(t)
 	if err != nil {
 		return fmt.Errorf("reading userauth reply: %w", err)
 	}
@@ -302,7 +307,7 @@ func SSHClientAuth(t *SSHTransport, secret []byte) error {
 		return errors.New("ssh: server auth token mismatch")
 	}
 
-	success, err := t.ReadPacket()
+	success, err := ReadSSHTransportPacket(t)
 	if err != nil {
 		return fmt.Errorf("reading USERAUTH_SUCCESS: %w", err)
 	}
@@ -315,8 +320,13 @@ func SSHClientAuth(t *SSHTransport, secret []byte) error {
 // SSHServerReadAuth runs the server side up to the point where it has the
 // client's token: it answers the service request and returns the token from the
 // userauth request.
+//
+// A login attempt that is not ours gets SSH_MSG_USERAUTH_FAILURE and another
+// try, up to the same limit a real sshd allows. That matters for probing: an
+// ordinary ssh client opens with method "none", which carries no token, and a
+// server that hung up on it would stand out from every real SSH host.
 func SSHServerReadAuth(t *SSHTransport) ([]byte, error) {
-	req, err := t.ReadPacket()
+	req, err := ReadSSHTransportPacket(t)
 	if err != nil {
 		return nil, fmt.Errorf("reading SERVICE_REQUEST: %w", err)
 	}
@@ -326,11 +336,20 @@ func SSHServerReadAuth(t *SSHTransport) ([]byte, error) {
 	if err := t.WritePacket(buildSSHServiceAccept()); err != nil {
 		return nil, err
 	}
-	auth, err := t.ReadPacket()
-	if err != nil {
-		return nil, fmt.Errorf("reading USERAUTH_REQUEST: %w", err)
+
+	for try := 0; try < sshMaxAuthTries; try++ {
+		auth, err := ReadSSHTransportPacket(t)
+		if err != nil {
+			return nil, fmt.Errorf("reading USERAUTH_REQUEST: %w", err)
+		}
+		if token, err := parseSSHUserAuthRequest(auth); err == nil {
+			return token, nil
+		}
+		if err := t.WritePacket(buildSSHUserAuthFailure()); err != nil {
+			return nil, err
+		}
 	}
-	return parseSSHUserAuthRequest(auth)
+	return nil, fmt.Errorf("%w: too many authentication attempts", errSSHAuthRejected)
 }
 
 // SSHServerAcceptAuth sends the answering token and USERAUTH_SUCCESS.

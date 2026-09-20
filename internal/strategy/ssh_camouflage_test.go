@@ -560,6 +560,147 @@ func TestSSHForgedSignatureRejected(t *testing.T) {
 	}
 }
 
+// sshUserAuthNone is the login an ordinary ssh client opens with: method
+// "none", carrying no credential at all.
+func sshUserAuthNone() []byte {
+	out := []byte{sshMsgUserAuthRequest}
+	out = sshAppendString(out, []byte("root"))
+	out = sshAppendString(out, []byte("ssh-connection"))
+	return sshAppendString(out, []byte("none"))
+}
+
+// sshOpenUserAuth brings up a transport and gets as far as SERVICE_ACCEPT.
+func sshOpenUserAuth(t *testing.T, secret []byte) (*SSHTransport, <-chan error) {
+	t.Helper()
+	cliRaw, srvRaw := sshPipe(t)
+	t.Cleanup(func() { cliRaw.Close(); srvRaw.Close() })
+	_ = cliRaw.SetDeadline(time.Now().Add(20 * time.Second))
+	_ = srvRaw.SetDeadline(time.Now().Add(20 * time.Second))
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := sshServeOnce(srvRaw, secret)
+		done <- err
+	}()
+
+	tr, err := SSHClientHandshake(cliRaw)
+	if err != nil {
+		t.Fatalf("transport handshake: %v", err)
+	}
+	if err := tr.WritePacket(buildSSHServiceRequest()); err != nil {
+		t.Fatalf("service request: %v", err)
+	}
+	accept, err := ReadSSHTransportPacket(tr)
+	if err != nil {
+		t.Fatalf("service accept: %v", err)
+	}
+	if err := checkSSHServiceMessage(accept, sshMsgServiceAccept); err != nil {
+		t.Fatalf("service accept: %v", err)
+	}
+	return tr, done
+}
+
+// TestSSHServerAnswersUnknownLoginLikeSSHD checks the anti-probe behaviour that
+// matters most: an ordinary ssh client opens with method "none", which carries
+// no token, and a server that hung up on it would stand out from every real SSH
+// host. It has to answer USERAUTH_FAILURE and keep going.
+func TestSSHServerAnswersUnknownLoginLikeSSHD(t *testing.T) {
+	secret := []byte(sshTestSecret)
+	tr, done := sshOpenUserAuth(t, secret)
+
+	if err := tr.WritePacket(sshUserAuthNone()); err != nil {
+		t.Fatalf("userauth none: %v", err)
+	}
+	reply, err := ReadSSHTransportPacket(tr)
+	if err != nil {
+		t.Fatalf("the server hung up on a method-none login instead of refusing it: %v", err)
+	}
+	if reply[0] != sshMsgUserAuthFailure {
+		t.Fatalf("the server answered method none with message %d, want USERAUTH_FAILURE (%d)",
+			reply[0], sshMsgUserAuthFailure)
+	}
+
+	// The real credential still works on the same connection, which is what a
+	// second attempt against a real server looks like.
+	token := SSHAuthToken(secret, tr.SessionID(), SSHAuthClientToServer)
+	if err := tr.WritePacket(buildSSHUserAuthRequest(token)); err != nil {
+		t.Fatalf("userauth password: %v", err)
+	}
+	banner, err := ReadSSHTransportPacket(tr)
+	if err != nil {
+		t.Fatalf("userauth reply: %v", err)
+	}
+	serverToken, err := parseSSHUserAuthBanner(banner)
+	if err != nil {
+		t.Fatalf("parsing the answering token: %v", err)
+	}
+	if !VerifySSHAuthToken(serverToken, secret, tr.SessionID(), SSHAuthServerToClient) {
+		t.Error("the answering token does not verify")
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("the server did not accept the retry: %v", err)
+	}
+}
+
+// TestSSHServerBoundsAuthAttempts pins the other half: the retries are finite,
+// so a peer cannot sit in the userauth loop forever.
+func TestSSHServerBoundsAuthAttempts(t *testing.T) {
+	tr, done := sshOpenUserAuth(t, []byte(sshTestSecret))
+
+	for i := 0; i < sshMaxAuthTries; i++ {
+		if err := tr.WritePacket(sshUserAuthNone()); err != nil {
+			t.Fatalf("attempt %d: %v", i, err)
+		}
+		reply, err := ReadSSHTransportPacket(tr)
+		if err != nil {
+			t.Fatalf("attempt %d: the server stopped answering early: %v", i, err)
+		}
+		if reply[0] != sshMsgUserAuthFailure {
+			t.Fatalf("attempt %d answered with message %d, want USERAUTH_FAILURE", i, reply[0])
+		}
+	}
+
+	err := <-done
+	if err == nil {
+		t.Fatal("the server kept the session after the attempt limit")
+	}
+	if !errors.Is(err, errSSHAuthRejected) {
+		t.Errorf("the server stopped for the wrong reason: %v", err)
+	}
+}
+
+// TestSSHServerSendsExtInfo checks we answer ext-info-c the way a stock sshd
+// does. Advertising the extension and then not sending it is the same class of
+// mismatch as offering a kex we cannot run.
+func TestSSHServerSendsExtInfo(t *testing.T) {
+	cliRaw, srvRaw := sshPipe(t)
+	t.Cleanup(func() { cliRaw.Close(); srvRaw.Close() })
+	_ = cliRaw.SetDeadline(time.Now().Add(20 * time.Second))
+	_ = srvRaw.SetDeadline(time.Now().Add(20 * time.Second))
+
+	go func() { _, _ = sshServeOnce(srvRaw, []byte(sshTestSecret)) }()
+
+	tr, err := SSHClientHandshake(cliRaw)
+	if err != nil {
+		t.Fatalf("transport handshake: %v", err)
+	}
+	// Deliberately the raw read, not the skipping one: EXT_INFO has to be the
+	// very first packet after NEWKEYS, where a real sshd puts it.
+	first, err := tr.ReadPacket()
+	if err != nil {
+		t.Fatalf("reading the first encrypted packet: %v", err)
+	}
+	if first[0] != sshMsgExtInfo {
+		t.Fatalf("the first packet after NEWKEYS is message %d, want EXT_INFO (%d)", first[0], sshMsgExtInfo)
+	}
+	if !bytes.Contains(first, []byte("server-sig-algs")) {
+		t.Error("EXT_INFO does not carry server-sig-algs")
+	}
+	if bytes.Contains(first, []byte("ping@openssh.com")) {
+		t.Error("EXT_INFO advertises ping@openssh.com, which we do not implement")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Mimicry
 // ---------------------------------------------------------------------------

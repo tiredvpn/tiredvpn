@@ -29,8 +29,12 @@ import (
 // SSH transport message numbers (RFC 4253 §12, RFC 4252 §6, RFC 5656 §7.1).
 const (
 	sshMsgDisconnect      = 1
+	sshMsgIgnore          = 2
+	sshMsgUnimplemented   = 3
+	sshMsgDebug           = 4
 	sshMsgServiceRequest  = 5
 	sshMsgServiceAccept   = 6
+	sshMsgExtInfo         = 7
 	sshMsgKexInit         = 20
 	sshMsgNewKeys         = 21
 	sshMsgKexECDHInit     = 30
@@ -491,6 +495,47 @@ func parseSSHKexECDHReply(payload []byte) (ks, qs, sig []byte, err error) {
 	return ks, qs, sig, nil
 }
 
+// sshServerSigAlgs is the server-sig-algs value OpenSSH 9.6p1 advertises. The
+// other two extensions a stock sshd sends, publickey-hostbound@openssh.com and
+// ping@openssh.com, are left out on purpose: they commit the server to answer
+// messages we do not implement, and advertising something we would then refuse
+// is the same mistake as offering a kex we cannot run.
+const sshServerSigAlgs = "ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384," +
+	"ecdsa-sha2-nistp521,sk-ssh-ed25519@openssh.com,sk-ecdsa-sha2-nistp256@openssh.com," +
+	"rsa-sha2-512,rsa-sha2-256"
+
+// buildSSHExtInfo builds SSH_MSG_EXT_INFO (RFC 8308 §2.3).
+func buildSSHExtInfo() []byte {
+	out := make([]byte, 5)
+	out[0] = sshMsgExtInfo
+	binary.BigEndian.PutUint32(out[1:5], 1) // one extension
+	out = sshAppendString(out, []byte("server-sig-algs"))
+	return sshAppendString(out, []byte(sshServerSigAlgs))
+}
+
+// ReadSSHTransportPacket returns the next packet that carries meaning, skipping
+// the transport housekeeping messages RFC 4253 §11 allows at any time plus the
+// EXT_INFO our own KEXINIT invites the peer to send.
+func ReadSSHTransportPacket(t *SSHTransport) ([]byte, error) {
+	for {
+		payload, err := t.ReadPacket()
+		if err != nil {
+			return nil, err
+		}
+		if len(payload) == 0 {
+			continue
+		}
+		switch payload[0] {
+		case sshMsgIgnore, sshMsgUnimplemented, sshMsgDebug, sshMsgExtInfo:
+			continue
+		case sshMsgDisconnect:
+			return nil, errors.New("ssh: peer sent SSH_MSG_DISCONNECT")
+		default:
+			return payload, nil
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Transport
 // ---------------------------------------------------------------------------
@@ -725,6 +770,7 @@ func SSHServerHandshake(conn net.Conn, hostKey ed25519.PrivateKey) (*SSHTranspor
 	if err := checkSSHKexInit(ic); err != nil {
 		return nil, err
 	}
+	wantsExtInfo := sshKexInitOffers(ic, "ext-info-c")
 
 	initPayload, err := ReadSSHPacket(br)
 	if err != nil {
@@ -775,7 +821,32 @@ func SSHServerHandshake(conn net.Conn, hostKey ed25519.PrivateKey) (*SSHTranspor
 	if _, err := ReadSSHPacket(br); err != nil {
 		return nil, fmt.Errorf("reading client NEWKEYS: %w", err)
 	}
-	return newSSHTransport(conn, br, k, h, false)
+	transport, err := newSSHTransport(conn, br, k, h, false)
+	if err != nil {
+		return nil, err
+	}
+	// A stock sshd answers a client that offered ext-info-c with EXT_INFO as
+	// the first packet after NEWKEYS. Skipping it would drop a real SSH client
+	// at an unusual point in the conversation.
+	if wantsExtInfo {
+		if err := transport.WritePacket(buildSSHExtInfo()); err != nil {
+			return nil, err
+		}
+	}
+	return transport, nil
+}
+
+// sshKexInitOffers reports whether a KEXINIT payload lists name in its kex
+// algorithm list, which is where the ext-info and strict-kex markers live.
+func sshKexInitOffers(payload []byte, name string) bool {
+	if len(payload) < 17 || payload[0] != sshMsgKexInit {
+		return false
+	}
+	list, _, err := sshReadString(payload[17:])
+	if err != nil {
+		return false
+	}
+	return sshNameListHas(list, name)
 }
 
 // checkSSHKexInit rejects a peer that is not offering what we will negotiate.
