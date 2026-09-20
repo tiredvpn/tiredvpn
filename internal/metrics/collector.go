@@ -1,7 +1,9 @@
 package metrics
 
 import (
+	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -88,10 +90,19 @@ func (c *Collector) buildKey(name string, labels map[string]string) string {
 		return name
 	}
 
-	// Simple concatenation - could be improved with sorting
+	// Sort label names so the key is stable across calls. Go map range order
+	// is randomised per call, so an unsorted concatenation produced a different
+	// key for the same labels between Set and Get - the value was stored under
+	// one key and looked up under another.
+	keys := make([]string, 0, len(labels))
+	for k := range labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
 	key := name
-	for k, v := range labels {
-		key += ";" + k + "=" + v
+	for _, k := range keys {
+		key += ";" + k + "=" + labels[k]
 	}
 	return key
 }
@@ -127,8 +138,11 @@ func (cv *CounterVec) Add(labels map[string]string, delta uint64) {
 	}
 	cv.mu.Unlock()
 
-	// Use atomic for the actual increment
-	*counter += delta
+	// Atomic increment: the map slot is guarded by mu, but the counter itself
+	// is mutated after the lock is released, so concurrent Adds to the same key
+	// race and lose updates without this. (The pointer stored in the map is
+	// stable once created, so atomic access to *counter is safe post-unlock.)
+	atomic.AddUint64(counter, delta)
 }
 
 // Get retrieves counter value
@@ -142,7 +156,7 @@ func (cv *CounterVec) Get(labels map[string]string) uint64 {
 	if !ok {
 		return 0
 	}
-	return *counter
+	return atomic.LoadUint64(counter)
 }
 
 func buildLabelsKey(labels map[string]string) string {
@@ -150,12 +164,21 @@ func buildLabelsKey(labels map[string]string) string {
 		return ""
 	}
 
+	// Sort for a stable key (see buildKey): without this, Inc and Get computed
+	// different keys for the same label set and concurrent Incs split one
+	// logical counter across several map entries.
+	keys := make([]string, 0, len(labels))
+	for k := range labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
 	key := ""
-	for k, v := range labels {
+	for _, k := range keys {
 		if key != "" {
 			key += ";"
 		}
-		key += k + "=" + v
+		key += k + "=" + labels[k]
 	}
 	return key
 }
