@@ -252,49 +252,103 @@ func TestConfusionCarrierParsesAsItsProtocol(t *testing.T) {
 			t.Fatal("no SSH identification string")
 		}
 		off := nl + 2
-		for i := 0; i < 2; i++ {
+
+		// The first flight is four binary packets: KEXINIT, KEX_ECDH_INIT,
+		// NEWKEYS, then the sealed body shaped like a post-NEWKEYS record.
+		type sshPkt struct {
+			payload []byte
+			padding []byte
+			pktLen  int
+		}
+		var pkts []sshPkt
+		for off < len(req) {
 			if off+5 > len(req) {
-				t.Fatalf("packet %d: truncated", i)
+				t.Fatalf("packet %d: truncated header", len(pkts))
 			}
 			pktLen := int(binary.BigEndian.Uint32(req[off : off+4]))
 			padLen := int(req[off+4])
+			if off+4+pktLen > len(req) {
+				t.Fatalf("packet %d: declares %d bytes, only %d remain", len(pkts), pktLen, len(req)-off-4)
+			}
 			if (4+pktLen)%confSSHBlockSize != 0 {
 				t.Errorf("packet %d: 4+packet_length = %d is not a multiple of %d",
-					i, 4+pktLen, confSSHBlockSize)
+					len(pkts), 4+pktLen, confSSHBlockSize)
 			}
 			if padLen < confSSHMinPadding {
-				t.Errorf("packet %d: padding_length = %d, RFC 4253 requires at least 4", i, padLen)
+				t.Errorf("packet %d: padding_length = %d, RFC 4253 requires at least 4", len(pkts), padLen)
 			}
-			if i == 0 && req[off+5] != confSSHMsgKexInit {
-				t.Errorf("first packet is msg %d, want KEXINIT", req[off+5])
-			}
-			if i == 0 {
-				// A KEXINIT whose name-lists are all empty is what v1 sent and
-				// what no implementation sends.
-				if pktLen < 300 {
-					t.Errorf("KEXINIT is %d bytes; a real one carries algorithm names", pktLen)
-				}
-				payloadLen := pktLen - 1 - padLen
-				payload := req[off+5 : off+5+payloadLen]
-				// The carrier's KEXINIT must be the very one ssh_camouflage's
-				// client sends: same algorithm name-lists, so a passive prober
-				// cannot tell the two transports apart by their KEXINIT either.
-				got := sshKexInitLists(t, payload)
-				want := sshKexInitLists(t, BuildSSHClientKexInit())
-				if !reflect.DeepEqual(got, want) {
-					t.Errorf("carrier KEXINIT name-lists differ from ssh_camouflage's:\n got %q\nwant %q", got, want)
-				}
-				// A real pre-NEWKEYS SSH packet pads with zeros; the carrier's
-				// KEXINIT must too, or the padding is a fingerprint of its own.
-				pad := req[off+5+payloadLen : off+4+pktLen]
-				if !bytes.Equal(pad, make([]byte, len(pad))) {
-					t.Errorf("KEXINIT padding is not all zeros: %x", pad)
-				}
-			}
+			payloadLen := pktLen - 1 - padLen
+			pkts = append(pkts, sshPkt{
+				payload: req[off+5 : off+5+payloadLen],
+				padding: req[off+5+payloadLen : off+4+pktLen],
+				pktLen:  pktLen,
+			})
 			off += 4 + pktLen
 		}
 		if off != len(req) {
-			t.Errorf("%d bytes left over after two SSH packets", len(req)-off)
+			t.Fatalf("%d bytes left over after the SSH packets", len(req)-off)
+		}
+		if len(pkts) != 4 {
+			t.Fatalf("first flight has %d packets, want 4 (KEXINIT, KEX_ECDH_INIT, NEWKEYS, data)", len(pkts))
+		}
+
+		// Packet 0: KEXINIT, byte-for-byte the name-lists ssh_camouflage's client
+		// sends, and padded with zeros like a real pre-NEWKEYS packet.
+		if pkts[0].payload[0] != confSSHMsgKexInit {
+			t.Errorf("packet 0 is msg %d, want KEXINIT (%d)", pkts[0].payload[0], confSSHMsgKexInit)
+		}
+		if pkts[0].pktLen < 300 {
+			t.Errorf("KEXINIT is %d bytes; a real one carries algorithm names", pkts[0].pktLen)
+		}
+		got := sshKexInitLists(t, pkts[0].payload)
+		want := sshKexInitLists(t, BuildSSHClientKexInit())
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("carrier KEXINIT name-lists differ from ssh_camouflage's:\n got %q\nwant %q", got, want)
+		}
+		if !bytes.Equal(pkts[0].padding, make([]byte, len(pkts[0].padding))) {
+			t.Errorf("KEXINIT padding is not all zeros: %x", pkts[0].padding)
+		}
+
+		// Packet 1: KEX_ECDH_INIT. Rules 4 and 8 - it must be a real curve25519
+		// init (msg 30 carrying exactly a 32-byte Q_C), not the hundreds of bytes
+		// the 1.11.0 carrier stuffed into a fake init string. Verified with the
+		// transport's own parser, which is what a real exchange feeds; and its
+		// whole payload must be 1 (msg) + 4 (string length) + 32 (Q_C) = 37 bytes.
+		if pkts[1].payload[0] != confSSHMsgKexECDHInit {
+			t.Errorf("packet 1 is msg %d, want KEX_ECDH_INIT (%d)", pkts[1].payload[0], confSSHMsgKexECDHInit)
+		}
+		qc, err := parseSSHKexECDHInit(pkts[1].payload)
+		if err != nil {
+			t.Fatalf("KEX_ECDH_INIT does not parse as a real one: %v", err)
+		}
+		if len(qc) != confSSHCurvePointLen {
+			t.Errorf("Q_C is %d bytes, want %d", len(qc), confSSHCurvePointLen)
+		}
+		if len(pkts[1].payload) != 1+4+confSSHCurvePointLen {
+			t.Errorf("KEX_ECDH_INIT payload is %d bytes, want %d (a real curve25519 init)",
+				len(pkts[1].payload), 1+4+confSSHCurvePointLen)
+		}
+		if !bytes.Equal(pkts[1].padding, make([]byte, len(pkts[1].padding))) {
+			t.Errorf("KEX_ECDH_INIT padding is not all zeros: %x", pkts[1].padding)
+		}
+
+		// Packet 2: NEWKEYS, a lone message byte, zero padded.
+		if len(pkts[2].payload) != 1 || pkts[2].payload[0] != confSSHMsgNewKeys {
+			t.Errorf("packet 2 payload = %x, want a lone NEWKEYS (%d)", pkts[2].payload, confSSHMsgNewKeys)
+		}
+		if !bytes.Equal(pkts[2].padding, make([]byte, len(pkts[2].padding))) {
+			t.Errorf("NEWKEYS padding is not all zeros: %x", pkts[2].padding)
+		}
+
+		// Packet 3: the sealed body. It carries no readable SSH message type - a
+		// real post-NEWKEYS packet is encrypted - and stays a plausible small
+		// record rather than a KEXINIT-sized one. The body itself is recovered in
+		// the round-trip test.
+		if len(pkts[3].payload) == 0 {
+			t.Fatal("data packet carries no body")
+		}
+		if pkts[3].pktLen > 4096 {
+			t.Errorf("data packet is %d bytes, larger than a plausible small record", pkts[3].pktLen)
 		}
 	})
 

@@ -615,6 +615,7 @@ func httpHeaderInt(head []byte, name string) (int, bool) {
 
 const (
 	confSSHMsgKexInit      = byte(20)
+	confSSHMsgNewKeys      = byte(21)
 	confSSHMsgKexECDHInit  = byte(30)
 	confSSHMsgKexECDHReply = byte(31)
 	confSSHMaxBanner       = 255
@@ -622,10 +623,19 @@ const (
 	confSSHBlockSize       = 8
 	confSSHMinPadding      = 4
 	confSSHPacketHeader    = 5 // uint32 packet_length + uint8 padding_length
+
+	// The ephemeral-key sizes a real curve25519-sha256 / ssh-ed25519 exchange
+	// puts on the wire. The carrier reproduces exactly these so KEX_ECDH_INIT and
+	// KEX_ECDH_REPLY have a real host's sizes rather than the hundreds of bytes
+	// the 1.11.0 carrier stuffed into a fake KEX_ECDH_INIT string.
+	confSSHCurvePointLen = 32 // curve25519 public value Q_C / Q_S
+	confSSHEd25519PubLen = 32 // ed25519 host public key inside K_S
+	confSSHEd25519SigLen = 64 // ed25519 signature inside the reply
 )
 
-// buildSSHCarrier emits a banner, a realistic KEXINIT, and a second binary
-// packet whose payload is msgType followed by our body as an SSH string.
+// buildSSHCarrier emits the opening flight of an SSH-2.0 transport carrying our
+// body: a banner, the KEXINIT, a correctly sized KEX_ECDH_INIT/REPLY, a NEWKEYS,
+// and then the body inside a binary packet shaped like a post-NEWKEYS record.
 //
 // The banner and the KEXINIT are exactly what the ssh_camouflage transport (S2)
 // puts on the wire: a request-side carrier reuses the client KEXINIT that S2's
@@ -633,6 +643,25 @@ const (
 // framed with the zero padding a real pre-NEWKEYS SSH packet carries. Both S2
 // KEXINITs are byte-verified against a live OpenSSH 9.6p1; the confusion
 // carrier borrows them so it cannot drift from the version its banner claims.
+//
+// The key-exchange packet carries a real 32-byte ephemeral value (and, for the
+// reply, a real-sized host-key blob, Q_S and signature), so its size matches a
+// real curve25519 exchange - see rule 4. Its contents are random rather than a
+// verified exchange; nobody checks them, since the carrier is a one-shot and the
+// parser skips the packet by length.
+//
+// After NEWKEYS a real SSH stream is encrypted, so the trailing packet - whose
+// payload is our opaque sealed body, padded with random bytes like an AEAD
+// packet - is indistinguishable in shape from an encrypted SSH_MSG_CHANNEL_DATA.
+//
+// Known residual, recorded per rule 8: a real client sends NEWKEYS and the first
+// encrypted packet only after the server's KEX_ECDH_REPLY, whereas this one-shot
+// carrier sends the whole flight at once, and the trailing packet's length field
+// is plaintext where a real post-NEWKEYS chacha20-poly1305 length is encrypted.
+// The size tell this replaces (a KEX_ECDH_INIT of hundreds of bytes) is a
+// stateless parse anomaly; what remains is a sequence/length anomaly a stateless
+// prober does not see. Neither is checked against a measured SSH capture - we
+// have none.
 func buildSSHCarrier(msgType byte, body []byte) ([]byte, error) {
 	var buf bytes.Buffer
 	buf.WriteString(ConfusionSSHBanner)
@@ -646,19 +675,51 @@ func buildSSHCarrier(msgType byte, body []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	payload := make([]byte, 0, 5+len(body))
-	payload = append(payload, msgType)
-	var strLen [4]byte
-	binary.BigEndian.PutUint32(strLen[:], uint32(len(body)))
-	payload = append(payload, strLen[:]...)
-	payload = append(payload, body...)
+	kexEcdh, err := buildConfSSHKexEcdhPayload(msgType)
+	if err != nil {
+		return nil, err
+	}
+	if err := WriteSSHPacket(&buf, kexEcdh); err != nil {
+		return nil, err
+	}
 
-	dataPacket, err := wrapConfSSHPacket(payload)
+	if err := WriteSSHPacket(&buf, []byte{confSSHMsgNewKeys}); err != nil {
+		return nil, err
+	}
+
+	dataPacket, err := wrapConfSSHPacket(body)
 	if err != nil {
 		return nil, err
 	}
 	buf.Write(dataPacket)
 	return buf.Bytes(), nil
+}
+
+// buildConfSSHKexEcdhPayload builds a KEX_ECDH_INIT or KEX_ECDH_REPLY payload
+// with the exact sizes a real curve25519-sha256 / ssh-ed25519 exchange produces.
+// The values are random - the carrier never runs the exchange - but the string
+// framing and lengths are a real host's, which is the property an observer sees.
+func buildConfSSHKexEcdhPayload(msgType byte) ([]byte, error) {
+	switch msgType {
+	case confSSHMsgKexECDHInit:
+		qc := make([]byte, confSSHCurvePointLen)
+		if _, err := rand.Read(qc); err != nil {
+			return nil, err
+		}
+		return buildSSHKexECDHInit(qc), nil
+	case confSSHMsgKexECDHReply:
+		pub := make([]byte, confSSHEd25519PubLen)
+		qs := make([]byte, confSSHCurvePointLen)
+		sig := make([]byte, confSSHEd25519SigLen)
+		for _, b := range [][]byte{pub, qs, sig} {
+			if _, err := rand.Read(b); err != nil {
+				return nil, err
+			}
+		}
+		return buildSSHKexECDHReply(sshHostKeyBlob(pub), qs, sshSignatureBlob(sig)), nil
+	default:
+		return nil, fmt.Errorf("confusion: unexpected ssh kex message %d", msgType)
+	}
 }
 
 // wrapConfSSHPacket frames payload per RFC 4253 section 6: the packet length
@@ -696,19 +757,32 @@ func parseSSHCarrier(data []byte, wantMsg byte, variant byte) (*ConfusionCarrier
 	}
 	// The full identification string, not just the SSH-2.0 prefix. A peer that
 	// opens with some other banner is somebody else's SSH client, and asking it
-	// for two more packets it will never send would hold a goroutine until the
+	// for more packets it will never send would hold a goroutine until the
 	// deadline for nothing.
 	if !bytes.HasPrefix(data, []byte(ConfusionSSHBanner)) {
 		return nil, ErrConfusionNotCarrier
 	}
 	off := nl + 2
 
-	kexLen, err := confSSHPacketLen(data, off)
-	if err != nil {
+	// The three plaintext packets, in order: KEXINIT, the key-exchange packet
+	// (KEX_ECDH_INIT on a request, KEX_ECDH_REPLY on a response), then NEWKEYS.
+	// Each is skipped by its declared length, and its message type is checked so
+	// that a foreign SSH flight in some other order is rejected rather than
+	// mistaken for ours.
+	var err error
+	if off, err = skipConfSSHPacket(data, off, confSSHMsgKexInit); err != nil {
 		return nil, err
 	}
-	off += 4 + kexLen
+	if off, err = skipConfSSHPacket(data, off, wantMsg); err != nil {
+		return nil, err
+	}
+	if off, err = skipConfSSHPacket(data, off, confSSHMsgNewKeys); err != nil {
+		return nil, err
+	}
 
+	// The trailing packet's payload is our opaque body: no inner message type,
+	// because after NEWKEYS a real packet is encrypted and carries no readable
+	// type. The SSH framing gives its exact length.
 	dataLen, err := confSSHPacketLen(data, off)
 	if err != nil {
 		return nil, err
@@ -718,27 +792,36 @@ func parseSSHCarrier(data []byte, wantMsg byte, variant byte) (*ConfusionCarrier
 	}
 	padLen := int(data[off+4])
 	payloadLen := dataLen - 1 - padLen
-	if padLen < confSSHMinPadding || payloadLen < 5 {
-		return nil, ErrConfusionNotCarrier
-	}
-	payload := data[off+5 : off+5+payloadLen]
-	if payload[0] != wantMsg {
-		return nil, ErrConfusionNotCarrier
-	}
-	strLen := int(binary.BigEndian.Uint32(payload[1:5]))
-	if 5+strLen > len(payload) {
+	if padLen < confSSHMinPadding || payloadLen < 0 {
 		return nil, ErrConfusionNotCarrier
 	}
 
 	c := &ConfusionCarrier{
 		Variant: variant,
-		Body:    payload[5 : 5+strLen],
+		Body:    data[off+5 : off+5+payloadLen],
 		Length:  off + 4 + dataLen,
 	}
 	if wantMsg == confSSHMsgKexECDHInit {
 		return splitCarrierNonce(c)
 	}
 	return c, nil
+}
+
+// skipConfSSHPacket validates that the packet at off is a whole SSH binary
+// packet whose first payload byte is wantMsg, and returns the offset just past
+// it. A truncated packet yields ErrConfusionNeedMore; a wrong message type or a
+// malformed frame yields ErrConfusionNotCarrier.
+func skipConfSSHPacket(data []byte, off int, wantMsg byte) (int, error) {
+	pktLen, err := confSSHPacketLen(data, off)
+	if err != nil {
+		return 0, err
+	}
+	padLen := int(data[off+4])
+	payloadLen := pktLen - 1 - padLen
+	if padLen < confSSHMinPadding || payloadLen < 1 || data[off+5] != wantMsg {
+		return 0, ErrConfusionNotCarrier
+	}
+	return off + 4 + pktLen, nil
 }
 
 func confSSHPacketLen(data []byte, off int) (int, error) {

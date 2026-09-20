@@ -48,7 +48,8 @@ const (
 	// Rule 3 of the verification rules asks what measured distribution such a
 	// field is checked against. For this one the answer is "nothing": the
 	// marker lives inside an opaque option of the carrier protocol (an EDNS0
-	// local-use option, an HTTP body, an SSH string, a SASL initial response),
+	// local-use option, an HTTP body, an opaque SSH packet payload, a SASL
+	// initial response),
 	// and we have no measurement of those lengths in the wild to match. That
 	// is recorded here deliberately rather than left implied.
 	confusionMarkerMinLen = 16
