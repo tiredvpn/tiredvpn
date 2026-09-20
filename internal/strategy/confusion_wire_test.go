@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -272,6 +273,22 @@ func TestConfusionCarrierParsesAsItsProtocol(t *testing.T) {
 				// what no implementation sends.
 				if pktLen < 300 {
 					t.Errorf("KEXINIT is %d bytes; a real one carries algorithm names", pktLen)
+				}
+				payloadLen := pktLen - 1 - padLen
+				payload := req[off+5 : off+5+payloadLen]
+				// The carrier's KEXINIT must be the very one ssh_camouflage's
+				// client sends: same algorithm name-lists, so a passive prober
+				// cannot tell the two transports apart by their KEXINIT either.
+				got := sshKexInitLists(t, payload)
+				want := sshKexInitLists(t, BuildSSHClientKexInit())
+				if !reflect.DeepEqual(got, want) {
+					t.Errorf("carrier KEXINIT name-lists differ from ssh_camouflage's:\n got %q\nwant %q", got, want)
+				}
+				// A real pre-NEWKEYS SSH packet pads with zeros; the carrier's
+				// KEXINIT must too, or the padding is a fingerprint of its own.
+				pad := req[off+5+payloadLen : off+4+pktLen]
+				if !bytes.Equal(pad, make([]byte, len(pad))) {
+					t.Errorf("KEXINIT padding is not all zeros: %x", pad)
 				}
 			}
 			off += 4 + pktLen

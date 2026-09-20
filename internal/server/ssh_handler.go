@@ -11,24 +11,43 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
 )
 
-// DetectSSHCamouflage reports whether the peeked bytes are the start of an SSH
-// camouflage session. It matches the "SSH-2.0" identification prefix but rejects
-// the legacy protocol-confusion SSH variant, which embeds the "TIRED" marker in
-// its very first segment. The camouflage client sends only the banner line first
-// (an interactive handshake), so a TIRED marker here means it is confusion, not us.
-func DetectSSHCamouflage(peek []byte) bool {
+// DetectSSHCamouflage reports whether the peeked bytes open an ssh_camouflage
+// session rather than the confusion transport's SSH carrier.
+//
+// Both transports open with the same OpenSSH identification string, so the
+// banner no longer tells them apart the way it did before 1.11.0 - and the
+// "TIRED" literal an even earlier build keyed on is long gone. What separates
+// them is the keyed marker the confusion carrier bears in its first flight:
+// that carrier arrives whole in one flight, so its marker is already in this
+// peek, while the ssh_camouflage client has sent only its banner and is waiting
+// for the server to speak. A peek that starts with the SSH banner but carries
+// no marker matching a secret we hold is ssh_camouflage; one whose marker does
+// match is the confusion transport and is dispatched there instead.
+//
+// This never reads from the connection: an incomplete SSH carrier (which is
+// what the ssh_camouflage client's lone banner looks like) returns true so the
+// caller hands it to the interactive handshake rather than blocking it on a
+// read of a carrier it will not finish.
+func DetectSSHCamouflage(peek []byte, srvCtx *serverContext) bool {
 	if !bytes.HasPrefix(peek, []byte("SSH-2.0")) {
 		return false
 	}
-	// The confusion transport's SSH carrier opens with a banner as well, and it
-	// is dispatched further down. It used to be told apart by the literal TIRED
-	// its first packet carried; that literal is gone with 1.11.0, so the banner
-	// itself is the discriminator - at this point in the dispatch neither
-	// transport has sent anything else.
-	if bytes.HasPrefix(peek, []byte(strategy.ConfusionSSHBanner)) {
+	return !peekBearsConfusionSSHMarker(peek, srvCtx)
+}
+
+// peekBearsConfusionSSHMarker reports whether peek is a complete confusion SSH
+// carrier whose client marker matches one of the server's secrets. A truncated
+// or foreign SSH opening returns false.
+func peekBearsConfusionSSHMarker(peek []byte, srvCtx *serverContext) bool {
+	req, err := strategy.ParseConfusionRequest(peek)
+	if err != nil {
 		return false
 	}
-	return true
+	if req.Variant != byte(strategy.ConfusionSSHoverTLS) {
+		return false
+	}
+	_, _, ok := matchConfusionSecret(req, srvCtx)
+	return ok
 }
 
 // handleSSHCamouflage drives the server side of the SSH transport and then

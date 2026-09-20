@@ -1369,11 +1369,36 @@ func handleConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 		return
 	}
 
-	// SSH camouflage: plaintext SSH-2.0 banner with no TIRED marker. Must be
-	// checked before protocol confusion (which also matches "SSH-2.0-") and
-	// before TLS, since the SSH handshake is plaintext.
-	if DetectSSHCamouflage(peekBuf) {
-		logger.Debug("Detected SSH camouflage")
+	// SSH: the confusion transport's SSH carrier and the ssh_camouflage
+	// transport both open with the same OpenSSH banner, so a passive prober
+	// reads one version from the port. They are told apart by the keyed marker
+	// the confusion carrier bears in its first flight, checked over the bytes
+	// already peeked - the ssh_camouflage client has sent only its banner and
+	// is waiting for the server, so reading on to assemble a carrier would
+	// block it until the auth timeout. Must precede protocol confusion (which
+	// also matches "SSH-2.0-") and TLS, since the SSH handshake is plaintext.
+	if bytes.HasPrefix(peekBuf, []byte("SSH-2.0")) {
+		if DetectSSHCamouflage(peekBuf, srvCtx) {
+			logger.Debug("Detected SSH camouflage")
+			handleSSHCamouflage(buffConn, srvCtx, logger)
+			return
+		}
+		// A confusion SSH carrier whose marker we recognize. Entry point 1 of 3
+		// into the confusion funnel; all three authenticate in classifyConfusion.
+		if sess, consumed, ok := classifyConfusion(buffConn, peekBuf, srvCtx, logger); ok {
+			logger.Debug("Detected SSH-carried protocol confusion")
+			handleProtocolConfusion(sess, srvCtx, logger)
+			return
+		} else if len(consumed) > 0 {
+			buffConn = &bufferedConn{
+				Conn:   conn,
+				reader: io.MultiReader(bytes.NewReader(consumed), conn),
+			}
+		}
+		// The peek bore a valid marker but the full carrier did not classify (a
+		// truncated first flight): hand it to the camouflage handshake rather
+		// than dropping it. A real ssh_camouflage client ends up here too.
+		logger.Debug("SSH carrier did not classify; treating as SSH camouflage")
 		handleSSHCamouflage(buffConn, srvCtx, logger)
 		return
 	}

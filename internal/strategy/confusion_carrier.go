@@ -10,6 +10,7 @@ import (
 	"io"
 	mathrand "math/rand"
 	"strconv"
+	"strings"
 )
 
 // The five carriers, as protocols rather than as prefixes.
@@ -60,13 +61,17 @@ const (
 // a peer from making the server buffer without limit.
 const confusionMaxCarrier = 32 * 1024
 
-// ConfusionSSHBanner is the identification string the SSH carrier opens with.
+// ConfusionSSHBanner is the identification line the SSH carrier opens with. It
+// is the ssh_camouflage transport's banner (SSHBanner) without the trailing
+// CRLF that buildSSHCarrier appends itself.
 //
-// It is exported because the dispatcher needs it: the SSH camouflage transport
-// opens with a banner too, and the banner is the only thing either of them has
-// put on the wire when the dispatcher has to choose. The two differ by their
-// claimed OpenSSH release, and both strings are ones real hosts send.
-const ConfusionSSHBanner = "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.4"
+// The two SSH-speaking transports must present the same OpenSSH release: on a
+// real host the sshd version is a property of the host, not of the request, so
+// answering one version to the confusion carrier and another to ssh_camouflage
+// from one port is a signal in itself. They are told apart by the keyed marker
+// the confusion carrier bears in its first flight, not by the banner - see the
+// server's DetectSSHCamouflage.
+var ConfusionSSHBanner = strings.TrimSuffix(SSHBanner, "\r\n")
 
 // confusionUserAgents and confusionGRPCPaths are drawn per connection so the
 // carrier is not one fixed string. Discrete pools, like the real populations
@@ -619,37 +624,27 @@ const (
 	confSSHPacketHeader    = 5 // uint32 packet_length + uint8 padding_length
 )
 
-// Real OpenSSH 8.9 name-lists. v1 sent ten empty ones, which no implementation
-// ever does and which a parser that reads KEXINIT at all would notice.
-var confSSHKexNameLists = []string{
-	"curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521,diffie-hellman-group-exchange-sha256,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512,diffie-hellman-group14-sha256,ext-info-c",
-	"ssh-ed25519-cert-v01@openssh.com,ecdsa-sha2-nistp256-cert-v01@openssh.com,rsa-sha2-512-cert-v01@openssh.com,ssh-ed25519,ecdsa-sha2-nistp256,rsa-sha2-512,rsa-sha2-256",
-	"chacha20-poly1305@openssh.com,aes128-ctr,aes192-ctr,aes256-ctr,aes128-gcm@openssh.com,aes256-gcm@openssh.com",
-	"chacha20-poly1305@openssh.com,aes128-ctr,aes192-ctr,aes256-ctr,aes128-gcm@openssh.com,aes256-gcm@openssh.com",
-	"umac-64-etm@openssh.com,umac-128-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com,hmac-sha1-etm@openssh.com",
-	"umac-64-etm@openssh.com,umac-128-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com,hmac-sha1-etm@openssh.com",
-	"none,zlib@openssh.com",
-	"none,zlib@openssh.com",
-	"",
-	"",
-}
-
 // buildSSHCarrier emits a banner, a realistic KEXINIT, and a second binary
 // packet whose payload is msgType followed by our body as an SSH string.
+//
+// The banner and the KEXINIT are exactly what the ssh_camouflage transport (S2)
+// puts on the wire: a request-side carrier reuses the client KEXINIT that S2's
+// client sends, a response-side carrier the server KEXINIT S2's server sends,
+// framed with the zero padding a real pre-NEWKEYS SSH packet carries. Both S2
+// KEXINITs are byte-verified against a live OpenSSH 9.6p1; the confusion
+// carrier borrows them so it cannot drift from the version its banner claims.
 func buildSSHCarrier(msgType byte, body []byte) ([]byte, error) {
 	var buf bytes.Buffer
 	buf.WriteString(ConfusionSSHBanner)
 	buf.WriteString("\r\n")
 
-	kexPayload, err := buildConfSSHKexInitPayload()
-	if err != nil {
+	kexPayload := BuildSSHClientKexInit()
+	if msgType == confSSHMsgKexECDHReply {
+		kexPayload = BuildSSHServerKexInit()
+	}
+	if err := WriteSSHPacket(&buf, kexPayload); err != nil {
 		return nil, err
 	}
-	kexPacket, err := wrapConfSSHPacket(kexPayload)
-	if err != nil {
-		return nil, err
-	}
-	buf.Write(kexPacket)
 
 	payload := make([]byte, 0, 5+len(body))
 	payload = append(payload, msgType)
@@ -664,27 +659,6 @@ func buildSSHCarrier(msgType byte, body []byte) ([]byte, error) {
 	}
 	buf.Write(dataPacket)
 	return buf.Bytes(), nil
-}
-
-func buildConfSSHKexInitPayload() ([]byte, error) {
-	var p bytes.Buffer
-	p.WriteByte(confSSHMsgKexInit)
-
-	cookie := make([]byte, 16)
-	if _, err := rand.Read(cookie); err != nil {
-		return nil, err
-	}
-	p.Write(cookie)
-
-	for _, list := range confSSHKexNameLists {
-		var l [4]byte
-		binary.BigEndian.PutUint32(l[:], uint32(len(list)))
-		p.Write(l[:])
-		p.WriteString(list)
-	}
-	p.WriteByte(0x00)           // first_kex_packet_follows
-	p.Write([]byte{0, 0, 0, 0}) // reserved
-	return p.Bytes(), nil
 }
 
 // wrapConfSSHPacket frames payload per RFC 4253 section 6: the packet length

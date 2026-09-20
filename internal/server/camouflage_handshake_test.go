@@ -58,31 +58,72 @@ func TestDetectIMAPCamouflage(t *testing.T) {
 	}
 }
 
-// TestDetectSSHCamouflage pins the SSH classifier, including the TIRED-marker
-// carve-out: the legacy protocol-confusion transport also opens with an SSH
-// banner, and routing it into the camouflage handshake would hang it.
+// buildConfusionSSHCarrier assembles a complete SSH-carrier first flight bearing
+// a client marker keyed to secret, the way the confusion transport dials.
+func buildConfusionSSHCarrier(t *testing.T, secret []byte) []byte {
+	t.Helper()
+	nonce := bytes.Repeat([]byte{0xa5}, strategy.ConfusionNonceLen)
+	variant := byte(strategy.ConfusionSSHoverTLS)
+	marker := strategy.ConfusionClientMarker(secret, nonce, variant)
+	// The sealed body is opaque to the classifier; only the marker is checked.
+	carrier, err := strategy.BuildConfusionRequest(variant, nonce, marker, bytes.Repeat([]byte{0x11}, 48))
+	if err != nil {
+		t.Fatalf("building confusion SSH carrier: %v", err)
+	}
+	return carrier
+}
+
+// TestDetectSSHCamouflage pins the SSH classifier. Since 1.11.0 the confusion
+// carrier and ssh_camouflage open with the same OpenSSH banner, so the banner
+// no longer separates them; the keyed marker the carrier bears does. A bare
+// banner (all the ssh_camouflage client sends first) reads as camouflage; a
+// complete carrier whose marker matches a secret we hold reads as confusion.
 func TestDetectSSHCamouflage(t *testing.T) {
+	srvCtx := camouflageCtx(t)
+
+	validCarrier := buildConfusionSSHCarrier(t, []byte(camouflageTestSecret))
+	foreignCarrier := buildConfusionSSHCarrier(t, []byte("some-other-secret-not-ours-32byte"))
+
 	tests := []struct {
 		name string
-		peek string
+		peek []byte
 		want bool
 	}{
-		{"real banner", strategy.SSHBanner, true},
-		{"minimal banner", "SSH-2.0-x\r\n", true},
-		{"confusion carrier banner", strategy.ConfusionSSHBanner + "\r\n", false},
-		{"SSH 1.99", "SSH-1.99-OpenSSH_9.6\r\n", false},
-		{"IMAP greeting", strategy.IMAPGreeting, false},
-		{"HTTP request", "GET / HTTP/1.1\r\n", false},
-		{"empty", "", false},
-		{"prefix shorter than the match", "SSH-2", false},
+		{"bare banner is camouflage", []byte(strategy.SSHBanner), true},
+		{"minimal banner is camouflage", []byte("SSH-2.0-x\r\n"), true},
+		{"carrier with our marker is confusion", validCarrier, false},
+		{"carrier with a foreign marker is camouflage", foreignCarrier, true},
+		{"SSH 1.99", []byte("SSH-1.99-OpenSSH_9.6\r\n"), false},
+		{"IMAP greeting", []byte(strategy.IMAPGreeting), false},
+		{"HTTP request", []byte("GET / HTTP/1.1\r\n"), false},
+		{"empty", []byte(""), false},
+		{"prefix shorter than the banner", []byte("SSH-2"), false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := DetectSSHCamouflage([]byte(tt.peek)); got != tt.want {
+			if got := DetectSSHCamouflage(tt.peek, srvCtx); got != tt.want {
 				t.Errorf("DetectSSHCamouflage(%q) = %v, want %v", tt.peek, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestSSHCarrierBannerMatchesCamouflage is the passive-observer check: the SSH
+// carrier and ssh_camouflage must present one and the same OpenSSH version, so
+// two connections opened by the two transports are indistinguishable by banner.
+// It reddens if the carrier's banner drifts from SSHBanner (e.g. reverts to the
+// old 8.9p1 string), which is what makes the collision observable again.
+func TestSSHCarrierBannerMatchesCamouflage(t *testing.T) {
+	carrier := buildConfusionSSHCarrier(t, []byte(camouflageTestSecret))
+	nl := bytes.Index(carrier, []byte("\r\n"))
+	if nl < 0 {
+		t.Fatal("carrier has no identification line")
+	}
+	gotBanner := string(carrier[:nl+2])
+	if gotBanner != strategy.SSHBanner {
+		t.Errorf("SSH carrier banner = %q, ssh_camouflage banner = %q; a passive prober reads two versions from one port",
+			gotBanner, strategy.SSHBanner)
 	}
 }
 
