@@ -273,9 +273,14 @@ func PooledRelay(client net.Conn, server *PooledConn, idleTimeout time.Duration)
 	var wg sync.WaitGroup
 	errCh := make(chan error, 2)
 
-	// Track last activity to detect truly dead connections
+	// Track last activity to detect truly dead connections. If NO data flows in
+	// either direction for maxIdleBeforeClose, the relay closes. Honour the
+	// caller's idleTimeout; fall back to 2m only when it is unset (<=0).
 	lastActivity := time.Now().UnixNano()
-	maxIdleBeforeClose := 2 * time.Minute // If NO data in either direction for 2 min, close
+	maxIdleBeforeClose := idleTimeout
+	if maxIdleBeforeClose <= 0 {
+		maxIdleBeforeClose = 2 * time.Minute
+	}
 
 	updateActivity := func() {
 		atomic.StoreInt64(&lastActivity, time.Now().UnixNano())
@@ -382,8 +387,12 @@ func PooledRelayLengthPrefixed(client net.Conn, server *PooledConn, idleTimeout 
 	var wg sync.WaitGroup
 	errCh := make(chan error, 2)
 
+	// Honour the caller's idleTimeout; fall back to 2m only when unset (<=0).
 	lastActivity := time.Now().UnixNano()
-	maxIdleBeforeClose := 2 * time.Minute
+	maxIdleBeforeClose := idleTimeout
+	if maxIdleBeforeClose <= 0 {
+		maxIdleBeforeClose = 2 * time.Minute
+	}
 
 	updateActivity := func() {
 		atomic.StoreInt64(&lastActivity, time.Now().UnixNano())

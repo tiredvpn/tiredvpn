@@ -800,3 +800,100 @@ func TestGetAtomicReserveHonoursMaxUnderLoad(t *testing.T) {
 		t.Fatalf("positive control: peak admitted=%d, want exactly %d", peak, maxConns)
 	}
 }
+
+// --- Defect 2: relay honours the caller's idle timeout -------------------
+
+type dummyAddr struct{}
+
+func (dummyAddr) Network() string { return "fake" }
+func (dummyAddr) String() string  { return "fake" }
+
+// idleTimeoutConn is a net.Conn that never delivers data: every Read waits
+// readGap then reports a timeout, so the relay's inactivity path drives the
+// test. Writes are swallowed. It ignores deadlines (the relay's hardcoded 30s
+// per-read deadline would otherwise make the test take 30s).
+type idleTimeoutConn struct {
+	readGap time.Duration
+	mu      sync.Mutex
+	closed  bool
+}
+
+func (c *idleTimeoutConn) Read(p []byte) (int, error) {
+	time.Sleep(c.readGap)
+	c.mu.Lock()
+	closed := c.closed
+	c.mu.Unlock()
+	if closed {
+		return 0, net.ErrClosed
+	}
+	return 0, timeoutErr{timeout: true}
+}
+func (c *idleTimeoutConn) Write(p []byte) (int, error) { return len(p), nil }
+func (c *idleTimeoutConn) Close() error {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	return nil
+}
+func (c *idleTimeoutConn) LocalAddr() net.Addr              { return dummyAddr{} }
+func (c *idleTimeoutConn) RemoteAddr() net.Addr             { return dummyAddr{} }
+func (c *idleTimeoutConn) SetDeadline(time.Time) error      { return nil }
+func (c *idleTimeoutConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *idleTimeoutConn) SetWriteDeadline(time.Time) error { return nil }
+
+// TestPooledRelayHonoursIdleTimeout predicates the idle-timeout fix: a 30ms
+// idle timeout must close an idle relay promptly. The old code hardcoded 2m and
+// ignored the parameter, so nothing closes within the 2s window (red).
+func TestPooledRelayHonoursIdleTimeout(t *testing.T) {
+	client := &idleTimeoutConn{readGap: 5 * time.Millisecond}
+	server := &PooledConn{Conn: &idleTimeoutConn{readGap: 5 * time.Millisecond}}
+	done := make(chan error, 1)
+	go func() { done <- PooledRelay(client, server, 30*time.Millisecond) }()
+
+	select {
+	case err := <-done:
+		if err != io.EOF {
+			t.Fatalf("relay returned %v, want io.EOF on idle close", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("relay ignored the 30ms idle timeout (old code hardcoded 2m)")
+	}
+}
+
+// TestPooledRelayKeepsOpenUnderLargeIdleTimeout is the positive control for the
+// above: with a 10s idle timeout the relay must NOT close within 300ms. Without
+// it, a "fix" that always closes fast would pass the previous test spuriously.
+func TestPooledRelayKeepsOpenUnderLargeIdleTimeout(t *testing.T) {
+	client := &idleTimeoutConn{readGap: 5 * time.Millisecond}
+	server := &PooledConn{Conn: &idleTimeoutConn{readGap: 5 * time.Millisecond}}
+	done := make(chan error, 1)
+	go func() { done <- PooledRelay(client, server, 10*time.Second) }()
+
+	select {
+	case err := <-done:
+		t.Fatalf("relay closed early (%v) under a 10s idle timeout", err)
+	case <-time.After(300 * time.Millisecond):
+		// still open, as expected
+	}
+	client.Close()
+	server.Conn.Close()
+	<-done
+}
+
+// TestPooledRelayLengthPrefixedHonoursIdleTimeout covers the second edited site
+// (the length-prefixed relay carried the same hardcoded 2m).
+func TestPooledRelayLengthPrefixedHonoursIdleTimeout(t *testing.T) {
+	client := &idleTimeoutConn{readGap: 5 * time.Millisecond}
+	server := &PooledConn{Conn: &idleTimeoutConn{readGap: 5 * time.Millisecond}}
+	done := make(chan error, 1)
+	go func() { done <- PooledRelayLengthPrefixed(client, server, 30*time.Millisecond) }()
+
+	select {
+	case err := <-done:
+		if err != io.EOF {
+			t.Fatalf("relay returned %v, want io.EOF on idle close", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("length-prefixed relay ignored the 30ms idle timeout (old code hardcoded 2m)")
+	}
+}
