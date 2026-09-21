@@ -187,13 +187,25 @@ func (r *SNIRotator) nextWithCooldown() string {
 
 	now := time.Now()
 
-	// Find SNI not in cooldown from the rotator's own pool
+	// Collect every SNI whose cooldown window has expired, then pick one at
+	// random. Walking r.pool in index order and returning the first eligible
+	// SNI made the emitted sequence fixed until the pool was exhausted
+	// (pool[0], pool[1], ...), and that constant shape is a per-client
+	// fingerprint an observer keys on. Randomising the pick over the eligible
+	// set keeps the cooldown invariant (a used SNI stays out until its window
+	// expires, so picks stay distinct until the pool is exhausted) while the
+	// order across connections is no longer predictable.
+	eligible := make([]string, 0, len(r.pool))
 	for _, sni := range r.pool {
 		lastUsed, exists := r.lastUsed[sni]
 		if !exists || now.Sub(lastUsed) > r.cooldown {
-			r.lastUsed[sni] = now
-			return sni
+			eligible = append(eligible, sni)
 		}
+	}
+	if len(eligible) > 0 {
+		sni := eligible[rand.Intn(len(eligible))]
+		r.lastUsed[sni] = now
+		return sni
 	}
 
 	// All in cooldown, use random
