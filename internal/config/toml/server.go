@@ -28,9 +28,9 @@ type ServerTLS struct {
 
 // ServerAuth describes authentication policy for incoming clients.
 type ServerAuth struct {
-	Mode      string   `toml:"mode"`
-	Tokens    []string `toml:"tokens,omitempty"`
-	TokensFile string  `toml:"tokens_file,omitempty"`
+	Mode       string   `toml:"mode"`
+	Tokens     []string `toml:"tokens,omitempty"`
+	TokensFile string   `toml:"tokens_file,omitempty"`
 }
 
 // Validate runs semantic checks not enforced by TOML decoding alone.
