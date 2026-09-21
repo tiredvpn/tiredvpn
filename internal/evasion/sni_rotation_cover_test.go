@@ -1,6 +1,7 @@
 package evasion
 
 import (
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -144,6 +145,62 @@ func TestCooldownReturnsDistinctUntilExhausted(t *testing.T) {
 	}
 	if len(seen) != len(pool) {
 		t.Fatalf("cooldown covered %d of %d SNIs before exhaustion", len(seen), len(pool))
+	}
+}
+
+// TestCooldownFirstPickIsSpreadOverPool is the FORM check (rule 3) for the
+// cooldown randomisation. A fresh rotator's very first pick used to be pool[0]
+// every time - a fixed opening move an observer reads as a fingerprint. Across
+// many fresh rotators the opening pick must instead land on every pool member
+// with no single value dominating. The detector is the same maxShareExceeds
+// that TestUniformityCheckerCatchesSkew proves fires on a lopsided sample
+// (rule 2, positive control).
+func TestCooldownFirstPickIsSpreadOverPool(t *testing.T) {
+	pool := []string{"a", "b", "c", "d", "e"}
+	const trials = 20000
+	counts := map[string]int{}
+	for i := 0; i < trials; i++ {
+		r := NewSNIRotatorWithPool(pool, StrategyCooldown)
+		got := r.Next()
+		if !contains(pool, got) {
+			t.Fatalf("first pick %q outside pool", got)
+		}
+		counts[got]++
+	}
+	for _, s := range pool {
+		if counts[s] == 0 {
+			t.Fatalf("cooldown opening pick never landed on %q in %d fresh rotators", s, trials)
+		}
+	}
+	if worst, share, bad := maxShareExceeds(counts, trials, 0.30); bad {
+		t.Fatalf("cooldown opening pick skewed: %q took %.1f%% (>30%%) - order is not randomised", worst, share*100)
+	}
+}
+
+// TestCooldownDrainOrderIsNotFixed checks the whole drained sequence, not just
+// the opening pick. Distinct-until-exhausted still holds (asserted by
+// TestCooldownReturnsDistinctUntilExhausted); here the ORDER of that drain must
+// vary between fresh rotators. The strict-order implementation returned the
+// identity permutation (pool[0], pool[1], ...) on every fresh rotator, so that
+// exact permutation must now be rare rather than universal.
+func TestCooldownDrainOrderIsNotFixed(t *testing.T) {
+	pool := []string{"a", "b", "c", "d", "e"}
+	const trials = 5000
+	identity := 0
+	for i := 0; i < trials; i++ {
+		r := NewSNIRotatorWithPool(pool, StrategyCooldown)
+		seq := make([]string, len(pool))
+		for j := range seq {
+			seq[j] = r.Next()
+		}
+		if slices.Equal(seq, pool) {
+			identity++
+		}
+	}
+	// A uniform random drain hits the identity permutation with probability
+	// 1/5! ~= 0.8%. Allow generous slack; strict order would give 100%.
+	if share := float64(identity) / float64(trials); share > 0.10 {
+		t.Fatalf("drained order matched the fixed pool order %.1f%% of the time (>10%%) - order is not randomised", share*100)
 	}
 }
 

@@ -459,20 +459,51 @@ func (r *sniRecorder) snapshot() []string {
 	return slices.Clone(r.seen)
 }
 
+// equalAsSets reports whether a and b hold the same distinct elements,
+// disregarding order and multiplicity.
+func equalAsSets(a, b []string) bool {
+	sa := map[string]struct{}{}
+	for _, s := range a {
+		sa[s] = struct{}{}
+	}
+	sb := map[string]struct{}{}
+	for _, s := range b {
+		sb[s] = struct{}{}
+	}
+	if len(sa) != len(sb) {
+		return false
+	}
+	for s := range sa {
+		if _, ok := sb[s]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 // TestCoverDomainsOnTheWireFollowTheDialSecret is the call-site test for the
-// donor pool, and it deliberately reads the domains off a socket rather than
-// asking the strategy which pool it would use.
+// donor pool: it reads the cover domains off a socket over the full m.Connect
+// path rather than asking the strategy which pool it would use, because the
+// caller is exactly where the wrong secret can leak in - connect chooses the
+// destination and selectDestination resolves the pool.
 //
-// The distinction is not academic. A test that calls donorsFor directly stays
-// green when the CALLER hands it the wrong secret - and the caller is exactly
-// where this can go wrong, twice over: connect chooses the destination, and
-// selectDestination resolves the pool. Either one reverting to the strategy's
-// construction-time secret would put one user's donor sequence on the wire while
-// authenticating as another, which is the linkage derivePool exists to break.
+// It asserts on the SET of cover domains, not the sequence. The cooldown rotator
+// now picks a random eligible SNI per connection (the fix that removed the fixed
+// per-client sequence fingerprint), so the order on the wire is deliberately
+// non-deterministic and only the set is stable. The set that reaches the wire
+// must be exactly the dial secret's derived pool - which proves connect drove
+// donor selection through the developer-donor pool rather than falling back to
+// the static Russian list or a truncated set.
 //
-// The cooldown rotator walks its pool in order, so the sequence of cover domains
-// across successive dials IS the derived pool. That makes the assertion exact
-// rather than statistical.
+// Note on the dial-vs-construction discrimination: derivePool sorts the whole
+// global pool by an HMAC of the secret and, when n == len(pool) as it is here,
+// returns a full permutation. Two secrets therefore yield the SAME SET, differing
+// only in the order the fix has just randomised away. So this test can no longer
+// tell the dial secret from the construction secret by the cover domains alone;
+// that discrimination is carried on the wire by TestShortIDFollowsDialSecret
+// (the short id in the ClientHello) and at the API by
+// TestDonorPoolFollowsEndpointSecret. The discrimination assertion below fires
+// only if a future pool makes the two secrets' SETS differ.
 func TestCoverDomainsOnTheWireFollowTheDialSecret(t *testing.T) {
 	const (
 		builtIn = "the-secret-the-strategy-was-built-with"
@@ -480,13 +511,10 @@ func TestCoverDomainsOnTheWireFollowTheDialSecret(t *testing.T) {
 	)
 	donors := developerDonors()
 	if len(donors) < 2 {
-		t.Skipf("cover pool has %d entries, nothing to order", len(donors))
+		t.Skipf("cover pool has %d entries, nothing to observe", len(donors))
 	}
 	wantBuiltIn := derivePool(donors, []byte(builtIn), len(donors))
 	wantDialing := derivePool(donors, []byte(dialing), len(donors))
-	if slices.Equal(wantBuiltIn, wantDialing) {
-		t.Fatal("the two secrets derive the same ordering; this test could not tell them apart")
-	}
 
 	rec := newSNIRecorder(t)
 
@@ -504,9 +532,17 @@ func TestCoverDomainsOnTheWireFollowTheDialSecret(t *testing.T) {
 	r.gate = newHandshakeGateWith(2, 0, 0)
 	m.Register(r)
 
-	// One Connect makes more than one dial (the manager retries), so this loops
-	// on the count of ClientHellos seen rather than on a dial count.
-	for attempt := 0; rec.count() < len(wantDialing) && attempt < 4*len(wantDialing); attempt++ {
+	// One Connect makes more than one dial (the manager retries). The cooldown
+	// keeps picks distinct until the pool is exhausted, so this loops until the
+	// observed set covers the whole pool rather than for a fixed dial count.
+	distinct := func() int {
+		seen := map[string]struct{}{}
+		for _, s := range rec.snapshot() {
+			seen[s] = struct{}{}
+		}
+		return len(seen)
+	}
+	for attempt := 0; distinct() < len(wantDialing) && attempt < 8*len(wantDialing); attempt++ {
 		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 		conn, _, err := m.Connect(ctx, rec.addr)
 		cancel()
@@ -517,15 +553,22 @@ func TestCoverDomainsOnTheWireFollowTheDialSecret(t *testing.T) {
 	}
 
 	got := rec.snapshot()
-	if len(got) < len(wantDialing) {
-		t.Fatalf("only %d ClientHellos reached the listener, want %d", len(got), len(wantDialing))
+	if !equalAsSets(got, wantDialing) {
+		t.Fatalf("cover domains on the wire = %v, want the dial secret's pool (as a set) %v", got, wantDialing)
 	}
-	got = got[:len(wantDialing)]
-	if !slices.Equal(got, wantDialing) {
-		if slices.Equal(got, wantBuiltIn) {
+
+	// Discrimination against the construction secret, kept for a future pool that
+	// makes the two secrets' sets differ. With the current developer pool
+	// derivePool returns a full permutation, so the sets coincide and this cannot
+	// tell them apart; the dial-vs-construction proof lives in
+	// TestShortIDFollowsDialSecret. See the doc comment above.
+	if !equalAsSets(wantBuiltIn, wantDialing) {
+		if equalAsSets(got, wantBuiltIn) {
 			t.Fatalf("the cover domains on the wire are the CONSTRUCTION secret's pool (%v): "+
 				"the dial secret is not reaching the donor selection", got)
 		}
-		t.Fatalf("cover domains = %v, want the dial secret's pool %v", got, wantDialing)
+	} else {
+		t.Logf("dial and construction secrets derive the same %d-element set; "+
+			"cover-domain set cannot discriminate them here (see TestShortIDFollowsDialSecret)", len(wantDialing))
 	}
 }
