@@ -7,6 +7,29 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.11.3] - 2026-09-21
+
+### Fixed
+
+- **No more re-pin spam and slow start when the host has no IPv6.** On a host with
+  no physical IPv6 route, the server-bypass pinner re-pinned the IPv6 exit
+  addresses on every 5-second tick, hit "no physical route", logged two warnings,
+  and told no one the family was dead — forever. Startup was also slow because the
+  selector entered an IPv6 candidate with no route and only learned it was dead by
+  timeout, stalling on one server instead of walking the pool.
+  - The bypass pinner is now edge-triggered: the warning and re-pin fire once, on
+    the transition into "no physical route", then stay quiet (still re-checking for
+    recovery), and report the transition upward.
+  - The endpoint selector gained an `unreachable` state (separate from cooldown, it
+    does not touch health): failover, `Next`, and the connectivity gate skip
+    unreachable candidates, and un-park never revives one.
+  - A family-connectivity preflight runs before the strategy scan, so a family with
+    no physical route is dropped immediately and the scan only touches reachable
+    `(endpoint, family)` pairs. The preflight reads the local route table only — it
+    sends no packets.
+  This is a client-side change; the wire protocol is unchanged and a 1.11.3 client
+  interoperates with 1.11.x servers.
+
 ## [1.11.2] - 2026-09-21
 
 ### Fixed
