@@ -7,6 +7,23 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.11.2] - 2026-09-21
+
+### Fixed
+
+- **evasion: the cooldown SNI order was a per-client fingerprint.** REALITY walks
+  a donor pool the rotator returned in strict order until the cooldown window was
+  exhausted. The pool is already permuted per secret (`derivePool`), so the order
+  did not leak across clients, but a single client repeated the same SNI sequence
+  every cycle — a weak linkability signal to an on-path observer watching that
+  client. The cooldown rotator now picks randomly among the SNIs not in cooldown,
+  keeping the no-repeat-within-window invariant. The dial secret still decides
+  *which* donors are in the pool; only the order is now random per connection.
+  `TestCoverDomainsOnTheWireFollowTheDialSecret` was rewritten to assert the wire
+  cover domains are the dial-secret pool as a *set* (and not the construction
+  secret's pool), which still proves the per-endpoint secret drives cover
+  selection without pinning a sequence.
+
 ## [1.11.1] - 2026-09-21
 
 ### Fixed
