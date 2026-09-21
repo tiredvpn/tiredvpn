@@ -4,6 +4,7 @@ package control
 
 import (
 	"encoding/binary"
+	"fmt"
 	"net"
 
 	"github.com/tiredvpn/tiredvpn/internal/log"
@@ -23,6 +24,10 @@ const ControlMagic byte = 0xCC
 // MinMessageSize is the minimum size of a control message header
 const MinMessageSize = 5 // magic + type + seq + length(2)
 
+// MaxPayloadSize is the largest payload the wire format can carry. The length
+// field is a uint16, so anything past this cannot be encoded without truncation.
+const MaxPayloadSize = 0xFFFF // 65535
+
 // Message represents a control channel message
 type Message struct {
 	Type    byte
@@ -30,9 +35,17 @@ type Message struct {
 	Payload []byte
 }
 
-// Serialize converts message to wire format
-func (m *Message) Serialize() []byte {
+// Serialize converts message to wire format. It returns an error when the
+// payload is larger than MaxPayloadSize: the wire length field is a uint16, so
+// a bigger payload would truncate the header silently and ParseMessage would
+// then read garbage. All current call-sites send empty or tiny control
+// payloads, so the error never fires in practice - but the guard turns a silent
+// corruption into a hard failure if that ever changes.
+func (m *Message) Serialize() ([]byte, error) {
 	length := len(m.Payload)
+	if length > MaxPayloadSize {
+		return nil, fmt.Errorf("control: payload %d bytes exceeds max %d", length, MaxPayloadSize)
+	}
 	buf := make([]byte, MinMessageSize+length)
 	buf[0] = ControlMagic
 	buf[1] = m.Type
@@ -41,7 +54,7 @@ func (m *Message) Serialize() []byte {
 	if length > 0 {
 		copy(buf[5:], m.Payload)
 	}
-	return buf
+	return buf, nil
 }
 
 // ParseMessage parses a control message from wire format
@@ -64,8 +77,10 @@ func ParseMessage(data []byte) *Message {
 		Seq:  data[2],
 	}
 	if length > 0 {
+		// int(length) matters: 5+length in uint16 space overflows at the
+		// ceiling (5+65535 wraps to 4), which would slice data[5:4] and panic.
 		msg.Payload = make([]byte, length)
-		copy(msg.Payload, data[5:5+length])
+		copy(msg.Payload, data[5:5+int(length)])
 	}
 	return msg
 }
@@ -90,7 +105,14 @@ func HandleServerMessage(conn net.Conn, data []byte) bool {
 			Type: MsgPong,
 			Seq:  msg.Seq,
 		}
-		conn.Write(pong.Serialize())
+		wire, err := pong.Serialize()
+		if err != nil {
+			// Unreachable: PONG carries no payload. Guard defensively so a
+			// future payload-bearing reply can never write a corrupt frame.
+			log.Debug("Server: failed to serialize PONG seq=%d: %v", msg.Seq, err)
+			return true
+		}
+		conn.Write(wire)
 		log.Debug("Server: PING->PONG seq=%d", msg.Seq)
 
 	case MsgStatsReq:

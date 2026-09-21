@@ -8,9 +8,21 @@ import (
 	"time"
 )
 
+// mustSerialize serializes m and fails the test on error. All existing frames
+// use tiny payloads, so an error here is a bug in the test's assumptions, not
+// an expected outcome.
+func mustSerialize(t *testing.T, m *Message) []byte {
+	t.Helper()
+	wire, err := m.Serialize()
+	if err != nil {
+		t.Fatalf("Serialize(%d-byte payload) unexpected error: %v", len(m.Payload), err)
+	}
+	return wire
+}
+
 func TestSerializeWireFormat(t *testing.T) {
 	m := &Message{Type: MsgStatsResp, Seq: 0x2a, Payload: []byte("hi")}
-	got := m.Serialize()
+	got := mustSerialize(t, m)
 	want := []byte{
 		ControlMagic, // 0xCC
 		MsgStatsResp, // type
@@ -33,7 +45,7 @@ func TestSerializeParseRoundTrip(t *testing.T) {
 		{"with payload", Message{Type: MsgStatsResp, Seq: 7, Payload: []byte("stats-data")}},
 		{"seq zero", Message{Type: MsgStatsReq, Seq: 0, Payload: []byte{0x00, 0xff}}},
 	} {
-		wire := (&c.msg).Serialize()
+		wire := mustSerialize(t, &c.msg)
 		parsed := ParseMessage(wire)
 		if parsed == nil {
 			t.Fatalf("%s: ParseMessage returned nil for valid frame", c.name)
@@ -51,7 +63,7 @@ func TestSerializeParseRoundTrip(t *testing.T) {
 }
 
 func TestParseMessageRejects(t *testing.T) {
-	valid := (&Message{Type: MsgStatsResp, Seq: 1, Payload: []byte("abcde")}).Serialize()
+	valid := mustSerialize(t, &Message{Type: MsgStatsResp, Seq: 1, Payload: []byte("abcde")})
 
 	for _, c := range []struct {
 		name string
@@ -75,7 +87,7 @@ func TestParseMessageRejects(t *testing.T) {
 }
 
 func TestParseMessageIgnoresTrailingBytes(t *testing.T) {
-	wire := (&Message{Type: MsgPong, Seq: 3, Payload: []byte("xy")}).Serialize()
+	wire := mustSerialize(t, &Message{Type: MsgPong, Seq: 3, Payload: []byte("xy")})
 	framed := append(append([]byte{}, wire...), 0xDE, 0xAD)
 	m := ParseMessage(framed)
 	if m == nil {
@@ -111,7 +123,7 @@ func TestHandleServerMessagePingPong(t *testing.T) {
 	defer srv.Close()
 	defer cli.Close()
 
-	ping := (&Message{Type: MsgPing, Seq: 0x11}).Serialize()
+	ping := mustSerialize(t, &Message{Type: MsgPing, Seq: 0x11})
 
 	handled := make(chan bool, 1)
 	go func() {
@@ -160,7 +172,7 @@ func TestHandleServerMessageNoReply(t *testing.T) {
 		{"unknown type", 0x7F},
 	} {
 		srv, cli := net.Pipe()
-		msg := (&Message{Type: c.typ, Seq: 5}).Serialize()
+		msg := mustSerialize(t, &Message{Type: c.typ, Seq: 5})
 
 		handled := make(chan bool, 1)
 		go func() {
@@ -187,7 +199,7 @@ func TestHandleServerMessageNoReply(t *testing.T) {
 // length encoded big-endian, matching MinMessageSize accounting.
 func TestSerializeLengthField(t *testing.T) {
 	payload := bytes.Repeat([]byte{0xAB}, 300)
-	wire := (&Message{Type: MsgStatsResp, Seq: 0, Payload: payload}).Serialize()
+	wire := mustSerialize(t, &Message{Type: MsgStatsResp, Seq: 0, Payload: payload})
 	if len(wire) != MinMessageSize+len(payload) {
 		t.Fatalf("wire len = %d, want %d", len(wire), MinMessageSize+len(payload))
 	}
@@ -197,5 +209,40 @@ func TestSerializeLengthField(t *testing.T) {
 	}
 	if ParseMessage(wire) == nil {
 		t.Error("300-byte-payload frame failed to round-trip through ParseMessage")
+	}
+}
+
+// TestSerializeRejectsOversizedPayload is the guard against silent truncation.
+// A payload past the uint16 ceiling cannot be length-encoded on the wire.
+//
+// On the old code Serialize took uint16(len(payload)): 70000 & 0xFFFF = 4464,
+// so it returned a frame whose header claimed 4464 bytes. ParseMessage then
+// read a truncated, wrong-length message with no error anywhere. Presented to
+// that logic (length check removed), this test is red because err is nil.
+func TestSerializeRejectsOversizedPayload(t *testing.T) {
+	oversized := bytes.Repeat([]byte{0xAB}, MaxPayloadSize+1)
+	wire, err := (&Message{Type: MsgStatsResp, Seq: 1, Payload: oversized}).Serialize()
+	if err == nil {
+		t.Fatalf("Serialize accepted %d-byte payload (max %d), want error", len(oversized), MaxPayloadSize)
+	}
+	if wire != nil {
+		t.Errorf("Serialize returned %d bytes alongside the error, want nil", len(wire))
+	}
+}
+
+// TestSerializeAcceptsMaxPayload is the positive control for the guard: the
+// largest encodable payload must still serialize and round-trip cleanly, so
+// the rejection above is proven to be a ceiling and not an off-by-one that
+// bites legitimate frames.
+func TestSerializeAcceptsMaxPayload(t *testing.T) {
+	payload := bytes.Repeat([]byte{0xCD}, MaxPayloadSize)
+	wire := mustSerialize(t, &Message{Type: MsgStatsResp, Seq: 9, Payload: payload})
+	parsed := ParseMessage(wire)
+	if parsed == nil {
+		t.Fatalf("max-payload frame (%d bytes) failed to parse", MaxPayloadSize)
+	}
+	if !bytes.Equal(parsed.Payload, payload) {
+		t.Errorf("max-payload round-trip corrupted the payload (len got %d, want %d)",
+			len(parsed.Payload), len(payload))
 	}
 }
