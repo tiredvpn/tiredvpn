@@ -1,28 +1,28 @@
 Origin: TiredVPN
 Label: TiredVPN
 Codename: stable
-Date: Sun, 20 Sep 2026 23:10:51 UTC
+Date: Mon, 21 Sep 2026 09:04:00 UTC
 Architectures: amd64 arm64
 Components: main
 Description: TiredVPN apt repository
 MD5Sum:
- 25236c76c39520d66cce70849b728db9 744 main/binary-amd64/Packages
- 96e2a8bc5875e1d29eb553f24660e8dd 525 main/binary-amd64/Packages.gz
+ c18bc071bb1a56a581d5b6fd356fb1f5 744 main/binary-amd64/Packages
+ ec2e63bafd0e8c54e01015d2e9dae965 521 main/binary-amd64/Packages.gz
  a1cb1598e0aa53fb7a19e480edb1fd61 106 main/binary-amd64/Release
- 9e82a7e10d3641e921291d072003d142 744 main/binary-arm64/Packages
- c2986edeb940b225871a13e4f46d1719 523 main/binary-arm64/Packages.gz
+ a4474c623dd00e0498f703a20b4f07f5 744 main/binary-arm64/Packages
+ a138d76c4ab98f246bf89dff4598b037 522 main/binary-arm64/Packages.gz
  833f0c2c40c4bd6fc40c49fa19ba6a0e 106 main/binary-arm64/Release
 SHA1:
- ae36f6313b60c303278ed40b629f7b3fb8aa5e8c 744 main/binary-amd64/Packages
- b6ed0ef3a20919179a05f724bdef3bb410013433 525 main/binary-amd64/Packages.gz
+ 144dcc284f43245f3fd1d52ade2148dde4638f8c 744 main/binary-amd64/Packages
+ 4a78af9dd7a4cac508f70c190ce2cf74614eecda 521 main/binary-amd64/Packages.gz
  cbfc21b1aea4c89370605c63ec154f6fec1a0765 106 main/binary-amd64/Release
- e471eed199b85cfaf22dbdddf57673515727fd28 744 main/binary-arm64/Packages
- c676ee71517520f5a35c7596e7fb76c8524fb009 523 main/binary-arm64/Packages.gz
+ 89e8cc17fd5bd60cfc50c86c2a908d0d3314ce6c 744 main/binary-arm64/Packages
+ 19a4678e6776b7b7697ba07eb8126ada6b96f1b9 522 main/binary-arm64/Packages.gz
  3bca33c026140b27d9e2f0e3015f33da87d18e20 106 main/binary-arm64/Release
 SHA256:
- ff68e4d2e5872551cd46c45f804f0742e8b5ed9fcc1edfc20b1cc66f51a34231 744 main/binary-amd64/Packages
- a06fcb8aeb60b0bd0cb796dcc46d469cdacfefbd9726f64e5ae9f8736cf94535 525 main/binary-amd64/Packages.gz
+ b801676c3d9eee78243b1d3b4463ed320d707b8a470a5dfaf77fe37d23c85b03 744 main/binary-amd64/Packages
+ 4d429048ec185b6159bb5630e5f4a2e581a73178d443140f9197db0764e66fa5 521 main/binary-amd64/Packages.gz
  f56fb9ff2142f536cc47925e506d8cc1e0f6279b4aa0d1ed26922aa43934b7c7 106 main/binary-amd64/Release
- 6de1a3e6ca31532f8d77a33487664ad6b724d81516ac897caa50a20eedb76b1c 744 main/binary-arm64/Packages
- 7bb36c321104f78ab50954372f409adc8df6d206a6ca3b769f7f5372bac29aa6 523 main/binary-arm64/Packages.gz
+ afccacbab5d6fee8a10aa154441186030506c9dcdd4a235244049aadddbe45b0 744 main/binary-arm64/Packages
+ eba40d4ebffc9ff0409107ef975a2ce439707afc3dcc69c0e9d1f13e1d99ac04 522 main/binary-arm64/Packages.gz
  2ea051df46bf72e3e60ff7def56f180e193b56db497b982353db591146d6542a 106 main/binary-arm64/Release
