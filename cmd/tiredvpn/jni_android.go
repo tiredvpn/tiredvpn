@@ -367,8 +367,11 @@ func Java_com_tiredvpn_android_native_TiredVpnNative_sendCommand(
 
 	logMessage(fmt.Sprintf("Command received: %s", goCmdStr))
 
-	// TODO: Implement command handling (for port hopping, etc.)
-	response := fmt.Sprintf(`{"status":"ok","command":"%s"}`, goCmdStr)
+	// No command channel is implemented here. The Kotlin side dropped the
+	// matching native method in 1.10.0 (port hopping was removed), so nothing
+	// should reach this export. Answer honestly rather than a blanket "ok" that
+	// would let a future caller mistake this dead export for a working channel.
+	response := fmt.Sprintf(`{"status":"error","error":"command channel not implemented","command":"%s"}`, goCmdStr)
 
 	// Convert Go string to Java
 	cResponse := C.CString(response)
@@ -435,6 +438,12 @@ func parseClientArgs(args []string) (*client.Config, error) {
 		// as tun.DefaultMTU) leaves a safe margin for all encapsulation. The app
 		// can still override via -tun-mtu.
 		TunMTU: 1280,
+		// The desktop client and the server default -reality-require-data-v2 to
+		// true (main.go), but this literal bypasses the flag set, so the field
+		// would otherwise stay at its zero value (false) and leave Android as the
+		// only platform silently accepting the malleable v1 REALITY data layer.
+		// Match the other clients: require the authenticated v2 layer.
+		REALITYRequireDataV2: true,
 	}
 
 	// -config is applied BEFORE the scan below, so that the args the app passed
