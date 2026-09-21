@@ -897,3 +897,80 @@ func TestPooledRelayLengthPrefixedHonoursIdleTimeout(t *testing.T) {
 		t.Fatal("length-prefixed relay ignored the 30ms idle timeout (old code hardcoded 2m)")
 	}
 }
+
+// --- Defect 3: partial length prefix survives a read timeout -------------
+
+// scriptedReadConn returns one scripted (chunk, err) pair per Read call, so a
+// test can model a length prefix that arrives split by a timeout.
+type scriptedReadConn struct {
+	chunks [][]byte
+	errs   []error
+	idx    int
+	mu     sync.Mutex
+	closed bool
+}
+
+func (c *scriptedReadConn) Read(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return 0, net.ErrClosed
+	}
+	if c.idx >= len(c.chunks) {
+		return 0, io.EOF
+	}
+	data := c.chunks[c.idx]
+	err := c.errs[c.idx]
+	c.idx++
+	return copy(p, data), err
+}
+func (c *scriptedReadConn) Write(p []byte) (int, error) { return len(p), nil }
+func (c *scriptedReadConn) Close() error {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	return nil
+}
+func (c *scriptedReadConn) LocalAddr() net.Addr              { return dummyAddr{} }
+func (c *scriptedReadConn) RemoteAddr() net.Addr             { return dummyAddr{} }
+func (c *scriptedReadConn) SetDeadline(time.Time) error      { return nil }
+func (c *scriptedReadConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *scriptedReadConn) SetWriteDeadline(time.Time) error { return nil }
+
+// TestPooledRelayLengthPrefixedKeepsPartialPrefixAcrossTimeout predicates the
+// frame-desync fix. The 4-byte length prefix (00 00 00 05) arrives as two bytes,
+// then a timeout, then the remaining two, then the "hello" payload. The relay
+// must reassemble the prefix and deliver exactly "hello".
+//
+// On the old code the timeout dropped the two prefix bytes already read and the
+// next ReadFull started fresh, consuming [00 05 'h' 'e'] as the length -> a huge
+// pktLen that trips the size guard and ends the relay before any payload reaches
+// the browser (red: the read below times out).
+func TestPooledRelayLengthPrefixedKeepsPartialPrefixAcrossTimeout(t *testing.T) {
+	payload := []byte("hello")
+	server := &scriptedReadConn{
+		chunks: [][]byte{{0, 0}, nil, {0, 5}, payload},
+		errs:   []error{nil, timeoutErr{timeout: true}, nil, nil},
+	}
+	clientLocal, clientEnd := net.Pipe()
+	done := make(chan error, 1)
+	go func() {
+		done <- PooledRelayLengthPrefixed(clientLocal, &PooledConn{Conn: server}, time.Minute)
+	}()
+
+	got := make([]byte, len(payload))
+	clientEnd.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(clientEnd, got); err != nil {
+		t.Fatalf("browser read: %v (frame desynced by dropped prefix bytes)", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("browser saw %q, want %q", got, payload)
+	}
+
+	clientEnd.Close()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("relay did not terminate")
+	}
+}

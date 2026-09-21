@@ -446,21 +446,28 @@ func PooledRelayLengthPrefixed(client net.Conn, server *PooledConn, idleTimeout 
 	go func() {
 		defer wg.Done()
 		lenBuf := make([]byte, 4)
+		lenGot := 0 // prefix bytes already read across timeout retries
 		for {
 			server.SetReadDeadline(time.Now().Add(30 * time.Second))
-			if _, err := io.ReadFull(server, lenBuf); err != nil {
+			// Read only the still-missing prefix bytes. A partial read that
+			// then times out leaves lenGot>0; starting a fresh 4-byte ReadFull
+			// here would drop those bytes and desync every subsequent frame.
+			n, err := io.ReadFull(server, lenBuf[lenGot:])
+			lenGot += n
+			if err != nil {
 				if err != io.EOF {
 					if isRelayTimeout(err) {
 						if !checkActivity() {
 							errCh <- io.EOF
 							return
 						}
-						continue
+						continue // keep lenGot; finish the prefix next round
 					}
 				}
 				errCh <- err
 				return
 			}
+			lenGot = 0 // full prefix consumed; reset for the next frame
 
 			pktLen := binary.BigEndian.Uint32(lenBuf)
 			if pktLen == 0 || pktLen > 64*1024 {
