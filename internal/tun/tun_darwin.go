@@ -389,6 +389,15 @@ func (t *TUNDevice) EnsureServerBypass() {}
 // WatchServerBypass is a no-op on macOS; see SetServerBypassIP.
 func (t *TUNDevice) WatchServerBypass(<-chan struct{}) {}
 
+// SetBypassUnroutableFunc is a no-op on macOS; there is no bypass watcher to
+// report from. See SetServerBypassIP.
+func (t *TUNDevice) SetBypassUnroutableFunc(func(net.IP, bool)) {}
+
+// HasPhysicalRoute answers "unknown" on macOS: without the netlink route table
+// the Linux path reads, the family preflight has nothing to decide on, so it
+// leaves every family in play rather than guessing. See SetServerBypassIP.
+func (t *TUNDevice) HasPhysicalRoute(net.IP) (routable, known bool) { return false, false }
+
 // SetDeferRoutes is a no-op on macOS; route deferral is a Linux-only safeguard.
 // Provided so cross-platform callers (vpn.go) compile.
 func (t *TUNDevice) SetDeferRoutes(bool) {}

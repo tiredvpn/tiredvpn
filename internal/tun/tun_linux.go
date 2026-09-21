@@ -5,6 +5,7 @@ package tun
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -93,6 +94,19 @@ type TUNDevice struct {
 	// left the next client start with no path to the server, so teardown skips
 	// it.
 	bypassPreexisted map[string]bool
+	// bypassUnroutable records, per address, that the last pin attempt found no
+	// physical route for its family (an IPv6 endpoint on a host with no IPv6).
+	// It is what stops the watcher from logging "cannot resolve physical route"
+	// every 5s forever: re-pinning is futile until a route appears, so the
+	// watcher checks for one quietly and re-pins only on the transition back.
+	// Guarded by bypassMu.
+	bypassUnroutable map[string]bool
+	// onBypassUnroutable, when set, is called on the transition of an address
+	// between routable and unroutable, so the strategy layer can drop that
+	// (endpoint, family) from selection instead of dialling it into the tunnel.
+	// Set once via SetBypassUnroutableFunc before the watcher starts; read
+	// without the lock because it never changes after that.
+	onBypassUnroutable func(ip net.IP, unroutable bool)
 	// v6BlockAllow are the IPv6 addresses punched through the leak block (the
 	// server's own transport addresses). Guarded by bypassMu, like the bypass
 	// state it mirrors.
@@ -212,6 +226,75 @@ func (t *TUNDevice) SetServerBypassIPs(ips []net.IP) {
 	t.bypassMu.Lock()
 	t.serverBypassIPs = out
 	t.bypassMu.Unlock()
+}
+
+// SetBypassUnroutableFunc registers a callback invoked when a bypass address
+// crosses between routable and unroutable, so the caller (the strategy layer)
+// can exclude or re-admit that (endpoint, family) in server selection. Call it
+// before the watcher starts; a nil func clears it.
+func (t *TUNDevice) SetBypassUnroutableFunc(f func(ip net.IP, unroutable bool)) {
+	t.bypassMu.Lock()
+	t.onBypassUnroutable = f
+	t.bypassMu.Unlock()
+}
+
+// HasPhysicalRoute reports whether the host has a route to ip that does not go
+// through this tunnel, and whether that answer is known. It is the physical
+// leg of the family preflight: a nil ip, or any lookup error, answers
+// (false, false) so the caller treats it as "unknown" and does not exclude the
+// family on a transient failure. A real "no route" answers (false, true).
+func (t *TUNDevice) HasPhysicalRoute(ip net.IP) (routable, known bool) {
+	if ip == nil {
+		return false, false
+	}
+	if _, err := t.physicalRouteTo(ip); err != nil {
+		if errors.Is(err, errNoPhysicalRoute) {
+			return false, true
+		}
+		return false, false // a listing error is "unknown", not "no route"
+	}
+	return true, true
+}
+
+// markBypassUnroutable records that ip has no physical route right now and
+// reports whether that is a change. On a change it fires onBypassUnroutable so
+// the address is dropped from selection. Called under no lock; takes bypassMu.
+func (t *TUNDevice) markBypassUnroutable(ip net.IP) bool {
+	key := ip.String()
+	t.bypassMu.Lock()
+	if t.bypassUnroutable == nil {
+		t.bypassUnroutable = make(map[string]bool, 2)
+	}
+	changed := !t.bypassUnroutable[key]
+	t.bypassUnroutable[key] = true
+	cb := t.onBypassUnroutable
+	t.bypassMu.Unlock()
+	if changed && cb != nil {
+		cb(ip, true)
+	}
+	return changed
+}
+
+// clearBypassUnroutable records that ip has a physical route again and reports
+// whether that is a change, firing onBypassUnroutable to re-admit it.
+func (t *TUNDevice) clearBypassUnroutable(ip net.IP) bool {
+	key := ip.String()
+	t.bypassMu.Lock()
+	changed := t.bypassUnroutable[key]
+	delete(t.bypassUnroutable, key)
+	cb := t.onBypassUnroutable
+	t.bypassMu.Unlock()
+	if changed && cb != nil {
+		cb(ip, false)
+	}
+	return changed
+}
+
+// isBypassUnroutable reports the last recorded route verdict for ip.
+func (t *TUNDevice) isBypassUnroutable(ip net.IP) bool {
+	t.bypassMu.Lock()
+	defer t.bypassMu.Unlock()
+	return t.bypassUnroutable[ip.String()]
 }
 
 // SetServerBypassIP records the VPN server's public IPv4, replacing whatever
@@ -383,6 +466,7 @@ func (t *TUNDevice) Close() error {
 	}
 	t.bypassRoutes = nil
 	t.bypassPreexisted = nil
+	t.bypassUnroutable = nil
 	// Stop the watcher from re-pinning routes we just tore down.
 	t.serverBypassIPs = nil
 	t.bypassMu.Unlock()
@@ -845,10 +929,15 @@ func (t *TUNDevice) physicalRouteTo(ip net.IP) (*netlink.Route, error) {
 		}
 	}
 	if best == nil {
-		return nil, fmt.Errorf("no physical route to %s", ip)
+		return nil, fmt.Errorf("%w to %s", errNoPhysicalRoute, ip)
 	}
 	return best, nil
 }
+
+// errNoPhysicalRoute is the definite "this host cannot reach that address off
+// the tunnel" verdict, distinct from a transient netlink listing failure. The
+// family preflight acts only on this one; a listing error stays "unknown".
+var errNoPhysicalRoute = errors.New("no physical route")
 
 // addServerBypass pins a host route to the VPN server through the current
 // physical gateway. Without it, a full-tunnel client loops its own server
@@ -931,8 +1020,16 @@ func (t *TUNDevice) pinBypass(ip net.IP) {
 	}
 	r, err := t.physicalRouteTo(ip)
 	if err != nil {
-		log.Warn("Server bypass: cannot resolve physical route to %s: %v", ip, err)
+		// Edge-triggered: the watcher calls this every 5s, so logging (and
+		// re-notifying the selector) on every miss is the spam this replaces.
+		// Warn once on the transition into unroutable; stay silent after.
+		if t.markBypassUnroutable(ip) {
+			log.Warn("Server bypass: no physical route to %s, excluding this family from selection until one returns: %v", ip, err)
+		}
 		return
+	}
+	if t.clearBypassUnroutable(ip) {
+		log.Info("Server bypass: physical route to %s is back, re-admitting", ip)
 	}
 	v6 := ip.To4() == nil
 	bits := 32
@@ -995,7 +1092,15 @@ func (t *TUNDevice) ensureBypass(ip net.IP) {
 	if err == nil && len(resolved) > 0 && resolved[0].LinkIndex != link.Attrs().Index {
 		return // still leaving through a physical link, nothing to do
 	}
-	if err != nil {
+	// Traffic to ip would go through the tunnel (or the lookup failed): it wants
+	// a bypass pin. When we already know this family has no physical route, do
+	// not log or re-pin on every tick - just check quietly whether a route came
+	// back, and fall through to re-pin (which logs the recovery) only then.
+	if t.isBypassUnroutable(ip) {
+		if _, perr := t.physicalRouteTo(ip); perr != nil {
+			return // still no physical route; stay silent, no spam
+		}
+	} else if err != nil {
 		log.Debug("Server bypass: route lookup for %s failed: %v, re-pinning", ip, err)
 	} else {
 		log.Warn("Server bypass: traffic to %s now routes via %s, re-pinning", ip, t.name)
