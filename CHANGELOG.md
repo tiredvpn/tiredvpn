@@ -7,6 +7,21 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.11.4] - 2026-09-21
+
+### Fixed
+
+- **Android now requires the authenticated REALITY v2 data layer.** The JNI entry
+  point builds `client.Config` as a literal that bypasses the flag set, so
+  `REALITYRequireDataV2` stayed at its zero value (false) — the desktop client and
+  the server default it to true, leaving Android as the only platform silently
+  accepting the malleable v1 data layer. It is now set true in the literal, to
+  match the other clients.
+- **Android: the `sendCommand` JNI export no longer returns a false-positive.** It
+  answered `{"status":"ok"}` to any input, but the Kotlin side dropped the matching
+  native method in 1.10.0 (port hopping was removed), so it is a dead export. It now
+  returns an explicit error instead of misleading a future caller.
+
 ## [1.11.3] - 2026-09-21
 
 ### Fixed
