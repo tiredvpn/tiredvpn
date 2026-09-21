@@ -94,8 +94,16 @@ func NewTunnelPool(mgr *strategy.Manager, serverAddr string, cfg Config) *Tunnel
 }
 
 // Get establishes a fresh tunnel connection, bounded by MaxConnections.
+//
+// The slot is reserved atomically: AddInt32 both checks and claims in one
+// operation, so N concurrent callers can never all pass a limit of N-1. A
+// separate LoadInt32 check followed by an increment in createConn was a
+// classic TOCTOU - between the load and the add, every racing caller read the
+// same under-limit value and the pool overshot MaxConnections. If the reserve
+// pushes us over the limit we hand the slot straight back and refuse.
 func (p *TunnelPool) Get(ctx context.Context) (*PooledConn, error) {
-	if int(atomic.LoadInt32(&p.totalConns)) >= p.config.MaxConnections {
+	if int(atomic.AddInt32(&p.totalConns, 1)) > p.config.MaxConnections {
+		atomic.AddInt32(&p.totalConns, -1)
 		return nil, ErrPoolExhausted
 	}
 	return p.createConn(ctx)
@@ -180,10 +188,10 @@ func (p *TunnelPool) DialTarget(ctx context.Context, targetAddr string) (*Pooled
 	return nil, fmt.Errorf("pool: dial %s failed after %d attempts: %w", targetAddr, maxAttempts, lastErr)
 }
 
-// createConn creates a new pooled connection
+// createConn creates a new pooled connection. The caller (Get) has already
+// reserved the slot atomically, so createConn does not increment the counter -
+// it only releases the reservation if the dial fails.
 func (p *TunnelPool) createConn(ctx context.Context) (*PooledConn, error) {
-	atomic.AddInt32(&p.totalConns, 1)
-
 	connectCtx, cancel := context.WithTimeout(ctx, p.config.ConnectTimeout)
 	defer cancel()
 
@@ -265,9 +273,14 @@ func PooledRelay(client net.Conn, server *PooledConn, idleTimeout time.Duration)
 	var wg sync.WaitGroup
 	errCh := make(chan error, 2)
 
-	// Track last activity to detect truly dead connections
+	// Track last activity to detect truly dead connections. If NO data flows in
+	// either direction for maxIdleBeforeClose, the relay closes. Honour the
+	// caller's idleTimeout; fall back to 2m only when it is unset (<=0).
 	lastActivity := time.Now().UnixNano()
-	maxIdleBeforeClose := 2 * time.Minute // If NO data in either direction for 2 min, close
+	maxIdleBeforeClose := idleTimeout
+	if maxIdleBeforeClose <= 0 {
+		maxIdleBeforeClose = 2 * time.Minute
+	}
 
 	updateActivity := func() {
 		atomic.StoreInt64(&lastActivity, time.Now().UnixNano())
@@ -374,8 +387,12 @@ func PooledRelayLengthPrefixed(client net.Conn, server *PooledConn, idleTimeout 
 	var wg sync.WaitGroup
 	errCh := make(chan error, 2)
 
+	// Honour the caller's idleTimeout; fall back to 2m only when unset (<=0).
 	lastActivity := time.Now().UnixNano()
-	maxIdleBeforeClose := 2 * time.Minute
+	maxIdleBeforeClose := idleTimeout
+	if maxIdleBeforeClose <= 0 {
+		maxIdleBeforeClose = 2 * time.Minute
+	}
 
 	updateActivity := func() {
 		atomic.StoreInt64(&lastActivity, time.Now().UnixNano())
@@ -429,21 +446,28 @@ func PooledRelayLengthPrefixed(client net.Conn, server *PooledConn, idleTimeout 
 	go func() {
 		defer wg.Done()
 		lenBuf := make([]byte, 4)
+		lenGot := 0 // prefix bytes already read across timeout retries
 		for {
 			server.SetReadDeadline(time.Now().Add(30 * time.Second))
-			if _, err := io.ReadFull(server, lenBuf); err != nil {
+			// Read only the still-missing prefix bytes. A partial read that
+			// then times out leaves lenGot>0; starting a fresh 4-byte ReadFull
+			// here would drop those bytes and desync every subsequent frame.
+			n, err := io.ReadFull(server, lenBuf[lenGot:])
+			lenGot += n
+			if err != nil {
 				if err != io.EOF {
 					if isRelayTimeout(err) {
 						if !checkActivity() {
 							errCh <- io.EOF
 							return
 						}
-						continue
+						continue // keep lenGot; finish the prefix next round
 					}
 				}
 				errCh <- err
 				return
 			}
+			lenGot = 0 // full prefix consumed; reset for the next frame
 
 			pktLen := binary.BigEndian.Uint32(lenBuf)
 			if pktLen == 0 || pktLen > 64*1024 {

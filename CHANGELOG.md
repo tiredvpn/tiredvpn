@@ -7,6 +7,26 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.11.1] - 2026-09-21
+
+### Fixed
+
+- **pool: the connection pool could exceed `MaxConnections` under load.** `Get`
+  read the counter and incremented it as two separate atomics, so concurrent
+  callers all passed the check before any of them bumped the count. It now
+  reserves the slot with a single atomic add and rolls back if the reservation
+  overshoots.
+- **pool: the configured idle timeout was ignored.** Both relay loops hardcoded a
+  2-minute idle close while the client passed its own value (5m); the passed value
+  is now honoured, falling back to 2m only when unset.
+- **pool: `PooledRelayLengthPrefixed` desynced frames on a partial read.** A read
+  timeout mid-length-prefix dropped the bytes already read and restarted, which
+  permanently misaligned every following frame. Partial prefix bytes are now kept
+  across the timeout.
+- **control: `Message.Serialize` silently truncated payloads over 65535 bytes.**
+  The length was written as `uint16`; oversized payloads corrupted the frame. It
+  now rejects them instead of emitting a corrupt header.
+
 ## [1.11.0] - 2026-09-20
 
 ### Compatibility

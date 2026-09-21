@@ -679,3 +679,298 @@ func TestPooledRelayLengthPrefixedRejectsBadFrame(t *testing.T) {
 		})
 	}
 }
+
+// --- Defect 1: atomic reserve honours MaxConnections under load ----------
+
+// barrierConnector reserves and then parks every Connect on a release channel,
+// so no slot is freed while the test measures how many connections got in. It
+// records the peak number of concurrent in-flight Connects, which equals the
+// number of Get calls that passed the pool's capacity guard.
+type barrierConnector struct {
+	inFlight int32
+	peak     int32
+	release  chan struct{}
+}
+
+func (b *barrierConnector) Connect(context.Context, string) (net.Conn, strategy.Strategy, error) {
+	n := atomic.AddInt32(&b.inFlight, 1)
+	for {
+		p := atomic.LoadInt32(&b.peak)
+		if n <= p || atomic.CompareAndSwapInt32(&b.peak, p, n) {
+			break
+		}
+	}
+	<-b.release
+	atomic.AddInt32(&b.inFlight, -1)
+	client, server := net.Pipe()
+	go func() { io.Copy(io.Discard, server); server.Close() }()
+	return client, fakeStrategy{}, nil
+}
+
+// runAdmissionRound fires `goroutines` concurrent Get calls at a pool capped at
+// maxConns, holding every admitted connection parked in Connect so that the
+// admitted count equals the peak simultaneously-live count. It returns that peak
+// and leaves the pool counter back at zero.
+func runAdmissionRound(t *testing.T, maxConns, goroutines int) int32 {
+	t.Helper()
+	bc := &barrierConnector{release: make(chan struct{})}
+	p := newTestPool(bc)
+	p.config.MaxConnections = maxConns
+
+	var rejected int32
+	conns := make(chan *PooledConn, goroutines)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			c, err := p.Get(context.Background())
+			if errors.Is(err, ErrPoolExhausted) {
+				atomic.AddInt32(&rejected, 1)
+				return
+			}
+			if err != nil {
+				t.Errorf("unexpected Get error: %v", err)
+				return
+			}
+			conns <- c
+		}()
+	}
+	close(start)
+
+	// Wait until every caller has either reserved a slot (now parked in Connect)
+	// or been refused, then freeze and read the peak.
+	deadline := time.After(5 * time.Second)
+	for atomic.LoadInt32(&bc.inFlight)+atomic.LoadInt32(&rejected) < int32(goroutines) {
+		select {
+		case <-deadline:
+			t.Fatalf("timed out: inFlight=%d rejected=%d, want sum=%d",
+				atomic.LoadInt32(&bc.inFlight), atomic.LoadInt32(&rejected), goroutines)
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	peak := atomic.LoadInt32(&bc.peak)
+
+	close(bc.release)
+	wg.Wait()
+	close(conns)
+	for c := range conns {
+		c.Close()
+	}
+	if got := p.Stats(); got != 0 {
+		t.Fatalf("totalConns=%d after closing all, want 0", got)
+	}
+	return peak
+}
+
+// TestGetAtomicReserveHonoursMaxUnderLoad predicates the TOCTOU fix. With the
+// limit at maxConns and far more concurrent callers, the pool must never admit
+// more than maxConns simultaneously - the connector holds every admitted
+// connection open, so admitted == peak concurrent Connects.
+//
+// The old Load-then-Add code split the guard from the increment across two
+// atomics: callers that read the same under-limit value before any of them
+// incremented all got in, overshooting maxConns. That overshoot needs several
+// callers inside the tiny Load->Add window at once, so a single burst catches it
+// only sometimes. We run many bursts and fail on the first overshoot: the fixed
+// code (atomic reserve) can never overshoot in ANY burst, so it stays green
+// across all rounds; the broken code overshoots within a handful of rounds.
+// -race does not flag the bug - both operations are atomic, the race is logical.
+//
+// Positive control: at least one round must admit the full maxConns (the last
+// round asserts exactly maxConns), so the cap is what refuses excess callers,
+// not a dead connector that admits nobody.
+func TestGetAtomicReserveHonoursMaxUnderLoad(t *testing.T) {
+	const (
+		maxConns   = 2
+		goroutines = 128
+		rounds     = 200
+	)
+	for r := 0; r < rounds; r++ {
+		if peak := runAdmissionRound(t, maxConns, goroutines); peak > maxConns {
+			t.Fatalf("round %d: peak concurrent connections=%d exceeded MaxConnections=%d (TOCTOU overshoot)",
+				r, peak, maxConns)
+		}
+	}
+	// Positive control: the cap admits exactly maxConns under load, not zero.
+	if peak := runAdmissionRound(t, maxConns, goroutines); peak != maxConns {
+		t.Fatalf("positive control: peak admitted=%d, want exactly %d", peak, maxConns)
+	}
+}
+
+// --- Defect 2: relay honours the caller's idle timeout -------------------
+
+type dummyAddr struct{}
+
+func (dummyAddr) Network() string { return "fake" }
+func (dummyAddr) String() string  { return "fake" }
+
+// idleTimeoutConn is a net.Conn that never delivers data: every Read waits
+// readGap then reports a timeout, so the relay's inactivity path drives the
+// test. Writes are swallowed. It ignores deadlines (the relay's hardcoded 30s
+// per-read deadline would otherwise make the test take 30s).
+type idleTimeoutConn struct {
+	readGap time.Duration
+	mu      sync.Mutex
+	closed  bool
+}
+
+func (c *idleTimeoutConn) Read(p []byte) (int, error) {
+	time.Sleep(c.readGap)
+	c.mu.Lock()
+	closed := c.closed
+	c.mu.Unlock()
+	if closed {
+		return 0, net.ErrClosed
+	}
+	return 0, timeoutErr{timeout: true}
+}
+func (c *idleTimeoutConn) Write(p []byte) (int, error) { return len(p), nil }
+func (c *idleTimeoutConn) Close() error {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	return nil
+}
+func (c *idleTimeoutConn) LocalAddr() net.Addr              { return dummyAddr{} }
+func (c *idleTimeoutConn) RemoteAddr() net.Addr             { return dummyAddr{} }
+func (c *idleTimeoutConn) SetDeadline(time.Time) error      { return nil }
+func (c *idleTimeoutConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *idleTimeoutConn) SetWriteDeadline(time.Time) error { return nil }
+
+// TestPooledRelayHonoursIdleTimeout predicates the idle-timeout fix: a 30ms
+// idle timeout must close an idle relay promptly. The old code hardcoded 2m and
+// ignored the parameter, so nothing closes within the 2s window (red).
+func TestPooledRelayHonoursIdleTimeout(t *testing.T) {
+	client := &idleTimeoutConn{readGap: 5 * time.Millisecond}
+	server := &PooledConn{Conn: &idleTimeoutConn{readGap: 5 * time.Millisecond}}
+	done := make(chan error, 1)
+	go func() { done <- PooledRelay(client, server, 30*time.Millisecond) }()
+
+	select {
+	case err := <-done:
+		if err != io.EOF {
+			t.Fatalf("relay returned %v, want io.EOF on idle close", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("relay ignored the 30ms idle timeout (old code hardcoded 2m)")
+	}
+}
+
+// TestPooledRelayKeepsOpenUnderLargeIdleTimeout is the positive control for the
+// above: with a 10s idle timeout the relay must NOT close within 300ms. Without
+// it, a "fix" that always closes fast would pass the previous test spuriously.
+func TestPooledRelayKeepsOpenUnderLargeIdleTimeout(t *testing.T) {
+	client := &idleTimeoutConn{readGap: 5 * time.Millisecond}
+	server := &PooledConn{Conn: &idleTimeoutConn{readGap: 5 * time.Millisecond}}
+	done := make(chan error, 1)
+	go func() { done <- PooledRelay(client, server, 10*time.Second) }()
+
+	select {
+	case err := <-done:
+		t.Fatalf("relay closed early (%v) under a 10s idle timeout", err)
+	case <-time.After(300 * time.Millisecond):
+		// still open, as expected
+	}
+	client.Close()
+	server.Conn.Close()
+	<-done
+}
+
+// TestPooledRelayLengthPrefixedHonoursIdleTimeout covers the second edited site
+// (the length-prefixed relay carried the same hardcoded 2m).
+func TestPooledRelayLengthPrefixedHonoursIdleTimeout(t *testing.T) {
+	client := &idleTimeoutConn{readGap: 5 * time.Millisecond}
+	server := &PooledConn{Conn: &idleTimeoutConn{readGap: 5 * time.Millisecond}}
+	done := make(chan error, 1)
+	go func() { done <- PooledRelayLengthPrefixed(client, server, 30*time.Millisecond) }()
+
+	select {
+	case err := <-done:
+		if err != io.EOF {
+			t.Fatalf("relay returned %v, want io.EOF on idle close", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("length-prefixed relay ignored the 30ms idle timeout (old code hardcoded 2m)")
+	}
+}
+
+// --- Defect 3: partial length prefix survives a read timeout -------------
+
+// scriptedReadConn returns one scripted (chunk, err) pair per Read call, so a
+// test can model a length prefix that arrives split by a timeout.
+type scriptedReadConn struct {
+	chunks [][]byte
+	errs   []error
+	idx    int
+	mu     sync.Mutex
+	closed bool
+}
+
+func (c *scriptedReadConn) Read(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return 0, net.ErrClosed
+	}
+	if c.idx >= len(c.chunks) {
+		return 0, io.EOF
+	}
+	data := c.chunks[c.idx]
+	err := c.errs[c.idx]
+	c.idx++
+	return copy(p, data), err
+}
+func (c *scriptedReadConn) Write(p []byte) (int, error) { return len(p), nil }
+func (c *scriptedReadConn) Close() error {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	return nil
+}
+func (c *scriptedReadConn) LocalAddr() net.Addr              { return dummyAddr{} }
+func (c *scriptedReadConn) RemoteAddr() net.Addr             { return dummyAddr{} }
+func (c *scriptedReadConn) SetDeadline(time.Time) error      { return nil }
+func (c *scriptedReadConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *scriptedReadConn) SetWriteDeadline(time.Time) error { return nil }
+
+// TestPooledRelayLengthPrefixedKeepsPartialPrefixAcrossTimeout predicates the
+// frame-desync fix. The 4-byte length prefix (00 00 00 05) arrives as two bytes,
+// then a timeout, then the remaining two, then the "hello" payload. The relay
+// must reassemble the prefix and deliver exactly "hello".
+//
+// On the old code the timeout dropped the two prefix bytes already read and the
+// next ReadFull started fresh, consuming [00 05 'h' 'e'] as the length -> a huge
+// pktLen that trips the size guard and ends the relay before any payload reaches
+// the browser (red: the read below times out).
+func TestPooledRelayLengthPrefixedKeepsPartialPrefixAcrossTimeout(t *testing.T) {
+	payload := []byte("hello")
+	server := &scriptedReadConn{
+		chunks: [][]byte{{0, 0}, nil, {0, 5}, payload},
+		errs:   []error{nil, timeoutErr{timeout: true}, nil, nil},
+	}
+	clientLocal, clientEnd := net.Pipe()
+	done := make(chan error, 1)
+	go func() {
+		done <- PooledRelayLengthPrefixed(clientLocal, &PooledConn{Conn: server}, time.Minute)
+	}()
+
+	got := make([]byte, len(payload))
+	clientEnd.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(clientEnd, got); err != nil {
+		t.Fatalf("browser read: %v (frame desynced by dropped prefix bytes)", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("browser saw %q, want %q", got, payload)
+	}
+
+	clientEnd.Close()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("relay did not terminate")
+	}
+}
