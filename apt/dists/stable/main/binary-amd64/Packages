@@ -1,5 +1,5 @@
 Package: tiredvpn
-Version: 1.11.1
+Version: 1.11.2
 Architecture: amd64
 Maintainer: TiredVPN Contributors <noreply@users.noreply.github.com>
 Installed-Size: 16791
@@ -7,11 +7,11 @@ Depends: openssl, iproute2
 Homepage: https://github.com/tiredvpn/tiredvpn
 Priority: optional
 Section: net
-Filename: pool/main/t/tiredvpn/tiredvpn_1.11.1_amd64.deb
-Size: 6797596
-SHA256: 04c6bdbd9b53db81921cbd039494abeaf635670cf9fdd3d2da8ce7a64fe2237e
-SHA1: 1ddc60f8e0111ef0ee0ccd63b696a861792bb44f
-MD5sum: 6e5f2edf8adf66253d95dbba6c36976f
+Filename: pool/main/t/tiredvpn/tiredvpn_1.11.2_amd64.deb
+Size: 6797868
+SHA256: a64ea4220ca47b5d3fdbfa666fa92ff3a2c71b4e69c147062c9c91781017b2e6
+SHA1: 9c1ad991cdf880ae25921cbdfc02695d08ff5be3
+MD5sum: 43a1a49efe908d4ce1b6b5580cf9ce97
 Description: DPI-resistant VPN for censored networks.
  Tunnels traffic past DPI/TSPU-style censorship using REALITY, QUIC obfuscation,
  protocol confusion, traffic morphing and other transports, and serves a
