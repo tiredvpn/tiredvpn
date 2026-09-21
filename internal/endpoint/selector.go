@@ -141,6 +141,7 @@ type CandidateState struct {
 	CooldownUntil       time.Time
 	LatencyEWMA         time.Duration
 	Probed              bool
+	Unreachable         bool
 }
 
 // Selector holds the candidate list, their health, and which one is currently
@@ -155,6 +156,16 @@ type Selector struct {
 	byAddr    map[string]int
 	pinnedIdx int
 	pinnedAt  time.Time
+
+	// unreachable marks candidates whose address family has no physical route
+	// off the tunnel right now - e.g. an IPv6 endpoint on a host with no IPv6
+	// at all. Unlike a cooldown it is not time-based and not an endpoint
+	// verdict: the server is fine, this host simply cannot reach it on that
+	// family, so it must be skipped by the failover walk (never dialled, never
+	// un-parked) rather than parked with backoff. Set from the physical-route
+	// preflight and from the TUN bypass watcher; cleared the moment the route
+	// reappears. Guarded by mu.
+	unreachable []bool
 }
 
 // NewSelector builds a selector from cfg, or returns the process-scoped one
@@ -182,12 +193,13 @@ func newSelector(cfg Config) (*Selector, error) {
 	}
 
 	return &Selector{
-		cfg:       cfg,
-		endpoints: eps,
-		cands:     cands,
-		health:    make([]health, len(cands)),
-		byAddr:    byAddr,
-		pinnedAt:  cfg.Now(),
+		cfg:         cfg,
+		endpoints:   eps,
+		cands:       cands,
+		health:      make([]health, len(cands)),
+		byAddr:      byAddr,
+		pinnedAt:    cfg.Now(),
+		unreachable: make([]bool, len(cands)),
 	}, nil
 }
 
@@ -273,10 +285,23 @@ func (s *Selector) Siblings(c Candidate) []string {
 // its answer only says which addresses are reachable, and Reconsider still
 // applies cooldowns when picking what to dial. Leaving a parked-but-live server
 // out would make the client wait when it has somewhere to go.
+// Addresses whose family has no physical route are left out: the gate would
+// only spend a TCP timeout on a dial that cannot leave the host.
 func (s *Selector) GateAddrs(c Candidate) []string {
-	out := s.Siblings(c)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []string
+	// Siblings (same endpoint, other family) first, then the rest of the pool.
+	for _, cand := range s.cands {
+		if cand.EndpointIdx == c.EndpointIdx && cand.Addr != c.Addr && !s.unreachable[s.byAddr[cand.Addr]] {
+			out = append(out, cand.Addr)
+		}
+	}
 	for _, cand := range s.cands {
 		if cand.EndpointIdx == c.EndpointIdx || cand.Addr == c.Addr {
+			continue
+		}
+		if s.unreachable[s.byAddr[cand.Addr]] {
 			continue
 		}
 		out = append(out, cand.Addr)
@@ -293,10 +318,54 @@ func (s *Selector) CandidateForAddr(addr string) (Candidate, bool) {
 	return s.cands[idx], true
 }
 
+// SetReachable records whether the host currently has a physical route to
+// addr's family. It returns whether that flipped the stored verdict, so the
+// caller logs the transition once instead of on every preflight tick. An
+// address the selector does not know is ignored.
+//
+// Marking a candidate unreachable never touches its health: a missing IPv6
+// route is the host's state, not the endpoint's, and punishing the endpoint for
+// it would leave the family parked with backoff long after the route returns.
+func (s *Selector) SetReachable(addr string, reachable bool) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	idx, found := s.byAddr[addr]
+	if !found {
+		return false
+	}
+	if s.unreachable[idx] == !reachable {
+		return false
+	}
+	s.unreachable[idx] = !reachable
+	return true
+}
+
+// Reachable reports whether addr is believed to have a physical route right
+// now. Unknown addresses read as reachable: the default is to try.
+func (s *Selector) Reachable(addr string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	idx, found := s.byAddr[addr]
+	if !found {
+		return true
+	}
+	return !s.unreachable[idx]
+}
+
 // inCooldownLocked reports whether candidate i is parked at time now.
 func (s *Selector) inCooldownLocked(i int, now time.Time) bool {
 	until := s.health[i].cooldownUntil
 	return !until.IsZero() && now.Before(until)
+}
+
+// unavailableLocked reports whether candidate i cannot be dialled right now,
+// either because it is parked (cooldown) or because its family has no physical
+// route. The failover walk uses this instead of inCooldownLocked so an
+// unroutable family is skipped exactly like a parked one - but see Next, where
+// the two diverge: a parked candidate can be un-parked as a last resort, an
+// unroutable one cannot, because dialling it is futile until the route returns.
+func (s *Selector) unavailableLocked(i int, now time.Time) bool {
+	return s.unreachable[i] || s.inCooldownLocked(i, now)
 }
 
 // Reconsider returns the candidate to use for a fresh connect cycle, applying
@@ -317,7 +386,7 @@ func (s *Selector) Reconsider(now time.Time) (Candidate, bool) {
 
 	rank := s.rankLocked()
 
-	if s.inCooldownLocked(s.pinnedIdx, now) {
+	if s.unavailableLocked(s.pinnedIdx, now) {
 		if i, ok := s.firstAvailableLocked(rank, now); ok {
 			s.repinLocked(i, now)
 			return s.cands[s.pinnedIdx], true
@@ -326,7 +395,7 @@ func (s *Selector) Reconsider(now time.Time) (Candidate, bool) {
 
 	if pos := rankPos(rank, s.pinnedIdx); pos > 0 && now.Sub(s.pinnedAt) >= s.cfg.MinDwell {
 		for _, i := range rank[:pos] {
-			if !s.inCooldownLocked(i, now) {
+			if !s.unavailableLocked(i, now) {
 				s.repinLocked(i, now)
 				break
 			}
@@ -415,14 +484,21 @@ func (s *Selector) Next(now time.Time) (Candidate, bool) {
 
 	for k := 1; k < len(rank); k++ {
 		i := rank[(pos+k)%len(rank)]
-		if !s.inCooldownLocked(i, now) {
+		if !s.unavailableLocked(i, now) {
 			return s.cands[i], true
 		}
 	}
 
+	// Every other candidate is parked. Un-park the least-bad one so the loop
+	// converges on something - but never an unroutable one: un-parking cannot
+	// give a family a route it does not have, so it would just send the dial
+	// into the tunnel to time out.
 	best := -1
 	for k := 1; k < len(rank); k++ {
 		i := rank[(pos+k)%len(rank)]
+		if s.unreachable[i] {
+			continue
+		}
 		if best < 0 || betterFallback(s.health[i], s.health[best]) {
 			best = i
 		}
@@ -443,11 +519,12 @@ func betterFallback(a, b health) bool {
 	return a.cooldownUntil.Before(b.cooldownUntil)
 }
 
-// firstAvailableLocked returns the most preferred candidate not in cooldown,
-// walking the rank order rather than the raw index order.
+// firstAvailableLocked returns the most preferred candidate that can be dialled
+// now - neither parked nor unroutable - walking the rank order rather than the
+// raw index order.
 func (s *Selector) firstAvailableLocked(rank []int, now time.Time) (int, bool) {
 	for _, i := range rank {
-		if !s.inCooldownLocked(i, now) {
+		if !s.unavailableLocked(i, now) {
 			return i, true
 		}
 	}
@@ -619,6 +696,12 @@ func (s *Selector) ResetHealth() {
 	for i := range s.health {
 		s.health[i] = health{}
 	}
+	// A network change can bring a family up (LTE without v6 to Wi-Fi with it),
+	// so clear the route verdicts too and let the next preflight re-mark. Leaving
+	// them set would keep a family excluded on a network that now carries it.
+	for i := range s.unreachable {
+		s.unreachable[i] = false
+	}
 	s.pinnedIdx = 0
 	s.pinnedAt = s.cfg.Now()
 }
@@ -640,6 +723,7 @@ func (s *Selector) Snapshot() []CandidateState {
 			CooldownUntil:       h.cooldownUntil,
 			LatencyEWMA:         h.latencyEWMA,
 			Probed:              h.probed,
+			Unreachable:         s.unreachable[i],
 		}
 	}
 	return out
@@ -695,7 +779,7 @@ func (s *Selector) ProbeCurrent(ctx context.Context) (Candidate, bool) {
 func (s *Selector) hasFallbackAfterLocked(i int, now time.Time) bool {
 	rank := s.rankLocked()
 	for _, j := range rank[rankPos(rank, i)+1:] {
-		if !s.inCooldownLocked(j, now) {
+		if !s.unavailableLocked(j, now) {
 			return true
 		}
 	}

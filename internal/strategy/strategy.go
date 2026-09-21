@@ -156,6 +156,15 @@ type Manager struct {
 	connectivityChecker  *ConnectivityChecker
 	excludeUDPStrategies bool // Temporarily exclude UDP-based strategies if UDP is blocked
 
+	// routeReachable, when set, reports whether the host has a physical route
+	// (off the tunnel) to a candidate address's family, and whether that answer
+	// is known. Injected from the TUN layer; nil in tests and on platforms
+	// without a route table. The family preflight uses it to drop no-route
+	// families - an IPv6 endpoint on a host with no IPv6 - before the strategy
+	// scan, instead of letting each dial time out into the tunnel. Guarded by
+	// m.mu.
+	routeReachable func(addr string) (routable, known bool)
+
 	// consecutiveConnectFailures counts back-to-back failed Connect() calls. The
 	// blocking pre-flight connectivity check is skipped on the hot reconnect path
 	// (a brief server-side RST/EOF should not cost a full check) and only re-armed
@@ -379,6 +388,72 @@ func (m *Manager) SetConnectivityChecker(checker *ConnectivityChecker) {
 	m.connectivityChecker = checker
 	if checker != nil {
 		log.Debug("Connectivity checker set for server: %s", checker.ServerAddr())
+	}
+}
+
+// SetRouteReachable injects the physical-route probe the family preflight
+// consults. addr is a "host:port" candidate address; the probe reports whether
+// the host can reach that family off the tunnel and whether it knows. Nil
+// disables the preflight (the pre-existing behaviour). Safe to call before
+// endpoints are configured.
+func (m *Manager) SetRouteReachable(fn func(addr string) (routable, known bool)) {
+	m.mu.Lock()
+	m.routeReachable = fn
+	m.mu.Unlock()
+}
+
+// SetEndpointReachableIP marks every candidate whose host matches ip as
+// reachable or not, without a network probe of its own. It is the path the TUN
+// bypass watcher uses to report that a family lost (or regained) its physical
+// route mid-session, so the next reconnect skips a dead family instead of
+// dialling it into the tunnel. A no-op when no selector or no matching
+// candidate exists.
+func (m *Manager) SetEndpointReachableIP(ip net.IP, reachable bool) {
+	sel := m.selector()
+	if sel == nil || ip == nil {
+		return
+	}
+	host := ip.String()
+	for _, c := range sel.Candidates() {
+		h, _, err := net.SplitHostPort(c.Addr)
+		if err != nil {
+			h = c.Addr
+		}
+		if h != host {
+			continue
+		}
+		if sel.SetReachable(c.Addr, reachable) {
+			log.Info("Endpoint %s marked reachable=%v by the bypass watcher", c, reachable)
+		}
+	}
+}
+
+// familyReachabilityPreflight runs before the strategy scan: it asks the
+// injected route probe about every candidate and marks the ones whose family
+// has no physical route unreachable, so the selector walk skips them instead of
+// timing out on each. It sends no packets - the probe reads the local routing
+// table only - so it adds no scanner-like traffic to the pool (verification
+// rule 8). A candidate whose route came back is re-admitted here too.
+func (m *Manager) familyReachabilityPreflight(sel *endpoint.Selector) {
+	m.mu.RLock()
+	probe := m.routeReachable
+	m.mu.RUnlock()
+	if probe == nil {
+		return
+	}
+	for _, c := range sel.Candidates() {
+		routable, known := probe(c.Addr)
+		if !known {
+			continue
+		}
+		if !sel.SetReachable(c.Addr, routable) {
+			continue
+		}
+		if routable {
+			log.Info("Family preflight: %s has a physical route again, re-admitting", c)
+		} else {
+			log.Warn("Family preflight: no physical route to %s, excluding it from the scan", c)
+		}
 	}
 }
 
@@ -820,6 +895,12 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 		}
 		return m.ConnectExcluding(ctx, m.withHoppedPort(target), nil)
 	}
+
+	// Family connectivity preflight BEFORE any strategy scan: drop the families
+	// this host has no physical route to (an IPv6 endpoint with no IPv6 on the
+	// line), so Reconsider and the failover walk below only ever land on a
+	// candidate the host can actually reach.
+	m.familyReachabilityPreflight(sel)
 
 	cand, ok := sel.Reconsider(sel.Now())
 	if !ok {

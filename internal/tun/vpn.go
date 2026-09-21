@@ -457,6 +457,34 @@ func (v *VPNClient) Start(ctx context.Context) error {
 		return nil // Already running
 	}
 
+	// Wire the physical-route signals between the TUN and the strategy manager
+	// BEFORE the first connect. Two directions, one truth:
+	//   - the family preflight asks HasPhysicalRoute so the very first scan skips
+	//     a family this host cannot reach (IPv6 endpoints with no IPv6 on the
+	//     line) instead of timing out on it;
+	//   - the bypass watcher reports when an address loses or regains its
+	//     physical route, so a family that dies mid-session is excluded from the
+	//     next reconnect and re-admitted once the route is back.
+	// Only for interfaces we own — on Android VpnService owns routing and the
+	// TUN methods are no-ops there.
+	if v.ownsInterface && v.manager != nil {
+		tunDev, mgr := v.tun, v.manager
+		mgr.SetRouteReachable(func(addr string) (routable, known bool) {
+			host, _, err := net.SplitHostPort(addr)
+			if err != nil {
+				host = addr
+			}
+			ip := net.ParseIP(host)
+			if ip == nil {
+				return false, false
+			}
+			return tunDev.HasPhysicalRoute(ip)
+		})
+		tunDev.SetBypassUnroutableFunc(func(ip net.IP, unroutable bool) {
+			mgr.SetEndpointReachableIP(ip, !unroutable)
+		})
+	}
+
 	// Connect to server
 	if err := v.connect(ctx); err != nil {
 		atomic.StoreInt32(&v.running, 0)
