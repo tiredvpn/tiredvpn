@@ -679,3 +679,124 @@ func TestPooledRelayLengthPrefixedRejectsBadFrame(t *testing.T) {
 		})
 	}
 }
+
+// --- Defect 1: atomic reserve honours MaxConnections under load ----------
+
+// barrierConnector reserves and then parks every Connect on a release channel,
+// so no slot is freed while the test measures how many connections got in. It
+// records the peak number of concurrent in-flight Connects, which equals the
+// number of Get calls that passed the pool's capacity guard.
+type barrierConnector struct {
+	inFlight int32
+	peak     int32
+	release  chan struct{}
+}
+
+func (b *barrierConnector) Connect(context.Context, string) (net.Conn, strategy.Strategy, error) {
+	n := atomic.AddInt32(&b.inFlight, 1)
+	for {
+		p := atomic.LoadInt32(&b.peak)
+		if n <= p || atomic.CompareAndSwapInt32(&b.peak, p, n) {
+			break
+		}
+	}
+	<-b.release
+	atomic.AddInt32(&b.inFlight, -1)
+	client, server := net.Pipe()
+	go func() { io.Copy(io.Discard, server); server.Close() }()
+	return client, fakeStrategy{}, nil
+}
+
+// runAdmissionRound fires `goroutines` concurrent Get calls at a pool capped at
+// maxConns, holding every admitted connection parked in Connect so that the
+// admitted count equals the peak simultaneously-live count. It returns that peak
+// and leaves the pool counter back at zero.
+func runAdmissionRound(t *testing.T, maxConns, goroutines int) int32 {
+	t.Helper()
+	bc := &barrierConnector{release: make(chan struct{})}
+	p := newTestPool(bc)
+	p.config.MaxConnections = maxConns
+
+	var rejected int32
+	conns := make(chan *PooledConn, goroutines)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			c, err := p.Get(context.Background())
+			if errors.Is(err, ErrPoolExhausted) {
+				atomic.AddInt32(&rejected, 1)
+				return
+			}
+			if err != nil {
+				t.Errorf("unexpected Get error: %v", err)
+				return
+			}
+			conns <- c
+		}()
+	}
+	close(start)
+
+	// Wait until every caller has either reserved a slot (now parked in Connect)
+	// or been refused, then freeze and read the peak.
+	deadline := time.After(5 * time.Second)
+	for atomic.LoadInt32(&bc.inFlight)+atomic.LoadInt32(&rejected) < int32(goroutines) {
+		select {
+		case <-deadline:
+			t.Fatalf("timed out: inFlight=%d rejected=%d, want sum=%d",
+				atomic.LoadInt32(&bc.inFlight), atomic.LoadInt32(&rejected), goroutines)
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	peak := atomic.LoadInt32(&bc.peak)
+
+	close(bc.release)
+	wg.Wait()
+	close(conns)
+	for c := range conns {
+		c.Close()
+	}
+	if got := p.Stats(); got != 0 {
+		t.Fatalf("totalConns=%d after closing all, want 0", got)
+	}
+	return peak
+}
+
+// TestGetAtomicReserveHonoursMaxUnderLoad predicates the TOCTOU fix. With the
+// limit at maxConns and far more concurrent callers, the pool must never admit
+// more than maxConns simultaneously - the connector holds every admitted
+// connection open, so admitted == peak concurrent Connects.
+//
+// The old Load-then-Add code split the guard from the increment across two
+// atomics: callers that read the same under-limit value before any of them
+// incremented all got in, overshooting maxConns. That overshoot needs several
+// callers inside the tiny Load->Add window at once, so a single burst catches it
+// only sometimes. We run many bursts and fail on the first overshoot: the fixed
+// code (atomic reserve) can never overshoot in ANY burst, so it stays green
+// across all rounds; the broken code overshoots within a handful of rounds.
+// -race does not flag the bug - both operations are atomic, the race is logical.
+//
+// Positive control: at least one round must admit the full maxConns (the last
+// round asserts exactly maxConns), so the cap is what refuses excess callers,
+// not a dead connector that admits nobody.
+func TestGetAtomicReserveHonoursMaxUnderLoad(t *testing.T) {
+	const (
+		maxConns   = 2
+		goroutines = 128
+		rounds     = 200
+	)
+	for r := 0; r < rounds; r++ {
+		if peak := runAdmissionRound(t, maxConns, goroutines); peak > maxConns {
+			t.Fatalf("round %d: peak concurrent connections=%d exceeded MaxConnections=%d (TOCTOU overshoot)",
+				r, peak, maxConns)
+		}
+	}
+	// Positive control: the cap admits exactly maxConns under load, not zero.
+	if peak := runAdmissionRound(t, maxConns, goroutines); peak != maxConns {
+		t.Fatalf("positive control: peak admitted=%d, want exactly %d", peak, maxConns)
+	}
+}

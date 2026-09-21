@@ -94,8 +94,16 @@ func NewTunnelPool(mgr *strategy.Manager, serverAddr string, cfg Config) *Tunnel
 }
 
 // Get establishes a fresh tunnel connection, bounded by MaxConnections.
+//
+// The slot is reserved atomically: AddInt32 both checks and claims in one
+// operation, so N concurrent callers can never all pass a limit of N-1. A
+// separate LoadInt32 check followed by an increment in createConn was a
+// classic TOCTOU - between the load and the add, every racing caller read the
+// same under-limit value and the pool overshot MaxConnections. If the reserve
+// pushes us over the limit we hand the slot straight back and refuse.
 func (p *TunnelPool) Get(ctx context.Context) (*PooledConn, error) {
-	if int(atomic.LoadInt32(&p.totalConns)) >= p.config.MaxConnections {
+	if int(atomic.AddInt32(&p.totalConns, 1)) > p.config.MaxConnections {
+		atomic.AddInt32(&p.totalConns, -1)
 		return nil, ErrPoolExhausted
 	}
 	return p.createConn(ctx)
@@ -180,10 +188,10 @@ func (p *TunnelPool) DialTarget(ctx context.Context, targetAddr string) (*Pooled
 	return nil, fmt.Errorf("pool: dial %s failed after %d attempts: %w", targetAddr, maxAttempts, lastErr)
 }
 
-// createConn creates a new pooled connection
+// createConn creates a new pooled connection. The caller (Get) has already
+// reserved the slot atomically, so createConn does not increment the counter -
+// it only releases the reservation if the dial fails.
 func (p *TunnelPool) createConn(ctx context.Context) (*PooledConn, error) {
-	atomic.AddInt32(&p.totalConns, 1)
-
 	connectCtx, cancel := context.WithTimeout(ctx, p.config.ConnectTimeout)
 	defer cancel()
 
