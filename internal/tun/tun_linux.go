@@ -594,16 +594,12 @@ func (t *TUNDevice) Configure(localIP, remoteIP net.IP, routes []string) error {
 		return fmt.Errorf("failed to set MTU: %w", err)
 	}
 
-	nlAddr := &netlink.Addr{
-		IPNet: &net.IPNet{IP: localIP, Mask: net.CIDRMask(32, 32)},
-		Peer:  &net.IPNet{IP: remoteIP, Mask: net.CIDRMask(32, 32)},
-	}
-	if err := netlink.AddrAdd(link, nlAddr); err != nil {
-		_, ipNet, perr := net.ParseCIDR(fmt.Sprintf("%s/24", localIP.String()))
-		if perr != nil {
+	p2pLocal, p2pPeer, fallback := p2pAddrPlan(localIP, remoteIP)
+	if err := netlink.AddrAdd(link, &netlink.Addr{IPNet: p2pLocal, Peer: p2pPeer}); err != nil {
+		if fallback == nil {
 			return fmt.Errorf("failed to set IP address: %w", err)
 		}
-		if err2 := netlink.AddrAdd(link, &netlink.Addr{IPNet: ipNet}); err2 != nil {
+		if err2 := netlink.AddrAdd(link, &netlink.Addr{IPNet: fallback}); err2 != nil {
 			return fmt.Errorf("failed to set IP address: %w", err)
 		}
 	}
@@ -1307,13 +1303,11 @@ func (t *TUNDevice) ConfigureSubnet(localIP net.IP, network *net.IPNet, serverIP
 		return fmt.Errorf("failed to set MTU: %w", err)
 	}
 
-	ones, _ := network.Mask.Size()
-	_, ipNet, err := net.ParseCIDR(fmt.Sprintf("%s/%d", localIP.String(), ones))
+	addr, err := subnetAddr(localIP, network)
 	if err != nil {
-		return fmt.Errorf("failed to parse CIDR: %w", err)
+		return fmt.Errorf("failed to compute TUN address: %w", err)
 	}
-	addr := fmt.Sprintf("%s/%d", localIP.String(), ones)
-	if err := netlink.AddrAdd(link, &netlink.Addr{IPNet: ipNet}); err != nil {
+	if err := netlink.AddrAdd(link, &netlink.Addr{IPNet: addr}); err != nil {
 		return fmt.Errorf("failed to set IP address: %w", err)
 	}
 
