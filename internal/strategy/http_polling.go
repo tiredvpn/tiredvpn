@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -197,6 +198,13 @@ type HTTPPollingConn struct {
 	// recvBuf or the connection is closed. Read waits on it instead of
 	// busy-waiting with time.Sleep.
 	recvCond *sync.Cond
+
+	// stream follows what kind of byte stream this session carries and, in TUN
+	// mode, its framing, so the keepalive feeder only ever splices a whole
+	// keepalive frame between frames. Guarded by recvLock; uplinkSeen lets
+	// Write skip the lock once the uplink prefix it needs has been recorded.
+	stream     meekStreamTracker
+	uplinkSeen atomic.Bool
 
 	// Read deadline support (honors SetReadDeadline/SetDeadline).
 	deadlineMu   sync.Mutex
@@ -427,6 +435,7 @@ func (c *HTTPPollingConn) poll() (ok bool, moved bool) {
 	// Buffer received data and update ack sequence
 	if len(resp) > 0 {
 		c.recvLock.Lock()
+		c.stream.observeDownlink(resp)
 		c.recvBuf.Write(resp)
 		// Wake any goroutine blocked in Read waiting for data.
 		c.recvCond.Broadcast()
@@ -456,11 +465,8 @@ func (c *HTTPPollingConn) poll() (ok bool, moved bool) {
 
 // runKeepaliveFeeder keeps the TUN relay's read deadline fed while the poll
 // layer is healthy. See the pollingKeepaliveFeed comment for why meek needs
-// this. It injects a synthetic keepalive frame ([0,0,0,0]) only when the
-// receive buffer is empty - i.e. at a frame boundary - so it can never corrupt
-// a partially delivered packet. If polls stop succeeding the connection is
-// genuinely dead, the feeder goes quiet, and the relay's own read deadline
-// fires to tear the session down.
+// this. If polls stop succeeding the connection is genuinely dead, the feeder
+// goes quiet, and the relay's own read deadline fires to tear the session down.
 func (c *HTTPPollingConn) runKeepaliveFeeder() {
 	ticker := time.NewTicker(pollingKeepaliveFeed)
 	defer ticker.Stop()
@@ -469,18 +475,38 @@ func (c *HTTPPollingConn) runKeepaliveFeeder() {
 		case <-c.closed:
 			return
 		case <-ticker.C:
-			last := c.lastPollOK.Load()
-			if last == 0 || time.Since(time.Unix(0, last)) > pollingPollHealthGrace {
-				continue // poll layer is not proving liveness - let the relay time out
-			}
-			c.recvLock.Lock()
-			if c.recvBuf.Len() == 0 {
-				c.recvBuf.Write([]byte{0, 0, 0, 0})
-				c.recvCond.Broadcast()
-			}
-			c.recvLock.Unlock()
+			c.feedKeepalive()
 		}
 	}
+}
+
+// meekKeepaliveFrame is the zero-length TUN frame the relay treats as a
+// keepalive.
+var meekKeepaliveFrame = []byte{0, 0, 0, 0}
+
+// feedKeepalive splices one synthetic keepalive frame into the receive buffer
+// if, and only if, that cannot change the stream the reader sees: the session
+// is in TUN mode, the reader has drained the buffer, and what it drained ends
+// on a frame boundary. It reports whether a frame was spliced.
+//
+// The old condition was "receive buffer empty" alone. That spliced four zero
+// bytes into every SOCKS download that ran past the first feeder tick, and in
+// TUN mode it fired whenever the reader was parked inside a frame split
+// across two poll responses.
+func (c *HTTPPollingConn) feedKeepalive() bool {
+	last := c.lastPollOK.Load()
+	if last == 0 || time.Since(time.Unix(0, last)) > pollingPollHealthGrace {
+		return false // poll layer is not proving liveness - let the relay time out
+	}
+	c.recvLock.Lock()
+	defer c.recvLock.Unlock()
+	if c.recvBuf.Len() != 0 || !c.stream.atFrameBoundary() {
+		return false
+	}
+	c.stream.observeDownlink(meekKeepaliveFrame)
+	c.recvBuf.Write(meekKeepaliveFrame)
+	c.recvCond.Broadcast()
+	return true
 }
 
 // doRequest performs one HTTP poll request, reusing the previous request's TLS
@@ -730,7 +756,11 @@ func (c *HTTPPollingConn) Read(p []byte) (int, error) {
 		}
 
 		if !time.Now().Before(deadline) {
-			return 0, errors.New("read timeout")
+			// The net.Conn deadline error: callers (the SOCKS relay among them)
+			// recognise a timeout through net.Error.Timeout() and keep an idle
+			// direction open. A plain error made every download-silent stream -
+			// an upload, an idle interactive session - die after 30s.
+			return 0, os.ErrDeadlineExceeded
 		}
 
 		c.recvCond.Wait()
@@ -743,6 +773,17 @@ func (c *HTTPPollingConn) Write(p []byte) (int, error) {
 	case <-c.closed:
 		return 0, errors.New("connection closed")
 	default:
+	}
+
+	// Record the uplink prefix before the bytes can be polled out, so the
+	// stream kind is known by the time any reply lands in recvBuf.
+	if !c.uplinkSeen.Load() {
+		c.recvLock.Lock()
+		c.stream.observeUplink(p)
+		if c.stream.upN == len(c.stream.up) {
+			c.uplinkSeen.Store(true)
+		}
+		c.recvLock.Unlock()
 	}
 
 	c.sendLock.Lock()
