@@ -199,7 +199,6 @@ func v6HalfDefaultRoute(linkIndex int, dst *net.IPNet) *netlink.Route {
 	return &netlink.Route{
 		LinkIndex: linkIndex,
 		Dst:       dst,
-		Priority:  v6HalfDefaultPriority(linkIndex),
 	}
 }
 
