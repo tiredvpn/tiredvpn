@@ -2905,7 +2905,7 @@ func handleAntiProbeDispatch(conn net.Conn, srvCtx *serverContext, logger *log.L
 	// Pull the TLS exporter before wrapping the conn: the server proof written
 	// after the knock ACK is an HMAC over this keying material, which binds it
 	// to this exact handshake (see strategy.AntiProbeServerProof). conn is the
-	// raw *tls.Conn here; the bufferedConn wrapper below would hide the method.
+	// raw *tls.Conn here, so there is nothing to unwrap yet.
 	ekm, ekmErr := exporterBindingKey(conn)
 	if ekmErr != nil {
 		logger.Debug("Anti-probe dispatch: exporter unavailable: %v", ekmErr)
@@ -2940,20 +2940,16 @@ func handleAntiProbeDispatch(conn net.Conn, srvCtx *serverContext, logger *log.L
 }
 
 // exporterBindingKey pulls the RFC 8446 §7.5 exporter out of a TLS connection,
-// unwrapping the bufferedConn the detector paths wrap it in first. bufferedConn
-// embeds net.Conn, so ConnectionState is not promoted through it and the type
-// assertion must run against the wrapped conn directly.
+// looking through every bufferedConn the detector paths wrap it in. bufferedConn
+// embeds net.Conn, so ConnectionState is not promoted through it; the legacy TLS
+// path stacks two of them (replayed dispatch byte, then the protocol peek), so
+// peeling a single layer is not enough. A conn with no TLS layer underneath is
+// still an error.
 func exporterBindingKey(conn net.Conn) ([]byte, error) {
-	if bc, ok := conn.(*bufferedConn); ok {
-		conn = bc.Conn
-	}
-	tc, ok := conn.(interface {
-		ConnectionState() tls.ConnectionState
-	})
+	state, ok := tlsConnectionState(conn)
 	if !ok {
 		return nil, errors.New("connection is not TLS")
 	}
-	state := tc.ConnectionState()
 	return customtls.ExportBindingKey(&state)
 }
 

@@ -124,29 +124,45 @@ type connUnwrapper interface {
 	Unwrap() net.Conn
 }
 
-// maxConnUnwrapDepth bounds the walk in negotiatedALPN. The dispatcher stacks
-// at most two bufferedConns on a *tls.Conn (dispatch byte, then the protocol
-// peek); the bound is there so a wrapper that ever returns itself cannot spin.
+// maxConnUnwrapDepth bounds the walk in tlsConnectionState. The dispatcher
+// stacks at most two bufferedConns on a *tls.Conn (the replayed dispatch byte,
+// then the legacy protocol peek, re-stacked in place when a detector replays
+// what it consumed); the bound is there so a wrapper that ever returns itself
+// cannot spin.
 const maxConnUnwrapDepth = 8
+
+// tlsConnectionState walks down the buffering wrappers the dispatcher puts on
+// top of a *tls.Conn and returns the handshake state of the first layer that
+// reports one. ok is false for a connection with no TLS layer underneath - the
+// plaintext entry paths - and for a chain deeper than maxConnUnwrapDepth.
+//
+// Every place in this package that reads TLS state off a conn it was handed
+// goes through here, so the unwrap depth is decided once: peeling a fixed
+// number of layers is what left the legacy TLS path, which stacks two, without
+// an exporter.
+func tlsConnectionState(conn net.Conn) (tls.ConnectionState, bool) {
+	for range maxConnUnwrapDepth {
+		if cs, ok := conn.(connectionStater); ok {
+			return cs.ConnectionState(), true
+		}
+		u, ok := conn.(connUnwrapper)
+		if !ok {
+			return tls.ConnectionState{}, false
+		}
+		if conn = u.Unwrap(); conn == nil {
+			return tls.ConnectionState{}, false
+		}
+	}
+	return tls.ConnectionState{}, false
+}
 
 // negotiatedALPN reports the ALPN protocol agreed on conn, looking through the
 // buffering wrappers the dispatcher puts on top of a *tls.Conn. It returns ""
 // for a connection that carries no TLS state, which is the plaintext case: the
 // unknown-protocol fallback on the bare socket, imap and ssh camouflage.
 func negotiatedALPN(conn net.Conn) string {
-	for range maxConnUnwrapDepth {
-		if cs, ok := conn.(connectionStater); ok {
-			return cs.ConnectionState().NegotiatedProtocol
-		}
-		u, ok := conn.(connUnwrapper)
-		if !ok {
-			return ""
-		}
-		if conn = u.Unwrap(); conn == nil {
-			return ""
-		}
-	}
-	return ""
+	state, _ := tlsConnectionState(conn)
+	return state.NegotiatedProtocol
 }
 
 // serveFakeWebsiteH2 answers the same fake website over HTTP/2, for clients
