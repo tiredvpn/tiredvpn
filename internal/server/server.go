@@ -1702,8 +1702,9 @@ func handleHTTP2(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
 	// Session binding (S22): bind the auth token to this TLS session's exporter.
 	// On the TLS entry path (handleTLSConnectionLegacy) conn wraps a *tls.Conn
 	// and the exporter is available; on the plaintext entry path
-	// (handleConnection) there is no TLS session, ekm is nil, and no bound client
-	// token matches — which is correct, since our clients always run over TLS.
+	// (handleConnection) there is no TLS session and ekm is nil; verifyH2Auth
+	// turns that into material no token can match (sessionBindingOrUnmatchable),
+	// since our clients always run over TLS.
 	ekm, ekmErr := exporterBindingKey(conn)
 	if ekmErr != nil {
 		logger.Debug("HTTP/2 stego: exporter unavailable: %v", ekmErr)
@@ -2082,7 +2083,8 @@ func handleMorphConnection(conn net.Conn, srvCtx *serverContext, logger *log.Log
 
 	// Session binding (S22): capture the TLS exporter before kTLS offload (which
 	// happens after auth, below). nil on the plaintext entry path — our clients
-	// always run over TLS, so a nil exporter simply fails to match a bound token.
+	// always run over TLS, and verifyMorphAuth rejects every token when there is
+	// no exporter (sessionBindingOrUnmatchable).
 	ekm, ekmErr := exporterBindingKey(conn)
 	if ekmErr != nil {
 		logger.Debug("Morph: exporter unavailable: %v", ekmErr)
@@ -4321,12 +4323,37 @@ func verifyFullKnockSequence(conn net.Conn, secret []byte, srvCtx *serverContext
 // here fixes clients whose clock drifts by more than the original 1 minute.
 const authClockSkewGraceMinutes int64 = 10
 
+// sessionBindingOrUnmatchable returns ekm unchanged when the connection has a
+// TLS session exporter, and fresh random keying material when it has none.
+//
+// exporterBindingKey fails on any connection that is not TLS - the plaintext
+// entry path in handleConnection routes a bare "MRPH" or HTTP/2 preface straight
+// into the morph and h2 handlers - and the handlers carried on with ekm == nil.
+// h.Write(nil) adds nothing to the HMAC, so the verifiers then accepted the
+// unbound pre-S22 token: one value per secret per minute, sent in the clear on
+// that path and replayable by anyone who saw it for the whole skew window.
+// No client of ours authenticates these transports without TLS.
+//
+// Random material rather than an early return: the token is still checked
+// against every bucket and fails the same way a wrong token does, so the peer
+// sees the existing failure response and its timing, not a new one.
+func sessionBindingOrUnmatchable(ekm []byte) []byte {
+	if len(ekm) > 0 {
+		return ekm
+	}
+	unmatchable := make([]byte, customtls.BindingExporterLen)
+	_, _ = rand.Read(unmatchable)
+	return unmatchable
+}
+
 // verifyH2Auth checks the HTTP/2 stego auth token. ekm is the TLS session
 // exporter this connection authenticates over; it is folded into the HMAC so a
 // token captured on another TLS session is rejected here (S22 session binding).
 // The client derives the matching token from the exporter of the same handshake
 // (internal/strategy/stego.go generateAuthTokenBound).
 func verifyH2Auth(apiKey, requestID string, secret, ekm []byte) bool {
+	ekm = sessionBindingOrUnmatchable(ekm)
+
 	// Decode hex values
 	apiKeyBytes := decodeHex(apiKey)
 	requestIDBytes := decodeHex(requestID)
@@ -4364,6 +4391,7 @@ func verifyH2Auth(apiKey, requestID string, secret, ekm []byte) bool {
 // is the TLS session exporter this connection authenticates over, folded into
 // the HMAC for S22 session binding (see verifyH2Auth).
 func verifyMorphAuth(receivedToken, secret, ekm []byte) bool {
+	ekm = sessionBindingOrUnmatchable(ekm)
 	if len(receivedToken) != 32 {
 		return false
 	}
@@ -4902,6 +4930,7 @@ func (s *HTTPPollingSession) ReadToClient(ackSeq int64) []byte {
 func verifyPollingAuth(authToken, sessionID string, secret, ekm []byte) bool {
 	// Auth token is generated as: HMAC(secret, sessionID:timestamp || ekm)[:16]
 	// We allow tokens from last 60 seconds
+	ekm = sessionBindingOrUnmatchable(ekm)
 	now := time.Now().Unix()
 
 	for delta := int64(0); delta <= 60; delta++ {
