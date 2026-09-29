@@ -9,6 +9,10 @@ import (
 	"golang.org/x/net/http2/hpack"
 )
 
+// pipeTestEKM stands in for the TLS session exporter on test sockets that carry
+// no TLS. Both ends of a test must pass the same value.
+var pipeTestEKM = []byte("pipe-test-exporter-0123456789abc")
+
 // TestH2StegoHandshakeEndToEnd drives the real client handshake
 // (strategy.HTTP2StegoConn.Handshake) against the real server frame loop
 // (readH2Preface -> newH2Framer -> runH2FrameLoop) over a loopback TCP
@@ -18,6 +22,10 @@ import (
 // It reproduces the "TCP up, handshake hangs to timeout" symptom: the client
 // blocks in waitForServerAck because the server never emits the auth ack the
 // client expects.
+//
+// The loopback socket has no TLS session, so both ends are handed the same
+// stand-in exporter (pipeTestEKM): the server refuses every token when the
+// exporter is missing, the way it must on the plaintext entry path.
 func TestH2StegoHandshakeEndToEnd(t *testing.T) {
 	secret := []byte("test-stego-secret-32-bytes-long!")
 
@@ -56,7 +64,7 @@ func TestH2StegoHandshakeEndToEnd(t *testing.T) {
 		var tunnel *h2TunnelState
 		var connTracked bool
 		serverErr <- nil
-		runH2FrameLoop(&serverConn, &framer, hpackDec, srvCtx, logger, &authenticated, &authClientID, &authSecret, &connTracked, &tunnel, nil, nil)
+		runH2FrameLoop(&serverConn, &framer, hpackDec, srvCtx, logger, &authenticated, &authClientID, &authSecret, &connTracked, &tunnel, nil, pipeTestEKM)
 	}()
 
 	clientConn, err := net.Dial("tcp", ln.Addr().String())
@@ -65,7 +73,7 @@ func TestH2StegoHandshakeEndToEnd(t *testing.T) {
 	}
 	defer clientConn.Close()
 
-	stegoConn := strategy.NewHTTP2StegoConn(clientConn, secret, true, strategy.NaivePaddingMinimal, nil)
+	stegoConn := strategy.NewHTTP2StegoConn(clientConn, secret, true, strategy.NaivePaddingMinimal, pipeTestEKM)
 
 	handshakeDone := make(chan error, 1)
 	go func() {
