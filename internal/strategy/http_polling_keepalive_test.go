@@ -116,6 +116,7 @@ func newScriptedPollingConn(t *testing.T, bodies [][]byte) *HTTPPollingConn {
 		ready:           make(chan struct{}),
 	}
 	c.recvCond = sync.NewCond(&c.recvLock)
+	c.sendCond = sync.NewCond(&c.sendLock)
 	t.Cleanup(func() { c.Close() })
 	return c
 }
@@ -140,11 +141,20 @@ func drain(t *testing.T, c *HTTPPollingConn) []byte {
 	}
 }
 
+// useFakeClock switches c's liveness clock to a fake one.
+func useFakeClock(c *HTTPPollingConn) *fakeClock {
+	fc := newFakeClock() // shared with the storm tests
+	c.now = fc.Now
+	return fc
+}
+
 // runPollScript polls once per scripted body, and after each poll drains the
 // receive buffer and gives the keepalive feeder its chance, exactly as a
-// feeder tick landing between two polls would. It returns the byte stream the
-// reader saw and after which polls the feeder spliced a keepalive.
-func runPollScript(t *testing.T, c *HTTPPollingConn, polls int) (stream []byte, spliced []int) {
+// feeder tick landing right after the reader emptied the buffer would. The
+// fake clock then moves 2s on, so a poll is never inside the handshake peek
+// guard of the one before it. It returns the byte stream the reader saw and
+// after which polls the feeder spliced a keepalive.
+func runPollScript(t *testing.T, c *HTTPPollingConn, fc *fakeClock, polls int) (stream []byte, spliced []int) {
 	t.Helper()
 	for i := range polls {
 		if ok, _ := c.poll(); !ok {
@@ -155,6 +165,7 @@ func runPollScript(t *testing.T, c *HTTPPollingConn, polls int) (stream []byte, 
 			spliced = append(spliced, i)
 			stream = append(stream, drain(t, c)...)
 		}
+		fc.Advance(2 * time.Second)
 	}
 	return stream, spliced
 }
@@ -165,30 +176,47 @@ func runPollScript(t *testing.T, c *HTTPPollingConn, polls int) (stream []byte, 
 // was "receive buffer empty". Here every poll is followed by a feeder chance on
 // an empty buffer; the reader must see the target's bytes and nothing else.
 func TestPollingFeederNeverTouchesSOCKSStream(t *testing.T) {
-	var want []byte
-	var bodies [][]byte
-	for range 5 {
-		b := make([]byte, 3000)
-		rand.Read(b)
-		bodies = append(bodies, b)
-		want = append(want, b...)
-	}
-	c := newScriptedPollingConn(t, bodies)
+	for _, tc := range []struct {
+		name string
+		fill func([]byte)
+	}{
+		{"random payload", func(b []byte) { rand.Read(b) }},
+		// The adversarial case: the success byte plus an all-zero file parses
+		// as a TUN handshake followed by keepalive frames, so only the mode
+		// gate keeps the feeder out of it.
+		{"zero-filled payload", func([]byte) {}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var want []byte
+			bodies := [][]byte{{0x00}} // the exit's SOCKS-mode "connected" byte
+			want = append(want, 0x00)
+			for range 5 {
+				// 2999, not a multiple of 4: read as TUN framing, the zero
+				// stream lands on a "frame boundary" after some of the polls.
+				b := make([]byte, 2999)
+				tc.fill(b)
+				bodies = append(bodies, b)
+				want = append(want, b...)
+			}
+			c := newScriptedPollingConn(t, bodies)
+			fc := useFakeClock(c)
 
-	// What pool.DialTarget writes first: [addrLen:2][addr].
-	target := "198.18.0.10:80"
-	hdr := binary.BigEndian.AppendUint16(nil, uint16(len(target)))
-	if _, err := c.Write(append(hdr, target...)); err != nil {
-		t.Fatalf("write: %v", err)
-	}
+			// What pool.DialTarget writes first: [addrLen:2][addr].
+			target := "198.18.0.10:80"
+			hdr := binary.BigEndian.AppendUint16(nil, uint16(len(target)))
+			if _, err := c.Write(append(hdr, target...)); err != nil {
+				t.Fatalf("write: %v", err)
+			}
 
-	got, spliced := runPollScript(t, c, len(bodies))
-	if len(spliced) != 0 {
-		t.Errorf("feeder spliced a keepalive into a SOCKS stream after polls %v", spliced)
-	}
-	if !bytes.Equal(got, want) {
-		t.Fatalf("SOCKS stream altered: got %d bytes, want %d (first diff at %d)",
-			len(got), len(want), firstDiff(got, want))
+			got, spliced := runPollScript(t, c, fc, len(bodies))
+			if len(spliced) != 0 {
+				t.Errorf("feeder spliced a keepalive into a SOCKS stream after polls %v", spliced)
+			}
+			if !bytes.Equal(got, want) {
+				t.Fatalf("SOCKS stream altered: got %d bytes, want %d (first diff at %d)",
+					len(got), len(want), firstDiff(got, want))
+			}
+		})
 	}
 }
 
@@ -216,7 +244,10 @@ func tunFrame(n int, fill byte) []byte {
 // empty buffer; a keepalive spliced there desyncs the packet loop. The script
 // ends polls mid-handshake, mid-header, mid-payload and on boundaries, for each
 // handshake layout a polling exit sends. Keepalives must appear after exactly
-// the boundary-ending polls, and the frames must come through intact.
+// the boundary-ending polls, and the frames must come through intact. The poll
+// that completes the handshake is a boundary too, but the feeder must stay out
+// of it: the handshake reader may be waiting there for an optional flags byte
+// (TestPollingFeederSparesHandshakeFlagsPeek runs that against the real reader).
 func TestPollingFeederSplicesOnlyBetweenTUNFrames(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -237,23 +268,26 @@ func TestPollingFeederSplicesOnlyBetweenTUNFrames(t *testing.T) {
 				down = append(down, f...)
 				ends = append(ends, len(down))
 			}
-			cuts := []int{
-				3,           // mid-handshake
-				hsEnd,       // handshake complete: first boundary
-				hsEnd + 2,   // mid-header of frame 0
-				hsEnd + 700, // mid-payload of frame 0
-				ends[0],     // boundary
-				ends[1],     // boundary
-				ends[2] - 1, // one byte short of a boundary
-				ends[3],     // boundary (end of stream)
+			cuts := []int{3} // mid-handshake
+			if hsEnd > meekHSBase+1 {
+				cuts = append(cuts, meekHSBase+1) // flags byte in, dual-stack block not
 			}
+			cuts = append(cuts,
+				hsEnd,     // handshake complete: boundary inside the peek guard
+				hsEnd+2,   // mid-header of frame 0
+				hsEnd+700, // mid-payload of frame 0
+				ends[0],   // boundary
+				ends[1],   // boundary
+				ends[2]-1, // one byte short of a boundary
+				ends[3],   // boundary (end of stream)
+			)
 			var bodies [][]byte
 			prev := 0
 			wantSplice := []int{}
 			for i, cut := range cuts {
 				bodies = append(bodies, down[prev:cut])
 				prev = cut
-				for _, e := range append([]int{hsEnd}, ends...) {
+				for _, e := range ends {
 					if cut == e {
 						wantSplice = append(wantSplice, i)
 					}
@@ -261,11 +295,12 @@ func TestPollingFeederSplicesOnlyBetweenTUNFrames(t *testing.T) {
 			}
 
 			c := newScriptedPollingConn(t, bodies)
+			fc := useFakeClock(c)
 			hsReq := []byte{meekTUNMode, 0, 0, 0, 0, 0x05, 0xdc, tc.version}
 			if _, err := c.Write(hsReq); err != nil {
 				t.Fatalf("write: %v", err)
 			}
-			got, spliced := runPollScript(t, c, len(bodies))
+			got, spliced := runPollScript(t, c, fc, len(bodies))
 
 			if fmt.Sprint(spliced) != fmt.Sprint(wantSplice) {
 				t.Errorf("keepalives spliced after polls %v, want exactly the boundary-ending polls %v", spliced, wantSplice)
@@ -305,10 +340,13 @@ func TestPollingFeederSplicesOnlyBetweenTUNFrames(t *testing.T) {
 // arrives at full handshake length.
 func TestPollingFeederStopsOnFailedHandshake(t *testing.T) {
 	c := newScriptedPollingConn(t, [][]byte{{0x01, 0, 0, 0, 0, 0, 0, 0, 0}})
+	fc := useFakeClock(c)
 	if _, err := c.Write([]byte{meekTUNMode, 0, 0, 0, 0, 0x05, 0xdc, 0x03}); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if _, spliced := runPollScript(t, c, 1); len(spliced) != 0 {
+	// Two polls: the second runs past the handshake peek guard, where the
+	// feeder would splice if it mistook the refusal for a handshake.
+	if _, spliced := runPollScript(t, c, fc, 2); len(spliced) != 0 {
 		t.Fatalf("feeder spliced a keepalive after a refused handshake")
 	}
 }
@@ -327,5 +365,163 @@ func TestPollingReadDeadlineIsTimeout(t *testing.T) {
 	}
 	if ne, ok := errors.AsType[net.Error](err); !ok || !ne.Timeout() {
 		t.Fatalf("Read deadline error %v does not report net.Error Timeout()", err)
+	}
+}
+
+// tunSessionPastHandshake opens a scripted v4 TUN session whose first poll
+// delivers the 10-byte handshake response and whose second delivers frames,
+// then moves the fake clock past the handshake peek guard.
+func tunSessionPastHandshake(t *testing.T, frames []byte) (*HTTPPollingConn, *fakeClock) {
+	t.Helper()
+	hs := append([]byte{0}, make([]byte, 9)...)
+	c := newScriptedPollingConn(t, [][]byte{hs, frames})
+	fc := useFakeClock(c)
+	if _, err := c.Write([]byte{meekTUNMode, 0, 0, 0, 0, 0x05, 0xdc, 0x04}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	return c, fc
+}
+
+// TestPollingFeederTickerSplices pins that the ticker goroutine actually calls
+// the feeder: with the TUN session idle on a frame boundary and polls healthy,
+// a keepalive frame must show up within a few ticks.
+func TestPollingFeederTickerSplices(t *testing.T) {
+	c, fc := tunSessionPastHandshake(t, tunFrame(40, 0x11))
+	runPollScript(t, c, fc, 2)
+	c.lastPollOK.Store(fc.Now().UnixNano())
+
+	c.feedEvery = 5 * time.Millisecond
+	go c.runKeepaliveFeeder()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		c.recvLock.Lock()
+		got := bytes.Clone(c.recvBuf.Bytes())
+		c.recvLock.Unlock()
+		if len(got) > 0 {
+			if !bytes.Equal(got, []byte{0, 0, 0, 0}) {
+				t.Fatalf("ticker produced % x, want one keepalive frame", got)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("feeder ticker never spliced a keepalive into an idle, healthy TUN session")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestPollingTrackerStopsOnOversizedFrame pins the fail-safe for a tracker that
+// lost the framing: a length over the protocol ceiling turns splicing off for
+// good, so a later position the tracker would take for a boundary is not used.
+func TestPollingTrackerStopsOnOversizedFrame(t *testing.T) {
+	const n = meekMaxFrame + 1
+	bogus := make([]byte, 4+n)
+	binary.BigEndian.PutUint32(bogus, n)
+	c, fc := tunSessionPastHandshake(t, bogus)
+	if _, spliced := runPollScript(t, c, fc, 2); len(spliced) != 0 {
+		t.Fatalf("feeder spliced after polls %v although the stream carried a %d-byte frame", spliced, n)
+	}
+}
+
+// TestPollingTrackerStopsOnPortHopHandshake: polling exits never advertise
+// port hopping, and the tracker does not follow that layout; seeing it must
+// turn splicing off rather than guess the handshake length.
+func TestPollingTrackerStopsOnPortHopHandshake(t *testing.T) {
+	hs := append([]byte{0}, make([]byte, 8)...)
+	hs = append(hs, meekHSFlagPortHop)
+	c := newScriptedPollingConn(t, [][]byte{hs, tunFrame(40, 0x22)})
+	fc := useFakeClock(c)
+	if _, err := c.Write([]byte{meekTUNMode, 0, 0, 0, 0, 0x05, 0xdc, 0x04}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, spliced := runPollScript(t, c, fc, 2); len(spliced) != 0 {
+		t.Fatalf("feeder spliced after polls %v into a stream whose handshake layout it cannot follow", spliced)
+	}
+}
+
+// TestPollingWriteBoundedAndFailsWhenPollsDie pins the uplink bound. With the
+// exit gone the relay no longer dies of a bogus read error, so the queue has to
+// be bounded on its own: Write must block at maxPollingSendBuffered instead of
+// growing sendBuf, and must fail once no poll has succeeded for the health
+// grace, so the relay ends.
+func TestPollingWriteBoundedAndFailsWhenPollsDie(t *testing.T) {
+	c := newScriptedPollingConn(t, nil) // nothing polls: the exit is dead
+	fc := useFakeClock(c)
+	c.lastPollOK.Store(fc.Now().UnixNano())
+
+	chunk := make([]byte, 32*1024)
+	const total = 4 * maxPollingSendBuffered
+	errc := make(chan error, 1)
+	go func() {
+		for written := 0; written < total; written += len(chunk) {
+			if _, err := c.Write(chunk); err != nil {
+				errc <- err
+				return
+			}
+		}
+		errc <- nil
+	}()
+
+	time.Sleep(300 * time.Millisecond)
+	c.sendLock.Lock()
+	queued := c.sendBuf.Len()
+	c.sendLock.Unlock()
+	if queued > maxPollingSendBuffered+len(chunk) {
+		t.Fatalf("uplink queue grew to %d bytes with nothing polling, bound is %d", queued, maxPollingSendBuffered)
+	}
+	select {
+	case err := <-errc:
+		t.Fatalf("Write returned (%v) while polls were still healthy and the queue full", err)
+	default:
+	}
+
+	fc.Advance(pollingPollHealthGrace + time.Second)
+	select {
+	case err := <-errc:
+		if !errors.Is(err, errPollingDead) {
+			t.Fatalf("Write after the poll layer died returned %v, want errPollingDead", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Write stayed blocked after the poll layer died; the relay would hang forever")
+	}
+}
+
+// TestPollingReadFailsWhenPollsDie: a read deadline on a dead poll layer must
+// end the relay (non-timeout error), while on a healthy one it stays a plain
+// timeout so a quiet downlink survives.
+func TestPollingReadFailsWhenPollsDie(t *testing.T) {
+	c := newScriptedPollingConn(t, nil)
+	fc := useFakeClock(c)
+	c.lastPollOK.Store(fc.Now().UnixNano())
+
+	c.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
+	if _, err := c.Read(make([]byte, 16)); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("healthy poll layer: Read returned %v, want a timeout", err)
+	}
+
+	fc.Advance(pollingPollHealthGrace + time.Second)
+	c.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
+	_, err := c.Read(make([]byte, 16))
+	if !errors.Is(err, errPollingDead) {
+		t.Fatalf("dead poll layer: Read returned %v, want errPollingDead", err)
+	}
+	if ne, ok := errors.AsType[net.Error](err); ok && ne.Timeout() {
+		t.Fatal("dead poll layer reported as a timeout; the SOCKS relay would keep it open")
+	}
+}
+
+// TestPollingDeadWhenNoPollSucceedsAfterInit: the init round-trip starts the
+// liveness clock, so a session whose polls all fail after it is declared dead
+// once the health grace runs out, instead of counting as "never polled".
+func TestPollingDeadWhenNoPollSucceedsAfterInit(t *testing.T) {
+	c := newScriptedPollingConn(t, [][]byte{[]byte("OK")})
+	fc := useFakeClock(c)
+	if err := c.init(t.Context()); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	fc.Advance(pollingPollHealthGrace + time.Second)
+	c.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
+	if _, err := c.Read(make([]byte, 16)); !errors.Is(err, errPollingDead) {
+		t.Fatalf("no poll since init past the grace: Read returned %v, want errPollingDead", err)
 	}
 }

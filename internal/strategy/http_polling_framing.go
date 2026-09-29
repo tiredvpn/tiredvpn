@@ -1,6 +1,10 @@
 package strategy
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+
+	"github.com/tiredvpn/tiredvpn/internal/log"
+)
 
 // meekStreamTracker tells the keepalive feeder where it may splice a synthetic
 // keepalive frame into the downlink byte stream without corrupting it.
@@ -80,6 +84,26 @@ func (t *meekStreamTracker) observeUplink(p []byte) {
 	}
 }
 
+// uplinkSettled reports that further uplink bytes cannot change what the
+// tracker decides: the version byte is in, or the downlink has started (the
+// stream kind and handshake version are read at the first downlink byte).
+func (t *meekStreamTracker) uplinkSettled() bool {
+	return t.upN == len(t.up) || t.state != meekDownUnknown
+}
+
+// pastHandshake reports that the TUN handshake response has been fully handed
+// to the receive buffer.
+func (t *meekStreamTracker) pastHandshake() bool {
+	return t.state == meekDownFrames
+}
+
+// markBroken stops splicing for the rest of the session. It is logged because
+// it silently brings back the relay's 30s idle teardown for this meek session.
+func (t *meekStreamTracker) markBroken(reason string) {
+	t.state = meekDownBroken
+	log.Debug("HTTP Polling: keepalive feeder off for this session: %s", reason)
+}
+
 // observeDownlink accounts for bytes appended to the receive buffer, in order.
 func (t *meekStreamTracker) observeDownlink(p []byte) {
 	for len(p) > 0 {
@@ -118,9 +142,10 @@ func (t *meekStreamTracker) consumeHandshake(p []byte) []byte {
 			return p
 		}
 		if t.hsNeed == 0 {
-			t.hsNeed = t.handshakeLen()
+			var why string
+			t.hsNeed, why = t.handshakeLen()
 			if t.hsNeed < 0 {
-				t.state = meekDownBroken
+				t.markBroken(why)
 				return nil
 			}
 		}
@@ -141,11 +166,11 @@ func (t *meekStreamTracker) hsVersion() byte {
 }
 
 // handshakeLen returns the full handshake response length once its deciding
-// prefix is in hs, or -1 when the session failed or the layout is not one a
-// polling exit sends.
-func (t *meekStreamTracker) handshakeLen() int {
+// prefix is in hs, or -1 and a reason when the session failed or the layout is
+// not one a polling exit sends.
+func (t *meekStreamTracker) handshakeLen() (int, string) {
 	if t.hs[0] != 0x00 {
-		return -1 // server refused the session; nothing framed follows
+		return -1, "TUN handshake refused" // nothing framed follows
 	}
 	if t.hsVersion() < meekHSVersionFlags {
 		// A polling exit builds its response with no advertised capabilities,
@@ -153,17 +178,17 @@ func (t *meekStreamTracker) handshakeLen() int {
 		// resolves a possible tenth byte with a timed peek the tracker cannot
 		// replicate; a server that ever sends one misaligns the tracker, which
 		// the frame-length check below catches.)
-		return meekHSBase
+		return meekHSBase, ""
 	}
 	flags := t.hs[meekHSBase]
 	if flags&meekHSFlagPortHop != 0 {
-		return -1
+		return -1, "handshake advertises port hopping, a layout polling exits never send"
 	}
 	n := meekHSBase + 1
 	if flags&meekHSFlagDualStack != 0 {
 		n += 32
 	}
-	return n
+	return n, ""
 }
 
 // consumeFrames eats [len:4][payload] frames and returns nothing (it always
@@ -185,7 +210,7 @@ func (t *meekStreamTracker) consumeFrames(p []byte) []byte {
 		t.hdrN = 0
 		l := binary.BigEndian.Uint32(t.hdr[:])
 		if l > meekMaxFrame {
-			t.state = meekDownBroken
+			t.markBroken("frame length over the protocol ceiling, lost framing")
 			return nil
 		}
 		t.bodyLeft = int(l)

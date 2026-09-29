@@ -37,7 +37,29 @@ import (
 const (
 	pollingKeepaliveFeed   = 10 * time.Second // inject a keepalive frame this often while idle
 	pollingPollHealthGrace = 20 * time.Second // stop feeding if no poll has succeeded within this
+
+	// pollingHandshakePeekGuard keeps the feeder quiet right after the reader
+	// drained the TUN handshake response. The TUN client's handshake reader
+	// (tun.readHandshakeResponse) waits up to handshakeFlagsGrace (300ms) for an
+	// optional flags byte whenever the response stopped at 9 bytes - which is
+	// exactly what a polling exit sends a v3 client. A keepalive spliced into
+	// that window has its first zero read as the flags byte and desyncs every
+	// frame after it. The guard is the peek budget with a wide margin; the feed
+	// period is 10s, so it costs nothing.
+	pollingHandshakePeekGuard = time.Second
+
+	// maxPollingSendBuffered bounds the uplink queue. Write blocks while this
+	// much is waiting to be polled out, so a fast local writer (a SOCKS upload,
+	// the TUN device) gets backpressure instead of growing the queue without
+	// limit. At 8 KiB per poll this is several seconds of uplink.
+	maxPollingSendBuffered = 1 << 20
 )
+
+// errPollingDead is returned by Read and Write once no poll has succeeded for
+// pollingPollHealthGrace. It is deliberately not a timeout: the SOCKS relay
+// keeps a timed-out direction open, and a dead exit must end the relay rather
+// than keep it (and the uplink queue) alive forever.
+var errPollingDead = errors.New("http_polling: no successful poll within the health grace")
 
 // maxPollBody caps the response Content-Length we will allocate for. A poll
 // response carries at most one relay buffer (tens of KB); 1 MiB leaves headroom
@@ -155,6 +177,7 @@ func (s *HTTPPollingStrategy) Connect(ctx context.Context, target string) (net.C
 	}
 	// recvCond coordinates Read() wakeups with poll()/Close() without busy-waiting.
 	pollConn.recvCond = sync.NewCond(&pollConn.recvLock)
+	pollConn.sendCond = sync.NewCond(&pollConn.sendLock)
 
 	// Initialize session (no target - SOCKS handler will write destination via Write())
 	if err := pollConn.init(ctx); err != nil {
@@ -198,6 +221,22 @@ type HTTPPollingConn struct {
 	// recvBuf or the connection is closed. Read waits on it instead of
 	// busy-waiting with time.Sleep.
 	recvCond *sync.Cond
+
+	// sendCond is signalled (under sendLock) when poll() takes data out of
+	// sendBuf or the connection closes; Write waits on it for room.
+	sendCond *sync.Cond
+
+	// now is the clock for liveness bookkeeping (lastPollOK, the handshake peek
+	// guard). nil means time.Now; tests substitute a fake clock.
+	now func() time.Time
+
+	// feedEvery overrides pollingKeepaliveFeed (tests only; 0 = default).
+	feedEvery time.Duration
+
+	// hsDrainedAt is when a Read first emptied the receive buffer after the
+	// TUN handshake response was complete - the moment the handshake reader's
+	// flags peek can start. Guarded by recvLock.
+	hsDrainedAt time.Time
 
 	// stream follows what kind of byte stream this session carries and, in TUN
 	// mode, its framing, so the keepalive feeder only ever splices a whole
@@ -279,6 +318,10 @@ func (c *HTTPPollingConn) init(ctx context.Context) error {
 	if len(resp) < 2 || resp[0] != 'O' || resp[1] != 'K' {
 		return errors.New("server did not acknowledge session")
 	}
+	// The init round-trip is the first proof of liveness; without it a session
+	// whose polls never succeed would never count as dead (pollDead treats "no
+	// poll recorded" as alive).
+	c.lastPollOK.Store(c.clock().UnixNano())
 
 	return nil
 }
@@ -404,6 +447,9 @@ func (c *HTTPPollingConn) poll() (ok bool, moved bool) {
 		if len(remaining) > 0 {
 			c.sendBuf.Write(remaining)
 		}
+		if c.sendCond != nil {
+			c.sendCond.Broadcast() // room for a Write blocked on the bound
+		}
 	}
 	c.sendLock.Unlock()
 
@@ -458,7 +504,7 @@ func (c *HTTPPollingConn) poll() (ok bool, moved bool) {
 
 	// Record liveness for the keepalive feeder: a completed poll round-trip is
 	// proof the meek transport is alive even when no tunnel payload is flowing.
-	c.lastPollOK.Store(time.Now().UnixNano())
+	c.lastPollOK.Store(c.clock().UnixNano())
 
 	return true, len(sendData) > 0 || len(resp) > 0
 }
@@ -468,7 +514,11 @@ func (c *HTTPPollingConn) poll() (ok bool, moved bool) {
 // this. If polls stop succeeding the connection is genuinely dead, the feeder
 // goes quiet, and the relay's own read deadline fires to tear the session down.
 func (c *HTTPPollingConn) runKeepaliveFeeder() {
-	ticker := time.NewTicker(pollingKeepaliveFeed)
+	every := c.feedEvery
+	if every <= 0 {
+		every = pollingKeepaliveFeed
+	}
+	ticker := time.NewTicker(every)
 	defer ticker.Stop()
 	for {
 		select {
@@ -480,14 +530,26 @@ func (c *HTTPPollingConn) runKeepaliveFeeder() {
 	}
 }
 
-// meekKeepaliveFrame is the zero-length TUN frame the relay treats as a
-// keepalive.
-var meekKeepaliveFrame = []byte{0, 0, 0, 0}
+// clock returns the liveness clock's current time.
+func (c *HTTPPollingConn) clock() time.Time {
+	if c.now != nil {
+		return c.now()
+	}
+	return time.Now()
+}
+
+// pollDead reports that no poll has succeeded for pollingPollHealthGrace.
+// A connection that has not recorded any poll yet is not dead.
+func (c *HTTPPollingConn) pollDead() bool {
+	last := c.lastPollOK.Load()
+	return last != 0 && c.clock().Sub(time.Unix(0, last)) > pollingPollHealthGrace
+}
 
 // feedKeepalive splices one synthetic keepalive frame into the receive buffer
 // if, and only if, that cannot change the stream the reader sees: the session
 // is in TUN mode, the reader has drained the buffer, and what it drained ends
-// on a frame boundary. It reports whether a frame was spliced.
+// on a frame boundary, and the handshake reader's flags peek is over
+// (pollingHandshakePeekGuard). It reports whether a frame was spliced.
 //
 // The old condition was "receive buffer empty" alone. That spliced four zero
 // bytes into every SOCKS download that ran past the first feeder tick, and in
@@ -495,7 +557,8 @@ var meekKeepaliveFrame = []byte{0, 0, 0, 0}
 // across two poll responses.
 func (c *HTTPPollingConn) feedKeepalive() bool {
 	last := c.lastPollOK.Load()
-	if last == 0 || time.Since(time.Unix(0, last)) > pollingPollHealthGrace {
+	now := c.clock()
+	if last == 0 || now.Sub(time.Unix(0, last)) > pollingPollHealthGrace {
 		return false // poll layer is not proving liveness - let the relay time out
 	}
 	c.recvLock.Lock()
@@ -503,8 +566,14 @@ func (c *HTTPPollingConn) feedKeepalive() bool {
 	if c.recvBuf.Len() != 0 || !c.stream.atFrameBoundary() {
 		return false
 	}
-	c.stream.observeDownlink(meekKeepaliveFrame)
-	c.recvBuf.Write(meekKeepaliveFrame)
+	if c.hsDrainedAt.IsZero() || now.Sub(c.hsDrainedAt) < pollingHandshakePeekGuard {
+		return false // the handshake reader may still be waiting for a flags byte
+	}
+	// A zero-length frame: observeDownlink leaves the tracker on the boundary,
+	// the call only keeps it in step with what recvBuf holds.
+	keepalive := []byte{0, 0, 0, 0}
+	c.stream.observeDownlink(keepalive)
+	c.recvBuf.Write(keepalive)
 	c.recvCond.Broadcast()
 	return true
 }
@@ -745,7 +814,11 @@ func (c *HTTPPollingConn) Read(p []byte) (int, error) {
 	defer c.recvLock.Unlock()
 	for {
 		if c.recvBuf.Len() > 0 {
-			return c.recvBuf.Read(p)
+			n, err := c.recvBuf.Read(p)
+			if c.recvBuf.Len() == 0 && c.hsDrainedAt.IsZero() && c.stream.pastHandshake() {
+				c.hsDrainedAt = c.clock()
+			}
+			return n, err
 		}
 
 		// Closed connection: report EOF once buffer is drained.
@@ -756,6 +829,9 @@ func (c *HTTPPollingConn) Read(p []byte) (int, error) {
 		}
 
 		if !time.Now().Before(deadline) {
+			if c.pollDead() {
+				return 0, errPollingDead
+			}
 			// The net.Conn deadline error: callers (the SOCKS relay among them)
 			// recognise a timeout through net.Error.Timeout() and keep an idle
 			// direction open. A plain error made every download-silent stream -
@@ -780,13 +856,17 @@ func (c *HTTPPollingConn) Write(p []byte) (int, error) {
 	if !c.uplinkSeen.Load() {
 		c.recvLock.Lock()
 		c.stream.observeUplink(p)
-		if c.stream.upN == len(c.stream.up) {
+		if c.stream.uplinkSettled() {
 			c.uplinkSeen.Store(true)
 		}
 		c.recvLock.Unlock()
 	}
 
 	c.sendLock.Lock()
+	if err := c.waitSendRoomLocked(); err != nil {
+		c.sendLock.Unlock()
+		return 0, err
+	}
 	n, err := c.sendBuf.Write(p)
 	c.sendLock.Unlock()
 
@@ -806,10 +886,40 @@ func (c *HTTPPollingConn) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// waitSendRoomLocked blocks while the uplink queue is at its bound, until a
+// poll drains it, the connection closes, or the poll layer is declared dead.
+// Caller holds sendLock.
+func (c *HTTPPollingConn) waitSendRoomLocked() error {
+	for c.sendBuf.Len() >= maxPollingSendBuffered {
+		select {
+		case <-c.closed:
+			return errors.New("connection closed")
+		default:
+		}
+		if c.pollDead() {
+			return errPollingDead
+		}
+		// Re-check liveness periodically even if no poll ever wakes us.
+		wake := time.AfterFunc(250*time.Millisecond, func() {
+			c.sendLock.Lock()
+			c.sendCond.Broadcast()
+			c.sendLock.Unlock()
+		})
+		c.sendCond.Wait()
+		wake.Stop()
+	}
+	return nil
+}
+
 // Close implements net.Conn
 func (c *HTTPPollingConn) Close() error {
 	c.closeOnce.Do(func() {
 		close(c.closed)
+		if c.sendCond != nil {
+			c.sendLock.Lock()
+			c.sendCond.Broadcast()
+			c.sendLock.Unlock()
+		}
 		// Wake any Read blocked on recvCond so it can return EOF.
 		c.recvLock.Lock()
 		c.recvCond.Broadcast()
