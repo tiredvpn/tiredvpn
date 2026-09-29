@@ -151,23 +151,44 @@ B1.
 
 ### The ordinary TLS transports
 
-HTTP/2 stego, morph, WebSocket-padded, HTTP polling and anti-probe run over a
-genuine TLS 1.3 connection to our server. Two caveats:
+HTTP/2 stego, morph, WebSocket-padded (and Geneva, which rides on it), HTTP
+polling and anti-probe run over a genuine TLS 1.3 connection to our server.
+
+**Client to server.** Every client token is an HMAC over the secret, a time
+bucket and the RFC 8446 §7.5 exporter of the TLS session it is sent on. A token
+captured on one session does not verify on any other, and a middlebox that
+terminates TLS cannot forward the client's token to the real server, because it
+sees different keying material on each leg. The time window is ±10 one-minute
+buckets for stego, morph and WebSocket-padded, and 60 seconds for HTTP polling.
+
+The binding needs a TLS session, and the server accepts these tokens only over
+one. Morph and HTTP/2 stego can also be reached over bare TCP, with a raw `MRPH`
+prefix or an HTTP/2 preface. There is no exporter there, so the server refuses
+the token with the same bytes, close and timing it gives a wrong token. Up to
+1.11.4 that path accepted a token computed over an empty exporter. It crossed
+the wire in the clear and could be replayed within the time window by anyone
+who saw it. No client we ship takes that path, so in practice the exposure was
+limited to third-party or hand-built clients that did.
+
+**Server to client.** Two caveats remain:
 
 - Every strategy dials with `InsecureSkipVerify: true`. The certificate is
   camouflage for the cover domain, not an identity, and only B1 replaces the
-  check with something else. Nothing else in the client verifies who it is
-  talking to.
-- The server proves nothing useful in return. The stego ack is
-  `HMAC(secret, "server-ack")` — a fixed value with no per-connection input, so
-  it is replayable by anyone who has ever seen one. Morph gets a single `0x00`
-  byte; WebSocket-padded gets an HTTP 101.
+  check with something else.
+- What the server proves depends on the transport. Anti-probe sends an HMAC over
+  the session exporter, which nobody without the secret can produce for that
+  session. The stego ack is `HMAC(secret, nonce || "server-ack")` over a fresh
+  server-chosen nonce: it differs per connection but is not bound to the TLS
+  session, so it holds only as long as no ack has been seen outside the TLS
+  that carries it. Morph gets a single `0x00` byte, WebSocket-padded an HTTP
+  101, HTTP polling an ordinary HTTP response. None of those three proves
+  anything.
 
-So on these transports, an adversary who can terminate TLS in the path and who
-has captured one auth token within the last twenty minutes can sit in the
-middle. That is the combined effect of the replayable token, the disabled
-certificate check and the absent server proof. If that is in your threat model,
-use B1.
+So an adversary who can terminate TLS in the path can no longer sit in the
+middle: it cannot authenticate to the real server with the client's token. It
+can still pose as the server to a morph, WebSocket-padded or HTTP polling
+client, answer with the expected byte or status, and receive whatever that
+client sends into the tunnel. If that is in your threat model, use B1.
 
 ### QUIC and Salamander
 
