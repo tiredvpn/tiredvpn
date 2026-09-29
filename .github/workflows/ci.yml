@@ -108,6 +108,72 @@ jobs:
       - name: On-wire signature detectors
         run: go test -race -timeout 5m -count=1 -v ./internal/wiretest/
 
+  # Tests that touch the real routing table and create links (TestRoot* in
+  # internal/tun). They gate themselves on TIREDVPN_NETNS_TESTS=1 plus root,
+  # so every other job compiles them and skips them. Here they get what they
+  # ask for: root inside a private network namespace that dies with the step,
+  # so nothing they add can leak into the runner's own namespace.
+  #
+  # A skip is a failure here. The helpers skip rather than fail when the host
+  # cannot create a dummy or TUN link, and a job that went green on skips would
+  # be claiming coverage it does not have. So the step lists every TestRoot*
+  # compiled into the binary and requires a top-level PASS line for each one.
+  netns_tests:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Build test binary
+        run: go test -c -o "$RUNNER_TEMP/tun.test" ./internal/tun/
+
+      - name: Load link modules
+        run: sudo modprobe dummy && sudo modprobe tun
+
+      - name: Root tests in a private network namespace
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/tun.test"
+          log="$RUNNER_TEMP/netns-tests.log"
+
+          # Package init may log to the same stream; keep only test names.
+          mapfile -t want < <("$bin" -test.list '^TestRoot' 2>/dev/null |
+            grep -E '^TestRoot[A-Za-z0-9_]*$' || true)
+          if [ "${#want[@]}" -eq 0 ]; then
+            echo "::error::no TestRoot* tests in the binary, nothing would be checked"
+            exit 1
+          fi
+          echo "expecting PASS from ${#want[@]} tests: ${want[*]}"
+
+          set +e
+          sudo unshare -n env TIREDVPN_NETNS_TESTS=1 \
+            "$bin" -test.run '^TestRoot' -test.v -test.count=1 -test.timeout=5m 2>&1 | tee "$log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::netns tests failed (exit $rc)"
+            exit "$rc"
+          fi
+
+          bad=0
+          if grep -E -- '--- SKIP' "$log"; then
+            echo "::error::netns tests were skipped, see the lines above"
+            bad=1
+          fi
+          for t in "${want[@]}"; do
+            if ! grep -qE -- "^--- PASS: ${t} \(" "$log"; then
+              echo "::error::${t} did not report PASS"
+              bad=1
+            fi
+          done
+          exit "$bad"
+
   benchmark:
     runs-on: ubuntu-latest
     if: github.event_name != 'schedule'
