@@ -19,6 +19,10 @@ type Conn struct {
 	tcpConn *net.TCPConn
 	tlsConn *tls.Conn
 
+	// rxMu serialises readers: pending and rx are receive-side state that
+	// concurrent Read calls would otherwise corrupt. Writers never take it.
+	rxMu sync.Mutex
+
 	// pending is application data crypto/tls decrypted before the handover
 	// (see Enable); Read returns it before touching the socket.
 	pending []byte
@@ -47,7 +51,11 @@ func NewConn(tlsConn *tls.Conn) (*Conn, error) {
 // Read reads data from the connection.
 // kTLS kernel will decrypt data automatically.
 // We use the TCP connection directly - kernel handles decryption.
+//
+// Read is safe to call from several goroutines; calls are serialised.
 func (c *Conn) Read(b []byte) (n int, err error) {
+	c.rxMu.Lock()
+	defer c.rxMu.Unlock()
 	if len(c.pending) > 0 {
 		n = copy(b, c.pending)
 		c.pending = c.pending[n:]
@@ -88,13 +96,10 @@ func (c *Conn) Write(b []byte) (n int, err error) {
 func (c *Conn) ReadFrom(r io.Reader) (int64, error) {
 	var head int64
 	if kc, ok := r.(*Conn); ok {
-		if len(kc.pending) > 0 {
-			n, err := c.tcpConn.Write(kc.pending)
-			kc.pending = kc.pending[n:]
-			head = int64(n)
-			if err != nil {
-				return head, err
-			}
+		n, err := kc.flushPending(c.tcpConn)
+		head = n
+		if err != nil {
+			return head, err
 		}
 		r = kc.tcpConn
 	}
@@ -103,26 +108,32 @@ func (c *Conn) ReadFrom(r io.Reader) (int64, error) {
 }
 
 func (c *Conn) WriteTo(w io.Writer) (int64, error) {
-	var head int64
-	if len(c.pending) > 0 {
-		n, err := w.Write(c.pending)
-		c.pending = c.pending[n:]
-		head = int64(n)
-		if err != nil {
-			return head, err
-		}
+	head, err := c.flushPending(w)
+	if err != nil {
+		return head, err
 	}
 	if kc, ok := w.(*Conn); ok {
 		w = kc.tcpConn
 	}
 	var n int64
-	var err error
 	if rf, ok := w.(io.ReaderFrom); ok {
 		n, err = rf.ReadFrom(c.tcpConn)
 	} else {
 		n, err = io.Copy(w, c.tcpConn)
 	}
 	return head + n, err
+}
+
+// flushPending writes out data left over from the handover, if any.
+func (c *Conn) flushPending(w io.Writer) (int64, error) {
+	c.rxMu.Lock()
+	defer c.rxMu.Unlock()
+	if len(c.pending) == 0 {
+		return 0, nil
+	}
+	n, err := w.Write(c.pending)
+	c.pending = c.pending[n:]
+	return int64(n), err
 }
 
 // Close closes the underlying TCP connection.

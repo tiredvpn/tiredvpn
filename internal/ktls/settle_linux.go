@@ -24,10 +24,10 @@ const (
 	maxSettleRounds = 64
 )
 
-// settleReadTimeout bounds the wait for the tail of a record that crypto/tls
-// has only partly read. A peer writes a record in one go, so the tail is
-// already in flight; this only guards against a peer that stalls mid-record.
-// A variable so tests can shorten it.
+// settleReadTimeout bounds the total wait, across all rounds, for the tail of
+// a record that crypto/tls has only partly read. A peer writes a record in one
+// go, so the tail is already in flight; this only guards against a peer that
+// stalls mid-record. A variable so tests can shorten it.
 var settleReadTimeout = 2 * time.Second
 
 // tlsBuffers points into the receive-side buffers of a *tls.Conn:
@@ -97,14 +97,19 @@ func (b *tlsBuffers) restore(pending []byte) {
 // is completed by reading exactly its missing bytes, never more. Application
 // data decrypted along the way is returned as pending.
 //
+// eof reports that a close_notify was among the settled records, so the
+// caller must end the stream after pending rather than read the socket.
+//
 // It is a no-op, touching neither the socket nor the deadlines, when the
-// buffers are already empty. Otherwise it leaves no read deadline set on
-// tlsConn.
-func settleReceiveBuffers(tlsConn *tls.Conn, b *tlsBuffers) (pending []byte, err error) {
+// buffers are already empty. Otherwise it clears the read deadline on tlsConn,
+// including one the caller set, and waits for split-record tails at most
+// settleReadTimeout in total.
+func settleReceiveBuffers(tlsConn *tls.Conn, b *tlsBuffers) (pending []byte, eof bool, err error) {
 	if b.empty() {
-		return nil, nil
+		return nil, false, nil
 	}
 	defer tlsConn.SetReadDeadline(time.Time{})
+	deadline := time.Now().Add(settleReadTimeout)
 
 	buf := make([]byte, 16384)
 	past := time.Unix(1, 0)
@@ -114,7 +119,7 @@ func settleReceiveBuffers(tlsConn *tls.Conn, b *tlsBuffers) (pending []byte, err
 		// sticky in crypto/tls, so the conn stays usable.
 		for {
 			if err := tlsConn.SetReadDeadline(past); err != nil {
-				return pending, err
+				return pending, false, err
 			}
 			n, err := tlsConn.Read(buf)
 			pending = append(pending, buf[:n]...)
@@ -125,15 +130,15 @@ func settleReceiveBuffers(tlsConn *tls.Conn, b *tlsBuffers) (pending []byte, err
 				break
 			}
 			if errors.Is(err, io.EOF) {
-				// close_notify: nothing follows it, the kernel will read EOF.
-				return pending, checkSettled(b)
+				// close_notify: nothing follows it.
+				return pending, true, checkSettled(b)
 			}
-			return pending, err
+			return pending, false, err
 		}
 
 		raw := b.rawInput.Bytes()
 		if len(raw) == 0 {
-			return pending, checkSettled(b)
+			return pending, false, checkSettled(b)
 		}
 		// What is left is the head of one record whose tail is still on
 		// the socket (or in a wrapper under tlsConn). Fetch exactly the tail.
@@ -141,23 +146,23 @@ func settleReceiveBuffers(tlsConn *tls.Conn, b *tlsBuffers) (pending []byte, err
 		if len(raw) >= recordHeaderLen {
 			n := int(raw[3])<<8 | int(raw[4])
 			if n > maxCiphertextLen {
-				return pending, fmt.Errorf("buffered record length %d exceeds TLS limit", n)
+				return pending, false, fmt.Errorf("buffered record length %d exceeds TLS limit", n)
 			}
 			need = recordHeaderLen + n - len(raw)
 		}
 		under := tlsConn.NetConn()
-		if err := under.SetReadDeadline(time.Now().Add(settleReadTimeout)); err != nil {
-			return pending, err
+		if err := under.SetReadDeadline(deadline); err != nil {
+			return pending, false, err
 		}
 		tail := make([]byte, need)
 		n, err := io.ReadFull(under, tail)
 		// Whatever was read belongs to crypto/tls, success or not.
 		b.rawInput.Write(tail[:n])
 		if err != nil {
-			return pending, fmt.Errorf("reading tail of a split record: %w", err)
+			return pending, false, fmt.Errorf("reading tail of a split record: %w", err)
 		}
 	}
-	return pending, errors.New("buffered TLS input did not settle")
+	return pending, false, errors.New("buffered TLS input did not settle")
 }
 
 func checkSettled(b *tlsBuffers) error {

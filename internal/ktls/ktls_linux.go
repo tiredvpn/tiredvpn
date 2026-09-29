@@ -359,6 +359,11 @@ func hkdfExpandLabel(h func() hash.Hash, secret []byte, label string, context []
 // application data it yields is returned by the first Reads on the *Conn. If
 // that cannot be done, Enable returns nil and tlsConn is left usable, with
 // the application data it yielded, if any, put back.
+//
+// When there was buffered input to settle, Enable clears the read deadline on
+// the connection, including one the caller set, and may block for up to
+// settleReadTimeout waiting for the tail of a split record. With nothing
+// buffered it does neither.
 func Enable(tlsConn *tls.Conn) *Conn {
 	if !Supported() {
 		fallbackConns.Add(1)
@@ -430,7 +435,7 @@ func Enable(tlsConn *tls.Conn) *Conn {
 		fallbackConns.Add(1)
 		return nil
 	}
-	pending, err := settleReceiveBuffers(tlsConn, bufs)
+	pending, eof, err := settleReceiveBuffers(tlsConn, bufs)
 	if err != nil {
 		bufs.restore(pending)
 		log.Debug("kTLS: cannot settle buffered TLS input: %v", err)
@@ -472,6 +477,11 @@ func Enable(tlsConn *tls.Conn) *Conn {
 		tcpConn: tcpConn,
 		tlsConn: tlsConn,
 		pending: pending,
+	}
+	if eof {
+		// The peer's close_notify was consumed while settling; end the
+		// stream after pending instead of waiting on the socket.
+		ktlsConn.rx.err = io.EOF
 	}
 
 	return ktlsConn
