@@ -350,6 +350,20 @@ func hkdfExpandLabel(h func() hash.Hash, secret []byte, label string, context []
 // Enable attempts to enable kTLS for the given connection.
 // Returns a wrapped connection that uses raw socket I/O if successful, nil otherwise.
 // After calling this, the original tlsConn should NOT be used for I/O.
+//
+// Enable may be called while crypto/tls still holds input it read ahead of
+// the caller - most commonly the server's NewSessionTicket, which a TLS 1.3
+// server sends right behind its Finished and which crypto/tls has usually
+// pulled off the socket, whole or in part, by the time Handshake returns.
+// Such input is processed in userspace first (see settleReceiveBuffers); any
+// application data it yields is returned by the first Reads on the *Conn. If
+// that cannot be done, Enable returns nil and tlsConn is left usable, with
+// the application data it yielded, if any, put back.
+//
+// When there was buffered input to settle, Enable clears the read deadline on
+// the connection, including one the caller set, and may block for up to
+// settleReadTimeout waiting for the tail of a split record. With nothing
+// buffered it does neither.
 func Enable(tlsConn *tls.Conn) *Conn {
 	if !Supported() {
 		fallbackConns.Add(1)
@@ -412,12 +426,38 @@ func Enable(tlsConn *tls.Conn) *Conn {
 		return nil
 	}
 
+	// Whatever crypto/tls has already pulled off the socket but not handed to
+	// the caller is invisible to the kernel. Settle it in userspace first so
+	// the kernel starts on a record boundary with the right sequence number.
+	bufs, err := tlsReceiveBuffers(tlsConn)
+	if err != nil {
+		log.Debug("kTLS: %v", err)
+		fallbackConns.Add(1)
+		return nil
+	}
+	pending, eof, err := settleReceiveBuffers(tlsConn, bufs)
+	if err != nil {
+		bufs.restore(pending)
+		log.Debug("kTLS: cannot settle buffered TLS input: %v", err)
+		fallbackConns.Add(1)
+		return nil
+	}
+	// Settling may have consumed records (NewSessionTicket, data), which
+	// advances the read sequence number; take the state as it is now.
+	if state, err = extractTLSState(tlsConn); err != nil {
+		bufs.restore(pending)
+		log.Debug("kTLS: cannot extract state after settling input: %v", err)
+		fallbackConns.Add(1)
+		return nil
+	}
+
 	var enableErr error
 	err = rawConn.Control(func(fd uintptr) {
 		enableErr = enableKTLS(int(fd), state)
 	})
 
 	if err != nil || enableErr != nil {
+		bufs.restore(pending)
 		log.Debug("kTLS: enable failed: %v / %v", err, enableErr)
 		fallbackConns.Add(1)
 		return nil
@@ -436,6 +476,12 @@ func Enable(tlsConn *tls.Conn) *Conn {
 	ktlsConn := &Conn{
 		tcpConn: tcpConn,
 		tlsConn: tlsConn,
+		pending: pending,
+	}
+	if eof {
+		// The peer's close_notify was consumed while settling; end the
+		// stream after pending instead of waiting on the socket.
+		ktlsConn.rx.err = io.EOF
 	}
 
 	return ktlsConn

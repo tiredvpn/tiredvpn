@@ -18,6 +18,18 @@ var firstEnableLog sync.Once
 type Conn struct {
 	tcpConn *net.TCPConn
 	tlsConn *tls.Conn
+
+	// rxMu serialises readers: pending and rx are receive-side state that
+	// concurrent Read calls would otherwise corrupt. Writers never take it.
+	rxMu sync.Mutex
+
+	// pending is application data crypto/tls decrypted before the handover
+	// (see Enable); Read returns it before touching the socket.
+	pending []byte
+
+	// Receive state for records the kernel hands up with a non-data content
+	// type (see readSocket).
+	rx recvState
 }
 
 // NewConn creates a new kTLS connection wrapper.
@@ -39,16 +51,20 @@ func NewConn(tlsConn *tls.Conn) (*Conn, error) {
 // Read reads data from the connection.
 // kTLS kernel will decrypt data automatically.
 // We use the TCP connection directly - kernel handles decryption.
+//
+// Read is safe to call from several goroutines; calls are serialised.
 func (c *Conn) Read(b []byte) (n int, err error) {
-	n, err = c.tcpConn.Read(b)
-	if err != nil {
-		return n, err
+	c.rxMu.Lock()
+	defer c.rxMu.Unlock()
+	if len(c.pending) > 0 {
+		n = copy(b, c.pending)
+		c.pending = c.pending[n:]
+		return n, nil
 	}
-	// Handle EOF properly
-	if n == 0 {
-		return 0, io.EOF
+	if len(b) == 0 {
+		return 0, nil
 	}
-	return n, nil
+	return c.readSocket(b)
 }
 
 // Write writes data to the connection.
@@ -73,21 +89,51 @@ func (c *Conn) Write(b []byte) (n int, err error) {
 // before dst.(ReaderFrom): a *Conn only as the copy source (e.g. relaying
 // into a plain upstream *net.TCPConn) needs WriteTo to reach the fast path;
 // a *Conn only as the destination needs ReadFrom.
+//
+// Data left over from the handover (pending) is written out first. Splicing
+// goes straight to the socket, so a non-data TLS record arriving mid-splice
+// fails the copy instead of being handled as in Read.
 func (c *Conn) ReadFrom(r io.Reader) (int64, error) {
+	var head int64
 	if kc, ok := r.(*Conn); ok {
+		n, err := kc.flushPending(c.tcpConn)
+		head = n
+		if err != nil {
+			return head, err
+		}
 		r = kc.tcpConn
 	}
-	return c.tcpConn.ReadFrom(r)
+	n, err := c.tcpConn.ReadFrom(r)
+	return head + n, err
 }
 
 func (c *Conn) WriteTo(w io.Writer) (int64, error) {
+	head, err := c.flushPending(w)
+	if err != nil {
+		return head, err
+	}
 	if kc, ok := w.(*Conn); ok {
 		w = kc.tcpConn
 	}
+	var n int64
 	if rf, ok := w.(io.ReaderFrom); ok {
-		return rf.ReadFrom(c.tcpConn)
+		n, err = rf.ReadFrom(c.tcpConn)
+	} else {
+		n, err = io.Copy(w, c.tcpConn)
 	}
-	return io.Copy(w, c.tcpConn)
+	return head + n, err
+}
+
+// flushPending writes out data left over from the handover, if any.
+func (c *Conn) flushPending(w io.Writer) (int64, error) {
+	c.rxMu.Lock()
+	defer c.rxMu.Unlock()
+	if len(c.pending) == 0 {
+		return 0, nil
+	}
+	n, err := w.Write(c.pending)
+	c.pending = c.pending[n:]
+	return int64(n), err
 }
 
 // Close closes the underlying TCP connection.
@@ -130,9 +176,8 @@ func (c *Conn) ConnectionState() tls.ConnectionState {
 // data phase. It is safe to call with any net.Conn:
 //
 //   - if conn is already a *ktls.Conn, it is returned unchanged.
-//   - if conn is a *tls.Conn whose TLS records have been fully drained from
-//     the TLS-stack buffer (i.e. the next read will hit raw socket), Enable is
-//     called and the *Conn wrapper is returned.
+//   - if conn is a *tls.Conn, Enable is called and, if it succeeds, the *Conn
+//     wrapper is returned.
 //   - otherwise the original conn is returned unchanged. This covers both
 //     non-TLS conns and *tls.Conn values for which Enable returns nil (kernel
 //     TLS unsupported or cipher not offloadable); in the latter case the
@@ -140,9 +185,9 @@ func (c *Conn) ConnectionState() tls.ConnectionState {
 //
 // label identifies the call site for log output ("tired-raw", "tired-confusion", ...).
 //
-// Callers must invoke this AFTER all protocol-level auth/header bytes have been
-// read or written through the *tls.Conn — otherwise residual decrypted bytes
-// in the TLS stack's buffer are lost when the kernel takes over the socket.
+// Input crypto/tls has read ahead of the caller - a session ticket, part of
+// the next record, decrypted bytes not yet returned - is carried over by
+// Enable, so nothing is lost whenever this is called.
 func TryEnable(conn net.Conn, label string) net.Conn {
 	if _, ok := conn.(*Conn); ok {
 		return conn
