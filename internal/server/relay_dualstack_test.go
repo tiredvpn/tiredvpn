@@ -35,12 +35,22 @@ type fakeTUNExit struct {
 	ln      net.Listener
 	secret  []byte
 	respond func(handshake []byte) []byte
+	// after, when set, is sent as a separate stego payload 50 ms after the
+	// response: the exit's first tunnel frame.
+	after []byte
 }
 
 // startFakeTUNExit launches the fake exit in the background. respond receives
 // the client's TUN handshake payload ([localIP:4][mtu:2][version:1] plus any
 // TRO1 origin trailer) and returns the response payload to send back.
 func startFakeTUNExit(t *testing.T, secret []byte, respond func(handshake []byte) []byte) *fakeTUNExit {
+	t.Helper()
+	return startFakeTUNExitThen(t, secret, respond, nil)
+}
+
+// startFakeTUNExitThen is startFakeTUNExit with a first tunnel frame sent 50 ms
+// after the response (nil: none).
+func startFakeTUNExitThen(t *testing.T, secret []byte, respond func(handshake []byte) []byte, after []byte) *fakeTUNExit {
 	t.Helper()
 
 	cert := selfSignedCertForTest(t)
@@ -52,7 +62,7 @@ func startFakeTUNExit(t *testing.T, secret []byte, respond func(handshake []byte
 	if err != nil {
 		t.Fatalf("fake exit listen: %v", err)
 	}
-	f := &fakeTUNExit{ln: ln, secret: secret, respond: respond}
+	f := &fakeTUNExit{ln: ln, secret: secret, respond: respond, after: after}
 	t.Cleanup(func() { ln.Close() })
 
 	go func() {
@@ -125,6 +135,10 @@ func (f *fakeTUNExit) serve(conn net.Conn) {
 			}
 			resp := f.respond(payload[1:])
 			sendStegoResponse(framer, fr.StreamID, resp, f.secret)
+			if f.after != nil {
+				time.Sleep(50 * time.Millisecond)
+				sendStegoResponse(framer, fr.StreamID, f.after, f.secret)
+			}
 		}
 	}
 }
@@ -132,6 +146,11 @@ func (f *fakeTUNExit) serve(conn net.Conn) {
 // dialTUNHandshake builds a v0x04 client handshake payload.
 func dialTUNHandshake() []byte {
 	return []byte{0, 0, 0, 0, 0x05, 0xdc, 0x04}
+}
+
+// v3TUNHandshake builds a v0x03 client handshake payload.
+func v3TUNHandshake() []byte {
+	return []byte{0, 0, 0, 0, 0x05, 0xdc, 0x03}
 }
 
 // TestDialTUNReadsFullHandshakeResponse drives DialTUN against a fake exit
@@ -142,16 +161,18 @@ func TestDialTUNReadsFullHandshakeResponse(t *testing.T) {
 	dual := &dualStackAddrs{ServerIP6: exitServerIP6, ClientIP6: exitClientIP6}
 
 	tests := []struct {
-		name     string
-		respond  func(handshake []byte) []byte
-		wantDual bool
+		name      string
+		handshake []byte // nil: dialTUNHandshake (v0x04)
+		respond   func(handshake []byte) []byte
+		wantDual  bool
 	}{
 		{
-			name: "legacy 9-byte exit response",
+			name: "bare 9-byte exit response to a v3 client",
+			// The exit's h2 path answers a v0x03 client without a flags byte;
+			// the relay reads with the version it forwarded.
+			handshake: v3TUNHandshake(),
 			respond: func([]byte) []byte {
-				// A pre-dual-stack exit answers any client version with the
-				// legacy layout.
-				return buildTUNHandshakeResponse(0x00, exitServerIP, exitClientIP, tunHandshakeCaps{}, nil)
+				return buildTUNHandshakeResponse(0x03, exitServerIP, exitClientIP, tunHandshakeCaps{}, nil)
 			},
 		},
 		{
@@ -177,7 +198,11 @@ func TestDialTUNReadsFullHandshakeResponse(t *testing.T) {
 			dialer := NewUpstreamDialer(exit.ln.Addr().String(), secret)
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			conn, resp, err := dialer.DialTUN(ctx, dialTUNHandshake(), "test-origin")
+			hs := tt.handshake
+			if hs == nil {
+				hs = dialTUNHandshake()
+			}
+			conn, resp, err := dialer.DialTUN(ctx, hs, "test-origin")
 			if err != nil {
 				t.Fatalf("DialTUN: %v", err)
 			}
@@ -233,9 +258,9 @@ func TestDialRelayTUNCarriesDualStackAddrs(t *testing.T) {
 		}
 	})
 
-	t.Run("legacy exit degrades to v4-only", func(t *testing.T) {
+	t.Run("exit without a v6 pool degrades to v4-only", func(t *testing.T) {
 		exit := startFakeTUNExit(t, secret, func([]byte) []byte {
-			return buildTUNHandshakeResponse(0x00, exitServerIP, exitClientIP, tunHandshakeCaps{}, nil)
+			return buildTUNHandshakeResponse(0x04, exitServerIP, exitClientIP, tunHandshakeCaps{}, nil)
 		})
 		srvCtx := newTestServerContext(t)
 		srvCtx.upstreamDialer = NewUpstreamDialer(exit.ln.Addr().String(), secret)
@@ -247,7 +272,7 @@ func TestDialRelayTUNCarriesDualStackAddrs(t *testing.T) {
 		defer sink.Close()
 
 		if d := sink.dualAddrs(); d != nil {
-			t.Errorf("legacy exit: sink.dualAddrs() = %+v, want nil", d)
+			t.Errorf("non-dual exit: sink.dualAddrs() = %+v, want nil", d)
 		}
 	})
 }
@@ -321,7 +346,7 @@ func TestRelayChainForwardsDualStack(t *testing.T) {
 	}
 
 	clientConn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	resp, err := tun.ReadTUNHandshakeResponse(stegoConn)
+	resp, _, err := tun.ReadTUNHandshakeResponse(stegoConn, dialTUNHandshake()[6])
 	if err != nil {
 		t.Fatalf("read handshake response: %v", err)
 	}
@@ -438,7 +463,7 @@ func TestRelayTUNToUpstreamRecordsDualStack(t *testing.T) {
 	}()
 
 	clientSide.SetReadDeadline(time.Now().Add(10 * time.Second))
-	resp, err := tun.ReadTUNHandshakeResponse(clientSide)
+	resp, _, err := tun.ReadTUNHandshakeResponse(clientSide, dialTUNHandshake()[6])
 	if err != nil {
 		t.Fatalf("read relayed handshake response: %v", err)
 	}

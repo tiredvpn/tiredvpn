@@ -107,8 +107,8 @@ func TestAddJitter(t *testing.T) {
 }
 
 // TestReadTUNHandshakeResponseRelayPath exercises the exported relay entry
-// point, which reads with clientVersion 0 ("unknown", forwarding a response
-// whose downstream client it cannot see). Every dual-stack shape must be read
+// point with the version of the client it relays for. Every dual-stack shape
+// (only ever sent to a v0x04 client) must be read
 // whole across arbitrary segmentation and its v6 block must decode - a byte
 // left in the stream would be forwarded to the client mid-frame and desync it.
 func TestReadTUNHandshakeResponseRelayPath(t *testing.T) {
@@ -126,7 +126,7 @@ func TestReadTUNHandshakeResponseRelayPath(t *testing.T) {
 				if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 					t.Fatalf("split %d: set deadline: %v", k, err)
 				}
-				resp, err := ReadTUNHandshakeResponse(conn)
+				resp, _, err := ReadTUNHandshakeResponse(conn, tunHandshakeVersionDualStack)
 				if err != nil {
 					t.Fatalf("split %d: ReadTUNHandshakeResponse: %v", k, err)
 				}
@@ -146,16 +146,16 @@ func TestReadTUNHandshakeResponseRelayPath(t *testing.T) {
 }
 
 // TestReadTUNHandshakeResponseLegacy9Byte confirms the relay path returns the
-// bare 9-byte form intact when the exit predates the flags byte: the exit sends
-// nothing past byte 9, so the read must bound the peek and return exactly those
-// nine bytes rather than hang.
+// bare 9-byte form intact for a v0x03 client, which an exit's h2 path answers
+// without a flags byte: the exit sends nothing past byte 9, so the read must
+// bound the peek and return exactly those nine bytes rather than hang.
 func TestReadTUNHandshakeResponseLegacy9Byte(t *testing.T) {
 	payload := append([]byte{}, handshakeBase...)
 	conn := chunkedConn(t, payload)
 	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		t.Fatalf("set deadline: %v", err)
 	}
-	resp, err := ReadTUNHandshakeResponse(conn)
+	resp, _, err := ReadTUNHandshakeResponse(conn, tunHandshakeVersion)
 	if err != nil {
 		t.Fatalf("ReadTUNHandshakeResponse: %v", err)
 	}

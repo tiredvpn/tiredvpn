@@ -604,36 +604,7 @@ func runControlSocketMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Si
 		// Resets circuit breakers and uses optimized fast reconnect
 		// Must send TUN handshake with current IP so server knows this is a TUN session
 		ReconnectFn: func(ctx context.Context, currentIP net.IP, mtu int) (tun.ReconnectResult, error) {
-			log.Info("Network change reconnect triggered (current IP: %s)", currentIP)
-
-			// Reset all circuit breakers and confidences - old network state is invalid
-			mgr.ResetForNetworkChange()
-
-			// Use optimized reconnect with shorter timeouts
-			conn, strat, err := mgr.ConnectForReconnect(ctx, cfg.ServerAddr)
-			if err != nil {
-				return tun.ReconnectResult{}, err
-			}
-
-			log.Info("Network change reconnect successful via %s, sending TUN handshake", strat.Name())
-
-			// Send TUN mode handshake with our current IP
-			// Server will recognize us and restore the session
-			serverIP, assignedIP, serverIP6, assignedIP6, err := sendReconnectHandshake(conn, currentIP, mtu, dualStack)
-			if err != nil {
-				conn.Close()
-				return tun.ReconnectResult{}, err
-			}
-
-			log.Info("Reconnect handshake complete (server: %s, assigned: %s)", serverIP, assignedIP)
-
-			return tun.ReconnectResult{
-				Conn:        conn,
-				ServerIP:    serverIP,
-				AssignedIP:  assignedIP,
-				ServerIP6:   serverIP6,
-				AssignedIP6: assignedIP6,
-			}, nil
+			return reconnectTUN(ctx, mgr, cfg.ServerAddr, currentIP, mtu, dualStack)
 		},
 
 		// Connect function - connects to server, returns assigned IP
@@ -708,17 +679,58 @@ func parseTunIPv6Policy(flagValue string) (bool, error) {
 	return policy == tun.IPv6PolicyDual, nil
 }
 
+// reconnectTUN is the control server's ReconnectFn: it redials through the
+// strategy manager after a network change and re-runs the TUN handshake with
+// the client's current IP so the exit restores the session. The conn it hands
+// back is the one the handshake reader returned, which the relay must read
+// from (it may carry the first byte of the first frame).
+func reconnectTUN(ctx context.Context, mgr *strategy.Manager, serverAddr string, currentIP net.IP, mtu int, dualStack bool) (tun.ReconnectResult, error) {
+	log.Info("Network change reconnect triggered (current IP: %s)", currentIP)
+
+	// Reset all circuit breakers and confidences - old network state is invalid
+	mgr.ResetForNetworkChange()
+
+	// Use optimized reconnect with shorter timeouts
+	conn, strat, err := mgr.ConnectForReconnect(ctx, serverAddr)
+	if err != nil {
+		return tun.ReconnectResult{}, err
+	}
+
+	log.Info("Network change reconnect successful via %s, sending TUN handshake", strat.Name())
+
+	// Send TUN mode handshake with our current IP
+	// Server will recognize us and restore the session
+	tunnelConn, serverIP, assignedIP, serverIP6, assignedIP6, err := sendReconnectHandshake(conn, currentIP, mtu, dualStack)
+	if err != nil {
+		conn.Close()
+		return tun.ReconnectResult{}, err
+	}
+
+	log.Info("Reconnect handshake complete (server: %s, assigned: %s)", serverIP, assignedIP)
+
+	return tun.ReconnectResult{
+		Conn:        tunnelConn,
+		ServerIP:    serverIP,
+		AssignedIP:  assignedIP,
+		ServerIP6:   serverIP6,
+		AssignedIP6: assignedIP6,
+	}, nil
+}
+
 // sendReconnectHandshake performs the TUN mode handshake on a fresh reconnect
 // connection, sending the client's current IP so the server can restore the
 // session. dualStack selects the version byte: v0x04 when -tun-ipv6 dual is
 // active (re-negotiating IPv6 on reconnect too), otherwise the historical
 // v0x03.
 //
+// tunnelConn is the conn the relay must read from afterwards: the handshake
+// reader may hand the first byte of the first frame back through it.
+//
 // serverIP6/assignedIP6 carry the re-negotiated dual-stack pair and are both
 // nil when the exit did not offer IPv6 on this reconnect. The caller has to
 // propagate them: the exit derives the client v6 from the v4 lease, so a new
 // v4 silently implies a new v6, and a host-owned interface cannot recompute it.
-func sendReconnectHandshake(conn net.Conn, currentIP net.IP, mtu int, dualStack bool) (serverIP, assignedIP, serverIP6, assignedIP6 net.IP, err error) {
+func sendReconnectHandshake(conn net.Conn, currentIP net.IP, mtu int, dualStack bool) (tunnelConn net.Conn, serverIP, assignedIP, serverIP6, assignedIP6 net.IP, err error) {
 	version := byte(0x03) // Version 3: full port hopping config + auto-MTU probe
 	if dualStack {
 		version = 0x04 // Version 4: + dual-stack IPv6 negotiation
@@ -730,33 +742,26 @@ func sendReconnectHandshake(conn net.Conn, currentIP net.IP, mtu int, dualStack 
 	handshake[7] = version
 
 	if _, err := conn.Write(handshake); err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("handshake write failed: %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("handshake write failed: %w", err)
 	}
 
-	// Read response (up to 64 bytes for extended v2 with port hopping config)
-	// Minimum 9 bytes: [status:1][serverIP:4][clientIP:4]
-	// The dual-stack path uses ReadTUNHandshakeResponse, which additionally
-	// drains the trailing 32-byte [serverIP6:16][clientIP6:16] block so the
-	// stream stays frame-aligned for the relay that follows.
+	// Read the response for the version just sent: exactly the response
+	// (flags byte, port-hop layout, dual-stack block) and nothing past it, so
+	// the relay that follows starts frame-aligned. The returned conn is the
+	// one the relay must read from, since it may carry the first byte of the
+	// first frame.
 	var resp []byte
-	var n int
-	if dualStack {
-		resp, err = tun.ReadTUNHandshakeResponse(conn)
-		n = len(resp)
-	} else {
-		buf := make([]byte, 64)
-		n, err = io.ReadAtLeast(conn, buf, 9)
-		resp = buf[:n]
-	}
+	resp, tunnelConn, err = tun.ReadTUNHandshakeResponse(conn, version)
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("handshake read failed: %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("handshake read failed: %w", err)
 	}
+	n := len(resp)
 	if n < 9 {
-		return nil, nil, nil, nil, fmt.Errorf("handshake response too short: %d bytes", n)
+		return nil, nil, nil, nil, nil, fmt.Errorf("handshake response too short: %d bytes", n)
 	}
 
 	if resp[0] != 0x00 {
-		return nil, nil, nil, nil, fmt.Errorf("server rejected reconnect: status=%d", resp[0])
+		return nil, nil, nil, nil, nil, fmt.Errorf("server rejected reconnect: status=%d", resp[0])
 	}
 
 	serverIP = net.IP(resp[1:5])
@@ -771,7 +776,7 @@ func sendReconnectHandshake(conn net.Conn, currentIP net.IP, mtu int, dualStack 
 		}
 	}
 
-	return serverIP, assignedIP, serverIP6, assignedIP6, nil
+	return tunnelConn, serverIP, assignedIP, serverIP6, assignedIP6, nil
 }
 
 // newTUNVPNConfig maps the client config onto the TUN layer's VPNConfig.

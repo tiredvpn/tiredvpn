@@ -250,10 +250,9 @@ func (d *UpstreamDialer) DialTUN(ctx context.Context, tunHandshake []byte, origi
 		return nil, nil, err
 	}
 
-	// Read the handshake response. The upstream frames it as a single stego
-	// payload, so one Read returns the version-dependent base layout; when the
-	// flags byte advertises dual-stack, ReadTUNHandshakeResponse additionally
-	// consumes the trailing 32-byte [serverIP6:16][clientIP6:16] block. The
+	// Read the handshake response: the version-dependent base layout and, when
+	// the flags byte advertises dual-stack, the trailing 32-byte
+	// [serverIP6:16][clientIP6:16] block, and nothing past them. The
 	// full raw response (base + block) is returned so callers can forward it
 	// to the downstream client verbatim. An old exit never sets the dual-stack
 	// flag, so its response is read exactly as before (base only, no extra
@@ -281,7 +280,16 @@ func (d *UpstreamDialer) DialTUN(ctx context.Context, tunHandshake []byte, origi
 	// old exit the origin it needs for per-client lease keys. Only deployment
 	// order protects the chain: upgrade every exit and every relay BEFORE
 	// enabling `-tun-ipv6 dual` on clients.
-	resp, err := tun.ReadTUNHandshakeResponse(stegoConn)
+	//
+	// The exit answers the client's version, which travels in tunHandshake[6],
+	// so the relay reads with that version (issue #93: guessing the flags byte
+	// from timing took a frame byte for it). The conn the reader returns is
+	// the one to bridge, since it may carry the first byte of the first frame.
+	clientVersion := byte(0)
+	if len(tunHandshake) >= 7 {
+		clientVersion = tunHandshake[6]
+	}
+	resp, tunnelConn, err := tun.ReadTUNHandshakeResponse(stegoConn, clientVersion)
 	if err != nil {
 		tlsConn.Close()
 		return nil, nil, err
@@ -297,7 +305,7 @@ func (d *UpstreamDialer) DialTUN(ctx context.Context, tunHandshake []byte, origi
 	}
 
 	log.Debug("Upstream TUN tunnel established (assigned IP=%s)", net.IP(resp[5:9]))
-	return stegoConn, resp, nil
+	return tunnelConn, resp, nil
 }
 
 // DialTimeout is a convenience wrapper with explicit timeout

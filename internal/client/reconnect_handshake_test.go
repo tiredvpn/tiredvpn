@@ -50,7 +50,7 @@ func TestSendReconnectHandshake(t *testing.T) {
 		verCh := make(chan byte, 1)
 		go func() { verCh <- scriptServer(t, srv, baseResp) }()
 
-		serverIP, assignedIP, serverIP6, assignedIP6, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, false)
+		_, serverIP, assignedIP, serverIP6, assignedIP6, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, false)
 		if err != nil {
 			t.Fatalf("sendReconnectHandshake: %v", err)
 		}
@@ -73,7 +73,7 @@ func TestSendReconnectHandshake(t *testing.T) {
 		verCh := make(chan byte, 1)
 		go func() { verCh <- scriptServer(t, srv, flagsResp, dualBlock[:16], dualBlock[16:]) }()
 
-		serverIP, assignedIP, serverIP6, assignedIP6, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, true)
+		_, serverIP, assignedIP, serverIP6, assignedIP6, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, true)
 		if err != nil {
 			t.Fatalf("sendReconnectHandshake: %v", err)
 		}
@@ -100,15 +100,17 @@ func TestSendReconnectHandshake(t *testing.T) {
 		}
 	})
 
-	t.Run("dual on, old server responds plain v3 layout", func(t *testing.T) {
+	t.Run("dual on, exit without a v6 pool answers flags 0x00", func(t *testing.T) {
 		cli, srv := net.Pipe()
 		defer cli.Close()
 		defer srv.Close()
 
+		// Every exit since dual-stack exists sends a v0x04 client the flags
+		// byte, zero when it has no -ip-pool-v6.
 		verCh := make(chan byte, 1)
-		go func() { verCh <- scriptServer(t, srv, baseResp) }()
+		go func() { verCh <- scriptServer(t, srv, append(append([]byte{}, baseResp...), 0x00)) }()
 
-		_, assignedIP, serverIP6, assignedIP6, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, true)
+		_, _, assignedIP, serverIP6, assignedIP6, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, true)
 		if err != nil {
 			t.Fatalf("sendReconnectHandshake: %v", err)
 		}
@@ -130,7 +132,7 @@ func TestSendReconnectHandshake(t *testing.T) {
 
 		go func() { scriptServer(t, srv, []byte{0x01, 0, 0, 0, 0, 0, 0, 0, 0}) }()
 
-		if _, _, _, _, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, false); err == nil {
+		if _, _, _, _, _, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, false); err == nil {
 			t.Fatal("expected error on status=0x01, got nil")
 		}
 	})
@@ -158,7 +160,7 @@ func TestSendReconnectHandshake(t *testing.T) {
 			}
 		}()
 
-		_, assignedIP, serverIP6, assignedIP6, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, true)
+		_, _, assignedIP, serverIP6, assignedIP6, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, true)
 		if err != nil {
 			t.Fatalf("sendReconnectHandshake: %v", err)
 		}
@@ -210,7 +212,7 @@ func TestSendReconnectHandshakeRequestFrame(t *testing.T) {
 				srv.Write([]byte{0x00, 10, 8, 0, 1, 10, 8, 0, 2})
 			}()
 
-			if _, _, _, _, err := sendReconnectHandshake(cli, tc.ip, tc.mtu, false); err != nil {
+			if _, _, _, _, _, err := sendReconnectHandshake(cli, tc.ip, tc.mtu, false); err != nil {
 				t.Fatalf("sendReconnectHandshake: %v", err)
 			}
 			hs := <-frameCh
@@ -256,7 +258,7 @@ func TestSendReconnectHandshakeFailures(t *testing.T) {
 		cli, srv := net.Pipe()
 		cli.Close()
 		srv.Close()
-		if _, _, _, _, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, false); err == nil {
+		if _, _, _, _, _, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, false); err == nil {
 			t.Fatal("expected a write error on a closed connection")
 		}
 	})
@@ -265,7 +267,7 @@ func TestSendReconnectHandshakeFailures(t *testing.T) {
 		cli, srv := net.Pipe()
 		defer cli.Close()
 		serveThen(srv, nil)
-		if _, _, _, _, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, false); err == nil {
+		if _, _, _, _, _, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, false); err == nil {
 			t.Fatal("expected a read error when the peer hangs up")
 		}
 	})
@@ -274,7 +276,7 @@ func TestSendReconnectHandshakeFailures(t *testing.T) {
 		cli, srv := net.Pipe()
 		defer cli.Close()
 		serveThen(srv, func(c net.Conn) { c.Write([]byte{0x00, 10, 8, 0, 1}) })
-		if _, _, _, _, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, false); err == nil {
+		if _, _, _, _, _, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, false); err == nil {
 			t.Fatal("expected an error on a truncated response")
 		}
 	})
@@ -287,7 +289,7 @@ func TestSendReconnectHandshakeFailures(t *testing.T) {
 			c.Write([]byte{0x00, 10, 8, 0, 1, 10, 8, 0, 2, 0x04})
 			c.Write(make([]byte, 16))
 		})
-		if _, _, _, _, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, true); err == nil {
+		if _, _, _, _, _, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, true); err == nil {
 			t.Fatal("expected an error when the advertised v6 block is short")
 		}
 	})
@@ -296,7 +298,7 @@ func TestSendReconnectHandshakeFailures(t *testing.T) {
 		cli, srv := net.Pipe()
 		defer cli.Close()
 		serveThen(srv, func(c net.Conn) { c.Write([]byte{0x7f, 10, 8, 0, 1, 10, 8, 0, 2}) })
-		if _, _, _, _, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, false); err == nil {
+		if _, _, _, _, _, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, false); err == nil {
 			t.Fatal("expected an error on a non-zero status byte")
 		}
 	})
@@ -308,7 +310,7 @@ func TestSendReconnectHandshakeFailures(t *testing.T) {
 		// and report no v6 rather than trying to read a block that isn't there.
 		serveThen(srv, func(c net.Conn) { c.Write([]byte{0x00, 10, 8, 0, 1, 10, 8, 0, 2, 0x02}) })
 
-		_, assignedIP, serverIP6, assignedIP6, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, true)
+		_, _, assignedIP, serverIP6, assignedIP6, err := sendReconnectHandshake(cli, net.IPv4(10, 8, 0, 2), 1280, true)
 		if err != nil {
 			t.Fatalf("sendReconnectHandshake: %v", err)
 		}

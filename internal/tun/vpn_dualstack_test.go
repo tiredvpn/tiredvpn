@@ -45,16 +45,24 @@ func TestHandshakeVersionSelection(t *testing.T) {
 // happens. Chunks larger than the read buffer are truncated to it.
 type scriptedConn struct {
 	chunks  [][]byte
-	idx     int
+	idx     int // chunks fully consumed
+	off     int // bytes of chunks[idx] already consumed
 	written []byte
 }
 
+// Read behaves like a stream: a chunk larger than p is handed out over several
+// reads, never truncated, so a reader that asks for exact sizes sees what a
+// real conn would give it. Reading past the last chunk fails the read.
 func (c *scriptedConn) Read(p []byte) (int, error) {
 	if c.idx >= len(c.chunks) {
 		return 0, errors.New("unexpected extra read")
 	}
-	n := copy(p, c.chunks[c.idx])
-	c.idx++
+	n := copy(p, c.chunks[c.idx][c.off:])
+	c.off += n
+	if c.off == len(c.chunks[c.idx]) {
+		c.idx++
+		c.off = 0
+	}
 	return n, nil
 }
 
@@ -258,7 +266,7 @@ func TestDoHandshakeEndToEndDualStack(t *testing.T) {
 			conn := &scriptedConn{chunks: [][]byte{serverResp}}
 
 			v := &VPNClient{tun: &TUNDevice{mtu: 1280}, ipv6Policy: dualPolicy(dual)}
-			resp, n, err := v.doHandshake(conn, net.IPv4zero)
+			resp, n, _, err := v.doHandshake(conn, net.IPv4zero)
 			if err != nil {
 				t.Fatalf("doHandshake: %v", err)
 			}
@@ -303,13 +311,13 @@ func TestReadHandshakeResponseFragmented(t *testing.T) {
 	block, server6, client6 := dualBlock()
 	base := []byte{0x00, 10, 8, 0, 1, 10, 8, 0, 2}
 
-	t.Run("legacy 9-byte response, dual requested", func(t *testing.T) {
+	t.Run("bare 9-byte response to a v3 client", func(t *testing.T) {
 		// Nothing follows the 9 bytes: the read must complete on the grace
 		// rather than block until the connect deadline.
 		conn := dripConn(t, base)
 		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 		start := time.Now()
-		resp, n, err := readHandshakeResponse(conn, tunHandshakeVersionDualStack)
+		resp, n, _, err := readHandshakeResponse(conn, tunHandshakeVersion)
 		if err != nil {
 			t.Fatalf("readHandshakeResponse: %v", err)
 		}
@@ -328,7 +336,7 @@ func TestReadHandshakeResponseFragmented(t *testing.T) {
 		full := append(append(append([]byte{}, base...), tunFlagMTUProbe|tunFlagDualStack), block...)
 		conn := dripConn(t, full)
 		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		resp, n, err := readHandshakeResponse(conn, tunHandshakeVersionDualStack)
+		resp, n, _, err := readHandshakeResponse(conn, tunHandshakeVersionDualStack)
 		if err != nil {
 			t.Fatalf("readHandshakeResponse: %v", err)
 		}
@@ -352,7 +360,7 @@ func TestReadHandshakeResponseFragmented(t *testing.T) {
 			tunFlagPortHopping|tunFlagMTUProbe|tunFlagDualStack), mid...), block...)
 		conn := dripConn(t, full)
 		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		resp, n, err := readHandshakeResponse(conn, tunHandshakeVersionDualStack)
+		resp, n, _, err := readHandshakeResponse(conn, tunHandshakeVersionDualStack)
 		if err != nil {
 			t.Fatalf("readHandshakeResponse: %v", err)
 		}
@@ -377,7 +385,7 @@ func TestReadHandshakeResponseFragmented(t *testing.T) {
 	t.Run("prefix split below 9 bytes still completes", func(t *testing.T) {
 		conn := dripConn(t, base)
 		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		_, n, err := readHandshakeResponse(conn, tunHandshakeVersion)
+		_, n, _, err := readHandshakeResponse(conn, tunHandshakeVersion)
 		if err != nil {
 			t.Fatalf("readHandshakeResponse: %v", err)
 		}
@@ -389,19 +397,19 @@ func TestReadHandshakeResponseFragmented(t *testing.T) {
 	t.Run("truncated prefix is an error, not a short read", func(t *testing.T) {
 		conn := dripConn(t, base[:5])
 		conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
-		if _, n, err := readHandshakeResponse(conn, tunHandshakeVersion); err == nil {
+		if _, n, _, err := readHandshakeResponse(conn, tunHandshakeVersion); err == nil {
 			t.Errorf("expected an error for a 5-byte response, got n=%d", n)
 		}
 	})
 }
 
-// TestReadHandshakeResponseNoPeekWithoutDual pins the compatibility guarantee:
-// a v0x03 client cannot be sent the dual-stack flag, so its read path must not
-// grow an extra round trip. The scripted conn errors on any read past the
-// first one, which is what proves it.
+// TestReadHandshakeResponseNoPeekWithoutDual pins that a bare 9-byte answer
+// to a v0x03 client comes back as exactly those nine bytes when nothing
+// follows: the read past the response fails (the scripted conn errors on any
+// read past its script) and must be taken as "no flags byte", not as an error.
 func TestReadHandshakeResponseNoPeekWithoutDual(t *testing.T) {
 	conn := &scriptedConn{chunks: [][]byte{{0x00, 10, 8, 0, 1, 10, 8, 0, 2}}}
-	_, n, err := readHandshakeResponse(conn, tunHandshakeVersion)
+	_, n, _, err := readHandshakeResponse(conn, tunHandshakeVersion)
 	if err != nil {
 		t.Fatalf("readHandshakeResponse: %v", err)
 	}
@@ -414,9 +422,13 @@ func TestReadHandshakeResponseNoPeekWithoutDual(t *testing.T) {
 // doHandshake: still 8 bytes, only the version byte changes.
 func TestHandshakeRequestVersionByte(t *testing.T) {
 	for _, dual := range []bool{false, true} {
-		conn := &scriptedConn{chunks: [][]byte{{0x00, 10, 8, 0, 1, 10, 8, 0, 2}}}
+		resp := append([]byte{}, handshakeBase...)
+		if dual {
+			resp = append(resp, 0x00) // a v0x04 client always gets the flags byte
+		}
+		conn := &scriptedConn{chunks: [][]byte{resp}}
 		v := &VPNClient{tun: &TUNDevice{mtu: 1280}, ipv6Policy: dualPolicy(dual)}
-		if _, _, err := v.doHandshake(conn, net.IPv4(10, 8, 0, 2)); err != nil {
+		if _, _, _, err := v.doHandshake(conn, net.IPv4(10, 8, 0, 2)); err != nil {
 			t.Fatalf("doHandshake: %v", err)
 		}
 		want := byte(tunHandshakeVersion)
