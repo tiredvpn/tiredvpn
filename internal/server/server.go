@@ -472,6 +472,11 @@ type serverContext struct {
 	ipPool         *IPPool          // IP pool for TUN mode
 	sharedTUN      *SharedTUN       // Shared TUN device for all clients
 	knockReplay    knockReplayGuard // anti-probe knock replay window (zero value usable)
+
+	// donorDialer opens the TCP connection to a REALITY donor ("host:443").
+	// Nil means net.DialTimeout, which is what production uses; tests set it
+	// so the donor fallback can be exercised without reaching the internet.
+	donorDialer func(addr string) (net.Conn, error)
 }
 
 // knockReplayGuard remembers the per-connection knock nonces seen inside the

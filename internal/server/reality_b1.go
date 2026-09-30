@@ -367,7 +367,7 @@ func awaitDonor(donor <-chan donorHandoff, peekBuf []byte, srvCtx *serverContext
 		return nil, "", errNoDonor
 	}
 	realityDonorDialsLazy.Add(1)
-	c, err := net.DialTimeout("tcp", net.JoinHostPort(dest, "443"), 10*time.Second)
+	c, err := srvCtx.dialDonor(net.JoinHostPort(dest, "443"))
 	return c, dest, err
 }
 

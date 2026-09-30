@@ -1,9 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"crypto/ecdh"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -22,6 +24,68 @@ type b1Fixture struct {
 	serverPub [32]byte
 	secret    []byte
 	clientID  clientIdentity
+
+	// donor stands in for the donor site: srvCtx dials it instead of the
+	// internet, so the donor fallback runs the same on any host.
+	donor *standInDonor
+}
+
+// standInDonor is a loopback listener posing as a donor site. Every accepted
+// connection is read to EOF and closed; what it carried lands in received.
+type standInDonor struct {
+	received chan []byte // bytes of each connection, once it is done
+}
+
+// newStandInDonor starts the listener and returns it with a dialer for
+// serverContext.donorDialer that reaches it whatever address is asked for.
+func newStandInDonor(t *testing.T) (*standInDonor, func(string) (net.Conn, error)) {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	d := &standInDonor{received: make(chan []byte, 16)}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
+				b, _ := io.ReadAll(c)
+				d.received <- b
+			}()
+		}
+	}()
+
+	dial := func(string) (net.Conn, error) {
+		return net.DialTimeout("tcp", ln.Addr().String(), time.Second)
+	}
+	return d, dial
+}
+
+// awaitHello waits for a connection that carried want, skipping ones that
+// carried something else - the gate also dials eagerly and then drops the
+// connection when it turns out not to need it.
+func (d *standInDonor) awaitHello(t *testing.T, want []byte) {
+	t.Helper()
+
+	timeout := time.After(5 * time.Second)
+	for {
+		select {
+		case got := <-d.received:
+			if bytes.Equal(got, want) {
+				return
+			}
+		case <-timeout:
+			t.Fatal("the donor never received the ClientHello byte for byte")
+		}
+	}
 }
 
 // newB1Fixture loads a static server key and builds a gate holding one client.
@@ -57,12 +121,15 @@ func newB1Fixture(t *testing.T, extraClients int) b1Fixture {
 	gate := newREALITYB1Gate(cfg.REALITYMaxTimeDiff)
 	gate.index.Rebuild(clients, nil)
 
+	donor, dialDonor := newStandInDonor(t)
+
 	return b1Fixture{
 		gate:      gate,
-		srvCtx:    &serverContext{cfg: cfg},
+		srvCtx:    &serverContext{cfg: cfg, donorDialer: dialDonor},
 		serverPub: serverPub,
 		secret:    secret,
 		clientID:  registryIdentity("alice"),
+		donor:     donor,
 	}
 }
 
@@ -738,10 +805,52 @@ func TestB1GateDefersLegacyClients(t *testing.T) {
 	if !tryREALITYB1(&nopConn{}, record, f.srvCtx, logger) {
 		t.Fatal("with legacy off the gate must claim the connection, not leak it to plain TLS")
 	}
+	f.donor.awaitHello(t, record)
 }
 
-// nopConn is a net.Conn that reads EOF and discards writes, enough for the
-// donor fallback to run to completion without a network.
+// TestB1GateHandsBackWhenDonorUnreachable is what an offline host, or a server
+// whose donor is filtered, does with a stranger's ClientHello. There is no
+// donor to proxy to, so the gate must hand the connection back to the ordinary
+// TLS path (realityDonorFallback returns false) rather than close it: a bare
+// FIN in answer to a ClientHello is the silence that told our servers apart.
+// The failure is counted, since it is otherwise invisible.
+func TestB1GateHandsBackWhenDonorUnreachable(t *testing.T) {
+	f := newB1Fixture(t, 0)
+	f.srvCtx.cfg.REALITYLegacyEnabled = false
+
+	var dialed []string
+	f.srvCtx.donorDialer = func(addr string) (net.Conn, error) {
+		dialed = append(dialed, addr)
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+	}
+
+	eph, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hello := buildHelloWithKeyShare(t, eph.PublicKey().Bytes())
+	record := append([]byte{0x16, 0x03, 0x01, byte(len(hello) >> 8), byte(len(hello))}, hello...)
+
+	failsBefore := realityDonorDialFailTotal.Load()
+	conn := &spyConn{}
+	if tryREALITYB1(conn, record, f.srvCtx, log.WithPrefix("test")) {
+		t.Fatal("the gate claimed a connection it had no donor for; it must hand it back to the TLS path")
+	}
+
+	if len(dialed) != 1 || dialed[0] != "yandex.ru:443" {
+		t.Fatalf("donor dials = %q, want exactly one to the allowlisted SNI yandex.ru:443", dialed)
+	}
+	if got := realityDonorDialFailTotal.Load() - failsBefore; got != 1 {
+		t.Fatalf("reality_donor_dial_fail_total moved by %d, want 1", got)
+	}
+	if conn.closed || conn.written > 0 {
+		t.Fatalf("the gate touched a connection it handed back (closed=%v, wrote %d bytes)", conn.closed, conn.written)
+	}
+}
+
+// nopConn is a net.Conn that reads EOF and discards writes. It does not stand
+// in for the network: the donor fallback dials through srvCtx.donorDialer,
+// which newB1Fixture points at a loopback stand-in donor.
 type nopConn struct{}
 
 func (nopConn) Read([]byte) (int, error)         { return 0, io.EOF }
@@ -752,3 +861,13 @@ func (nopConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
 func (nopConn) SetDeadline(time.Time) error      { return nil }
 func (nopConn) SetReadDeadline(time.Time) error  { return nil }
 func (nopConn) SetWriteDeadline(time.Time) error { return nil }
+
+// spyConn is a nopConn that remembers whether it was written to or closed.
+type spyConn struct {
+	nopConn
+	written int
+	closed  bool
+}
+
+func (c *spyConn) Write(p []byte) (int, error) { c.written += len(p); return len(p), nil }
+func (c *spyConn) Close() error                { c.closed = true; return nil }

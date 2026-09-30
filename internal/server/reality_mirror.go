@@ -231,10 +231,18 @@ func dialDonorEagerly(peekBuf []byte, srvCtx *serverContext) <-chan donorHandoff
 
 	go func() {
 		realityDonorDialsEager.Add(1)
-		c, err := net.DialTimeout("tcp", net.JoinHostPort(dest, "443"), 10*time.Second)
+		c, err := srvCtx.dialDonor(net.JoinHostPort(dest, "443"))
 		out <- donorHandoff{conn: c, dest: dest, err: err}
 	}()
 	return out
+}
+
+// dialDonor opens a connection to a donor site at addr (host:port).
+func (s *serverContext) dialDonor(addr string) (net.Conn, error) {
+	if s.donorDialer != nil {
+		return s.donorDialer(addr)
+	}
+	return net.DialTimeout("tcp", addr, 10*time.Second)
 }
 
 // errNoDonor means the destination policy allows no donor for this connection:

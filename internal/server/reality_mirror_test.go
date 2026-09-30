@@ -358,10 +358,12 @@ func TestDonorDialCountersSplit(t *testing.T) {
 	eagerBefore := realityDonorDialsEager.Load()
 	lazyBefore := realityDonorDialsLazy.Load()
 
-	// A destination that resolves nowhere: the dial fails, but it happened, and
-	// that is what the counter is for.
+	// A dial that fails: it still happened, and that is what the counter is
+	// for. The dialer is stubbed so the test never reaches the donor itself.
 	hello := buildRecordWithSNI(t, "yandex.ru")
-	srvCtx := &serverContext{cfg: &Config{}}
+	srvCtx := &serverContext{cfg: &Config{}, donorDialer: func(string) (net.Conn, error) {
+		return nil, errors.New("connection refused")
+	}}
 	<-dialDonorEagerly(hello, srvCtx)
 
 	if realityDonorDialsEager.Load() != eagerBefore+1 {
