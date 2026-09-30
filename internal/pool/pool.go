@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/log"
+	"github.com/tiredvpn/tiredvpn/internal/protocol"
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
 )
 
@@ -125,10 +126,13 @@ func (p *TunnelPool) Get(ctx context.Context) (*PooledConn, error) {
 // On success the returned PooledConn has its deadlines cleared; the caller owns
 // it and must Close it when the relay finishes.
 func (p *TunnelPool) DialTarget(ctx context.Context, targetAddr string) (*PooledConn, error) {
-	addrBytes := []byte(targetAddr)
-	if len(addrBytes) > 65535 {
-		return nil, fmt.Errorf("pool: target address too long (%d bytes)", len(addrBytes))
+	// Refuse before opening a tunnel: the first byte of the length prefix is
+	// the server's mode byte, and a target of 512+ bytes would turn it into the
+	// TUN-mode marker (#94). See protocol.ValidateTarget.
+	if err := protocol.ValidateTarget(targetAddr); err != nil {
+		return nil, fmt.Errorf("pool: %w", err)
 	}
+	addrBytes := []byte(targetAddr)
 	addrPacket := make([]byte, 2+len(addrBytes))
 	binary.BigEndian.PutUint16(addrPacket[:2], uint16(len(addrBytes)))
 	copy(addrPacket[2:], addrBytes)
