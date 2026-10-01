@@ -87,7 +87,7 @@ func (s *ShaperConfig) validate() error {
 		return nil
 	}
 	if s.RandomizationRange < 0 || s.RandomizationRange >= 1 {
-		return fmt.Errorf("shaper.randomization_range must be in [0, 1), got %v", s.RandomizationRange)
+		return fmt.Errorf("shaper.randomization_range must be in [0, 1)")
 	}
 	hasPreset := s.Preset != ""
 	hasCustom := s.Custom != nil
@@ -146,7 +146,7 @@ func (d *DistConfig) validate() error {
 	case "":
 		return fmt.Errorf("missing type")
 	default:
-		return fmt.Errorf("unknown distribution type %q", d.Type)
+		return fmt.Errorf("unknown distribution type (want histogram, lognormal, pareto or markov)")
 	}
 }
 
@@ -171,17 +171,17 @@ func (h *HistogramDist) validate() error {
 
 func (l *LogNormalDist) validate() error {
 	if l.Sigma < 0 {
-		return fmt.Errorf("lognormal.sigma must be non-negative, got %v", l.Sigma)
+		return fmt.Errorf("lognormal.sigma must be non-negative")
 	}
 	return nil
 }
 
 func (p *ParetoDist) validate() error {
 	if p.Xm <= 0 {
-		return fmt.Errorf("pareto.xm must be > 0, got %v", p.Xm)
+		return fmt.Errorf("pareto.xm must be > 0")
 	}
 	if p.Alpha <= 0 {
-		return fmt.Errorf("pareto.alpha must be > 0, got %v", p.Alpha)
+		return fmt.Errorf("pareto.alpha must be > 0")
 	}
 	return nil
 }
@@ -206,7 +206,7 @@ func (m *MarkovDist) validate() error {
 			sum += p
 		}
 		if math.Abs(sum-1.0) > 0.001 {
-			return fmt.Errorf("markov.transitions[%d] sums to %v, want 1±0.001", i, sum)
+			return fmt.Errorf("markov.transitions[%d] must sum to 1 (±0.001)", i)
 		}
 	}
 	return nil

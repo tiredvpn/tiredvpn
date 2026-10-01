@@ -26,7 +26,6 @@
 package toml
 
 import (
-	"errors"
 	"fmt"
 	"os"
 
@@ -67,15 +66,9 @@ func decodeStrict(path string, v any) error {
 	dec := gotoml.NewDecoder(f)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
-		var serr *gotoml.StrictMissingError
-		if errors.As(err, &serr) {
-			return fmt.Errorf("%s: %s", path, serr.String())
-		}
-		var derr *gotoml.DecodeError
-		if errors.As(err, &derr) {
-			return fmt.Errorf("%s: %s", path, derr.String())
-		}
-		return fmt.Errorf("%s: %w", path, err)
+		// Not err itself, nor its String(): those quote the lines around the
+		// error, values included (decode_error.go).
+		return decodeFileError(path, err)
 	}
 	return nil
 }

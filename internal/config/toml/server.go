@@ -39,7 +39,7 @@ func (c *ServerConfig) Validate() error {
 		return fmt.Errorf("listen.address is required")
 	}
 	if c.Listen.Port <= 0 || c.Listen.Port > 65535 {
-		return fmt.Errorf("listen.port must be in 1..65535, got %d", c.Listen.Port)
+		return fmt.Errorf("listen.port must be in 1..65535")
 	}
 	if c.Strategy.Mode == "" {
 		return fmt.Errorf("strategy.mode is required")
