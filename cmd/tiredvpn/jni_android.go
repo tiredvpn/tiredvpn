@@ -253,7 +253,8 @@ func Java_com_tiredvpn_android_native_TiredVpnNative_startClient(
 		C.jni_array_release_element(env, argv, C.jsize(i), cStr)
 	}
 
-	logMessage(fmt.Sprintf("Starting client with %d args: %s", len(args), strings.Join(args, " ")))
+	// -secret is redacted in this line (argv_redact.go).
+	logMessage(jniStartLogLine(args))
 
 	if len(args) == 0 {
 		logMessage("ERROR: No arguments provided")

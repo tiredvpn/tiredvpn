@@ -15,7 +15,11 @@ import (
 // everywhere; jni_android.go keeps only the glue.
 
 // parseClientArgs parses command line args into client.Config
-func parseClientArgs(args []string) (*client.Config, error) {
+func parseClientArgs(args []string) (_ *client.Config, err error) {
+	// Errors go to the app's log and its error state as is; hide any -secret
+	// value that came back inside one (argv_redact.go).
+	defer func() { err = redactArgError(err, args) }()
+
 	cfg := &client.Config{
 		AndroidMode: true,
 		// TUN is opt-in via -tun. The app's TUN path always passes -tun; proxy mode
@@ -55,6 +59,11 @@ func parseClientArgs(args []string) (*client.Config, error) {
 		shaperSeed    int64
 		sawServerFlag bool
 	)
+
+	// Tokens echoed into a log come from this copy, never from args: an
+	// unknown "--secret" or "-secret=v" is echoed whole, and so is the value
+	// token after it.
+	logArgs := redactArgs(args)
 
 	// Parse flags from args (simple parser, doesn't use flag package)
 	for i := 0; i < len(args); i++ {
@@ -144,7 +153,7 @@ func parseClientArgs(args []string) (*client.Config, error) {
 				if v, err := strconv.Atoi(args[i+1]); err == nil {
 					cfg.QUICPort = v
 				} else {
-					log.Warn("parseClientArgs: invalid -quic-port value %q: %v", args[i+1], err)
+					log.Warn("parseClientArgs: invalid -quic-port value %q: %v", logArgs[i+1], strconvReason(err))
 				}
 				i++
 			}
@@ -175,7 +184,7 @@ func parseClientArgs(args []string) (*client.Config, error) {
 				if v, err := strconv.ParseInt(args[i+1], 10, 64); err == nil {
 					shaperSeed = v
 				} else {
-					log.Warn("parseClientArgs: invalid -shaper-seed value %q: %v", args[i+1], err)
+					log.Warn("parseClientArgs: invalid -shaper-seed value %q: %v", logArgs[i+1], strconvReason(err))
 				}
 				i++
 			}
@@ -219,7 +228,7 @@ func parseClientArgs(args []string) (*client.Config, error) {
 				if v, err := strconv.ParseBool(args[i+1]); err == nil {
 					cfg.PreferIPv6 = v
 				} else {
-					log.Warn("parseClientArgs: invalid -prefer-ipv6 value %q: %v", args[i+1], err)
+					log.Warn("parseClientArgs: invalid -prefer-ipv6 value %q: %v", logArgs[i+1], strconvReason(err))
 				}
 				i++
 			}
@@ -228,7 +237,7 @@ func parseClientArgs(args []string) (*client.Config, error) {
 				if v, err := strconv.ParseBool(args[i+1]); err == nil {
 					cfg.FallbackToV4 = v
 				} else {
-					log.Warn("parseClientArgs: invalid -fallback-v4 value %q: %v", args[i+1], err)
+					log.Warn("parseClientArgs: invalid -fallback-v4 value %q: %v", logArgs[i+1], strconvReason(err))
 				}
 				i++
 			}
@@ -236,7 +245,7 @@ func parseClientArgs(args []string) (*client.Config, error) {
 		default:
 			// No more silent drops: log every unrecognized token so flag
 			// contract drift between the app and the core is visible.
-			log.Warn("parseClientArgs: ignoring unknown flag %q", args[i])
+			log.Warn("parseClientArgs: ignoring unknown flag %q", logArgs[i])
 		}
 	}
 
