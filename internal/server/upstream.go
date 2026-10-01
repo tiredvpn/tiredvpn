@@ -289,7 +289,14 @@ func (d *UpstreamDialer) DialTUN(ctx context.Context, tunHandshake []byte, origi
 	if len(tunHandshake) >= 7 {
 		clientVersion = tunHandshake[6]
 	}
-	resp, tunnelConn, err := tun.ReadTUNHandshakeResponse(stegoConn, clientVersion)
+	//
+	// The read is bounded by ctx (connectStego cleared the conn's deadlines,
+	// and ctx alone does not interrupt a blocked Read), and the reader clears
+	// the deadline again before returning: the bridge and pump that take this
+	// conn read without deadlines, so one left behind would cut the tunnel
+	// when it passed, whatever the traffic (issue #93, v3 relay drop).
+	deadline, _ := ctx.Deadline()
+	resp, tunnelConn, err := tun.ReadTUNHandshakeResponse(stegoConn, clientVersion, deadline)
 	if err != nil {
 		tlsConn.Close()
 		return nil, nil, err

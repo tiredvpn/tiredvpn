@@ -111,7 +111,7 @@ func TestRelayBridgeKeepsFirstFrame(t *testing.T) {
 	if err := clientSide.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		t.Fatalf("set deadline: %v", err)
 	}
-	resp, next, err := tun.ReadTUNHandshakeResponse(clientSide, 0x03)
+	resp, next, err := tun.ReadTUNHandshakeResponse(clientSide, 0x03, time.Time{})
 	if err != nil {
 		t.Fatalf("read relayed handshake response: %v", err)
 	}
@@ -119,4 +119,88 @@ func TestRelayBridgeKeepsFirstFrame(t *testing.T) {
 		t.Fatalf("relayed resp = %x, want %x", resp, want)
 	}
 	expectRelayFirstFrame(t, next)
+}
+
+// TestDialTUNConnCarriesNoDeadline is issue #93's v3 relay drop: the conn
+// DialTUN hands to the bridge and the pump, which read without deadlines of
+// their own, must not carry the handshake's read deadline. The exit's first
+// frame comes after the dial context's deadline has passed and is read with
+// no deadline set, like the bridge reads it.
+func TestDialTUNConnCarriesNoDeadline(t *testing.T) {
+	secret := []byte("relay-dualstack-test-secret-32b!")
+	for _, tc := range []struct {
+		name      string
+		handshake []byte
+	}{
+		{"v3", v3TUNHandshake()},
+		{"v4", dialTUNHandshake()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exit := startFakeTUNExitThen(t, secret, exitAnswer, relayFirstFrame())
+			exit.afterDelay = 2 * time.Second
+
+			dialer := NewUpstreamDialer(exit.ln.Addr().String(), secret)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			conn, _, err := dialer.DialTUN(ctx, tc.handshake, "test-origin")
+			if err != nil {
+				t.Fatalf("DialTUN: %v", err)
+			}
+			defer conn.Close()
+
+			want := relayFirstFrame()
+			got := make([]byte, len(want))
+			done := make(chan error, 1)
+			go func() { _, err := io.ReadFull(conn, got); done <- err }()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("bridge-style read after the dial deadline: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("first frame never arrived")
+			}
+			if !bytes.Equal(got, want) {
+				t.Fatalf("first frame = %x, want %x", got, want)
+			}
+		})
+	}
+}
+
+// TestDialTUNSilentExitFails: an exit that sends part of an answer and goes
+// quiet fails the dial on its context instead of hanging it - a v0x04 answer
+// cut at the prefix, and the h2 path's one-byte refusal.
+func TestDialTUNSilentExitFails(t *testing.T) {
+	secret := []byte("relay-dualstack-test-secret-32b!")
+	for _, tc := range []struct {
+		name      string
+		handshake []byte
+		answer    []byte
+	}{
+		{"v4, bare prefix", dialTUNHandshake(), buildTUNHandshakeResponse(0x03, exitServerIP, exitClientIP, tunHandshakeCaps{}, nil)},
+		{"one-byte refusal", v3TUNHandshake(), []byte{0x01}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exit := startFakeTUNExit(t, secret, func([]byte) []byte { return tc.answer })
+			dialer := NewUpstreamDialer(exit.ln.Addr().String(), secret)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			done := make(chan error, 1)
+			go func() {
+				conn, _, err := dialer.DialTUN(ctx, tc.handshake, "test-origin")
+				if conn != nil {
+					conn.Close()
+				}
+				done <- err
+			}()
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("silent exit accepted")
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("DialTUN hung on a silent exit")
+			}
+		})
+	}
 }

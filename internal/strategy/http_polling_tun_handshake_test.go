@@ -38,7 +38,7 @@ func TestPollingFeederSparesHandshakeFlagsPeek(t *testing.T) {
 	done := make(chan result, 1)
 	go func() {
 		c.SetReadDeadline(time.Now().Add(10 * time.Second))
-		resp, next, err := tun.ReadTUNHandshakeResponse(c, 0x03)
+		resp, next, err := tun.ReadTUNHandshakeResponse(c, 0x03, time.Time{})
 		if err != nil {
 			done <- result{err: err}
 			return

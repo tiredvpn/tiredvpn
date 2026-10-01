@@ -126,7 +126,7 @@ func TestReadTUNHandshakeResponseRelayPath(t *testing.T) {
 				if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 					t.Fatalf("split %d: set deadline: %v", k, err)
 				}
-				resp, _, err := ReadTUNHandshakeResponse(conn, tunHandshakeVersionDualStack)
+				resp, _, err := ReadTUNHandshakeResponse(conn, tunHandshakeVersionDualStack, time.Time{})
 				if err != nil {
 					t.Fatalf("split %d: ReadTUNHandshakeResponse: %v", k, err)
 				}
@@ -155,7 +155,7 @@ func TestReadTUNHandshakeResponseLegacy9Byte(t *testing.T) {
 	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		t.Fatalf("set deadline: %v", err)
 	}
-	resp, _, err := ReadTUNHandshakeResponse(conn, tunHandshakeVersion)
+	resp, _, err := ReadTUNHandshakeResponse(conn, tunHandshakeVersion, time.Time{})
 	if err != nil {
 		t.Fatalf("ReadTUNHandshakeResponse: %v", err)
 	}

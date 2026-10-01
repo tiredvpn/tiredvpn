@@ -35,9 +35,10 @@ type fakeTUNExit struct {
 	ln      net.Listener
 	secret  []byte
 	respond func(handshake []byte) []byte
-	// after, when set, is sent as a separate stego payload 50 ms after the
-	// response: the exit's first tunnel frame.
-	after []byte
+	// after, when set, is sent as a separate stego payload afterDelay (default
+	// 50 ms) after the response: the exit's first tunnel frame.
+	after      []byte
+	afterDelay time.Duration
 }
 
 // startFakeTUNExit launches the fake exit in the background. respond receives
@@ -136,7 +137,11 @@ func (f *fakeTUNExit) serve(conn net.Conn) {
 			resp := f.respond(payload[1:])
 			sendStegoResponse(framer, fr.StreamID, resp, f.secret)
 			if f.after != nil {
-				time.Sleep(50 * time.Millisecond)
+				d := f.afterDelay
+				if d == 0 {
+					d = 50 * time.Millisecond
+				}
+				time.Sleep(d)
 				sendStegoResponse(framer, fr.StreamID, f.after, f.secret)
 			}
 		}
@@ -346,7 +351,7 @@ func TestRelayChainForwardsDualStack(t *testing.T) {
 	}
 
 	clientConn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	resp, _, err := tun.ReadTUNHandshakeResponse(stegoConn, dialTUNHandshake()[6])
+	resp, _, err := tun.ReadTUNHandshakeResponse(stegoConn, dialTUNHandshake()[6], time.Time{})
 	if err != nil {
 		t.Fatalf("read handshake response: %v", err)
 	}
@@ -463,7 +468,7 @@ func TestRelayTUNToUpstreamRecordsDualStack(t *testing.T) {
 	}()
 
 	clientSide.SetReadDeadline(time.Now().Add(10 * time.Second))
-	resp, _, err := tun.ReadTUNHandshakeResponse(clientSide, dialTUNHandshake()[6])
+	resp, _, err := tun.ReadTUNHandshakeResponse(clientSide, dialTUNHandshake()[6], time.Time{})
 	if err != nil {
 		t.Fatalf("read relayed handshake response: %v", err)
 	}

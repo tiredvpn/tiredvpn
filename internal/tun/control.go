@@ -1295,7 +1295,7 @@ func (cs *ControlServer) performTUNHandshake() (assignedIP, serverIP net.IP, err
 	// nothing past it, so the relay that follows starts frame-aligned; the conn
 	// it returns replaces cs.serverConn because it may carry the first byte of
 	// the first frame back to the relay.
-	resp, n, next, err := readHandshakeResponse(cs.serverConn, version)
+	resp, n, next, err := readHandshakeResponse(cs.serverConn, version, time.Now().Add(handshakeReadTimeout))
 	if err != nil {
 		return nil, nil, fmt.Errorf("handshake read failed: %w", err)
 	}

@@ -700,7 +700,10 @@ func reconnectTUN(ctx context.Context, mgr *strategy.Manager, serverAddr string,
 
 	// Send TUN mode handshake with our current IP
 	// Server will recognize us and restore the session
-	tunnelConn, serverIP, assignedIP, serverIP6, assignedIP6, err := sendReconnectHandshake(conn, currentIP, mtu, dualStack)
+	// The response read is bounded by the reconnect's own context when it has
+	// a deadline (zero lets the reader apply its default).
+	deadline, _ := ctx.Deadline()
+	tunnelConn, serverIP, assignedIP, serverIP6, assignedIP6, err := sendReconnectHandshake(conn, currentIP, mtu, dualStack, deadline)
 	if err != nil {
 		conn.Close()
 		return tun.ReconnectResult{}, err
@@ -724,13 +727,15 @@ func reconnectTUN(ctx context.Context, mgr *strategy.Manager, serverAddr string,
 // v0x03.
 //
 // tunnelConn is the conn the relay must read from afterwards: the handshake
-// reader may hand the first byte of the first frame back through it.
+// reader may hand the first byte of the first frame back through it. deadline
+// bounds the response read (zero: the reader's default) and is cleared again,
+// so tunnelConn carries no read deadline.
 //
 // serverIP6/assignedIP6 carry the re-negotiated dual-stack pair and are both
 // nil when the exit did not offer IPv6 on this reconnect. The caller has to
 // propagate them: the exit derives the client v6 from the v4 lease, so a new
 // v4 silently implies a new v6, and a host-owned interface cannot recompute it.
-func sendReconnectHandshake(conn net.Conn, currentIP net.IP, mtu int, dualStack bool) (tunnelConn net.Conn, serverIP, assignedIP, serverIP6, assignedIP6 net.IP, err error) {
+func sendReconnectHandshake(conn net.Conn, currentIP net.IP, mtu int, dualStack bool, deadline time.Time) (tunnelConn net.Conn, serverIP, assignedIP, serverIP6, assignedIP6 net.IP, err error) {
 	version := byte(0x03) // Version 3: full port hopping config + auto-MTU probe
 	if dualStack {
 		version = 0x04 // Version 4: + dual-stack IPv6 negotiation
@@ -751,7 +756,7 @@ func sendReconnectHandshake(conn net.Conn, currentIP net.IP, mtu int, dualStack 
 	// one the relay must read from, since it may carry the first byte of the
 	// first frame.
 	var resp []byte
-	resp, tunnelConn, err = tun.ReadTUNHandshakeResponse(conn, version)
+	resp, tunnelConn, err = tun.ReadTUNHandshakeResponse(conn, version, deadline)
 	if err != nil {
 		return nil, nil, nil, nil, nil, fmt.Errorf("handshake read failed: %w", err)
 	}

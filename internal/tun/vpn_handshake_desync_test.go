@@ -81,7 +81,7 @@ func TestHandshakeCoalescedWithFirstFrame(t *testing.T) {
 			if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 				t.Fatalf("set deadline: %v", err)
 			}
-			resp, n, next, err := readHandshakeResponse(conn, tc.version)
+			resp, n, next, err := readHandshakeResponse(conn, tc.version, time.Time{})
 			if err != nil {
 				t.Fatalf("readHandshakeResponse: %v", err)
 			}
@@ -111,7 +111,7 @@ func TestHandshakeFrameInsideFlagsWindow(t *testing.T) {
 			if err := cli.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 				t.Fatalf("set deadline: %v", err)
 			}
-			resp, n, next, err := readHandshakeResponse(cli, tc.version)
+			resp, n, next, err := readHandshakeResponse(cli, tc.version, time.Time{})
 			if err != nil {
 				t.Fatalf("readHandshakeResponse: %v", err)
 			}

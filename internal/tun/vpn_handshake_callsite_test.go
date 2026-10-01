@@ -33,6 +33,13 @@ func bareV3Response() []byte {
 	return append(resp, callsiteClientIP.To4()...)
 }
 
+// coalesced as a playExit gap sends the first frame in the same Write as the
+// response (issue #93 scenario 1); silent sends no frame at all.
+const (
+	coalesced time.Duration = -1
+	silent    time.Duration = -2
+)
+
 // playExit serves one TUN handshake on srv: it reads the 8-byte request,
 // answers with resp and, after gap, sends firstFrame.
 func playExit(t *testing.T, srv net.Conn, resp []byte, gap time.Duration) {
@@ -40,6 +47,14 @@ func playExit(t *testing.T, srv net.Conn, resp []byte, gap time.Duration) {
 	go func() {
 		req := make([]byte, 8)
 		if _, err := io.ReadFull(srv, req); err != nil {
+			return
+		}
+		switch gap {
+		case coalesced:
+			_, _ = srv.Write(append(append([]byte{}, resp...), firstFrame...))
+			return
+		case silent:
+			_, _ = srv.Write(resp)
 			return
 		}
 		if _, err := srv.Write(resp); err != nil {
@@ -55,6 +70,8 @@ func playExit(t *testing.T, srv net.Conn, resp []byte, gap time.Duration) {
 type pipeStrategy struct {
 	t    *testing.T
 	resp []byte
+	gap  time.Duration    // 0: 50 ms
+	last *recDeadlineConn // the conn of the latest Connect
 }
 
 func (s *pipeStrategy) Name() string                        { return "pipe" }
@@ -66,15 +83,51 @@ func (s *pipeStrategy) Description() string                 { return "in-memory 
 func (s *pipeStrategy) Connect(context.Context, string) (net.Conn, error) {
 	cli, srv := net.Pipe()
 	s.t.Cleanup(func() { cli.Close(); srv.Close() })
-	playExit(s.t, srv, s.resp, 50*time.Millisecond)
-	return cli, nil
+	gap := s.gap
+	if gap == 0 {
+		gap = 50 * time.Millisecond
+	}
+	playExit(s.t, srv, s.resp, gap)
+	s.last = &recDeadlineConn{Conn: cli}
+	return s.last, nil
 }
 
 func newPipeManager(t *testing.T) *strategy.Manager {
 	t.Helper()
-	m := strategy.NewManager()
-	m.Register(&pipeStrategy{t: t, resp: bareV3Response()})
+	m, _ := newPipeManagerWith(t, bareV3Response(), 0)
 	return m
+}
+
+func newPipeManagerWith(t *testing.T, resp []byte, gap time.Duration) (*strategy.Manager, *pipeStrategy) {
+	t.Helper()
+	m := strategy.NewManager()
+	ps := &pipeStrategy{t: t, resp: resp, gap: gap}
+	m.Register(ps)
+	return m, ps
+}
+
+// noDeadlineLeft fails the test when the last read deadline armed on the
+// dialled conn is not cleared.
+func noDeadlineLeft(t *testing.T, c *recDeadlineConn) {
+	t.Helper()
+	if c == nil {
+		t.Fatal("no conn was dialled")
+	}
+	last, n := c.lastDeadline()
+	if n == 0 {
+		t.Fatal("handshake armed no read deadline")
+	}
+	if !last.IsZero() {
+		t.Fatalf("handshake left a read deadline %v out on the tunnel conn", time.Until(last).Round(time.Millisecond))
+	}
+}
+
+// shortHandshakeTimeout shortens the default response budget for one test.
+func shortHandshakeTimeout(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := handshakeReadTimeout
+	handshakeReadTimeout = d
+	t.Cleanup(func() { handshakeReadTimeout = old })
 }
 
 // newCallsiteClient is a v0x03 VPNClient whose TUN already carries the
@@ -119,17 +172,93 @@ func TestSeamlessPortHopKeepsFirstFrame(t *testing.T) {
 }
 
 // TestControlHandshakeKeepsFirstFrame covers the control-socket (host-owned
-// TUN) handshake: cs.serverConn is what the relay goroutine reads afterwards.
+// TUN) handshake, the Android path, which sends v0x03 unless IPv6 in the
+// tunnel is turned on: cs.serverConn is what the relay goroutine reads
+// afterwards, with the frame following the bare answer or in the same Read.
 func TestControlHandshakeKeepsFirstFrame(t *testing.T) {
+	for name, gap := range map[string]time.Duration{"frame 50ms later": 50 * time.Millisecond, "coalesced": coalesced} {
+		t.Run(name, func(t *testing.T) {
+			cli, srv := net.Pipe()
+			t.Cleanup(func() { cli.Close(); srv.Close() })
+			playExit(t, srv, bareV3Response(), gap)
+
+			rec := &recDeadlineConn{Conn: cli}
+			cs := &ControlServer{serverConn: rec, mtu: 1280, config: &ControlConfig{}}
+			if _, _, err := cs.performTUNHandshake(); err != nil {
+				t.Fatalf("performTUNHandshake: %v", err)
+			}
+			noDeadlineLeft(t, rec)
+			readFrameAfterHandshake(t, cs.serverConn)
+		})
+	}
+}
+
+// TestControlHandshakeSilentPeerFails: a dual-stack control handshake whose
+// peer sends the prefix and goes quiet fails on the response budget instead
+// of hanging the control socket.
+func TestControlHandshakeSilentPeerFails(t *testing.T) {
+	shortHandshakeTimeout(t, 300*time.Millisecond)
 	cli, srv := net.Pipe()
 	t.Cleanup(func() { cli.Close(); srv.Close() })
-	playExit(t, srv, bareV3Response(), 50*time.Millisecond)
+	playExit(t, srv, bareV3Response(), silent)
 
-	cs := &ControlServer{serverConn: cli, mtu: 1280, config: &ControlConfig{}}
-	if _, _, err := cs.performTUNHandshake(); err != nil {
-		t.Fatalf("performTUNHandshake: %v", err)
+	cs := &ControlServer{serverConn: cli, mtu: 1280, config: &ControlConfig{DualStack: true}}
+	done := make(chan error, 1)
+	go func() { _, _, err := cs.performTUNHandshake(); done <- err }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("silent peer accepted")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("control handshake hung on a silent peer")
 	}
-	readFrameAfterHandshake(t, cs.serverConn)
+}
+
+// TestConnectLeavesNoDeadline and TestSeamlessPortHopLeavesNoDeadline: the
+// conn installed for the packet loop carries no read deadline from the
+// handshake.
+func TestConnectLeavesNoDeadline(t *testing.T) {
+	m, ps := newPipeManagerWith(t, bareV3Response(), coalesced)
+	v := newCallsiteClient(m)
+	if err := v.connect(t.Context()); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	noDeadlineLeft(t, ps.last)
+	readFrameAfterHandshake(t, v.conn)
+}
+
+func TestSeamlessPortHopLeavesNoDeadline(t *testing.T) {
+	m, ps := newPipeManagerWith(t, bareV3Response(), coalesced)
+	v := newCallsiteClient(m)
+	old, oldPeer := net.Pipe()
+	t.Cleanup(func() { old.Close(); oldPeer.Close() })
+	v.conn = old
+	v.seamlessPortHop(8443)
+	if v.conn == old {
+		t.Fatal("port hop did not swap the connection")
+	}
+	noDeadlineLeft(t, ps.last)
+	readFrameAfterHandshake(t, v.conn)
+}
+
+// TestConnectSilentPeerFails: a v0x04 connect whose exit sends the prefix and
+// goes quiet fails on the response budget.
+func TestConnectSilentPeerFails(t *testing.T) {
+	shortHandshakeTimeout(t, 300*time.Millisecond)
+	m, _ := newPipeManagerWith(t, bareV3Response(), silent)
+	v := newCallsiteClient(m)
+	v.ipv6Policy = IPv6PolicyDual
+	done := make(chan error, 1)
+	go func() { done <- v.connect(t.Context()) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("silent exit accepted")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("connect hung on a silent exit")
+	}
 }
 
 // TestV4FlagsByteReadRegardlessOfTiming pins that a v0x04 client takes the
@@ -153,7 +282,7 @@ func TestV4FlagsByteReadRegardlessOfTiming(t *testing.T) {
 	if err := cli.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		t.Fatalf("set deadline: %v", err)
 	}
-	resp, n, next, err := readHandshakeResponse(cli, tunHandshakeVersionDualStack)
+	resp, n, next, err := readHandshakeResponse(cli, tunHandshakeVersionDualStack, time.Time{})
 	if err != nil {
 		t.Fatalf("readHandshakeResponse: %v", err)
 	}
@@ -170,7 +299,7 @@ func TestV4FlagsByteReadRegardlessOfTiming(t *testing.T) {
 func TestRefusalIsNotPeekedPast(t *testing.T) {
 	for _, version := range []byte{tunHandshakeVersion, tunHandshakeVersionDualStack} {
 		conn := &scriptedConn{chunks: [][]byte{{0x01, 0, 0, 0, 0, 0, 0, 0, 0}}}
-		resp, n, _, err := readHandshakeResponse(conn, version)
+		resp, n, _, err := readHandshakeResponse(conn, version, time.Time{})
 		if err != nil {
 			t.Fatalf("version 0x%02x: %v", version, err)
 		}
