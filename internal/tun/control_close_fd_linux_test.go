@@ -149,7 +149,13 @@ type ctlHarness struct {
 	t   *testing.T
 	cs  *ControlServer
 	ctl *net.UnixConn
-	dec *json.Decoder
+
+	// One reader owns the control connection: responses go to respCh,
+	// asynchronous events are recorded. A json.Decoder cannot survive a read
+	// deadline, so nothing else may read the connection.
+	respCh   chan ControlResponse
+	eventsMu sync.Mutex
+	events   []EventMessage
 
 	exitBytes atomic.Int64 // bytes the relay framed toward the exit
 }
@@ -173,7 +179,8 @@ func newCtlHarness(t *testing.T) *ctlHarness {
 		t.Fatalf("dial control socket: %v", err)
 	}
 	h.ctl = conn
-	h.dec = json.NewDecoder(conn)
+	h.respCh = make(chan ControlResponse, 1)
+	go h.readControl()
 	t.Cleanup(func() {
 		conn.Close()
 		cancel()
@@ -212,31 +219,52 @@ func (h *ctlHarness) newExitConn() net.Conn {
 	return cli
 }
 
-// send writes one command, with fd attached when fd >= 0, and returns the
-// response, skipping asynchronous events.
-func (h *ctlHarness) send(cmd string, fd int) ControlResponse {
-	h.t.Helper()
-	var oob []byte
-	if fd >= 0 {
-		oob = unix.UnixRights(fd)
-	}
-	if _, _, err := h.ctl.WriteMsgUnix([]byte(cmd), oob, nil); err != nil {
-		h.t.Fatalf("send %s: %v", cmd, err)
-	}
-	_ = h.ctl.SetReadDeadline(time.Now().Add(10 * time.Second))
+// readControl splits the control connection into responses and events.
+func (h *ctlHarness) readControl() {
+	dec := json.NewDecoder(h.ctl)
 	for {
 		var raw map[string]any
-		if err := h.dec.Decode(&raw); err != nil {
-			h.t.Fatalf("read response to %s: %v", cmd, err)
-		}
-		if _, isEvent := raw["event"]; isEvent {
-			continue
+		if err := dec.Decode(&raw); err != nil {
+			close(h.respCh)
+			return
 		}
 		data, _ := json.Marshal(raw)
+		if _, isEvent := raw["event"]; isEvent {
+			var ev EventMessage
+			_ = json.Unmarshal(data, &ev)
+			h.eventsMu.Lock()
+			h.events = append(h.events, ev)
+			h.eventsMu.Unlock()
+			continue
+		}
 		var resp ControlResponse
 		_ = json.Unmarshal(data, &resp)
-		return resp
+		h.respCh <- resp
 	}
+}
+
+// eventCount reports how many events with this name the host has received.
+func (h *ctlHarness) eventCount(name string) int {
+	h.eventsMu.Lock()
+	defer h.eventsMu.Unlock()
+	n := 0
+	for _, ev := range h.events {
+		if ev.Event == name {
+			n++
+		}
+	}
+	return n
+}
+
+// send writes one command, with fd attached when fd >= 0, and returns the
+// response.
+func (h *ctlHarness) send(cmd string, fd int) ControlResponse {
+	h.t.Helper()
+	resp := <-h.sendAsync(cmd, fd)
+	if resp.Status == "send-failed" || resp.Status == "read-failed" {
+		h.t.Fatalf("%s: %s", cmd, resp.Error)
+	}
+	return resp
 }
 
 func (h *ctlHarness) coreFd() int {
@@ -324,21 +352,14 @@ func (h *ctlHarness) sendAsync(cmd string, fd int) <-chan ControlResponse {
 		return out
 	}
 	go func() {
-		_ = h.ctl.SetReadDeadline(time.Now().Add(10 * time.Second))
-		for {
-			var raw map[string]any
-			if err := h.dec.Decode(&raw); err != nil {
-				out <- ControlResponse{Status: "read-failed", Error: err.Error()}
-				return
+		select {
+		case resp, ok := <-h.respCh:
+			if !ok {
+				resp = ControlResponse{Status: "read-failed", Error: "control connection closed"}
 			}
-			if _, isEvent := raw["event"]; isEvent {
-				continue
-			}
-			data, _ := json.Marshal(raw)
-			var resp ControlResponse
-			_ = json.Unmarshal(data, &resp)
 			out <- resp
-			return
+		case <-time.After(10 * time.Second):
+			out <- ControlResponse{Status: "read-failed", Error: "no response in 10s"}
 		}
 	}()
 	return out
@@ -464,13 +485,8 @@ func TestControlFdSwapClosesOldFdOnce(t *testing.T) {
 				if newTun.peerSeesHangup(100 * time.Millisecond) {
 					t.Fatal("the swap closed the new TUN fd")
 				}
-				// At most one relay's worth of goroutines: the old relay is gone.
-				// Not "exactly one": on the hot-swap path the stopped relay
-				// closes the server connection it shares with the new one, so
-				// the new relay's server reader dies at once. That is a defect
-				// of its own, outside this test.
-				if !waitFor(3*time.Second, func() bool { return relayGoroutines() <= baseline+4 }) {
-					t.Errorf("the superseded relay outlived the swap: baseline %d, now %d", baseline, relayGoroutines())
+				if !waitFor(3*time.Second, func() bool { return relayGoroutines() == baseline+4 }) {
+					t.Errorf("want exactly one relay after the swap: baseline %d, now %d", baseline, relayGoroutines())
 				}
 
 				canary := plantCanary(t, oldNum)
@@ -489,10 +505,11 @@ func TestControlFdSwapClosesOldFdOnce(t *testing.T) {
 	}
 }
 
-// TestControlCloseDuringSwap: both swap paths drop cs.mu mid-way to let the
+// TestControlCloseDuringSwap: network_changed drops cs.mu mid-way to let the
 // old relay drain. A Close (or disconnect) landing in that gap used to be
 // followed by the swap starting a relay on the nil server connection it left
-// behind, and on a fd nothing would close any more.
+// behind, and on a fd nothing would close any more. (Hot-swap used to have
+// the same gap; it now swaps the TUN under the lock and has none.)
 func TestControlCloseDuringSwap(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -500,11 +517,6 @@ func TestControlCloseDuringSwap(t *testing.T) {
 		inSwap  func(cs *ControlServer) bool
 		reconns bool
 	}{
-		{
-			name:   "hot-swap",
-			cmd:    `{"command":"set_fd"}`,
-			inSwap: func(cs *ControlServer) bool { return cs.relayStopCh == nil && !cs.waitingForFd },
-		},
 		{
 			name:    "network_changed",
 			cmd:     `{"command":"network_changed","reason":"wifi_to_lte"}`,
@@ -670,15 +682,9 @@ func TestControlDisconnectReportsNoDeadConnection(t *testing.T) {
 	if !ft.peerSeesHangup(3 * time.Second) {
 		t.Error("disconnect did not release the TUN fd")
 	}
-	_ = h.ctl.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-	for {
-		var ev EventMessage
-		if err := h.dec.Decode(&ev); err != nil {
-			return // deadline: nothing more was sent
-		}
-		if ev.Event == "connection_dead" {
-			t.Fatalf("host told connection_dead after its own disconnect: %+v", ev)
-		}
+	time.Sleep(500 * time.Millisecond)
+	if n := h.eventCount("connection_dead"); n != 0 {
+		t.Fatalf("host told connection_dead %d times after its own disconnect", n)
 	}
 }
 

@@ -75,6 +75,7 @@ type ControlServer struct {
 	tunFd           int           // Current TUN fd (for reconnect)
 	tunDev          *TUNDevice    // Current TUN device (for reconnect)
 	relayStopCh     chan struct{} // Channel to stop current TUN relay
+	relay           *tunRelay     // Current relay, for swapping its TUN in place
 	relayGeneration int           // Incremented on each relay start/hot-swap; stale OnError callbacks are ignored
 	reconnecting    bool          // True when intentionally reconnecting (suppress dead event)
 
@@ -438,10 +439,11 @@ func (cs *ControlServer) handleSetFdWithReceivedFd(ctx context.Context, fd int) 
 		cs.relayGeneration++
 		myGen := cs.relayGeneration
 
-		go RunTUNRelayWithCallbacks(tunDev, cs.serverConn, cs.assignedIP, cs.serverIP, cs.relayStopCh, &RelayCallbacks{
+		cs.relay = startTUNRelay(tunDev, cs.serverConn, cs.assignedIP, cs.serverIP, cs.relayStopCh, &RelayCallbacks{
 			OnError: func(reason string) {
 				cs.mu.Lock()
 				current := cs.relayGeneration
+				auto := cs.autoReconnect
 				cs.mu.Unlock()
 				if current != myGen {
 					log.Info("TUN relay OnError ignored (stale gen=%d, current=%d): %s", myGen, current, reason)
@@ -449,7 +451,7 @@ func (cs *ControlServer) handleSetFdWithReceivedFd(ctx context.Context, fd int) 
 				}
 				log.Info("TUN relay died: %s", reason)
 				// Start auto-reconnect in background if enabled
-				if cs.autoReconnect {
+				if auto {
 					go cs.doAutoReconnect(reason)
 				} else {
 					cs.sendEvent("connection_dead", reason)
@@ -487,79 +489,30 @@ func (cs *ControlServer) hotSwapTunFdLocked(newFd int) ControlResponse {
 	if newFd < 0 {
 		return ControlResponse{Status: "error", Error: "invalid fd for hot-swap"}
 	}
-	gen := cs.sessionGen
 
-	// Stop current TUN relay
-	if cs.relayStopCh != nil {
-		close(cs.relayStopCh)
-		cs.relayStopCh = nil
-	}
-
-	// Force-unblock any pending serverConn.ReadFull so old Server→TUN goroutine exits quickly.
-	// Without this, it stays blocked up to readTimeout (30s), competing with new relay for reads.
-	if cs.serverConn != nil {
-		cs.serverConn.SetReadDeadline(time.Now())
-	}
-
-	// Release mutex briefly so relay goroutines can exit cleanly
-	cs.mu.Unlock()
-	time.Sleep(150 * time.Millisecond)
-	cs.mu.Lock()
-
-	// A disconnect or Close in the gap has already torn the session down
-	// (old device included). Starting a relay now would run it on a nil
-	// server connection and resurrect a VPN the host just stopped.
-	if cs.sessionGen != gen {
-		releaseReceivedFd(newFd)
-		return ControlResponse{Status: "error", Error: "session torn down during hot-swap"}
-	}
-
-	// Restore deadline so new relay can use serverConn normally
-	if cs.serverConn != nil {
-		cs.serverConn.SetReadDeadline(time.Time{})
-	}
-
-	// Close old TUN device
-	if cs.tunDev != nil {
-		cs.tunDev.Close()
-		cs.tunDev = nil
-	}
-	cs.tunFd = 0
-
+	// Only the TUN changes; the session - its server connection, the relay
+	// reading it, keepalives - stays as it is. This used to stop the relay
+	// and start another on the same connection: the stopped relay closed the
+	// connection on its way out, so the new one died at once and the host was
+	// told connection_dead, which on Android restarts the whole core.
 	newTunDev, err := cs.adoptTunFd(newFd)
 	if err != nil {
 		log.Error("hot-swap: failed to create TUN device: %v", err)
 		return ControlResponse{Status: "error", Error: fmt.Sprintf("hot-swap create TUN: %v", err)}
 	}
+	if cs.relay == nil || !cs.relay.SwapTUN(newTunDev) {
+		newTunDev.Close()
+		return ControlResponse{Status: "error", Error: "hot-swap: relay is not running"}
+	}
+	old := cs.tunDev
 	cs.tunDev = newTunDev
 	cs.tunFd = newFd
+	// Wakes the old device's reader, which SwapTUN has already told to stop.
+	if old != nil {
+		old.Close()
+	}
 
-	// Restart relay with the same server connection
-	cs.relayGeneration++
-	myGen := cs.relayGeneration
-	cs.relayStopCh = make(chan struct{})
-	go RunTUNRelayWithCallbacks(cs.tunDev, cs.serverConn, cs.assignedIP, cs.serverIP, cs.relayStopCh, &RelayCallbacks{
-		OnError: func(reason string) {
-			cs.mu.Lock()
-			current := cs.relayGeneration
-			cs.mu.Unlock()
-			if current != myGen {
-				log.Info("TUN relay OnError ignored (stale gen=%d, current=%d): %s", myGen, current, reason)
-				return
-			}
-			log.Info("TUN relay died after hot-swap: %s", reason)
-			if cs.autoReconnect {
-				go cs.doAutoReconnect(reason)
-			} else {
-				cs.sendEvent("connection_dead", reason)
-			}
-		},
-		OnKeepalive: func() {
-			cs.sendEvent("keepalive", "")
-		},
-	})
-
-	log.Info("hot-swap complete: TUN relay restarted on new fd=%d (local=%s, remote=%s)", newFd, cs.assignedIP, cs.serverIP)
+	log.Info("hot-swap complete: relay moved to new TUN fd=%d, session kept (local=%s, remote=%s)", newFd, cs.assignedIP, cs.serverIP)
 
 	resp := ControlResponse{
 		Status:    "connected",
@@ -661,6 +614,7 @@ func (cs *ControlServer) handleReconnect(ctx context.Context, reason string, new
 		log.Debug("Stopping current TUN relay...")
 		close(cs.relayStopCh)
 		cs.relayStopCh = nil
+		cs.relay = nil
 	}
 
 	// Wait a bit for network to stabilize after change
@@ -801,7 +755,7 @@ func (cs *ControlServer) handleReconnect(ctx context.Context, reason string, new
 	cs.relayStopCh = make(chan struct{})
 	cs.relayGeneration++
 	myRelayGen := cs.relayGeneration
-	go RunTUNRelayWithCallbacks(cs.tunDev, cs.serverConn, cs.assignedIP, cs.serverIP, cs.relayStopCh, &RelayCallbacks{
+	cs.relay = startTUNRelay(cs.tunDev, cs.serverConn, cs.assignedIP, cs.serverIP, cs.relayStopCh, &RelayCallbacks{
 		OnError: func(reason string) {
 			cs.mu.Lock()
 			current := cs.relayGeneration
@@ -1043,6 +997,7 @@ func (cs *ControlServer) releaseTunLocked() {
 	if cs.relayStopCh != nil {
 		close(cs.relayStopCh)
 		cs.relayStopCh = nil
+		cs.relay = nil
 	}
 	if cs.tunDev != nil {
 		cs.tunDev.Close()
@@ -1202,6 +1157,7 @@ func (cs *ControlServer) attemptReconnect(ctx context.Context) bool {
 	if cs.relayStopCh != nil {
 		close(cs.relayStopCh)
 		cs.relayStopCh = nil
+		cs.relay = nil
 	}
 
 	// Close existing server connection
@@ -1268,17 +1224,18 @@ func (cs *ControlServer) attemptReconnect(ctx context.Context) bool {
 	cs.relayStopCh = make(chan struct{})
 	cs.relayGeneration++
 	myAutoGen := cs.relayGeneration
-	go RunTUNRelayWithCallbacks(cs.tunDev, cs.serverConn, cs.assignedIP, cs.serverIP, cs.relayStopCh, &RelayCallbacks{
+	cs.relay = startTUNRelay(cs.tunDev, cs.serverConn, cs.assignedIP, cs.serverIP, cs.relayStopCh, &RelayCallbacks{
 		OnError: func(reason string) {
 			cs.mu.Lock()
 			current := cs.relayGeneration
+			auto := cs.autoReconnect
 			cs.mu.Unlock()
 			if current != myAutoGen {
 				log.Info("TUN relay OnError ignored (stale gen=%d, current=%d): %s", myAutoGen, current, reason)
 				return
 			}
 			log.Info("TUN relay died: %s", reason)
-			if cs.autoReconnect {
+			if auto {
 				go cs.doAutoReconnect(reason)
 			} else {
 				cs.sendEvent("connection_dead", reason)
