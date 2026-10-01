@@ -8,6 +8,9 @@ RUN apk add --no-cache git ca-certificates tzdata
 WORKDIR /app
 
 COPY go.mod go.sum* ./
+# go.mod replaces github.com/vishvananda/netlink with this in-tree copy, so it
+# has to be present before the module download step.
+COPY third_party/ ./third_party/
 RUN go mod download
 
 COPY . .
