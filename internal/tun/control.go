@@ -78,6 +78,16 @@ type ControlServer struct {
 	relayGeneration int           // Incremented on each relay start/hot-swap; stale OnError callbacks are ignored
 	reconnecting    bool          // True when intentionally reconnecting (suppress dead event)
 
+	// sessionGen is bumped by every teardown (disconnect, Close). Handlers
+	// that drop cs.mu mid-way (hot-swap, reconnect) compare it after taking
+	// the lock back, so a teardown that ran in the gap is not undone by a
+	// relay started on top of it.
+	sessionGen uint64
+	closed     bool // Close ran: no command may bring a session back
+
+	closeOnce sync.Once
+	closeErr  error
+
 	// Auto-reconnect state
 	autoReconnect     bool          // Enable automatic reconnect on connection loss
 	autoReconnectStop chan struct{} // Stop channel for auto-reconnect goroutine
@@ -192,9 +202,17 @@ func (cs *ControlServer) Run(ctx context.Context) error {
 			case <-ctx.Done():
 				return nil
 			default:
-				log.Debug("Accept error: %v", err)
-				continue
 			}
+			// Close shuts the listener; every Accept after that fails at
+			// once, and retrying would spin until ctx is cancelled.
+			cs.mu.Lock()
+			closed := cs.closed
+			cs.mu.Unlock()
+			if closed {
+				return nil
+			}
+			log.Debug("Accept error: %v", err)
+			continue
 		}
 
 		go cs.handleConnection(ctx, conn)
@@ -255,27 +273,35 @@ func (cs *ControlServer) handleConnection(ctx context.Context, conn net.Conn) {
 
 		var resp ControlResponse
 
+		// A received fd belongs to the core from recvmsg on: the kernel
+		// installed it for us and the host keeps its own. set_fd and
+		// reconnect/network_changed take it over (adoptTunFd); every other
+		// command has no use for it, and leaving it open would pin a VPN
+		// interface for the life of the process.
 		switch cmd.Command {
-		case "connect":
-			resp = cs.handleConnect(ctx)
-
 		case "set_fd":
 			resp = cs.handleSetFdWithReceivedFd(ctx, fd)
-
-		case "disconnect":
-			resp = cs.handleDisconnect()
-
-		case "status":
-			resp = cs.handleStatus()
 
 		case "reconnect", "network_changed":
 			resp = cs.handleReconnect(ctx, cmd.Reason, fd)
 
-		case "network_available":
-			resp = cs.handleNetworkAvailable()
-
 		default:
-			resp = ControlResponse{Status: "error", Error: "unknown command"}
+			if fd >= 0 {
+				log.Warn("Control command %q carried fd %d it does not use, closing it", cmd.Command, fd)
+				releaseReceivedFd(fd)
+			}
+			switch cmd.Command {
+			case "connect":
+				resp = cs.handleConnect(ctx)
+			case "disconnect":
+				resp = cs.handleDisconnect()
+			case "status":
+				resp = cs.handleStatus()
+			case "network_available":
+				resp = cs.handleNetworkAvailable()
+			default:
+				resp = ControlResponse{Status: "error", Error: "unknown command"}
+			}
 		}
 
 		if err := encoder.Encode(resp); err != nil {
@@ -289,6 +315,10 @@ func (cs *ControlServer) handleConnection(ctx context.Context, conn net.Conn) {
 func (cs *ControlServer) handleConnect(ctx context.Context) ControlResponse {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
+
+	if cs.closed {
+		return ControlResponse{Status: "error", Error: "control server closed"}
+	}
 
 	if cs.assignedIP != nil {
 		// Already connected, return existing config
@@ -369,6 +399,7 @@ func (cs *ControlServer) handleSetFdWithReceivedFd(ctx context.Context, fd int) 
 			log.Info("set_fd: relay already running — hot-swapping TUN fd (old=%d, new=%d)", cs.tunFd, fd)
 			return cs.hotSwapTunFdLocked(fd)
 		}
+		releaseReceivedFd(fd)
 		return ControlResponse{Status: "error", Error: "not waiting for fd, call connect first"}
 	}
 
@@ -378,23 +409,13 @@ func (cs *ControlServer) handleSetFdWithReceivedFd(ctx context.Context, fd int) 
 
 	log.Info("Using TUN fd from SCM_RIGHTS: %d", fd)
 
-	// Save fd for reconnect
-	cs.tunFd = fd
-
-	// Create TUN device from fd (needed for reconnect)
-	mtu := cs.mtu
-	if mtu == 0 {
-		mtu = DefaultMTU
-	}
-	tunDev, err := CreateTUNFromFd(fd, "tun0", mtu)
+	tunDev, err := cs.adoptTunFd(fd)
 	if err != nil {
 		return ControlResponse{Status: "error", Error: fmt.Sprintf("failed to create TUN: %v", err)}
 	}
-	if err := tunDev.ConfigureFromFd(cs.assignedIP, cs.serverIP); err != nil {
-		tunDev.Close()
-		return ControlResponse{Status: "error", Error: fmt.Sprintf("failed to configure TUN: %v", err)}
-	}
 	cs.tunDev = tunDev
+	// Save fd for reconnect
+	cs.tunFd = fd
 
 	// TUN handshake was already performed in handleConnect (before waiting_fd was sent).
 	// Android created TUN with the real IP from the start → no IP mismatch expected.
@@ -420,10 +441,10 @@ func (cs *ControlServer) handleSetFdWithReceivedFd(ctx context.Context, fd int) 
 		go RunTUNRelayWithCallbacks(tunDev, cs.serverConn, cs.assignedIP, cs.serverIP, cs.relayStopCh, &RelayCallbacks{
 			OnError: func(reason string) {
 				cs.mu.Lock()
-				stale := cs.relayGeneration != myGen
+				current := cs.relayGeneration
 				cs.mu.Unlock()
-				if stale {
-					log.Info("TUN relay OnError ignored (stale gen=%d, current=%d): %s", myGen, cs.relayGeneration, reason)
+				if current != myGen {
+					log.Info("TUN relay OnError ignored (stale gen=%d, current=%d): %s", myGen, current, reason)
 					return
 				}
 				log.Info("TUN relay died: %s", reason)
@@ -466,6 +487,7 @@ func (cs *ControlServer) hotSwapTunFdLocked(newFd int) ControlResponse {
 	if newFd < 0 {
 		return ControlResponse{Status: "error", Error: "invalid fd for hot-swap"}
 	}
+	gen := cs.sessionGen
 
 	// Stop current TUN relay
 	if cs.relayStopCh != nil {
@@ -484,6 +506,14 @@ func (cs *ControlServer) hotSwapTunFdLocked(newFd int) ControlResponse {
 	time.Sleep(150 * time.Millisecond)
 	cs.mu.Lock()
 
+	// A disconnect or Close in the gap has already torn the session down
+	// (old device included). Starting a relay now would run it on a nil
+	// server connection and resurrect a VPN the host just stopped.
+	if cs.sessionGen != gen {
+		releaseReceivedFd(newFd)
+		return ControlResponse{Status: "error", Error: "session torn down during hot-swap"}
+	}
+
 	// Restore deadline so new relay can use serverConn normally
 	if cs.serverConn != nil {
 		cs.serverConn.SetReadDeadline(time.Time{})
@@ -494,22 +524,15 @@ func (cs *ControlServer) hotSwapTunFdLocked(newFd int) ControlResponse {
 		cs.tunDev.Close()
 		cs.tunDev = nil
 	}
-	cs.tunFd = newFd
+	cs.tunFd = 0
 
-	mtu := cs.mtu
-	if mtu == 0 {
-		mtu = DefaultMTU
-	}
-	newTunDev, err := CreateTUNFromFd(newFd, "tun0", mtu)
+	newTunDev, err := cs.adoptTunFd(newFd)
 	if err != nil {
 		log.Error("hot-swap: failed to create TUN device: %v", err)
 		return ControlResponse{Status: "error", Error: fmt.Sprintf("hot-swap create TUN: %v", err)}
 	}
-	if err := newTunDev.ConfigureFromFd(cs.assignedIP, cs.serverIP); err != nil {
-		newTunDev.Close()
-		return ControlResponse{Status: "error", Error: fmt.Sprintf("hot-swap configure TUN: %v", err)}
-	}
 	cs.tunDev = newTunDev
+	cs.tunFd = newFd
 
 	// Restart relay with the same server connection
 	cs.relayGeneration++
@@ -518,10 +541,10 @@ func (cs *ControlServer) hotSwapTunFdLocked(newFd int) ControlResponse {
 	go RunTUNRelayWithCallbacks(cs.tunDev, cs.serverConn, cs.assignedIP, cs.serverIP, cs.relayStopCh, &RelayCallbacks{
 		OnError: func(reason string) {
 			cs.mu.Lock()
-			stale := cs.relayGeneration != myGen
+			current := cs.relayGeneration
 			cs.mu.Unlock()
-			if stale {
-				log.Info("TUN relay OnError ignored (stale gen=%d, current=%d): %s", myGen, cs.relayGeneration, reason)
+			if current != myGen {
+				log.Info("TUN relay OnError ignored (stale gen=%d, current=%d): %s", myGen, current, reason)
 				return
 			}
 			log.Info("TUN relay died after hot-swap: %s", reason)
@@ -559,6 +582,18 @@ func (cs *ControlServer) hotSwapTunFdLocked(newFd int) ControlResponse {
 func (cs *ControlServer) handleDisconnect() ControlResponse {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
+
+	// A relay dying of the teardown below (its server read fails before it
+	// sees the stop channel) must not report connection_dead for a session
+	// the host ended on purpose.
+	cs.sessionGen++
+	cs.relayGeneration++
+
+	// Stop the relay and close the TUN copy this process received over
+	// SCM_RIGHTS. The host closing its own descriptor does not take the
+	// interface down while ours is open, and nothing else closes ours: the
+	// relay only ever reads from it.
+	cs.releaseTunLocked()
 
 	if cs.serverConn != nil {
 		cs.serverConn.Close()
@@ -603,6 +638,13 @@ func (cs *ControlServer) handleStatus() ControlResponse {
 func (cs *ControlServer) handleReconnect(ctx context.Context, reason string, newFd int) ControlResponse {
 	cs.mu.Lock()
 
+	if cs.closed {
+		cs.mu.Unlock()
+		releaseReceivedFd(newFd)
+		return ControlResponse{Status: "error", Error: "control server closed"}
+	}
+	gen := cs.sessionGen
+
 	log.Info("Network change detected: %s, initiating reconnect (new_fd=%d)", reason, newFd)
 
 	// Set reconnecting flag BEFORE stopping relay to suppress connection_dead events
@@ -646,6 +688,15 @@ func (cs *ControlServer) handleReconnect(ctx context.Context, reason string, new
 		log.Debug("Reconnect failed, reconnecting flag cleared")
 	}
 
+	// The lock was dropped three times above. A disconnect or Close in any
+	// of those gaps ended the session; reconnecting now would bring back a
+	// tunnel the host has stopped, on a fd nobody would ever close.
+	if cs.sessionGen != gen {
+		releaseReceivedFd(newFd)
+		clearReconnecting()
+		return ControlResponse{Status: "error", Error: "session torn down during reconnect"}
+	}
+
 	// If new fd provided, update TUN device
 	if newFd >= 0 {
 		log.Info("Using new TUN fd from Android: %d (old fd=%d)", newFd, cs.tunFd)
@@ -654,14 +705,9 @@ func (cs *ControlServer) handleReconnect(ctx context.Context, reason string, new
 			cs.tunDev.Close()
 			cs.tunDev = nil
 		}
-		cs.tunFd = newFd
+		cs.tunFd = 0
 
-		// Create new TUN device from fd
-		mtu := cs.mtu
-		if mtu == 0 {
-			mtu = DefaultMTU
-		}
-		tunDev, err := CreateTUNFromFd(newFd, "tun0", mtu)
+		tunDev, err := cs.adoptTunFd(newFd)
 		if err != nil {
 			log.Error("Failed to create TUN from new fd: %v", err)
 			clearReconnecting()
@@ -670,16 +716,8 @@ func (cs *ControlServer) handleReconnect(ctx context.Context, reason string, new
 				Error:  fmt.Sprintf("failed to create TUN from new fd: %v", err),
 			}
 		}
-		if err := tunDev.ConfigureFromFd(cs.assignedIP, cs.serverIP); err != nil {
-			tunDev.Close()
-			log.Error("Failed to configure TUN from new fd: %v", err)
-			clearReconnecting()
-			return ControlResponse{
-				Status: "error",
-				Error:  fmt.Sprintf("failed to configure TUN: %v", err),
-			}
-		}
 		cs.tunDev = tunDev
+		cs.tunFd = newFd
 		log.Info("Created new TUN device from fd %d", newFd)
 	}
 
@@ -766,10 +804,10 @@ func (cs *ControlServer) handleReconnect(ctx context.Context, reason string, new
 	go RunTUNRelayWithCallbacks(cs.tunDev, cs.serverConn, cs.assignedIP, cs.serverIP, cs.relayStopCh, &RelayCallbacks{
 		OnError: func(reason string) {
 			cs.mu.Lock()
-			stale := cs.relayGeneration != myRelayGen
+			current := cs.relayGeneration
 			cs.mu.Unlock()
-			if stale {
-				log.Info("TUN relay OnError ignored (stale gen=%d, current=%d): %s", myRelayGen, cs.relayGeneration, reason)
+			if current != myRelayGen {
+				log.Info("TUN relay OnError ignored (stale gen=%d, current=%d): %s", myRelayGen, current, reason)
 				return
 			}
 			log.Info("TUN relay died: %s, notifying Android", reason)
@@ -947,13 +985,79 @@ func (cs *ControlServer) sendEvent(event string, data string) {
 	}
 }
 
-// Close closes the control server
+// Close closes the control server: it tears the session down, including the
+// TUN descriptor received from the host, and stops accepting connections.
+// Safe to call more than once; only the first call does anything.
 func (cs *ControlServer) Close() error {
-	// Stop auto-reconnect if running
-	cs.stopAutoReconnect()
-	cs.handleDisconnect()
-	os.Remove(cs.socketPath)
-	return cs.listener.Close()
+	cs.closeOnce.Do(func() {
+		cs.mu.Lock()
+		cs.closed = true
+		cs.mu.Unlock()
+		// Stop auto-reconnect if running
+		cs.stopAutoReconnect()
+		cs.handleDisconnect()
+		os.Remove(cs.socketPath)
+		cs.closeErr = cs.listener.Close()
+	})
+	return cs.closeErr
+}
+
+// adoptTunFd turns a TUN descriptor received over SCM_RIGHTS into the device
+// the relay reads. On success the device owns the descriptor; on failure it
+// has been closed here. Either way the caller must not use the number again.
+// Called with cs.mu held.
+func (cs *ControlServer) adoptTunFd(fd int) (*TUNDevice, error) {
+	// Non-blocking before os.NewFile, so the file lands in the netpoller.
+	// For a blocking descriptor os.File.Close cannot interrupt a Read in
+	// progress: the close(2) is deferred until that Read returns, and on an
+	// idle interface it never does, so the descriptor - and the VPN
+	// interface with it - outlives Disconnect. VpnService hands over a
+	// blocking descriptor whenever the host called Builder.setBlocking(true).
+	// O_NONBLOCK is set on the open file, which the host's descriptor shares;
+	// the host does no I/O on it, the core is the only reader and writer.
+	if err := unix.SetNonblock(fd, true); err != nil {
+		releaseReceivedFd(fd)
+		return nil, fmt.Errorf("set TUN fd %d non-blocking: %w", fd, err)
+	}
+	mtu := cs.mtu
+	if mtu == 0 {
+		mtu = DefaultMTU
+	}
+	tunDev, err := CreateTUNFromFd(fd, "tun0", mtu)
+	if err != nil {
+		releaseReceivedFd(fd)
+		return nil, err
+	}
+	if err := tunDev.ConfigureFromFd(cs.assignedIP, cs.serverIP); err != nil {
+		tunDev.Close()
+		return nil, fmt.Errorf("configure TUN: %w", err)
+	}
+	return tunDev, nil
+}
+
+// releaseTunLocked stops the running relay and closes the TUN device. The
+// device is closed through os.File, which is idempotent, and the pointer is
+// cleared, so no path can reach the same descriptor twice. Called with cs.mu
+// held.
+func (cs *ControlServer) releaseTunLocked() {
+	if cs.relayStopCh != nil {
+		close(cs.relayStopCh)
+		cs.relayStopCh = nil
+	}
+	if cs.tunDev != nil {
+		cs.tunDev.Close()
+		cs.tunDev = nil
+	}
+	cs.tunFd = 0
+}
+
+// releaseReceivedFd closes a descriptor received over SCM_RIGHTS that was
+// never wrapped in an os.File. The number came from our own recvmsg, so no
+// one else holds it; closing it once here is the only close it gets.
+func releaseReceivedFd(fd int) {
+	if fd >= 0 {
+		_ = unix.Close(fd)
+	}
 }
 
 // Auto-reconnect constants
@@ -1088,6 +1192,12 @@ func (cs *ControlServer) attemptReconnect(ctx context.Context) bool {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
+	// Torn down while the attempt waited for the lock: there is no device to
+	// relay on, and a session the host ended must stay ended.
+	if cs.closed || cs.tunDev == nil {
+		return false
+	}
+
 	// Stop any existing relay
 	if cs.relayStopCh != nil {
 		close(cs.relayStopCh)
@@ -1161,10 +1271,10 @@ func (cs *ControlServer) attemptReconnect(ctx context.Context) bool {
 	go RunTUNRelayWithCallbacks(cs.tunDev, cs.serverConn, cs.assignedIP, cs.serverIP, cs.relayStopCh, &RelayCallbacks{
 		OnError: func(reason string) {
 			cs.mu.Lock()
-			stale := cs.relayGeneration != myAutoGen
+			current := cs.relayGeneration
 			cs.mu.Unlock()
-			if stale {
-				log.Info("TUN relay OnError ignored (stale gen=%d, current=%d): %s", myAutoGen, cs.relayGeneration, reason)
+			if current != myAutoGen {
+				log.Info("TUN relay OnError ignored (stale gen=%d, current=%d): %s", myAutoGen, current, reason)
 				return
 			}
 			log.Info("TUN relay died: %s", reason)

@@ -162,6 +162,14 @@ type TUNDevice struct {
 	// matches on the whole address, so deleting the wrong form fails and
 	// leaves the stale address behind.
 	v6PeerForm bool
+
+	// hostOwnedLink marks a device wrapped around a descriptor the host
+	// handed in (Android VpnService, see CreateTUNFromFd). The core owns that
+	// descriptor and nothing else: the interface, its routes and its filter
+	// rules belong to the host, so Close releases the descriptor and leaves
+	// the link alone. Without it Close would go after whatever interface
+	// happens to be named like the placeholder name on this machine.
+	hostOwnedLink bool
 }
 
 // trackedRoute is one route this device installed: its destination and the
@@ -433,6 +441,13 @@ func (t *TUNDevice) SetReadDeadline(deadline time.Time) error {
 }
 
 func (t *TUNDevice) Close() error {
+	if t.hostOwnedLink {
+		// Wake a pending Read first. For a descriptor the netpoller knows
+		// (non-blocking, see ControlServer.adoptTunFd) Close alone would also
+		// do it; the deadline keeps the order explicit.
+		_ = t.file.SetReadDeadline(time.Now())
+		return t.file.Close()
+	}
 	if t.name != "" && t.mtu > 40 {
 		if err := removeMSSClamping(t.name); err != nil {
 			log.Warn("Failed to remove MSS clamping rules: %v", err)
