@@ -5,7 +5,9 @@ package tun
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -676,6 +678,119 @@ func TestControlDisconnectReportsNoDeadConnection(t *testing.T) {
 		}
 		if ev.Event == "connection_dead" {
 			t.Fatalf("host told connection_dead after its own disconnect: %+v", ev)
+		}
+	}
+}
+
+// inode is the socket inode behind the fake TUN's host end. Every descriptor
+// that refers to that open file - the host's and the copy SCM_RIGHTS installs
+// in the core - reads back as "socket:[inode]" in /proc/self/fd.
+func (ft *fakeTun) inode(t *testing.T) uint64 {
+	t.Helper()
+	var st unix.Stat_t
+	if err := unix.Fstat(ft.host, &st); err != nil {
+		t.Fatalf("fstat: %v", err)
+	}
+	return st.Ino
+}
+
+// tunFdCount counts this process's open descriptors that point at any of the
+// given fake TUNs: what `ls -l /proc/<pid>/fd` shows for /dev/tun on a device.
+func tunFdCount(t *testing.T, inodes ...uint64) int {
+	t.Helper()
+	want := make(map[string]bool, len(inodes))
+	for _, ino := range inodes {
+		want[fmt.Sprintf("socket:[%d]", ino)] = true
+	}
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatalf("read /proc/self/fd: %v", err)
+	}
+	n := 0
+	for _, e := range entries {
+		target, err := os.Readlink("/proc/self/fd/" + e.Name())
+		if err == nil && want[target] {
+			n++
+		}
+	}
+	return n
+}
+
+// TestControlTunFdCount counts descriptors the way the on-device check does:
+// the process holds one per TUN before set_fd (the host's), two after it (the
+// core's copy), and is back to the host's one after Close.
+func TestControlTunFdCount(t *testing.T) {
+	for _, mode := range fdModes {
+		t.Run(mode.name, func(t *testing.T) {
+			h := newCtlHarness(t)
+			ft := newFakeTun(t, mode.blocking)
+			ino := ft.inode(t)
+
+			before := tunFdCount(t, ino)
+			if before != 1 {
+				t.Fatalf("before set_fd: %d TUN fds, want 1 (the host's)", before)
+			}
+			if resp := h.send(`{"command":"set_fd"}`, ft.host); resp.Status != "connected" {
+				t.Fatalf("set_fd: %+v", resp)
+			}
+			if got := tunFdCount(t, ino); got != before+1 {
+				t.Fatalf("positive control: after set_fd %d TUN fds, want %d", got, before+1)
+			}
+
+			_ = h.cs.Close()
+			if !waitFor(3*time.Second, func() bool { return tunFdCount(t, ino) == before }) {
+				t.Errorf("after Close: %d TUN fds, want %d: the core kept its copy", tunFdCount(t, ino), before)
+			}
+		})
+	}
+}
+
+// TestControlTunFdCountAcrossSwaps: one network change after another must not
+// grow the number of TUN descriptors. With every host copy dropped, the
+// process holds exactly the core's current one, and none after Close.
+func TestControlTunFdCountAcrossSwaps(t *testing.T) {
+	const swaps = 5
+	for _, cmd := range []string{
+		`{"command":"set_fd"}`,
+		`{"command":"network_changed","reason":"wifi_to_lte"}`,
+	} {
+		kind := "hot-swap"
+		if strings.Contains(cmd, "network_changed") {
+			kind = "network_changed"
+		}
+		for _, mode := range fdModes {
+			t.Run(kind+"/"+mode.name, func(t *testing.T) {
+				h := newCtlHarness(t)
+				h.withReconnect()
+				var inodes []uint64
+
+				first := newFakeTun(t, mode.blocking)
+				inodes = append(inodes, first.inode(t))
+				if resp := h.send(`{"command":"set_fd"}`, first.host); resp.Status != "connected" {
+					t.Fatalf("set_fd: %+v", resp)
+				}
+				first.dropHostCopy()
+				if got := tunFdCount(t, inodes...); got != 1 {
+					t.Fatalf("positive control: %d TUN fds after set_fd, want 1", got)
+				}
+
+				for i := range swaps {
+					next := newFakeTun(t, mode.blocking)
+					inodes = append(inodes, next.inode(t))
+					if resp := h.send(cmd, next.host); resp.Status != "connected" {
+						t.Fatalf("swap %d: %+v", i+1, resp)
+					}
+					next.dropHostCopy()
+					if !waitFor(3*time.Second, func() bool { return tunFdCount(t, inodes...) == 1 }) {
+						t.Fatalf("after swap %d: %d TUN fds, want 1: superseded descriptors pile up", i+1, tunFdCount(t, inodes...))
+					}
+				}
+
+				_ = h.cs.Close()
+				if !waitFor(3*time.Second, func() bool { return tunFdCount(t, inodes...) == 0 }) {
+					t.Errorf("after Close: %d TUN fds, want 0", tunFdCount(t, inodes...))
+				}
+			})
 		}
 	}
 }
