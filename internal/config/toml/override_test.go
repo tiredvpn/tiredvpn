@@ -140,13 +140,48 @@ func TestResolveClient_InvalidPortFromFlag(t *testing.T) {
 }
 
 func TestResolveClient_BadHostPortFlag(t *testing.T) {
-	fs := newClientFlagSet()
-	if err := fs.Parse([]string{"-server", "no-port-here"}); err != nil {
-		t.Fatalf("parse: %v", err)
+	for _, bad := range []string{"vpn.example.org:notaport", "vpn.example.org:0", "[2001:db8::1", "2001:db8::zz"} {
+		fs := newClientFlagSet()
+		if err := fs.Parse([]string{"-server", bad}); err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if _, err := ResolveClient(testdata(t, "client_minimal.toml"), fs); err == nil {
+			t.Fatalf("-server %q: expected a parse error", bad)
+		}
 	}
-	_, err := ResolveClient(testdata(t, "client_minimal.toml"), fs)
-	if err == nil {
-		t.Fatal("expected error parsing -server without port")
+}
+
+// TestResolveClient_FlagWithoutPortKeepsFilePort: a -server / -server-v6 value
+// without a port replaces the host and keeps the port the file (or the
+// default) gave. -server-v6 is typed bare far more often than not, and a bare
+// IPv6 literal cannot carry a port at all.
+func TestResolveClient_FlagWithoutPortKeepsFilePort(t *testing.T) {
+	cases := []struct {
+		flag, value, wantHost string
+	}{
+		{"-server", "vpn2.example.org", "vpn2.example.org"},
+		{"-server", "198.51.100.7", "198.51.100.7"},
+		{"-server-v6", "2001:db8::7", "2001:db8::7"},
+		{"-server-v6", "[2001:db8::7]", "2001:db8::7"},
+	}
+	for _, tc := range cases {
+		fs := newClientFlagSet()
+		fs.String("server-v6", "", "Server IPv6 address")
+		if err := fs.Parse([]string{tc.flag, tc.value}); err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		cfg, err := ResolveClient(testdata(t, "client_minimal.toml"), fs)
+		if err != nil {
+			t.Fatalf("%s %q: %v", tc.flag, tc.value, err)
+		}
+		srv := cfg.ServerList()[0]
+		host, port := srv.Address, srv.Port
+		if tc.flag == "-server-v6" {
+			host, port = srv.AddressV6, srv.PortV6
+		}
+		if host != tc.wantHost || port != 443 {
+			t.Fatalf("%s %q: got host=%q port=%d, want %q and the file's 443", tc.flag, tc.value, host, port, tc.wantHost)
+		}
 	}
 }
 

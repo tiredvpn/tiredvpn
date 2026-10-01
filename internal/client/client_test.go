@@ -76,7 +76,7 @@ func TestIPv4Fallback(t *testing.T) {
 	// Create manager with IPv6 config pointing to invalid address
 	mgrCfg := strategy.DefaultManagerConfig{
 		ServerAddr:   "127.0.0.1:443",
-		ServerAddrV6: "[::1]:99999", // Invalid port - will fail connectivity check
+		ServerAddrV6: "[::1]:1", // closed port: fails the connectivity check, and unlike 99999 it is a port
 		PreferIPv6:   true,
 		FallbackToV4: true, // Enable fallback
 		Secret:       []byte("test-secret"),
@@ -116,7 +116,7 @@ func TestIPv6NoFallback(t *testing.T) {
 	// Create manager with IPv6 config, no fallback
 	mgrCfg := strategy.DefaultManagerConfig{
 		ServerAddr:   "127.0.0.1:443",
-		ServerAddrV6: "[::1]:99999", // Invalid - will fail
+		ServerAddrV6: "[::1]:1", // closed port - will fail
 		PreferIPv6:   true,
 		FallbackToV4: false, // No fallback
 		Secret:       []byte("test-secret"),
@@ -128,9 +128,9 @@ func TestIPv6NoFallback(t *testing.T) {
 
 	// -fallback-v4=false is an explicit "never touch IPv4" knob; silently
 	// dropping to v4 here would defeat it and leak onto the blocked family.
-	assert.Equal(t, "[::1]:99999", mgr.ProbeEndpointFamily(ctx),
+	assert.Equal(t, "[::1]:1", mgr.ProbeEndpointFamily(ctx),
 		"Should return IPv6 address even when fallback disabled")
-	assert.Equal(t, "[::1]:99999", mgr.GetServerAddr(ctx),
+	assert.Equal(t, "[::1]:1", mgr.GetServerAddr(ctx),
 		"Should return IPv6 address even when fallback disabled")
 }
 
@@ -139,7 +139,7 @@ func TestIPv6NoFallback(t *testing.T) {
 func TestIPv6ResetCheck(t *testing.T) {
 	mgrCfg := strategy.DefaultManagerConfig{
 		ServerAddr:   "127.0.0.1:443",
-		ServerAddrV6: "[::1]:99999", // unreachable, so the probe falls back
+		ServerAddrV6: "[::1]:1", // unreachable, so the probe falls back
 		PreferIPv6:   true,
 		FallbackToV4: true,
 		Secret:       []byte("test-secret"),
@@ -151,7 +151,7 @@ func TestIPv6ResetCheck(t *testing.T) {
 	assert.Equal(t, "127.0.0.1:443", mgr.ProbeEndpointFamily(ctx), "unreachable v6 must fall back")
 
 	mgr.ResetIPv6Check()
-	assert.Equal(t, "[::1]:99999", mgr.GetServerAddr(ctx),
+	assert.Equal(t, "[::1]:1", mgr.GetServerAddr(ctx),
 		"reset must put the preferred family back before the next probe")
 	assert.Equal(t, "127.0.0.1:443", mgr.ProbeEndpointFamily(ctx),
 		"the re-probe must reach the same verdict, not a cached one")

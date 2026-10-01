@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/benchmark"
+	"github.com/tiredvpn/tiredvpn/internal/endpoint"
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/pool"
 	"github.com/tiredvpn/tiredvpn/internal/porthopping"
@@ -1201,8 +1202,15 @@ func truncate(s string, maxLen int) string {
 // POOLED CONNECTION HANDLERS
 // ============================================================================
 
+// targetDialer is the one thing the local proxy handlers need from the tunnel
+// pool. An interface so a test can see the exact target string a request
+// turns into without a server on the other end.
+type targetDialer interface {
+	DialTarget(ctx context.Context, targetAddr string) (*pool.PooledConn, error)
+}
+
 // handleConnectionPooled auto-detects protocol using pooled connections
-func handleConnectionPooled(conn net.Conn, tunnelPool *pool.TunnelPool, connID uint64) {
+func handleConnectionPooled(conn net.Conn, tunnelPool targetDialer, connID uint64) {
 	// Track connection in metrics
 	if clientMetrics != nil {
 		clientMetrics.IncConnections()
@@ -1233,7 +1241,7 @@ func handleConnectionPooled(conn net.Conn, tunnelPool *pool.TunnelPool, connID u
 }
 
 // handleHTTPProxyPooled handles HTTP proxy with connection pooling
-func handleHTTPProxyPooled(conn net.Conn, tunnelPool *pool.TunnelPool, connID uint64) {
+func handleHTTPProxyPooled(conn net.Conn, tunnelPool targetDialer, connID uint64) {
 	defer conn.Close()
 
 	logger := log.WithPrefix(fmt.Sprintf("http:%d", connID))
@@ -1277,9 +1285,13 @@ func handleHTTPProxyPooled(conn net.Conn, tunnelPool *pool.TunnelPool, connID ui
 		return
 	}
 
-	targetAddr := parts[1]
-	if !strings.Contains(targetAddr, ":") {
-		targetAddr += ":443"
+	// The port is appended through the shared normaliser: the old
+	// "no colon, add :443" test let "[2001:db8::1]" through without a port,
+	// and a bare IPv6 literal would have been spliced into nonsense.
+	targetAddr, err := endpoint.NormalizeAddr(parts[1], 443)
+	if err != nil || targetAddr == "" {
+		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+		return
 	}
 
 	logger.Info("CONNECT %s", targetAddr)
@@ -1324,7 +1336,7 @@ func handleHTTPProxyPooled(conn net.Conn, tunnelPool *pool.TunnelPool, connID ui
 }
 
 // handlePlainHTTPPooled handles plain HTTP requests with pooling
-func handlePlainHTTPPooled(conn net.Conn, tunnelPool *pool.TunnelPool, request string, rawRequest []byte, logger *log.Logger) {
+func handlePlainHTTPPooled(conn net.Conn, tunnelPool targetDialer, request string, rawRequest []byte, logger *log.Logger) {
 	lines := strings.SplitN(request, "\r\n", 2)
 	if len(lines) < 1 {
 		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
@@ -1347,13 +1359,16 @@ func handlePlainHTTPPooled(conn net.Conn, tunnelPool *pool.TunnelPool, request s
 		return
 	}
 
-	targetHost := parsedURL.Host
-	if !strings.Contains(targetHost, ":") {
-		if parsedURL.Scheme == "https" {
-			targetHost += ":443"
-		} else {
-			targetHost += ":80"
-		}
+	// http://[2001:db8::1]/ has a colon in its host and no port: the old
+	// strings.Contains(":") test sent "[2001:db8::1]" to the tunnel as is.
+	defaultPort := 80
+	if parsedURL.Scheme == "https" {
+		defaultPort = 443
+	}
+	targetHost, err := endpoint.NormalizeAddr(parsedURL.Host, defaultPort)
+	if err != nil {
+		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+		return
 	}
 
 	logger.Info("%s %s", method, parsedURL.Host)
@@ -1415,7 +1430,7 @@ func handlePlainHTTPPooled(conn net.Conn, tunnelPool *pool.TunnelPool, request s
 }
 
 // handleSOCKS5Pooled handles SOCKS5 with connection pooling
-func handleSOCKS5Pooled(conn net.Conn, tunnelPool *pool.TunnelPool, connID uint64) {
+func handleSOCKS5Pooled(conn net.Conn, tunnelPool targetDialer, connID uint64) {
 	defer conn.Close()
 
 	logger := log.WithPrefix(fmt.Sprintf("socks:%d", connID))
@@ -1475,7 +1490,9 @@ func handleSOCKS5Pooled(conn net.Conn, tunnelPool *pool.TunnelPool, connID uint6
 		}
 		domain := string(addr[:len(addr)-2])
 		port := int(addr[len(addr)-2])<<8 | int(addr[len(addr)-1])
-		targetAddr = fmt.Sprintf("%s:%d", domain, port)
+		// A client may put an IPv6 literal in the domain field; JoinAddr
+		// brackets it where "%s:%d" would not.
+		targetAddr = endpoint.JoinAddr(domain, port)
 
 	case 0x04: // IPv6 - not supported, reject
 		logger.Debug("IPv6 not supported, rejecting")

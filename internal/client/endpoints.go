@@ -74,7 +74,11 @@ func ResolveEndpoints(cfg *Config) ([]endpoint.Endpoint, error) {
 		if s.Addr == "" && s.AddrV6 == "" {
 			return nil, fmt.Errorf("servers[%d] (%s): no address configured", i, specName(i, s.Name))
 		}
-		eps = append(eps, endpoint.Endpoint{
+		// One normalisation for every entry, whether it came from a
+		// [[servers]] list or was synthesised above from -server/-server-v6:
+		// the single-server path used to hand the raw flag value to the
+		// dialer, so a bare IPv6 literal became an undialable candidate.
+		ep, err := endpoint.Endpoint{
 			Name:   s.Name,
 			V4:     s.Addr,
 			V6:     s.AddrV6,
@@ -82,7 +86,11 @@ func ResolveEndpoints(cfg *Config) ([]endpoint.Endpoint, error) {
 			Order:  i,
 			Secret: s.Secret,
 			SNI:    s.SNI,
-		})
+		}.Normalized()
+		if err != nil {
+			return nil, fmt.Errorf("servers[%d] (%s): %w", i, specName(i, s.Name), err)
+		}
+		eps = append(eps, ep)
 	}
 
 	if err := reconcileSecrets(cfg, specs); err != nil {

@@ -278,7 +278,8 @@ CORE OPTIONS:
 
 IPv6 TRANSPORT:
   -server-v6 string
-        Server IPv6 address (e.g., [2001:db8::100]:995)
+        Server IPv6 address: 2001:db8::100, [2001:db8::100] or [2001:db8::100]:995
+        (without a port it takes the port of -server)
   -prefer-ipv6
         Prefer IPv6 transport if available (default true)
   -fallback-v4
@@ -648,7 +649,7 @@ func runClient(args []string) {
 	fs.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
 
 	// IPv6 Transport
-	fs.StringVar(&cfg.ServerAddrV6, "server-v6", "", "Server IPv6 address (e.g., [2001:db8::100]:995)")
+	fs.StringVar(&cfg.ServerAddrV6, "server-v6", "", "Server IPv6 address: 2001:db8::100, [2001:db8::100] or [2001:db8::100]:995 (without a port it takes the port of -server)")
 	fs.BoolVar(&cfg.PreferIPv6, "prefer-ipv6", true, "Prefer IPv6 transport if available")
 	fs.BoolVar(&cfg.FallbackToV4, "fallback-v4", true, "Fallback to IPv4 if IPv6 fails")
 

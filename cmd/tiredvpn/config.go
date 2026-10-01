@@ -10,6 +10,7 @@ import (
 
 	"github.com/tiredvpn/tiredvpn/internal/client"
 	tomlcfg "github.com/tiredvpn/tiredvpn/internal/config/toml"
+	"github.com/tiredvpn/tiredvpn/internal/endpoint"
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/server"
 	"github.com/tiredvpn/tiredvpn/internal/shaper/presets"
@@ -99,14 +100,17 @@ func applyServerList(cfg *client.Config, tcfg *tomlcfg.ClientConfig) error {
 			Secret: s.Secret,
 			SNI:    s.SNI,
 		}
-		if s.Address != "" {
-			spec.Addr = joinHostPort(s.Address, s.Port)
+		// endpoint.NormalizeAddr is the same code the -server/-server-v6
+		// path goes through in client.ResolveEndpoints. Joining the fields
+		// directly turned address_v6 = "[2001:db8::2]" into "[[2001:db8::2]]:995".
+		// The schema stores the address bare and the port apart, but a port
+		// written into the address wins, as it does on the command line.
+		var err error
+		if spec.Addr, err = endpoint.NormalizeAddr(s.Address, s.Port); err != nil {
+			return fmt.Errorf("server %q: address: %w", s.Name, err)
 		}
-		if s.AddressV6 != "" {
-			// JoinHostPort brackets it, which is the form the transport and
-			// the TUN bypass expect; the schema stores it bare so the file
-			// does not have to.
-			spec.AddrV6 = joinHostPort(s.AddressV6, s.PortV6)
+		if spec.AddrV6, err = endpoint.NormalizeAddr(s.AddressV6, s.PortV6); err != nil {
+			return fmt.Errorf("server %q: address_v6: %w", s.Name, err)
 		}
 		specs = append(specs, spec)
 	}

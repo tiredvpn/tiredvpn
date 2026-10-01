@@ -225,8 +225,8 @@ func (c *ConnectivityChecker) Check(ctx context.Context) ConnectivityResult {
 	if answered == "" {
 		answered = "none"
 	}
-	log.Debug("Connectivity check from %s:%s - TCP:%v (answered=%s) UDP:%v ICMP:%v (latency=%v)",
-		host, port, result.TCP, answered, result.UDP, result.ICMP, result.Latency)
+	log.Debug("Connectivity check from %s - TCP:%v (answered=%s) UDP:%v ICMP:%v (latency=%v)",
+		net.JoinHostPort(host, port), result.TCP, answered, result.UDP, result.ICMP, result.Latency)
 
 	// Cache result
 	c.mu.Lock()
@@ -329,17 +329,17 @@ func (c *ConnectivityChecker) checkUDP(ctx context.Context, addr string) error {
 
 func (c *ConnectivityChecker) checkICMP(ctx context.Context, host string) error {
 	d := net.Dialer{Timeout: c.auxTimeout}
-	conn, err := d.DialContext(ctx, "tcp", host+":443")
-	if err == nil {
-		conn.Close()
-		return nil
+	var err error
+	for _, port := range []string{"443", "80"} {
+		// JoinHostPort, not host+":"+port: host is unbracketed here, and
+		// "2001:db8::1:443" is not an address net.Dial accepts.
+		var conn net.Conn
+		if conn, err = d.DialContext(ctx, "tcp", net.JoinHostPort(host, port)); err == nil {
+			conn.Close()
+			return nil
+		}
 	}
-	conn2, err2 := d.DialContext(ctx, "tcp", host+":80")
-	if err2 == nil {
-		conn2.Close()
-		return nil
-	}
-	return fmt.Errorf("host unreachable: %w", err2)
+	return fmt.Errorf("host unreachable: %w", err)
 }
 
 // WaitForConnectivity waits in a loop until TCP connectivity is available.

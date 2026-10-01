@@ -4,7 +4,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"net"
 	"strconv"
 	"strings"
 
@@ -397,22 +396,22 @@ func splitCommaList(s string) []string {
 	return out
 }
 
-// splitHostPort accepts "host:port" or bare ":port" and returns parts.
-// An empty port slot returns 0 so the caller keeps the existing value.
+// splitHostPort splits a -server / -server-v6 value. A value without a port
+// returns 0 so the caller keeps the existing (file or default) port.
 func splitHostPort(s string) (string, int, error) {
-	if s == "" {
-		return "", 0, errors.New("empty address")
+	// The shared parser: it takes a bare IPv6 literal and "[v6]" without a
+	// port, which net.SplitHostPort rejects ("too many colons", "missing
+	// port") although both are what a user types for -server-v6.
+	//
+	// ":port" alone is kept as before: it changes the port and leaves the host
+	// to the file. A leading colon followed by more colons is an IPv6 literal
+	// ("::1"), not this shape.
+	if rest, ok := strings.CutPrefix(s, ":"); ok && rest != "" && !strings.Contains(rest, ":") {
+		port, err := strconv.ParseUint(rest, 10, 16)
+		if err != nil || port == 0 {
+			return "", 0, fmt.Errorf("invalid port %q", rest)
+		}
+		return "", int(port), nil
 	}
-	host, portStr, err := net.SplitHostPort(s)
-	if err != nil {
-		return "", 0, err
-	}
-	if portStr == "" {
-		return host, 0, nil
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return "", 0, fmt.Errorf("invalid port %q: %w", portStr, err)
-	}
-	return host, port, nil
+	return endpoint.SplitAddr(s)
 }
