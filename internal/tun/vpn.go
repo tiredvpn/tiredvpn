@@ -748,7 +748,7 @@ func (v *VPNClient) seamlessPortHop(newPort int) {
 	}
 
 	// Perform TUN mode handshake on new connection
-	handshakeErr := v.performHandshake(newConn)
+	tunnelConn, handshakeErr := v.performHandshake(newConn)
 	if handshakeErr != nil {
 		newConn.Close()
 		log.Warn("VPN: port hop handshake failed: %v, falling back to force reconnect", handshakeErr)
@@ -759,7 +759,7 @@ func (v *VPNClient) seamlessPortHop(newPort int) {
 	// Atomic swap: new connection ready, swap with old (break)
 	v.mu.Lock()
 	oldConn := v.conn
-	v.conn = newConn
+	v.conn = tunnelConn
 	v.strategy = newStrategy
 	v.serverAddr = newTarget
 	v.lastActive = time.Now()
@@ -776,7 +776,10 @@ func (v *VPNClient) seamlessPortHop(newPort int) {
 
 // performHandshake performs TUN mode handshake on a connection
 // Used by seamlessPortHop to setup new connection before swapping
-func (v *VPNClient) performHandshake(conn net.Conn) error {
+//
+// It returns the conn to install: the handshake reader may hand back the start
+// of the first tunnel frame through a wrapper (see readHandshakeResponse).
+func (v *VPNClient) performHandshake(conn net.Conn) (net.Conn, error) {
 	// Send TUN mode handshake
 	// Format: [mode:1][localIP:4][mtu:2][version:1]
 	handshake := make([]byte, 8)
@@ -787,21 +790,20 @@ func (v *VPNClient) performHandshake(conn net.Conn) error {
 
 	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	if _, err := conn.Write(handshake); err != nil {
-		return fmt.Errorf("handshake write failed: %w", err)
+		return nil, fmt.Errorf("handshake write failed: %w", err)
 	}
 
 	// Read server response (drains the dual-stack block when advertised, so
 	// the stream stays frame-aligned for the packet loop that follows).
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	resp, n, err := readHandshakeResponse(conn, v.handshakeVersion())
+	resp, n, conn, err := readHandshakeResponse(conn, v.handshakeVersion(), time.Now().Add(5*time.Second))
 	if err != nil {
-		return fmt.Errorf("handshake read failed: %w", err)
+		return nil, fmt.Errorf("handshake read failed: %w", err)
 	}
 	if n < 9 {
-		return fmt.Errorf("invalid server response: got %d bytes", n)
+		return nil, fmt.Errorf("invalid server response: got %d bytes", n)
 	}
 	if resp[0] != 0x00 {
-		return fmt.Errorf("server error: status=%d", resp[0])
+		return nil, fmt.Errorf("server error: status=%d", resp[0])
 	}
 
 	// Verify server assigned same IP (port hop should preserve IP)
@@ -816,7 +818,7 @@ func (v *VPNClient) performHandshake(conn net.Conn) error {
 	}
 
 	log.Debug("VPN: port hop handshake successful")
-	return nil
+	return conn, nil
 }
 
 // connect establishes connection to server.
@@ -859,11 +861,14 @@ func (v *VPNClient) connect(parent context.Context) error {
 	}
 
 	// Perform the TUN-mode handshake on local variables (still no lock).
-	resp, n, err := v.doHandshake(conn, localIP)
+	resp, n, tunnelConn, err := v.doHandshake(conn, localIP)
 	if err != nil {
 		conn.Close()
 		return err
 	}
+	// From here on the tunnel is read through tunnelConn: the handshake reader
+	// may have had to look at the first byte of the first frame.
+	conn = tunnelConn
 
 	// Server sends its TUN IP and assigned client IP.
 	serverIP := net.IP(resp[1:5])
@@ -959,8 +964,9 @@ func (v *VPNClient) connect(parent context.Context) error {
 
 // doHandshake writes the TUN-mode handshake and reads the server response.
 // It runs without holding v.mu and returns the raw response buffer and its
-// length for the caller to parse.
-func (v *VPNClient) doHandshake(conn net.Conn, localIP net.IP) ([]byte, int, error) {
+// length for the caller to parse, plus the conn the tunnel must be read from
+// afterwards (see readHandshakeResponse).
+func (v *VPNClient) doHandshake(conn net.Conn, localIP net.IP) ([]byte, int, net.Conn, error) {
 	// Send TUN mode handshake.
 	// Format: [mode:1][localIP:4][mtu:2][version:1]
 	// If localIP is 0.0.0.0, server will auto-assign an IP.
@@ -973,7 +979,7 @@ func (v *VPNClient) doHandshake(conn net.Conn, localIP net.IP) ([]byte, int, err
 
 	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	if _, err := conn.Write(handshake); err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
 
 	// Read server response.
@@ -981,25 +987,24 @@ func (v *VPNClient) doHandshake(conn net.Conn, localIP net.IP) ([]byte, int, err
 	// Extended v1 (14 bytes): [status:1][serverIP:4][clientIP:4][flags:1][portStart:2][portEnd:2]
 	// Extended v2 (20+ bytes): [status:1][serverIP:4][clientIP:4][flags:1][portStart:2][portEnd:2][hopInterval:4][strategy:1][seedLen:1][seed:0-32]
 	// Dual-stack (v4): the version-dependent layout followed by [serverIP6:16][clientIP6:16]
-	conn.SetReadDeadline(time.Now().Add(handshakeReadTimeout))
-	resp, n, err := readHandshakeResponse(conn, v.handshakeVersion())
+	resp, n, conn, err := readHandshakeResponse(conn, v.handshakeVersion(), time.Now().Add(handshakeReadTimeout))
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
 	if n < 9 {
-		return nil, 0, fmt.Errorf("invalid server response: got %d bytes, expected at least 9", n)
+		return nil, 0, nil, fmt.Errorf("invalid server response: got %d bytes, expected at least 9", n)
 	}
 	if resp[0] != 0x00 {
 		switch resp[0] {
 		case 0x01:
-			return nil, 0, fmt.Errorf("server error: IP pool exhausted")
+			return nil, 0, nil, fmt.Errorf("server error: IP pool exhausted")
 		case 0x02:
-			return nil, 0, fmt.Errorf("server error: no IP pool configured (auto IP not supported)")
+			return nil, 0, nil, fmt.Errorf("server error: no IP pool configured (auto IP not supported)")
 		default:
-			return nil, 0, fmt.Errorf("server error: status=%d", resp[0])
+			return nil, 0, nil, fmt.Errorf("server error: status=%d", resp[0])
 		}
 	}
-	return resp, n, nil
+	return resp, n, conn, nil
 }
 
 // handshakeRespBufSize fits the largest handshake response: the v2 layout
@@ -1010,19 +1015,22 @@ const handshakeRespBufSize = 96
 // returns the raw response bytes: the version-dependent base layout plus the
 // trailing 32-byte dual-stack block when the flags byte advertises it.
 // Exported for the multi-hop relay (internal/server), which must forward the
-// exit's response to the downstream client verbatim.
+// exit's response to the downstream client verbatim, and for the client's
+// reconnect path.
 //
-// The relay does not know the downstream client's handshake version here, so
-// the dual-stack-capable read path is always taken. That only costs the
-// bounded flags-byte peek when the exit answers with the bare 9-byte form;
-// every exit since the auto-MTU probe sets a flags byte on the stego path, so
-// in practice the peek never fires.
-func ReadTUNHandshakeResponse(conn net.Conn) ([]byte, error) {
-	resp, n, err := readHandshakeResponse(conn, 0) // 0: the relay cannot see the client's version
+// clientVersion is the handshake version byte that was sent to the exit (the
+// relay forwards its client's byte verbatim, so it knows it too): it decides
+// whether a flags byte follows the 9-byte prefix. deadline bounds the read of
+// the response (zero: handshakeReadTimeout from now); it is cleared again
+// before returning, so the returned conn carries no read deadline. The
+// returned conn is the one to keep reading from; see readHandshakeResponse
+// for why it can differ.
+func ReadTUNHandshakeResponse(conn net.Conn, clientVersion byte, deadline time.Time) ([]byte, net.Conn, error) {
+	resp, n, next, err := readHandshakeResponse(conn, clientVersion, deadline)
 	if err != nil {
-		return nil, err
+		return nil, conn, err
 	}
-	return resp[:n], nil
+	return resp[:n], next, nil
 }
 
 // ParseTUNHandshakeCapabilities decodes the capabilities of a raw TUN
@@ -1033,84 +1041,177 @@ func ParseTUNHandshakeCapabilities(resp []byte) (ServerCapabilities, bool) {
 	return parseServerCapabilities(resp, len(resp))
 }
 
-// handshakeReadTimeout is the read budget callers arm before reading a
-// handshake response. readHandshakeResponse re-arms it after the bounded
-// flags-byte peek so the rest of the response is not read under the peek's
-// much shorter deadline.
-const handshakeReadTimeout = 10 * time.Second
+// handshakeReadTimeout is the default budget for reading a handshake
+// response, used when the caller has no deadline of its own. A var so tests
+// can shorten it.
+var handshakeReadTimeout = 10 * time.Second
 
-// handshakeFlagsGrace bounds the wait for the optional flags byte (resp[9])
-// when the response arrived split exactly at the 9-byte boundary. A server
-// answering with the legacy 9-byte form sends nothing more, so this read must
-// never block: it costs the grace once, only on that path, and only for a
-// client that asked for dual-stack (nobody else can be sent a v6 block).
+// handshakeFlagsGrace bounds the wait for the byte after the 9-byte prefix of
+// a success response to a client below v0x04, the only case where the reader
+// cannot tell from the version whether a flags byte follows (see
+// readHandshakeFlags). An answer that ends at 9 bytes is followed by nothing
+// until the first tunnel frame, so the reader must never wait on it for long.
 const handshakeFlagsGrace = 300 * time.Millisecond
 
-// readHandshakeResponse reads the server's TUN handshake response.
+// readHandshakeResponse reads the server's TUN handshake response and returns
+// it together with the conn the caller must keep reading tunnel frames from.
 //
-// The 9-byte prefix [status:1][serverIP:4][clientIP:4] is present in every
-// response shape and is therefore read to completion — a transport that splits
-// the response across TCP segments, TLS records or stego frames used to leave
-// the tail in the stream and desync the packet loop that follows. Everything
-// past those 9 bytes is optional, so it can never be blocked on: expectDual
-// (the client sent handshake version 0x04) allows a short bounded peek for the
-// flags byte, after which the advertised remainder is read to completion.
+// Nothing past the response is ever consumed: the response is read with exact
+// reads (the 9-byte prefix [status:1][serverIP:4][clientIP:4], the flags byte
+// when there is one, then the layout the flags announce), never with a
+// buffer-sized Read. An exit or relay may start sending tunnel frames right
+// after the response, and a transport is free to hand them over in the same
+// Read; a byte of a frame taken as part of the response shifts every frame
+// after it and the session dies at the next read timeout (issue #93).
 //
-// An up-to-date exit always emits the flags byte to a v0x04 client (see
-// buildTUNHandshakeResponse), so the peek is a fallback, not the normal path:
-// it only fires against an exit that predates dual-stack, which the deployment
-// order already rules out (exits and relays upgrade before clients). Keeping it
-// bounded matters because such an exit sends nothing more, and a blind read of
-// the tenth byte would either hang the connect or swallow the first byte of
-// downstream tunnel traffic.
+// Whether a flags byte follows the prefix is decided from what the client
+// knows, never from whether a byte happens to arrive in time:
 //
-// expectDual=false keeps the read behaviour byte-for-byte as it was: a v0x03
-// client is never sent the dual-stack flag, so nothing beyond the first read
-// can be pending.
-func readHandshakeResponse(conn net.Conn, clientVersion byte) ([]byte, int, error) {
+//   - status != 0: the TUN core refused, and its refusals are the bare 9-byte
+//     prefix. (Some transports refuse with a single 0x01 byte instead; the
+//     prefix read fails on those, bounded by the response deadline.)
+//   - clientVersion >= 0x04: every exit and relay since dual-stack emits the
+//     flags byte to such a client, even when it is zero (buildTUNHandshakeResponse),
+//     so it is read unconditionally.
+//   - below 0x04 the version alone does not settle it: over one transport a
+//     terminating exit answers with a flags byte and a relay forwarding an
+//     exit's h2 answer does not, and the response carries no version echo.
+//     The byte's value does settle it: those versions only get a flags byte
+//     when it is non-zero, while the first byte of any tunnel frame
+//     [len:4][pkt] is zero (len <= maxFrameLen). See readHandshakeFlags.
+//
+// When the byte after the prefix turns out to belong to the first frame, or
+// has not arrived yet, it is handed over through the returned conn; otherwise
+// the returned conn is conn itself. Callers must use the returned conn from
+// then on.
+//
+// deadline bounds every read of the response (zero means handshakeReadTimeout
+// from now), so a peer that sends a prefix and goes quiet fails the handshake
+// instead of hanging it. The reader clears the read deadline before it
+// returns, on every path: the conn goes on to consumers that read without
+// deadlines of their own (the relay's bridge and pump), and a deadline left
+// behind would cut them off once it passed, however busy the tunnel was.
+func readHandshakeResponse(conn net.Conn, clientVersion byte, deadline time.Time) ([]byte, int, net.Conn, error) {
+	if deadline.IsZero() {
+		deadline = time.Now().Add(handshakeReadTimeout)
+	}
+	_ = conn.SetReadDeadline(deadline)
+	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
+
 	resp := make([]byte, handshakeRespBufSize)
-	n, err := conn.Read(resp)
+	if _, err := io.ReadFull(conn, resp[:9]); err != nil {
+		return nil, 0, conn, err
+	}
+	if resp[0] != 0x00 {
+		// Refusals built by the TUN core are the bare 9-byte prefix and
+		// nothing follows them. (Transports that refuse with a single byte
+		// never get here: the 9-byte read above fails on them.)
+		return resp, 9, conn, nil
+	}
+	n, next, err := readHandshakeFlags(conn, resp, clientVersion)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, conn, err
 	}
-	if n < 9 {
-		m, err := io.ReadFull(conn, resp[n:9])
-		if err != nil {
-			return nil, 0, err
-		}
-		n += m
-	}
-	if n == 9 {
-		n = peekHandshakeFlags(conn, resp, n)
-		if n == 9 && clientVersion >= tunHandshakeVersionDualStack {
-			log.Warn("Dual-stack requested but the exit answered without a flags byte: " +
-				"it predates dual-stack, continuing IPv4-only (upgrade exits and relays before clients)")
-		}
-	}
-	n, err = readResponseTail(conn, resp, n, clientVersion)
+	n, err = readResponseTail(next, resp, n, clientVersion)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, conn, err
 	}
-	return resp, n, nil
+	return resp, n, next, nil
 }
 
-// peekHandshakeFlags waits a bounded time for the optional flags byte when the
-// response stopped exactly at the 9-byte boundary. Returns 10 once the byte
-// arrived and 9 otherwise — a legacy server sends nothing more, and an
-// unbounded read of the tenth byte would hang the connect against it.
-func peekHandshakeFlags(conn net.Conn, resp []byte, n int) int {
-	if err := conn.SetReadDeadline(time.Now().Add(handshakeFlagsGrace)); err != nil {
-		// A transport that cannot arm a deadline must not be blocked on.
-		return n
+// readHandshakeFlags reads the flags byte resp[9] of a success response whose
+// 9-byte prefix is already in resp, and returns the number of valid bytes in
+// resp (9 or 10) and the conn to continue on.
+//
+// A v0x04 client always gets the byte, so it is read unconditionally under the
+// response deadline. Below v0x04 the byte is present only when non-zero, and
+// what follows a bare 9-byte answer is a tunnel frame starting with 0x00, so
+// the byte is looked at rather than assumed: non-zero is the flags byte, zero
+// is the first byte of a frame and is handed back through a replayConn. When
+// nothing has arrived within handshakeFlagsGrace the answer is taken to have
+// no flags (the only answer that can end at 9 bytes with nothing behind it),
+// and the read still in flight is handed over too.
+func readHandshakeFlags(conn net.Conn, resp []byte, clientVersion byte) (int, net.Conn, error) {
+	if clientVersion >= tunHandshakeVersionDualStack {
+		if _, err := io.ReadFull(conn, resp[9:10]); err != nil {
+			return 9, conn, fmt.Errorf("handshake flags read failed: %w", err)
+		}
+		return 10, conn, nil
 	}
-	defer func() {
-		_ = conn.SetReadDeadline(time.Now().Add(handshakeReadTimeout))
+	peek := peekHandshakeByte(conn)
+	select {
+	case r := <-peek:
+		switch {
+		case r.err != nil:
+			// Nothing followed: the response deadline ran out first, or the
+			// peer closed. Either way there is no flags byte, and the conn
+			// reports its own state to the next read.
+			return 9, conn, nil
+		case r.b != 0:
+			resp[9] = r.b
+			return 10, conn, nil
+		default:
+			return 9, &replayConn{Conn: conn, pending: []byte{r.b}}, nil
+		}
+	case <-time.After(handshakeFlagsGrace):
+		return 9, &replayConn{Conn: conn, inflight: peek}, nil
+	}
+}
+
+// peekResult is the outcome of the one-byte read peekHandshakeByte starts.
+type peekResult struct {
+	b   byte
+	err error
+}
+
+// peekHandshakeByte reads the byte after the 9-byte prefix on its own
+// goroutine and delivers it on the returned channel.
+//
+// The wait is bounded by a timer in readHandshakeFlags, not by a read
+// deadline on the transport. A deadline that fires inside a transport's
+// record read is not harmless: a record layer that has consumed a header and
+// then times out on the body loses its framing (confusion, for one), and some
+// transports do not honour read deadlines at all (the ICMP tunnel), so the
+// peek would hang until the first packet. A read left running past the grace
+// is not lost either: the replayConn that carries it delivers its byte first.
+func peekHandshakeByte(conn net.Conn) <-chan peekResult {
+	ch := make(chan peekResult, 1) // buffered: the goroutine never blocks on a reader that went away
+	go func() {
+		var one [1]byte
+		_, err := io.ReadFull(conn, one[:])
+		ch <- peekResult{b: one[0], err: err}
 	}()
-	m, err := io.ReadFull(conn, resp[n:n+1])
-	if err != nil {
-		return n
+	return ch
+}
+
+// replayConn returns bytes the handshake reader had to look at before the
+// packet loop reads from the underlying conn, and finishes a peek read the
+// reader stopped waiting for. It deliberately exposes no Unwrap/NetConn
+// accessor: anything reading the inner conn directly would skip the pending
+// bytes or race the read in flight.
+type replayConn struct {
+	net.Conn
+	pending  []byte
+	inflight <-chan peekResult // a peek read still running, nil once collected
+}
+
+func (c *replayConn) Read(p []byte) (int, error) {
+	if c.inflight != nil {
+		r := <-c.inflight
+		c.inflight = nil
+		if r.err != nil {
+			// The read ended without a byte; whatever ended it (a deadline
+			// the caller set since, a close) is this read's answer.
+			return 0, r.err
+		}
+		c.pending = append(c.pending, r.b)
 	}
-	return n + m
+	if len(c.pending) > 0 {
+		n := copy(p, c.pending)
+		c.pending = c.pending[n:]
+		return n, nil
+	}
+	return c.Conn.Read(p)
 }
 
 // readResponseTail completes the handshake response beyond the mandatory
@@ -1126,10 +1227,8 @@ func peekHandshakeFlags(conn net.Conn, resp []byte, n int) int {
 //
 // clientVersion disambiguates the two port-hop layouts, which are otherwise
 // indistinguishable by content: a v0x01 client gets the 14-byte v1 form, and
-// anything above it gets the 20+seed v2 form. Version 0 means "unknown"
-// (the relay, which forwards a response whose client it cannot see) and is
-// treated as v2, matching what the exit sends every client this code speaks
-// for.
+// anything above it gets the 20+seed v2 form. Version 0 (a client that sent
+// no version byte) is never offered port hopping, so its branch is moot.
 func readResponseTail(conn net.Conn, resp []byte, n int, clientVersion byte) (int, error) {
 	if n < 10 {
 		return n, nil // legacy 9-byte form, nothing follows

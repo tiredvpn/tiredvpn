@@ -2,7 +2,6 @@ package tun
 
 import (
 	"bytes"
-	"errors"
 	"net"
 	"strings"
 	"testing"
@@ -39,24 +38,6 @@ func chunkedConn(t *testing.T, payload []byte, splits ...int) net.Conn {
 		}
 	}()
 	return cli
-}
-
-// deadlineErrConn refuses to arm a read deadline. peekHandshakeFlags must
-// treat that as "cannot bound this read" and give up rather than read the
-// tenth byte unbounded, which against a legacy exit would hang the connect
-// until the outer handshake timeout.
-type deadlineErrConn struct {
-	scriptedConn
-	reads int
-}
-
-func (c *deadlineErrConn) Read(p []byte) (int, error) {
-	c.reads++
-	return c.scriptedConn.Read(p)
-}
-
-func (c *deadlineErrConn) SetReadDeadline(time.Time) error {
-	return errors.New("transport cannot arm a deadline")
 }
 
 // dualResponses returns the response shapes an exit may send to a dual-stack
@@ -99,7 +80,7 @@ func TestReadHandshakeResponseSplitAtEveryBoundary(t *testing.T) {
 				if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 					t.Fatalf("split %d: set deadline: %v", k, err)
 				}
-				resp, n, err := readHandshakeResponse(conn, tunHandshakeVersionDualStack)
+				resp, n, _, err := readHandshakeResponse(conn, tunHandshakeVersionDualStack, time.Time{})
 				if err != nil {
 					t.Fatalf("split at %d: %v", k, err)
 				}
@@ -124,7 +105,7 @@ func TestReadHandshakeResponseShapesSingleRead(t *testing.T) {
 	for name, payload := range dualResponses() {
 		t.Run(name, func(t *testing.T) {
 			conn := &scriptedConn{chunks: [][]byte{payload}}
-			resp, n, err := readHandshakeResponse(conn, tunHandshakeVersionDualStack)
+			resp, n, _, err := readHandshakeResponse(conn, tunHandshakeVersionDualStack, time.Time{})
 			if err != nil {
 				t.Fatalf("readHandshakeResponse: %v", err)
 			}
@@ -173,7 +154,7 @@ func TestReadHandshakeResponseV4OnlyShapes(t *testing.T) {
 				if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 					t.Fatalf("split %d: set deadline: %v", k, err)
 				}
-				resp, n, err := readHandshakeResponse(conn, tc.version)
+				resp, n, _, err := readHandshakeResponse(conn, tc.version, time.Time{})
 				if err != nil {
 					t.Fatalf("split at %d: %v", k, err)
 				}
@@ -201,7 +182,7 @@ func TestReadHandshakeResponseTruncatedMidResponse(t *testing.T) {
 		if err := conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
 			t.Fatalf("set deadline: %v", err)
 		}
-		if _, n, err := readHandshakeResponse(conn, tunHandshakeVersionDualStack); err == nil {
+		if _, n, _, err := readHandshakeResponse(conn, tunHandshakeVersionDualStack, time.Now().Add(500*time.Millisecond)); err == nil {
 			t.Errorf("truncated at %d bytes: got n=%d and no error, want an error", k, n)
 		}
 	}
@@ -211,7 +192,7 @@ func TestReadHandshakeResponseTruncatedMidResponse(t *testing.T) {
 	// caller then parses as a legacy one and treats as a successful connect.
 	for _, version := range []byte{tunHandshakeVersion, tunHandshakeVersionDualStack} {
 		conn := &scriptedConn{} // any read fails
-		resp, n, err := readHandshakeResponse(conn, version)
+		resp, n, _, err := readHandshakeResponse(conn, version, time.Time{})
 		if err == nil {
 			t.Errorf("version 0x%02x: silent server accepted, got n=%d", version, n)
 		}
@@ -222,14 +203,14 @@ func TestReadHandshakeResponseTruncatedMidResponse(t *testing.T) {
 }
 
 // TestReadHandshakeResponseNoExtraReadOnV3Response pins that a complete
-// response costs exactly one read, whatever version the client announced.
-// scriptedConn errors on any read past its script, so a second read fails the
-// test outright.
+// response is consumed whole and nothing is read past it, whatever version the
+// client announced. scriptedConn errors on any read past its script, so a
+// read beyond the response fails the test outright.
 //
 // A response that already carries its flags byte tells the reader everything
 // it needs, so nothing further is fetched. The bare 9-byte form is a different
-// case and is covered by the peek tests: there the reader cannot know whether
-// a tenth byte is coming and pays a bounded grace period to find out.
+// case and is covered by the peek tests: there a v0x03 reader looks at the
+// next byte, bounded by a grace period, to tell flags from a frame.
 func TestReadHandshakeResponseNoExtraReadOnV3Response(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -243,7 +224,7 @@ func TestReadHandshakeResponseNoExtraReadOnV3Response(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			conn := &scriptedConn{chunks: [][]byte{tc.payload}}
-			_, n, err := readHandshakeResponse(conn, tc.version)
+			_, n, _, err := readHandshakeResponse(conn, tc.version, time.Time{})
 			if err != nil {
 				t.Fatalf("readHandshakeResponse: %v", err)
 			}
@@ -254,51 +235,6 @@ func TestReadHandshakeResponseNoExtraReadOnV3Response(t *testing.T) {
 				t.Errorf("consumed %d reads, want exactly 1", conn.idx)
 			}
 		})
-	}
-}
-
-// TestPeekHandshakeFlagsUnarmableDeadline covers the transport that cannot set
-// a read deadline. The peek must then not read at all: an unbounded read of
-// the tenth byte against a legacy exit blocks until the outer handshake
-// timeout, turning a working IPv4-only connect into a ten-second hang.
-func TestPeekHandshakeFlagsUnarmableDeadline(t *testing.T) {
-	conn := &deadlineErrConn{
-		scriptedConn: scriptedConn{chunks: [][]byte{{tunFlagDualStack}}},
-	}
-	resp := make([]byte, handshakeRespBufSize)
-	copy(resp, handshakeBase)
-
-	if got := peekHandshakeFlags(conn, resp, 9); got != 9 {
-		t.Errorf("peekHandshakeFlags = %d, want 9 (no read without a deadline)", got)
-	}
-	if conn.reads != 0 {
-		t.Errorf("peek issued %d reads, want 0", conn.reads)
-	}
-}
-
-// TestPeekHandshakeFlagsRestoresDeadline checks the deadline handed back to the
-// caller. The peek narrows the read deadline to its grace window; leaving it
-// narrowed would make the reads that follow (the dual block, then the whole
-// packet loop) time out after 300ms.
-func TestPeekHandshakeFlagsRestoresDeadline(t *testing.T) {
-	rec := &deadlineRecorderConn{
-		scriptedConn: scriptedConn{chunks: [][]byte{{tunFlagDualStack}}},
-	}
-	resp := make([]byte, handshakeRespBufSize)
-	copy(resp, handshakeBase)
-
-	before := time.Now()
-	if got := peekHandshakeFlags(rec, resp, 9); got != 10 {
-		t.Fatalf("peekHandshakeFlags = %d, want 10", got)
-	}
-	if len(rec.deadlines) != 2 {
-		t.Fatalf("armed %d deadlines, want 2 (grace, then restore)", len(rec.deadlines))
-	}
-	if d := rec.deadlines[0].Sub(before); d > handshakeFlagsGrace+time.Second {
-		t.Errorf("grace deadline is %v out, want about %v", d, handshakeFlagsGrace)
-	}
-	if d := rec.deadlines[1].Sub(before); d < handshakeReadTimeout/2 {
-		t.Errorf("restored deadline is %v out, want about %v", d, handshakeReadTimeout)
 	}
 }
 

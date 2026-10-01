@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"io"
 	"math/rand"
 	"net"
 	"os"
@@ -1291,23 +1290,16 @@ func (cs *ControlServer) performTUNHandshake() (assignedIP, serverIP net.IP, err
 		return nil, nil, fmt.Errorf("handshake write failed: %w", err)
 	}
 
-	// Read response (up to 64 bytes for extended v2 with port hopping config)
-	// Minimum 9 bytes: [status:1][serverIP:4][clientIP:4]
-	// The dual-stack path reuses readHandshakeResponse, which additionally
-	// drains the trailing 32-byte [serverIP6:16][clientIP6:16] block so the
-	// stream stays frame-aligned for the relay that follows.
-	var resp []byte
-	var n int
-	if cs.config.DualStack {
-		resp, n, err = readHandshakeResponse(cs.serverConn, tunHandshakeVersionDualStack)
-	} else {
-		buf := make([]byte, 64)
-		n, err = io.ReadAtLeast(cs.serverConn, buf, 9)
-		resp = buf
-	}
+	// Read the response for the version just sent. readHandshakeResponse reads
+	// exactly the response (flags byte, port-hop layout, dual-stack block) and
+	// nothing past it, so the relay that follows starts frame-aligned; the conn
+	// it returns replaces cs.serverConn because it may carry the first byte of
+	// the first frame back to the relay.
+	resp, n, next, err := readHandshakeResponse(cs.serverConn, version, time.Now().Add(handshakeReadTimeout))
 	if err != nil {
 		return nil, nil, fmt.Errorf("handshake read failed: %w", err)
 	}
+	cs.serverConn = next
 	// Guard before any indexing: a short response with a nil error would make
 	// resp[0] / resp[5:9] below panic, and that panic is swallowed by the
 	// recover() in handleConnection — the host then sees the control socket

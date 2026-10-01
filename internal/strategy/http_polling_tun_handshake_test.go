@@ -38,13 +38,13 @@ func TestPollingFeederSparesHandshakeFlagsPeek(t *testing.T) {
 	done := make(chan result, 1)
 	go func() {
 		c.SetReadDeadline(time.Now().Add(10 * time.Second))
-		resp, err := tun.ReadTUNHandshakeResponse(c)
+		resp, next, err := tun.ReadTUNHandshakeResponse(c, 0x03, time.Time{})
 		if err != nil {
 			done <- result{err: err}
 			return
 		}
 		hdr := make([]byte, 4)
-		if _, err := io.ReadFull(c, hdr); err != nil {
+		if _, err := io.ReadFull(next, hdr); err != nil {
 			done <- result{hs: resp, err: err}
 			return
 		}
@@ -54,7 +54,7 @@ func TestPollingFeederSparesHandshakeFlagsPeek(t *testing.T) {
 			return
 		}
 		body := make([]byte, n)
-		if _, err := io.ReadFull(c, body); err != nil {
+		if _, err := io.ReadFull(next, body); err != nil {
 			done <- result{hs: resp, err: err}
 			return
 		}

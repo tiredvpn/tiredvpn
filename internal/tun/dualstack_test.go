@@ -208,8 +208,10 @@ func TestPerformTUNHandshakeDualStack(t *testing.T) {
 		}
 	})
 
-	t.Run("dual on, non-dual server falls back to v4-only", func(t *testing.T) {
-		cs, conn := newCS(true, baseResp)
+	t.Run("dual on, exit without a v6 pool falls back to v4-only", func(t *testing.T) {
+		// Every exit since dual-stack exists answers a v0x04 client with a
+		// flags byte, zero when it has no -ip-pool-v6.
+		cs, conn := newCS(true, append(append([]byte{}, baseResp...), 0x00))
 		if _, _, err := cs.performTUNHandshake(); err != nil {
 			t.Fatalf("performTUNHandshake: %v", err)
 		}
@@ -297,20 +299,21 @@ func TestControlResponseIPv6RemovedJSON(t *testing.T) {
 }
 
 // TestHandshakeFallbackNonDualServer is the client-side regression for a
-// dual-requested client against a non-dual exit: the v3 response parses to a
-// clean v4-only capability set, so no v6 configuration is emitted anywhere
-// downstream.
+// dual-requested client against an exit that does not offer dual-stack: the
+// response parses to a clean v4-only capability set, so no v6 configuration
+// is emitted anywhere downstream.
 func TestHandshakeFallbackNonDualServer(t *testing.T) {
-	// Legacy 9-byte response (pre-flags server).
-	conn := &scriptedConn{chunks: [][]byte{{0x00, 10, 8, 0, 1, 10, 8, 0, 2}}}
+	// Flags-only response with no bits set: what an exit without -ip-pool-v6
+	// sends a v0x04 client.
+	conn := &scriptedConn{chunks: [][]byte{append(append([]byte{}, handshakeBase...), 0x00)}}
 	v := &VPNClient{tun: &TUNDevice{mtu: 1280}, ipv6Policy: IPv6PolicyDual}
-	resp, n, err := v.doHandshake(conn, net.IPv4zero)
+	resp, n, _, err := v.doHandshake(conn, net.IPv4zero)
 	if err != nil {
 		t.Fatalf("doHandshake: %v", err)
 	}
-	caps, hasCaps := parseServerCapabilities(resp, n)
-	if hasCaps || caps.DualStackEnabled || caps.ServerIP6 != nil || caps.ClientIP6 != nil {
-		t.Errorf("legacy server response must yield no caps and no v6: %+v hasCaps=%v", caps, hasCaps)
+	caps, _ := parseServerCapabilities(resp, n)
+	if caps.DualStackEnabled || caps.ServerIP6 != nil || caps.ClientIP6 != nil {
+		t.Errorf("non-dual exit response must yield no v6: %+v", caps)
 	}
 	if conn.written[7] != tunHandshakeVersionDualStack {
 		t.Errorf("dual client must still send 0x%02x, sent 0x%02x", tunHandshakeVersionDualStack, conn.written[7])

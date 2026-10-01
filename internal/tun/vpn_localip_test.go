@@ -23,7 +23,7 @@ func TestLocalIPReportsAssignedNotRequested(t *testing.T) {
 	conn := &scriptedConn{chunks: [][]byte{resp}}
 
 	v := &VPNClient{tun: &TUNDevice{mtu: 1280}, localIP: requested}
-	if err := v.performHandshake(conn); err != nil {
+	if _, err := v.performHandshake(conn); err != nil {
 		t.Fatalf("performHandshake: %v", err)
 	}
 
@@ -45,7 +45,7 @@ func TestLocalIPKeepsRequestedWhenEchoed(t *testing.T) {
 	conn := &scriptedConn{chunks: [][]byte{resp}}
 
 	v := &VPNClient{tun: &TUNDevice{mtu: 1280}, localIP: requested}
-	if err := v.performHandshake(conn); err != nil {
+	if _, err := v.performHandshake(conn); err != nil {
 		t.Fatalf("performHandshake: %v", err)
 	}
 	if got := v.LocalIP(); !got.Equal(requested) {
