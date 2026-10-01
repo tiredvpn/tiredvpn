@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -972,5 +973,128 @@ func TestPooledRelayLengthPrefixedKeepsPartialPrefixAcrossTimeout(t *testing.T) 
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("relay did not terminate")
+	}
+}
+
+// --- target framing ------------------------------------------------------
+
+// countingConn records every byte the client writes into the tunnel.
+type countingConn struct {
+	net.Conn
+	written *atomic.Int64
+}
+
+func (c countingConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	c.written.Add(int64(n))
+	return n, err
+}
+
+// countingConnector hands out tunnel connections whose writes are counted, and
+// runs a server that reads the framed target and acks it. It records every
+// target the server received, so a test can check what went over the wire.
+type countingConnector struct {
+	calls   atomic.Int32
+	written atomic.Int64
+	mu      sync.Mutex
+	seen    []string
+}
+
+func (c *countingConnector) Connect(_ context.Context, _ string) (net.Conn, strategy.Strategy, error) {
+	c.calls.Add(1)
+	client, server := net.Pipe()
+	go func() {
+		defer server.Close()
+		var got string
+		lenBuf := make([]byte, 2)
+		if _, err := io.ReadFull(server, lenBuf); err == nil {
+			addr := make([]byte, binary.BigEndian.Uint16(lenBuf))
+			if _, err := io.ReadFull(server, addr); err == nil {
+				got = string(addr)
+			}
+		}
+		c.mu.Lock()
+		c.seen = append(c.seen, got)
+		c.mu.Unlock()
+		server.Write([]byte{0x00})
+		io.Copy(io.Discard, server)
+	}()
+	return countingConn{Conn: client, written: &c.written}, fakeStrategy{}, nil
+}
+
+// TestDialTargetRefusesUnframeableTargetBeforeWriting pins the fix for #94. The
+// first byte of the 2-byte length prefix is the byte every server read path
+// compares against 0x02 (TUN mode); a target of 512+ bytes makes that byte 0x02
+// or higher. DialTarget must refuse such a target before it opens a tunnel or
+// writes a single byte into one.
+func TestDialTargetRefusesUnframeableTargetBeforeWriting(t *testing.T) {
+	host := func(n int) string { return strings.Repeat("a", n) }
+	cases := map[string]string{
+		"512 bytes (prefix 0x02 0x00)":   host(508) + ":443",
+		"host 256 bytes":                 host(256) + ":443",
+		"bracketed host 256 bytes":       "[" + host(256) + "]:443",
+		"prefix 0x03":                    host(800) + ":443",
+		"65535 bytes":                    host(65529) + ":443",
+		"port longer than 5 digits":      "example.com:000443",
+		"port out of range":              "example.com:65536",
+		"port not decimal":               "example.com:https",
+		"no port":                        "example.com",
+		"port bytes smuggle long target": "example.com:" + host(600),
+	}
+	for name, target := range cases {
+		t.Run(name, func(t *testing.T) {
+			c := &countingConnector{}
+			p := newTestPool(c)
+			conn, err := p.DialTarget(context.Background(), target)
+			if err == nil {
+				conn.Close()
+				t.Fatalf("DialTarget(%d-byte target): expected error, got success", len(target))
+			}
+			if got := c.calls.Load(); got != 0 {
+				t.Fatalf("Connect called %d times for an unframeable target, want 0", got)
+			}
+			if got := c.written.Load(); got != 0 {
+				t.Fatalf("%d bytes written for an unframeable target, want 0", got)
+			}
+		})
+	}
+}
+
+// TestDialTargetAcceptsSOCKS5SizedTargets is the positive control for the test
+// above: every target the SOCKS5 address format can carry still goes through,
+// byte for byte, with a length prefix whose first byte is never 0x02.
+func TestDialTargetAcceptsSOCKS5SizedTargets(t *testing.T) {
+	host := func(n int) string { return strings.Repeat("a", n) }
+	cases := []string{
+		"a:1",
+		"example.com:443",
+		"192.0.2.1:80",
+		"[2001:db8::1]:443",
+		host(255) + ":443",
+		host(255) + ":65535",            // 261 bytes, the longest unbracketed target
+		"[" + host(255) + "]:65535",     // 263 bytes, the longest target at all
+		"[fe80::1%" + host(200) + "]:0", // zone-qualified IPv6 literal
+	}
+	for _, target := range cases {
+		t.Run(fmt.Sprintf("%d bytes", len(target)), func(t *testing.T) {
+			c := &countingConnector{}
+			p := newTestPool(c)
+			conn, err := p.DialTarget(context.Background(), target)
+			if err != nil {
+				t.Fatalf("DialTarget(%d-byte target): %v", len(target), err)
+			}
+			conn.Close()
+			if want := int64(2 + len(target)); c.written.Load() != want {
+				t.Fatalf("wrote %d bytes, want %d (prefix + target)", c.written.Load(), want)
+			}
+			if len(target)>>8 >= 0x02 {
+				t.Fatalf("accepted target of %d bytes has prefix first byte 0x%02x", len(target), len(target)>>8)
+			}
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			if len(c.seen) != 1 || c.seen[0] != target {
+				t.Fatalf("server received %q, want the target unchanged", c.seen)
+			}
+		})
 	}
 }
