@@ -2054,29 +2054,144 @@ func RunTUNRelayWithCallback(tunDev *TUNDevice, serverConn net.Conn, localIP, re
 // RunTUNRelayWithCallbacks runs packet relay with external stop control and full callback support
 // Includes proactive dead connection detection (45s timeout) and keepalive event notifications
 func RunTUNRelayWithCallbacks(tunDev *TUNDevice, serverConn net.Conn, localIP, remoteIP net.IP, externalStopCh chan struct{}, callbacks *RelayCallbacks) {
-	log.Info("Starting TUN relay (local=%s, remote=%s)", localIP, remoteIP)
+	newTUNRelay(tunDev, serverConn, localIP, remoteIP, externalStopCh, callbacks).run()
+}
 
+// tunRelay is one relay over a server connection, with a handle that lets
+// the TUN side be replaced while it runs.
+//
+// With an external stop channel the server connection belongs to whoever
+// started the relay (the control server's session), not to the relay: a
+// relay its owner stopped leaves the connection alone and reports nothing,
+// because the owner is either closing the connection itself or handing it
+// on. Only a relay that dies on its own - a read or write on the connection
+// failing while nobody asked it to stop - closes the connection and reports
+// OnError. Without an external stop channel the relay owns the connection
+// and always closes it, as before.
+type tunRelay struct {
+	serverConn net.Conn
+	remoteIP   net.IP
+	localIP    net.IP
+	callbacks  *RelayCallbacks
+
+	stopCh       chan struct{}
+	ownerStopped func() bool // the external stop channel was closed
+	safeClose    func()
+
+	tun          atomic.Pointer[TUNDevice] // where server->TUN writes go
+	lastActivity atomic.Int64
+
+	// firstDev/firstStop are the reader run starts with, fixed at
+	// construction: a SwapTUN that lands before run gets going must still
+	// find - and stop - the reader of the device it replaces.
+	firstDev  *TUNDevice
+	firstStop chan struct{}
+
+	mu         sync.Mutex
+	readerStop chan struct{} // stops the reader of the current TUN only
+	done       chan struct{} // closed when run returns
+}
+
+func newTUNRelay(tunDev *TUNDevice, serverConn net.Conn, localIP, remoteIP net.IP, externalStopCh chan struct{}, callbacks *RelayCallbacks) *tunRelay {
 	stopCh, safeClose := makeStopChannel(externalStopCh)
-
-	lastActivity := time.Now().UnixNano()
-	updateActivity := func() { atomic.StoreInt64(&lastActivity, time.Now().UnixNano()) }
-	getIdleDuration := func() time.Duration {
-		return time.Since(time.Unix(0, atomic.LoadInt64(&lastActivity)))
+	r := &tunRelay{
+		serverConn: serverConn,
+		localIP:    localIP,
+		remoteIP:   remoteIP,
+		callbacks:  callbacks,
+		stopCh:     stopCh,
+		safeClose:  safeClose,
+		readerStop: make(chan struct{}),
+		done:       make(chan struct{}),
 	}
+	r.ownerStopped = func() bool {
+		if externalStopCh == nil {
+			return false
+		}
+		select {
+		case <-externalStopCh:
+			return true
+		default:
+			return false
+		}
+	}
+	r.tun.Store(tunDev)
+	r.firstDev, r.firstStop = tunDev, r.readerStop
+	r.updateActivity()
+	return r
+}
 
-	go runDeadConnectionMonitor(stopCh, safeClose, getIdleDuration, callbacks)
-	go runKeepaliveSender(stopCh, serverConn)
-	go runTUNToServer(stopCh, safeClose, tunDev, serverConn, updateActivity)
+// startTUNRelay runs a relay in its own goroutine and returns its handle.
+func startTUNRelay(tunDev *TUNDevice, serverConn net.Conn, localIP, remoteIP net.IP, externalStopCh chan struct{}, callbacks *RelayCallbacks) *tunRelay {
+	r := newTUNRelay(tunDev, serverConn, localIP, remoteIP, externalStopCh, callbacks)
+	go r.run()
+	return r
+}
 
-	errorReason := runServerToTUN(stopCh, safeClose, tunDev, serverConn, remoteIP, updateActivity, callbacks)
+func (r *tunRelay) updateActivity() { r.lastActivity.Store(time.Now().UnixNano()) }
 
-	safeClose()
-	serverConn.Close()
+func (r *tunRelay) idleDuration() time.Duration {
+	return time.Since(time.Unix(0, r.lastActivity.Load()))
+}
+
+// connFailed is called when a write on the server connection fails. A
+// relay its owner did not stop treats that as the connection dying and
+// closes it, so the server reader fails at once and the death is reported
+// now instead of after the read timeout.
+func (r *tunRelay) connFailed() {
+	if !r.ownerStopped() {
+		r.serverConn.Close()
+	}
+}
+
+func (r *tunRelay) run() {
+	defer close(r.done)
+	log.Info("Starting TUN relay (local=%s, remote=%s)", r.localIP, r.remoteIP)
+
+	go runDeadConnectionMonitor(r.stopCh, r.safeClose, r.idleDuration, r.callbacks)
+	go runKeepaliveSender(r.stopCh, r.serverConn, r.connFailed)
+	go runTUNToServer(r.stopCh, r.firstStop, r.safeClose, r.firstDev, r.serverConn, r.updateActivity, r.connFailed)
+
+	errorReason := runServerToTUN(r.stopCh, r.safeClose, &r.tun, r.serverConn, r.remoteIP, r.updateActivity, r.callbacks)
+
+	r.safeClose()
+	if r.ownerStopped() {
+		// The owner stopped us and keeps the connection; whatever the reader
+		// returned (its read was cut short on purpose) is not a death.
+		log.Info("TUN relay stopped by its owner")
+		return
+	}
+	r.serverConn.Close()
 	log.Info("TUN relay stopped (reason: %s)", errorReason)
 
-	if callbacks != nil && callbacks.OnError != nil && errorReason != "" {
-		callbacks.OnError(errorReason)
+	if r.callbacks != nil && r.callbacks.OnError != nil && errorReason != "" {
+		r.callbacks.OnError(errorReason)
 	}
+}
+
+// SwapTUN moves a running relay onto newDev. The server connection, the
+// server reader, the keepalive sender and the dead-connection monitor carry
+// on untouched: from the exit's side nothing happens. Server->TUN writes go
+// to newDev from now on, a reader for newDev starts, and the reader of the
+// previous device is told to stop; the caller closes that device, which
+// wakes the reader if it is blocked. Reports false if the relay is no longer
+// running, in which case nothing changed.
+func (r *tunRelay) SwapTUN(newDev *TUNDevice) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	select {
+	case <-r.done:
+		return false
+	default:
+	}
+	if r.ownerStopped() {
+		return false
+	}
+	close(r.readerStop)
+	r.readerStop = make(chan struct{})
+	r.tun.Store(newDev)
+	go runTUNToServer(r.stopCh, r.readerStop, r.safeClose, newDev, r.serverConn, r.updateActivity, r.connFailed)
+	return true
 }
 
 // makeStopChannel returns the stop channel and a safe-close function.
@@ -2113,7 +2228,7 @@ func runDeadConnectionMonitor(stopCh chan struct{}, safeClose func(), getIdleDur
 }
 
 // runKeepaliveSender periodically writes zero-length keepalive frames to serverConn.
-func runKeepaliveSender(stopCh chan struct{}, serverConn net.Conn) {
+func runKeepaliveSender(stopCh chan struct{}, serverConn net.Conn, connFailed func()) {
 	ticker := time.NewTicker(keepaliveInterval)
 	defer ticker.Stop()
 	for {
@@ -2123,6 +2238,7 @@ func runKeepaliveSender(stopCh chan struct{}, serverConn net.Conn) {
 			serverConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			if _, err := serverConn.Write(keepalive); err != nil {
 				log.Debug("Keepalive write error: %v", err)
+				connFailed()
 				return
 			}
 			log.Debug("Sent keepalive")
@@ -2132,14 +2248,19 @@ func runKeepaliveSender(stopCh chan struct{}, serverConn net.Conn) {
 	}
 }
 
-// runTUNToServer reads IP packets from the TUN device and frames them to serverConn.
-func runTUNToServer(stopCh chan struct{}, safeClose func(), tunDev *TUNDevice, serverConn net.Conn, updateActivity func()) {
+// runTUNToServer reads IP packets from one TUN device and frames them to
+// serverConn. readerStop ends this reader alone (the relay moved to another
+// device); stopCh ends the whole relay.
+func runTUNToServer(stopCh, readerStop chan struct{}, safeClose func(), tunDev *TUNDevice, serverConn net.Conn, updateActivity func(), connFailed func()) {
 	buf := make([]byte, tunDev.mtu+4)
 	pktCount := 0
 	for {
 		select {
 		case <-stopCh:
 			log.Debug("TUN->Server: stop signal received")
+			return
+		case <-readerStop:
+			log.Debug("TUN->Server: TUN replaced, reader for the old device exits")
 			return
 		default:
 		}
@@ -2149,6 +2270,13 @@ func runTUNToServer(stopCh chan struct{}, safeClose func(), tunDev *TUNDevice, s
 			if isTemporaryError(err) {
 				time.Sleep(10 * time.Millisecond)
 				continue
+			}
+			select {
+			case <-readerStop:
+				// The device was closed because the relay moved off it.
+				log.Debug("TUN->Server: old device closed after swap: %v", err)
+				return
+			default:
 			}
 			log.Debug("TUN read error: %v", err)
 			safeClose()
@@ -2166,6 +2294,7 @@ func runTUNToServer(stopCh chan struct{}, safeClose func(), tunDev *TUNDevice, s
 		serverConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		if _, err := serverConn.Write(buf[:n+4]); err != nil {
 			log.Debug("Server write error: %v", err)
+			connFailed()
 			safeClose()
 			return
 		}
@@ -2173,9 +2302,10 @@ func runTUNToServer(stopCh chan struct{}, safeClose func(), tunDev *TUNDevice, s
 	}
 }
 
-// runServerToTUN reads framed packets from serverConn and writes them to the TUN device.
-// Returns an error reason string (empty if stopped intentionally).
-func runServerToTUN(stopCh chan struct{}, safeClose func(), tunDev *TUNDevice, serverConn net.Conn, remoteIP net.IP, updateActivity func(), callbacks *RelayCallbacks) string {
+// runServerToTUN reads framed packets from serverConn and writes them to the
+// relay's current TUN device, re-read per packet so a swap takes effect on
+// the next one. Returns an error reason string (empty if stopped intentionally).
+func runServerToTUN(stopCh chan struct{}, safeClose func(), tun *atomic.Pointer[TUNDevice], serverConn net.Conn, remoteIP net.IP, updateActivity func(), callbacks *RelayCallbacks) string {
 	lenBuf := make([]byte, 4)
 	pktCount := 0
 	for {
@@ -2206,6 +2336,7 @@ func runServerToTUN(stopCh chan struct{}, safeClose func(), tunDev *TUNDevice, s
 			continue
 		}
 
+		tunDev := tun.Load()
 		if reason := handleOversizedPacket(tunDev, serverConn, remoteIP, pktLen); reason != "" {
 			if reason == "dropped" {
 				continue
