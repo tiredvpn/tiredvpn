@@ -2148,8 +2148,12 @@ func (r *tunRelay) run() {
 	defer close(r.done)
 	log.Info("Starting TUN relay (local=%s, remote=%s)", r.localIP, r.remoteIP)
 
-	go runDeadConnectionMonitor(r.stopCh, r.safeClose, r.idleDuration, r.callbacks)
-	go runKeepaliveSender(r.stopCh, r.serverConn, r.connFailed)
+	// Both helpers stop with this relay, not only with its owner: after the
+	// relay died on its own nobody may close stopCh for a long time, and a
+	// monitor left running would report the same death again 45s later -
+	// after a restart, into a control connection that no longer exists.
+	go runDeadConnectionMonitor(r.stopCh, r.done, r.safeClose, r.idleDuration, r.callbacks)
+	go runKeepaliveSender(r.stopCh, r.done, r.serverConn, r.connFailed)
 	go runTUNToServer(r.stopCh, r.firstStop, r.safeClose, r.firstDev, r.serverConn, r.updateActivity, r.connFailed)
 
 	errorReason := runServerToTUN(r.stopCh, r.safeClose, &r.tun, r.serverConn, r.remoteIP, r.updateActivity, r.callbacks)
@@ -2206,7 +2210,7 @@ func makeStopChannel(externalStopCh chan struct{}) (chan struct{}, func()) {
 }
 
 // runDeadConnectionMonitor periodically checks for idle connections and triggers safeClose.
-func runDeadConnectionMonitor(stopCh chan struct{}, safeClose func(), getIdleDuration func() time.Duration, callbacks *RelayCallbacks) {
+func runDeadConnectionMonitor(stopCh chan struct{}, relayDone <-chan struct{}, safeClose func(), getIdleDuration func() time.Duration, callbacks *RelayCallbacks) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -2223,12 +2227,14 @@ func runDeadConnectionMonitor(stopCh chan struct{}, safeClose func(), getIdleDur
 			}
 		case <-stopCh:
 			return
+		case <-relayDone:
+			return
 		}
 	}
 }
 
 // runKeepaliveSender periodically writes zero-length keepalive frames to serverConn.
-func runKeepaliveSender(stopCh chan struct{}, serverConn net.Conn, connFailed func()) {
+func runKeepaliveSender(stopCh chan struct{}, relayDone <-chan struct{}, serverConn net.Conn, connFailed func()) {
 	ticker := time.NewTicker(keepaliveInterval)
 	defer ticker.Stop()
 	for {
@@ -2243,6 +2249,8 @@ func runKeepaliveSender(stopCh chan struct{}, serverConn net.Conn, connFailed fu
 			}
 			log.Debug("Sent keepalive")
 		case <-stopCh:
+			return
+		case <-relayDone:
 			return
 		}
 	}
