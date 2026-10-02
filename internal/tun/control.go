@@ -9,7 +9,6 @@ import (
 	"net"
 	"os"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/log"
@@ -248,68 +247,138 @@ func (cs *ControlServer) handleConnection(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	rawConn, err := unixConn.SyscallConn()
-	if err != nil {
-		log.Debug("Failed to get syscall conn: %v", err)
-		return
-	}
-
 	encoder := json.NewEncoder(conn)
 
+	// The socket is a byte stream: one read may hold several commands, or
+	// part of one. Parsing each read as a single JSON value turned the host's
+	// network_available + network_changed, written back to back, into a parse
+	// error, a closed connection and a full core restart on the host.
+	framer := newControlFramer()
+	defer framer.release()
+	buf := make([]byte, 4096)
+	// Room for a few descriptors: the host sends one, and any extra that
+	// arrive are closed below rather than left to the kernel's truncation.
+	oob := make([]byte, unix.CmsgSpace(4*4))
+
 	for {
-		// Read message with potential fd using recvmsg
-		jsonData, fd, err := recvMessageWithFd(rawConn)
+		n, oobn, flags, _, err := unixConn.ReadMsgUnix(buf, oob)
+		fd := receivedFd(oob[:oobn], flags)
+		if n == 0 {
+			releaseReceivedFd(fd)
+			if err != nil {
+				log.Debug("Control read: %v", err)
+			}
+			return
+		}
+		msgs, ferr := framer.feed(buf[:n], fd)
+		for i, m := range msgs {
+			resp, ok := cs.dispatchControl(ctx, m)
+			if !ok {
+				continue
+			}
+			if err := encoder.Encode(resp); err != nil {
+				log.Debug("Control encode error: %v", err)
+				for _, rest := range msgs[i+1:] {
+					releaseReceivedFd(rest.fd)
+				}
+				return
+			}
+		}
+		if ferr != nil {
+			log.Warn("Control: %v, closing the connection", ferr)
+			return
+		}
 		if err != nil {
-			log.Debug("recvMessageWithFd error: %v", err)
-			return
-		}
-
-		var cmd ControlCommand
-		if err := json.Unmarshal(jsonData, &cmd); err != nil {
-			log.Debug("JSON unmarshal error: %v (data: %s)", err, string(jsonData))
-			return
-		}
-
-		log.Info("Control command: %s (received_fd=%d)", cmd.Command, fd)
-
-		var resp ControlResponse
-
-		// A received fd belongs to the core from recvmsg on: the kernel
-		// installed it for us and the host keeps its own. set_fd and
-		// reconnect/network_changed take it over (adoptTunFd); every other
-		// command has no use for it, and leaving it open would pin a VPN
-		// interface for the life of the process.
-		switch cmd.Command {
-		case "set_fd":
-			resp = cs.handleSetFdWithReceivedFd(ctx, fd)
-
-		case "reconnect", "network_changed":
-			resp = cs.handleReconnect(ctx, cmd.Reason, fd)
-
-		default:
-			if fd >= 0 {
-				log.Warn("Control command %q carried fd %d it does not use, closing it", cmd.Command, fd)
-				releaseReceivedFd(fd)
-			}
-			switch cmd.Command {
-			case "connect":
-				resp = cs.handleConnect(ctx)
-			case "disconnect":
-				resp = cs.handleDisconnect()
-			case "status":
-				resp = cs.handleStatus()
-			case "network_available":
-				resp = cs.handleNetworkAvailable()
-			default:
-				resp = ControlResponse{Status: "error", Error: "unknown command"}
-			}
-		}
-
-		if err := encoder.Encode(resp); err != nil {
-			log.Debug("Control encode error: %v", err)
+			log.Debug("Control read: %v", err)
 			return
 		}
 	}
+}
+
+// receivedFd extracts the descriptor a read carried, -1 if none. The host
+// sends at most one per command; any others are closed here.
+func receivedFd(oob []byte, flags int) int {
+	if flags&unix.MSG_CTRUNC != 0 {
+		log.Warn("Control: ancillary data truncated, descriptors beyond the buffer were dropped by the kernel")
+	}
+	if len(oob) == 0 {
+		return -1
+	}
+	msgs, err := unix.ParseSocketControlMessage(oob)
+	if err != nil {
+		log.Debug("Failed to parse control message: %v", err)
+		return -1
+	}
+	fd := -1
+	for i := range msgs {
+		fds, err := unix.ParseUnixRights(&msgs[i])
+		if err != nil {
+			continue
+		}
+		for _, f := range fds {
+			if fd < 0 {
+				fd = f
+				continue
+			}
+			log.Warn("Control: extra fd %d in one message, closing it", f)
+			releaseReceivedFd(f)
+		}
+	}
+	if fd >= 0 {
+		log.Debug("Received fd via SCM_RIGHTS: %d", fd)
+	}
+	return fd
+}
+
+// dispatchControl runs one framed command. ok is false when the bytes were
+// valid JSON but not a command; there is no command to answer then, and
+// answering anyway would hand the host a response it would pair with its
+// next request.
+func (cs *ControlServer) dispatchControl(ctx context.Context, m controlMsg) (ControlResponse, bool) {
+	fd := m.fd
+	var cmd ControlCommand
+	if err := json.Unmarshal(m.data, &cmd); err != nil {
+		log.Warn("Control: skipping undecodable command: %v (%q)", err, clip(m.data))
+		releaseReceivedFd(fd)
+		return ControlResponse{}, false
+	}
+
+	log.Info("Control command: %s (received_fd=%d)", cmd.Command, fd)
+
+	var resp ControlResponse
+
+	// A received fd belongs to the core from recvmsg on: the kernel
+	// installed it for us and the host keeps its own. set_fd and
+	// reconnect/network_changed take it over (adoptTunFd); every other
+	// command has no use for it, and leaving it open would pin a VPN
+	// interface for the life of the process.
+	switch cmd.Command {
+	case "set_fd":
+		resp = cs.handleSetFdWithReceivedFd(ctx, fd)
+
+	case "reconnect", "network_changed":
+		resp = cs.handleReconnect(ctx, cmd.Reason, fd)
+
+	default:
+		if fd >= 0 {
+			log.Warn("Control command %q carried fd %d it does not use, closing it", cmd.Command, fd)
+			releaseReceivedFd(fd)
+		}
+		switch cmd.Command {
+		case "connect":
+			resp = cs.handleConnect(ctx)
+		case "disconnect":
+			resp = cs.handleDisconnect()
+		case "status":
+			resp = cs.handleStatus()
+		case "network_available":
+			resp = cs.handleNetworkAvailable()
+		default:
+			resp = ControlResponse{Status: "error", Error: "unknown command"}
+		}
+	}
+
+	return resp, true
 }
 
 // handleConnect connects to VPN server and returns assigned IP
@@ -387,7 +456,7 @@ func ipString(ip net.IP) string {
 }
 
 // handleSetFdWithReceivedFd starts VPN with fd received via SCM_RIGHTS
-// The fd was already received in recvMessageWithFd along with the JSON command
+// The fd arrived over SCM_RIGHTS with the command (see controlFramer)
 func (cs *ControlServer) handleSetFdWithReceivedFd(ctx context.Context, fd int) ControlResponse {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
@@ -824,86 +893,6 @@ func (cs *ControlServer) handleNetworkAvailable() ControlResponse {
 		Status: "ok",
 		Error:  "",
 	}
-}
-
-// recvMessageWithFd receives a message with optional fd via SCM_RIGHTS
-// Returns the data bytes, received fd (-1 if none), and error
-// Uses retry loop to handle EAGAIN on non-blocking sockets
-// Waits indefinitely for data (or until connection closed)
-func recvMessageWithFd(rawConn syscall.RawConn) ([]byte, int, error) {
-	var data []byte
-	fd := -1
-	var recvErr error
-
-	for {
-		data = nil
-		fd = -1
-		recvErr = nil
-
-		err := rawConn.Read(func(sockFd uintptr) bool {
-			// Buffer for JSON data (up to 4KB should be enough)
-			buf := make([]byte, 4096)
-
-			// Buffer for control message (SCM_RIGHTS) - enough for 1 fd
-			oob := make([]byte, unix.CmsgSpace(4))
-
-			n, oobn, _, _, err := unix.Recvmsg(int(sockFd), buf, oob, 0)
-			if err != nil {
-				if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
-					// Non-blocking socket, need to retry
-					recvErr = err
-					return true // exit callback, will retry in outer loop
-				}
-				recvErr = fmt.Errorf("recvmsg failed: %w", err)
-				return true
-			}
-
-			if n == 0 {
-				recvErr = fmt.Errorf("connection closed")
-				return true
-			}
-
-			data = buf[:n]
-			log.Debug("Recvmsg: n=%d, oobn=%d, data=%s", n, oobn, string(data))
-
-			// Parse control message if present
-			if oobn > 0 {
-				msgs, err := unix.ParseSocketControlMessage(oob[:oobn])
-				if err != nil {
-					log.Debug("Failed to parse control message: %v", err)
-				} else if len(msgs) > 0 {
-					fds, err := unix.ParseUnixRights(&msgs[0])
-					if err != nil {
-						log.Debug("Failed to parse unix rights: %v", err)
-					} else if len(fds) > 0 {
-						fd = fds[0]
-						log.Debug("Received fd via SCM_RIGHTS: %d", fd)
-					}
-				}
-			}
-
-			return true
-		})
-
-		if err != nil {
-			return nil, -1, fmt.Errorf("rawConn.Read failed: %w", err)
-		}
-
-		// Check if we got EAGAIN - need to retry (sleep longer to reduce CPU)
-		if recvErr == unix.EAGAIN || recvErr == unix.EWOULDBLOCK {
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-
-		// Got data or real error - exit loop
-		break
-	}
-
-	if recvErr != nil {
-		return nil, -1, recvErr
-	}
-
-	return data, fd, nil
 }
 
 // sendEvent sends an event notification to Android via control connection
