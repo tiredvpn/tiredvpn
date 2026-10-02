@@ -39,6 +39,23 @@ func TestForwardH2TUNKeepaliveEcho(t *testing.T) {
 		secret:     secret,
 		sink:       &nopTUNSink{},
 	}
+	// Every downstream write on a TUN tunnel goes through the tunnel's frame
+	// gate, which is closed until the handshake response is out; a keepalive
+	// echo before that must not reach the client ahead of the handshake.
+	tunnel.tunGate = newTunFrameGate(func(frame []byte) error {
+		tunnel.mu.Lock()
+		sendStegoResponse(framer, tunnel.streamID, frame, tunnel.secret)
+		tunnel.mu.Unlock()
+		return nil
+	})
+	forwardH2TUNPacket(tunnel, sid, []byte{0, 0, 0, 0}, logger)
+	if out.Len() != 0 {
+		t.Fatalf("keepalive echoed before the handshake response went out: %d bytes", out.Len())
+	}
+	if err := tunnel.tunGate.Open([]byte{0x00}); err != nil {
+		t.Fatalf("open gate: %v", err)
+	}
+	out.Reset()
 
 	// Zero-length keepalive: [len:4 = 0]. Must be echoed back (DATA frame out).
 	forwardH2TUNPacket(tunnel, sid, []byte{0, 0, 0, 0}, logger)
