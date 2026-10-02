@@ -102,7 +102,7 @@ type ClientTun struct {
 func (t ClientTun) validate() error {
 	for i, entry := range t.IPv6Allow {
 		if strings.Contains(entry, ",") {
-			return fmt.Errorf("tun.ipv6_allow[%d]: %q contains a comma; put each interface or prefix in its own list entry", i, entry)
+			return fmt.Errorf("tun.ipv6_allow[%d] contains a comma; put each interface or prefix in its own list entry", i)
 		}
 		if strings.TrimSpace(entry) == "" {
 			return fmt.Errorf("tun.ipv6_allow[%d] is empty", i)
@@ -110,7 +110,7 @@ func (t ClientTun) validate() error {
 	}
 	for i, entry := range t.Routes6 {
 		if strings.Contains(entry, ",") {
-			return fmt.Errorf("tun.routes6[%d]: %q contains a comma; put each prefix in its own list entry", i, entry)
+			return fmt.Errorf("tun.routes6[%d] contains a comma; put each prefix in its own list entry", i)
 		}
 		if strings.TrimSpace(entry) == "" {
 			return fmt.Errorf("tun.routes6[%d] is empty", i)
@@ -197,27 +197,27 @@ func (s *Selection) Resolve() (ResolvedSelection, error) {
 	switch out.Policy {
 	case "", PolicyPriority, PolicyLatency, PolicyWeighted:
 	default:
-		return out, fmt.Errorf("selection.policy: unknown value %q (want %s, %s or %s)",
-			s.Policy, PolicyPriority, PolicyLatency, PolicyWeighted)
+		return out, fmt.Errorf("selection.policy: unknown value (want %s, %s or %s)",
+			PolicyPriority, PolicyLatency, PolicyWeighted)
 	}
 
 	out.Family = strings.ToLower(strings.TrimSpace(s.Family))
 	switch out.Family {
 	case "", "prefer_v6", "prefer_v4", "v6_only", "v4_only":
 	default:
-		return out, fmt.Errorf("selection.family: unknown value %q (want prefer_v6, prefer_v4, v6_only or v4_only)", s.Family)
+		return out, fmt.Errorf("selection.family: unknown value (want prefer_v6, prefer_v4, v6_only or v4_only)")
 	}
 
 	out.HealthCheck = strings.ToLower(strings.TrimSpace(s.HealthCheck))
 	switch out.HealthCheck {
 	case "", HealthCheckOff, HealthCheckActive:
 	default:
-		return out, fmt.Errorf("selection.health_check: unknown value %q (want %s or %s)",
-			s.HealthCheck, HealthCheckOff, HealthCheckActive)
+		return out, fmt.Errorf("selection.health_check: unknown value (want %s or %s)",
+			HealthCheckOff, HealthCheckActive)
 	}
 
 	if s.FailureThreshold < 0 {
-		return out, fmt.Errorf("selection.failure_threshold must be >= 0, got %d", s.FailureThreshold)
+		return out, fmt.Errorf("selection.failure_threshold must be >= 0")
 	}
 	out.FailureThreshold = s.FailureThreshold
 
@@ -240,8 +240,7 @@ func (s *Selection) Resolve() (ResolvedSelection, error) {
 	}
 
 	if out.MaxCooldown > 0 && out.Cooldown > 0 && out.MaxCooldown < out.Cooldown {
-		return out, fmt.Errorf("selection.max_cooldown (%s) is shorter than selection.cooldown (%s)",
-			out.MaxCooldown, out.Cooldown)
+		return out, fmt.Errorf("selection.max_cooldown is shorter than selection.cooldown")
 	}
 	return out, nil
 }
@@ -251,12 +250,13 @@ func parseSelectionDuration(name, raw string) (time.Duration, error) {
 	if raw == "" {
 		return 0, nil
 	}
+	// time.ParseDuration's error quotes its input; say what is wrong instead.
 	d, err := time.ParseDuration(raw)
 	if err != nil {
-		return 0, fmt.Errorf("selection.%s: %w", name, err)
+		return 0, fmt.Errorf("selection.%s: invalid duration (want a Go duration such as 30s or 5m)", name)
 	}
 	if d < 0 {
-		return 0, fmt.Errorf("selection.%s must not be negative, got %s", name, d)
+		return 0, fmt.Errorf("selection.%s must not be negative", name)
 	}
 	return d, nil
 }
@@ -336,7 +336,7 @@ func (c *ClientConfig) Validate() error {
 
 	seen := make(map[string]int, len(list))
 	for i, s := range list {
-		where := serverLabel(i, s.Name, len(c.Servers) > 0)
+		where := serverLabel(i, len(c.Servers) > 0)
 		if !s.hasAddress() {
 			return fmt.Errorf("%s: address or address_v6 is required", where)
 		}
@@ -354,7 +354,7 @@ func (c *ClientConfig) Validate() error {
 			continue
 		}
 		if prev, dup := seen[s.Name]; dup {
-			return fmt.Errorf("duplicate server name %q (entries %d and %d)", s.Name, prev, i)
+			return fmt.Errorf("duplicate server name (entries %d and %d)", prev, i)
 		}
 		seen[s.Name] = i
 	}
@@ -377,10 +377,8 @@ func (c *ClientConfig) Validate() error {
 	return nil
 }
 
-func serverLabel(i int, name string, isList bool) string {
+func serverLabel(i int, isList bool) string {
 	switch {
-	case name != "":
-		return fmt.Sprintf("servers[%d] (%s)", i, name)
 	case isList:
 		return fmt.Sprintf("servers[%d]", i)
 	default:
@@ -390,7 +388,7 @@ func serverLabel(i int, name string, isList bool) string {
 
 func validatePort(field string, port int) error {
 	if port <= 0 || port > 65535 {
-		return fmt.Errorf("%s must be in 1..65535, got %d", field, port)
+		return fmt.Errorf("%s must be in 1..65535", field)
 	}
 	return nil
 }
