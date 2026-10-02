@@ -178,7 +178,7 @@ func TestPerformTUNHandshakeDualStack(t *testing.T) {
 
 	t.Run("dual off keeps v3 and ignores v6", func(t *testing.T) {
 		cs, conn := newCS(false, baseResp)
-		if _, _, err := cs.performTUNHandshake(); err != nil {
+		if _, _, err := cs.performTUNHandshake(context.Background()); err != nil {
 			t.Fatalf("performTUNHandshake: %v", err)
 		}
 		if conn.written[7] != tunHandshakeVersion {
@@ -193,7 +193,7 @@ func TestPerformTUNHandshakeDualStack(t *testing.T) {
 		resp := append(append([]byte{}, baseResp...), tunFlagDualStack)
 		resp = append(resp, block...)
 		cs, conn := newCS(true, resp)
-		assigned, server, err := cs.performTUNHandshake()
+		assigned, server, err := cs.performTUNHandshake(context.Background())
 		if err != nil {
 			t.Fatalf("performTUNHandshake: %v", err)
 		}
@@ -212,7 +212,7 @@ func TestPerformTUNHandshakeDualStack(t *testing.T) {
 		// Every exit since dual-stack exists answers a v0x04 client with a
 		// flags byte, zero when it has no -ip-pool-v6.
 		cs, conn := newCS(true, append(append([]byte{}, baseResp...), 0x00))
-		if _, _, err := cs.performTUNHandshake(); err != nil {
+		if _, _, err := cs.performTUNHandshake(context.Background()); err != nil {
 			t.Fatalf("performTUNHandshake: %v", err)
 		}
 		if conn.written[7] != tunHandshakeVersionDualStack {

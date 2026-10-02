@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/log"
@@ -83,7 +84,19 @@ type ControlServer struct {
 	// the lock back, so a teardown that ran in the gap is not undone by a
 	// relay started on top of it.
 	sessionGen uint64
-	closed     bool // Close ran: no command may bring a session back
+	// closed is set first thing in Close, without cs.mu: a command holding
+	// the lock checks it before installing anything it built meanwhile.
+	closed atomic.Bool
+
+	// life ends when Close starts. Every command's network work runs under a
+	// context tied to it, so Close can cut a connect or reconnect short
+	// instead of waiting behind cs.mu for it to time out on its own.
+	life       context.Context
+	lifeCancel context.CancelFunc
+
+	// sockID identifies the socket file this server created, so Close
+	// removes it only while the path still points at it (see removeOwnSocket).
+	sockID os.FileInfo
 
 	closeOnce sync.Once
 	closeErr  error
@@ -171,14 +184,41 @@ func NewControlServer(socketPath string, cfg *ControlConfig) (*ControlServer, er
 	// Make socket accessible
 	os.Chmod(socketPath, 0666)
 
+	// The socket file is removed by removeOwnSocket, not by the listener:
+	// a UnixListener unlinks its path on Close whoever the file belongs to
+	// by then, and after a stop that gave up waiting a newer core may
+	// already be listening on the same path.
+	if ul, ok := listener.(*net.UnixListener); ok {
+		ul.SetUnlinkOnClose(false)
+	}
+	sockID, err := os.Lstat(socketPath)
+	if err != nil {
+		listener.Close()
+		return nil, fmt.Errorf("stat %s: %w", socketPath, err)
+	}
+
+	life, lifeCancel := context.WithCancel(context.Background())
 	return &ControlServer{
 		socketPath:           socketPath,
 		listener:             listener,
+		sockID:               sockID,
+		life:                 life,
+		lifeCancel:           lifeCancel,
 		config:               cfg,
 		mtu:                  cfg.MTU,
 		tunFdCh:              make(chan int, 1),
 		networkAvailableChan: make(chan struct{}, 1), // Buffered to avoid blocking Android
 	}, nil
+}
+
+// opContext returns ctx, also cancelled when Close starts.
+func (cs *ControlServer) opContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(ctx)
+	if cs.life == nil {
+		return ctx, cancel
+	}
+	stop := context.AfterFunc(cs.life, cancel)
+	return ctx, func() { stop(); cancel() }
 }
 
 // Run starts the control server
@@ -205,10 +245,7 @@ func (cs *ControlServer) Run(ctx context.Context) error {
 			}
 			// Close shuts the listener; every Accept after that fails at
 			// once, and retrying would spin until ctx is cancelled.
-			cs.mu.Lock()
-			closed := cs.closed
-			cs.mu.Unlock()
-			if closed {
+			if cs.closed.Load() {
 				return nil
 			}
 			log.Debug("Accept error: %v", err)
@@ -386,7 +423,7 @@ func (cs *ControlServer) handleConnect(ctx context.Context) ControlResponse {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
-	if cs.closed {
+	if cs.closed.Load() {
 		return ControlResponse{Status: "error", Error: "control server closed"}
 	}
 
@@ -409,9 +446,20 @@ func (cs *ControlServer) handleConnect(ctx context.Context) ControlResponse {
 		return ControlResponse{Status: "error", Error: "connect function not configured"}
 	}
 
-	placeholderIP, _, conn, err := cs.config.ConnectFn(ctx)
+	// The dial and the handshake run with cs.mu held; opCtx is what lets
+	// Close interrupt them rather than wait up to the handshake timeout.
+	opCtx, cancel := cs.opContext(ctx)
+	defer cancel()
+
+	placeholderIP, _, conn, err := cs.config.ConnectFn(opCtx)
 	if err != nil {
 		return ControlResponse{Status: "error", Error: err.Error()}
+	}
+	// A dial deaf to cancellation can return after Close gave up waiting for
+	// the lock; what it built is dropped, not installed.
+	if cs.closed.Load() {
+		conn.Close()
+		return ControlResponse{Status: "error", Error: "control server closed"}
 	}
 
 	cs.serverConn = conn
@@ -421,7 +469,7 @@ func (cs *ControlServer) handleConnect(ctx context.Context) ControlResponse {
 	// from the start — eliminating IP mismatch and the need for hot-swap.
 	// NOTE: previously this was done after set_fd to fix "EOF" errors. The EOF was caused
 	// by concurrent relay + handshake; here there is no relay yet, so it's safe.
-	realAssignedIP, realServerIP, err := cs.performTUNHandshake()
+	realAssignedIP, realServerIP, err := cs.performTUNHandshake(opCtx)
 	if err != nil {
 		conn.Close()
 		cs.serverConn = nil
@@ -660,7 +708,7 @@ func (cs *ControlServer) handleStatus() ControlResponse {
 func (cs *ControlServer) handleReconnect(ctx context.Context, reason string, newFd int) ControlResponse {
 	cs.mu.Lock()
 
-	if cs.closed {
+	if cs.closed.Load() {
 		cs.mu.Unlock()
 		releaseReceivedFd(newFd)
 		return ControlResponse{Status: "error", Error: "control server closed"}
@@ -758,8 +806,10 @@ func (cs *ControlServer) handleReconnect(ctx context.Context, reason string, new
 	var ipv6Removed bool
 
 	// Use ReconnectFn if available (preferred - handles circuit breaker reset)
+	opCtx, cancel := cs.opContext(ctx)
+	defer cancel()
 	if cs.config.ReconnectFn != nil {
-		res, err := cs.config.ReconnectFn(ctx, cs.assignedIP, cs.mtu)
+		res, err := cs.config.ReconnectFn(opCtx, cs.assignedIP, cs.mtu)
 		if err != nil {
 			log.Error("Reconnect failed: %v", err)
 			clearReconnecting()
@@ -767,6 +817,11 @@ func (cs *ControlServer) handleReconnect(ctx context.Context, reason string, new
 				Status: "error",
 				Error:  fmt.Sprintf("reconnect failed: %v", err),
 			}
+		}
+		if cs.closed.Load() {
+			res.Conn.Close()
+			clearReconnecting()
+			return ControlResponse{Status: "error", Error: "control server closed"}
 		}
 		cs.serverConn = res.Conn
 		cs.serverIP = res.ServerIP
@@ -799,7 +854,7 @@ func (cs *ControlServer) handleReconnect(ctx context.Context, reason string, new
 		log.Info("Reconnected successfully via ReconnectFn (server IP: %s, assigned: %s)", res.ServerIP, cs.assignedIP)
 	} else {
 		// Fallback: use ConnectFn (less optimal - may need new IP)
-		assignedIP, serverIP, conn, err := cs.config.ConnectFn(ctx)
+		assignedIP, serverIP, conn, err := cs.config.ConnectFn(opCtx)
 		if err != nil {
 			log.Error("Reconnect failed: %v", err)
 			clearReconnecting()
@@ -807,6 +862,11 @@ func (cs *ControlServer) handleReconnect(ctx context.Context, reason string, new
 				Status: "error",
 				Error:  fmt.Sprintf("reconnect failed: %v", err),
 			}
+		}
+		if cs.closed.Load() {
+			conn.Close()
+			clearReconnecting()
+			return ControlResponse{Status: "error", Error: "control server closed"}
 		}
 		cs.serverConn = conn
 		cs.assignedIP = assignedIP
@@ -928,21 +988,68 @@ func (cs *ControlServer) sendEvent(event string, data string) {
 	}
 }
 
+// closeTeardownWait bounds how long Close waits for cs.mu. The commands that
+// hold it for long do network work Close has already cancelled, so the lock
+// normally frees at once; the bound is for a dial that ignores cancellation.
+const closeTeardownWait = 500 * time.Millisecond
+
 // Close closes the control server: it tears the session down, including the
 // TUN descriptor received from the host, and stops accepting connections.
 // Safe to call more than once; only the first call does anything.
+//
+// The parts that need no lock go first and cannot be held up: mark closed,
+// cancel the in-flight connect/reconnect, stop listening, remove our socket
+// file. The session teardown needs cs.mu; if a command still holds it after
+// closeTeardownWait, Close returns and the teardown runs as soon as the lock
+// frees (the command, seeing closed, installs nothing on the way out).
 func (cs *ControlServer) Close() error {
 	cs.closeOnce.Do(func() {
-		cs.mu.Lock()
-		cs.closed = true
-		cs.mu.Unlock()
-		// Stop auto-reconnect if running
-		cs.stopAutoReconnect()
-		cs.handleDisconnect()
-		os.Remove(cs.socketPath)
+		cs.closed.Store(true)
+		if cs.lifeCancel != nil {
+			cs.lifeCancel()
+		}
 		cs.closeErr = cs.listener.Close()
+		cs.removeOwnSocket()
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			cs.stopAutoReconnect()
+			cs.handleDisconnect()
+		}()
+		select {
+		case <-done:
+		case <-time.After(closeTeardownWait):
+			log.Warn("Close: a command still holds the control lock after %v; the session is torn down when it returns", closeTeardownWait)
+		}
 	})
 	return cs.closeErr
+}
+
+// removeOwnSocket removes the socket file only while the path still names
+// the file this server created. A newer core started on the same path (after
+// a stop that gave up waiting for this one) has replaced it by then, and its
+// file must stay.
+//
+// Between the Lstat and the Remove another core could still replace the file
+// and lose it. That needs a new core to unlink and bind the path inside a
+// window of a few microseconds, while it normally starts well after this one
+// was told to stop; the host then sees the socket missing and restarts the
+// core again, which is the same outcome as before this check, made rare.
+func (cs *ControlServer) removeOwnSocket() {
+	if cs.sockID == nil {
+		os.Remove(cs.socketPath)
+		return
+	}
+	cur, err := os.Lstat(cs.socketPath)
+	if err != nil {
+		return
+	}
+	if !os.SameFile(cur, cs.sockID) {
+		log.Info("Control socket %s now belongs to another instance, leaving it", cs.socketPath)
+		return
+	}
+	os.Remove(cs.socketPath)
 }
 
 // adoptTunFd turns a TUN descriptor received over SCM_RIGHTS into the device
@@ -1138,9 +1245,11 @@ func (cs *ControlServer) attemptReconnect(ctx context.Context) bool {
 
 	// Torn down while the attempt waited for the lock: there is no device to
 	// relay on, and a session the host ended must stay ended.
-	if cs.closed || cs.tunDev == nil {
+	if cs.closed.Load() || cs.tunDev == nil {
 		return false
 	}
+	ctx, cancel := cs.opContext(ctx)
+	defer cancel()
 
 	// Stop any existing relay
 	if cs.relayStopCh != nil {
@@ -1317,10 +1426,17 @@ func addAutoReconnectJitter(d time.Duration) time.Duration {
 // performTUNHandshake sends TUN mode handshake and receives assigned IP
 // This must be called AFTER VPN interface is created (after receiving FD from Android)
 // Moved from ConnectFn to fix "handshake read failed: EOF" error
-func (cs *ControlServer) performTUNHandshake() (assignedIP, serverIP net.IP, err error) {
+func (cs *ControlServer) performTUNHandshake(ctx context.Context) (assignedIP, serverIP net.IP, err error) {
 	if cs.serverConn == nil {
 		return nil, nil, fmt.Errorf("no server connection")
 	}
+
+	// The response read is bounded by a conn deadline, not by ctx, so a
+	// cancelled ctx closes the conn to end it. stop() reporting false means
+	// that already happened and the conn is gone.
+	conn := cs.serverConn
+	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stop()
 
 	// Get MTU from config or use default
 	mtu := cs.mtu
@@ -1352,6 +1468,9 @@ func (cs *ControlServer) performTUNHandshake() (assignedIP, serverIP net.IP, err
 	// it returns replaces cs.serverConn because it may carry the first byte of
 	// the first frame back to the relay.
 	resp, n, next, err := readHandshakeResponse(cs.serverConn, version, time.Now().Add(handshakeReadTimeout))
+	if !stop() {
+		return nil, nil, fmt.Errorf("handshake interrupted: %w", context.Cause(ctx))
+	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("handshake read failed: %w", err)
 	}
