@@ -1,3 +1,8 @@
+// This file was modified from github.com/vishvananda/netlink v1.3.1 by the
+// tiredvpn authors: getNetlinkSocket and Subscribe now close the socket
+// through its *os.File when bind(2) fails, and close the fd when
+// SetNonblock fails. See ../NOTICE.
+
 // Package nl has low level primitives for making Netlink calls.
 package nl
 
@@ -702,6 +707,8 @@ func getNetlinkSocket(protocol int) (*NetlinkSocket, error) {
 	}
 	err = unix.SetNonblock(fd, true)
 	if err != nil {
+		// Nothing owns fd yet, so close it directly.
+		unix.Close(fd)
 		return nil, err
 	}
 	s := &NetlinkSocket{
@@ -710,7 +717,10 @@ func getNetlinkSocket(protocol int) (*NetlinkSocket, error) {
 	}
 	s.lsa.Family = unix.AF_NETLINK
 	if err := unix.Bind(fd, &s.lsa); err != nil {
-		unix.Close(fd)
+		// s.file owns fd from here on. Close through it: a bare unix.Close(fd)
+		// leaves the *os.File alive, and its finalizer closes the same fd
+		// number again later, when it may already belong to another file.
+		s.Close()
 		return nil, err
 	}
 
@@ -795,6 +805,8 @@ func Subscribe(protocol int, groups ...uint) (*NetlinkSocket, error) {
 	}
 	err = unix.SetNonblock(fd, true)
 	if err != nil {
+		// Nothing owns fd yet, so close it directly.
+		unix.Close(fd)
 		return nil, err
 	}
 	s := &NetlinkSocket{
@@ -808,7 +820,10 @@ func Subscribe(protocol int, groups ...uint) (*NetlinkSocket, error) {
 	}
 
 	if err := unix.Bind(fd, &s.lsa); err != nil {
-		unix.Close(fd)
+		// s.file owns fd from here on. Close through it: a bare unix.Close(fd)
+		// leaves the *os.File alive, and its finalizer closes the same fd
+		// number again later, when it may already belong to another file.
+		s.Close()
 		return nil, err
 	}
 
