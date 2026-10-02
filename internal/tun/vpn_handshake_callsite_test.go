@@ -184,7 +184,7 @@ func TestControlHandshakeKeepsFirstFrame(t *testing.T) {
 
 			rec := &recDeadlineConn{Conn: cli}
 			cs := &ControlServer{serverConn: rec, mtu: 1280, config: &ControlConfig{}}
-			if _, _, err := cs.performTUNHandshake(); err != nil {
+			if _, _, err := cs.performTUNHandshake(context.Background()); err != nil {
 				t.Fatalf("performTUNHandshake: %v", err)
 			}
 			noDeadlineLeft(t, rec)
@@ -204,7 +204,7 @@ func TestControlHandshakeSilentPeerFails(t *testing.T) {
 
 	cs := &ControlServer{serverConn: cli, mtu: 1280, config: &ControlConfig{DualStack: true}}
 	done := make(chan error, 1)
-	go func() { _, _, err := cs.performTUNHandshake(); done <- err }()
+	go func() { _, _, err := cs.performTUNHandshake(context.Background()); done <- err }()
 	select {
 	case err := <-done:
 		if err == nil {

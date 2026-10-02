@@ -703,8 +703,7 @@ func reconnectTUN(ctx context.Context, mgr *strategy.Manager, serverAddr string,
 	// Server will recognize us and restore the session
 	// The response read is bounded by the reconnect's own context when it has
 	// a deadline (zero lets the reader apply its default).
-	deadline, _ := ctx.Deadline()
-	tunnelConn, serverIP, assignedIP, serverIP6, assignedIP6, err := sendReconnectHandshake(conn, currentIP, mtu, dualStack, deadline)
+	tunnelConn, serverIP, assignedIP, serverIP6, assignedIP6, err := reconnectHandshake(ctx, conn, currentIP, mtu, dualStack)
 	if err != nil {
 		conn.Close()
 		return tun.ReconnectResult{}, err
@@ -719,6 +718,21 @@ func reconnectTUN(ctx context.Context, mgr *strategy.Manager, serverAddr string,
 		ServerIP6:   serverIP6,
 		AssignedIP6: assignedIP6,
 	}, nil
+}
+
+// reconnectHandshake runs sendReconnectHandshake so that cancelling ctx ends
+// it. The response read is bounded by ctx's deadline (none: the reader's
+// default), not by ctx itself, so a cancelled ctx - the control server
+// closing - closes conn to cut the read short. On error the caller closes
+// conn.
+func reconnectHandshake(ctx context.Context, conn net.Conn, currentIP net.IP, mtu int, dualStack bool) (tunnelConn net.Conn, serverIP, assignedIP, serverIP6, assignedIP6 net.IP, err error) {
+	deadline, _ := ctx.Deadline()
+	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	tunnelConn, serverIP, assignedIP, serverIP6, assignedIP6, err = sendReconnectHandshake(conn, currentIP, mtu, dualStack, deadline)
+	if !stop() {
+		return nil, nil, nil, nil, nil, fmt.Errorf("reconnect handshake interrupted: %w", context.Cause(ctx))
+	}
+	return tunnelConn, serverIP, assignedIP, serverIP6, assignedIP6, err
 }
 
 // sendReconnectHandshake performs the TUN mode handshake on a fresh reconnect
