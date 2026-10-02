@@ -1,0 +1,25 @@
+This directory contains a modified copy of github.com/vishvananda/netlink.
+
+  Upstream:  https://github.com/vishvananda/netlink
+  Version:   v1.3.1 (tag commit 17daef607c6442d47b0565343cf8a69f985a4cb7)
+  License:   Apache License 2.0, see LICENSE in this directory.
+  Copyright: the vishvananda/netlink authors.
+
+The upstream repository has no NOTICE file. Upstream tests, testdata, CI
+configuration, Makefile and cmd/ were not copied. The main module uses this
+copy through a replace directive in go.mod.
+
+Modifications by the tiredvpn authors (2026):
+
+  nl/nl_linux.go
+    getNetlinkSocket, Subscribe:
+      - on bind(2) failure the socket is closed through NetlinkSocket.Close
+        (the owning *os.File) instead of unix.Close(fd). The old code left the
+        *os.File alive, so its GC finalizer closed the same fd number a second
+        time, possibly after the number had been reused by another file. On
+        Android, where bind on NETLINK_ROUTE fails with EACCES for apps, this
+        aborted the process through fdsan.
+      - on SetNonblock failure the fd is closed instead of leaked.
+
+No other file was changed. When an upstream release contains an equivalent
+fix, remove this directory and the replace directive.

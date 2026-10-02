@@ -34,3 +34,8 @@ require (
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
 )
+
+// Vendored copy of netlink v1.3.1 with a fix for a double close of the netlink
+// socket fd when bind(2) fails (see third_party/netlink/NOTICE). Drop this
+// replace once an upstream release carries the fix.
+replace github.com/vishvananda/netlink => ./third_party/netlink
