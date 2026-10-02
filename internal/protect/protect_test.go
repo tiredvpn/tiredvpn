@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/binary"
 	"net"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -100,18 +101,32 @@ func TestProtectSocketNoProtector(t *testing.T) {
 	}
 }
 
+// realFd returns an open descriptor owned by the test (a pipe end).
+func realFd(t *testing.T) int {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	t.Cleanup(func() { r.Close(); w.Close() })
+	return int(r.Fd())
+}
+
 func TestProtectRawFdSuccess(t *testing.T) {
 	resetProtector(t)
 	path, gotFd := fakeProtectServer(t, []byte{0}, false)
 	globalProtector = &protector{path: path}
 
-	if err := ProtectRawFd(1234); err != nil {
+	fd := realFd(t)
+	if err := ProtectRawFd(fd); err != nil {
 		t.Fatalf("ProtectRawFd success path returned %v", err)
 	}
 	select {
-	case fd := <-gotFd:
-		if fd != 1234 {
-			t.Errorf("server received fd=%d, want 1234 (little-endian wire check)", fd)
+	case got := <-gotFd:
+		// Protocol 1 carries the number of a private duplicate, never the
+		// caller's own. The duplicate is closed once the answer is in.
+		if int(got) == fd {
+			t.Errorf("server received the caller's own fd=%d, want a duplicate", fd)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("server never received the fd")
@@ -125,18 +140,35 @@ func TestProtectRawFdFailureReply(t *testing.T) {
 	path, _ := fakeProtectServer(t, []byte{1}, false)
 	globalProtector = &protector{path: path}
 
-	if err := ProtectRawFd(7); err == nil {
+	if err := ProtectRawFd(realFd(t)); err == nil {
 		t.Fatal("reply byte 1 must produce an error")
 	}
 }
 
 func TestProtectRawFdNoReply(t *testing.T) {
 	resetProtector(t)
+	prev := v1HoldAfterEOF
+	v1HoldAfterEOF = 10 * time.Millisecond
+	t.Cleanup(func() { waitHeldZero(t); v1HoldAfterEOF = prev })
 	path, _ := fakeProtectServer(t, nil, true) // reads fd, closes without replying
 	globalProtector = &protector{path: path}
 
-	if err := ProtectRawFd(7); err == nil {
+	if err := ProtectRawFd(realFd(t)); err == nil {
 		t.Fatal("closed connection without reply must produce a read error")
+	}
+}
+
+func TestProtectRawFdBadFd(t *testing.T) {
+	resetProtector(t)
+	path, gotFd := fakeProtectServer(t, []byte{0}, false)
+	globalProtector = &protector{path: path}
+	if err := ProtectRawFd(-1); err == nil {
+		t.Fatal("an invalid descriptor must fail before anything is sent")
+	}
+	select {
+	case fd := <-gotFd:
+		t.Fatalf("server received fd=%d for an invalid descriptor", fd)
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 

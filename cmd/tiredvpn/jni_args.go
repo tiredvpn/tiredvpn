@@ -126,6 +126,20 @@ func parseClientArgs(args []string) (_ *client.Config, err error) {
 				cfg.ProtectPath = args[i+1]
 				i++
 			}
+		// The protect channel protocol the app speaks. Apps up to 1.11.0 do not
+		// send it and speak protocol 1; an older core ignores it as an unknown
+		// flag, so a newer app must keep serving protocol 1 as well.
+		case "-protect-proto":
+			if i+1 < len(args) {
+				if v, err := strconv.Atoi(args[i+1]); err != nil {
+					log.Warn("parseClientArgs: invalid -protect-proto value %q: %v", logArgs[i+1], strconvReason(err))
+				} else if v == 1 || v == 2 {
+					cfg.ProtectProto = v
+				} else {
+					log.Warn("parseClientArgs: unsupported -protect-proto value %q, using protocol 1", logArgs[i+1])
+				}
+				i++
+			}
 		case "-strategy":
 			if i+1 < len(args) {
 				cfg.StrategyName = args[i+1]
