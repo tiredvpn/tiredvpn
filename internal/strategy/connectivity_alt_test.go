@@ -2,53 +2,23 @@ package strategy
 
 import (
 	"context"
-	"net"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 )
-
-// countingLoopback starts an IPv4 loopback listener that counts accepted
-// connections, so a test can assert which addresses the TCP gate actually
-// dialled rather than only which verdict it returned.
-func countingLoopback(t *testing.T) (addr string, accepts *atomic.Int64, stop func()) {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	var n atomic.Int64
-	done := make(chan struct{})
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				close(done)
-				return
-			}
-			n.Add(1)
-			conn.Close()
-		}
-	}()
-	return ln.Addr().String(), &n, func() {
-		ln.Close()
-		<-done
-	}
-}
 
 // TestCheckTCPAnyProbeOrder pins that the primary address is tried first and
 // that a working primary costs no dial to the alternate. The alt address exists
 // for the censored-family case; probing it unconditionally would double every
 // pre-flight check on the hot reconnect path.
 //
-// The alt counter is only ever read after checkTCPAny returned, so a non-zero
-// value means the loop really did dial it — there is no accept still in flight.
+// The alt counter is read only after settle: a dial checkTCPAny made at the
+// last moment can still be in the accept queue when it returns, and reading
+// zero then would pass a loop that did dial the alternate.
 func TestCheckTCPAnyProbeOrder(t *testing.T) {
-	primary, _, stopPrimary := countingLoopback(t)
-	defer stopPrimary()
-	alt, altHits, stopAlt := countingLoopback(t)
-	defer stopAlt()
+	primaryL := newCountingListener(t)
+	altL := newCountingListener(t)
+	primary, alt := primaryL.addr, altL.addr
 
 	c := NewConnectivityChecker(primary, 2*time.Second, true)
 	c.SetAltAddr(alt)
@@ -59,7 +29,8 @@ func TestCheckTCPAnyProbeOrder(t *testing.T) {
 	if _, err := c.checkTCPAny(context.Background()); err != nil {
 		t.Fatalf("checkTCPAny = %v, want nil", err)
 	}
-	if n := altHits.Load(); n != 0 {
+	altL.settle(t)
+	if n := altL.accepts.Load(); n != 0 {
 		t.Errorf("alt dialled %d times, want 0 when the primary answers", n)
 	}
 }
@@ -92,8 +63,7 @@ func TestCheckTCPAnyReturnsLastError(t *testing.T) {
 // reconnect paths call; if either bypassed the alternate, a client with a
 // blocked IPv4 would still sit in "waiting for network".
 func TestCheckInheritsAltAddr(t *testing.T) {
-	live, _, stop := countingLoopback(t)
-	defer stop()
+	live := newCountingListener(t).addr
 	dead := freeLoopbackAddr(t)
 
 	t.Run("Check", func(t *testing.T) {

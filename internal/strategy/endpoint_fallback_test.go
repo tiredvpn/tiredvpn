@@ -35,15 +35,74 @@ func (c *endpointClock) Advance(d time.Duration) {
 	c.t = c.t.Add(d)
 }
 
-// countingListener is a loopback listener that counts accepted connections and
-// can be killed mid-test. Counts are only ever read after the call under test
-// returned, so no accept is still in flight when they are compared.
-type countingListener struct {
-	ln      net.Listener
-	addr    string
+// acceptLog counts the connections an accept loop has taken off the queue.
+//
+// The count lags the dialler. The kernel completes the handshake from the
+// listen backlog, so a Dial or a Connect is already back while the accept
+// goroutine has not run yet: reading the counter straight after the call under
+// test is a race, and it misses in both directions. A "saw at least one"
+// check goes red for nothing; a "saw none" check goes green with a dial still
+// sitting in the queue. settle is what makes the count mean something.
+type acceptLog struct {
 	accepts atomic.Int64
-	done    chan struct{}
-	once    sync.Once
+
+	mu      sync.Mutex
+	marker  string // local address of the settle connection, "" when none
+	reached chan struct{}
+}
+
+// note books one accepted connection. It reports whether the connection is the
+// settle marker, which is not counted and which the caller should just close.
+func (a *acceptLog) note(conn net.Conn) (isMarker bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.marker != "" && conn.RemoteAddr().String() == a.marker {
+		close(a.reached)
+		a.marker, a.reached = "", nil
+		return true
+	}
+	a.accepts.Add(1)
+	return false
+}
+
+// settle returns once the accept loop has taken every connection that was
+// already established when settle was called.
+//
+// It dials a marker connection of its own and waits for the loop to accept it.
+// The accept queue is FIFO, so once the marker is out, so is every connection
+// that completed its handshake before it - which is every dial made by a call
+// that has already returned. The marker is not counted.
+func (a *acceptLog) settle(t *testing.T, addr string) {
+	t.Helper()
+	// Held across the dial so the loop cannot accept the marker before it is
+	// recognisable as one.
+	a.mu.Lock()
+	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		a.mu.Unlock()
+		t.Fatalf("settle %s: %v", addr, err)
+	}
+	reached := make(chan struct{})
+	a.marker, a.reached = c.LocalAddr().String(), reached
+	a.mu.Unlock()
+	defer c.Close()
+
+	select {
+	case <-reached:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("accept loop on %s did not drain its queue within 5s", addr)
+	}
+}
+
+// countingListener is a loopback listener that counts accepted connections and
+// can be killed mid-test. Read its count only after settle: see acceptLog.
+type countingListener struct {
+	acceptLog
+
+	ln   net.Listener
+	addr string
+	done chan struct{}
+	once sync.Once
 }
 
 func newCountingListener(t *testing.T) *countingListener {
@@ -53,19 +112,27 @@ func newCountingListener(t *testing.T) *countingListener {
 		t.Fatalf("listen: %v", err)
 	}
 	l := &countingListener{ln: ln, addr: ln.Addr().String(), done: make(chan struct{})}
-	go func() {
-		defer close(l.done)
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			l.accepts.Add(1)
-			conn.Close()
-		}
-	}()
+	go l.serve()
 	t.Cleanup(l.stop)
 	return l
+}
+
+func (l *countingListener) serve() {
+	defer close(l.done)
+	for {
+		conn, err := l.ln.Accept()
+		if err != nil {
+			return
+		}
+		l.note(conn)
+		conn.Close()
+	}
+}
+
+// settle waits until every connection already made to l has been counted.
+func (l *countingListener) settle(t *testing.T) {
+	t.Helper()
+	l.acceptLog.settle(t, l.addr)
 }
 
 func (l *countingListener) stop() {
@@ -334,17 +401,7 @@ func reviveListener(t *testing.T, addr string) *countingListener {
 		t.Skipf("cannot re-bind %s: %v", addr, err)
 	}
 	l := &countingListener{ln: ln, addr: addr, done: make(chan struct{})}
-	go func() {
-		defer close(l.done)
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			l.accepts.Add(1)
-			conn.Close()
-		}
-	}()
+	go l.serve()
 	return l
 }
 
@@ -375,6 +432,8 @@ func TestReprobeTouchesOnlyThePinnedCandidate(t *testing.T) {
 	ctx := context.Background()
 	m.ProbeAll(ctx, "")
 	m.doPeriodicReprobe(ctx)
+	pinned.settle(t)
+	other.settle(t)
 
 	if n := pinned.accepts.Load(); n == 0 {
 		t.Fatal("the pinned endpoint saw no probes - the test proves nothing")

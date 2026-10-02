@@ -22,15 +22,18 @@ import (
 // It must hold the accepted connections. Closing them would send a FIN, the
 // strategy's read would return EOF instead of a timeout, and the test would
 // exercise the ordinary-failure path instead of the silent one.
+//
+// Read its count only after settle: see acceptLog.
 type blackholeListener struct {
-	ln      net.Listener
-	addr    string
-	accepts atomic.Int64
+	acceptLog
 
-	mu   sync.Mutex
-	held []net.Conn
-	done chan struct{}
-	once sync.Once
+	ln   net.Listener
+	addr string
+
+	heldMu sync.Mutex
+	held   []net.Conn
+	done   chan struct{}
+	once   sync.Once
 }
 
 func newBlackholeListener(t *testing.T) *blackholeListener {
@@ -47,10 +50,13 @@ func newBlackholeListener(t *testing.T) *blackholeListener {
 			if err != nil {
 				return
 			}
-			l.accepts.Add(1)
-			l.mu.Lock()
+			if l.note(conn) {
+				conn.Close()
+				continue
+			}
+			l.heldMu.Lock()
 			l.held = append(l.held, conn)
-			l.mu.Unlock()
+			l.heldMu.Unlock()
 		}
 	}()
 	t.Cleanup(l.stop)
@@ -61,13 +67,19 @@ func (l *blackholeListener) stop() {
 	l.once.Do(func() {
 		l.ln.Close()
 		<-l.done
-		l.mu.Lock()
+		l.heldMu.Lock()
 		for _, c := range l.held {
 			c.Close()
 		}
 		l.held = nil
-		l.mu.Unlock()
+		l.heldMu.Unlock()
 	})
+}
+
+// settle waits until every connection already made to l has been counted.
+func (l *blackholeListener) settle(t *testing.T) {
+	t.Helper()
+	l.acceptLog.settle(t, l.addr)
 }
 
 // helloListener answers every connection with one byte, which is what
@@ -373,6 +385,7 @@ func TestSilentEndpointDoesNotEatTheWholeConnectBudget(t *testing.T) {
 	if got := m.GetServerAddr(context.Background()); got != live.addr {
 		t.Fatalf("pinned %s, want the live server %s", got, live.addr)
 	}
+	silent.settle(t)
 	if silent.accepts.Load() == 0 {
 		t.Fatal("the silent endpoint was never dialled - the test proves nothing")
 	}
@@ -416,6 +429,8 @@ func TestEndpointHealthSurvivesClientRecreation(t *testing.T) {
 		t.Fatal("cycle one reached a server it has no budget for - retune the test")
 	}
 
+	silentA.settle(t)
+	silentB.settle(t)
 	dialsBefore := silentA.accepts.Load() + silentB.accepts.Load()
 	if dialsBefore == 0 {
 		t.Fatal("cycle one dialled neither silent server - the test proves nothing")
@@ -433,6 +448,8 @@ func TestEndpointHealthSurvivesClientRecreation(t *testing.T) {
 	if got := second.GetServerAddr(context.Background()); got != live.addr {
 		t.Fatalf("cycle two pinned %s, want the live server %s", got, live.addr)
 	}
+	silentA.settle(t)
+	silentB.settle(t)
 	if after := silentA.accepts.Load() + silentB.accepts.Load(); after != dialsBefore {
 		t.Fatalf("cycle two dialled the silent servers %d more times; a fresh client "+
 			"must inherit the verdict, not rediscover it", after-dialsBefore)

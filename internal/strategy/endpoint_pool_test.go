@@ -104,6 +104,9 @@ func TestPoolReprobesTouchOnlyThePinnedCandidate(t *testing.T) {
 	// emergency reprobe cannot be driven directly here - its first probe is a
 	// 30-second tick away - so this is what stands in for it.
 	m.ProbeAll(ctx, other1.addr)
+	for _, l := range []*countingListener{pinned, other1, other2} {
+		l.settle(t)
+	}
 
 	if n := pinned.accepts.Load(); n == 0 {
 		t.Fatal("the pinned endpoint saw no probes - the test proves nothing")
@@ -117,18 +120,24 @@ func TestPoolReprobesTouchOnlyThePinnedCandidate(t *testing.T) {
 
 // TestPoolSteadyStateAddsNoDials: with everything healthy the pool must cost
 // exactly what a single-server client costs. Any per-cycle sweep would show up
-// here as accepts on the endpoints nobody is using.
+// here as accepts on the endpoints nobody is using, and any extra dial per
+// cycle as more than one accept per Connect on the pinned one.
+//
+// The first Connect is left out of the per-cycle count: it is allowed to pay
+// for discovery. What it may not do is touch the rest of the pool either.
 func TestPoolSteadyStateAddsNoDials(t *testing.T) {
 	pinned := newCountingListener(t)
 	other1 := newCountingListener(t)
 	other2 := newCountingListener(t)
+	all := []*countingListener{pinned, other1, other2}
 
 	clk := newEndpointClock()
 	m := newMultiEndpointManager(t, clk, endpoint.Config{}, pinned.addr, other1.addr, other2.addr)
 	m.Register(&targetStrategy{mgr: m, id: "s1", priority: 1})
 
 	ctx := context.Background()
-	for range 5 {
+	connect := func() {
+		t.Helper()
 		conn, _, err := m.Connect(ctx, "")
 		if err != nil {
 			t.Fatalf("Connect: %v", err)
@@ -137,10 +146,26 @@ func TestPoolSteadyStateAddsNoDials(t *testing.T) {
 		clk.Advance(time.Minute)
 	}
 
-	if n := pinned.accepts.Load(); n == 0 {
+	connect()
+	pinned.settle(t)
+	first := pinned.accepts.Load()
+	if first == 0 {
 		t.Fatal("the pinned endpoint saw no connections - the test proves nothing")
 	}
-	for i, l := range []*countingListener{other1, other2} {
+
+	const cycles = 4
+	for range cycles {
+		connect()
+	}
+	for _, l := range all {
+		l.settle(t)
+	}
+
+	if got := pinned.accepts.Load() - first; got != cycles {
+		t.Errorf("%d steady-state Connects cost the pinned endpoint %d dial(s), want exactly %d",
+			cycles, got, cycles)
+	}
+	for i, l := range all[1:] {
 		if n := l.accepts.Load(); n != 0 {
 			t.Errorf("healthy pool dialled unused endpoint %d %d time(s), want 0", i+1, n)
 		}
