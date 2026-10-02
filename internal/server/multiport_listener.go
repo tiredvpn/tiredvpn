@@ -52,7 +52,9 @@ func NewMultiPortListener(host string, ports []int) (*MultiPortListener, error) 
 	// Start listeners on all ports, skip any that fail (e.g., TIME_WAIT)
 	skipped := 0
 	for _, port := range ports {
-		addr := fmt.Sprintf("%s:%d", host, port)
+		// JoinHostPort: an IPv6 listen host ("::" from -listen [::]:995)
+		// spliced with %s:%d gives ":::995", which net.Listen rejects.
+		addr := net.JoinHostPort(host, strconv.Itoa(port))
 		l, err := net.Listen("tcp", addr)
 		if err != nil {
 			// Log warning and skip this port (likely TIME_WAIT or in use)
@@ -405,7 +407,7 @@ func NewMultiPortListenerFromRange(host, portRange string, maxPorts int) (net.Li
 
 	if len(ports) == 1 {
 		// Single port - use regular listener
-		addr := fmt.Sprintf("%s:%d", host, ports[0])
+		addr := net.JoinHostPort(host, strconv.Itoa(ports[0]))
 		return net.Listen("tcp", addr)
 	}
 

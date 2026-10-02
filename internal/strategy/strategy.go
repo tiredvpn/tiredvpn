@@ -1707,6 +1707,19 @@ func initManagerTransport(m *Manager, cfg DefaultManagerConfig) {
 		}
 		eps = []endpoint.Endpoint{{Name: "server", V4: cfg.ServerAddr, V6: cfg.ServerAddrV6}}
 	}
+	// Synthesised or passed in, every endpoint goes through the same
+	// normalisation as client.ResolveEndpoints, so a raw -server-v6 value
+	// ("2001:db8::2") reaching this fallback still dials as [2001:db8::2]:port.
+	normalized := make([]endpoint.Endpoint, 0, len(eps))
+	for _, e := range eps {
+		n, err := e.Normalized()
+		if err != nil {
+			log.Warn("Endpoint selector not configured: %s: %v", e.Label(len(normalized)), err)
+			return
+		}
+		normalized = append(normalized, n)
+	}
+	eps = normalized
 
 	legacy := endpoint.FamilyPolicyFromLegacy(cfg.PreferIPv6, cfg.FallbackToV4)
 	sel, err := endpoint.NewTunedSelector(eps, cfg.EndpointTuning, legacy)
