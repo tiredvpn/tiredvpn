@@ -13,10 +13,17 @@ import (
 // clientRunner runs at most one client at a time. Starting cancels the client
 // already running (without waiting for it); stopping cancels it and waits a
 // bounded time for it to return.
+//
+// Each client gets its own done channel. A single WaitGroup shared by every
+// client cannot express this: when stop gives up after its deadline, the
+// goroutine it left in Wait is still waiting when the next start calls Add,
+// and Go panics with "WaitGroup is reused before previous Wait has returned".
+// A channel per client has no such reuse, and a stop that gives up leaves
+// nothing behind.
 type clientRunner struct {
 	mu     sync.Mutex
 	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	done   chan struct{} // closed when the current client returns
 }
 
 // cancelCurrent cancels the running client, if any, and reports whether
@@ -41,10 +48,10 @@ func (r *clientRunner) start(run func(ctx context.Context)) {
 		r.cancel()
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	r.cancel = cancel
-	r.wg.Add(1)
+	done := make(chan struct{})
+	r.cancel, r.done = cancel, done
 	go func() {
-		defer r.wg.Done()
+		defer close(done)
 		run(ctx)
 	}()
 }
@@ -60,17 +67,13 @@ func (r *clientRunner) stop(timeout time.Duration, announce func()) (wasRunning,
 		return false, false
 	}
 	r.cancel()
-	r.cancel = nil
+	done := r.done
+	r.cancel, r.done = nil, nil
 	r.mu.Unlock()
 	if announce != nil {
 		announce()
 	}
 
-	done := make(chan struct{})
-	go func() {
-		r.wg.Wait()
-		close(done)
-	}()
 	select {
 	case <-done:
 		return true, true
