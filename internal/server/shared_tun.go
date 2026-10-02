@@ -95,6 +95,12 @@ type ClientWriter struct {
 	// Framing function - different protocols have different framing
 	// Returns the framed packet ready to send
 	framePacket func(pkt []byte) []byte
+
+	// gate, when set, owns every write to this tunnel: the handshake response,
+	// the frames below, the transport's keepalive echo and probe reply. It is
+	// what keeps the handshake first in the stream and one frame from landing
+	// inside another. See tun_frame_gate.go.
+	gate *tunFrameGate
 }
 
 // reconnectTracker tracks per-client reconnect frequency to prevent flapping
@@ -230,6 +236,19 @@ func (st *SharedTUN) TUNDevice() *tun.TUNDevice {
 // RegisterClient adds a client to the shared TUN
 // If client with same IP exists, old connection is gracefully drained before replacement
 func (st *SharedTUN) RegisterClient(clientIP net.IP, clientID string, conn net.Conn, frameFunc func([]byte) []byte) *ClientWriter {
+	return st.registerClient(clientIP, clientID, conn, frameFunc, nil)
+}
+
+// RegisterClientGated registers a client whose tunnel is owned by a frame gate.
+// The gate must already exist when the client enters the dispatcher's map, which
+// is the whole point: a packet dispatched in the window between registration and
+// the handshake response is refused by the closed gate instead of being framed
+// into the stream ahead of the response.
+func (st *SharedTUN) RegisterClientGated(clientIP net.IP, clientID string, conn net.Conn, frameFunc func([]byte) []byte, gate *tunFrameGate) *ClientWriter {
+	return st.registerClient(clientIP, clientID, conn, frameFunc, gate)
+}
+
+func (st *SharedTUN) registerClient(clientIP net.IP, clientID string, conn net.Conn, frameFunc func([]byte) []byte, gate *tunFrameGate) *ClientWriter {
 	ipStr := clientIP.String()
 	now := time.Now().Unix()
 
@@ -241,6 +260,7 @@ func (st *SharedTUN) RegisterClient(clientIP net.IP, clientID string, conn net.C
 		created:     now,
 		done:        make(chan struct{}),
 		framePacket: frameFunc,
+		gate:        gate,
 	}
 
 	// Track reconnect frequency
@@ -458,7 +478,9 @@ func (st *SharedTUN) packetWorker(id int, ch chan *tunPacket) {
 	}
 }
 
-// SendPacket sends a packet to the client connection
+// SendPacket sends a packet to the client connection. With a gate set it is one
+// of several writers on this tunnel and writes through the gate, so it can never
+// get ahead of the handshake response or inside another writer's frame.
 func (w *ClientWriter) SendPacket(pkt []byte) error {
 	// Check if done
 	select {
@@ -479,6 +501,20 @@ func (w *ClientWriter) SendPacket(pkt []byte) error {
 		framedPkt = make([]byte, 4+len(pkt))
 		binary.BigEndian.PutUint32(framedPkt[:4], uint32(len(pkt)))
 		copy(framedPkt[4:], pkt)
+	}
+
+	if w.gate != nil {
+		if err := w.gate.Frame(framedPkt); err != nil {
+			if FrameDropped(err) {
+				// The client has not finished its handshake: this packet belongs
+				// to a tunnel that is not carrying traffic yet. Dropping it looks
+				// to the inner TCP exactly like a lost packet.
+				return nil
+			}
+			return err
+		}
+		atomic.StoreInt64(&w.lastActive, time.Now().Unix())
+		return nil
 	}
 
 	w.writeMu.Lock()

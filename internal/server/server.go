@@ -1680,6 +1680,10 @@ type h2TunnelState struct {
 	// stego conn that chunks at 1000/1400 bytes) is reassembled instead of dropped.
 	// Read/written only from the single runH2FrameLoop goroutine -> no lock needed.
 	reasmBuf []byte
+	// tunGate owns every downstream write once this tunnel is in TUN mode: the
+	// handshake response, the dispatcher's frames, the keepalive echo and the
+	// auto-MTU probe reply. nil outside TUN mode.
+	tunGate *tunFrameGate
 }
 
 // h2ReasmBufLimit caps the inbound reassembly buffer. AMS prod runs with swap 0, so
@@ -1929,13 +1933,13 @@ func forwardH2TUNPacket(tunnel *h2TunnelState, streamID uint32, payload []byte, 
 			// rebuilt the whole frame, so the marker check sees a complete probe.
 			if tun.IsProbeFrame(ipPkt) {
 				if reply := tun.MakeProbeReply(ipPkt); reply != nil {
-					if h2c, ok := tunnel.targetConn.(*h2TunConn); ok {
+					if _, ok := tunnel.targetConn.(*h2TunConn); ok && tunnel.tunGate != nil {
 						frame := make([]byte, 4+len(reply))
 						binary.BigEndian.PutUint32(frame[:4], uint32(len(reply)))
 						copy(frame[4:], reply)
-						tunnel.mu.Lock()
-						sendStegoResponse(h2c.framer, tunnel.streamID, frame, h2c.secret)
-						tunnel.mu.Unlock()
+						if err := tunnel.tunGate.Frame(frame); err != nil && !FrameDropped(err) {
+							logger.Debug("Auto-MTU: H2 probe reply write failed: %v", err)
+						}
 						logger.Debug("Auto-MTU: H2 echoed PROBE_REPLY size=%d", len(reply))
 					}
 					tunnel.sink.UpdateActivity()
@@ -1953,11 +1957,11 @@ func forwardH2TUNPacket(tunnel *h2TunnelState, streamID uint32, payload []byte, 
 			// TUN handlers all echo zero-length keepalives; without it idle H2
 			// clients get no inbound traffic and self-disconnect when their
 			// readTimeout expires.
-			if h2c, ok := tunnel.targetConn.(*h2TunConn); ok {
+			if _, ok := tunnel.targetConn.(*h2TunConn); ok && tunnel.tunGate != nil {
 				logger.Debug("H2 TUN: received keepalive, echoing back")
-				tunnel.mu.Lock()
-				sendStegoResponse(h2c.framer, tunnel.streamID, []byte{0, 0, 0, 0}, h2c.secret)
-				tunnel.mu.Unlock()
+				if err := tunnel.tunGate.Frame([]byte{0, 0, 0, 0}); err != nil && !FrameDropped(err) {
+					logger.Debug("H2 TUN: keepalive echo failed: %v", err)
+				}
 			}
 			tunnel.sink.UpdateActivity()
 		})
@@ -2532,12 +2536,18 @@ func handleMorphTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverConte
 		logger.Debug("Morph TUN client requested: IP=%s (legacy v1)", requestedIP)
 	}
 
-	var writeMu sync.Mutex
-	writeMorphFrame := func(framed []byte) error {
-		writeMu.Lock()
-		defer writeMu.Unlock()
+	// One gate for every downstream write on this tunnel: the handshake
+	// response, the dispatcher's frames, the keepalive echo, the relay pump.
+	gate := newTunFrameGate(func(framed []byte) error {
 		conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 		_, err := conn.Write(framed)
+		return err
+	})
+	writeMorphFrame := func(framed []byte) error {
+		err := gate.Frame(framed)
+		if FrameDropped(err) {
+			return nil
+		}
 		return err
 	}
 
@@ -2581,7 +2591,7 @@ func handleMorphTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverConte
 		serverIP = cfg.TunIP
 
 		// Register client with shared TUN using Morph framing
-		writer := srvCtx.sharedTUN.RegisterClient(clientIP, clientID.id, conn, morphFramePacket)
+		writer := srvCtx.sharedTUN.RegisterClientGated(clientIP, clientID.id, conn, morphFramePacket, gate)
 		localSink := newLocalTUNSink(srvCtx.sharedTUN, writer, clientIP)
 		sink = localSink
 		defer func() {
@@ -2603,7 +2613,7 @@ func handleMorphTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverConte
 	binary.BigEndian.PutUint16(resp[4:6], uint16(padLen))
 	copy(resp[6:], respData)
 	fillRandPadding(resp[6+len(respData):])
-	if err := writeMorphFrame(resp); err != nil {
+	if err := gate.Open(resp); err != nil {
 		logger.Debug("Morph TUN handshake response write failed: %v", err)
 		return
 	}
@@ -3180,12 +3190,16 @@ func handleConfusionTUNMode(sess *confusionSession, remainingData []byte, srvCtx
 		logger.Debug("Confusion TUN client requested: IP=%s, clientID=%s (legacy v1)", requestedIP, clientID)
 	}
 
-	var confWriteMu sync.Mutex
-	writeConfusionFrame := func(frame []byte) error {
-		confWriteMu.Lock()
-		defer confWriteMu.Unlock()
+	gate := newTunFrameGate(func(frame []byte) error {
 		conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 		_, err := conn.Write(frame)
+		return err
+	})
+	writeConfusionFrame := func(frame []byte) error {
+		err := gate.Frame(frame)
+		if FrameDropped(err) {
+			return nil
+		}
 		return err
 	}
 
@@ -3229,7 +3243,7 @@ func handleConfusionTUNMode(sess *confusionSession, remainingData []byte, srvCtx
 		serverIP = cfg.TunIP
 
 		// Register client with shared TUN (default framing: [length:4][packet:N])
-		writer := srvCtx.sharedTUN.RegisterClient(clientIP, clientID.id, conn, nil)
+		writer := srvCtx.sharedTUN.RegisterClientGated(clientIP, clientID.id, conn, nil, gate)
 		localSink := newLocalTUNSink(srvCtx.sharedTUN, writer, clientIP)
 		sink = localSink
 		defer func() {
@@ -3247,7 +3261,7 @@ func handleConfusionTUNMode(sess *confusionSession, remainingData []byte, srvCtx
 	dual := downstreamDualStackAddrs(sink, cfg.IPPoolV6, clientIP)
 	resp := buildTUNHandshakeResponse(clientVersion, serverIP, clientIP, tunHandshakeCaps{}, dual)
 	recordDualStackSession(srvCtx, clientVersion, dual)
-	if err := writeConfusionFrame(resp); err != nil {
+	if err := gate.Open(resp); err != nil {
 		logger.Debug("Confusion TUN handshake response write failed: %v", err)
 		return
 	}
@@ -3648,7 +3662,15 @@ func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger
 		logger.Info("Advertising dual-stack: server6=%s client6=%s", dual.ServerIP6, dual.ClientIP6)
 	}
 
-	if _, err := conn.Write(resp); err != nil {
+	// One gate owns every downstream write on this tunnel: the handshake
+	// response below, the dispatcher's frames, the keepalive echo and the
+	// auto-MTU probe reply. See tun_frame_gate.go.
+	gate := newTunFrameGate(func(frame []byte) error {
+		conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+		_, err := conn.Write(frame)
+		return err
+	})
+	if err := gate.Open(resp); err != nil {
 		logger.Debug("Failed to send TUN response: %v", err)
 		if ipFromPool {
 			srvCtx.ipPool.Release(clientIP)
@@ -3658,7 +3680,7 @@ func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger
 
 	// Register client with shared TUN
 	// Default framing: [length:4][packet:N]
-	writer := srvCtx.sharedTUN.RegisterClient(clientIP, clientID.id, conn, nil)
+	writer := srvCtx.sharedTUN.RegisterClientGated(clientIP, clientID.id, conn, nil, gate)
 	defer func() {
 		srvCtx.sharedTUN.UnregisterClient(clientIP, writer)
 		// Don't release IP - it stays allocated for reconnects
@@ -3671,7 +3693,6 @@ func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger
 	// TUN -> Client is handled by SharedTUN packet dispatcher
 	var packetsUp int64
 	lenBuf := make([]byte, 4)
-	var writeMu sync.Mutex
 
 	for {
 		// Check if client disconnected (replaced by new connection)
@@ -3693,10 +3714,9 @@ func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger
 		// Handle keepalive packet (zero length) - echo back
 		if pktLen == 0 {
 			logger.Debug("Received keepalive, echoing back")
-			writeMu.Lock()
-			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			conn.Write(lenBuf)
-			writeMu.Unlock()
+			if err := gate.Frame(lenBuf); err != nil && !FrameDropped(err) {
+				logger.Debug("Keepalive echo write failed: %v", err)
+			}
 			writer.UpdateActivity()
 			continue
 		}
@@ -3723,10 +3743,9 @@ func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger
 				replyFrame := make([]byte, 4+len(reply))
 				binary.BigEndian.PutUint32(replyFrame[:4], uint32(len(reply)))
 				copy(replyFrame[4:], reply)
-				writeMu.Lock()
-				conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-				conn.Write(replyFrame)
-				writeMu.Unlock()
+				if err := gate.Frame(replyFrame); err != nil && !FrameDropped(err) {
+					logger.Debug("Auto-MTU reply write failed: %v", err)
+				}
 				writer.UpdateActivity()
 			}
 			// A non-request or malformed probe frame is dropped silently.
@@ -4076,14 +4095,21 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 
 	// sendPacketDown wraps one IP packet in the stego TUN framing the client
 	// expects: [len:4][packet:N].
+	gate := newTunFrameGate(func(frame []byte) error {
+		tunnel.mu.Lock()
+		sendStegoResponse(framer, tunnel.streamID, frame, tunnel.secret)
+		tunnel.mu.Unlock()
+		return nil
+	})
+	tunnel.tunGate = gate
 	sendPacketDown := func(pkt []byte) error {
 		framed := make([]byte, 4+len(pkt))
 		binary.BigEndian.PutUint32(framed[:4], uint32(len(pkt)))
 		copy(framed[4:], pkt)
 
-		tunnel.mu.Lock()
-		sendStegoResponse(framer, tunnel.streamID, framed, tunnel.secret)
-		tunnel.mu.Unlock()
+		if err := gate.Frame(framed); err != nil && !FrameDropped(err) {
+			return err
+		}
 		return nil
 	}
 
@@ -4118,12 +4144,10 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 		serverIP = cfg.TunIP
 		h2Conn.clientIP = clientIP
 
-		// Register client with shared TUN using custom frame function
-		// Note: For H2, we send directly in frameFunc, so it returns nil
-		writer := srvCtx.sharedTUN.RegisterClient(clientIP, tunnel.clientID.id, h2Conn, func(pkt []byte) []byte {
-			sendPacketDown(pkt)
-			return nil // Already sent directly
-		})
+		// Register client with shared TUN. The default [len:4][packet:N] framing
+		// is what the gate's writer wraps in a stego response, so there is no
+		// longer a frameFunc that sends on its own and returns nil.
+		writer := srvCtx.sharedTUN.RegisterClientGated(clientIP, tunnel.clientID.id, h2Conn, nil, gate)
 		tunnel.sharedTUNWriter = writer
 		tunnel.sharedTUN = srvCtx.sharedTUN
 		tunnel.sink = newLocalTUNSink(srvCtx.sharedTUN, writer, clientIP)
@@ -4138,7 +4162,13 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 	dual := downstreamDualStackAddrs(tunnel.sink, cfg.IPPoolV6, clientIP)
 	resp := buildTUNHandshakeResponse(clientVersion, serverIP, clientIP, tunHandshakeCaps{}, dual)
 	recordDualStackSession(srvCtx, clientVersion, dual)
-	sendStegoResponse(framer, tunnel.streamID, resp, tunnel.secret)
+	// Through the gate, like every other write on this tunnel: the h2 framer is
+	// not safe for concurrent use (one shared scratch buffer, several writes per
+	// frame) and this response used to take no lock at all.
+	if err := tunnel.tunGate.Open(resp); err != nil {
+		logger.Debug("H2 TUN handshake response write failed: %v", err)
+		return
+	}
 
 	logger.Info("H2 TUN mode established (client=%s, server=%s)", clientIP, serverIP)
 }
@@ -5401,6 +5431,18 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 		sess:   sess,
 		closed: make(chan struct{}),
 	}
+	// One gate for every downstream write on this session: the handshake
+	// response, the dispatcher's frames, the keepalive echo, the relay pump.
+	// Without it a frame queued for this tunnel IP could reach the client ahead
+	// of the handshake response and desync the stream for good.
+	gate := newTunFrameGate(func(frame []byte) error {
+		if sess.closed {
+			return io.EOF
+		}
+		sess.WriteToClient(frame)
+		return nil
+	})
+	pollConn.gate = gate
 
 	var clientIP, serverIP net.IP
 	var sink tunPacketSink
@@ -5446,7 +5488,7 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 
 		// Register client with shared TUN using custom framer for polling
 		// Polling uses [length:4][packet:N] framing
-		writer := srvCtx.sharedTUN.RegisterClient(clientIP, clientID.id, pollConn, nil)
+		writer := srvCtx.sharedTUN.RegisterClientGated(clientIP, clientID.id, pollConn, nil, gate)
 		localSink := newLocalTUNSink(srvCtx.sharedTUN, writer, clientIP)
 		sink = localSink
 		defer func() {
@@ -5462,7 +5504,10 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 	dual := downstreamDualStackAddrs(sink, cfg.IPPoolV6, clientIP)
 	resp := buildTUNHandshakeResponse(clientVersion, serverIP, clientIP, tunHandshakeCaps{}, dual)
 	recordDualStackSession(srvCtx, clientVersion, dual)
-	sess.WriteToClient(resp)
+	if err := gate.Open(resp); err != nil {
+		logger.Debug("HTTP Polling TUN handshake response write failed: %v", err)
+		return
+	}
 
 	logger.Info("HTTP Polling TUN mode established (client=%s, server=%s)", clientIP, serverIP)
 
@@ -5507,7 +5552,9 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 			if pktLen == 0 {
 				data = data[4:]
 				logger.Debug("HTTP Polling TUN: echoing keepalive")
-				sess.WriteToClient([]byte{0, 0, 0, 0}) // Echo keepalive
+				if err := gate.Frame([]byte{0, 0, 0, 0}); err != nil && !FrameDropped(err) {
+					logger.Debug("HTTP Polling TUN: keepalive echo failed: %v", err)
+				}
 				continue
 			}
 
@@ -5559,6 +5606,7 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 type pollingTUNConn struct {
 	sess   *HTTPPollingSession
 	closed chan struct{}
+	gate   *tunFrameGate
 }
 
 func (c *pollingTUNConn) Read(b []byte) (int, error) {
@@ -5575,6 +5623,15 @@ func (c *pollingTUNConn) Write(b []byte) (int, error) {
 	frame := make([]byte, 4+len(b))
 	binary.BigEndian.PutUint32(frame[0:4], uint32(len(b)))
 	copy(frame[4:], b)
+	if c.gate != nil {
+		if err := c.gate.Frame(frame); err != nil {
+			if FrameDropped(err) {
+				return len(b), nil // not attached yet; the inner TCP retransmits
+			}
+			return 0, err
+		}
+		return len(b), nil
+	}
 	c.sess.WriteToClient(frame)
 	return len(b), nil
 }
