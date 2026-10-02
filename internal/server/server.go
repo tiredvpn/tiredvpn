@@ -4727,8 +4727,9 @@ type HTTPPollingSession struct {
 	targetConn net.Conn
 	targetLock sync.Mutex
 
-	// Lifecycle
-	closed    bool
+	// Lifecycle. closed is read without a lock by the relay loops and the TUN
+	// writer, so it is atomic; closeLock serialises Close itself.
+	closed    atomic.Bool
 	closeLock sync.Mutex
 }
 
@@ -4827,10 +4828,10 @@ func (s *HTTPPollingSession) Close() {
 	s.closeLock.Lock()
 	defer s.closeLock.Unlock()
 
-	if s.closed {
+	if s.closed.Load() {
 		return
 	}
-	s.closed = true
+	s.closed.Store(true)
 
 	s.targetLock.Lock()
 	if s.targetConn != nil {
@@ -4846,32 +4847,55 @@ func (s *HTTPPollingSession) WriteToClient(data []byte) {
 	s.toClient.Write(data)
 }
 
-// ReadFromClient reads data received from client
+// The uplink (client -> server bytes) has exactly one writer and one reader:
+//
+//   - writer: processHTTPPollingRequest, which appends each request body with
+//     WriteFromClient in the order the bodies arrive;
+//   - reader: the session's relay goroutine (runPollingSessionRelay, then
+//     runPollingTUNMode or the SOCKS client->target loop), which takes
+//     everything with ReadFromClient.
+//
+// The reader keeps whatever it cannot use yet (a frame whose tail is still in
+// flight, the rest of a body after the SOCKS target address) to itself. It used
+// to write that tail back with WriteFromClient, which put it BEHIND any body
+// that had arrived while it was parsing - the stream came out reordered and the
+// TUN parser read a garbage length and closed the session. ReadFromClient also
+// handed out a slice that still pointed into the buffer, so the next body was
+// written over bytes the reader was still parsing, or still writing to the
+// SOCKS target.
+
+// ReadFromClient takes every byte received from the client so far. The slice is
+// the caller's: nothing in the session refers to it afterwards.
 func (s *HTTPPollingSession) ReadFromClient() []byte {
 	s.bufLock.Lock()
 	defer s.bufLock.Unlock()
+	if s.fromClient.Len() == 0 {
+		return nil
+	}
 	data := s.fromClient.Bytes()
-	s.fromClient.Reset()
+	s.fromClient = bytes.NewBuffer(nil) // hand the old array over; never write it again
 	return data
 }
 
-// maxFromClientBuffered bounds fromClient so a stuck consumer (bad framing,
-// dead target) can't grow it without limit under a chatty poller. Legitimate
-// traffic never approaches this - it's individual TUN/SOCKS frames capped at
-// 65535 bytes each, drained every ~10ms.
+// maxFromClientBuffered bounds the uplink a stuck reader can leave behind.
+// Legitimate traffic never approaches it: the reader drains every ~10ms and the
+// client uploads at most 8 KiB per request.
 const maxFromClientBuffered = 4 * 1024 * 1024
 
-// WriteFromClient writes data received from client
-func (s *HTTPPollingSession) WriteFromClient(data []byte) {
+// WriteFromClient appends one request body to the uplink, or refuses it whole
+// when that would take the uplink over maxFromClientBuffered. A refused body
+// is not lost: the caller answers the request with an error, and the client
+// keeps the bytes and sends them again (see processHTTPPollingRequest).
+// Dropping it silently, as this used to, leaves a hole in a byte stream that
+// nothing can repair.
+func (s *HTTPPollingSession) WriteFromClient(data []byte) bool {
 	s.bufLock.Lock()
 	defer s.bufLock.Unlock()
 	if s.fromClient.Len()+len(data) > maxFromClientBuffered {
-		// Consumer is stuck or the client is misbehaving; drop rather than
-		// grow unbounded. The stuck-consumer case above already tears the
-		// session down, so this is a backstop against similar bugs elsewhere.
-		return
+		return false
 	}
 	s.fromClient.Write(data)
+	return true
 }
 
 // ReadToClient reads data to send to client with acknowledgement-based reliability
@@ -4991,6 +5015,25 @@ func decodeClientSecret(secretStr string) []byte {
 	return []byte(secretStr)
 }
 
+// pollingUplinkCommitBudget is how long a request body may take to arrive,
+// counted from its header block, and still be written into the session.
+//
+// The uplink carries no sequence number. The client gives every request 3s
+// (tlsConn.SetDeadline in internal/strategy/http_polling.go exchange), and on
+// any error it puts the body back at the front of its send buffer and sends it
+// again on a fresh connection. A body that reaches the server after the client
+// gave up is therefore a copy of bytes that are already on their way again:
+// writing it duplicates them, and in TUN mode the frame parser then reads a
+// garbage length and closes the session. On a lossy path this is a slow body
+// read (seen on a 300ms/2%-loss stand: the abandoned body finished 2.3s and
+// 4.5s after its headers). A refusal is always safe - a client still waiting
+// re-sends, one that left never reads the answer - so the budget is set well
+// inside the client's 3s, leaving room for the headers' own delay and for the
+// response's way back. What it cannot catch is a body that arrived in time
+// whose response is then lost past the client's deadline; only an uplink
+// sequence number in the protocol closes that.
+const pollingUplinkCommitBudget = time.Second
+
 // pollingServerMaxRequests / pollingServerKeepaliveIdle bound connection reuse
 // on the server side. They mirror the client's bounds: reuse amortises the TLS
 // handshake across a burst of active polls, but a meek connection is never held
@@ -5082,6 +5125,7 @@ func readPollingRequestHead(reader *bufio.Reader) ([]byte, error) {
 // processHTTPPollingRequest processes a single HTTP polling request and reports
 // whether the client asked to keep the connection open for a further request.
 func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serverContext, request, ekm []byte, logger *log.Logger) (keepAliveOut bool) {
+	headAt := time.Now() // the header block is in; the body, if any, follows
 	// Parse headers from request
 	lines := bytes.Split(request, []byte("\r\n"))
 	var sessionID, authToken string
@@ -5128,6 +5172,11 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 			return false
 		}
 	}
+
+	// A body that took too long to arrive may belong to a request the client
+	// has already given up on (see pollingUplinkCommitBudget); it is refused
+	// below instead of written.
+	late := len(body) > 0 && time.Since(headAt) > pollingUplinkCommitBudget
 
 	// Check if session already exists - if so, use its secret for auth
 	existingSess := pollingManager.Get(sessionID)
@@ -5198,9 +5247,16 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 	if isNew {
 		logger.Info("HTTP Polling: New session %s (client: %s), body=%d bytes, contentLength=%d", sessionID[:8], clientID, len(body), contentLength)
 
-		// Write init body data (contains target address) BEFORE starting relay
+		// Write init body data (contains target address) BEFORE starting relay.
+		// The session is empty, so only a body over the whole bound is refused;
+		// no relay will ever read this session, so it goes with the body.
 		if len(body) > 0 {
-			sess.WriteFromClient(body)
+			if late || !sess.WriteFromClient(body) {
+				logger.Debug("HTTP Polling: New session %s body of %d bytes refused (late=%v)", sessionID[:8], len(body), late)
+				pollingManager.Remove(sessionID)
+				sendHTTPPollingBusy(conn)
+				return false
+			}
 			logger.Debug("HTTP Polling: New session received %d bytes (target addr): %x", len(body), body)
 		} else {
 			logger.Debug("HTTP Polling: WARNING - New session has no body data!")
@@ -5219,7 +5275,22 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 
 	// Write client data to session buffer
 	if len(body) > 0 {
-		sess.WriteFromClient(body)
+		if late {
+			logger.Debug("HTTP Polling: body of %d bytes took %v (session %s), refusing it as possibly abandoned",
+				len(body), time.Since(headAt).Round(time.Millisecond), sessionID[:8])
+			sendHTTPPollingBusy(conn)
+			return false
+		}
+		if !sess.WriteFromClient(body) {
+			// The relay is not keeping up. Refuse the body instead of dropping
+			// it: a non-200 makes the client keep these bytes, drop the
+			// connection and send them again after its backoff, so the stream
+			// stays whole and the backlog stays bounded. No downlink data and no
+			// ack are processed for this request; the next one carries both.
+			logger.Debug("HTTP Polling: uplink full (session %s), refusing %d bytes", sessionID[:8], len(body))
+			sendHTTPPollingBusy(conn)
+			return false
+		}
 		logger.Debug("HTTP Polling: Received %d bytes from client (session %s)", len(body), sessionID[:8])
 	}
 
@@ -5237,8 +5308,11 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 func runPollingSessionRelay(sess *HTTPPollingSession, srvCtx *serverContext, logger *log.Logger) {
 	logger.Debug("HTTP Polling: Starting relay for session %s", sess.ID[:8])
 
-	// Wait for first data from client to determine target
+	// Wait for first data from client to determine target. This goroutine is
+	// the uplink's only reader from here on: what it takes but cannot use yet
+	// stays in head and is handed on, never written back into the session.
 	var targetAddr string
+	var head []byte // uplink bytes taken but not consumed yet
 	timeout := time.After(30 * time.Second)
 
 	for {
@@ -5250,35 +5324,32 @@ func runPollingSessionRelay(sess *HTTPPollingSession, srvCtx *serverContext, log
 		default:
 		}
 
-		data := sess.ReadFromClient()
-		if len(data) > 0 {
+		if fresh := sess.ReadFromClient(); len(fresh) > 0 {
+			head = append(head, fresh...)
+		}
+		if len(head) > 0 {
 			// Check for TUN mode (first byte = 0x02)
-			if data[0] == 0x02 {
+			if head[0] == 0x02 {
 				logger.Info("HTTP Polling: TUN mode detected for session %s", sess.ID[:8])
-				runPollingTUNMode(sess, data[1:], srvCtx, logger)
+				runPollingTUNMode(sess, head[1:], srvCtx, logger)
 				return
 			}
 
 			// SOCKS mode: First 2 bytes are address length
-			if len(data) < 2 {
-				logger.Debug("HTTP Polling: Invalid address length")
-				pollingManager.Remove(sess.ID)
-				return
+			if len(head) >= 2 {
+				addrLen := int(head[0])<<8 | int(head[1])
+				if addrLen < 3 || addrLen > 256 {
+					logger.Debug("HTTP Polling: Invalid address (len=%d, have=%d)", addrLen, len(head))
+					pollingManager.Remove(sess.ID)
+					return
+				}
+				if len(head) >= 2+addrLen {
+					targetAddr = string(head[2 : 2+addrLen])
+					head = head[2+addrLen:] // the first payload bytes, written to the target first
+					break
+				}
 			}
-
-			addrLen := int(data[0])<<8 | int(data[1])
-			if addrLen < 3 || addrLen > 256 || len(data) < 2+addrLen {
-				logger.Debug("HTTP Polling: Invalid address (len=%d, have=%d)", addrLen, len(data))
-				pollingManager.Remove(sess.ID)
-				return
-			}
-
-			targetAddr = string(data[2 : 2+addrLen])
-			// Put remaining data back
-			if len(data) > 2+addrLen {
-				sess.WriteFromClient(data[2+addrLen:])
-			}
-			break
+			// The address is split across bodies: wait for the rest.
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -5315,11 +5386,18 @@ func runPollingSessionRelay(sess *HTTPPollingSession, srvCtx *serverContext, log
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Client -> Target
+	// Client -> Target. The slices ReadFromClient returns belong to this
+	// goroutine, so a body arriving mid-write can no longer overwrite them.
 	go func() {
 		defer wg.Done()
+		if len(head) > 0 {
+			if _, err := targetConn.Write(head); err != nil {
+				return
+			}
+			head = nil
+		}
 		for {
-			if sess.closed {
+			if sess.closed.Load() {
 				return
 			}
 			data := sess.ReadFromClient()
@@ -5344,7 +5422,7 @@ func runPollingSessionRelay(sess *HTTPPollingSession, srvCtx *serverContext, log
 			}
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					if sess.closed {
+					if sess.closed.Load() {
 						return
 					}
 					continue
@@ -5376,6 +5454,16 @@ func sendHTTPPollingResponse(conn net.Conn, body []byte, keepAlive bool) {
 	if len(body) > 0 {
 		conn.Write(body)
 	}
+}
+
+// sendHTTPPollingBusy refuses a request whose body the session cannot take
+// yet. Any non-200 is an error to the client, which re-sends the body later.
+func sendHTTPPollingBusy(conn net.Conn) {
+	conn.Write([]byte("HTTP/1.1 503 Service Unavailable\r\n" +
+		"Content-Type: text/plain\r\n" +
+		"Content-Length: 0\r\n" +
+		"Connection: close\r\n" +
+		"\r\n"))
 }
 
 // sendHTTPPollingError sends HTTP 400 error
@@ -5436,7 +5524,7 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 	// Without it a frame queued for this tunnel IP could reach the client ahead
 	// of the handshake response and desync the stream for good.
 	gate := newTunFrameGate(func(frame []byte) error {
-		if sess.closed {
+		if sess.closed.Load() {
 			return io.EOF
 		}
 		sess.WriteToClient(frame)
@@ -5515,6 +5603,7 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 	// TUN -> Client is handled by SharedTUN packet dispatcher via pollConn.Write()
 	lenBuf := make([]byte, 4)
 	var packetsUp int64
+	var pending []byte // a frame's head whose tail has not arrived yet
 
 	for {
 		select {
@@ -5528,17 +5617,23 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 		}
 
 		// Check if session is still active
-		if sess.closed {
+		if sess.closed.Load() {
 			logger.Debug("HTTP Polling TUN: session closed")
 			return
 		}
 
-		// Read packet from client via polling buffer
-		data := sess.ReadFromClient()
-		if len(data) == 0 {
+		// Read packet from client via polling buffer. pending is the tail of a
+		// frame taken earlier; it is ours and goes in front of the new bytes.
+		fresh := sess.ReadFromClient()
+		if len(fresh) == 0 {
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
+		data := fresh
+		if len(pending) > 0 {
+			data = append(pending, fresh...)
+		}
+		pending = nil
 
 		// Process packets from buffer
 		logger.Debug("HTTP Polling TUN: processing data, len=%d", len(data))
@@ -5573,7 +5668,6 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 			if int(pktLen)+4 > len(data) {
 				// Genuinely incomplete - wait for the rest on the next poll.
 				logger.Debug("HTTP Polling TUN: incomplete packet, pktLen=%d, data=%d", pktLen, len(data))
-				sess.WriteFromClient(data)
 				break
 			}
 
@@ -5595,9 +5689,10 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 			sink.UpdateActivity()
 		}
 
-		// Put remaining partial data back
+		// Keep the unparsed tail (less than one frame) for the next round. A
+		// copy, so the array of a large body is not pinned for one short tail.
 		if len(data) > 0 {
-			sess.WriteFromClient(data)
+			pending = append([]byte(nil), data...)
 		}
 	}
 }
@@ -5616,7 +5711,7 @@ func (c *pollingTUNConn) Read(b []byte) (int, error) {
 
 func (c *pollingTUNConn) Write(b []byte) (int, error) {
 	// Write packet to client with length prefix
-	if c.sess.closed {
+	if c.sess.closed.Load() {
 		return 0, io.EOF
 	}
 	// Frame: [length:4][packet:N]
