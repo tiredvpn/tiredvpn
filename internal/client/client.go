@@ -22,6 +22,7 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/pool"
 	"github.com/tiredvpn/tiredvpn/internal/porthopping"
+	"github.com/tiredvpn/tiredvpn/internal/protect"
 	"github.com/tiredvpn/tiredvpn/internal/shaper"
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
 	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
@@ -96,6 +97,7 @@ type Config struct {
 	// the host (not Go) also owns route/DNS/firewall setup.
 	TunFd         int    // Use existing TUN file descriptor
 	ProtectPath   string // Unix socket path for protect() calls (Android only)
+	ProtectProto  int    // protect channel protocol the app speaks (-protect-proto); 2 = SCM_RIGHTS, else 1
 	ControlSocket string // Control socket path for host<->Go command channel
 	AndroidMode   bool   // Running on Android (disables os/exec, ICMP checks, etc.)
 	MacOSMode     bool   // Running on macOS inside NEPacketTunnelProvider (same shape as AndroidMode minus protect)
@@ -571,6 +573,19 @@ func runProbeAndServe(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal
 	return runProxyMode(cfg, mgr, sigChan)
 }
 
+// initProtector selects the protect protocol the app asked for
+// (-protect-proto) and connects the protector. Both have to happen before the
+// first dial.
+func initProtector(cfg *Config) {
+	protect.SetProtocol(cfg.ProtectProto)
+	if cfg.ProtectPath == "" {
+		return
+	}
+	if err := tun.InitAndroidProtector(cfg.ProtectPath); err != nil {
+		log.Warn("Socket protector init failed: %v (connections may not work)", err)
+	}
+}
+
 // runControlSocketMode runs in Android control socket mode
 // Android app connects to socket, sends "connect", gets IP, creates VPN interface, sends fd
 func runControlSocketMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) error {
@@ -578,11 +593,7 @@ func runControlSocketMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Si
 
 	// Initialize Android socket protector if protect path is provided
 	// This allows strategies to protect sockets from VPN routing
-	if cfg.ProtectPath != "" {
-		if err := tun.InitAndroidProtector(cfg.ProtectPath); err != nil {
-			log.Warn("Socket protector init failed: %v (connections may not work)", err)
-		}
-	}
+	initProtector(cfg)
 
 	// IPv6 inside the tunnel: -tun-ipv6 dual opts the control-socket path into
 	// the v0x04 dual-stack handshake, same policy parser as desktop TUN mode.
@@ -884,6 +895,8 @@ func newTUNVPNConfig(cfg *Config, mgr *strategy.Manager) (tun.VPNConfig, error) 
 
 func runTUNMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) error {
 	log.Info("Starting TUN mode")
+	// The VPN client initializes the protector itself from ProtectPath.
+	protect.SetProtocol(cfg.ProtectProto)
 
 	vpnCfg, err := newTUNVPNConfig(cfg, mgr)
 	if err != nil {

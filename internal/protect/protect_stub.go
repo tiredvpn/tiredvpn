@@ -7,6 +7,16 @@ import (
 	"net"
 )
 
+// Protocol versions accepted by SetProtocol.
+const (
+	ProtoV1 = 1
+	ProtoV2 = 2
+)
+
+func SetProtocol(_ int) {}
+
+func Protocol() int { return ProtoV1 }
+
 func InitAndroidProtector(_ string) error { return nil }
 
 func ProtectSocket(_ int) error { return nil }
