@@ -172,11 +172,8 @@ import (
 )
 
 var (
-	// Global client context and cancel function
-	clientCtx    context.Context
-	clientCancel context.CancelFunc
-	clientMutex  sync.Mutex
-	clientWg     sync.WaitGroup
+	// The running client (client_runner.go)
+	jniClient clientRunner
 
 	// TUN file descriptor passed from Android
 	tunFd     int
@@ -228,15 +225,9 @@ func Java_com_tiredvpn_android_native_TiredVpnNative_startClient(
 	class C.jclass,
 	argv C.jobjectArray,
 ) C.jint {
-	clientMutex.Lock()
-	defer clientMutex.Unlock()
-
 	// Stop any existing client
-	if clientCancel != nil {
+	if jniClient.cancelCurrent() {
 		logMessage("Stopping existing client before starting new one")
-		clientCancel()
-		clientCtx = nil
-		clientCancel = nil
 	}
 
 	// Decode the Java String[] element-by-element. Each element is one argv
@@ -264,13 +255,8 @@ func Java_com_tiredvpn_android_native_TiredVpnNative_startClient(
 	// Set up os.Args for flag parsing
 	os.Args = append([]string{"tiredvpn", "client"}, args...)
 
-	// Create cancelable context
-	clientCtx, clientCancel = context.WithCancel(context.Background())
-
 	// Run client in goroutine
-	clientWg.Add(1)
-	go func() {
-		defer clientWg.Done()
+	jniClient.start(func(ctx context.Context) {
 		defer func() {
 			if r := recover(); r != nil {
 				errMsg := fmt.Sprintf("Client panicked: %v", r)
@@ -283,14 +269,14 @@ func Java_com_tiredvpn_android_native_TiredVpnNative_startClient(
 		sendStateChange("connecting", `{}`)
 
 		// Run the client (this will block until disconnect)
-		if err := runClientWithContext(clientCtx, args); err != nil {
+		if err := runClientWithContext(ctx, args); err != nil {
 			errMsg := fmt.Sprintf("Client error: %v", err)
 			logMessage(errMsg)
 			sendStateChange("error", fmt.Sprintf(`{"error":"%s"}`, errMsg))
 		} else {
 			sendStateChange("disconnected", `{}`)
 		}
-	}()
+	})
 
 	return 0
 }
@@ -300,34 +286,16 @@ func Java_com_tiredvpn_android_native_TiredVpnNative_stopClient(
 	env *C.JNIEnv,
 	class C.jclass,
 ) {
-	clientMutex.Lock()
-
-	if clientCancel != nil {
-		logMessage("Stopping client")
-		clientCancel()
-		clientCtx = nil
-		clientCancel = nil
-
-		clientMutex.Unlock()
-
-		// Wait for client goroutine to finish (with timeout)
-		done := make(chan struct{})
-		go func() {
-			clientWg.Wait()
-			close(done)
-		}()
-
-		select {
-		case <-done:
-			logMessage("Client stopped successfully")
-		case <-time.After(5 * time.Second):
-			logMessage("WARNING: Client did not stop within 5 seconds")
-		}
-
-		sendStateChange("disconnected", `{}`)
-	} else {
-		clientMutex.Unlock()
+	wasRunning, stopped := jniClient.stop(5*time.Second, func() { logMessage("Stopping client") })
+	if !wasRunning {
+		return
 	}
+	if stopped {
+		logMessage("Client stopped successfully")
+	} else {
+		logMessage("WARNING: Client did not stop within 5 seconds")
+	}
+	sendStateChange("disconnected", `{}`)
 }
 
 //export Java_com_tiredvpn_android_native_TiredVpnNative_setTunFd
