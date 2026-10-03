@@ -1,0 +1,28 @@
+Origin: TiredVPN
+Label: TiredVPN
+Codename: stable
+Date: Sat, 03 Oct 2026 07:25:41 UTC
+Architectures: amd64 arm64
+Components: main
+Description: TiredVPN apt repository
+MD5Sum:
+ c1c3a080d75698f58bd9193157ee702a 745 main/binary-amd64/Packages
+ 146bedb29b35d7574898ef836ce36d28 523 main/binary-amd64/Packages.gz
+ a1cb1598e0aa53fb7a19e480edb1fd61 106 main/binary-amd64/Release
+ 33ec35a14d4239647168a16a2d3378ee 745 main/binary-arm64/Packages
+ 94ca1a32535e93d951049acc59ca2a46 525 main/binary-arm64/Packages.gz
+ 833f0c2c40c4bd6fc40c49fa19ba6a0e 106 main/binary-arm64/Release
+SHA1:
+ b29432025b66654b56c5e72b389b042242f9f1cc 745 main/binary-amd64/Packages
+ acab4417a1d7ad5de5fb15524c4f7681c5771c65 523 main/binary-amd64/Packages.gz
+ cbfc21b1aea4c89370605c63ec154f6fec1a0765 106 main/binary-amd64/Release
+ e640809a1059416c27557ae28454f762455f3596 745 main/binary-arm64/Packages
+ 5d059c647af8a1e2965068a0f16644fa1fd98565 525 main/binary-arm64/Packages.gz
+ 3bca33c026140b27d9e2f0e3015f33da87d18e20 106 main/binary-arm64/Release
+SHA256:
+ a5b3a8403708aded001cccef9aecc0e449fe09f4f0153e7b82c738d7e88bef62 745 main/binary-amd64/Packages
+ 39b3f85808462506d3da49c9dedf4efd9ff4b9b9574b69d421b0b7dc6fa24268 523 main/binary-amd64/Packages.gz
+ f56fb9ff2142f536cc47925e506d8cc1e0f6279b4aa0d1ed26922aa43934b7c7 106 main/binary-amd64/Release
+ f0dab0a4035f24563f8abdf45fc4dcf47165c637d98c85c91063816c3fcd04a7 745 main/binary-arm64/Packages
+ 303e02067c97aa5e2ba21cfb259ee0d9032174778363712b4a2ac154fccc6d44 525 main/binary-arm64/Packages.gz
+ 2ea051df46bf72e3e60ff7def56f180e193b56db497b982353db591146d6542a 106 main/binary-arm64/Release

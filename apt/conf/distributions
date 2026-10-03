@@ -1,0 +1,7 @@
+Origin: TiredVPN
+Label: TiredVPN
+Codename: stable
+Architectures: amd64 arm64
+Components: main
+Description: TiredVPN apt repository
+SignWith: 26AB51B6A825EFBD

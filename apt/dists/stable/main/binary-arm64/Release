@@ -1,0 +1,5 @@
+Component: main
+Origin: TiredVPN
+Label: TiredVPN
+Architecture: arm64
+Description: TiredVPN apt repository
