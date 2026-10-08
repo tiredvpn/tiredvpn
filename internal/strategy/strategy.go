@@ -1994,26 +1994,32 @@ func registerTLSStrategies(m *Manager, cfg DefaultManagerConfig, hasServer, hasS
 		return
 	}
 
-	reality := NewREALITYStrategy(m, cfg.Secret)
-	reality.SetFingerprint(cfg.TLSFingerprint)
-	if cfg.REALITYServerPubKeyB64 != "" {
-		key, err := customtls.DecodeKeyBase64(cfg.REALITYServerPubKeyB64)
-		if err != nil {
-			log.Warn("REALITY: B1 server key is not valid base64: %v; B1 stays off", err)
-		} else {
-			reality.SetB1(key)
-		}
-	}
-	reality.SetRequireDataV2(cfg.REALITYRequireDataV2)
-	if cfg.PQEnabled && cfg.PQServerKemPubB64 != "" {
-		kemPub, err := base64.StdEncoding.DecodeString(cfg.PQServerKemPubB64)
-		if err == nil && len(kemPub) > 0 {
-			if err := reality.SetPostQuantum(kemPub); err != nil {
-				log.Warn("REALITY: PQ init failed, using classical: %v", err)
+	newConfiguredReality := func() *REALITYStrategy {
+		reality := NewREALITYStrategy(m, cfg.Secret)
+		reality.SetFingerprint(cfg.TLSFingerprint)
+		if cfg.REALITYServerPubKeyB64 != "" {
+			key, err := customtls.DecodeKeyBase64(cfg.REALITYServerPubKeyB64)
+			if err != nil {
+				log.Warn("REALITY: B1 server key is not valid base64: %v; B1 stays off", err)
+			} else {
+				reality.SetB1(key)
 			}
 		}
+		reality.SetRequireDataV2(cfg.REALITYRequireDataV2)
+		if cfg.PQEnabled && cfg.PQServerKemPubB64 != "" {
+			kemPub, err := base64.StdEncoding.DecodeString(cfg.PQServerKemPubB64)
+			if err == nil && len(kemPub) > 0 {
+				if err := reality.SetPostQuantum(kemPub); err != nil {
+					log.Warn("REALITY: PQ init failed, using classical: %v", err)
+				}
+			}
+		}
+		return reality
 	}
-	m.Register(reality)
+	m.Register(newConfiguredReality())
+	singleFlight := newConfiguredReality()
+	singleFlight.gate = newSingleFlightHandshakeGate()
+	m.Register(&SingleFlightREALITYStrategy{REALITYStrategy: singleFlight})
 
 	m.Register(NewWebSocketPaddedStrategy(m, cfg.Secret))
 	m.Register(NewHTTPPollingStrategy(m, cfg.Secret))

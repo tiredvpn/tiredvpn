@@ -39,6 +39,7 @@ Sorted by priority. Lower priority = tried earlier.
 | `imap_camouflage` | IMAP Camouflage | TCP | 29 | always |
 | `state_exhaustion` | State Table Exhaustion | TCP | 50 | always |
 | `icmp_tunnel` | ICMP Tunnel | ICMP | 70 | `-icmp-tunnel` |
+| `reality_singleflight` | REALITY Single Flight | TLS/TCP | 1000 | always; experimental, explicitly select with `-strategy reality_singleflight` |
 
 "always" means: the client has a server address (`-server`, `-server-v6`, or a
 `[[servers]]` list) *and* a secret. Miss either and none of the "always" rows

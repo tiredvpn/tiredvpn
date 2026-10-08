@@ -595,6 +595,7 @@ priority order; `-strategy <id>` pins one.
 | `icmp_tunnel` | ICMP Tunnel | Backup tunnel over ICMP Echo (opt-in: `-icmp-tunnel`, requires CAP_NET_RAW and a server started with `-enable-icmp`) |
 | `ssh_camouflage` | SSH Camouflage | Tunnel under SSH traffic (priority 28, requires server support) |
 | `imap_camouflage` | IMAP Camouflage | Tunnel under IMAP mail protocol (priority 29, requires server support) |
+| `reality_singleflight` | REALITY Single Flight | Experimental REALITY strategy; serializes TLS handshakes across donor SNI names with 450–600 ms between starts (select with `-strategy reality_singleflight`) |
 
 The strategy engine supports:
 
