@@ -1,0 +1,12 @@
+{
+  "id": "gost_tls13_gosuslugi",
+  "branch": "candidate/gost-tls13-gosuslugi",
+  "base_commit": "97e4f71418378cdd84ce4bb8a9294b0599396ce8",
+  "status": "production-deployed-experimental",
+  "sni": "www.gosuslugi.ru",
+  "transport": "separate TCP listener / strict RFC 9367 GOST TLS 1.3 / TypeMux + smux",
+  "certificate_authentication": "SHA-256 pin of the server leaf certificate DER",
+  "production_deployed": true,
+  "cloudflare_or_routes_changed": false,
+  "source_spec": "../../GOST-TLS13-STRATEGY-SPEC.md"
+}

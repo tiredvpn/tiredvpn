@@ -10,6 +10,13 @@ pass to `-strategy`, and where the code is honest about not being finished.
 
 ## Registered strategies
 
+An additional experimental strategy, `gost_tls13_gosuslugi`, is registered
+only when explicitly selected and supplied with `-gost-tls13-pin` and
+`-gost-tls13-port`. It uses RFC 9367 GOST TLS 1.3 with SNI
+`www.gosuslugi.ru` and a separate server listener. See
+[`GOST-IMPLEMENTATION.md`](../GOST-IMPLEMENTATION.md). Successful transport
+tests do not demonstrate resistance to provider filtering.
+
 Sorted by priority. Lower priority = tried earlier.
 
 | ID | Name | Transport | Priority | Registered when |

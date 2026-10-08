@@ -17,9 +17,10 @@ import (
 const redactedValue = "***"
 
 // sensitiveArgNames are the argv flags whose value must never reach a log or
-// an error. -secret authenticates the client. Keep this in step with
-// SECRET_FLAGS in the app's NativeArgs.kt.
-var sensitiveArgNames = []string{"secret"}
+// an error. -secret authenticates the client and the GOST pin is treated as
+// connection-authentication material. Keep this in step with SECRET_FLAGS in
+// the app's NativeArgs.kt.
+var sensitiveArgNames = []string{"secret", "gost-tls13-pin"}
 
 // sensitiveArg reports whether tok is a sensitive flag and, if so, whether its
 // value is inline (-flag=value). One or two leading dashes are accepted, as

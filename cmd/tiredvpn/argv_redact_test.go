@@ -56,6 +56,8 @@ func TestRedactArgsSpellings(t *testing.T) {
 		want string
 	}{
 		{[]string{"-secret", redactTestSecret}, "-secret ***"},
+		{[]string{"-gost-tls13-pin", redactTestSecret}, "-gost-tls13-pin ***"},
+		{[]string{"--gost-tls13-pin=" + redactTestSecret}, "--gost-tls13-pin=***"},
 		{[]string{"-secret=" + redactTestSecret}, "-secret=***"},
 		{[]string{"--secret", redactTestSecret}, "--secret ***"},
 		{[]string{"--secret=" + redactTestSecret}, "--secret=***"},

@@ -1,9 +1,11 @@
 package server
 
 import (
+	"errors"
 	"net"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -183,6 +185,9 @@ func TestWildcardListenersCoexist(t *testing.T) {
 
 	v6, err := net.Listen("tcp6", derived)
 	if err != nil {
+		if errors.Is(err, syscall.EAFNOSUPPORT) || errors.Is(err, syscall.EPROTONOSUPPORT) {
+			t.Skipf("IPv6 is unavailable in this environment: %v", err)
+		}
 		t.Fatalf("tcp6 listener on %s alongside tcp4 on port %d: %v", derived, addr4.Port, err)
 	}
 	defer v6.Close()

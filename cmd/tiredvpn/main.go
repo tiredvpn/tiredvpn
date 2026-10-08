@@ -220,6 +220,11 @@ REALITY OPTIONS:
   -reality-require-data-v2
         Reject REALITY clients still on the v1 data layer (default true; =false only to accept pre-1.11 clients)
 
+  -gost-listen string
+        Separate experimental GOST TLS 1.3 listener; disabled unless set with -gost-cert and -gost-key
+  -gost-cert / -gost-key
+        Server-owned GOST certificate and PKCS #8 private key for the separate listener
+
 NODE CEILINGS (address reputation):
   -node-max-clients int
         Cap distinct authenticated clients on this node, 0 = off (default 0).
@@ -392,6 +397,10 @@ ADVANCED EVASION:
         Refuse REALITY servers still on the v1 data layer instead of silently falling back (default true; =false only for pre-1.11 servers)
   -reality-server-pubkey string
         Server's static REALITY public key, base64. Set it to speak the B1 transport; empty uses the legacy one.
+  -gost-tls13-pin string
+        Enable experimental GOST TLS 1.3 with exact SHA-256 DER certificate pin
+  -gost-tls13-port int
+        Separate GOST TLS listener port; required with -strategy gost_tls13_gosuslugi
 
 ICMP TUNNEL (backup transport):
   -icmp-tunnel
@@ -447,7 +456,7 @@ type serverFlagOpts struct {
 	showVersion     *bool
 }
 
-// registerClientREALITYFlags binds the client-side REALITY flags.
+// registerClientTransportFlags binds client-side REALITY and experimental GOST TLS flags.
 //
 // Split out for the same reason registerServerFlags exists: a config field
 // bound to no flag is dead and nothing notices. That matters more than usual
@@ -455,8 +464,10 @@ type serverFlagOpts struct {
 // transport itself is written, "does nothing" is indistinguishable from "never
 // wired up". It also gives streams A and B somewhere to add client flags
 // without editing runClient, which everyone shares.
-func registerClientREALITYFlags(fs *flag.FlagSet, cfg *client.Config) {
+func registerClientTransportFlags(fs *flag.FlagSet, cfg *client.Config) {
 	fs.StringVar(&cfg.REALITYServerPubKey, "reality-server-pubkey", "", "Server's static REALITY public key, base64. Set it to speak the B1 transport; empty uses the legacy one. No probing, no downgrade on error.")
+	fs.StringVar(&cfg.GOSTTLSPin, "gost-tls13-pin", "", "Enable experimental GOST TLS 1.3 strategy; SHA-256 hex fingerprint of the server leaf certificate (DER).")
+	fs.IntVar(&cfg.GOSTTLSPort, "gost-tls13-port", 0, "Required separate TCP listener port for strategy gost_tls13_gosuslugi.")
 }
 
 // registerServerFlags binds every server flag onto fs and cfg. It is split out
@@ -470,6 +481,9 @@ func registerServerFlags(fs *flag.FlagSet, cfg *server.Config) *serverFlagOpts {
 	fs.StringVar(&cfg.ListenAddr, "listen", ":443", "Listen address")
 	fs.StringVar(&cfg.CertFile, "cert", "server.crt", "TLS certificate file")
 	fs.StringVar(&cfg.KeyFile, "key", "server.key", "TLS key file")
+	fs.StringVar(&cfg.GOSTListenAddr, "gost-listen", "", "Separate experimental GOST TLS 1.3 listener address (example :12444); requires -gost-cert and -gost-key")
+	fs.StringVar(&cfg.GOSTCertFile, "gost-cert", "", "Optional RFC 9367 GOST TLS 1.3 certificate in PEM (enables experimental GOST transport)")
+	fs.StringVar(&cfg.GOSTKeyFile, "gost-key", "", "Private key matching -gost-cert (PKCS #8 PEM)")
 	opts.secret = fs.String("secret", "", "Shared secret for authentication (single-client mode)")
 	fs.StringVar(&cfg.FakeWebRoot, "fake-root", "./www", "Fake website root directory")
 	// Operator-set hostname that unauthorized REALITY probes are transparently
@@ -700,7 +714,7 @@ func runClient(args []string) {
 	fs.BoolVar(&cfg.REALITYRequireDataV2, "reality-require-data-v2", true, "Refuse REALITY servers still on the v1 data layer instead of silently falling back. On by default in 1.11.0; set =false only to reach pre-1.11 servers on the malleable v1 layer.")
 	fs.StringVar(&cfg.BurstReshape, "burst-reshape", "off", "Split the inner TLS handshake with a nudge/ack exchange so the nDPI burst heuristic stops matching: off, on. MUST match the server setting - a one-sided 'on' corrupts streams.")
 	fs.IntVar(&cfg.BurstReshapePadFlight, "burst-reshape-pad-flight", 0, "Extra bytes the server adds to its flight (0 = off). Must match the server.")
-	registerClientREALITYFlags(fs, cfg)
+	registerClientTransportFlags(fs, cfg)
 
 	// RTT Masking flags
 	fs.BoolVar(&cfg.RTTMaskingEnabled, "rtt-masking", false, "Enable RTT masking (hides proxy timing signature)")

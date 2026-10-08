@@ -49,6 +49,18 @@ func TestRegisterServerFlags_REALITYCoverDomain(t *testing.T) {
 	}
 }
 
+func TestRegisterServerFlags_GOSTTLSListener(t *testing.T) {
+	cfg := &server.Config{}
+	fs := flag.NewFlagSet("server", flag.ContinueOnError)
+	registerServerFlags(fs, cfg)
+	if err := fs.Parse([]string{"-gost-listen", "127.0.0.1:12444", "-gost-cert", "server-gost.crt", "-gost-key", "server-gost.key"}); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.GOSTListenAddr != "127.0.0.1:12444" || cfg.GOSTCertFile != "server-gost.crt" || cfg.GOSTKeyFile != "server-gost.key" {
+		t.Fatalf("GOST listener flags not wired to config: %+v", cfg)
+	}
+}
+
 // TestApplyClientTOMLConfig_EmptyPath_NoOp verifies that omitting --config
 // leaves the existing CLI-derived client.Config untouched (legacy code path).
 func TestApplyClientTOMLConfig_EmptyPath_NoOp(t *testing.T) {
@@ -227,7 +239,7 @@ func TestRegisterServerFlags_RequireDataV2Default(t *testing.T) {
 func TestRegisterClientFlags_REALITYServerPubKey(t *testing.T) {
 	cfg := &client.Config{}
 	fs := flag.NewFlagSet("client", flag.ContinueOnError)
-	registerClientREALITYFlags(fs, cfg)
+	registerClientTransportFlags(fs, cfg)
 	if err := fs.Parse(nil); err != nil {
 		t.Fatalf("parse (defaults): %v", err)
 	}
@@ -237,7 +249,7 @@ func TestRegisterClientFlags_REALITYServerPubKey(t *testing.T) {
 
 	cfg = &client.Config{}
 	fs = flag.NewFlagSet("client", flag.ContinueOnError)
-	registerClientREALITYFlags(fs, cfg)
+	registerClientTransportFlags(fs, cfg)
 	if err := fs.Parse([]string{"-reality-server-pubkey", "cHVia2V5"}); err != nil {
 		t.Fatalf("parse: %v", err)
 	}

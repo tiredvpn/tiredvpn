@@ -38,12 +38,14 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
 	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 	"github.com/tiredvpn/tiredvpn/internal/tun"
+	"github.com/xtaci/smux"
+	"gitverse.ru/uzer_007/gogost/v3/gosttls"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 )
 
 var (
-	Version     = "1.11.5"
+	Version     = "1.12.1"
 	connCounter uint64
 )
 
@@ -113,6 +115,10 @@ var onHandlerDone func()
 // immediately rather than queued, so a reconnect storm cannot accumulate
 // goroutines or buffers. Returns true if the connection was admitted.
 func acceptConnection(conn net.Conn, srvCtx *serverContext, connID uint64) bool {
+	return acceptConnectionHandler(conn, srvCtx, connID, handleConnection)
+}
+
+func acceptConnectionHandler(conn net.Conn, srvCtx *serverContext, connID uint64, handler func(net.Conn, *serverContext, uint64)) bool {
 	// Capture the semaphore into a local so the spawned goroutine releases the
 	// exact channel it acquired and never reads the package-level admissionSem
 	// variable concurrently with any reassignment.
@@ -121,7 +127,7 @@ func acceptConnection(conn net.Conn, srvCtx *serverContext, connID uint64) bool 
 	// Defensive: if admission control was not initialised, fall back to the old
 	// unbounded behaviour rather than dropping every connection.
 	if sem == nil {
-		go handleConnection(conn, srvCtx, connID)
+		go handler(conn, srvCtx, connID)
 		return true
 	}
 	select {
@@ -133,7 +139,7 @@ func acceptConnection(conn net.Conn, srvCtx *serverContext, connID uint64) bool 
 					onHandlerDone()
 				}
 			}()
-			handleConnection(conn, srvCtx, connID)
+			handler(conn, srvCtx, connID)
 		}()
 		return true
 	default:
@@ -283,15 +289,18 @@ func relayWithControl(clientConn, targetConn net.Conn) (bytesUp, bytesDown int64
 
 // Config holds server configuration
 type Config struct {
-	ListenAddr  string
-	CertFile    string
-	KeyFile     string
-	Secret      []byte // Single secret mode (backward compatible)
-	FakeWebRoot string
-	Debug       bool
-	TunIP       net.IP
-	TunName     string // TUN interface name (default: tiredvpn0)
-	TunMTU      int    // TUN interface MTU (0 = tun.DefaultMTU = 1280)
+	ListenAddr     string
+	CertFile       string
+	KeyFile        string
+	GOSTListenAddr string // Separate experimental TLS-GOST listener address; empty disables it.
+	GOSTCertFile   string // Optional RFC 9367 GOST TLS 1.3 certificate; enables the experimental GOST TLS path.
+	GOSTKeyFile    string
+	Secret         []byte // Single secret mode (backward compatible)
+	FakeWebRoot    string
+	Debug          bool
+	TunIP          net.IP
+	TunName        string // TUN interface name (default: tiredvpn0)
+	TunMTU         int    // TUN interface MTU (0 = tun.DefaultMTU = 1280)
 
 	// Multi-client mode (Redis)
 	RedisAddr string // e.g., "localhost:6379"
@@ -466,9 +475,11 @@ type serverContext struct {
 	cfg            *Config
 	registry       *ClientRegistry
 	store          *RedisStore
-	upstreamDialer *UpstreamDialer  // for multi-hop mode
-	metrics        *Metrics         // Prometheus metrics
-	tlsConfig      *tls.Config      // TLS config for non-REALITY connections
+	upstreamDialer *UpstreamDialer // for multi-hop mode
+	metrics        *Metrics        // Prometheus metrics
+	tlsConfig      *tls.Config     // TLS config for non-REALITY connections
+	gostTLSConfig  *gosttls.Config // Optional strict RFC 9367 TLS 1.3 profile
+	gostListener   net.Listener
 	ipPool         *IPPool          // IP pool for TUN mode
 	sharedTUN      *SharedTUN       // Shared TUN device for all clients
 	knockReplay    knockReplayGuard // anti-probe knock replay window (zero value usable)
@@ -573,10 +584,28 @@ func Run(cfg *Config) error {
 	if err := initTLSConfig(cfg, srvCtx); err != nil {
 		return err
 	}
-
 	listener, err := createTCPListener(cfg)
 	if err != nil {
 		return err
+	}
+	if (cfg.GOSTCertFile == "") != (cfg.GOSTKeyFile == "") || (cfg.GOSTCertFile == "") != (cfg.GOSTListenAddr == "") {
+		_ = listener.Close()
+		return fmt.Errorf("experimental GOST TLS requires all three options: -gost-listen, -gost-cert and -gost-key")
+	}
+	if cfg.GOSTCertFile != "" {
+		cert, err := gosttls.LoadX509KeyPair(cfg.GOSTCertFile, cfg.GOSTKeyFile)
+		if err != nil {
+			_ = listener.Close()
+			return fmt.Errorf("load GOST TLS certificate: %w", err)
+		}
+		srvCtx.gostTLSConfig = gosttls.GOSTConfig(&gosttls.Config{Certificates: []gosttls.Certificate{cert}})
+		srvCtx.gostListener, err = net.Listen("tcp", cfg.GOSTListenAddr)
+		if err != nil {
+			_ = listener.Close()
+			return fmt.Errorf("GOST TLS listener %q: %w", cfg.GOSTListenAddr, err)
+		}
+		log.Info("Experimental GOST TLS 1.3 listener on %s (SNI %s)", srvCtx.gostListener.Addr(), strategy.GosuslugiSNI)
+		go serveGOSTTLSListener(srvCtx.gostListener, srvCtx)
 	}
 
 	log.Info("Debug mode: %v", cfg.Debug)
@@ -586,7 +615,7 @@ func Run(cfg *Config) error {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	go handleShutdownSignal(sigChan, srvCtx, quicServer, listener)
+	go handleShutdownSignal(sigChan, srvCtx, quicServer, listener, srvCtx.gostListener)
 
 	if cfg.EnableIPv6 {
 		// Derived here rather than at flag-parse time so every way of building
@@ -824,6 +853,51 @@ func createTCPListener(cfg *Config) (net.Listener, error) {
 	return l, nil
 }
 
+func serveGOSTTLSListener(listener net.Listener, srvCtx *serverContext) {
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			log.Warn("GOST TLS listener accept failed: %v", err)
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		connID := atomic.AddUint64(&connCounter, 1)
+		acceptConnectionHandler(conn, srvCtx, connID, handleGOSTTLSConnection)
+	}
+}
+
+func handleGOSTTLSConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
+	defer conn.Close()
+	if srvCtx.gostTLSConfig == nil {
+		return
+	}
+	logger := log.WithPrefix(fmt.Sprintf("gost-tls:%d", connID))
+	if srvCtx.metrics != nil {
+		srvCtx.metrics.IncConnections()
+		defer srvCtx.metrics.DecConnections()
+	}
+	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+	gconn := gosttls.Server(conn, srvCtx.gostTLSConfig)
+	if err := gconn.Handshake(); err != nil {
+		logger.Debug("Handshake failed: %v", err)
+		return
+	}
+	state := gconn.ConnectionState()
+	if state.Version != gosttls.VersionTLS13 || !isGOSTSuiteServer(state.CipherSuite) {
+		logger.Warn("Unexpected TLS version or cipher suite; closing connection")
+		_ = gconn.Close()
+		return
+	}
+	logger.Info("Negotiated TLS profile: version=1.3 suite=0x%04x", state.CipherSuite)
+	_ = gconn.SetDeadline(time.Time{})
+	handleTLSConnection(gconn, srvCtx, connID)
+}
+
+func isGOSTSuiteServer(id uint16) bool { return id >= 0xC103 && id <= 0xC106 }
+
 // createMultiPortTCPListener creates a MultiPortListener from the port-range config.
 func createMultiPortTCPListener(cfg *Config) (net.Listener, error) {
 	host, mainPortStr, err := net.SplitHostPort(cfg.ListenAddr)
@@ -958,7 +1032,7 @@ func buildQUICServerConfig(cfg *Config, srvCtx *serverContext, quicAddr string) 
 }
 
 // handleShutdownSignal waits for OS signal and performs graceful shutdown.
-func handleShutdownSignal(sigChan chan os.Signal, srvCtx *serverContext, quicServer *strategy.QUICServer, listener net.Listener) {
+func handleShutdownSignal(sigChan chan os.Signal, srvCtx *serverContext, quicServer *strategy.QUICServer, listener net.Listener, additional ...net.Listener) {
 	sig := <-sigChan
 	log.Info("Received signal %v, shutting down...", sig)
 	if srvCtx.registry != nil {
@@ -971,6 +1045,11 @@ func handleShutdownSignal(sigChan chan os.Signal, srvCtx *serverContext, quicSer
 		quicServer.Stop()
 	}
 	listener.Close()
+	for _, extra := range additional {
+		if extra != nil {
+			_ = extra.Close()
+		}
+	}
 	os.Exit(0)
 }
 
@@ -1454,10 +1533,10 @@ func handleConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 }
 
 // handleTLSConnection handles protocols over TLS (after TLS handshake completed).
-// conn must be a fully-handshaked *tls.Conn — kTLS upgrade is deferred to each
-// per-protocol handler at the relay-phase boundary via ktls.TryEnable.
+// conn is any TLS-backed net.Conn; kTLS upgrade remains limited to compatible
+// standard TLS handlers at each relay-phase boundary via ktls.TryEnable.
 // Routes by the first encrypted byte (protocol discriminator) sent by the client.
-func handleTLSConnection(conn *tls.Conn, srvCtx *serverContext, connID uint64) {
+func handleTLSConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 	logger := log.WithPrefix(fmt.Sprintf("conn:%d", connID))
 
 	// Read 1-byte protocol discriminator (encrypted; invisible in ClientHello)
@@ -1471,6 +1550,20 @@ func handleTLSConnection(conn *tls.Conn, srvCtx *serverContext, connID uint64) {
 	logger.Debug("dispatch routing: type=0x%02x", protoType)
 
 	switch protoType {
+	case protocol.TypeMux:
+		sess, err := smux.Server(conn, smux.DefaultConfig())
+		if err != nil {
+			logger.Debug("TLS mux setup failed: %v", err)
+			return
+		}
+		defer sess.Close()
+		for {
+			stream, err := sess.AcceptStream()
+			if err != nil {
+				return
+			}
+			go handleRawTunnel(stream, srvCtx, logger, clientIdentity{})
+		}
 	case protocol.TypeStego:
 		handleHTTP2WithALPN(conn, srvCtx, logger)
 	case protocol.TypeRaw:

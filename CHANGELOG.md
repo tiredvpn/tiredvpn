@@ -7,6 +7,23 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.12.1-igor.1] - 2026-10-08
+
+### Fixed
+
+- Android JNI now parses the GOST TLS 1.3 certificate pin and listener port flags;
+  the previous Android release ignored them and could not start the GOST strategy.
+
+## [1.12.0-igor.1] - 2026-10-08
+
+### Added
+
+- Experimental opt-in `gost_tls13_gosuslugi` transport: RFC 9367 GOST TLS 1.3,
+  SNI `www.gosuslugi.ru`, separate TCP listener, and SHA-256 pinning of the
+  operator's server certificate. See `GOST-IMPLEMENTATION.md` for setup and
+  limitations. This is a compatibility-tested candidate; DPI-filtering
+  effectiveness has not been established.
+
 ## [1.11.5] - 2026-10-03
 
 ### Changed

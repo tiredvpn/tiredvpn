@@ -581,7 +581,7 @@ func (m *Manager) ListStrategyIDs() string {
 		baseID := id
 		if idx := strings.Index(id, "_"); idx > 0 {
 			// Keep full ID for strategies like geneva_russia
-			if !strings.HasPrefix(id, "geneva") && !strings.HasPrefix(id, "quic") {
+			if !strings.HasPrefix(id, "geneva") && !strings.HasPrefix(id, "quic") && !strings.HasPrefix(id, GOSTTLS13StrategyID) {
 				baseID = id[:idx]
 			}
 		}
@@ -1574,10 +1574,13 @@ var _ io.ReadWriteCloser = (*StrategyConn)(nil)
 
 // DefaultManagerConfig contains configuration for default manager
 type DefaultManagerConfig struct {
-	ServerAddr string       // Server address for server-based strategies
-	Secret     []byte       // Shared secret for authentication
-	RelayNodes []*RelayNode // Mesh relay nodes (optional)
-	CoverHost  string       // Host to impersonate for HTTP/2 stego
+	ServerAddr     string       // Server address for server-based strategies
+	Secret         []byte       // Shared secret for authentication
+	RelayNodes     []*RelayNode // Mesh relay nodes (optional)
+	CoverHost      string       // Host to impersonate for HTTP/2 stego
+	GOSTTLSPin     string       // SHA-256 of the RFC 9367 server leaf certificate DER; empty disables the candidate.
+	GOSTTLSPort    int          // Explicit separate TCP listener port for the experimental strategy.
+	GOSTTLSEnabled bool         // Register only when explicitly selected by strategy ID.
 
 	// IPv6 Transport Layer
 	ServerAddrV6 string // IPv6 server address (e.g., "[2001:db8::100]:995")
@@ -2014,6 +2017,14 @@ func registerTLSStrategies(m *Manager, cfg DefaultManagerConfig, hasServer, hasS
 		}
 	}
 	m.Register(reality)
+	if cfg.GOSTTLSEnabled && cfg.GOSTTLSPin != "" {
+		gostStrategy, err := NewGOSTTLS13Strategy(m, cfg.GOSTTLSPin, cfg.GOSTTLSPort)
+		if err != nil {
+			log.Warn("GOST TLS 1.3 strategy disabled: %v", err)
+		} else {
+			m.Register(gostStrategy)
+		}
+	}
 
 	m.Register(NewWebSocketPaddedStrategy(m, cfg.Secret))
 	m.Register(NewHTTPPollingStrategy(m, cfg.Secret))

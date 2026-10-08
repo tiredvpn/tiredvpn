@@ -580,6 +580,7 @@ priority order; `-strategy <id>` pins one.
 | ID | Name | Description |
 |----|------|-------------|
 | `reality` | REALITY Protocol | Impersonates legitimate websites with authentic TLS fingerprints (first in the default order) |
+| `gost_tls13_gosuslugi` | GOST TLS 1.3 (Gosuslugi SNI) | Experimental RFC 9367 TLS 1.3 on a separate TCP listener; explicitly opt-in and requires `-gost-tls13-pin` plus server-side GOST certificate/listener. SNI is `www.gosuslugi.ru`. |
 | `quic_salamander` | QUIC Salamander | QUIC over UDP with Salamander padding (opt-in: `-quic`) |
 | `quic` | QUIC Tunnel | QUIC transport with version spoofing, draft-29 to bypass TSPU (opt-in: `-quic`) |
 | `seqovl` | Seqovl (Sequence Overlap) | Prepends a secret-marked decoy TLS record before the REALITY ClientHello to desync stateful DPI reassembly (packet-level overlap on Linux via `-seqovl-packet`) |

@@ -30,7 +30,7 @@ import (
 )
 
 var (
-	Version   = "1.11.5"
+	Version   = "1.12.1"
 	BuildTime = "unknown"
 
 	// Global metrics instance (nil if metrics disabled)
@@ -147,6 +147,8 @@ type Config struct {
 	// The key is public: it ships alongside the secret because that channel
 	// already exists, not because it needs protecting.
 	REALITYServerPubKey string
+	GOSTTLSPin          string // SHA-256 of DER server certificate; enables experimental GOST TLS 1.3 strategy.
+	GOSTTLSPort         int    // Separate TCP listener port for the experimental GOST TLS strategy.
 
 	// RTT Masking
 	RTTMaskingEnabled bool   // Enable RTT masking
@@ -310,6 +312,11 @@ func applyAdaptiveDefaults(cfg *Config) {
 
 // buildManager constructs and configures the strategy manager.
 func buildManager(cfg *Config, secret string) (*strategy.Manager, error) {
+	if cfg.StrategyName == strategy.GOSTTLS13StrategyID {
+		if cfg.GOSTTLSPin == "" || cfg.GOSTTLSPort < 1 || cfg.GOSTTLSPort > 65535 {
+			return nil, fmt.Errorf("strategy %s requires -gost-tls13-pin and an explicit -gost-tls13-port", strategy.GOSTTLS13StrategyID)
+		}
+	}
 	// Resolved here rather than passed in: RunWithContext (Android/macOS) and
 	// Run are separate entry points, and a parameter would let one of them
 	// build a manager whose endpoints disagree with cfg.ServerAddr.
@@ -342,6 +349,9 @@ func buildManager(cfg *Config, secret string) (*strategy.Manager, error) {
 		SeqovlPacketEnabled:    cfg.SeqovlPacketEnabled,
 		TLSFingerprint:         cfg.TLSFingerprint,
 		REALITYServerPubKeyB64: cfg.REALITYServerPubKey,
+		GOSTTLSPin:             cfg.GOSTTLSPin,
+		GOSTTLSPort:            cfg.GOSTTLSPort,
+		GOSTTLSEnabled:         cfg.StrategyName == strategy.GOSTTLS13StrategyID,
 		ECHEnabled:             cfg.ECHEnabled,
 		ECHConfigList:          echConfigList,
 		ECHPublicName:          cfg.ECHPublicName,

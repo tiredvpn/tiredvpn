@@ -145,6 +145,20 @@ func parseClientArgs(args []string) (_ *client.Config, err error) {
 				cfg.StrategyName = args[i+1]
 				i++
 			}
+		case "-gost-tls13-pin":
+			if i+1 < len(args) {
+				cfg.GOSTTLSPin = args[i+1]
+				i++
+			}
+		case "-gost-tls13-port":
+			if i+1 < len(args) {
+				if v, err := strconv.Atoi(args[i+1]); err == nil {
+					cfg.GOSTTLSPort = v
+				} else {
+					log.Warn("parseClientArgs: invalid -gost-tls13-port value %q: %v", logArgs[i+1], strconvReason(err))
+				}
+				i++
+			}
 		// -cover is the canonical flag (matches CLI -cover and what the app sends).
 		// -cover-host is kept as a legacy alias.
 		case "-cover", "-cover-host":
