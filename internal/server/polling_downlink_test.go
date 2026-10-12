@@ -324,3 +324,41 @@ func TestPollingShortSessionIDDoesNotPanic(t *testing.T) {
 		}
 	}
 }
+
+// TestPollingUnackedWindowBounded: a client that keeps polling but never acks
+// makes the server hold everything it sent for a re-send. That window is part
+// of a session's worst case, so it must stop at 1 MiB (plus the chunk that
+// crossed it), not at the 2 MiB it used to allow.
+func TestPollingUnackedWindowBounded(t *testing.T) {
+	sess := newPollingSession("fxpollunacked000")
+	chunk := make([]byte, 16<<10)
+	rng := rand.New(rand.NewSource(14))
+	for range 1000 { // 16 MiB offered, polled without a single ack
+		rng.Read(chunk)
+		sess.offerToClient(chunk)
+		sess.ReadToClient(0)
+	}
+	sess.bufLock.Lock()
+	held := len(sess.unackedBuf)
+	sess.bufLock.Unlock()
+	if held > 1<<20+16<<10 {
+		t.Fatalf("a client that never acks left %d bytes in the re-send window", held)
+	}
+}
+
+// TestPollingUplinkBacklogBounded: a target that stops reading leaves the
+// uplink to fill. Part of a session's worst case, so it stops at 1 MiB of
+// 8 KiB client bodies, not the 4 MiB it used to allow.
+func TestPollingUplinkBacklogBounded(t *testing.T) {
+	sess := newPollingSession("fxpolluplinkcap0")
+	body := make([]byte, 8<<10)
+	held := 0
+	for range 1024 { // 8 MiB offered, nothing drains
+		if sess.WriteFromClient(body) {
+			held += len(body)
+		}
+	}
+	if held > 1<<20 {
+		t.Fatalf("the uplink took %d bytes with nothing draining it", held)
+	}
+}
