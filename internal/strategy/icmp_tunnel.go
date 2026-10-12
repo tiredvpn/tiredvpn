@@ -54,7 +54,7 @@ const (
 
 	// Stealth mode parameters (ONLY allowed mode)
 	StealthPacketRate  = 10 // packets per second
-	StealthPayloadSize = 56 // bytes, matches standard ping
+	StealthPayloadSize = 56 // bytes, standard ping payload; data packets are not cut to it, see Write
 	StealthJitterMin   = 10 // milliseconds
 	StealthJitterMax   = 50 // milliseconds
 
@@ -221,7 +221,7 @@ func (s *ICMPTunnelStrategy) Connect(ctx context.Context, target string) (net.Co
 	}
 
 	// Create ICMP connection (requires root/CAP_NET_RAW)
-	icmpConn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
+	icmpConn, err := icmpListenPacket("ip4:icmp", "0.0.0.0")
 	if err != nil {
 		return nil, fmt.Errorf("icmp tunnel: listen failed (need root/CAP_NET_RAW): %w", err)
 	}
@@ -277,9 +277,20 @@ func (s *ICMPTunnelStrategy) Connect(ctx context.Context, target string) (net.Co
 	return tunnel, nil
 }
 
+// icmpListenPacket opens the raw ICMP socket the tunnel runs over. It is a
+// variable so tests can put a scripted network in place of the raw socket,
+// which needs CAP_NET_RAW and a real peer.
+var icmpListenPacket = func(network, address string) (net.PacketConn, error) {
+	conn, err := icmp.ListenPacket(network, address)
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
+}
+
 // icmpTunnelConn implements net.Conn over ICMP
 type icmpTunnelConn struct {
-	icmpConn   *icmp.PacketConn
+	icmpConn   net.PacketConn
 	serverIP   *net.IPAddr
 	serverAddr string
 	// sendCipher encrypts client-to-server packets (c2s direction).
@@ -326,6 +337,8 @@ func (c *icmpTunnelConn) handshake(ctx context.Context) error {
 	// Set deadline
 	deadline, _ := ctx.Deadline()
 	c.icmpConn.SetDeadline(deadline)
+	stop := context.AfterFunc(ctx, func() { c.icmpConn.SetReadDeadline(time.Unix(1, 0)) })
+	defer stop()
 
 	// Send handshake init
 	if _, err := c.icmpConn.WriteTo(initPacket, c.serverIP); err != nil {
@@ -334,21 +347,30 @@ func (c *icmpTunnelConn) handshake(ctx context.Context) error {
 
 	log.Debug("ICMP Tunnel: Handshake init sent")
 
-	// Wait for reply
+	// Wait for the server's reply. A raw socket sees every ICMP packet the host
+	// receives, and with the default net.ipv4.icmp_echo_ignore_all=0 the
+	// server's kernel answers our Echo Request itself, reflecting its payload,
+	// before the tunnel server's reply arrives. Skip whatever does not
+	// authenticate as s2c from the server until the deadline.
 	reply := make([]byte, 1500)
-	n, peer, err := c.icmpConn.ReadFrom(reply)
-	if err != nil {
-		return fmt.Errorf("receive ack: %w", err)
-	}
-
-	// Verify sender
-	if peer.String() != c.serverIP.String() {
-		return fmt.Errorf("unexpected sender: %s", peer)
-	}
-
-	// Parse and validate reply
-	if err := c.parseHandshakeReply(reply[:n]); err != nil {
-		return fmt.Errorf("parse reply: %w", err)
+	var rejected error
+	for {
+		n, peer, err := c.icmpConn.ReadFrom(reply)
+		if err != nil {
+			if rejected != nil {
+				return fmt.Errorf("receive ack: %w (last rejected reply: %v)", err, rejected)
+			}
+			return fmt.Errorf("receive ack: %w", err)
+		}
+		if peer.String() != c.serverIP.String() {
+			continue
+		}
+		if err := c.parseHandshakeReply(reply[:n]); err != nil {
+			rejected = err
+			log.Debug("ICMP Tunnel: Handshake: skipping reply from %s: %v", peer, err)
+			continue
+		}
+		break
 	}
 
 	log.Debug("ICMP Tunnel: Handshake complete")
@@ -490,36 +512,67 @@ func ParseTunnelHeader(data []byte) TunnelHeader {
 func (c *icmpTunnelConn) sendLoop() {
 	// Calculate minimum interval for rate limit
 	interval := time.Second / time.Duration(c.rateLimit)
+	// carry holds a queued write that did not fit into the previous packet.
+	var carry []byte
 
 	for {
-		select {
-		case <-c.done:
-			return
-		case data := <-c.sendQueue:
-			// Rate limiting
-			c.rateMu.Lock()
-			elapsed := time.Since(c.lastSendTime)
-			if elapsed < interval {
-				// Add jitter (10-50ms for stealth)
-				jitter := time.Duration(StealthJitterMin+int(time.Now().UnixNano()%int64(StealthJitterMax-StealthJitterMin))) * time.Millisecond
-				time.Sleep(interval - elapsed + jitter)
-			}
-			c.lastSendTime = time.Now()
-			c.rateMu.Unlock()
-
-			// Build and send packet
-			packet, err := c.buildPacket(data, 0)
-			if err != nil {
-				log.Debug("ICMP Tunnel: build packet error: %v", err)
-				continue
-			}
-
-			c.icmpConn.SetWriteDeadline(time.Now().Add(ICMPWriteTimeout))
-			if _, err := c.icmpConn.WriteTo(packet, c.serverIP); err != nil {
-				log.Debug("ICMP Tunnel: send error: %v", err)
+		var data []byte
+		if carry != nil {
+			data, carry = carry, nil
+		} else {
+			select {
+			case <-c.done:
+				return
+			case data = <-c.sendQueue:
 			}
 		}
+
+		// Rate limiting
+		c.rateMu.Lock()
+		elapsed := time.Since(c.lastSendTime)
+		if elapsed < interval {
+			// Add jitter (10-50ms for stealth)
+			jitter := time.Duration(StealthJitterMin+int(time.Now().UnixNano()%int64(StealthJitterMax-StealthJitterMin))) * time.Millisecond
+			time.Sleep(interval - elapsed + jitter)
+		}
+		c.lastSendTime = time.Now()
+		c.rateMu.Unlock()
+
+		// Writes queued while we waited for the slot ride in this packet.
+		data, carry = c.coalesceQueued(data)
+
+		// Build and send packet
+		packet, err := c.buildPacket(data, 0)
+		if err != nil {
+			log.Debug("ICMP Tunnel: build packet error: %v", err)
+			continue
+		}
+
+		c.icmpConn.SetWriteDeadline(time.Now().Add(ICMPWriteTimeout))
+		if _, err := c.icmpConn.WriteTo(packet, c.serverIP); err != nil {
+			log.Debug("ICMP Tunnel: send error: %v", err)
+		}
 	}
+}
+
+// coalesceQueued appends writes already waiting in sendQueue to data, as many
+// as fit into one packet. Writes are never split: the TUN layer writes one
+// length-prefixed frame per Write, and a packet that carries only whole frames
+// can be lost without misaligning the stream for the frames after it. The
+// first write that does not fit is returned as carry for the next packet.
+func (c *icmpTunnelConn) coalesceQueued(data []byte) (packet, carry []byte) {
+	for len(data) < MaxPayloadSize {
+		select {
+		case next := <-c.sendQueue:
+			if len(data)+len(next) > MaxPayloadSize {
+				return data, next
+			}
+			data = append(data, next...)
+		default:
+			return data, nil
+		}
+	}
+	return data, nil
 }
 
 // recvLoop handles incoming packets
@@ -642,15 +695,14 @@ func (c *icmpTunnelConn) Write(b []byte) (int, error) {
 		return 0, io.ErrClosedPipe
 	}
 
-	// Fragment if needed (stealth mode uses small payloads)
-	maxPayload := StealthPayloadSize - AuthTagSize
+	// Fragment only what does not fit into one packet. The packet rate is
+	// what stealth mode limits; cutting a frame into StealthPayloadSize pieces
+	// on top of that left ~3 kbit/s of uplink, less than Auto-MTU probes alone
+	// consume, so everything queued behind them for tens of seconds.
 	total := 0
 
-	for i := 0; i < len(b); i += maxPayload {
-		end := i + maxPayload
-		if end > len(b) {
-			end = len(b)
-		}
+	for i := 0; i < len(b); i += MaxPayloadSize {
+		end := min(i+MaxPayloadSize, len(b))
 
 		chunk := make([]byte, end-i)
 		copy(chunk, b[i:end])
