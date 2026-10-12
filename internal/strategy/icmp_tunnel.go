@@ -1,6 +1,7 @@
 package strategy
 
 import (
+	"bytes"
 	"context"
 	"crypto/cipher"
 	"crypto/hmac"
@@ -340,29 +341,62 @@ func (c *icmpTunnelConn) handshake(ctx context.Context) error {
 	stop := context.AfterFunc(ctx, func() { c.icmpConn.SetReadDeadline(time.Unix(1, 0)) })
 	defer stop()
 
-	// Send handshake init
-	if _, err := c.icmpConn.WriteTo(initPacket, c.serverIP); err != nil {
+	// Send handshake init. It counts against the packet rate like any other
+	// packet, so the first data packet does not follow it within a millisecond.
+	c.rateMu.Lock()
+	_, err = c.icmpConn.WriteTo(initPacket, c.serverIP)
+	c.lastSendTime = time.Now()
+	c.rateMu.Unlock()
+	if err != nil {
 		return fmt.Errorf("send init: %w", err)
 	}
 
 	log.Debug("ICMP Tunnel: Handshake init sent")
 
+	initMsg, err := icmp.ParseMessage(1, initPacket)
+	if err != nil {
+		return fmt.Errorf("parse init packet: %w", err)
+	}
+	initData := initMsg.Body.(*icmp.Echo).Data
+
 	// Wait for the server's reply. A raw socket sees every ICMP packet the host
 	// receives, and with the default net.ipv4.icmp_echo_ignore_all=0 the
 	// server's kernel answers our Echo Request itself, reflecting its payload,
 	// before the tunnel server's reply arrives. Skip whatever does not
-	// authenticate as s2c from the server until the deadline.
+	// authenticate as s2c from the server. Once the reflection has shown that
+	// the host answers ping, wait only icmpTunnelReplyGrace for the tunnel
+	// server: a host without one would otherwise cost the whole deadline and
+	// be counted as silent.
 	reply := make([]byte, 1500)
 	var rejected error
+	var reflectedAt time.Time
 	for {
 		n, peer, err := c.icmpConn.ReadFrom(reply)
 		if err != nil {
-			if rejected != nil {
-				return fmt.Errorf("receive ack: %w (last rejected reply: %v)", err, rejected)
+			if cause := context.Cause(ctx); cause != nil && !errors.Is(cause, context.DeadlineExceeded) {
+				return fmt.Errorf("handshake aborted: %w", cause)
 			}
-			return fmt.Errorf("receive ack: %w", err)
+			if !reflectedAt.IsZero() {
+				return fmt.Errorf("%w: kernel answered the init, no tunnel server reply in %v (server without -enable-icmp, or a different secret)",
+					errICMPNoTunnelServer, time.Since(reflectedAt).Round(time.Millisecond))
+			}
+			if rejected != nil {
+				return fmt.Errorf("receive ack: no valid reply from the tunnel server: %w (last rejected packet: %v)", err, rejected)
+			}
+			return fmt.Errorf("receive ack: no reply from the server: %w", err)
 		}
 		if peer.String() != c.serverIP.String() {
+			continue
+		}
+		if icmpIsReflectionOf(reply[:n], initData) {
+			if reflectedAt.IsZero() {
+				reflectedAt = time.Now()
+				graceEnd := reflectedAt.Add(icmpTunnelReplyGrace)
+				if deadline.IsZero() || graceEnd.Before(deadline) {
+					c.icmpConn.SetReadDeadline(graceEnd)
+				}
+				log.Debug("ICMP Tunnel: Handshake: server kernel reflected the init, waiting %v for the tunnel server", icmpTunnelReplyGrace)
+			}
 			continue
 		}
 		if err := c.parseHandshakeReply(reply[:n]); err != nil {
@@ -375,6 +409,28 @@ func (c *icmpTunnelConn) handshake(ctx context.Context) error {
 
 	log.Debug("ICMP Tunnel: Handshake complete")
 	return nil
+}
+
+// errICMPNoTunnelServer reports a server host that answers ping but runs no
+// ICMP tunnel server for us. Its text avoids "timeout" on purpose: the scan
+// counts timeouts as silence, and this host is talking.
+var errICMPNoTunnelServer = errors.New("host answers ping but no ICMP tunnel server replied")
+
+// icmpTunnelReplyGrace is how long the handshake waits for the tunnel server
+// after the server kernel's reflection of the init arrived. The tunnel reply
+// trails the kernel's by well under a millisecond on the bench.
+var icmpTunnelReplyGrace = 2 * time.Second
+
+// icmpIsReflectionOf reports whether packet is an Echo Reply carrying exactly
+// the payload we sent: the server kernel answering our request itself. The
+// ICMP ID and sequence are not compared, a NAT on the way may rewrite the ID.
+func icmpIsReflectionOf(packet, sentData []byte) bool {
+	msg, err := icmp.ParseMessage(1, packet)
+	if err != nil || msg.Type != ipv4.ICMPTypeEchoReply {
+		return false
+	}
+	echo, ok := msg.Body.(*icmp.Echo)
+	return ok && bytes.Equal(echo.Data, sentData)
 }
 
 // parseHandshakeReply validates handshake response
