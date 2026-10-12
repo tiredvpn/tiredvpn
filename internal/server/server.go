@@ -4717,6 +4717,12 @@ type HTTPPollingSession struct {
 	fromClient *bytes.Buffer // Data from client to target
 	bufLock    sync.Mutex
 
+	// toClientRoom wakes the SOCKS relay parked on a full downlink (see
+	// awaitToClientRoom). Created on first use under bufLock.
+	toClientRoom *sync.Cond
+	// toClientDropped counts TUN frames dropped on a full downlink.
+	toClientDropped atomic.Int64
+
 	// Acknowledgement tracking for reliable delivery
 	sentOffset   int64     // Total bytes sent to client (before ack)
 	ackOffset    int64     // Bytes acknowledged by client
@@ -4838,13 +4844,77 @@ func (s *HTTPPollingSession) Close() {
 		s.targetConn.Close()
 	}
 	s.targetLock.Unlock()
+
+	// Release a relay parked on a full downlink. It checks closed under
+	// bufLock before it waits, so taking the lock here cannot miss it.
+	s.bufLock.Lock()
+	if s.toClientRoom != nil {
+		s.toClientRoom.Broadcast()
+	}
+	s.bufLock.Unlock()
 }
 
-// WriteToClient writes data to be sent to client on next poll
+// pollingMaxToClientBuffered bounds the downlink one session holds for its
+// client. The client drains it at most 16 KiB per poll (ReadToClient), with a
+// single poll worker, so anything the target delivers faster used to pile up in
+// server memory: a 100 MB download through a SOCKS session sat in RSS within a
+// second, and a 2.6 GB one ran a 2 GB node out of memory.
+//
+// 1 MiB is 64 full poll responses. In SOCKS mode the relay stops reading the
+// target at the bound and the target's TCP window closes, so the size only has
+// to keep the next polls supplied while the relay refills (it refills as soon
+// as a poll takes a chunk); it costs memory, not throughput. In TUN mode the
+// bound is a queue depth: frames past it are dropped (see offerToClient), and
+// at the ~100 Mbit/s a polling TUN reaches on a clean path 1 MiB is ~80 ms of
+// queue, enough to absorb a dispatcher burst without tail-dropping on a healthy
+// path. It matches the client's own uplink bound (maxPollingSendBuffered).
+const pollingMaxToClientBuffered = 1 << 20
+
+// WriteToClient appends data to the downlink unconditionally. It is only for
+// the one-byte connect/handshake status replies, which go to a session whose
+// downlink is still empty; bulk data goes through awaitToClientRoom (SOCKS)
+// or offerToClient (TUN), which respect pollingMaxToClientBuffered.
 func (s *HTTPPollingSession) WriteToClient(data []byte) {
 	s.bufLock.Lock()
 	defer s.bufLock.Unlock()
 	s.toClient.Write(data)
+}
+
+// awaitToClientRoom blocks while the downlink is at pollingMaxToClientBuffered
+// and returns how many bytes it can take now, or 0 once the session is closed.
+// The SOCKS relay reads at most that much from the target, so the downlink
+// never exceeds the bound and the target is held back by its own TCP window
+// rather than by dropping or by ending the session.
+func (s *HTTPPollingSession) awaitToClientRoom() int {
+	s.bufLock.Lock()
+	defer s.bufLock.Unlock()
+	for !s.closed.Load() {
+		if room := pollingMaxToClientBuffered - s.toClient.Len(); room > 0 {
+			return room
+		}
+		if s.toClientRoom == nil {
+			s.toClientRoom = sync.NewCond(&s.bufLock)
+		}
+		s.toClientRoom.Wait()
+	}
+	return 0
+}
+
+// offerToClient appends one TUN frame to the downlink, or drops it whole when
+// that would take the downlink past pollingMaxToClientBuffered. TUN frames are
+// written by the SharedTUN dispatcher, which serves every client on the node,
+// so it must not wait for one slow poller; a dropped IP packet is what a full
+// router queue does, and the inner TCP retransmits it. Dropping inside a frame
+// would desync the stream for good, so it is all or nothing.
+func (s *HTTPPollingSession) offerToClient(frame []byte) bool {
+	s.bufLock.Lock()
+	defer s.bufLock.Unlock()
+	if s.toClient.Len()+len(frame) > pollingMaxToClientBuffered {
+		s.toClientDropped.Add(1)
+		return false
+	}
+	s.toClient.Write(frame)
+	return true
 }
 
 // The uplink (client -> server bytes) has exactly one writer and one reader:
@@ -4970,6 +5040,9 @@ func (s *HTTPPollingSession) ReadToClient(ackSeq int64) []byte {
 	s.toClient.Reset()
 	if len(remaining) > 0 {
 		s.toClient.Write(remaining)
+	}
+	if s.toClientRoom != nil {
+		s.toClientRoom.Signal() // the downlink has room again; only the relay waits
 	}
 
 	return result
@@ -5410,13 +5483,18 @@ func runPollingSessionRelay(sess *HTTPPollingSession, srvCtx *serverContext, log
 		}
 	}()
 
-	// Target -> Client
+	// Target -> Client. Reads only as much as the downlink can take: while the
+	// client is behind, the target is left unread and its TCP window closes.
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, 32*1024)
 		for {
+			room := sess.awaitToClientRoom()
+			if room == 0 {
+				return // session closed
+			}
 			targetConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-			n, err := targetConn.Read(buf)
+			n, err := targetConn.Read(buf[:min(room, len(buf))])
 			if n > 0 {
 				sess.WriteToClient(buf[:n])
 			}
@@ -5527,10 +5605,17 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 		if sess.closed.Load() {
 			return io.EOF
 		}
-		sess.WriteToClient(frame)
+		// A full downlink drops the frame (offerToClient); that is packet
+		// loss, not a dead tunnel, so it is not reported as an error.
+		sess.offerToClient(frame)
 		return nil
 	})
 	pollConn.gate = gate
+	defer func() {
+		if n := sess.toClientDropped.Load(); n > 0 {
+			logger.Debug("HTTP Polling TUN: %d frame(s) dropped on a full downlink (session %s)", n, sess.ID[:8])
+		}
+	}()
 
 	var clientIP, serverIP net.IP
 	var sink tunPacketSink
@@ -5727,7 +5812,7 @@ func (c *pollingTUNConn) Write(b []byte) (int, error) {
 		}
 		return len(b), nil
 	}
-	c.sess.WriteToClient(frame)
+	c.sess.offerToClient(frame) // dropped when the downlink is full, like a lost packet
 	return len(b), nil
 }
 
