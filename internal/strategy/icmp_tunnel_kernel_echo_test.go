@@ -41,6 +41,10 @@ type icmpFakeNet struct {
 	// foreignFirst delivers a reflection of every request from another host
 	// ahead of everything else, as a raw socket sees unrelated ICMP.
 	foreignFirst bool
+	// forgedFirst delivers, from the server's address, a well-formed s2c
+	// reply for the request's session sealed with the wrong key, ahead of
+	// everything else: one spoofed packet that must not end the handshake.
+	forgedFirst bool
 
 	in     chan icmpFakePacket
 	closed chan struct{}
@@ -116,6 +120,11 @@ func (f *icmpFakeNet) WriteTo(b []byte, addr net.Addr) (int, error) {
 	f.mu.Lock()
 	f.sent = append(f.sent, icmpFakeSent{at: time.Now(), ipLen: 20 + len(b)})
 	f.mu.Unlock()
+	if f.forgedFirst && len(echo.Data) >= TunnelHeaderSize {
+		header := ParseTunnelHeader(echo.Data[:TunnelHeaderSize])
+		forged := icmpServerReply(DeriveICMPKey([]byte("attacker")), header.SessionID, echo.ID, header.PacketSeq, []byte("forged"), header.Flags)
+		f.deliver(forged)
+	}
 	if f.foreignFirst {
 		f.deliverFrom(icmpForeignHost, &icmp.Message{
 			Type: ipv4.ICMPTypeEchoReply,
@@ -382,20 +391,7 @@ func TestICMPWriteSendsFullFrameInOnePacket(t *testing.T) {
 func TestICMPSendLoopCoalescesQueuedFrames(t *testing.T) {
 	secret := []byte("icmp-coalesce-secret")
 	fake := newICMPFakeNet(secret, false)
-	masterKey := DeriveICMPKey(secret)
-	const sessionID = 0x01020304
-	sendCipher, _ := chacha20poly1305.NewX(DeriveICMPDirectionalKey(masterKey, sessionID, "c2s"))
-	c := &icmpTunnelConn{
-		icmpConn:   fake,
-		serverIP:   fake.serverIP,
-		sendCipher: sendCipher,
-		sessionID:  sessionID,
-		sendQueue:  make(chan []byte, 256),
-		recvQueue:  make(chan []byte, 256),
-		done:       make(chan struct{}),
-		rateLimit:  StealthPacketRate,
-	}
-	t.Cleanup(func() { c.Close() })
+	c := icmpSendConn(t, fake, secret, StealthPacketRate)
 
 	// Queue the frames before the send loop runs, as they pile up while it
 	// sleeps out the rate limit.
@@ -415,30 +411,21 @@ func TestICMPSendLoopCoalescesQueuedFrames(t *testing.T) {
 	}
 }
 
-// Coalescing must keep each Write whole: a write that does not fit what is
-// already in the packet goes into the next packet intact, so losing a packet
-// loses whole frames and the length-prefixed stream stays aligned.
-func TestICMPSendLoopKeepsFramesWhole(t *testing.T) {
+// Coalescing must keep each Write whole and in order: a write that does not
+// fit what is already in the packet starts the next packet, and later small
+// writes do not jump ahead of it. Losing a packet then loses whole frames, and
+// the length-prefixed stream stays aligned and ordered.
+func TestICMPSendLoopKeepsFramesWholeAndInOrder(t *testing.T) {
 	secret := []byte("icmp-coalesce-secret")
 	fake := newICMPFakeNet(secret, false)
-	masterKey := DeriveICMPKey(secret)
-	const sessionID = 0x0a0b0c0d
-	sendCipher, _ := chacha20poly1305.NewX(DeriveICMPDirectionalKey(masterKey, sessionID, "c2s"))
-	c := &icmpTunnelConn{
-		icmpConn:   fake,
-		serverIP:   fake.serverIP,
-		sendCipher: sendCipher,
-		sessionID:  sessionID,
-		sendQueue:  make(chan []byte, 256),
-		recvQueue:  make(chan []byte, 256),
-		done:       make(chan struct{}),
-		rateLimit:  1000,
-	}
-	t.Cleanup(func() { c.Close() })
+	c := icmpSendConn(t, fake, secret, 1000)
 
-	small := bytes.Repeat([]byte{1}, 100)
-	big := bytes.Repeat([]byte{2}, MaxPayloadSize-50)
-	for _, w := range [][]byte{small, big} {
+	writes := [][]byte{
+		bytes.Repeat([]byte{1}, 100),
+		bytes.Repeat([]byte{2}, MaxPayloadSize-50),
+		bytes.Repeat([]byte{3}, 50),
+	}
+	for _, w := range writes {
 		if _, err := c.Write(w); err != nil {
 			t.Fatalf("Write: %v", err)
 		}
@@ -446,9 +433,86 @@ func TestICMPSendLoopKeepsFramesWhole(t *testing.T) {
 	go c.sendLoop()
 
 	got := icmpWaitFrames(t, fake, 2)
-	if !bytes.Equal(got[0], small) || !bytes.Equal(got[1], big) {
-		t.Fatalf("packets carried %d and %d bytes, want %d and %d: a write was split across packets",
-			len(got[0]), len(got[1]), len(small), len(big))
+	want := [][]byte{writes[0], append(bytes.Clone(writes[1]), writes[2]...)}
+	for i := range want {
+		if !bytes.Equal(got[i], want[i]) {
+			t.Fatalf("packet %d carried %d bytes starting %x, want %d starting %x",
+				i, len(got[i]), got[i][:1], len(want[i]), want[i][:1])
+		}
+	}
+}
+
+// The TUN layer reuses its buffer for the next packet as soon as Write
+// returns. What goes on the wire must be what was written, not whatever the
+// buffer holds by the time the send loop gets to it.
+func TestICMPWriteCopiesCallerBuffer(t *testing.T) {
+	secret := []byte("icmp-copy-secret")
+	fake := newICMPFakeNet(secret, false)
+	c := icmpSendConn(t, fake, secret, 1000)
+
+	buf := bytes.Repeat([]byte{0xaa}, 200)
+	want := bytes.Clone(buf)
+	if _, err := c.Write(buf); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	for i := range buf {
+		buf[i] = 0x55
+	}
+	go c.sendLoop()
+
+	if got := icmpWaitFrames(t, fake, 1)[0]; !bytes.Equal(got, want) {
+		t.Fatalf("packet carried %x..., want the bytes as written %x...", got[:4], want[:4])
+	}
+}
+
+// The packet rate cap is the one stealth property the send loop keeps, so it
+// is checked on the wire: with a full queue, including writes that wait as
+// carry for the next packet, no two requests leave closer than 1/rate.
+func TestICMPSendLoopHonoursRateLimit(t *testing.T) {
+	secret := []byte("icmp-rate-secret")
+	fake := newICMPFakeNet(secret, false)
+	const rate = 20
+	c := icmpSendConn(t, fake, secret, rate)
+	for range 5 {
+		// Each write fills most of a packet, so every packet after the first
+		// starts from the carry of the one before.
+		if _, err := c.Write(bytes.Repeat([]byte{1}, MaxPayloadSize-100)); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+	go c.sendLoop()
+
+	icmpWaitFrames(t, fake, 5)
+	sent := fake.sends()
+	interval := time.Second / rate
+	for i := 1; i < len(sent); i++ {
+		if gap := sent[i].at.Sub(sent[i-1].at); gap < interval*9/10 {
+			t.Fatalf("request %d left %v after the previous one, want at least %v", i, gap, interval)
+		}
+	}
+}
+
+// A write still waiting as carry when the conn is closed is dropped, not sent
+// into the closed socket.
+func TestICMPSendLoopStopsAfterClose(t *testing.T) {
+	secret := []byte("icmp-close-secret")
+	fake := newICMPFakeNet(secret, false)
+	c := icmpSendConn(t, fake, secret, 5)
+	for range 2 {
+		if _, err := c.Write(bytes.Repeat([]byte{1}, MaxPayloadSize-100)); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+	go c.sendLoop()
+	icmpWaitFrames(t, fake, 1)
+	c.Close()
+	fake.Close()
+	time.Sleep(400 * time.Millisecond) // two rate-limit intervals
+	fake.mu.Lock()
+	after := fake.afterClose
+	fake.mu.Unlock()
+	if after != 0 {
+		t.Fatalf("send loop wrote %d packets after Close", after)
 	}
 }
 
@@ -505,6 +569,16 @@ func TestICMPConnectSkipsPacketsFromOtherHosts(t *testing.T) {
 	secret := []byte("icmp-foreign-secret")
 	fake := newICMPFakeNet(secret, false)
 	fake.foreignFirst = true
+	icmpConnect(t, secret, fake)
+}
+
+// A spoofed packet with the server's address and our session that fails
+// authentication is skipped like the kernel's reflection; otherwise one
+// forged packet per attempt would keep the tunnel from ever coming up.
+func TestICMPConnectSkipsForgedServerReply(t *testing.T) {
+	secret := []byte("icmp-forged-secret")
+	fake := newICMPFakeNet(secret, true)
+	fake.forgedFirst = true
 	icmpConnect(t, secret, fake)
 }
 

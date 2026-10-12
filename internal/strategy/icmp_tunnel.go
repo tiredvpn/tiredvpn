@@ -607,6 +607,14 @@ func (c *icmpTunnelConn) sendLoop() {
 		c.lastSendTime = time.Now()
 		c.rateMu.Unlock()
 
+		// The conn may have closed while we slept; a write held as carry
+		// would otherwise go into the closed socket.
+		select {
+		case <-c.done:
+			return
+		default:
+		}
+
 		// A write larger than the path allows is cut here rather than left to
 		// IP fragmentation, which a fragmented echo request would show on the
 		// wire. Otherwise writes queued while we waited for the slot ride in
