@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -34,6 +36,11 @@ type icmpFakeNet struct {
 	// echoData makes the fake server send every data payload back as an s2c
 	// data reply, the way a peer that answers each frame would.
 	echoData bool
+	// noServer leaves only the kernel: the host has no tunnel server for us.
+	noServer bool
+	// foreignFirst delivers a reflection of every request from another host
+	// ahead of everything else, as a raw socket sees unrelated ICMP.
+	foreignFirst bool
 
 	in     chan icmpFakePacket
 	closed chan struct{}
@@ -44,7 +51,17 @@ type icmpFakeNet struct {
 	deadlineSet  chan struct{} // closed and replaced on every SetReadDeadline
 	s2cSeq       uint32
 	dataFrames   [][]byte // decrypted c2s data payloads, one per Echo Request
+	sent         []icmpFakeSent
+	afterClose   int // writes attempted after Close
 }
+
+// icmpFakeSent is one Echo Request as it left the client.
+type icmpFakeSent struct {
+	at    time.Time
+	ipLen int // the IPv4 packet length the request would have on the wire
+}
+
+var icmpForeignHost = &net.IPAddr{IP: net.IPv4(198, 51, 100, 7)}
 
 func newICMPFakeNet(secret []byte, kernelEcho bool) *icmpFakeNet {
 	return &icmpFakeNet{
@@ -88,6 +105,23 @@ func (f *icmpFakeNet) WriteTo(b []byte, addr net.Addr) (int, error) {
 	if msg.Type != ipv4.ICMPTypeEcho || !ok {
 		return len(b), nil
 	}
+	select {
+	case <-f.closed:
+		f.mu.Lock()
+		f.afterClose++
+		f.mu.Unlock()
+		return 0, net.ErrClosed
+	default:
+	}
+	f.mu.Lock()
+	f.sent = append(f.sent, icmpFakeSent{at: time.Now(), ipLen: 20 + len(b)})
+	f.mu.Unlock()
+	if f.foreignFirst {
+		f.deliverFrom(icmpForeignHost, &icmp.Message{
+			Type: ipv4.ICMPTypeEchoReply,
+			Body: &icmp.Echo{ID: echo.ID, Seq: echo.Seq, Data: bytes.Clone(echo.Data)},
+		})
+	}
 	if f.kernelEcho {
 		f.deliver(&icmp.Message{
 			Type: ipv4.ICMPTypeEchoReply,
@@ -101,7 +135,7 @@ func (f *icmpFakeNet) WriteTo(b []byte, addr net.Addr) (int, error) {
 // serve plays the tunnel server: authenticate the request with the c2s key,
 // answer control packets, record data payloads.
 func (f *icmpFakeNet) serve(echo *icmp.Echo) {
-	if len(echo.Data) < TunnelHeaderSize {
+	if f.noServer || len(echo.Data) < TunnelHeaderSize {
 		return
 	}
 	header := ParseTunnelHeader(echo.Data[:TunnelHeaderSize])
@@ -154,13 +188,15 @@ func icmpServerReply(masterKey []byte, sessionID uint32, id int, seq uint32, dat
 	}
 }
 
-func (f *icmpFakeNet) deliver(msg *icmp.Message) {
+func (f *icmpFakeNet) deliver(msg *icmp.Message) { f.deliverFrom(f.serverIP, msg) }
+
+func (f *icmpFakeNet) deliverFrom(from net.Addr, msg *icmp.Message) {
 	raw, err := msg.Marshal(nil)
 	if err != nil {
 		panic(err)
 	}
 	select {
-	case f.in <- icmpFakePacket{data: raw, from: f.serverIP}:
+	case f.in <- icmpFakePacket{data: raw, from: from}:
 	case <-f.closed:
 	}
 }
@@ -169,6 +205,12 @@ func (f *icmpFakeNet) frames() [][]byte {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([][]byte(nil), f.dataFrames...)
+}
+
+func (f *icmpFakeNet) sends() []icmpFakeSent {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]icmpFakeSent(nil), f.sent...)
 }
 
 func (f *icmpFakeNet) Close() error {
@@ -201,14 +243,41 @@ func icmpUseFakeNet(t *testing.T, fake *icmpFakeNet) {
 
 func icmpConnect(t *testing.T, secret []byte, fake *icmpFakeNet) net.Conn {
 	t.Helper()
-	icmpUseFakeNet(t, fake)
-	s := NewICMPTunnelStrategy(fake.serverIP.String()+":443", secret)
-	conn, err := s.Connect(t.Context(), fake.serverIP.String()+":443")
+	conn, _, err := icmpDial(t, t.Context(), secret, fake, 5*time.Second)
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
-	t.Cleanup(func() { conn.Close() })
 	return conn
+}
+
+// icmpDial runs Connect against fake and fails the test if it has not
+// returned within limit, so a broken wait shows up as a failure and not as a
+// test binary hung until go test's own timeout.
+func icmpDial(t *testing.T, ctx context.Context, secret []byte, fake *icmpFakeNet, limit time.Duration) (net.Conn, time.Duration, error) {
+	t.Helper()
+	icmpUseFakeNet(t, fake)
+	s := NewICMPTunnelStrategy(fake.serverIP.String()+":443", secret)
+	type result struct {
+		conn net.Conn
+		err  error
+	}
+	done := make(chan result, 1)
+	start := time.Now()
+	go func() {
+		conn, err := s.Connect(ctx, fake.serverIP.String()+":443")
+		done <- result{conn, err}
+	}()
+	select {
+	case r := <-done:
+		if r.conn != nil {
+			t.Cleanup(func() { r.conn.Close() })
+		}
+		return r.conn, time.Since(start), r.err
+	case <-time.After(limit):
+		fake.Close()
+		t.Fatalf("Connect still running after %v", limit)
+		return nil, 0, nil
+	}
 }
 
 // With the default icmp_echo_ignore_all=0 the server host's kernel answers the
@@ -383,28 +452,6 @@ func TestICMPSendLoopKeepsFramesWhole(t *testing.T) {
 	}
 }
 
-// A reply arriving after the handshake deadline must not be waited for
-// forever, and a run of kernel echoes alone must not count as success.
-func TestICMPHandshakeTimesOutOnKernelEchoOnly(t *testing.T) {
-	secret := []byte("icmp-kernel-echo-secret")
-	fake := newICMPFakeNet(secret, true)
-	// Server that never answers: only the kernel reflects.
-	fake.masterKey = DeriveICMPKey([]byte("some other secret"))
-	icmpUseFakeNet(t, fake)
-	s := NewICMPTunnelStrategy(fake.serverIP.String()+":443", secret)
-	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
-	defer cancel()
-	start := time.Now()
-	conn, err := s.Connect(ctx, fake.serverIP.String()+":443")
-	if err == nil {
-		conn.Close()
-		t.Fatal("Connect succeeded on kernel echoes alone")
-	}
-	if elapsed := time.Since(start); elapsed > 2*time.Second {
-		t.Fatalf("Connect returned after %v, want it bounded by the context deadline", elapsed)
-	}
-}
-
 // recvLoop on its own, without the handshake in front of it: the kernel's
 // reflection of a data request arrives first and the server's reply second.
 // Only the reply may reach the reader.
@@ -451,23 +498,103 @@ func TestICMPRecvLoopDropsReflectedRequest(t *testing.T) {
 	}
 }
 
-// Cancelling the caller's context ends the handshake wait at once rather than
-// at Connect's own 10-second deadline.
-func TestICMPHandshakeStopsOnCancel(t *testing.T) {
-	secret := []byte("icmp-kernel-echo-secret")
+// A raw socket also sees ICMP from hosts that have nothing to do with us. A
+// packet from another address ahead of the server's reply must not end the
+// handshake.
+func TestICMPConnectSkipsPacketsFromOtherHosts(t *testing.T) {
+	secret := []byte("icmp-foreign-secret")
+	fake := newICMPFakeNet(secret, false)
+	fake.foreignFirst = true
+	icmpConnect(t, secret, fake)
+}
+
+// A server host that answers ping but runs no tunnel server for us (no
+// -enable-icmp, or another secret) has to fail fast and as an answer, not as
+// silence: the scan counts timeouts against the address, and this one talks.
+// The error must not blame the secret either, a kernel reflection says
+// nothing about it.
+func TestICMPHandshakeReportsPingOnlyHost(t *testing.T) {
+	orig := icmpTunnelReplyGrace
+	icmpTunnelReplyGrace = 200 * time.Millisecond
+	t.Cleanup(func() { icmpTunnelReplyGrace = orig })
+
+	secret := []byte("icmp-ping-only-secret")
 	fake := newICMPFakeNet(secret, true)
-	fake.masterKey = DeriveICMPKey([]byte("some other secret"))
-	icmpUseFakeNet(t, fake)
-	s := NewICMPTunnelStrategy(fake.serverIP.String()+":443", secret)
-	ctx, cancel := context.WithCancel(t.Context())
-	time.AfterFunc(200*time.Millisecond, cancel)
-	start := time.Now()
-	conn, err := s.Connect(ctx, fake.serverIP.String()+":443")
+	fake.noServer = true
+	conn, elapsed, err := icmpDial(t, t.Context(), secret, fake, 5*time.Second)
 	if err == nil {
 		conn.Close()
 		t.Fatal("Connect succeeded on kernel echoes alone")
 	}
-	if elapsed := time.Since(start); elapsed > 2*time.Second {
+	if !errors.Is(err, errICMPNoTunnelServer) {
+		t.Fatalf("err = %v, want errICMPNoTunnelServer", err)
+	}
+	if isTimeoutError(err) {
+		t.Fatalf("err = %v is classified as a timeout; the host answered", err)
+	}
+	if strings.Contains(err.Error(), "auth") {
+		t.Fatalf("err = %v blames authentication", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("Connect took %v, want about the %v grace", elapsed, icmpTunnelReplyGrace)
+	}
+}
+
+// With nothing coming back at all the failure stays a timeout: that is the
+// silence the scan is meant to count.
+func TestICMPHandshakeSilenceIsTimeout(t *testing.T) {
+	secret := []byte("icmp-silence-secret")
+	fake := newICMPFakeNet(secret, false)
+	fake.noServer = true
+	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer cancel()
+	conn, _, err := icmpDial(t, ctx, secret, fake, 5*time.Second)
+	if err == nil {
+		conn.Close()
+		t.Fatal("Connect succeeded with no reply")
+	}
+	if !isTimeoutError(err) {
+		t.Fatalf("err = %v, want a timeout", err)
+	}
+}
+
+// Cancelling the caller's context ends the handshake wait at once rather than
+// at Connect's own 10-second deadline, and says it was cancelled.
+func TestICMPHandshakeStopsOnCancel(t *testing.T) {
+	secret := []byte("icmp-cancel-secret")
+	fake := newICMPFakeNet(secret, false)
+	fake.noServer = true
+	ctx, cancel := context.WithCancel(t.Context())
+	time.AfterFunc(200*time.Millisecond, cancel)
+	conn, elapsed, err := icmpDial(t, ctx, secret, fake, 5*time.Second)
+	if err == nil {
+		conn.Close()
+		t.Fatal("Connect succeeded with no reply")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if elapsed > 2*time.Second {
 		t.Fatalf("Connect returned %v after cancel, want it to stop with the context", elapsed)
+	}
+}
+
+// The handshake init is a packet like any other: the first data packet must
+// not follow it inside the rate limit's interval.
+func TestICMPHandshakeInitCountsAgainstRateLimit(t *testing.T) {
+	secret := []byte("icmp-init-rate-secret")
+	fake := newICMPFakeNet(secret, false)
+	conn := icmpConnect(t, secret, fake)
+	if _, err := conn.Write([]byte("first frame")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	icmpWaitFrames(t, fake, 1)
+	sent := fake.sends()
+	if len(sent) < 2 {
+		t.Fatalf("saw %d requests, want init and a data packet", len(sent))
+	}
+	interval := time.Second / StealthPacketRate
+	if gap := sent[1].at.Sub(sent[0].at); gap < interval*9/10 {
+		t.Fatalf("data packet left %v after the init, want at least %v", gap, interval)
 	}
 }
