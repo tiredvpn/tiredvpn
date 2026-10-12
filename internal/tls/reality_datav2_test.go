@@ -3,6 +3,8 @@ package tls
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/hex"
+	"slices"
 	"testing"
 )
 
@@ -210,18 +212,112 @@ func syntheticClientHello(t *testing.T) []byte {
 }
 
 // findPaddingBody returns the body of the padding extension in a ClientHello
-// produced by AddPaddingWithREALITY, which appends it last.
+// produced by AddPaddingWithREALITY.
+//
+// It walks the extension list through findPaddingExtension, the parser the
+// client uses. It used to take the last 00 15 in the record, which is the byte
+// scan findPaddingExtension replaced: the padding body is random, so about one
+// hello in 256 has a later 00 15 in it, and as many again have a public key
+// whose first byte 0x15 pairs with the low byte of the 0x0100 length.
 func findPaddingBody(t *testing.T, hello []byte) []byte {
 	t.Helper()
 
-	marker := []byte{0x00, 0x15}
-	idx := bytes.LastIndex(hello, marker)
-	if idx < 0 || idx+4 > len(hello) {
-		t.Fatal("padding extension not found")
+	offset, bodyLen, err := findPaddingExtension(hello)
+	if err != nil {
+		t.Fatalf("padding extension: %v", err)
 	}
-	extLen := int(hello[idx+2])<<8 | int(hello[idx+3])
-	if idx+4+extLen > len(hello) {
-		t.Fatal("padding extension truncated")
+	return hello[offset+4 : offset+4+bodyLen]
+}
+
+// collidingPrivKey has an X25519 public key starting with 0x15, so the padding
+// header it produces reads 00 15 01 00 15: the last 00 15 in the record is one
+// byte inside the length field. Found by hashing "padding-collision-31".
+const collidingPrivKey = "5f74c063d4fde37ed029e0a06f3d9b1795f64fb624c387c24734edd7f4441dff"
+
+// TestFindPaddingBodyIgnoresMarkerInBody pins the two inputs that made
+// TestPaddingCarriesV2WithoutGrowing fail at random: a 00 15 straddling the
+// header and the body, and a 00 15 with a large length inside the random tail.
+// The padding is appended right after base, so its offset is known exactly.
+func TestFindPaddingBodyIgnoresMarkerInBody(t *testing.T) {
+	t.Parallel()
+
+	secret := []byte("shared-secret")
+	var priv [32]byte
+	if _, err := hex.Decode(priv[:], []byte(collidingPrivKey)); err != nil {
+		t.Fatal(err)
 	}
-	return hello[idx+4 : idx+4+extLen]
+	ext, err := NewClientREALITYExtensionDataV2(secret, priv, [32]byte{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ext.PubKey[0] != 0x15 {
+		t.Fatalf("fixture public key starts with %#02x, want 0x15", ext.PubKey[0])
+	}
+
+	base := syntheticClientHello(t)
+	hello, err := AddPaddingWithREALITY(base, ext, MinPaddingSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The random tail is whatever crypto/rand gave; planting a header there is
+	// one of its possible values.
+	planted := slices.Clone(hello)
+	tail := len(base) + 4 + REALITYExtensionLength + DataV2ExtraLength
+	copy(planted[tail+10:], []byte{0x00, 0x15, 0xff, 0xff})
+
+	for name, h := range map[string][]byte{"key straddles header": hello, "marker in random tail": planted} {
+		t.Run(name, func(t *testing.T) {
+			want := h[len(base)+4:]
+			if got := findPaddingBody(t, h); !bytes.Equal(got, want) {
+				t.Fatalf("padding body at the wrong place: got %d bytes, want %d", len(got), len(want))
+			}
+			got, err := ExtractREALITYFromPadding(findPaddingBody(t, h))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.PubKey != ext.PubKey || got.AuthToken != ext.AuthToken {
+				t.Fatal("core fields did not survive injection")
+			}
+			if _, ok := ParseClientDataV2(secret, got.PubKey, got.Extra); !ok {
+				t.Fatal("v2 signal did not survive injection")
+			}
+		})
+	}
+}
+
+// TestPaddingRoundTripAcrossKeys runs the injection and the parser over many
+// random keys and salts. About one hello in 128 carries a stray 00 15 in its
+// padding, so 2000 runs put the parser through roughly 16 collisions.
+func TestPaddingRoundTripAcrossKeys(t *testing.T) {
+	t.Parallel()
+
+	secret := []byte("shared-secret")
+	base := syntheticClientHello(t)
+	for range 2000 {
+		priv, _ := testKeyPair(t)
+		ext, err := NewClientREALITYExtensionDataV2(secret, priv, testSalt(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		hello, err := AddPaddingWithREALITY(base, ext, MinPaddingSize)
+		if err != nil {
+			t.Fatal(err)
+		}
+		offset, bodyLen, err := findPaddingExtension(hello)
+		if err != nil {
+			t.Fatalf("pubkey %x: %v", ext.PubKey, err)
+		}
+		if offset != len(base) || bodyLen != MinPaddingSize {
+			t.Fatalf("pubkey %x: padding at %d len %d, want %d len %d",
+				ext.PubKey, offset, bodyLen, len(base), MinPaddingSize)
+		}
+		got, err := ExtractREALITYFromPadding(hello[offset+4 : offset+4+bodyLen])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := ParseClientDataV2(secret, got.PubKey, got.Extra); !ok {
+			t.Fatalf("pubkey %x: v2 signal did not survive injection", ext.PubKey)
+		}
+	}
 }
