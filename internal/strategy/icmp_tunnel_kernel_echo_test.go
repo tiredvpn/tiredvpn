@@ -598,3 +598,72 @@ func TestICMPHandshakeInitCountsAgainstRateLimit(t *testing.T) {
 		t.Fatalf("data packet left %v after the init, want at least %v", gap, interval)
 	}
 }
+
+// icmpSendConn builds a tunnel conn for send-path tests without a handshake;
+// the send loop is not started.
+func icmpSendConn(t *testing.T, fake *icmpFakeNet, secret []byte, rateLimit int) *icmpTunnelConn {
+	t.Helper()
+	const sessionID = 0x05060708
+	sendCipher, _ := chacha20poly1305.NewX(DeriveICMPDirectionalKey(DeriveICMPKey(secret), sessionID, "c2s"))
+	c := &icmpTunnelConn{
+		icmpConn:   fake,
+		serverIP:   fake.serverIP,
+		sendCipher: sendCipher,
+		sessionID:  sessionID,
+		sendQueue:  make(chan []byte, 256),
+		recvQueue:  make(chan []byte, 256),
+		done:       make(chan struct{}),
+		rateLimit:  rateLimit,
+	}
+	t.Cleanup(func() { c.Close() })
+	return c
+}
+
+// On a path narrower than our largest packet (a 1280-MTU tunnel underneath,
+// some mobile APNs) no request may be larger than the path: the kernel would
+// fragment it, and a fragmented echo request is a mark on the wire. A full
+// TUN frame is cut across packets instead, and the stream stays in order.
+func TestICMPSendLoopKeepsPacketsWithinPathMTU(t *testing.T) {
+	secret := []byte("icmp-pmtu-secret")
+	fake := newICMPFakeNet(secret, false)
+	c := icmpSendConn(t, fake, secret, 1000)
+	const pathMTU = 1300
+	c.pathMTU = func() int { return pathMTU }
+
+	frame := bytes.Repeat([]byte{7}, 4+1280)
+	var want []byte
+	for _, w := range [][]byte{frame, bytes.Repeat([]byte{8}, 56), bytes.Repeat([]byte{9}, 56)} {
+		if _, err := c.Write(w); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		want = append(want, w...)
+	}
+	go c.sendLoop()
+
+	var got []byte
+	deadline := time.Now().Add(5 * time.Second)
+	for len(got) < len(want) && time.Now().Before(deadline) {
+		got = bytes.Join(fake.frames(), nil)
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("stream carried %d bytes, want the %d written, in order", len(got), len(want))
+	}
+	for i, s := range fake.sends() {
+		if s.ipLen > pathMTU {
+			t.Fatalf("request %d is %d bytes on the wire, path MTU is %d", i, s.ipLen, pathMTU)
+		}
+	}
+}
+
+// A path MTU below the IPv4 minimum is not believed.
+func TestICMPPacketPayloadLimitFloor(t *testing.T) {
+	c := &icmpTunnelConn{pathMTU: func() int { return 100 }}
+	if got, want := c.packetPayloadLimit(), icmpMinPathMTU-icmpPacketOverhead; got != want {
+		t.Fatalf("limit = %d, want %d", got, want)
+	}
+	c.pathMTU = func() int { return 0 }
+	if got := c.packetPayloadLimit(); got != MaxPayloadSize {
+		t.Fatalf("limit with unknown MTU = %d, want MaxPayloadSize %d", got, MaxPayloadSize)
+	}
+}

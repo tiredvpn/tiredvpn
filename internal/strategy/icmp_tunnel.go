@@ -50,8 +50,16 @@ const (
 	TunnelHeaderSize = 16
 	AuthTagSize      = 16 // Poly1305
 
-	// MaxPayloadSize = MTU - IP header - ICMP header - Tunnel header - Auth tag
+	// MaxPayloadSize is the most tunnel data one packet carries: a 1400-byte
+	// ICMP message minus the ICMP header, tunnel header and auth tag. On the
+	// wire that is a 1420-byte IPv4 packet; on a path with a smaller MTU the
+	// send loop lowers the limit further (packetPayloadLimit).
 	MaxPayloadSize = 1400 - ICMPHeaderSize - TunnelHeaderSize - AuthTagSize
+
+	// icmpPacketOverhead is what an IPv4 packet adds around tunnel data.
+	icmpPacketOverhead = 20 + ICMPHeaderSize + TunnelHeaderSize + AuthTagSize
+	// icmpMinPathMTU is the smallest MTU we size packets for (RFC 791).
+	icmpMinPathMTU = 576
 
 	// Stealth mode parameters (ONLY allowed mode)
 	StealthPacketRate  = 10 // packets per second
@@ -258,6 +266,7 @@ func (s *ICMPTunnelStrategy) Connect(ctx context.Context, target string) (net.Co
 		recvQueue:  make(chan []byte, 256),
 		done:       make(chan struct{}),
 		rateLimit:  s.rateLimit,
+		pathMTU:    icmpCachedRouteMTU(serverIP.IP),
 	}
 
 	// Perform handshake
@@ -312,6 +321,10 @@ type icmpTunnelConn struct {
 	// State
 	done   chan struct{}
 	closed atomic.Bool
+
+	// pathMTU reports the MTU towards the server, 0 if unknown. Packets are
+	// sized to it so the kernel never has to fragment them.
+	pathMTU func() int
 
 	// Rate limiting (stealth mode)
 	rateLimit    int
@@ -594,8 +607,15 @@ func (c *icmpTunnelConn) sendLoop() {
 		c.lastSendTime = time.Now()
 		c.rateMu.Unlock()
 
-		// Writes queued while we waited for the slot ride in this packet.
-		data, carry = c.coalesceQueued(data)
+		// A write larger than the path allows is cut here rather than left to
+		// IP fragmentation, which a fragmented echo request would show on the
+		// wire. Otherwise writes queued while we waited for the slot ride in
+		// this packet.
+		if limit := c.packetPayloadLimit(); len(data) > limit {
+			data, carry = data[:limit], data[limit:]
+		} else {
+			data, carry = c.coalesceQueued(data, limit)
+		}
 
 		// Build and send packet
 		packet, err := c.buildPacket(data, 0)
@@ -611,16 +631,48 @@ func (c *icmpTunnelConn) sendLoop() {
 	}
 }
 
+// packetPayloadLimit is how much tunnel data fits into one packet without IP
+// fragmentation on the way to the server.
+func (c *icmpTunnelConn) packetPayloadLimit() int {
+	limit := MaxPayloadSize
+	if c.pathMTU != nil {
+		if mtu := c.pathMTU(); mtu > 0 {
+			limit = min(limit, max(mtu, icmpMinPathMTU)-icmpPacketOverhead)
+		}
+	}
+	return limit
+}
+
+// icmpCachedRouteMTU returns a pathMTU func that asks the kernel at most once
+// a second: the path MTU it learns from Fragmentation Needed can change
+// during a session, but not per packet.
+func icmpCachedRouteMTU(ip net.IP) func() int {
+	var (
+		mu      sync.Mutex
+		checked time.Time
+		mtu     int
+	)
+	return func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		if time.Since(checked) >= time.Second {
+			mtu = icmpRouteMTU(ip)
+			checked = time.Now()
+		}
+		return mtu
+	}
+}
+
 // coalesceQueued appends writes already waiting in sendQueue to data, as many
-// as fit into one packet. Writes are never split: the TUN layer writes one
+// as fit into limit. Writes are never split: the TUN layer writes one
 // length-prefixed frame per Write, and a packet that carries only whole frames
 // can be lost without misaligning the stream for the frames after it. The
 // first write that does not fit is returned as carry for the next packet.
-func (c *icmpTunnelConn) coalesceQueued(data []byte) (packet, carry []byte) {
-	for len(data) < MaxPayloadSize {
+func (c *icmpTunnelConn) coalesceQueued(data []byte, limit int) (packet, carry []byte) {
+	for len(data) < limit {
 		select {
 		case next := <-c.sendQueue:
-			if len(data)+len(next) > MaxPayloadSize {
+			if len(data)+len(next) > limit {
 				return data, next
 			}
 			data = append(data, next...)
@@ -751,10 +803,11 @@ func (c *icmpTunnelConn) Write(b []byte) (int, error) {
 		return 0, io.ErrClosedPipe
 	}
 
-	// Fragment only what does not fit into one packet. The packet rate is
-	// what stealth mode limits; cutting a frame into StealthPayloadSize pieces
-	// on top of that left ~3 kbit/s of uplink, less than Auto-MTU probes alone
-	// consume, so everything queued behind them for tens of seconds.
+	// Cut only what cannot fit into one packet; sendLoop cuts further if the
+	// path MTU is smaller. The packet rate is what stealth mode limits;
+	// cutting a frame into StealthPayloadSize pieces on top of that left about
+	// 2 kbit/s of uplink (measured), less than Auto-MTU probes alone consume,
+	// so everything queued behind them for tens of seconds.
 	total := 0
 
 	for i := 0; i < len(b); i += MaxPayloadSize {
