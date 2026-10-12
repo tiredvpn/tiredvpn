@@ -1,12 +1,17 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
+	"fmt"
+	"io"
 	"math/rand"
 	"net"
+	"net/http"
 	"os"
+	"runtime"
 	"testing"
 	"time"
 
@@ -248,5 +253,74 @@ func TestPollingTUNDownlinkBoundedDropsWholeFrames(t *testing.T) {
 	}
 	if frames == 0 || frames >= packets {
 		t.Fatalf("client got %d of %d frames: expected the head of the burst, with the tail dropped", frames, packets)
+	}
+}
+
+// pollingRawRequest feeds one raw request head and body to
+// processHTTPPollingRequest and returns the HTTP status the client would see.
+// A panic is reported as a failure instead of taking the test binary down, the
+// way it would take the server down: nothing recovers on the connection path.
+func pollingRawRequest(t *testing.T, head string, body io.Reader) (status int) {
+	t.Helper()
+	srvEnd, cliEnd := net.Pipe()
+	defer srvEnd.Close()
+	defer cliEnd.Close()
+	statusCh := make(chan int, 1)
+	go func() {
+		cliEnd.SetReadDeadline(time.Now().Add(5 * time.Second))
+		resp, err := http.ReadResponse(bufio.NewReader(cliEnd), nil)
+		if err != nil {
+			statusCh <- -1
+			return
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		statusCh <- resp.StatusCode
+	}()
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Errorf("request handler panicked (the server process would die): %v", r)
+				srvEnd.Close()
+			}
+		}()
+		processHTTPPollingRequest(srvEnd, bufio.NewReader(body), newTestServerContext(t), []byte(head),
+			bytes.Repeat([]byte{0x11}, 32), testLogger(t))
+	}()
+	return <-statusCh
+}
+
+// TestPollingRequestBodyLengthBoundedBeforeAuth: the body is read before the
+// request is authenticated, into a buffer of whatever size Content-Length
+// names. Any TLS peer could make the server allocate gigabytes, and a length
+// past RAM+swap is a fatal out-of-memory in the runtime, not a recoverable
+// error. The client never sends more than an 8 KiB chunk.
+func TestPollingRequestBodyLengthBoundedBeforeAuth(t *testing.T) {
+	const announced = 256 << 20
+	head := fmt.Sprintf("POST /poll HTTP/1.1\r\nX-Session-ID: fxpollbodylen000\r\nX-Auth-Token: AAAAAAAAAAAAAAAA\r\n"+
+		"Content-Length: %d\r\n\r\n", announced)
+
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	status := pollingRawRequest(t, head, bytes.NewReader(make([]byte, 1024)))
+	runtime.ReadMemStats(&after)
+
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > announced/4 {
+		t.Fatalf("an unauthenticated request naming a %d-byte body made the server allocate %d bytes", announced, allocated)
+	}
+	if status == http.StatusOK {
+		t.Fatalf("oversized body answered %d", status)
+	}
+}
+
+// TestPollingShortSessionIDDoesNotPanic: session IDs are logged as id[:8] on
+// the unauthenticated path, so a shorter ID used to panic the handler, and with
+// no recover on the connection path the whole server with it.
+func TestPollingShortSessionIDDoesNotPanic(t *testing.T) {
+	for _, id := range []string{"a", "abc", "abcdefg"} {
+		head := "POST /poll HTTP/1.1\r\nX-Session-ID: " + id + "\r\nX-Auth-Token: AAAAAAAAAAAAAAAA\r\nContent-Length: 0\r\n\r\n"
+		if status := pollingRawRequest(t, head, bytes.NewReader(nil)); status == http.StatusOK {
+			t.Fatalf("session id %q answered %d", id, status)
+		}
 	}
 }

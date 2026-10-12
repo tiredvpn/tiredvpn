@@ -5118,6 +5118,19 @@ const (
 	pollingServerKeepaliveIdle = 15 * time.Second
 )
 
+// pollingMaxRequestBody / pollingMinSessionIDLen bound what an unauthenticated
+// request can make the handler do. The client uploads at most an 8 KiB chunk
+// per poll (internal/strategy/http_polling.go poll()) and its first body (a
+// SOCKS target address or a TUN handshake) is smaller still, so 64 KiB is
+// generous; without a bound, Content-Length sized an allocation made before the
+// auth check, and a length past RAM+swap is a fatal runtime out-of-memory. The
+// client's session ID is 16 characters (generateSessionID); the handler logs
+// its first 8.
+const (
+	pollingMaxRequestBody  = 64 << 10
+	pollingMinSessionIDLen = 8
+)
+
 // handleHTTPPollingWithALPN handles HTTP polling connections via ALPN routing
 // This is the kTLS-compatible entry point for tired-polling ALPN
 func handleHTTPPollingWithALPN(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
@@ -5227,6 +5240,20 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 	if sessionID == "" {
 		logger.Debug("HTTP Polling: Missing session ID")
 		sendHTTPPollingError(conn, "Missing session ID")
+		return false
+	}
+	// Everything below logs sessionID[:8], unauthenticated paths included, and
+	// nothing recovers a panic on the connection path.
+	if len(sessionID) < pollingMinSessionIDLen {
+		logger.Debug("HTTP Polling: Session ID too short (%d bytes)", len(sessionID))
+		sendHTTPPollingError(conn, "Invalid session ID")
+		return false
+	}
+	// The body is read before authentication, into a buffer of the announced
+	// size, so the size is checked first.
+	if contentLength < 0 || contentLength > pollingMaxRequestBody {
+		logger.Debug("HTTP Polling: Refusing body of %d bytes", contentLength)
+		sendHTTPPollingError(conn, "Invalid body length")
 		return false
 	}
 
