@@ -33,13 +33,14 @@ import (
 // newPollingSession builds a session the way GetOrCreate does, without putting
 // it in the global manager.
 func newPollingSession(id string) *HTTPPollingSession {
-	return &HTTPPollingSession{
+	sess := &HTTPPollingSession{
 		ID:         id,
 		Created:    time.Now(),
-		LastActive: time.Now(),
 		toClient:   bytes.NewBuffer(nil),
 		fromClient: bytes.NewBuffer(nil),
 	}
+	sess.touch(time.Now())
+	return sess
 }
 
 // uplinkPacket builds a minimal IPv4 packet whose payload carries seq and a
@@ -303,7 +304,7 @@ func TestPollingUplinkRefusedBodyIsNotLost(t *testing.T) {
 	pollingManager.mu.Lock()
 	pollingManager.sessions[sess.ID] = sess
 	pollingManager.mu.Unlock()
-	defer pollingManager.Remove(sess.ID)
+	defer pollingManager.removeSession(sess)
 
 	rng := rand.New(rand.NewSource(5))
 	backlog := make([]byte, maxFromClientBuffered-1000)
@@ -408,7 +409,7 @@ func TestPollingUplinkRefusesLateBody(t *testing.T) {
 	pollingManager.mu.Lock()
 	pollingManager.sessions[sess.ID] = sess
 	pollingManager.mu.Unlock()
-	defer pollingManager.Remove(sess.ID)
+	defer pollingManager.removeSession(sess)
 
 	body := make([]byte, 8192)
 	rand.New(rand.NewSource(7)).Read(body)

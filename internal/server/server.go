@@ -396,6 +396,12 @@ type Config struct {
 	// 0 = one hour.
 	NodeWindow time.Duration
 
+	// PollingMaxSessions caps open HTTP polling sessions on this node, and
+	// PollingMaxSessionsPerClient those of one registry client. 0 = off. See
+	// PollingDefaultMaxSessions for the defaults the server flags use.
+	PollingMaxSessions          int
+	PollingMaxSessionsPerClient int
+
 	// REALITYRequireDataV2 rejects clients that do not negotiate the v2 data
 	// layer (per-connection X25519 keys + ChaCha20-Poly1305). Off during the
 	// rollout so upgraded exits keep serving older clients; turn it on once
@@ -529,6 +535,7 @@ func Run(cfg *Config) error {
 
 	initAdmissionControl(cfg)
 	initNodeCap(cfg)
+	initPollingLimits(cfg)
 
 	if err := validateREALITYConfig(cfg); err != nil {
 		return fmt.Errorf("reality configuration: %w", err)
@@ -4705,12 +4712,16 @@ func computeWebSocketAccept(key string) string {
 
 // HTTPPollingSession represents a single polling session
 type HTTPPollingSession struct {
-	ID         string
-	ClientID   clientIdentity
-	Origin     string // Peer host of the request that opened the session
-	Secret     []byte
-	Created    time.Time
-	LastActive time.Time
+	ID       string
+	ClientID clientIdentity
+	Origin   string // Peer host of the request that opened the session
+	Secret   []byte
+	Created  time.Time
+
+	// lastActive is the UnixNano of the last request on this session. The
+	// request handler writes it and the idle sweep reads it, neither under the
+	// session's locks, so it is atomic.
+	lastActive atomic.Int64
 
 	// Bidirectional buffers
 	toClient   *bytes.Buffer // Data from target to client
@@ -4739,6 +4750,14 @@ type HTTPPollingSession struct {
 	closeLock sync.Mutex
 }
 
+// touch records a request on the session at t.
+func (s *HTTPPollingSession) touch(t time.Time) { s.lastActive.Store(t.UnixNano()) }
+
+// idleFor is how long the session has gone without a request as of now.
+func (s *HTTPPollingSession) idleFor(now time.Time) time.Duration {
+	return now.Sub(time.Unix(0, s.lastActive.Load()))
+}
+
 // HTTPPollingManager manages all polling sessions
 type HTTPPollingManager struct {
 	sessions map[string]*HTTPPollingSession
@@ -4747,13 +4766,89 @@ type HTTPPollingManager struct {
 	// Cleanup interval
 	cleanupInterval time.Duration
 	sessionTimeout  time.Duration
+
+	// Ceilings on open sessions, 0 = off; see PollingDefaultMaxSessions.
+	// Guarded by mu.
+	maxSessions  int
+	maxPerClient int
+
+	refusedNode    atomic.Uint64 // new sessions refused at the node ceiling
+	refusedClient  atomic.Uint64 // new sessions refused at a client's ceiling
+	refusalLogAt   atomic.Int64  // UnixNano of the last refusal warning
+	refusalsLogged atomic.Uint64 // refusals already reported in a warning
 }
+
+// A polling session costs a relay goroutine, a target connection and, at
+// worst, its three buffers: the downlink (pollingMaxToClientBuffered), the
+// unacknowledged window (maxUnackedSize) and the uplink (maxFromClientBuffered),
+// 1 MiB each. The Go heap runs at about twice its live size (GOGC=100), so
+// that is ~6 MiB of RSS per session at worst; measured, 100 sessions with a
+// full downlink each took the server to 289 MB. Nothing else limits how many a
+// client opens: every new session ID with a valid token is a new session.
+//
+// PollingDefaultMaxSessions keeps that worst case near a quarter of a 3 GiB
+// production node, which also carries the mux, the relays and REALITY:
+// 100 x ~6 MiB = ~600 MiB, 20%. A TUN client holds one session; a SOCKS client
+// holds one per proxied connection, so a node serving SOCKS over polling may
+// need more and the flag is there for it.
+//
+// PollingDefaultMaxSessionsPerClient applies only to registry clients, whose
+// identity is their own. Half the node means one client - or one leaked
+// secret - cannot take every slot. Clients on the global secret all share one
+// identity and are held only to the node ceiling: capping that identity would
+// cap all of them together.
+const (
+	PollingDefaultMaxSessions          = 100
+	PollingDefaultMaxSessionsPerClient = 50
+)
+
+// pollingSessionTimeout / pollingSweepInterval decide how long an abandoned
+// session keeps its slot. The client never announces that it is done; it just
+// stops polling. A live client polls at least every pollIdleMax (4s, +25%
+// jitter) and gives a session up by itself after 20s without a successful poll
+// (pollingPollHealthGrace in internal/strategy/http_polling.go), opening a new
+// one if it still needs the tunnel. So a session with no request for 60s has
+// no client left, and the sweep frees it within 70s. It used to take up to
+// five and a half minutes, long enough for dead sessions to fill the ceiling.
+const (
+	pollingSessionTimeout = 60 * time.Second
+	pollingSweepInterval  = 10 * time.Second
+)
+
+// pollingRefusalLogEvery rate-limits the operator warning about refusals.
+const pollingRefusalLogEvery = time.Minute
+
+var (
+	errPollingNodeFull   = errors.New("polling session ceiling reached")
+	errPollingClientFull = errors.New("polling per-client session ceiling reached")
+)
 
 // Global polling manager
 var pollingManager = &HTTPPollingManager{
 	sessions:        make(map[string]*HTTPPollingSession),
-	cleanupInterval: 30 * time.Second,
-	sessionTimeout:  5 * time.Minute,
+	cleanupInterval: pollingSweepInterval,
+	sessionTimeout:  pollingSessionTimeout,
+}
+
+// setLimits sets the session ceilings; 0 turns one off.
+func (pm *HTTPPollingManager) setLimits(total, perClient int) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	pm.maxSessions, pm.maxPerClient = max(total, 0), max(perClient, 0)
+}
+
+// limits reports the session ceilings.
+func (pm *HTTPPollingManager) limits() (total, perClient int) {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	return pm.maxSessions, pm.maxPerClient
+}
+
+// initPollingLimits applies the configured ceilings at server start.
+func initPollingLimits(cfg *Config) {
+	pollingManager.setLimits(cfg.PollingMaxSessions, cfg.PollingMaxSessionsPerClient)
+	log.Info("HTTP Polling: at most %d sessions, %d per registry client (0 = no limit)",
+		cfg.PollingMaxSessions, cfg.PollingMaxSessionsPerClient)
 }
 
 // init starts the polling manager cleanup routine
@@ -4778,7 +4873,9 @@ func (pm *HTTPPollingManager) cleanup() {
 
 	now := time.Now()
 	for id, sess := range pm.sessions {
-		if now.Sub(sess.LastActive) > pm.sessionTimeout {
+		// A closed session is dead whatever its clock says: nothing relays for
+		// it, yet a client still polling it would keep it in the map.
+		if sess.closed.Load() || sess.idleFor(now) > pm.sessionTimeout {
 			log.Debug("HTTP Polling: Cleaning up stale session %s", id[:8])
 			sess.Close()
 			delete(pm.sessions, id)
@@ -4786,14 +4883,36 @@ func (pm *HTTPPollingManager) cleanup() {
 	}
 }
 
-// GetOrCreate gets or creates a session
-func (pm *HTTPPollingManager) GetOrCreate(sessionID string, secret []byte, clientID clientIdentity, origin string) (*HTTPPollingSession, bool) {
+// GetOrCreate gets or creates a session. A new session is refused with
+// errPollingNodeFull or errPollingClientFull at a ceiling; an existing one is
+// always returned, so sessions already open are never cut off by the limit.
+// The count is the map itself, so every path that removes a session frees its
+// slot without separate bookkeeping to get out of step.
+func (pm *HTTPPollingManager) GetOrCreate(sessionID string, secret []byte, clientID clientIdentity, origin string) (*HTTPPollingSession, bool, error) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
+	now := time.Now()
 	if sess, exists := pm.sessions[sessionID]; exists {
-		sess.LastActive = time.Now()
-		return sess, false
+		sess.touch(now)
+		return sess, false, nil
+	}
+
+	if pm.maxSessions > 0 && len(pm.sessions) >= pm.maxSessions {
+		pm.refusedNode.Add(1)
+		return nil, false, errPollingNodeFull
+	}
+	if pm.maxPerClient > 0 && clientID.perClient {
+		n := 0
+		for _, s := range pm.sessions {
+			if s.ClientID == clientID {
+				n++
+			}
+		}
+		if n >= pm.maxPerClient {
+			pm.refusedClient.Add(1)
+			return nil, false, errPollingClientFull
+		}
 	}
 
 	// Create new session
@@ -4802,13 +4921,34 @@ func (pm *HTTPPollingManager) GetOrCreate(sessionID string, secret []byte, clien
 		ClientID:   clientID,
 		Origin:     origin,
 		Secret:     secret,
-		Created:    time.Now(),
-		LastActive: time.Now(),
+		Created:    now,
 		toClient:   bytes.NewBuffer(nil),
 		fromClient: bytes.NewBuffer(nil),
 	}
+	sess.touch(now)
 	pm.sessions[sessionID] = sess
-	return sess, true
+	return sess, true, nil
+}
+
+// warnRefusal tells the operator that sessions are being refused, at most once
+// per pollingRefusalLogEvery.
+func (pm *HTTPPollingManager) warnRefusal(err error, clientID clientIdentity) {
+	now := time.Now().UnixNano()
+	last := pm.refusalLogAt.Load()
+	if now-last < int64(pollingRefusalLogEvery) || !pm.refusalLogAt.CompareAndSwap(last, now) {
+		return
+	}
+	total := pm.refusedNode.Load() + pm.refusedClient.Load()
+	since := total - pm.refusalsLogged.Swap(total)
+	pm.mu.RLock()
+	open, maxTotal, maxPer := len(pm.sessions), pm.maxSessions, pm.maxPerClient
+	pm.mu.RUnlock()
+	flag := "-polling-max-sessions"
+	if errors.Is(err, errPollingClientFull) {
+		flag = "-polling-max-sessions-per-client"
+	}
+	log.Warn("HTTP Polling: refusing new sessions (%v, client %s): %d open, ceilings %d per node / %d per client, %d refused since the last warning; raise %s if this is real load",
+		err, clientID, open, maxTotal, maxPer, since, flag)
 }
 
 // Get retrieves a session
@@ -4818,16 +4958,41 @@ func (pm *HTTPPollingManager) Get(sessionID string) *HTTPPollingSession {
 	return pm.sessions[sessionID]
 }
 
-// Remove removes a session
-func (pm *HTTPPollingManager) Remove(sessionID string) {
+// removeSession removes sess, and only sess: a relay finishing late must not
+// take out a newer session that reuses the ID (the client re-polling an ID the
+// sweep already removed creates one).
+func (pm *HTTPPollingManager) removeSession(sess *HTTPPollingSession) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
-
-	if sess, exists := pm.sessions[sessionID]; exists {
-		sess.Close()
-		delete(pm.sessions, sessionID)
+	if pm.sessions[sess.ID] == sess {
+		delete(pm.sessions, sess.ID)
 	}
+	sess.Close()
 }
+
+// stats is what the exporter renders.
+func (pm *HTTPPollingManager) stats() (open, maxTotal, maxPer int, refusedNode, refusedClient uint64) {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	return len(pm.sessions), pm.maxSessions, pm.maxPerClient, pm.refusedNode.Load(), pm.refusedClient.Load()
+}
+
+// writePollingMetrics renders the session count against its ceiling.
+func writePollingMetrics(w io.Writer) {
+	open, maxTotal, maxPer, refusedNode, refusedClient := pollingManager.stats()
+	fmt.Fprintf(w, "# HELP tiredvpn_polling_sessions Open HTTP polling sessions\n")
+	fmt.Fprintf(w, "# TYPE tiredvpn_polling_sessions gauge\n")
+	fmt.Fprintf(w, "tiredvpn_polling_sessions %d\n\n", open)
+	fmt.Fprintf(w, "# HELP tiredvpn_polling_sessions_ceiling Configured polling session ceilings, 0 = off\n")
+	fmt.Fprintf(w, "# TYPE tiredvpn_polling_sessions_ceiling gauge\n")
+	fmt.Fprintf(w, "tiredvpn_polling_sessions_ceiling{limit=\"node\"} %d\n", maxTotal)
+	fmt.Fprintf(w, "tiredvpn_polling_sessions_ceiling{limit=\"client\"} %d\n\n", maxPer)
+	fmt.Fprintf(w, "# HELP tiredvpn_polling_refused_total New polling sessions refused at a ceiling\n")
+	fmt.Fprintf(w, "# TYPE tiredvpn_polling_refused_total counter\n")
+	fmt.Fprintf(w, "tiredvpn_polling_refused_total{limit=\"node\"} %d\n", refusedNode)
+	fmt.Fprintf(w, "tiredvpn_polling_refused_total{limit=\"client\"} %d\n\n", refusedClient)
+}
+
 
 // Close closes the session and its target connection
 func (s *HTTPPollingSession) Close() {
@@ -5348,7 +5513,16 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 	}
 
 	// Get or create session
-	sess, isNew := pollingManager.GetOrCreate(sessionID, usedSecret, clientID, originOf(conn.RemoteAddr()))
+	sess, isNew, err := pollingManager.GetOrCreate(sessionID, usedSecret, clientID, originOf(conn.RemoteAddr()))
+	if err != nil {
+		// After authentication on purpose: a peer without a secret never gets
+		// here, so the ceiling cannot be measured from outside. The answer is
+		// the busy reply the uplink bound already sends, not a new one.
+		logger.Debug("HTTP Polling: New session %s refused: %v", sessionID[:8], err)
+		pollingManager.warnRefusal(err, clientID)
+		sendHTTPPollingBusy(conn)
+		return false
+	}
 
 	if isNew {
 		logger.Info("HTTP Polling: New session %s (client: %s), body=%d bytes, contentLength=%d", sessionID[:8], clientID, len(body), contentLength)
@@ -5359,7 +5533,7 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 		if len(body) > 0 {
 			if late || !sess.WriteFromClient(body) {
 				logger.Debug("HTTP Polling: New session %s body of %d bytes refused (late=%v)", sessionID[:8], len(body), late)
-				pollingManager.Remove(sessionID)
+				pollingManager.removeSession(sess)
 				sendHTTPPollingBusy(conn)
 				return false
 			}
@@ -5376,8 +5550,8 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 		return keepAlive
 	}
 
-	// Existing session - exchange data
-	sess.LastActive = time.Now()
+	// Existing session - exchange data. GetOrCreate has refreshed its idle
+	// clock.
 
 	// Write client data to session buffer
 	if len(body) > 0 {
@@ -5425,7 +5599,7 @@ func runPollingSessionRelay(sess *HTTPPollingSession, srvCtx *serverContext, log
 		select {
 		case <-timeout:
 			logger.Debug("HTTP Polling: Session %s timed out waiting for target", sess.ID[:8])
-			pollingManager.Remove(sess.ID)
+			pollingManager.removeSession(sess)
 			return
 		default:
 		}
@@ -5446,7 +5620,7 @@ func runPollingSessionRelay(sess *HTTPPollingSession, srvCtx *serverContext, log
 				addrLen := int(head[0])<<8 | int(head[1])
 				if addrLen < 3 || addrLen > 256 {
 					logger.Debug("HTTP Polling: Invalid address (len=%d, have=%d)", addrLen, len(head))
-					pollingManager.Remove(sess.ID)
+					pollingManager.removeSession(sess)
 					return
 				}
 				if len(head) >= 2+addrLen {
@@ -5476,7 +5650,7 @@ func runPollingSessionRelay(sess *HTTPPollingSession, srvCtx *serverContext, log
 	if err != nil {
 		logger.Warn("HTTP Polling: Failed to connect to %s: %v", targetAddr, err)
 		sess.WriteToClient([]byte{0x01}) // Failure
-		pollingManager.Remove(sess.ID)
+		pollingManager.removeSession(sess)
 		return
 	}
 
@@ -5545,7 +5719,7 @@ func runPollingSessionRelay(sess *HTTPPollingSession, srvCtx *serverContext, log
 
 	wg.Wait()
 	logger.Info("HTTP Polling: Session %s relay ended", sess.ID[:8])
-	pollingManager.Remove(sess.ID)
+	pollingManager.removeSession(sess)
 }
 
 // sendHTTPPollingResponse sends HTTP 200 OK with body (Keep-Alive)
@@ -5599,7 +5773,7 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 	if len(remainingData) < 6 {
 		logger.Debug("HTTP Polling TUN handshake too short: %d bytes", len(remainingData))
 		sess.WriteToClient([]byte{0x01}) // Failure
-		pollingManager.Remove(sess.ID)
+		pollingManager.removeSession(sess)
 		return
 	}
 
@@ -5608,7 +5782,7 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 	if srvCtx == nil || (srvCtx.sharedTUN == nil && srvCtx.upstreamDialer == nil) {
 		logger.Error("HTTP Polling TUN: Shared TUN not initialized")
 		sess.WriteToClient([]byte{0x01}) // Failure
-		pollingManager.Remove(sess.ID)
+		pollingManager.removeSession(sess)
 		return
 	}
 
@@ -5665,13 +5839,13 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 		if err != nil {
 			logger.Warn("HTTP Polling TUN relay: upstream dial failed: %v", err)
 			sess.WriteToClient([]byte{0x01}) // Failure
-			pollingManager.Remove(sess.ID)
+			pollingManager.removeSession(sess)
 			return
 		}
 		sink, serverIP, clientIP = relaySink, upServerIP, upClientIP
 		defer func() {
 			relaySink.Close()
-			pollingManager.Remove(sess.ID)
+			pollingManager.removeSession(sess)
 			logger.Info("HTTP Polling TUN relay client disconnected: %s (clientID=%s)", clientIP, clientID)
 		}()
 	} else {
@@ -5681,7 +5855,7 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 			if err != nil {
 				logger.Error("HTTP Polling TUN: Failed to allocate IP from pool: %v", err)
 				sess.WriteToClient([]byte{0x01}) // Failure
-				pollingManager.Remove(sess.ID)
+				pollingManager.removeSession(sess)
 				return
 			}
 			clientIP = allocatedIP
@@ -5699,7 +5873,7 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 		sink = localSink
 		defer func() {
 			localSink.Close()
-			pollingManager.Remove(sess.ID)
+			pollingManager.removeSession(sess)
 			logger.Info("HTTP Polling TUN client disconnected: %s (clientID=%s)", clientIP, clientID)
 		}()
 	}
@@ -5779,7 +5953,7 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 			if pktLen > 65535 {
 				logger.Debug("HTTP Polling TUN: invalid packet length %d, closing session", pktLen)
 				sess.Close()
-				pollingManager.Remove(sess.ID)
+				pollingManager.removeSession(sess)
 				return
 			}
 

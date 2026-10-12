@@ -231,6 +231,13 @@ NODE CEILINGS (address reputation):
   -node-window duration
         Sliding window the traffic ceiling is measured over (default 1h)
 
+POLLING SESSIONS (memory):
+  -polling-max-sessions int
+        Cap open HTTP polling sessions on this node, 0 = off (default 100). Each can
+        hold up to ~6 MiB of RSS; a SOCKS client holds one per proxied connection.
+  -polling-max-sessions-per-client int
+        Cap open polling sessions of one registry client, 0 = off (default 50).
+
 ADVANCED OPTIONS:
   -fake-root string
         Fake website root directory (default "./www")
@@ -486,6 +493,11 @@ func registerServerFlags(fs *flag.FlagSet, cfg *server.Config) *serverFlagOpts {
 	fs.IntVar(&cfg.NodeMaxClients, "node-max-clients", 0, "Cap distinct authenticated clients on this node (0 = off). Address reputation is the one blocking vector that ignores traffic shape; 200 users on one address bought two hours in the Iranian experiment, 5-7 bought two days. NOTE: transports that authenticate against a single shared secret carry no client id and are not counted, so the real number on this node can exceed the cap.")
 	fs.Int64Var(&cfg.NodeMaxBytesPerWindow, "node-max-bytes", 0, "Cap bytes carried per window on this node (0 = off). This is the ceiling that means something on a relay, where peers are downstream nodes rather than people.")
 	fs.DurationVar(&cfg.NodeWindow, "node-window", time.Hour, "Sliding window the traffic ceiling is measured over")
+	// Polling session ceilings. Unlike the node ceilings these default to on:
+	// they guard memory, not reputation, and without them one authenticated
+	// client can open sessions until the node runs out of RAM.
+	fs.IntVar(&cfg.PollingMaxSessions, "polling-max-sessions", server.PollingDefaultMaxSessions, "Cap open HTTP polling sessions on this node (0 = off). Each can hold up to 3 MiB of buffers (~6 MiB of RSS); 100 keeps that near a fifth of a 3 GiB node. A SOCKS client holds one session per proxied connection.")
+	fs.IntVar(&cfg.PollingMaxSessionsPerClient, "polling-max-sessions-per-client", server.PollingDefaultMaxSessionsPerClient, "Cap open HTTP polling sessions of one registry client (0 = off). Clients on the global secret share one identity and are held only to -polling-max-sessions.")
 	fs.BoolVar(&cfg.REALITYRequireDataV2, "reality-require-data-v2", true, "Reject REALITY clients that do not negotiate the v2 data layer (per-connection keys + AEAD). On by default in 1.11.0; set =false only to accept pre-1.11 clients on the malleable v1 layer.")
 	// B1 transport. -reality-b1 defaults to off while the B1 handler is still
 	// a stub: with it on, a server without a static key refuses to start, and
