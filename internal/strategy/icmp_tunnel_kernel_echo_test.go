@@ -741,3 +741,36 @@ func TestICMPPacketPayloadLimitFloor(t *testing.T) {
 		t.Fatalf("limit with unknown MTU = %d, want MaxPayloadSize %d", got, MaxPayloadSize)
 	}
 }
+
+// When the path is too narrow for a full frame, every frame is cut. The tail
+// of a cut frame must share its packet with the bytes that follow; alone it
+// spends a rate-limited slot on a few dozen bytes, and the bench measured the
+// uplink halving that way.
+func TestICMPSendLoopFillsPacketsAfterACut(t *testing.T) {
+	secret := []byte("icmp-fill-secret")
+	fake := newICMPFakeNet(secret, false)
+	c := icmpSendConn(t, fake, secret, 1000)
+	const pathMTU = 1300
+	c.pathMTU = func() int { return pathMTU }
+
+	var want []byte
+	for i := range 6 {
+		frame := bytes.Repeat([]byte{byte(i + 1)}, 4+1280)
+		if _, err := c.Write(frame); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		want = append(want, frame...)
+	}
+	go c.sendLoop()
+
+	limit := pathMTU - icmpPacketOverhead
+	packets := (len(want) + limit - 1) / limit
+	got := bytes.Join(icmpWaitFrames(t, fake, packets), nil)
+	time.Sleep(50 * time.Millisecond) // let any extra packet show up
+	if n := len(fake.frames()); n != packets {
+		t.Fatalf("%d bytes took %d packets, want %d full ones", len(want), n, packets)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("stream carried %d bytes, want the %d written, in order", len(got), len(want))
+	}
+}

@@ -583,12 +583,15 @@ func (c *icmpTunnelConn) sendLoop() {
 	interval := time.Second / time.Duration(c.rateLimit)
 	// carry holds a queued write that did not fit into the previous packet.
 	var carry []byte
+	// cut marks carry as the tail of a write already split across packets.
+	cut := false
 
 	for {
 		var data []byte
 		if carry != nil {
 			data, carry = carry, nil
 		} else {
+			cut = false
 			select {
 			case <-c.done:
 				return
@@ -617,11 +620,18 @@ func (c *icmpTunnelConn) sendLoop() {
 
 		// A write larger than the path allows is cut here rather than left to
 		// IP fragmentation, which a fragmented echo request would show on the
-		// wire. Otherwise writes queued while we waited for the slot ride in
-		// this packet.
-		if limit := c.packetPayloadLimit(); len(data) > limit {
-			data, carry = data[:limit], data[limit:]
-		} else {
+		// wire. A packet that starts with the tail of a cut write is filled up
+		// with the bytes that follow: that write is split already, and leaving
+		// its tail alone in a packet would spend a rate-limited slot on a few
+		// bytes. Otherwise writes queued while we waited for the slot ride in
+		// this packet whole.
+		limit := c.packetPayloadLimit()
+		switch {
+		case len(data) > limit:
+			data, carry, cut = data[:limit], data[limit:], true
+		case cut:
+			data, carry, cut = c.fillQueued(data, limit)
+		default:
 			data, carry = c.coalesceQueued(data, limit)
 		}
 
@@ -689,6 +699,24 @@ func (c *icmpTunnelConn) coalesceQueued(data []byte, limit int) (packet, carry [
 		}
 	}
 	return data, nil
+}
+
+// fillQueued appends queued writes to data up to exactly limit bytes, cutting
+// the write that does not fit. It returns that write's remainder as carry and
+// whether carry is such a cut tail.
+func (c *icmpTunnelConn) fillQueued(data []byte, limit int) (packet, carry []byte, cut bool) {
+	for len(data) < limit {
+		select {
+		case next := <-c.sendQueue:
+			if room := limit - len(data); len(next) > room {
+				return append(data, next[:room]...), next[room:], true
+			}
+			data = append(data, next...)
+		default:
+			return data, nil, false
+		}
+	}
+	return data, nil, false
 }
 
 // recvLoop handles incoming packets
