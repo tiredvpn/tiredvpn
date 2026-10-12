@@ -147,6 +147,7 @@ func (m *Metrics) Handler() http.HandlerFunc {
 		writeREALITYAuthMetrics(w)
 		writeREALITYDonorMetrics(w)
 		writeNodeCapMetrics(w)
+		writePollingMetrics(w)
 
 		// Errors
 		fmt.Fprintf(w, "# HELP tiredvpn_auth_failures_total Total authentication failures\n")
