@@ -4949,8 +4949,11 @@ func (s *HTTPPollingSession) ReadFromClient() []byte {
 
 // maxFromClientBuffered bounds the uplink a stuck reader can leave behind.
 // Legitimate traffic never approaches it: the reader drains every ~10ms and the
-// client uploads at most 8 KiB per request.
-const maxFromClientBuffered = 4 * 1024 * 1024
+// client uploads at most 8 KiB per request, from a queue of its own that is
+// itself bounded at 1 MiB (maxPollingSendBuffered). It was 4 MiB; at 1 MiB a
+// target that stops reading meets the busy refusal after ~128 bodies instead of
+// ~512, and a session's worst case shrinks by 3 MiB.
+const maxFromClientBuffered = 1 << 20
 
 // WriteFromClient appends one request body to the uplink, or refuses it whole
 // when that would take the uplink over maxFromClientBuffered. A refused body
@@ -5007,8 +5010,11 @@ func (s *HTTPPollingSession) ReadToClient(ackSeq int64) []byte {
 		}
 	}
 
-	// Flow control: don't send more data if unacked buffer is full
-	const maxUnackedSize = 2 * 1024 * 1024 // 2MB max unacked data
+	// Flow control: don't send more data if unacked buffer is full. The client
+	// has one poll worker and acks everything it holds on every poll, so the
+	// window normally carries one chunk; 1 MiB is 64 lost responses in a row.
+	// It was 2 MiB, more than the downlink bound behind it.
+	const maxUnackedSize = 1 << 20
 	if len(s.unackedBuf) > maxUnackedSize {
 		// Wait for acks before sending more
 		return nil
