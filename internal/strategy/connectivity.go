@@ -2,12 +2,15 @@ package strategy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/log"
@@ -29,12 +32,14 @@ type ConnectivityResult struct {
 	UDP  bool // UDP connectivity check passed
 	ICMP bool // ICMP ping succeeded (optional)
 
-	// UDPKnown is true when UDP carries a verdict from a probe that finished,
-	// this round or an earlier one. It is false on a cold start whose probe
-	// has not landed yet: UDP is then a zero value, not a "blocked" verdict,
-	// and the QUIC gate must not read it as one. The probe's only positive answer
-	// is its own read timeout, which is longer than the grace Check waits, so
-	// before this field every cold start read the placeholder as "UDP down"
+	// UDPKnown is true when UDP carries a verdict: a probe to this address
+	// finished with silence (works) or an ICMP refusal (blocked), this round
+	// or an earlier one, on a network whose TCP gate passed. It is false on a
+	// cold start whose probe has not landed yet, after the TCP gate failed,
+	// after a network change, and when the probe died on a local error such
+	// as "network is unreachable" - none of which says anything about UDP to
+	// the server. UDP is then a placeholder the QUIC gate must not act on.
+	// Before this field every cold start read the placeholder as "UDP down"
 	// and a forced -strategy quic_salamander client exited on the spot.
 	UDPKnown bool
 
@@ -73,6 +78,26 @@ type ConnectivityChecker struct {
 	// UDP check probes the primary host on this port: its verdict gates QUIC,
 	// and the server's TCP port answered for a different socket entirely.
 	udpPort int
+
+	// The cached UDP verdict (lastResult.UDP/UDPKnown) is only ever written by
+	// storeUDPVerdict and invalidateUDPVerdict. udpVerdictAddr is the address
+	// it is about: a verdict for another server or family is no verdict here.
+	// udpVerdictStart orders verdicts by when their probe started, so a slow
+	// probe from an older round cannot overwrite a newer one, nor revive a
+	// verdict that invalidateUDPVerdict voided after the probe went out.
+	udpVerdictAddr  string
+	udpVerdictStart time.Time
+
+	// udpDial opens the probe socket; nil means a plain net.Dialer. Tests use
+	// it to stand in for a host whose network is down.
+	udpDial func(ctx context.Context, network, addr string) (net.Conn, error)
+}
+
+// udpGateVerdict is what one UDP probe established. known is false when the
+// probe ended without hearing about the path at all.
+type udpGateVerdict struct {
+	known bool
+	ok    bool
 }
 
 // NewConnectivityChecker creates a new connectivity checker
@@ -92,8 +117,63 @@ func NewConnectivityChecker(serverAddr string, timeout time.Duration, androidMod
 // setUDPProbePort points the UDP check at QUIC's port. See udpPort.
 func (c *ConnectivityChecker) setUDPProbePort(port int) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.udpPort = port
+	c.mu.Unlock()
+	c.invalidateUDPVerdict()
+}
+
+// storeUDPVerdict caches a finished probe's verdict. Unknown results are not
+// stored, and neither is a verdict whose probe started before the cached one
+// or before the last invalidation.
+func (c *ConnectivityChecker) storeUDPVerdict(addr string, start time.Time, v udpGateVerdict) {
+	if !v.known {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if start.Before(c.udpVerdictStart) {
+		return
+	}
+	c.lastResult.UDP, c.lastResult.UDPKnown = v.ok, true
+	c.udpVerdictAddr, c.udpVerdictStart = addr, start
+}
+
+// cachedUDPVerdict returns the cached verdict if it is about addr.
+func (c *ConnectivityChecker) cachedUDPVerdict(addr string) (ok, known bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if !c.lastResult.UDPKnown || c.udpVerdictAddr != addr {
+		return false, false
+	}
+	return c.lastResult.UDP, true
+}
+
+// invalidateUDPVerdict forgets the cached verdict: the network it was taken on
+// is gone or was down, so it describes nothing the next connect will cross.
+func (c *ConnectivityChecker) invalidateUDPVerdict() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastResult.UDP, c.lastResult.UDPKnown = false, false
+	c.udpVerdictAddr, c.udpVerdictStart = "", time.Now()
+}
+
+// refreshUDPAsync probes UDP to the current primary in the background and
+// caches the verdict. The hot paths that skip the full Check (recovery from
+// WaitForConnectivity, a network change) use it so the QUIC gate is not left
+// on an invalidated verdict until the next pre-flight.
+func (c *ConnectivityChecker) refreshUDPAsync() {
+	c.mu.RLock()
+	primary := c.serverAddr
+	c.mu.RUnlock()
+	addr := c.udpProbeAddr(primary)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*c.auxTimeout)
+		defer cancel()
+		start := time.Now()
+		v, err := c.checkUDP(ctx, addr)
+		log.Debug("UDP re-probe of %s: known=%v ok=%v (%v)", addr, v.known, v.ok, err)
+		c.storeUDPVerdict(addr, start, v)
+	}()
 }
 
 // udpProbeAddr is the address the UDP check probes for primary.
@@ -202,26 +282,26 @@ func (c *ConnectivityChecker) Check(ctx context.Context) ConnectivityResult {
 		close(tcpDone)
 	}()
 
-	var udpOK, icmpOK atomic.Bool
-	auxDone := make(chan struct{})
+	// UDP and ICMP run apart: only UDP gates anything, and the ICMP check's
+	// TCP dials (700ms each on a silent port) must not hold a refused UDP
+	// verdict back past the grace.
+	udpAddr := c.udpProbeAddr(primary)
+	udpStart := time.Now()
+	var udpV udpGateVerdict
+	udpDone := make(chan struct{})
 	go func() {
-		defer close(auxDone)
-		var wg sync.WaitGroup
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			udpOK.Store(c.checkUDP(ctx, c.udpProbeAddr(primary)) == nil)
-		}()
+		defer close(udpDone)
+		udpV, _ = c.checkUDP(ctx, udpAddr)
+	}()
+	var icmpOK atomic.Bool
+	icmpDone := make(chan struct{})
+	go func() {
+		defer close(icmpDone)
 		// ICMP check (optional, may fail without root).
 		// Skip on Android - os/exec causes SIGSYS due to seccomp.
 		if !c.androidMode {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				icmpOK.Store(c.checkICMP(ctx, host) == nil)
-			}()
+			icmpOK.Store(c.checkICMP(ctx, host) == nil)
 		}
-		wg.Wait()
 	}()
 
 	<-tcpDone
@@ -234,22 +314,44 @@ func (c *ConnectivityChecker) Check(ctx context.Context) ConnectivityResult {
 		result.Error = tcpErr
 	}
 
-	auxPending := false
+	switch {
+	case !result.TCP:
+		// The server is unreachable, so whatever the UDP probe meets is the
+		// network being down or changing, not the path to the server. Its
+		// verdict, and the cached one, would outlive the outage: a client
+		// started with the link down came back with "UDP blocked" and a
+		// forced QUIC client exited on "no available strategies".
+		c.invalidateUDPVerdict()
+	default:
+		select {
+		case <-udpDone:
+			c.storeUDPVerdict(udpAddr, udpStart, udpV)
+		case <-time.After(c.auxGrace):
+			// Slow this round: let the probe refresh the cache once it lands.
+			// storeUDPVerdict orders it against newer rounds by start time.
+			go func() {
+				<-udpDone
+				c.storeUDPVerdict(udpAddr, udpStart, udpV)
+			}()
+		}
+		// This round's verdict if it landed, else the last one for this
+		// address, else unknown.
+		result.UDP, result.UDPKnown = c.cachedUDPVerdict(udpAddr)
+	}
+
 	select {
-	case <-auxDone:
-		result.UDP = udpOK.Load()
+	case <-icmpDone:
 		result.ICMP = icmpOK.Load()
-		result.UDPKnown = true
-	case <-time.After(c.auxGrace):
-		// Aux probes are slow this round; reuse the last known verdict and let
-		// them refresh the cache once they land. On a cold start there is no
-		// last verdict, and UDPKnown stays false to say so.
+	default:
 		c.mu.RLock()
-		result.UDP = c.lastResult.UDP
 		result.ICMP = c.lastResult.ICMP
-		result.UDPKnown = c.lastResult.UDPKnown
 		c.mu.RUnlock()
-		auxPending = true
+		go func() {
+			<-icmpDone
+			c.mu.Lock()
+			c.lastResult.ICMP = icmpOK.Load()
+			c.mu.Unlock()
+		}()
 	}
 
 	// The address that ANSWERED, not the one the walk started from. The gate
@@ -260,28 +362,10 @@ func (c *ConnectivityChecker) Check(ctx context.Context) ConnectivityResult {
 	if answered == "" {
 		answered = "none"
 	}
-	log.Debug("Connectivity check from %s - TCP:%v (answered=%s) UDP:%v ICMP:%v (latency=%v)",
-		net.JoinHostPort(host, port), result.TCP, answered, result.UDP, result.ICMP, result.Latency)
+	log.Debug("Connectivity check from %s - TCP:%v (answered=%s) UDP:%v (known=%v) ICMP:%v (latency=%v)",
+		net.JoinHostPort(host, port), result.TCP, answered, result.UDP, result.UDPKnown, result.ICMP, result.Latency)
 
-	// Cache result
-	c.mu.Lock()
-	c.lastResult = result
-	c.mu.Unlock()
-
-	// Started only after the store above: a probe landing between the select
-	// and the store would otherwise have its verdict overwritten by the
-	// placeholder this round carried.
-	if auxPending {
-		go func() {
-			<-auxDone
-			c.mu.Lock()
-			c.lastResult.UDP = udpOK.Load()
-			c.lastResult.ICMP = icmpOK.Load()
-			c.lastResult.UDPKnown = true
-			c.mu.Unlock()
-		}()
-	}
-
+	c.cacheResult(result)
 	return result
 }
 
@@ -302,15 +386,31 @@ func (c *ConnectivityChecker) checkTCPOnly(ctx context.Context) ConnectivityResu
 		result.Addr = addr
 	}
 
-	// Carry forward last known UDP/ICMP (they gate QUIC and rarely flip).
-	c.mu.Lock()
+	// Carry forward last known UDP/ICMP (they gate QUIC and rarely flip) -
+	// unless the TCP gate failed, which voids the UDP verdict (see Check).
+	if !result.TCP {
+		c.invalidateUDPVerdict()
+	}
+	c.mu.RLock()
 	result.UDP = c.lastResult.UDP
 	result.ICMP = c.lastResult.ICMP
 	result.UDPKnown = c.lastResult.UDPKnown
-	c.lastResult = result
-	c.mu.Unlock()
+	c.mu.RUnlock()
+	c.cacheResult(result)
 
 	return result
+}
+
+// cacheResult stores result as the last one, keeping the cached UDP verdict:
+// that is owned by storeUDPVerdict and invalidateUDPVerdict, which order
+// verdicts by probe start, and a round that only carried it must not undo a
+// verdict that landed in the meantime.
+func (c *ConnectivityChecker) cacheResult(result ConnectivityResult) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	udp, known := c.lastResult.UDP, c.lastResult.UDPKnown
+	c.lastResult = result
+	c.lastResult.UDP, c.lastResult.UDPKnown = udp, known
 }
 
 // checkTCP verifies that the server's TCP port is reachable.
@@ -326,16 +426,25 @@ func (c *ConnectivityChecker) checkTCP(ctx context.Context, addr string) error {
 	return nil
 }
 
-// checkUDP sends a UDP packet and waits for any response
-// Note: UDP is connectionless, so we just check if we can send and receive
-func (c *ConnectivityChecker) checkUDP(ctx context.Context, addr string) error {
-	dialer := &net.Dialer{
-		Timeout: c.auxTimeout,
+// checkUDP sends a datagram to addr and reads for a moment.
+//
+// Only two outcomes are a verdict about UDP to the server. Silence until the
+// read deadline: the datagram left and nothing refused it (it may still have
+// been dropped - the probe cannot tell). An ICMP port unreachable, which the
+// connected socket reports as ECONNREFUSED: refused. A reply also counts as
+// working. Everything else - "network is unreachable", "no route to host", a
+// dial that fails before any packet leaves - is the local network talking,
+// and comes back as unknown instead of the "UDP blocked" it used to be.
+func (c *ConnectivityChecker) checkUDP(ctx context.Context, addr string) (udpGateVerdict, error) {
+	c.mu.RLock()
+	dial := c.udpDial
+	c.mu.RUnlock()
+	if dial == nil {
+		dial = (&net.Dialer{Timeout: c.auxTimeout}).DialContext
 	}
-
-	conn, err := dialer.DialContext(ctx, "udp", addr)
+	conn, err := dial(ctx, "udp", addr)
 	if err != nil {
-		return fmt.Errorf("UDP dial failed: %w", err)
+		return udpGateVerdict{}, fmt.Errorf("UDP dial failed: %w", err)
 	}
 	defer conn.Close()
 
@@ -350,31 +459,26 @@ func (c *ConnectivityChecker) checkUDP(ctx context.Context, addr string) error {
 		0xc0, 0x00, 0x00, 0x01, 0x08, 0x00, 0x00, 0x00, // 8 bytes header
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 8 bytes padding
 	}
-	_, err = conn.Write(probe)
-	if err != nil {
-		return fmt.Errorf("UDP write failed: %w", err)
+	if _, err = conn.Write(probe); err != nil {
+		if errors.Is(err, syscall.ECONNREFUSED) {
+			return udpGateVerdict{known: true}, fmt.Errorf("UDP blocked: %w", err)
+		}
+		return udpGateVerdict{}, fmt.Errorf("UDP write failed: %w", err)
 	}
 
-	// Try to read response (server probably won't respond, but ICMP errors might come)
-	// Short timeout - we don't expect actual response
 	conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 	buf := make([]byte, 64)
 	_, err = conn.Read(buf)
-
-	// Timeout is expected - it means no ICMP error came back
-	if err != nil {
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			// Timeout is OK - UDP probably works, just no response
-			return nil
-		}
-		// Other errors (like ICMP unreachable) indicate UDP is blocked
-		if strings.Contains(err.Error(), "connection refused") ||
-			strings.Contains(err.Error(), "unreachable") {
-			return fmt.Errorf("UDP blocked: %w", err)
-		}
+	switch {
+	case err == nil:
+		return udpGateVerdict{known: true, ok: true}, nil
+	case errors.Is(err, os.ErrDeadlineExceeded):
+		return udpGateVerdict{known: true, ok: true}, nil
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return udpGateVerdict{known: true}, fmt.Errorf("UDP blocked: %w", err)
+	default:
+		return udpGateVerdict{}, fmt.Errorf("UDP probe inconclusive: %w", err)
 	}
-
-	return nil
 }
 
 func (c *ConnectivityChecker) checkICMP(ctx context.Context, host string) error {
@@ -428,6 +532,9 @@ func (c *ConnectivityChecker) WaitForConnectivity(ctx context.Context, interval 
 			result = c.checkTCPOnly(ctx)
 			if result.TCP {
 				log.Info("Connectivity restored to %s", result.Addr)
+				// The outage voided the UDP verdict; take a fresh one in the
+				// background rather than slow the recovery down with it.
+				c.refreshUDPAsync()
 				return result
 			}
 			backoff = nextProbeBackoff(backoff)

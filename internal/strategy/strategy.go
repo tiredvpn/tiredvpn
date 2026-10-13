@@ -283,6 +283,12 @@ func (m *Manager) recordConnectResult(success bool) {
 // applyUDPGate flips QUIC/UDP strategy exclusion based on a fresh UDP probe.
 func (m *Manager) applyUDPGate(udpOK bool) {
 	m.mu.Lock()
+	m.applyUDPGateLocked(udpOK)
+	m.mu.Unlock()
+}
+
+// applyUDPGateLocked is applyUDPGate for a caller that holds m.mu.
+func (m *Manager) applyUDPGateLocked(udpOK bool) {
 	m.udpGatePending = false
 	if !udpOK {
 		if !m.excludeUDPStrategies {
@@ -295,7 +301,6 @@ func (m *Manager) applyUDPGate(udpOK bool) {
 		}
 		m.excludeUDPStrategies = false
 	}
-	m.mu.Unlock()
 }
 
 // udpGateDeferQUIC handles a pre-flight that ended before the UDP probe did.
@@ -316,6 +321,12 @@ func (m *Manager) udpGateDeferQUIC() {
 	if !m.excludeUDPStrategies {
 		log.Debug("UDP verdict not in yet, QUIC strategies sit out this scan")
 	}
+	m.udpGateDeferQUICLocked()
+}
+
+// udpGateDeferQUICLocked is the auto-mode half of udpGateDeferQUIC, for a
+// caller that holds m.mu and has already ruled out forced mode.
+func (m *Manager) udpGateDeferQUICLocked() {
 	m.excludeUDPStrategies = true
 	m.udpGatePending = true
 }
@@ -331,9 +342,18 @@ func (m *Manager) udpGateRefresh() {
 	if !pending || checker == nil {
 		return
 	}
-	if r := checker.LastResult(); r.UDPKnown {
-		m.applyUDPGate(r.UDP)
+	r := checker.LastResult()
+	if !r.UDPKnown {
+		return
 	}
+	// Re-checked under the lock: a pre-flight running alongside may have
+	// applied a fresher verdict since pending was read, and the cached one
+	// must not undo it.
+	m.mu.Lock()
+	if m.udpGatePending {
+		m.applyUDPGateLocked(r.UDP)
+	}
+	m.mu.Unlock()
 }
 
 // shouldSkipFastReconnect records a fast-reconnect attempt for strategyID and
@@ -2733,6 +2753,21 @@ func (m *Manager) ResetForNetworkChange() {
 
 	// Storm state is tied to the old network - clear it after a network change.
 	m.stormDetector.Reset()
+
+	// So is the UDP verdict: it gated QUIC for the old network (or for no
+	// network at all, when this runs because the link went down). Void it,
+	// take a fresh one in the background, and until it lands treat QUIC as on
+	// a cold start: forced keeps it, auto lets it sit out the scans.
+	if m.connectivityChecker != nil {
+		m.connectivityChecker.invalidateUDPVerdict()
+		m.connectivityChecker.refreshUDPAsync()
+	}
+	if m.forced {
+		m.excludeUDPStrategies = false
+		m.udpGatePending = false
+	} else {
+		m.udpGateDeferQUICLocked()
+	}
 
 	// Stop any running emergency reprobe. Nil the channel after closing so a
 	// StopEmergencyReprobe that already fired (or a second network change) does

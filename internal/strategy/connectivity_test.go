@@ -153,22 +153,29 @@ func TestCheckGatedOnTCP(t *testing.T) {
 }
 
 // TestCheckTCPOnlyCarriesUDP confirms the fast path preserves the cached UDP
-// verdict instead of resetting it to false on every retry.
+// verdict while TCP answers, instead of resetting it on every retry - and that
+// a failed TCP gate voids it as unknown, not as "blocked": the network being
+// down says nothing about UDP to the server.
 func TestCheckTCPOnlyCarriesUDP(t *testing.T) {
-	addr := freeLoopbackAddr(t)
+	addr := udpGateServer(t, true)
 	c := NewConnectivityChecker(addr, 200*time.Millisecond, false)
-
-	// Seed the cache as if UDP had been observed working.
-	c.mu.Lock()
-	c.lastResult = ConnectivityResult{UDP: true, CheckedAt: time.Now()}
-	c.mu.Unlock()
+	c.storeUDPVerdict(addr, time.Now(), udpGateVerdict{known: true, ok: true})
 
 	res := c.checkTCPOnly(context.Background())
+	if !res.TCP {
+		t.Fatalf("expected TCP up, got %+v", res)
+	}
+	if !res.UDP || !res.UDPKnown {
+		t.Fatalf("checkTCPOnly dropped the cached UDP verdict: %+v", res)
+	}
+
+	c.SetAddrs(freeLoopbackAddr(t))
+	res = c.checkTCPOnly(context.Background())
 	if res.TCP {
 		t.Fatalf("expected TCP down on a free port")
 	}
-	if !res.UDP {
-		t.Fatalf("checkTCPOnly dropped the cached UDP verdict")
+	if res.UDPKnown {
+		t.Fatalf("a failed TCP gate kept a UDP verdict: %+v", res)
 	}
 }
 

@@ -1,10 +1,13 @@
 package strategy
 
 import (
+	"context"
 	"net"
+	"os"
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -287,5 +290,283 @@ func TestUDPGateRefreshAppliesLandedVerdict(t *testing.T) {
 	conn.Close()
 	if strat.ID() != "quic_salamander" {
 		t.Fatalf("scan dialled %s, want quic_salamander", strat.ID())
+	}
+}
+
+// udpGateFlappingServer reserves a loopback port and brings TCP and a silent
+// UDP socket up on it only when up() is called - a server that becomes
+// reachable once the client's link does.
+func udpGateFlappingServer(t *testing.T) (addr string, up func()) {
+	t.Helper()
+	addr = freeLoopbackAddr(t)
+	return addr, func() {
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			t.Errorf("listen tcp %s: %v", addr, err)
+			return
+		}
+		pc, err := net.ListenPacket("udp", addr)
+		if err != nil {
+			ln.Close()
+			t.Errorf("listen udp %s: %v", addr, err)
+			return
+		}
+		var (
+			heldMu sync.Mutex
+			held   []net.Conn
+		)
+		go func() {
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				heldMu.Lock()
+				held = append(held, c)
+				heldMu.Unlock()
+			}
+		}()
+		go func() {
+			buf := make([]byte, 2048)
+			for {
+				if _, _, err := pc.ReadFrom(buf); err != nil {
+					return
+				}
+			}
+		}()
+		t.Cleanup(func() {
+			ln.Close()
+			pc.Close()
+			heldMu.Lock()
+			defer heldMu.Unlock()
+			for _, c := range held {
+				c.Close()
+			}
+		})
+	}
+}
+
+// udpGateNetUnreachable is what a UDP dial returns with no route at all.
+func udpGateNetUnreachable(context.Context, string, string) (net.Conn, error) {
+	return nil, &net.OpError{Op: "dial", Net: "udp", Err: os.NewSyscallError("connect", syscall.ENETUNREACH)}
+}
+
+// TestUDPGateLinkDownAtStartForcedQUICConnects is the review's E7: a forced
+// QUIC client started while the link is down. The UDP probe met "network is
+// unreachable", that counted as a finished probe saying "blocked", the TCP
+// wait carried it, and when the link came up the client exited with "no
+// available strategies". A failed TCP gate now voids the verdict, so the
+// client connects once the server is back.
+func TestUDPGateLinkDownAtStartForcedQUICConnects(t *testing.T) {
+	addr, up := udpGateFlappingServer(t)
+	m := udpGateForcedQUICManager(t, addr)
+	m.connectivityChecker.udpDial = udpGateNetUnreachable
+
+	go func() {
+		time.Sleep(600 * time.Millisecond)
+		m.connectivityChecker.mu.Lock()
+		m.connectivityChecker.udpDial = nil
+		m.connectivityChecker.mu.Unlock()
+		up()
+	}()
+
+	conn, strat, err := m.Connect(t.Context(), addr)
+	if err != nil {
+		t.Fatalf("connect after the link came up: %v", err)
+	}
+	conn.Close()
+	if strat.ID() != "quic_salamander" {
+		t.Fatalf("connected via %s, want quic_salamander", strat.ID())
+	}
+}
+
+// TestUDPGateRefusalWhileTCPDownIsVoid: a refusal the probe heard while the
+// TCP gate failed is a verdict about a network the client is not using yet.
+// It must not survive into the connect that follows recovery.
+func TestUDPGateRefusalWhileTCPDownIsVoid(t *testing.T) {
+	addr, up := udpGateFlappingServer(t) // UDP closed until up(): ICMP refused
+	m := udpGateForcedQUICManager(t, addr)
+	go func() {
+		time.Sleep(600 * time.Millisecond)
+		up()
+	}()
+
+	conn, strat, err := m.Connect(t.Context(), addr)
+	if err != nil {
+		t.Fatalf("connect after recovery: %v", err)
+	}
+	conn.Close()
+	if strat.ID() != "quic_salamander" {
+		t.Fatalf("connected via %s, want quic_salamander", strat.ID())
+	}
+}
+
+// TestUDPGateLocalErrorIsNoVerdict: with TCP up, a UDP probe that dies on a
+// local error ("network is unreachable" - say the family's route is gone)
+// heard nothing about the server and must not exclude a forced QUIC client.
+func TestUDPGateLocalErrorIsNoVerdict(t *testing.T) {
+	addr := udpGateServer(t, true)
+	m := udpGateForcedQUICManager(t, addr)
+	m.connectivityChecker.udpDial = udpGateNetUnreachable
+
+	conn, strat, err := m.Connect(t.Context(), addr)
+	if err != nil {
+		t.Fatalf("connect with a locally failing UDP probe: %v", err)
+	}
+	conn.Close()
+	if strat.ID() != "quic_salamander" {
+		t.Fatalf("connected via %s, want quic_salamander", strat.ID())
+	}
+}
+
+// TestUDPGateNetworkChangeVoidsVerdict: ResetForNetworkChange used to keep the
+// UDP verdict and the QUIC exclusion of the network the client just left. It
+// now voids both, re-probes in the background, and the next scan in auto mode
+// acts on the fresh verdict.
+func TestUDPGateNetworkChangeVoidsVerdict(t *testing.T) {
+	addr := udpGateServer(t, true)
+	m := NewManager()
+	m.Register(&mockStrategy{id: "quic_salamander", name: "QUIC Salamander", priority: 4, serverAddr: addr})
+	m.Register(&mockStrategy{id: "confusion_0", priority: 10, serverAddr: addr})
+	c := NewConnectivityChecker(addr, 2*time.Second, false)
+	m.SetConnectivityChecker(c)
+
+	// The old network refused UDP, and the gate acted on it.
+	c.storeUDPVerdict(c.udpProbeAddr(addr), time.Now(), udpGateVerdict{known: true})
+	m.applyUDPGate(false)
+
+	m.ResetForNetworkChange()
+	if r := c.LastResult(); r.UDPKnown && !r.UDP {
+		t.Fatal("the old network's refusal survived the network change")
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for !c.LastResult().UDPKnown {
+		if time.Now().After(deadline) {
+			t.Fatal("no fresh UDP verdict after the network change")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	conn, strat, err := m.ConnectExcluding(t.Context(), addr, []string{"confusion_0"})
+	if err != nil {
+		t.Fatalf("scan after the network change: %v", err)
+	}
+	conn.Close()
+	if strat.ID() != "quic_salamander" {
+		t.Fatalf("scan dialled %s, want quic_salamander", strat.ID())
+	}
+}
+
+// TestUDPGateLateProbeCannotReviveVoidedVerdict: a Check whose UDP probe
+// outlives the grace finishes in the background. If the network changes in
+// between, the late verdict is about the old network and must not land on
+// top of the invalidation.
+func TestUDPGateLateProbeCannotReviveVoidedVerdict(t *testing.T) {
+	addr := udpGateServer(t, true)
+	c := NewConnectivityChecker(addr, 2*time.Second, false)
+	if r := c.Check(t.Context()); !r.TCP || r.UDPKnown {
+		t.Fatalf("want TCP up and the UDP verdict still in flight: %+v", r)
+	}
+	c.invalidateUDPVerdict() // what ResetForNetworkChange does
+	time.Sleep(c.auxTimeout)
+	if c.LastResult().UDPKnown {
+		t.Fatal("a probe sent before the invalidation landed after it")
+	}
+}
+
+// TestUDPGateVerdictIsPerAddress: the gate moves between servers and families
+// (SetAddrs per candidate). A verdict about one address is no verdict about
+// another, so a Check that times out on a new address reports unknown.
+func TestUDPGateVerdictIsPerAddress(t *testing.T) {
+	a := udpGateServer(t, true)
+	b := udpGateServer(t, true)
+	c := NewConnectivityChecker(a, 2*time.Second, false)
+	c.storeUDPVerdict(a, time.Now(), udpGateVerdict{known: true})
+
+	c.SetAddrs(b)
+	if r := c.Check(t.Context()); r.UDPKnown {
+		t.Fatalf("Check on %s reported %s's verdict: %+v", b, a, r)
+	}
+}
+
+// TestUDPGateRecoveryReprobes: after an outage the TCP wait returns without a
+// full Check, and the outage voided the verdict. Auto mode would then keep
+// QUIC deferred with nothing to lift it until the next pre-flight; recovery
+// must take a fresh verdict in the background.
+func TestUDPGateRecoveryReprobes(t *testing.T) {
+	addr, up := udpGateFlappingServer(t)
+	m := NewManager()
+	m.Register(&mockStrategy{id: "quic_salamander", name: "QUIC Salamander", priority: 4, serverAddr: addr})
+	m.Register(&mockStrategy{id: "confusion_0", priority: 10, serverAddr: addr})
+	c := NewConnectivityChecker(addr, 2*time.Second, false)
+	m.SetConnectivityChecker(c)
+	go func() {
+		time.Sleep(600 * time.Millisecond)
+		up()
+	}()
+
+	conn, strat, err := m.Connect(t.Context(), addr)
+	if err != nil {
+		t.Fatalf("connect after recovery: %v", err)
+	}
+	conn.Close()
+	if strat.ID() != "confusion_0" {
+		t.Fatalf("auto mode dialled %s with no UDP verdict, want confusion_0", strat.ID())
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for !c.LastResult().UDPKnown {
+		if time.Now().After(deadline) {
+			t.Fatal("no UDP verdict after recovery")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestUDPGateCheckWithTCPDownLeavesNoVerdict: the reconnect loop asks Check
+// alone whether the network is back (tun.checkNetworkConnectivity). With TCP
+// down, a refusal the UDP probe heard is about a network the client cannot
+// use, and must not be cached as the verdict.
+func TestUDPGateCheckWithTCPDownLeavesNoVerdict(t *testing.T) {
+	addr, _ := udpGateFlappingServer(t) // nothing listening: TCP and UDP refused
+	c := NewConnectivityChecker(addr, 2*time.Second, false)
+	if r := c.Check(t.Context()); r.TCP || r.UDPKnown {
+		t.Fatalf("Check with TCP down: %+v", r)
+	}
+	time.Sleep(c.auxTimeout)
+	if c.LastResult().UDPKnown {
+		t.Fatal("a UDP verdict taken with TCP down was cached")
+	}
+}
+
+// udpGateReadErrConn is a UDP socket whose reads fail with err: an ICMP host
+// unreachable or prohibited from a router on the way, say.
+type udpGateReadErrConn struct {
+	net.Conn
+	err error
+}
+
+func (c udpGateReadErrConn) Read([]byte) (int, error) { return 0, c.err }
+
+// TestUDPGateHostUnreachableIsNoVerdict: only silence and a port unreachable
+// are verdicts. A "no route to host" on the read is the network on the way
+// talking about itself, and used to exclude QUIC as "UDP blocked".
+func TestUDPGateHostUnreachableIsNoVerdict(t *testing.T) {
+	addr := udpGateServer(t, true)
+	m := udpGateForcedQUICManager(t, addr)
+	m.connectivityChecker.udpDial = func(ctx context.Context, network, a string) (net.Conn, error) {
+		conn, err := (&net.Dialer{}).DialContext(ctx, network, a)
+		if err != nil {
+			return nil, err
+		}
+		return udpGateReadErrConn{Conn: conn, err: &net.OpError{Op: "read", Net: "udp", Err: os.NewSyscallError("recvfrom", syscall.EHOSTUNREACH)}}, nil
+	}
+
+	conn, strat, err := m.Connect(t.Context(), addr)
+	if err != nil {
+		t.Fatalf("connect with a host-unreachable UDP probe: %v", err)
+	}
+	conn.Close()
+	if strat.ID() != "quic_salamander" {
+		t.Fatalf("connected via %s, want quic_salamander", strat.ID())
 	}
 }
