@@ -116,13 +116,20 @@ func (e *REALITYExtension) Unmarshal(data []byte) error {
 // Accepts tokens from the current 5-minute bucket and the adjacent ones to
 // tolerate clock skew between client and server.
 func VerifyClientAuth(secret []byte, clientPubKey [32]byte, authToken [32]byte) bool {
+	return verifyClientAuthAt(secret, clientPubKey, authToken, time.Now())
+}
+
+// verifyClientAuthAt is VerifyClientAuth with the clock passed in. Every bucket
+// it tries is counted from the same reading of now, so a bucket edge passing
+// in the middle of the check cannot shift the window.
+func verifyClientAuthAt(secret []byte, clientPubKey [32]byte, authToken [32]byte, now time.Time) bool {
 	// Check the current bucket first, then the grace buckets on either side.
 	offsets := []int64{0}
 	for g := int64(1); g <= authTokenGraceBuckets; g++ {
 		offsets = append(offsets, -g, g)
 	}
 	for _, offset := range offsets {
-		expected := generateAuthTokenAtBucket(secret, clientPubKey, offset)
+		expected := generateAuthTokenAt(secret, clientPubKey, now, offset)
 		if hmac.Equal(authToken[:], expected[:]) {
 			return true
 		}
@@ -131,10 +138,10 @@ func VerifyClientAuth(secret []byte, clientPubKey [32]byte, authToken [32]byte) 
 	return false
 }
 
-// generateAuthTokenAtBucket computes HMAC-SHA256(secret, pubKey || timestamp_bucket)
-// for the bucket offset by bucketOffset from the current 5-minute bucket.
-func generateAuthTokenAtBucket(secret []byte, clientPubKey [32]byte, bucketOffset int64) [32]byte {
-	bucket := (time.Now().Unix() / 300) + bucketOffset
+// generateAuthTokenAt computes HMAC-SHA256(secret, pubKey || timestamp_bucket)
+// for the bucket offset by bucketOffset from the 5-minute bucket holding now.
+func generateAuthTokenAt(secret []byte, clientPubKey [32]byte, now time.Time, bucketOffset int64) [32]byte {
+	bucket := (now.Unix() / 300) + bucketOffset
 	h := hmac.New(sha256.New, secret)
 	h.Write(clientPubKey[:])
 	var tsBuf [8]byte
@@ -158,9 +165,9 @@ func VerifyServerAuth(secret, clientPubKey []byte, authToken [32]byte) bool {
 
 // generateAuthToken creates HMAC-SHA256(secret, pubKey || timestamp_bucket) for
 // the current 5-minute bucket. Binding to pubKey makes the token unique per
-// connection. It is a thin wrapper over generateAuthTokenAtBucket with offset 0.
+// connection. It is a thin wrapper over generateAuthTokenAt with offset 0.
 func generateAuthToken(secret []byte, clientPubKey [32]byte) [32]byte {
-	return generateAuthTokenAtBucket(secret, clientPubKey, 0)
+	return generateAuthTokenAt(secret, clientPubKey, time.Now(), 0)
 }
 
 // --- Data layer v2 negotiation ---------------------------------------------
