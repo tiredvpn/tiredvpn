@@ -7,6 +7,70 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.11.6] - 2026-10-13
+
+### Security
+
+- **HTTP Polling server: memory is bounded before and after authentication.**
+  A single peer could exhaust a node's memory through the polling path.
+  - Before authentication, the request line and headers are read through a
+    16 KiB bounded reader with a 10 s deadline on the first request. A line
+    with no newline used to be buffered whole (three 300 MiB lines took a test
+    server to 1.9 GB RSS). The request body is no longer allocated from
+    `Content-Length` before the token is checked.
+  - A session ID shorter than 8 bytes no longer panics the server process.
+  - After authentication, each session's downlink is capped at 1 MiB with
+    backpressure on the target (SOCKS) or frame drop (TUN). Uplink and unacked
+    buffers are capped at 1 MiB each. A large download through polling used to
+    grow the server's RSS without limit until the OOM killer ran.
+  Responses to unauthenticated peers are byte-for-byte unchanged.
+
+### Added
+
+- **Server: `-polling-max-sessions` (default 100) and
+  `-polling-max-sessions-per-client` (default 50, registry clients only).**
+  A refused session gets the existing busy response. Idle polling sessions are
+  swept after 60 s instead of ~5 minutes. New metrics:
+  `tiredvpn_polling_sessions`, `tiredvpn_polling_sessions_ceiling`,
+  `tiredvpn_polling_refused_total` and `tiredvpn_polling_tun_dropped_total`
+  (Redis mode).
+
+### Fixed
+
+- **QUIC: forced `-strategy quic_salamander` no longer exits on a cold start**,
+  after a start with the link down, or after a network change. The UDP gate now
+  acts only on a finished probe; local errors such as "network unreachable" and
+  host-prohibited replies (firewalld's default) are no longer read as "UDP
+  blocked". The QUIC probe and the gate's UDP check probe the port QUIC dials
+  and report ICMP refusals.
+- **ICMP tunnel works with the server kernel answering pings.** The handshake
+  read a single packet and took the kernel's echo of its own request; it now
+  waits for an authenticated reply. Data frames go out whole, sized to the path
+  MTU, instead of 40-byte pieces that capped the uplink near 2 kbit/s.
+- **HTTP Polling: a poll for a session the server no longer has does not reopen
+  it.** It used to create a fresh session and write "OK" into the data stream.
+  The server now answers once with an over-ceiling frame length (65536), which
+  makes desktop clients reconnect within about a second after a server restart.
+  Android clients up to 1.11.5 recover through their 30 s read deadline, as they
+  did before.
+- **TUN relay rejects frames over the protocol ceiling before allocating.** The
+  relay used by the Android control socket sized its buffer from the frame
+  length, so a length of `0xffffffff` asked for 4 GiB and killed the process.
+- Flaky tests in `internal/tls` (padding scan, signature length distribution,
+  auth token clock) are fixed; the auth code now reads the clock once per
+  verification. Token values and the acceptance window are unchanged.
+
+### Changed
+
+- `-quic-port` is ignored with a warning: it never reached a dial. Both QUIC
+  variants dial the port given in `-server`. `admin add` and `admin qr` no
+  longer write `quicPort=8443`.
+- Plain QUIC is registered with `-quic-sni-frag` or on an explicit
+  `-strategy quic`; otherwise only QUIC Salamander is offered. Plain QUIC needs
+  a server started with `-quic-sni-reassembly`.
+- In auto mode a QUIC dial gives up after 3x the measured RTT (1-5 s) without
+  an answer, instead of quic-go's 5 s/10 s default.
+
 ## [1.11.5] - 2026-10-03
 
 ### Changed
