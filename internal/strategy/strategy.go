@@ -410,6 +410,12 @@ func (m *Manager) SetConnectivityChecker(checker *ConnectivityChecker) {
 	m.connectivityChecker = checker
 	if checker != nil {
 		log.Debug("Connectivity checker set for server: %s", checker.ServerAddr())
+		for _, s := range m.strategies {
+			if q, ok := s.(*QUICStrategy); ok {
+				checker.setUDPProbePort(q.port)
+				break
+			}
+		}
 	}
 }
 
