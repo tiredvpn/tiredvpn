@@ -321,17 +321,15 @@ func TestCertSignatureIsAWellFormedECDSASignature(t *testing.T) {
 // A real P-256 signature is 70, 71 or 72 bytes, with weights near 1/4, 1/2, 1/4
 // — DER prepends a zero byte to an integer whose top bit is set, independently
 // for r and for s. A constant length, or a flat spread of lengths, is the
-// promise this project keeps breaking. The sample below is deliberately large
-// enough to tell 1/2 from 1/4 and deliberately loose about the exact counts:
-// the property is the shape, not a p-value.
+// promise this project keeps breaking. The sample is large enough to see the
+// rare short lengths at their real rate; the limits and their false-alarm
+// rates are worked out next to sigLengthTailProblems.
 func TestCertSignatureLengthDistribution(t *testing.T) {
-	const samples = 400
-
 	cert := mintTestCert(t, "github.com")
 	spki := cert.Leaf.RawSubjectPublicKeyInfo
 
 	seen := map[int]int{}
-	for range samples {
+	for range sigSamples {
 		sig, err := certSignature(testAuthKey(t), spki)
 		if err != nil {
 			t.Fatalf("certSignature: %v", err)
@@ -339,58 +337,72 @@ func TestCertSignatureLengthDistribution(t *testing.T) {
 		seen[len(sig)]++
 	}
 
+	// Bands of about 7.5 standard deviations around 2000, 3984 and 2000: each
+	// fails a correct encoder with probability below 1e-13.
 	for _, want := range []struct {
 		n        int
 		lo, hi   int
 		expected string
 	}{
-		{70, samples / 8, samples / 2, "~1/4"},
-		{71, samples / 4, 3 * samples / 4, "~1/2"},
-		{72, samples / 8, samples / 2, "~1/4"},
+		{70, 1700, 2300, "~1/4"},
+		{71, 3650, 4350, "~1/2"},
+		{72, 1700, 2300, "~1/4"},
 	} {
 		got := seen[want.n]
 		if got < want.lo || got > want.hi {
 			t.Errorf("%d-byte signatures: %d of %d, want %s (%d..%d)",
-				want.n, got, samples, want.expected, want.lo, want.hi)
+				want.n, got, sigSamples, want.expected, want.lo, want.hi)
 		}
 	}
-	for _, problem := range sigLengthTailProblems(seen, samples) {
+	for _, problem := range sigLengthTailProblems(seen) {
 		t.Error(problem)
 	}
-	t.Logf("lengths over %d samples: %v", samples, seen)
+	t.Logf("lengths over %d samples: %v", sigSamples, seen)
 }
 
-// sigLengthTailProblems checks the lengths outside the 70..72 bulk.
+// The tail of the length distribution, below the 70..72 bulk.
 //
-// Nothing above 72 is possible: two 33-byte integers is the longest a P-256
-// signature gets. Below 70 there is no hard floor short of 8 bytes, the DER of
-// two one-byte integers. An integer drops to 31 bytes when its top nine bits
-// are zero, 1 in 512, and to 30 bytes at 1 in 131072, so 69 bytes turns up
-// about once in 256 signatures and 68 about once in 88000. A cut-off at 69
-// failed one run in 250. Measured on 2M signatures from crypto/ecdsa and 4M
-// from certSignature: 68 bytes 28 and 49 times, 69 bytes 3877 and 7629 times.
+// An integer is 33 bytes with probability 1/2, 32 bytes just under 1/2, 31
+// bytes when its top nine bits are zero (about 1/512) and 30 bytes at about
+// 1/131072. A signature is 6 bytes of DER framing plus both integers, which
+// gives 69 bytes about once in 514 signatures, 68 once in 88000, 67 once in
+// 17 million and 66 once in 3.5 billion. Measured on 2M signatures from
+// crypto/ecdsa and 4M from certSignature: 69 bytes 3877 and 7629 times, 68
+// bytes 28 and 49 times. The old floor of 69 failed one run in 250.
 //
-// What a real signer does not produce is many short signatures, so the tail is
-// bounded by its share: 1.6 expected in 400, and more than 1 in 32 is not
-// chance (Poisson tail below 1e-8).
-func sigLengthTailProblems(seen map[int]int, samples int) []string {
-	const shortest, longest = 8, 72
+// Over sigSamples = 8000 signatures, all probabilities binomial:
+//   - anything above 72 bytes is impossible;
+//   - anything below 66 bytes happens with probability 1.1e-8 per run;
+//   - signatures shorter than 70 bytes number 15.7 on average, and 45 or more
+//     happens with probability 1.1e-9. A regression that makes 1 signature in
+//     128 short (four times the real rate) trips that limit in 99% of runs, one
+//     at 1 in 256 in 1%.
+const (
+	sigSamples    = 8000
+	sigShortest   = 66
+	sigLongest    = 72
+	sigShortLimit = 44
+)
+
+// sigLengthTailProblems applies the tail limits above to a length histogram of
+// sigSamples signatures.
+func sigLengthTailProblems(seen map[int]int) []string {
 	var problems []string
 	short := 0
 	for n, count := range seen {
 		switch {
-		case n < shortest || n > longest:
+		case n < sigShortest || n > sigLongest:
 			problems = append(problems, fmt.Sprintf(
-				"%d signatures came out %d bytes, outside %d..%d, the range a P-256 signature occupies",
-				count, n, shortest, longest))
+				"%d signatures came out %d bytes, outside %d..%d; a P-256 signature lands there less than once in 10^11",
+				count, n, sigShortest, sigLongest))
 		case n < 70:
 			short += count
 		}
 	}
-	if short > samples/32 {
+	if short > sigShortLimit {
 		problems = append(problems, fmt.Sprintf(
-			"%d of %d signatures are shorter than 70 bytes, a real signer gives about 1 in 256",
-			short, samples))
+			"%d of %d signatures are shorter than 70 bytes, a real signer gives about 1 in 511 (%d at most here)",
+			short, sigSamples, sigShortLimit))
 	}
 	return problems
 }
@@ -400,23 +412,34 @@ func sigLengthTailProblems(seen map[int]int, samples int) []string {
 func TestSigLengthTailProblems(t *testing.T) {
 	t.Parallel()
 
+	bulk := func(short map[int]int) map[int]int {
+		seen := map[int]int{70: 2000, 72: 2000}
+		rest := sigSamples - 4000
+		for n, c := range short {
+			seen[n] += c
+			rest -= c
+		}
+		seen[71] += rest
+		return seen
+	}
 	tests := []struct {
 		name  string
 		seen  map[int]int
 		valid bool
 	}{
-		{"bulk only", map[int]int{70: 100, 71: 200, 72: 100}, true},
-		{"one 69", map[int]int{69: 1, 70: 100, 71: 199, 72: 100}, true},
-		{"one 68", map[int]int{68: 1, 70: 100, 71: 199, 72: 100}, true},
-		{"one 67", map[int]int{67: 1, 70: 100, 71: 199, 72: 100}, true},
-		{"short share at the limit", map[int]int{69: 12, 70: 100, 71: 188, 72: 100}, true},
-		{"too many short", map[int]int{69: 13, 70: 100, 71: 187, 72: 100}, false},
-		{"73 bytes", map[int]int{70: 100, 71: 199, 72: 100, 73: 1}, false},
-		{"7 bytes", map[int]int{7: 1, 70: 100, 71: 199, 72: 100}, false},
+		{"bulk only", bulk(nil), true},
+		{"one 69", bulk(map[int]int{69: 1}), true},
+		{"one 68", bulk(map[int]int{68: 1}), true},
+		{"one 66", bulk(map[int]int{66: 1}), true},
+		// Literal counts rather than sigShortLimit, so moving the limit fails here.
+		{"44 short", bulk(map[int]int{69: 42, 68: 1, 67: 1}), true},
+		{"45 short", bulk(map[int]int{69: 45}), false},
+		{"73 bytes", bulk(map[int]int{73: 1}), false},
+		{"65 bytes", bulk(map[int]int{65: 1}), false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			problems := sigLengthTailProblems(tt.seen, 400)
+			problems := sigLengthTailProblems(tt.seen)
 			if got := len(problems) == 0; got != tt.valid {
 				t.Fatalf("valid = %v, want %v: %v", got, tt.valid, problems)
 			}
