@@ -2344,6 +2344,17 @@ func runServerToTUN(stopCh chan struct{}, safeClose func(), tun *atomic.Pointer[
 			continue
 		}
 
+		// A length over the protocol ceiling is not a packet that is too big for
+		// this MTU, it is lost framing - or the server's reset signal for a
+		// session it no longer has. Checked before anything is allocated: the
+		// handler below reads the whole announced length into memory, and a
+		// garbage header of 0xffffffff was a 4 GiB allocation. VPNClient's read
+		// loop has always disconnected here; this relay now does the same.
+		if pktLen > maxFrameLen {
+			log.Debug("Frame length %d exceeds protocol max, disconnecting", pktLen)
+			return fmt.Sprintf("server_frame_over_ceiling: %d", pktLen)
+		}
+
 		tunDev := tun.Load()
 		if reason := handleOversizedPacket(tunDev, serverConn, remoteIP, pktLen); reason != "" {
 			if reason == "dropped" {
