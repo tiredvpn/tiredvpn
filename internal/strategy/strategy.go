@@ -2086,7 +2086,14 @@ func registerQUICStrategies(m *Manager, cfg DefaultManagerConfig, hasServer, has
 	// ports no server listens on.
 	port := derivedQUICPort(cfg)
 	if cfg.QUICPort != 0 && cfg.QUICPort != port {
-		log.Warn("-quic-port %d is ignored: QUIC dials the server's port %d, where its QUIC listener sits "+
+		// 443 and 8443 are the values the Android app and old connection
+		// strings send on every start without anyone choosing them; a warning
+		// in every log would be noise. Anything else was typed on purpose.
+		logf := log.Warn
+		if cfg.QUICPort == 443 || cfg.QUICPort == 8443 {
+			logf = log.Debug
+		}
+		logf("-quic-port %d is ignored: QUIC dials the server's port %d, where its QUIC listener sits "+
 			"unless the server runs with -quic-listen", cfg.QUICPort, port)
 	}
 

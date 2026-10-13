@@ -265,7 +265,7 @@ client:
     fallback: true              # -fallback (default true)
     quic:
       enabled: false            # -quic
-      port: 0                   # -quic-port (0 = don't pass, leave default 443)
+      port: 0                   # -quic-port: ignored by the client, QUIC dials the server port; kept for old values files
       sniFrag: false            # -quic-sni-frag
     ech:
       enabled: false            # -ech
