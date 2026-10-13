@@ -156,19 +156,27 @@ func TestVerifyServerAuth(t *testing.T) {
 	}
 }
 
+// testBucketStart is the first second of a 5-minute bucket. Its bucket number
+// is even, so a 10-minute bucket would start here too and could not pass the
+// edge check below by accident.
+var testBucketStart = time.Unix(1_800_000_000, 0)
+
+// TestAuthTokenTimestampWindow runs on a fixed clock. It used to sleep 100 ms
+// between two tokens on the real one and failed whenever the sleep crossed a
+// bucket edge, about once in 3000 runs.
 func TestAuthTokenTimestampWindow(t *testing.T) {
 	secret := []byte("test-secret")
 	var pubKey [32]byte
 	copy(pubKey[:], "test-pubkey-32-bytes-fixed-value")
 
-	token1 := generateAuthToken(secret, pubKey)
+	token := func(at time.Time) [32]byte { return generateAuthTokenAt(secret, pubKey, at, 0) }
+	end := testBucketStart.Add(300*time.Second - 50*time.Millisecond)
 
-	time.Sleep(100 * time.Millisecond)
-
-	token2 := generateAuthToken(secret, pubKey)
-
-	if !bytes.Equal(token1[:], token2[:]) {
-		t.Error("Tokens in same time window do not match")
+	if a, b := token(testBucketStart), token(end); !bytes.Equal(a[:], b[:]) {
+		t.Error("tokens from the first and the last moment of one bucket do not match")
+	}
+	if a, b := token(end), token(end.Add(100*time.Millisecond)); bytes.Equal(a[:], b[:]) {
+		t.Error("tokens on both sides of a bucket edge match")
 	}
 }
 
@@ -220,7 +228,7 @@ func TestHMACAuthTokenConsistency(t *testing.T) {
 
 	tokens := make([][32]byte, 5)
 	for i := range tokens {
-		tokens[i] = generateAuthToken(secret, pubKey)
+		tokens[i] = generateAuthTokenAt(secret, pubKey, testBucketStart, 0)
 	}
 
 	for i := 1; i < len(tokens); i++ {
@@ -235,8 +243,8 @@ func TestHMACAuthTokenConsistency(t *testing.T) {
 // bucket and for the immediately adjacent buckets (offset -1 and +1) must pass;
 // tokens two buckets away (offset -2 and +2) must be rejected.
 //
-// generateAuthTokenAtBucket is package-private but reachable from this in-package
-// test, so we mint tokens at precise offsets without mocking time.
+// generateAuthTokenAt and verifyClientAuthAt take the clock as an argument, so
+// both sides see the same bucket even if the real clock crosses an edge.
 func TestVerifyClientAuthGrace(t *testing.T) {
 	secret := []byte("grace-window-secret")
 	var pubKey [32]byte
@@ -256,8 +264,8 @@ func TestVerifyClientAuthGrace(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			token := generateAuthTokenAtBucket(secret, pubKey, tc.offset)
-			got := VerifyClientAuth(secret, pubKey, token)
+			token := generateAuthTokenAt(secret, pubKey, testBucketStart, tc.offset)
+			got := verifyClientAuthAt(secret, pubKey, token, testBucketStart)
 			if got != tc.want {
 				t.Errorf("VerifyClientAuth with bucketOffset=%d = %v, want %v", tc.offset, got, tc.want)
 			}
