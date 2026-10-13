@@ -150,3 +150,51 @@ func TestQUICProbeTargetsTheQUICPort(t *testing.T) {
 		t.Fatal("no probe datagram reached the QUIC port")
 	}
 }
+
+// quicGateVerdict wires a checker into a QUIC-enabled manager the way the
+// client does (SetConnectivityChecker after registration), runs the gate
+// against the pinned endpoint and waits for the UDP verdict.
+func quicGateVerdict(t *testing.T, quicAddr, pinnedAddr string) bool {
+	t.Helper()
+	m := NewDefaultManager(DefaultManagerConfig{
+		ServerAddr:  quicAddr,
+		Endpoints:   []endpoint.Endpoint{{Name: "a", V4: pinnedAddr}},
+		Secret:      []byte("0123456789abcdef0123456789abcdef"),
+		QUICEnabled: true,
+	})
+	c := NewConnectivityChecker(pinnedAddr, 2*time.Second, false)
+	m.SetConnectivityChecker(c)
+
+	if r := c.Check(t.Context()); !r.TCP {
+		t.Fatalf("TCP gate failed on %s: %+v", pinnedAddr, r)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for !c.LastResult().UDPKnown {
+		if time.Now().After(deadline) {
+			t.Fatal("UDP verdict never landed")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return c.LastResult().UDP
+}
+
+// TestUDPGateProbesTheQUICPort: the gate's UDP verdict decides whether QUIC
+// is tried, so it has to be about the port QUIC dials. It probed the pinned
+// TCP port instead, which answered for an unrelated socket. Checked both
+// ways: QUIC port open while the TCP port's UDP twin is closed, and the
+// reverse.
+func TestUDPGateProbesTheQUICPort(t *testing.T) {
+	// pinned: TCP open (the gate needs it), UDP twin closed.
+	pinnedClosed := udpGateServer(t, false)
+	quicOpen := newQUICPortListener(t)
+	if !quicGateVerdict(t, quicOpen.addr, pinnedClosed) {
+		t.Error("open QUIC port judged blocked: the probe went to the TCP port's closed UDP twin")
+	}
+
+	// pinned: TCP open, UDP twin open and silent; QUIC port closed.
+	pinnedOpen := udpGateServer(t, true)
+	quicClosed := quicClosedUDPAddr(t)
+	if quicGateVerdict(t, quicClosed, pinnedOpen) {
+		t.Error("closed QUIC port judged working: the probe went to the TCP port's open UDP twin")
+	}
+}

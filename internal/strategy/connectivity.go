@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -67,6 +68,11 @@ type ConnectivityChecker struct {
 	serverAddr string   // full addr host:port
 	altAddrs   []string // same server on its other address families, optional
 	lastResult ConnectivityResult
+
+	// udpPort is where QUIC dials, 0 when no QUIC strategy is registered. The
+	// UDP check probes the primary host on this port: its verdict gates QUIC,
+	// and the server's TCP port answered for a different socket entirely.
+	udpPort int
 }
 
 // NewConnectivityChecker creates a new connectivity checker
@@ -81,6 +87,28 @@ func NewConnectivityChecker(serverAddr string, timeout time.Duration, androidMod
 		auxGrace:    300 * time.Millisecond,
 		androidMode: androidMode,
 	}
+}
+
+// setUDPProbePort points the UDP check at QUIC's port. See udpPort.
+func (c *ConnectivityChecker) setUDPProbePort(port int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.udpPort = port
+}
+
+// udpProbeAddr is the address the UDP check probes for primary.
+func (c *ConnectivityChecker) udpProbeAddr(primary string) string {
+	c.mu.RLock()
+	port := c.udpPort
+	c.mu.RUnlock()
+	if port == 0 {
+		return primary
+	}
+	host, _, err := net.SplitHostPort(primary)
+	if err != nil {
+		return primary
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port))
 }
 
 // SetAltAddr registers the same server's address on the other family (the
@@ -182,7 +210,7 @@ func (c *ConnectivityChecker) Check(ctx context.Context) ConnectivityResult {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			udpOK.Store(c.checkUDP(ctx, primary) == nil)
+			udpOK.Store(c.checkUDP(ctx, c.udpProbeAddr(primary)) == nil)
 		}()
 		// ICMP check (optional, may fail without root).
 		// Skip on Android - os/exec causes SIGSYS due to seccomp.
