@@ -354,15 +354,74 @@ func TestCertSignatureLengthDistribution(t *testing.T) {
 				want.n, got, samples, want.expected, want.lo, want.hi)
 		}
 	}
-	// Anything outside 69..72 would mean the encoder is not doing what a DER
-	// encoder does. 69 is legitimate but rare — a leading zero byte in r or s,
-	// 1 in 256 each — so it is allowed rather than expected.
-	for n, count := range seen {
-		if n < 69 || n > 72 {
-			t.Errorf("%d signatures came out %d bytes, outside the range a P-256 signature occupies", count, n)
-		}
+	for _, problem := range sigLengthTailProblems(seen, samples) {
+		t.Error(problem)
 	}
 	t.Logf("lengths over %d samples: %v", samples, seen)
+}
+
+// sigLengthTailProblems checks the lengths outside the 70..72 bulk.
+//
+// Nothing above 72 is possible: two 33-byte integers is the longest a P-256
+// signature gets. Below 70 there is no hard floor short of 8 bytes, the DER of
+// two one-byte integers. An integer drops to 31 bytes when its top nine bits
+// are zero, 1 in 512, and to 30 bytes at 1 in 131072, so 69 bytes turns up
+// about once in 256 signatures and 68 about once in 88000. A cut-off at 69
+// failed one run in 250. Measured on 2M signatures from crypto/ecdsa and 4M
+// from certSignature: 68 bytes 28 and 49 times, 69 bytes 3877 and 7629 times.
+//
+// What a real signer does not produce is many short signatures, so the tail is
+// bounded by its share: 1.6 expected in 400, and more than 1 in 32 is not
+// chance (Poisson tail below 1e-8).
+func sigLengthTailProblems(seen map[int]int, samples int) []string {
+	const shortest, longest = 8, 72
+	var problems []string
+	short := 0
+	for n, count := range seen {
+		switch {
+		case n < shortest || n > longest:
+			problems = append(problems, fmt.Sprintf(
+				"%d signatures came out %d bytes, outside %d..%d, the range a P-256 signature occupies",
+				count, n, shortest, longest))
+		case n < 70:
+			short += count
+		}
+	}
+	if short > samples/32 {
+		problems = append(problems, fmt.Sprintf(
+			"%d of %d signatures are shorter than 70 bytes, a real signer gives about 1 in 256",
+			short, samples))
+	}
+	return problems
+}
+
+// TestSigLengthTailProblems pins the tail check on fixed inputs. 68 bytes is
+// what made TestCertSignatureLengthDistribution fail at random.
+func TestSigLengthTailProblems(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		seen  map[int]int
+		valid bool
+	}{
+		{"bulk only", map[int]int{70: 100, 71: 200, 72: 100}, true},
+		{"one 69", map[int]int{69: 1, 70: 100, 71: 199, 72: 100}, true},
+		{"one 68", map[int]int{68: 1, 70: 100, 71: 199, 72: 100}, true},
+		{"one 67", map[int]int{67: 1, 70: 100, 71: 199, 72: 100}, true},
+		{"short share at the limit", map[int]int{69: 12, 70: 100, 71: 188, 72: 100}, true},
+		{"too many short", map[int]int{69: 13, 70: 100, 71: 187, 72: 100}, false},
+		{"73 bytes", map[int]int{70: 100, 71: 199, 72: 100, 73: 1}, false},
+		{"7 bytes", map[int]int{7: 1, 70: 100, 71: 199, 72: 100}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			problems := sigLengthTailProblems(tt.seen, 400)
+			if got := len(problems) == 0; got != tt.valid {
+				t.Fatalf("valid = %v, want %v: %v", got, tt.valid, problems)
+			}
+		})
+	}
 }
 
 // TestCertsDifferOnlyInTheSignature is the observable property an inspector can
