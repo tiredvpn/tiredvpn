@@ -91,6 +91,19 @@ type ConnectivityChecker struct {
 	// udpDial opens the probe socket; nil means a plain net.Dialer. Tests use
 	// it to stand in for a host whose network is down.
 	udpDial func(ctx context.Context, network, addr string) (net.Conn, error)
+
+	// tcpDial opens the TCP gate's connections; nil means a plain net.Dialer.
+	// Tests use it for an address that times out instead of refusing.
+	tcpDial func(ctx context.Context, network, addr string) (net.Conn, error)
+
+	// icmpCheck stands in for checkICMP when set. Tests use it for a host
+	// whose 443 and 80 swallow the ICMP check's dials.
+	icmpCheck func(ctx context.Context, host string) error
+
+	// rttHost and rttMin are the path RTT the auto-mode QUIC budget scales
+	// with: the minimum TCP connect time to the host that answered the gate.
+	rttHost string
+	rttMin  time.Duration
 }
 
 // udpGateVerdict is what one UDP probe established. known is false when the
@@ -238,15 +251,73 @@ func (c *ConnectivityChecker) addrsToTry() []string {
 // checkTCPAny reports the address that answered as soon as any configured one
 // does, and returns the last error when none do.
 func (c *ConnectivityChecker) checkTCPAny(ctx context.Context) (string, error) {
+	addr, _, err := c.checkTCPAnyTimed(ctx)
+	return addr, err
+}
+
+// checkTCPAnyTimed is checkTCPAny that also reports how long the connect to
+// the answering address took. Only that one: the walk's total time also
+// held the timeouts of the dead addresses before it - three seconds for a
+// blocked IPv4 ahead of a live IPv6 - which is not anyone's RTT.
+func (c *ConnectivityChecker) checkTCPAnyTimed(ctx context.Context) (string, time.Duration, error) {
 	var lastErr error
 	for _, addr := range c.addrsToTry() {
+		start := time.Now()
 		err := c.checkTCP(ctx, addr)
 		if err == nil {
-			return addr, nil
+			rtt := time.Since(start)
+			c.notePathRTT(addr, rtt)
+			return addr, rtt, nil
 		}
 		lastErr = err
 	}
-	return "", lastErr
+	return "", 0, lastErr
+}
+
+// notePathRTT folds one TCP connect time into the per-host minimum. A single
+// connect also counts SYN retransmits (a lost SYN adds a second or more on a
+// lossy mobile link); the minimum over the samples so far is the path's RTT.
+func (c *ConnectivityChecker) notePathRTT(addr string, rtt time.Duration) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if host != c.rttHost || c.rttMin == 0 || rtt < c.rttMin {
+		if host != c.rttHost {
+			c.rttHost = host
+		}
+		c.rttMin = rtt
+	}
+}
+
+// pathRTT is the minimum TCP connect time measured to host, 0 when there is
+// none for it.
+func (c *ConnectivityChecker) pathRTT(host string) time.Duration {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if host != c.rttHost {
+		return 0
+	}
+	return c.rttMin
+}
+
+// resetPathRTT forgets the RTT, which belongs to the network just left.
+func (c *ConnectivityChecker) resetPathRTT() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.rttHost, c.rttMin = "", 0
+}
+
+// currentUDPVerdict is the cached verdict about the address the UDP check
+// would probe now. LastResult carries the last verdict of any address, which
+// after an endpoint switch is the previous server's.
+func (c *ConnectivityChecker) currentUDPVerdict() (ok, known bool) {
+	c.mu.RLock()
+	primary := c.serverAddr
+	c.mu.RUnlock()
+	return c.cachedUDPVerdict(c.udpProbeAddr(primary))
 }
 
 // Check performs TCP, UDP and ICMP connectivity checks
@@ -276,9 +347,7 @@ func (c *ConnectivityChecker) Check(ctx context.Context) ConnectivityResult {
 	var tcpLatency time.Duration
 	tcpDone := make(chan struct{})
 	go func() {
-		start := time.Now()
-		tcpAddr, tcpErr = c.checkTCPAny(ctx)
-		tcpLatency = time.Since(start)
+		tcpAddr, tcpLatency, tcpErr = c.checkTCPAnyTimed(ctx)
 		close(tcpDone)
 	}()
 
@@ -300,7 +369,13 @@ func (c *ConnectivityChecker) Check(ctx context.Context) ConnectivityResult {
 		// ICMP check (optional, may fail without root).
 		// Skip on Android - os/exec causes SIGSYS due to seccomp.
 		if !c.androidMode {
-			icmpOK.Store(c.checkICMP(ctx, host) == nil)
+			c.mu.RLock()
+			check := c.icmpCheck
+			c.mu.RUnlock()
+			if check == nil {
+				check = c.checkICMP
+			}
+			icmpOK.Store(check(ctx, host) == nil)
 		}
 	}()
 
@@ -376,13 +451,12 @@ func (c *ConnectivityChecker) Check(ctx context.Context) ConnectivityResult {
 func (c *ConnectivityChecker) checkTCPOnly(ctx context.Context) ConnectivityResult {
 	result := ConnectivityResult{CheckedAt: time.Now()}
 
-	start := time.Now()
-	addr, err := c.checkTCPAny(ctx)
+	addr, rtt, err := c.checkTCPAnyTimed(ctx)
 	result.TCP = err == nil
 	if err != nil {
 		result.Error = err
 	} else {
-		result.Latency = time.Since(start)
+		result.Latency = rtt
 		result.Addr = addr
 	}
 
@@ -417,8 +491,13 @@ func (c *ConnectivityChecker) cacheResult(result ConnectivityResult) {
 // A plain TCP dial is enough — the server speaks a custom protocol, so a TLS
 // handshake would always fail the connectivity check even when the port is up.
 func (c *ConnectivityChecker) checkTCP(ctx context.Context, addr string) error {
-	dialer := &net.Dialer{Timeout: c.timeout}
-	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	c.mu.RLock()
+	dial := c.tcpDial
+	c.mu.RUnlock()
+	if dial == nil {
+		dial = (&net.Dialer{Timeout: c.timeout}).DialContext
+	}
+	conn, err := dial(ctx, "tcp", addr)
 	if err != nil {
 		return fmt.Errorf("TCP connect failed: %w", err)
 	}
@@ -512,6 +591,12 @@ func (c *ConnectivityChecker) WaitForConnectivity(ctx context.Context, interval 
 	// First check immediately.
 	result := c.checkTCPOnly(ctx)
 	if result.TCP {
+		// Back before the wait began, but the Check that sent the caller here
+		// failed its TCP leg and voided the verdict: re-probe as the loop below
+		// does, or auto mode keeps QUIC deferred with nothing to lift it.
+		if !result.UDPKnown {
+			c.refreshUDPAsync()
+		}
 		return result
 	}
 

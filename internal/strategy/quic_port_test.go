@@ -261,7 +261,7 @@ func TestQUICClientConfigHandshakeIdle(t *testing.T) {
 		})
 		if checker {
 			c := NewConnectivityChecker("192.0.2.1:995", time.Second, false)
-			c.cacheResult(ConnectivityResult{TCP: true, Latency: rtt})
+			c.notePathRTT("192.0.2.1:995", rtt)
 			m.SetConnectivityChecker(c)
 		}
 		if forced {
@@ -272,7 +272,7 @@ func TestQUICClientConfigHandshakeIdle(t *testing.T) {
 		return quicRegisteredStrategy(t, m)
 	}
 
-	if got := quicWith(t, true, time.Second, true).quicClientConfig().HandshakeIdleTimeout; got != 0 {
+	if got := quicWith(t, true, time.Second, true).quicClientConfig("192.0.2.1:995").HandshakeIdleTimeout; got != 0 {
 		t.Errorf("forced: HandshakeIdleTimeout %v, want 0 (quic-go default)", got)
 	}
 	cases := []struct {
@@ -286,9 +286,12 @@ func TestQUICClientConfigHandshakeIdle(t *testing.T) {
 		{"1s RTT gets three", time.Second, true, 3 * time.Second},
 		{"slow path capped", 4 * time.Second, true, quicAutoHandshakeIdleCeil},
 	}
+	if got := quicWith(t, false, time.Second, true).quicClientConfig("198.51.100.7:995").HandshakeIdleTimeout; got != quicAutoHandshakeIdleFloor {
+		t.Errorf("auto toward a host with no RTT of its own: %v, want the floor", got)
+	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := quicWith(t, false, c.rtt, c.checker).quicClientConfig().HandshakeIdleTimeout; got != c.want {
+			if got := quicWith(t, false, c.rtt, c.checker).quicClientConfig("192.0.2.1:995").HandshakeIdleTimeout; got != c.want {
 				t.Errorf("auto at RTT %v: HandshakeIdleTimeout %v, want %v", c.rtt, got, c.want)
 			}
 		})

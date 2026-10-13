@@ -158,6 +158,9 @@ type Manager struct {
 	// udpGatePending marks an exclusion set by udpGateDeferQUIC rather than by
 	// a verdict: the next scan replaces it with the verdict once it has landed.
 	udpGatePending bool
+	// udpGateRefreshHook, when set, runs in udpGateRefresh between reading the
+	// verdict and taking the lock to apply it. Tests only.
+	udpGateRefreshHook func()
 
 	// routeReachable, when set, reports whether the host has a physical route
 	// (off the tunnel) to a candidate address's family, and whether that answer
@@ -330,10 +333,10 @@ func (m *Manager) udpGateDeferQUICLocked() {
 	m.udpGatePending = true
 }
 
-// quicGateRTT is the TCP connect time the connectivity gate last measured, 0
-// when there is none. Nil-safe: strategies built without a manager in tests
-// ask too.
-func (m *Manager) quicGateRTT() time.Duration {
+// quicGateRTT is the path RTT the connectivity gate measured to host (the
+// minimum TCP connect time to it), 0 when there is none. Nil-safe: strategies
+// built without a manager in tests ask too.
+func (m *Manager) quicGateRTT(host string) time.Duration {
 	if m == nil {
 		return 0
 	}
@@ -343,7 +346,7 @@ func (m *Manager) quicGateRTT() time.Duration {
 	if c == nil {
 		return 0
 	}
-	return c.LastResult().Latency
+	return c.pathRTT(host)
 }
 
 // udpGateRefresh replaces a deferral with the verdict that has landed since.
@@ -357,16 +360,22 @@ func (m *Manager) udpGateRefresh() {
 	if !pending || checker == nil {
 		return
 	}
-	r := checker.LastResult()
-	if !r.UDPKnown {
+	// The verdict about the address the gate stands on now, not LastResult's:
+	// after an endpoint switch that is the previous server's, and applying it
+	// kept QUIC off a working server for the rest of the session.
+	udpOK, known := checker.currentUDPVerdict()
+	if !known {
 		return
+	}
+	if m.udpGateRefreshHook != nil {
+		m.udpGateRefreshHook()
 	}
 	// Re-checked under the lock: a pre-flight running alongside may have
 	// applied a fresher verdict since pending was read, and the cached one
 	// must not undo it.
 	m.mu.Lock()
 	if m.udpGatePending {
-		m.applyUDPGateLocked(r.UDP)
+		m.applyUDPGateLocked(udpOK)
 	}
 	m.mu.Unlock()
 }
@@ -2789,6 +2798,7 @@ func (m *Manager) ResetForNetworkChange() {
 	// a cold start: forced keeps it, auto lets it sit out the scans.
 	if m.connectivityChecker != nil {
 		m.connectivityChecker.invalidateUDPVerdict()
+		m.connectivityChecker.resetPathRTT()
 		m.connectivityChecker.refreshUDPAsync()
 	}
 	if m.forced {
