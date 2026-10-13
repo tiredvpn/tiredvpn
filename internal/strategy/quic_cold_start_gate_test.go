@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
 	"slices"
@@ -534,5 +535,193 @@ func TestUDPGateHostUnreachableIsNoVerdict(t *testing.T) {
 	conn.Close()
 	if strat.ID() != "quic_salamander" {
 		t.Fatalf("connected via %s, want quic_salamander", strat.ID())
+	}
+}
+
+// TestUDPGateRefreshUsesCurrentAddressVerdict (review round 2, minor 5): A
+// refused UDP, the client moved to B, whose probe was still in flight when
+// the pre-flight deferred QUIC. The refresh read LastResult - still A's
+// refusal - and applied it to B, keeping QUIC off a working server for the
+// rest of the session.
+func TestUDPGateRefreshUsesCurrentAddressVerdict(t *testing.T) {
+	a := udpGateServer(t, false)
+	b := udpGateServer(t, true)
+	m := NewManager()
+	m.Register(&mockStrategy{id: "quic_salamander", name: "QUIC Salamander", priority: 4, serverAddr: b})
+	m.Register(&mockStrategy{id: "confusion_0", priority: 10, serverAddr: b})
+	c := NewConnectivityChecker(a, 2*time.Second, false)
+	m.SetConnectivityChecker(c)
+	if r := c.Check(t.Context()); !r.UDPKnown || r.UDP {
+		t.Fatalf("A should be refused and known: %+v", r)
+	}
+	c.SetAddrs(b)
+	c.Check(t.Context())
+	m.udpGateDeferQUIC() // the pre-flight on B's unknown verdict
+	m.udpGateRefresh()   // the scan right after it
+	time.Sleep(800 * time.Millisecond)
+	m.udpGateRefresh() // B's own verdict has landed
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.excludeUDPStrategies {
+		t.Fatalf("QUIC excluded on B by A's verdict (pending=%v)", m.udpGatePending)
+	}
+}
+
+// udpGateSlowDeadDial makes dead time out after delay instead of refusing at
+// once - a blocked IPv4 in front of a live IPv6.
+func udpGateSlowDeadDial(dead string, delay time.Duration) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if addr == dead {
+			time.Sleep(delay)
+			return nil, &net.OpError{Op: "dial", Net: network, Err: os.ErrDeadlineExceeded}
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, addr)
+	}
+}
+
+// TestUDPGateRTTSkipsDeadAddresses (review round 2, minor 6): the RTT behind
+// the auto-mode QUIC budget was the time of the whole gate walk, dead
+// addresses' timeouts included. With a blocked first address the budget hit
+// its 5s ceiling and a dial into a silent drop cost ~10s again. It must come
+// from the connect to the address that answered.
+func TestUDPGateRTTSkipsDeadAddresses(t *testing.T) {
+	alive := udpGateServer(t, true)
+	_, port, _ := net.SplitHostPort(alive)
+	dead := net.JoinHostPort("127.0.0.2", port)
+	m := NewDefaultManager(DefaultManagerConfig{
+		ServerAddr:  alive,
+		Secret:      []byte("0123456789abcdef0123456789abcdef"),
+		QUICEnabled: true,
+	})
+	c := NewConnectivityChecker(dead, 3*time.Second, false)
+	c.tcpDial = udpGateSlowDeadDial(dead, time.Second)
+	m.SetConnectivityChecker(c)
+	c.SetAddrs(dead, alive)
+
+	if r := c.Check(t.Context()); r.Addr != alive {
+		t.Fatalf("gate answered by %q, want %s: %+v", r.Addr, alive, r)
+	}
+	q := quicRegisteredStrategy(t, m)
+	if got := q.quicClientConfig(q.quicDialAddr(t.Context())).HandshakeIdleTimeout; got != quicAutoHandshakeIdleFloor {
+		t.Fatalf("auto budget behind a dead first address: %v, want %v (the live address's RTT)", got, quicAutoHandshakeIdleFloor)
+	}
+}
+
+// TestUDPGateNetworkChangeForgetsRTT: the RTT belongs to the network the
+// client left; after Wi-Fi -> LTE the budget must not be sized by it.
+func TestUDPGateNetworkChangeForgetsRTT(t *testing.T) {
+	m := NewManager()
+	c := NewConnectivityChecker("192.0.2.1:995", time.Second, false)
+	m.SetConnectivityChecker(c)
+	c.notePathRTT("192.0.2.1:995", 2*time.Second)
+	m.ResetForNetworkChange()
+	if got := m.quicGateRTT("192.0.2.1"); got != 0 {
+		t.Fatalf("RTT %v survived the network change", got)
+	}
+}
+
+// TestUDPGateWaitImmediateSuccessReprobes (review round 2, minor 7): the
+// Check that sends a client into WaitForConnectivity voided the verdict; when
+// TCP is already back on the wait's first try, the verdict must be re-probed
+// there too, not only after a retry.
+func TestUDPGateWaitImmediateSuccessReprobes(t *testing.T) {
+	a := udpGateServer(t, true)
+	c := NewConnectivityChecker(a, 2*time.Second, false)
+	c.invalidateUDPVerdict() // as Check does when its TCP leg failed
+	if r := c.WaitForConnectivity(t.Context(), 100*time.Millisecond); !r.TCP {
+		t.Fatal("TCP should be up")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for !c.LastResult().UDPKnown {
+		if time.Now().After(deadline) {
+			t.Fatalf("no UDP re-probe after immediate recovery: %+v", c.LastResult())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestUDPGateRefreshYieldsToFresherVerdict: udpGateRefresh reads the cached
+// verdict, then takes the lock to apply it. A pre-flight that applies a
+// fresher verdict in between ends the deferral, and the refresh must not
+// overwrite it with the older one. The hook puts the pre-flight exactly there.
+func TestUDPGateRefreshYieldsToFresherVerdict(t *testing.T) {
+	addr := udpGateServer(t, true)
+	m := NewManager()
+	c := NewConnectivityChecker(addr, 2*time.Second, false)
+	m.SetConnectivityChecker(c)
+	c.storeUDPVerdict(c.udpProbeAddr(addr), time.Now(), udpGateVerdict{known: true}) // cached: refused
+	m.udpGateDeferQUIC()
+	m.udpGateRefreshHook = func() { m.applyUDPGate(true) } // fresher: works
+
+	m.udpGateRefresh()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.excludeUDPStrategies {
+		t.Fatal("refresh overwrote a fresher verdict with the cached refusal")
+	}
+}
+
+// TestUDPGateVerdictNotHeldByICMP: the ICMP check dials 443 and 80 with a
+// 700ms timeout each, and only UDP gates anything. A refusal that arrives at
+// once must reach the result inside the grace even when the ICMP check is
+// still waiting on a host that swallows those dials.
+func TestUDPGateVerdictNotHeldByICMP(t *testing.T) {
+	addr := udpGateServer(t, false) // UDP refused at once
+	c := NewConnectivityChecker(addr, 2*time.Second, false)
+	c.icmpCheck = func(ctx context.Context, _ string) error {
+		select {
+		case <-time.After(2 * time.Second):
+		case <-ctx.Done():
+		}
+		return errors.New("swallowed")
+	}
+
+	start := time.Now()
+	r := c.Check(t.Context())
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("Check waited %v on the ICMP check", took)
+	}
+	if !r.UDPKnown || r.UDP {
+		t.Fatalf("refused UDP not in the result: %+v", r)
+	}
+}
+
+// TestUDPGateNetworkChangeReleasesForcedQUIC: a forced QUIC client whose old
+// network refused UDP must get QUIC back after a network change, or it has
+// no strategy at all.
+func TestUDPGateNetworkChangeReleasesForcedQUIC(t *testing.T) {
+	addr := udpGateServer(t, true)
+	m := udpGateForcedQUICManager(t, addr)
+	m.applyUDPGate(false) // the old network refused
+	m.ResetForNetworkChange()
+
+	conn, strat, err := m.ConnectExcluding(t.Context(), addr, nil)
+	if err != nil {
+		t.Fatalf("forced QUIC after a network change: %v", err)
+	}
+	conn.Close()
+	if strat.ID() != "quic_salamander" {
+		t.Fatalf("connected via %s, want quic_salamander", strat.ID())
+	}
+}
+
+// TestUDPGatePathRTTIsTheMinimum: one TCP connect also counts SYN
+// retransmits, a second or more on a lossy mobile link. The budget scales
+// with the minimum seen for the host, and a new host starts over.
+func TestUDPGatePathRTTIsTheMinimum(t *testing.T) {
+	c := NewConnectivityChecker("192.0.2.1:995", time.Second, false)
+	for _, rtt := range []time.Duration{time.Second, 100 * time.Millisecond, 1200 * time.Millisecond} {
+		c.notePathRTT("192.0.2.1:995", rtt)
+	}
+	if got := c.pathRTT("192.0.2.1"); got != 100*time.Millisecond {
+		t.Fatalf("path RTT %v, want the 100ms minimum", got)
+	}
+	c.notePathRTT("198.51.100.7:995", 700*time.Millisecond)
+	if got := c.pathRTT("198.51.100.7"); got != 700*time.Millisecond {
+		t.Fatalf("new host's RTT %v, want 700ms", got)
+	}
+	if got := c.pathRTT("192.0.2.1"); got != 0 {
+		t.Fatalf("old host still answers %v", got)
 	}
 }

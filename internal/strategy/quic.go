@@ -306,8 +306,8 @@ func quicAutoHandshakeIdle(rtt time.Duration) time.Duration {
 	return min(max(quicAutoHandshakeIdleRTTs*rtt, quicAutoHandshakeIdleFloor), quicAutoHandshakeIdleCeil)
 }
 
-// quicClientConfig is the quic-go configuration Connect dials with.
-func (s *QUICStrategy) quicClientConfig() *quic.Config {
+// quicClientConfig is the quic-go configuration Connect dials addr with.
+func (s *QUICStrategy) quicClientConfig(addr string) *quic.Config {
 	cfg := &quic.Config{
 		MaxIdleTimeout:        30 * time.Second,
 		KeepAlivePeriod:       10 * time.Second,
@@ -317,7 +317,8 @@ func (s *QUICStrategy) quicClientConfig() *quic.Config {
 		Allow0RTT: true,
 	}
 	if s.manager == nil || !s.manager.IsForced() {
-		cfg.HandshakeIdleTimeout = quicAutoHandshakeIdle(s.manager.quicGateRTT())
+		host, _, _ := net.SplitHostPort(addr)
+		cfg.HandshakeIdleTimeout = quicAutoHandshakeIdle(s.manager.quicGateRTT(host))
 	}
 	return cfg
 }
@@ -346,7 +347,7 @@ func (s *QUICStrategy) Connect(ctx context.Context, target string) (net.Conn, er
 	log.Debug("%s: Using server address %s", s.Name(), addr)
 
 	// Create QUIC config with evasion settings
-	quicConfig := s.quicClientConfig()
+	quicConfig := s.quicClientConfig(addr)
 
 	// TLS config - we'll use whitelisted SNI
 	tlsConfig := &tls.Config{
@@ -490,7 +491,11 @@ func (s *QUICStrategy) Connect(ctx context.Context, target string) (net.Conn, er
 		conn, err = quic.Dial(ctx, udpConn, udpAddr, tlsConfig, quicConfig)
 		if err != nil {
 			udpConn.Close()
-			return nil, fmt.Errorf("QUIC dial failed: %w", err)
+			// Plain QUIC without SNI fragmentation is only ever an explicit
+			// -strategy quic, and a default server swallows it in silence;
+			// say why here, where the failure is read, not only at startup.
+			return nil, fmt.Errorf("QUIC dial failed (plain QUIC only reaches a -quic-sni-reassembly server; "+
+				"a default server speaks Salamander): %w", err)
 		}
 	}
 
