@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -45,6 +46,13 @@ type icmpFakeNet struct {
 	// reply for the request's session sealed with the wrong key, ahead of
 	// everything else: one spoofed packet that must not end the handshake.
 	forgedFirst bool
+	// reflectAgainAfter, if set, delivers the kernel's reflection a second
+	// time that long after the first, as a network that duplicates packets does.
+	reflectAgainAfter time.Duration
+	// cancelOnRead, if set, is called when the first packet is read, and the
+	// read then waits for the context's AfterFunc before returning it: the
+	// context ends between ReadFrom and whatever the caller does next.
+	cancelOnRead context.CancelFunc
 
 	in     chan icmpFakePacket
 	closed chan struct{}
@@ -90,6 +98,14 @@ func (f *icmpFakeNet) ReadFrom(b []byte) (int, net.Addr, error) {
 		}
 		select {
 		case p := <-f.in:
+			f.mu.Lock()
+			cancel := f.cancelOnRead
+			f.cancelOnRead = nil
+			f.mu.Unlock()
+			if cancel != nil {
+				cancel()
+				time.Sleep(50 * time.Millisecond)
+			}
 			return copy(b, p.data), p.from, nil
 		case <-f.closed:
 			return 0, nil, net.ErrClosed
@@ -132,10 +148,14 @@ func (f *icmpFakeNet) WriteTo(b []byte, addr net.Addr) (int, error) {
 		})
 	}
 	if f.kernelEcho {
-		f.deliver(&icmp.Message{
+		reflection := &icmp.Message{
 			Type: ipv4.ICMPTypeEchoReply,
 			Body: &icmp.Echo{ID: echo.ID, Seq: echo.Seq, Data: bytes.Clone(echo.Data)},
-		})
+		}
+		f.deliver(reflection)
+		if f.reflectAgainAfter > 0 {
+			time.AfterFunc(f.reflectAgainAfter, func() { f.deliver(reflection) })
+		}
 	}
 	f.serve(echo)
 	return len(b), nil
@@ -600,8 +620,8 @@ func TestICMPHandshakeReportsPingOnlyHost(t *testing.T) {
 		conn.Close()
 		t.Fatal("Connect succeeded on kernel echoes alone")
 	}
-	if !errors.Is(err, errICMPNoTunnelServer) {
-		t.Fatalf("err = %v, want errICMPNoTunnelServer", err)
+	if !errors.Is(err, errICMPNoTunnelReply) {
+		t.Fatalf("err = %v, want errICMPNoTunnelReply", err)
 	}
 	if isTimeoutError(err) {
 		t.Fatalf("err = %v is classified as a timeout; the host answered", err)
@@ -772,5 +792,222 @@ func TestICMPSendLoopFillsPacketsAfterACut(t *testing.T) {
 	}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("stream carried %d bytes, want the %d written, in order", len(got), len(want))
+	}
+}
+
+// icmpShortGrace shortens the wait after the kernel's reflection for a test.
+func icmpShortGrace(t *testing.T, d time.Duration) {
+	t.Helper()
+	orig := icmpTunnelReplyGrace
+	icmpTunnelReplyGrace = d
+	t.Cleanup(func() { icmpTunnelReplyGrace = orig })
+}
+
+// The ping-only verdict is about the server host. A copy of our init coming
+// back from some other address says nothing about it; with the server silent
+// the result must stay a timeout.
+func TestICMPForeignReflectionDoesNotCountAsServer(t *testing.T) {
+	icmpShortGrace(t, 200*time.Millisecond)
+	secret := []byte("icmp-foreign-reflection-secret")
+	fake := newICMPFakeNet(secret, false)
+	fake.noServer = true
+	fake.foreignFirst = true
+	ctx, cancel := context.WithTimeout(t.Context(), 600*time.Millisecond)
+	defer cancel()
+	conn, _, err := icmpDial(t, ctx, secret, fake, 5*time.Second)
+	if err == nil {
+		conn.Close()
+		t.Fatal("Connect succeeded with no server")
+	}
+	if errors.Is(err, errICMPNoTunnelReply) || !isTimeoutError(err) {
+		t.Fatalf("err = %v, want a timeout: only another host echoed the init", err)
+	}
+}
+
+// Cancelling while the handshake waits out the window after the reflection
+// is a cancellation, not a ping-only host.
+func TestICMPHandshakeCancelInsideReflectionWindow(t *testing.T) {
+	icmpShortGrace(t, 2*time.Second)
+	secret := []byte("icmp-window-cancel-secret")
+	fake := newICMPFakeNet(secret, true)
+	fake.noServer = true
+	ctx, cancel := context.WithCancel(t.Context())
+	time.AfterFunc(200*time.Millisecond, cancel)
+	conn, elapsed, err := icmpDial(t, ctx, secret, fake, 5*time.Second)
+	if err == nil {
+		conn.Close()
+		t.Fatal("Connect succeeded with no server")
+	}
+	if !errors.Is(err, context.Canceled) || errors.Is(err, errICMPNoTunnelReply) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("Connect returned %v after a cancel at 200ms", elapsed)
+	}
+}
+
+// The window starts at the first reflection. A duplicate of it arriving later
+// must not restart the wait.
+func TestICMPHandshakeWindowStartsAtFirstReflection(t *testing.T) {
+	icmpShortGrace(t, 400*time.Millisecond)
+	secret := []byte("icmp-dup-reflection-secret")
+	fake := newICMPFakeNet(secret, true)
+	fake.noServer = true
+	fake.reflectAgainAfter = 300 * time.Millisecond
+	conn, elapsed, err := icmpDial(t, t.Context(), secret, fake, 5*time.Second)
+	if err == nil {
+		conn.Close()
+		t.Fatal("Connect succeeded with no server")
+	}
+	if !errors.Is(err, errICMPNoTunnelReply) {
+		t.Fatalf("err = %v, want errICMPNoTunnelReply", err)
+	}
+	if elapsed > 600*time.Millisecond {
+		t.Fatalf("Connect took %v, want about the 400ms window from the first reflection", elapsed)
+	}
+}
+
+// A queued write that exactly fills what a cut tail leaves of the packet must
+// not leave an empty remainder behind: that would send a request with no data
+// and spend a rate-limited slot on it.
+func TestICMPSendLoopExactFillLeavesNoEmptyPacket(t *testing.T) {
+	secret := []byte("icmp-exact-fill-secret")
+	fake := newICMPFakeNet(secret, false)
+	c := icmpSendConn(t, fake, secret, 1000)
+	const pathMTU = 1300
+	c.pathMTU = func() int { return pathMTU }
+	limit := pathMTU - icmpPacketOverhead
+
+	first := bytes.Repeat([]byte{1}, limit+10)  // cut: limit, then a 10-byte tail
+	second := bytes.Repeat([]byte{2}, limit-10) // fills the tail's packet exactly
+	for _, w := range [][]byte{first, second} {
+		if _, err := c.Write(w); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+	go c.sendLoop()
+
+	icmpWaitFrames(t, fake, 2)
+	time.Sleep(50 * time.Millisecond) // let a third packet show up if there is one
+	got := fake.frames()
+	if len(got) != 2 {
+		sizes := make([]int, len(got))
+		for i, f := range got {
+			sizes[i] = len(f)
+		}
+		t.Fatalf("sent %d packets with %v bytes of data, want 2 full ones", len(got), sizes)
+	}
+}
+
+// The path can narrow during a session (Fragmentation Needed). Packets after
+// that must follow the new MTU, not the one seen when the conn started.
+func TestICMPSendLoopFollowsPathMTUChange(t *testing.T) {
+	secret := []byte("icmp-pmtu-change-secret")
+	fake := newICMPFakeNet(secret, false)
+	c := icmpSendConn(t, fake, secret, 1000)
+	var calls atomic.Int32
+	c.pathMTU = func() int {
+		if calls.Add(1) == 1 {
+			return 1500
+		}
+		return 1300
+	}
+
+	var want []byte
+	for i := range 4 {
+		frame := bytes.Repeat([]byte{byte(i + 1)}, 4+1280)
+		if _, err := c.Write(frame); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		want = append(want, frame...)
+	}
+	go c.sendLoop()
+
+	deadline := time.Now().Add(5 * time.Second)
+	var got []byte
+	for len(got) < len(want) && time.Now().Before(deadline) {
+		got = bytes.Join(fake.frames(), nil)
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("stream carried %d bytes, want the %d written, in order", len(got), len(want))
+	}
+	sent := fake.sends()
+	for i, s := range sent[1:] {
+		if s.ipLen > 1300 {
+			t.Fatalf("request %d is %d bytes after the path narrowed to 1300", i+1, s.ipLen)
+		}
+	}
+}
+
+// The same through Connect: the conn it builds has to ask the kernel for the
+// path MTU again for later packets, not keep the answer from the start.
+func TestICMPConnectRereadsPathMTU(t *testing.T) {
+	var calls atomic.Int32
+	orig := icmpPathMTU
+	icmpPathMTU = func(net.IP) int {
+		if calls.Add(1) == 1 {
+			return 1500
+		}
+		return 1300
+	}
+	t.Cleanup(func() { icmpPathMTU = orig })
+
+	secret := []byte("icmp-connect-pmtu-secret")
+	fake := newICMPFakeNet(secret, false)
+	conn := icmpConnect(t, secret, fake)
+	for i := range 3 {
+		if _, err := conn.Write(bytes.Repeat([]byte{byte(i + 1)}, 4+1280)); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+	icmpWaitFrames(t, fake, 3)
+	sent := fake.sends() // [0] is the handshake init
+	for i, s := range sent[2:] {
+		if s.ipLen > 1300 {
+			t.Fatalf("data request %d is %d bytes after the path narrowed to 1300", i+2, s.ipLen)
+		}
+	}
+}
+
+// A Connect deadline shorter than the window after the reflection ends the
+// wait at the deadline.
+func TestICMPHandshakeWindowEndsAtDeadline(t *testing.T) {
+	icmpShortGrace(t, 3*time.Second)
+	secret := []byte("icmp-window-deadline-secret")
+	fake := newICMPFakeNet(secret, true)
+	fake.noServer = true
+	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer cancel()
+	conn, elapsed, err := icmpDial(t, ctx, secret, fake, 5*time.Second)
+	if err == nil {
+		conn.Close()
+		t.Fatal("Connect succeeded with no server")
+	}
+	if elapsed > time.Second {
+		t.Fatalf("Connect took %v with a 300ms deadline", elapsed)
+	}
+}
+
+// The context can end while the handshake is between ReadFrom returning the
+// reflection and arming the window. The AfterFunc has moved the deadline into
+// the past by then; arming the window must not move it out again.
+func TestICMPHandshakeContextEndingAtTheReflection(t *testing.T) {
+	icmpShortGrace(t, 3*time.Second)
+	secret := []byte("icmp-window-race-secret")
+	fake := newICMPFakeNet(secret, true)
+	fake.noServer = true
+	ctx, cancel := context.WithCancel(t.Context())
+	fake.cancelOnRead = cancel
+	conn, elapsed, err := icmpDial(t, ctx, secret, fake, 5*time.Second)
+	if err == nil {
+		conn.Close()
+		t.Fatal("Connect succeeded with no server")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("Connect took %v after the context ended at the first read", elapsed)
 	}
 }

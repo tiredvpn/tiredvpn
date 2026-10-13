@@ -266,7 +266,7 @@ func (s *ICMPTunnelStrategy) Connect(ctx context.Context, target string) (net.Co
 		recvQueue:  make(chan []byte, 256),
 		done:       make(chan struct{}),
 		rateLimit:  s.rateLimit,
-		pathMTU:    icmpCachedRouteMTU(serverIP.IP),
+		pathMTU:    func() int { return icmpPathMTU(serverIP.IP) },
 	}
 
 	// Perform handshake
@@ -298,6 +298,10 @@ var icmpListenPacket = func(network, address string) (net.PacketConn, error) {
 	return conn, nil
 }
 
+// icmpPathMTU asks the kernel for the MTU towards a server; a variable so
+// tests can make the path narrow during a session.
+var icmpPathMTU = icmpRouteMTU
+
 // icmpTunnelConn implements net.Conn over ICMP
 type icmpTunnelConn struct {
 	icmpConn   net.PacketConn
@@ -323,7 +327,10 @@ type icmpTunnelConn struct {
 	closed atomic.Bool
 
 	// pathMTU reports the MTU towards the server, 0 if unknown. Packets are
-	// sized to it so the kernel never has to fragment them.
+	// sized to it so the kernel never has to fragment them. It is asked for
+	// every packet: a path MTU learned from Fragmentation Needed applies from
+	// the next packet on, and the query costs a few syscalls at a rate of at
+	// most 10 packets a second.
 	pathMTU func() int
 
 	// Rate limiting (stealth mode)
@@ -390,8 +397,8 @@ func (c *icmpTunnelConn) handshake(ctx context.Context) error {
 				return fmt.Errorf("handshake aborted: %w", cause)
 			}
 			if !reflectedAt.IsZero() {
-				return fmt.Errorf("%w: kernel answered the init, no tunnel server reply in %v (server without -enable-icmp, or a different secret)",
-					errICMPNoTunnelServer, time.Since(reflectedAt).Round(time.Millisecond))
+				return fmt.Errorf("%w within %v of the server kernel's echo of the init (possible causes: no ICMP tunnel server, a different secret, or tunnel replies dropped on the path)",
+					errICMPNoTunnelReply, time.Since(reflectedAt).Round(time.Millisecond))
 			}
 			if rejected != nil {
 				return fmt.Errorf("receive ack: no valid reply from the tunnel server: %w (last rejected packet: %v)", err, rejected)
@@ -404,9 +411,13 @@ func (c *icmpTunnelConn) handshake(ctx context.Context) error {
 		if icmpIsReflectionOf(reply[:n], initData) {
 			if reflectedAt.IsZero() {
 				reflectedAt = time.Now()
-				graceEnd := reflectedAt.Add(icmpTunnelReplyGrace)
-				if deadline.IsZero() || graceEnd.Before(deadline) {
-					c.icmpConn.SetReadDeadline(graceEnd)
+				// A Connect deadline earlier than the window still wins: the
+				// AfterFunc above moves the read deadline into the past when
+				// the context ends. If it ended between ReadFrom and this
+				// line, the AfterFunc has run already; redo its work.
+				c.icmpConn.SetReadDeadline(reflectedAt.Add(icmpTunnelReplyGrace))
+				if ctx.Err() != nil {
+					c.icmpConn.SetReadDeadline(time.Unix(1, 0))
 				}
 				log.Debug("ICMP Tunnel: Handshake: server kernel reflected the init, waiting %v for the tunnel server", icmpTunnelReplyGrace)
 			}
@@ -424,10 +435,12 @@ func (c *icmpTunnelConn) handshake(ctx context.Context) error {
 	return nil
 }
 
-// errICMPNoTunnelServer reports a server host that answers ping but runs no
-// ICMP tunnel server for us. Its text avoids "timeout" on purpose: the scan
-// counts timeouts as silence, and this host is talking.
-var errICMPNoTunnelServer = errors.New("host answers ping but no ICMP tunnel server replied")
+// errICMPNoTunnelReply reports a server host whose kernel echoed the init
+// while no tunnel reply reached us. The client cannot tell why: no tunnel
+// server, another secret, or replies cut on the way (they differ from the
+// kernel's in the DF bit, for one). Its text avoids "timeout" on purpose: the
+// scan counts timeouts as silence, and this host is talking.
+var errICMPNoTunnelReply = errors.New("host answers ping but no ICMP tunnel reply arrived")
 
 // icmpTunnelReplyGrace is how long the handshake waits for the tunnel server
 // after the server kernel's reflection of the init arrived. The tunnel reply
@@ -659,26 +672,6 @@ func (c *icmpTunnelConn) packetPayloadLimit() int {
 		}
 	}
 	return limit
-}
-
-// icmpCachedRouteMTU returns a pathMTU func that asks the kernel at most once
-// a second: the path MTU it learns from Fragmentation Needed can change
-// during a session, but not per packet.
-func icmpCachedRouteMTU(ip net.IP) func() int {
-	var (
-		mu      sync.Mutex
-		checked time.Time
-		mtu     int
-	)
-	return func() int {
-		mu.Lock()
-		defer mu.Unlock()
-		if time.Since(checked) >= time.Second {
-			mtu = icmpRouteMTU(ip)
-			checked = time.Now()
-		}
-		return mtu
-	}
 }
 
 // coalesceQueued appends writes already waiting in sendQueue to data, as many
