@@ -195,8 +195,9 @@ func (s *QUICStrategy) RequiresServer() bool {
 
 // Probe tests if QUIC can reach the server
 func (s *QUICStrategy) Probe(ctx context.Context, target string) error {
-	// Get server address (IPv6/IPv4 with automatic fallback)
-	addr := s.manager.GetServerAddr(ctx)
+	// The port QUIC will really use, not the TCP one: probing the TCP port
+	// said nothing about a QUIC listener elsewhere.
+	addr := s.quicDialAddr(ctx)
 	log.Debug("QUIC Probe: Using server address: %s", addr)
 
 	// Use "udp" (not "udp4") to support both IPv4 and IPv6
@@ -217,21 +218,20 @@ func (s *QUICStrategy) Probe(ctx context.Context, target string) error {
 		return fmt.Errorf("probe write failed: %w", err)
 	}
 
-	// We don't expect a response (server might not understand our probe)
-	// Success = no ICMP unreachable within timeout
-	// Use short timeout - ICMP unreachable comes back quickly if port is blocked
+	// We don't expect a response (server might not understand our probe).
+	// The one answer that means something is an ICMP unreachable, which the
+	// connected socket reports as a read error well inside the deadline. That
+	// error used to fall through to "return nil", so a closed or rejected port
+	// probed exactly like a working one.
 	conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 	buf := make([]byte, 100)
-	_, err = conn.Read(buf)
-	if err != nil {
-		// Timeout is OK - server just didn't respond to probe
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			return nil // Success - no blocking detected
+	if _, err = conn.Read(buf); err != nil {
+		if netErr, ok := errors.AsType[net.Error](err); ok && netErr.Timeout() {
+			return nil // silence: nothing refused the probe
 		}
-		// ICMP unreachable would be immediate error
+		return fmt.Errorf("QUIC probe to %s refused: %w", addr, err)
 	}
-
-	return nil
+	return nil // something answered
 }
 
 // quicProbeLen is the datagram size of the reachability probe. RFC 9000 §14.1

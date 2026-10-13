@@ -86,3 +86,67 @@ func TestQUICDialPortIsTheServerPort(t *testing.T) {
 		}
 	}
 }
+
+// quicProbeVerdict runs the manager's ProbeAll - the call site that feeds
+// probe results into confidence - for a forced quic_salamander client whose
+// -server port is serverAddr and whose pinned endpoint is pinnedAddr.
+func quicProbeVerdict(t *testing.T, serverAddr, pinnedAddr string) Result {
+	t.Helper()
+	m := NewDefaultManager(DefaultManagerConfig{
+		ServerAddr:  serverAddr,
+		Endpoints:   []endpoint.Endpoint{{Name: "a", V4: pinnedAddr}},
+		Secret:      []byte("0123456789abcdef0123456789abcdef"),
+		QUICEnabled: true,
+	})
+	if err := m.ForceStrategy("quic_salamander"); err != nil {
+		t.Fatalf("force: %v", err)
+	}
+	res := m.ProbeAll(t.Context(), pinnedAddr)
+	if len(res) != 1 {
+		t.Fatalf("want one probe result, got %d", len(res))
+	}
+	return res[0]
+}
+
+// quicClosedUDPAddr returns a loopback address with nothing on its UDP port,
+// so a datagram to it draws an ICMP port unreachable.
+func quicClosedUDPAddr(t *testing.T) string {
+	t.Helper()
+	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen udp: %v", err)
+	}
+	addr := pc.LocalAddr().String()
+	pc.Close()
+	return addr
+}
+
+// TestQUICProbeReportsRefusal: the probe's only meaningful answer is an ICMP
+// unreachable, and Probe swallowed it, so a closed QUIC port probed as
+// available. It must fail there and pass where the port is open and silent.
+func TestQUICProbeReportsRefusal(t *testing.T) {
+	closed := quicClosedUDPAddr(t)
+	if r := quicProbeVerdict(t, closed, closed); r.Success {
+		t.Fatal("probe of a closed UDP port reported success")
+	}
+
+	open := newQUICPortListener(t)
+	if r := quicProbeVerdict(t, open.addr, open.addr); !r.Success {
+		t.Fatalf("probe of an open, silent UDP port failed: %v", r.Error)
+	}
+}
+
+// TestQUICProbeTargetsTheQUICPort: with the pinned endpoint's port closed and
+// the -server port open, the probe must look where Connect will dial, not at
+// the pinned TCP address.
+func TestQUICProbeTargetsTheQUICPort(t *testing.T) {
+	server := newQUICPortListener(t)
+	pinned := quicClosedUDPAddr(t)
+	if r := quicProbeVerdict(t, server.addr, pinned); !r.Success {
+		t.Fatalf("probe went to the pinned port instead of the QUIC port: %v", r.Error)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if server.received() == 0 {
+		t.Fatal("no probe datagram reached the QUIC port")
+	}
+}
