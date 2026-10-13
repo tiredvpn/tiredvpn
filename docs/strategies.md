@@ -16,7 +16,7 @@ Sorted by priority. Lower priority = tried earlier.
 |----|------|-----------|---------:|-----------------|
 | `quic_salamander` | QUIC Salamander | QUIC/UDP | 4 | `-quic` and not `-quic-sni-frag` |
 | `reality` | REALITY Protocol | TLS/TCP | 5 | always |
-| `quic` | QUIC Tunnel | QUIC/UDP | 5 | `-quic` |
+| `quic` | QUIC Tunnel | QUIC/UDP | 5 | `-quic -quic-sni-frag`, or `-quic -strategy quic` |
 | `http_polling` | HTTP Polling (meek-style) | HTTP/1.1 | 6 | always |
 | `seqovl` | Seqovl | TLS/TCP | 7 | always |
 | `http2_stego` | HTTP/2 Steganography | HTTP/2 | 7 | always |
@@ -138,12 +138,15 @@ support fails REALITY auth on that strategy and falls back.
 
 ### QUIC — `quic`, `quic_salamander`
 
-Both need `-quic`. `quic_salamander` pads QUIC Initial packets
-([Salamander](https://arxiv.org/abs/2407.02996)) to remove the statistical
-fingerprint DPI uses to spot QUIC. `-quic-sni-frag` fragments the SNI across
-CRYPTO frames — it applies to the plain `quic` strategy, and when it is on
-`quic_salamander` is **not registered at all** (the two are alternatives, not
-layers).
+Both need `-quic`, and a client registers one of them, matching the one
+dialect the server's QUIC listener speaks. `quic_salamander` pads QUIC Initial
+packets ([Salamander](https://arxiv.org/abs/2407.02996)) to remove the
+statistical fingerprint DPI uses to spot QUIC; it is what a default server
+speaks. `-quic-sni-frag` fragments the SNI across CRYPTO frames and registers
+plain `quic` instead, for a server running `-quic-sni-reassembly`, which speaks
+unwrapped QUIC to any client. Plain QUIC without fragmentation is not
+registered in auto mode, since a default server only drops it; `-strategy quic`
+asks for it by name and gets it, for a reassembly server.
 
 Both variants dial UDP on the port of `-server` (then the first endpoint,
 then 443): the server opens its QUIC listener on its `-listen` address unless it
