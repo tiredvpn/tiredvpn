@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -194,6 +195,7 @@ func TestPollingTUNDownlinkBoundedDropsWholeFrames(t *testing.T) {
 	}
 	sess := newPollingSession("fxpolltundown000")
 	defer sess.Close()
+	droppedBefore := pollingManager.tunDropped.Load()
 	go runPollingTUNMode(sess, []byte{10, 99, 0, 9, 0x05, 0x00, 0x03}, srvCtx, testLogger(t))
 
 	var writer *ClientWriter
@@ -250,6 +252,15 @@ func TestPollingTUNDownlinkBoundedDropsWholeFrames(t *testing.T) {
 		next++
 		frames++
 		stream = stream[4+n:]
+	}
+	// The operator sees every dropped frame on /metrics.
+	if got := pollingManager.tunDropped.Load() - droppedBefore; got != uint64(packets-frames) {
+		t.Fatalf("drop counter moved by %d, %d frames were dropped", got, packets-frames)
+	}
+	var metrics bytes.Buffer
+	writePollingMetrics(&metrics)
+	if want := fmt.Sprintf("tiredvpn_polling_tun_dropped_total %d\n", pollingManager.tunDropped.Load()); !strings.Contains(metrics.String(), want) {
+		t.Fatalf("metrics do not report the drops, want %q in:\n%s", want, metrics.String())
 	}
 	if frames == 0 || frames >= packets {
 		t.Fatalf("client got %d of %d frames: expected the head of the burst, with the tail dropped", frames, packets)

@@ -202,14 +202,20 @@ func (r *pollingRecorder) SetWriteDeadline(time.Time) error { return nil }
 // client polls at least every pollIdleMax (4s, +25% jitter) and gives a session
 // up itself after 20s without a successful poll, so a session silent for 90s
 // has no client left; it used to be kept for five minutes, long enough for
-// dead sessions to fill the ceiling. A session polled a few seconds ago stays.
+// dead sessions to fill the ceiling.
+//
+// The other side of the window: a session silent for 50s must stay. A TUN
+// client lets its session go at the latest ~50s after its last successful poll
+// (20s health grace plus the relay's 30s read timeout), and polls that fail on
+// the way never reach the server to refresh the clock. A timeout under that
+// tears down sessions whose client is still waiting out a network blip.
 func TestPollingAbandonedSessionReleasedInTime(t *testing.T) {
 	withPollingLimits(t, 0, 0)
 	now := time.Now()
 	dead := newPollingSession("fxcap-dead-00000")
 	dead.touch(now.Add(-90 * time.Second))
 	live := newPollingSession("fxcap-live-00000")
-	live.touch(now.Add(-5 * time.Second))
+	live.touch(now.Add(-50 * time.Second))
 	// Closed but still polled: nothing relays for it any more.
 	closedRecent := newPollingSession("fxcap-closed-000")
 	closedRecent.touch(now)
@@ -229,7 +235,7 @@ func TestPollingAbandonedSessionReleasedInTime(t *testing.T) {
 		t.Fatal("the swept session was not closed, its relay keeps running")
 	}
 	if pollingManager.Get(live.ID) == nil {
-		t.Fatal("a session polled 5s ago was swept")
+		t.Fatal("a session silent for 50s was swept: its client may still be riding out a short outage")
 	}
 	if pollingManager.Get(closedRecent.ID) != nil {
 		t.Fatal("a closed session kept its slot because its client is still polling")
