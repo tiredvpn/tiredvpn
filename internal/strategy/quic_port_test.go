@@ -198,3 +198,51 @@ func TestUDPGateProbesTheQUICPort(t *testing.T) {
 		t.Error("closed QUIC port judged working: the probe went to the TCP port's open UDP twin")
 	}
 }
+
+// quicSilentDialTime runs a real QUIC Salamander Connect against a UDP port
+// that swallows everything - a silent drop - and reports how long it took to
+// give up.
+func quicSilentDialTime(t *testing.T, forced bool) time.Duration {
+	t.Helper()
+	silent := newQUICPortListener(t)
+	m := NewDefaultManager(DefaultManagerConfig{
+		ServerAddr:  silent.addr,
+		Secret:      []byte("0123456789abcdef0123456789abcdef"),
+		QUICEnabled: true,
+	})
+	if forced {
+		if err := m.ForceStrategy("quic_salamander"); err != nil {
+			t.Fatalf("force: %v", err)
+		}
+	}
+	q := quicRegisteredStrategy(t, m)
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	start := time.Now()
+	if conn, err := q.Connect(ctx, silent.addr); err == nil {
+		conn.Close()
+		t.Fatal("QUIC connected to a port that never answers")
+	}
+	return time.Since(start)
+}
+
+// TestQUICAutoDialGivesUpOnSilence: in auto mode a QUIC dial into a silent
+// drop sat in quic-go's default handshake timeout for ~10s, ahead of every
+// TCP strategy. Auto mode must give up within twice its idle budget.
+func TestQUICAutoDialGivesUpOnSilence(t *testing.T) {
+	limit := 2*quicAutoHandshakeIdleTimeout + 500*time.Millisecond
+	if took := quicSilentDialTime(t, false); took > limit {
+		t.Fatalf("auto-mode QUIC dial into silence took %v, want under %v", took, limit)
+	}
+}
+
+// TestQUICForcedDialKeepsDefaultTimeout: forced mode has nothing to fall back
+// to, so it keeps quic-go's default patience.
+func TestQUICForcedDialKeepsDefaultTimeout(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits out quic-go's default handshake timeout")
+	}
+	if took := quicSilentDialTime(t, true); took < 4*time.Second {
+		t.Fatalf("forced QUIC dial gave up after %v, want the default handshake timeout", took)
+	}
+}
