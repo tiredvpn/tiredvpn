@@ -4876,7 +4876,7 @@ func (pm *HTTPPollingManager) cleanup() {
 		// A closed session is dead whatever its clock says: nothing relays for
 		// it, yet a client still polling it would keep it in the map.
 		if sess.closed.Load() || sess.idleFor(now) > pm.sessionTimeout {
-			log.Debug("HTTP Polling: Cleaning up stale session %s", id[:8])
+			log.Debug("HTTP Polling: Cleaning up stale session %s", pollingLogID(id))
 			sess.Close()
 			delete(pm.sessions, id)
 		}
@@ -4992,7 +4992,6 @@ func writePollingMetrics(w io.Writer) {
 	fmt.Fprintf(w, "tiredvpn_polling_refused_total{limit=\"node\"} %d\n", refusedNode)
 	fmt.Fprintf(w, "tiredvpn_polling_refused_total{limit=\"client\"} %d\n\n", refusedClient)
 }
-
 
 // Close closes the session and its target connection
 func (s *HTTPPollingSession) Close() {
@@ -5289,18 +5288,40 @@ const (
 	pollingServerKeepaliveIdle = 15 * time.Second
 )
 
-// pollingMaxRequestBody / pollingMinSessionIDLen bound what an unauthenticated
-// request can make the handler do. The client uploads at most an 8 KiB chunk
-// per poll (internal/strategy/http_polling.go poll()) and its first body (a
-// SOCKS target address or a TUN handshake) is smaller still, so 64 KiB is
-// generous; without a bound, Content-Length sized an allocation made before the
-// auth check, and a length past RAM+swap is a fatal runtime out-of-memory. The
-// client's session ID is 16 characters (generateSessionID); the handler logs
-// its first 8.
+// pollingMaxRequestBody / pollingMaxHeadBytes / pollingHeadTimeout bound what
+// an unauthenticated request can make the handler do. Everything up to the auth
+// check - the header block and the body - is read from a peer nobody has
+// verified yet.
+//
+//   - Body: the client uploads at most an 8 KiB chunk per poll
+//     (internal/strategy/http_polling.go poll()) and its first request has no
+//     body at all, so 64 KiB is generous. Content-Length used to size an
+//     allocation made before the auth check; a length past RAM+swap is a fatal
+//     runtime out-of-memory. A larger body is now read and thrown away under the
+//     same deadline instead of stored, so the answer is the one the old server
+//     gave for it.
+//   - Header block: 16 KiB was already the limit, but it was checked after a
+//     whole line had been read, and a line without '\n' was buffered for as long
+//     as it kept coming (300 MiB per connection in a review run). The reader is
+//     now exactly that size and a line that does not fit ends the connection, as
+//     a header block over 16 KiB always did.
+//   - Time: the first request's header block had no deadline at all; it now
+//     gets the 10s the ALPN entry already gives the first read.
 const (
-	pollingMaxRequestBody  = 64 << 10
-	pollingMinSessionIDLen = 8
+	pollingMaxRequestBody = 64 << 10
+	pollingMaxHeadBytes   = 16 << 10
+	pollingHeadTimeout    = 10 * time.Second
+	pollingBodyTimeout    = 5 * time.Second
 )
+
+// pollingLogID is the part of a session ID the logs show. IDs come from the
+// peer, before any check, so this must not assume a length.
+func pollingLogID(id string) string {
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
+}
 
 // handleHTTPPollingWithALPN handles HTTP polling connections via ALPN routing
 // This is the kTLS-compatible entry point for tired-polling ALPN
@@ -5327,7 +5348,9 @@ func handleHTTPPollingWithALPN(conn net.Conn, srvCtx *serverContext, logger *log
 // aligned across requests.
 func handleHTTPPolling(conn net.Conn, srvCtx *serverContext, firstRequest []byte, logger *log.Logger) {
 	defer conn.Close()
-	reader := bufio.NewReader(io.MultiReader(bytes.NewReader(firstRequest), conn))
+	// The buffer is the header limit: readPollingRequestHead reads lines with
+	// ReadSlice, so no line can grow past it.
+	reader := bufio.NewReaderSize(io.MultiReader(bytes.NewReader(firstRequest), conn), pollingMaxHeadBytes)
 
 	// Session binding (S22): every request on this connection authenticates
 	// against the same TLS session exporter. Keep-alive reuses one *tls.Conn for
@@ -5340,8 +5363,11 @@ func handleHTTPPolling(conn net.Conn, srvCtx *serverContext, firstRequest []byte
 	}
 
 	for i := 0; i < pollingServerMaxRequests; i++ {
-		if i > 0 {
-			// Wait a bounded time for the next keep-alive request.
+		// The whole header block has to arrive in time: the first one within
+		// pollingHeadTimeout, a keep-alive one within the idle window.
+		if i == 0 {
+			conn.SetReadDeadline(time.Now().Add(pollingHeadTimeout))
+		} else {
 			conn.SetReadDeadline(time.Now().Add(pollingServerKeepaliveIdle))
 		}
 		head, err := readPollingRequestHead(reader)
@@ -5360,18 +5386,27 @@ func handleHTTPPolling(conn net.Conn, srvCtx *serverContext, firstRequest []byte
 	}
 }
 
+// errPollingHeadTooLarge ends a connection whose header block is over
+// pollingMaxHeadBytes, or has a line that is.
+var errPollingHeadTooLarge = errors.New("polling request head too large")
+
 // readPollingRequestHead reads one HTTP request's header block (up to and
-// including the terminating blank line) from reader.
+// including the terminating blank line) from reader, which must have been
+// created with a buffer of pollingMaxHeadBytes: ReadSlice never reads past it,
+// so a line without '\n' costs the buffer and nothing more.
 func readPollingRequestHead(reader *bufio.Reader) ([]byte, error) {
 	var head []byte
 	for {
-		line, err := reader.ReadBytes('\n')
+		line, err := reader.ReadSlice('\n')
+		if errors.Is(err, bufio.ErrBufferFull) {
+			return nil, errPollingHeadTooLarge
+		}
 		if err != nil {
 			return nil, err
 		}
-		head = append(head, line...)
-		if len(head) > 16*1024 {
-			return nil, errors.New("polling request head too large")
+		head = append(head, line...) // copies: line is only valid until the next read
+		if len(head) > pollingMaxHeadBytes {
+			return nil, errPollingHeadTooLarge
 		}
 		if bytes.Equal(line, []byte("\r\n")) || bytes.Equal(line, []byte("\n")) {
 			return head, nil
@@ -5413,18 +5448,20 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 		sendHTTPPollingError(conn, "Missing session ID")
 		return false
 	}
-	// Everything below logs sessionID[:8], unauthenticated paths included, and
-	// nothing recovers a panic on the connection path.
-	if len(sessionID) < pollingMinSessionIDLen {
-		logger.Debug("HTTP Polling: Session ID too short (%d bytes)", len(sessionID))
-		sendHTTPPollingError(conn, "Invalid session ID")
-		return false
-	}
-	// The body is read before authentication, into a buffer of the announced
-	// size, so the size is checked first.
-	if contentLength < 0 || contentLength > pollingMaxRequestBody {
-		logger.Debug("HTTP Polling: Refusing body of %d bytes", contentLength)
-		sendHTTPPollingError(conn, "Invalid body length")
+	// The body is read before authentication. One our client could have sent
+	// is stored; a larger one is read and discarded under the same deadline and
+	// then refused the way a failed auth is, which is what the old server
+	// answered for it - only now without holding it in memory.
+	if contentLength > pollingMaxRequestBody {
+		conn.SetReadDeadline(time.Now().Add(pollingBodyTimeout))
+		_, err := io.CopyN(io.Discard, reader, int64(contentLength))
+		conn.SetReadDeadline(time.Time{})
+		logger.Debug("HTTP Polling: Discarded oversized body of %d bytes (err=%v)", contentLength, err)
+		if err != nil {
+			sendHTTPPollingError(conn, "Failed to read body")
+		} else {
+			sendHTTPPollingError(conn, "Authentication failed")
+		}
 		return false
 	}
 
@@ -5434,7 +5471,7 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 	var body []byte
 	if contentLength > 0 {
 		body = make([]byte, contentLength)
-		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		conn.SetReadDeadline(time.Now().Add(pollingBodyTimeout))
 		_, err := io.ReadFull(reader, body)
 		conn.SetReadDeadline(time.Time{})
 		if err != nil {
@@ -5462,7 +5499,7 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 			clientID = existingSess.ClientID
 		} else {
 			// Debug: try all secrets to find which one would match
-			logger.Debug("HTTP Polling: Auth failed for existing session %s (token mismatch)", sessionID[:8])
+			logger.Debug("HTTP Polling: Auth failed for existing session %s (token mismatch)", pollingLogID(sessionID))
 
 			// Try registered clients to see if any match
 			if srvCtx.registry != nil {
@@ -5506,7 +5543,7 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 		}
 
 		if usedSecret == nil {
-			logger.Debug("HTTP Polling: Authentication failed for new session %s", sessionID[:8])
+			logger.Debug("HTTP Polling: Authentication failed for new session %s", pollingLogID(sessionID))
 			sendHTTPPollingError(conn, "Authentication failed")
 			return false
 		}
@@ -5518,21 +5555,21 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 		// After authentication on purpose: a peer without a secret never gets
 		// here, so the ceiling cannot be measured from outside. The answer is
 		// the busy reply the uplink bound already sends, not a new one.
-		logger.Debug("HTTP Polling: New session %s refused: %v", sessionID[:8], err)
+		logger.Debug("HTTP Polling: New session %s refused: %v", pollingLogID(sessionID), err)
 		pollingManager.warnRefusal(err, clientID)
 		sendHTTPPollingBusy(conn)
 		return false
 	}
 
 	if isNew {
-		logger.Info("HTTP Polling: New session %s (client: %s), body=%d bytes, contentLength=%d", sessionID[:8], clientID, len(body), contentLength)
+		logger.Info("HTTP Polling: New session %s (client: %s), body=%d bytes, contentLength=%d", pollingLogID(sessionID), clientID, len(body), contentLength)
 
 		// Write init body data (contains target address) BEFORE starting relay.
 		// The session is empty, so only a body over the whole bound is refused;
 		// no relay will ever read this session, so it goes with the body.
 		if len(body) > 0 {
 			if late || !sess.WriteFromClient(body) {
-				logger.Debug("HTTP Polling: New session %s body of %d bytes refused (late=%v)", sessionID[:8], len(body), late)
+				logger.Debug("HTTP Polling: New session %s body of %d bytes refused (late=%v)", pollingLogID(sessionID), len(body), late)
 				pollingManager.removeSession(sess)
 				sendHTTPPollingBusy(conn)
 				return false
@@ -5557,7 +5594,7 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 	if len(body) > 0 {
 		if late {
 			logger.Debug("HTTP Polling: body of %d bytes took %v (session %s), refusing it as possibly abandoned",
-				len(body), time.Since(headAt).Round(time.Millisecond), sessionID[:8])
+				len(body), time.Since(headAt).Round(time.Millisecond), pollingLogID(sessionID))
 			sendHTTPPollingBusy(conn)
 			return false
 		}
@@ -5567,17 +5604,17 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 			// connection and send them again after its backoff, so the stream
 			// stays whole and the backlog stays bounded. No downlink data and no
 			// ack are processed for this request; the next one carries both.
-			logger.Debug("HTTP Polling: uplink full (session %s), refusing %d bytes", sessionID[:8], len(body))
+			logger.Debug("HTTP Polling: uplink full (session %s), refusing %d bytes", pollingLogID(sessionID), len(body))
 			sendHTTPPollingBusy(conn)
 			return false
 		}
-		logger.Debug("HTTP Polling: Received %d bytes from client (session %s)", len(body), sessionID[:8])
+		logger.Debug("HTTP Polling: Received %d bytes from client (session %s)", len(body), pollingLogID(sessionID))
 	}
 
 	// Get data for client (with acknowledgement tracking)
 	toClient := sess.ReadToClient(ackSeq)
 	if len(toClient) > 0 {
-		logger.Debug("HTTP Polling: Sending %d bytes to client (session %s, ack=%d)", len(toClient), sessionID[:8], ackSeq)
+		logger.Debug("HTTP Polling: Sending %d bytes to client (session %s, ack=%d)", len(toClient), pollingLogID(sessionID), ackSeq)
 	}
 
 	sendHTTPPollingResponse(conn, toClient, keepAlive)
@@ -5586,7 +5623,7 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 
 // runPollingSessionRelay handles the relay for a polling session
 func runPollingSessionRelay(sess *HTTPPollingSession, srvCtx *serverContext, logger *log.Logger) {
-	logger.Debug("HTTP Polling: Starting relay for session %s", sess.ID[:8])
+	logger.Debug("HTTP Polling: Starting relay for session %s", pollingLogID(sess.ID))
 
 	// Wait for first data from client to determine target. This goroutine is
 	// the uplink's only reader from here on: what it takes but cannot use yet
@@ -5598,7 +5635,7 @@ func runPollingSessionRelay(sess *HTTPPollingSession, srvCtx *serverContext, log
 	for {
 		select {
 		case <-timeout:
-			logger.Debug("HTTP Polling: Session %s timed out waiting for target", sess.ID[:8])
+			logger.Debug("HTTP Polling: Session %s timed out waiting for target", pollingLogID(sess.ID))
 			pollingManager.removeSession(sess)
 			return
 		default:
@@ -5610,7 +5647,7 @@ func runPollingSessionRelay(sess *HTTPPollingSession, srvCtx *serverContext, log
 		if len(head) > 0 {
 			// Check for TUN mode (first byte = 0x02)
 			if head[0] == 0x02 {
-				logger.Info("HTTP Polling: TUN mode detected for session %s", sess.ID[:8])
+				logger.Info("HTTP Polling: TUN mode detected for session %s", pollingLogID(sess.ID))
 				runPollingTUNMode(sess, head[1:], srvCtx, logger)
 				return
 			}
@@ -5634,7 +5671,7 @@ func runPollingSessionRelay(sess *HTTPPollingSession, srvCtx *serverContext, log
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	logger.Info("HTTP Polling: Session %s connecting to %s", sess.ID[:8], targetAddr)
+	logger.Info("HTTP Polling: Session %s connecting to %s", pollingLogID(sess.ID), targetAddr)
 
 	// Connect to target
 	var targetConn net.Conn
@@ -5660,7 +5697,7 @@ func runPollingSessionRelay(sess *HTTPPollingSession, srvCtx *serverContext, log
 
 	// Send success
 	sess.WriteToClient([]byte{0x00})
-	logger.Info("HTTP Polling: Session %s connected to %s", sess.ID[:8], targetAddr)
+	logger.Info("HTTP Polling: Session %s connected to %s", pollingLogID(sess.ID), targetAddr)
 
 	// Start bidirectional relay
 	var wg sync.WaitGroup
@@ -5718,7 +5755,7 @@ func runPollingSessionRelay(sess *HTTPPollingSession, srvCtx *serverContext, log
 	}()
 
 	wg.Wait()
-	logger.Info("HTTP Polling: Session %s relay ended", sess.ID[:8])
+	logger.Info("HTTP Polling: Session %s relay ended", pollingLogID(sess.ID))
 	pollingManager.removeSession(sess)
 }
 
@@ -5820,7 +5857,7 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 	pollConn.gate = gate
 	defer func() {
 		if n := sess.toClientDropped.Load(); n > 0 {
-			logger.Debug("HTTP Polling TUN: %d frame(s) dropped on a full downlink (session %s)", n, sess.ID[:8])
+			logger.Debug("HTTP Polling TUN: %d frame(s) dropped on a full downlink (session %s)", n, pollingLogID(sess.ID))
 		}
 	}()
 
