@@ -117,7 +117,7 @@ type Config struct {
 
 	// QUIC transport
 	QUICEnabled bool // Enable QUIC strategy
-	QUICPort    int  // QUIC server port (default 8443)
+	QUICPort    int  // -quic-port; ignored by the dial, see strategy.registerQUICStrategies
 
 	// ICMP tunnel (backup transport, requires CAP_NET_RAW)
 	ICMPTunnelEnabled bool // Enable ICMP tunnel strategy
@@ -451,7 +451,7 @@ func logEnabledFeatures(cfg *Config, mgr *strategy.Manager) {
 		log.Info("RTT masking enabled (profile=%s)", cfg.RTTProfile)
 	}
 	if cfg.QUICEnabled {
-		log.Info("QUIC transport enabled (port=%d)", cfg.QUICPort)
+		log.Info("QUIC transport enabled")
 	}
 	if cfg.ECHEnabled {
 		log.Info("ECH enabled (outer SNI: %s)", cfg.ECHPublicName)
