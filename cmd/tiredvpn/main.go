@@ -876,6 +876,28 @@ Generate QR:
     -cover      Cover host (default: api.googleapis.com)`)
 }
 
+// adminConnFlags are the connection-string flags admin add and admin qr share,
+// defined once so their defaults cannot drift apart.
+type adminConnFlags struct {
+	quic     *bool
+	quicPort *int
+	strategy *string
+	cover    *string
+}
+
+func registerAdminConnFlags(fs *flag.FlagSet) adminConnFlags {
+	return adminConnFlags{
+		quic:     fs.Bool("quic", true, "Enable QUIC"),
+		quicPort: fs.Int("quic-port", 0, "QUIC port for the connection string; 0 leaves it out (clients dial the server port)"),
+		strategy: fs.String("strategy", "auto", "Strategy"),
+		cover:    fs.String("cover", "api.googleapis.com", "Cover host"),
+	}
+}
+
+func (f adminConnFlags) connectionString(serverAddr, secret string) string {
+	return buildConnectionString(serverAddr, secret, *f.quic, *f.quicPort, *f.strategy, *f.cover)
+}
+
 // buildConnectionString builds a tired:// connection string
 func buildConnectionString(serverAddr, secret string, quic bool, quicPort int, strategy, cover string) string {
 	params := url.Values{}
@@ -966,10 +988,7 @@ func adminAdd(args []string) {
 	tunIP := fs.String("tun-ip", "", "Fixed TUN IP (optional, server assigns if empty)")
 	maxConns := fs.Int("max-conns", 0, "Max concurrent connections (0 = server default)")
 	expiresIn := fs.String("expires-in", "", "Expiry as Go duration, e.g. 720h (optional)")
-	quic := fs.Bool("quic", true, "Enable QUIC")
-	quicPort := fs.Int("quic-port", 0, "QUIC port for the connection string; 0 leaves it out (clients dial the server port)")
-	strategy := fs.String("strategy", "auto", "Strategy")
-	cover := fs.String("cover", "api.googleapis.com", "Cover host")
+	conn := registerAdminConnFlags(fs)
 
 	fs.Parse(args)
 
@@ -1027,7 +1046,7 @@ func adminAdd(args []string) {
 	}
 
 	// Build connection string from the server-issued secret
-	connStr := buildConnectionString(*serverAddr, created.Secret, *quic, *quicPort, *strategy, *cover)
+	connStr := conn.connectionString(*serverAddr, created.Secret)
 
 	fmt.Println("╔════════════════════════════════════════════════════════════════╗")
 	fmt.Println("║                    CLIENT ADDED SUCCESSFULLY                   ║")
@@ -1139,10 +1158,7 @@ func adminQR(args []string) {
 
 	serverAddr := fs.String("server", "", "Server address")
 	secret := fs.String("secret", "", "Client secret")
-	quic := fs.Bool("quic", true, "Enable QUIC")
-	quicPort := fs.Int("quic-port", 0, "QUIC port for the connection string; 0 leaves it out (clients dial the server port)")
-	strategy := fs.String("strategy", "auto", "Strategy")
-	cover := fs.String("cover", "api.googleapis.com", "Cover host")
+	conn := registerAdminConnFlags(fs)
 
 	fs.Parse(args)
 
@@ -1152,7 +1168,7 @@ func adminQR(args []string) {
 		os.Exit(1)
 	}
 
-	connStr := buildConnectionString(*serverAddr, *secret, *quic, *quicPort, *strategy, *cover)
+	connStr := conn.connectionString(*serverAddr, *secret)
 
 	fmt.Println("╔════════════════════════════════════════════════════════════════╗")
 	fmt.Println("║                      CONNECTION STRING                         ║")
