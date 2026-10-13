@@ -230,7 +230,7 @@ func quicSilentDialTime(t *testing.T, forced bool) time.Duration {
 // drop sat in quic-go's default handshake timeout for ~10s, ahead of every
 // TCP strategy. Auto mode must give up within twice its idle budget.
 func TestQUICAutoDialGivesUpOnSilence(t *testing.T) {
-	limit := 2*quicAutoHandshakeIdleTimeout + 500*time.Millisecond
+	limit := 2*quicAutoHandshakeIdleFloor + 500*time.Millisecond
 	if took := quicSilentDialTime(t, false); took > limit {
 		t.Fatalf("auto-mode QUIC dial into silence took %v, want under %v", took, limit)
 	}
@@ -244,5 +244,53 @@ func TestQUICForcedDialKeepsDefaultTimeout(t *testing.T) {
 	}
 	if took := quicSilentDialTime(t, true); took < 4*time.Second {
 		t.Fatalf("forced QUIC dial gave up after %v, want the default handshake timeout", took)
+	}
+}
+
+// TestQUICClientConfigHandshakeIdle pins the dial budget without waiting it
+// out, so it runs under -short in CI: forced keeps quic-go's default (0 in
+// the config), auto scales with the RTT the TCP gate measured, between the
+// floor and the ceiling. A flat 1s lost QUIC at 1s RTT on every dial.
+func TestQUICClientConfigHandshakeIdle(t *testing.T) {
+	quicWith := func(t *testing.T, forced bool, rtt time.Duration, checker bool) *QUICStrategy {
+		t.Helper()
+		m := NewDefaultManager(DefaultManagerConfig{
+			ServerAddr:  "192.0.2.1:995",
+			Secret:      []byte("0123456789abcdef0123456789abcdef"),
+			QUICEnabled: true,
+		})
+		if checker {
+			c := NewConnectivityChecker("192.0.2.1:995", time.Second, false)
+			c.cacheResult(ConnectivityResult{TCP: true, Latency: rtt})
+			m.SetConnectivityChecker(c)
+		}
+		if forced {
+			if err := m.ForceStrategy("quic_salamander"); err != nil {
+				t.Fatalf("force: %v", err)
+			}
+		}
+		return quicRegisteredStrategy(t, m)
+	}
+
+	if got := quicWith(t, true, time.Second, true).quicClientConfig().HandshakeIdleTimeout; got != 0 {
+		t.Errorf("forced: HandshakeIdleTimeout %v, want 0 (quic-go default)", got)
+	}
+	cases := []struct {
+		name    string
+		rtt     time.Duration
+		checker bool
+		want    time.Duration
+	}{
+		{"no gate, no RTT", 0, false, quicAutoHandshakeIdleFloor},
+		{"fast path keeps the floor", 50 * time.Millisecond, true, quicAutoHandshakeIdleFloor},
+		{"1s RTT gets three", time.Second, true, 3 * time.Second},
+		{"slow path capped", 4 * time.Second, true, quicAutoHandshakeIdleCeil},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := quicWith(t, false, c.rtt, c.checker).quicClientConfig().HandshakeIdleTimeout; got != c.want {
+				t.Errorf("auto at RTT %v: HandshakeIdleTimeout %v, want %v", c.rtt, got, c.want)
+			}
+		})
 	}
 }

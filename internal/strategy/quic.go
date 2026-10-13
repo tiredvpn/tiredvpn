@@ -283,17 +283,44 @@ func (s *QUICStrategy) buildProbePacket() []byte {
 	return packet
 }
 
-// quicAutoHandshakeIdleTimeout bounds a QUIC dial in auto mode. The UDP gate
-// cannot tell a silent drop from a working path, so the dial itself is the
-// test, and with quic-go's default (5s idle, 2x that in total) a dropped path
-// held every TCP strategy behind it for 10.9s on a cold start. quic-go aborts
-// after this long without a single packet from the server, and after twice
-// this long in any case. On a live path the server answers within an RTT
-// plus a retransmit, so what auto mode gives up is a handshake that needs
-// more than two seconds in all, and the TCP strategies behind it are a fair
-// trade for that. Forced mode keeps the default: it has nothing to fall back
-// to and gains nothing from giving up early.
-const quicAutoHandshakeIdleTimeout = time.Second
+// Auto mode bounds a QUIC dial by quicAutoHandshakeIdle. The UDP gate cannot
+// tell a silent drop from a working path, so the dial itself is the test, and
+// with quic-go's default (5s idle, 2x that in total) a dropped path held every
+// TCP strategy behind it for 10.9s on a cold start. quic-go aborts after the
+// idle timeout without a packet from the server, and after twice that in any
+// case; retransmitted Initials do not reset it. A flat second lost QUIC on
+// slow paths (1 of 30 dials at 1s RTT, 28 of 30 at 800ms with 10% loss), so
+// the budget scales with the RTT the TCP gate measured: room for the first
+// answer plus two lost flights, between a floor that keeps a silent drop cheap
+// on fast paths and quic-go's own default. Forced mode keeps the default: it
+// has nothing to fall back to and gains nothing from giving up early.
+const (
+	quicAutoHandshakeIdleRTTs  = 3
+	quicAutoHandshakeIdleFloor = time.Second
+	quicAutoHandshakeIdleCeil  = 5 * time.Second
+)
+
+// quicAutoHandshakeIdle is the auto-mode handshake idle timeout for a path
+// whose TCP connect took rtt (0 when unmeasured).
+func quicAutoHandshakeIdle(rtt time.Duration) time.Duration {
+	return min(max(quicAutoHandshakeIdleRTTs*rtt, quicAutoHandshakeIdleFloor), quicAutoHandshakeIdleCeil)
+}
+
+// quicClientConfig is the quic-go configuration Connect dials with.
+func (s *QUICStrategy) quicClientConfig() *quic.Config {
+	cfg := &quic.Config{
+		MaxIdleTimeout:        30 * time.Second,
+		KeepAlivePeriod:       10 * time.Second,
+		MaxIncomingStreams:    100,
+		MaxIncomingUniStreams: 100,
+		// Enable 0-RTT for faster reconnection
+		Allow0RTT: true,
+	}
+	if s.manager == nil || !s.manager.IsForced() {
+		cfg.HandshakeIdleTimeout = quicAutoHandshakeIdle(s.manager.quicGateRTT())
+	}
+	return cfg
+}
 
 // quicDialAddr is where this strategy's datagrams go: the pinned endpoint's
 // host (IPv6/IPv4 with automatic fallback) on the strategy's UDP port. Probe,
@@ -319,17 +346,7 @@ func (s *QUICStrategy) Connect(ctx context.Context, target string) (net.Conn, er
 	log.Debug("%s: Using server address %s", s.Name(), addr)
 
 	// Create QUIC config with evasion settings
-	quicConfig := &quic.Config{
-		MaxIdleTimeout:        30 * time.Second,
-		KeepAlivePeriod:       10 * time.Second,
-		MaxIncomingStreams:    100,
-		MaxIncomingUniStreams: 100,
-		// Enable 0-RTT for faster reconnection
-		Allow0RTT: true,
-	}
-	if s.manager == nil || !s.manager.IsForced() {
-		quicConfig.HandshakeIdleTimeout = quicAutoHandshakeIdleTimeout
-	}
+	quicConfig := s.quicClientConfig()
 
 	// TLS config - we'll use whitelisted SNI
 	tlsConfig := &tls.Config{

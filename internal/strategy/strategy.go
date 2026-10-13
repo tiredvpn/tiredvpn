@@ -331,6 +331,22 @@ func (m *Manager) udpGateDeferQUICLocked() {
 	m.udpGatePending = true
 }
 
+// quicGateRTT is the TCP connect time the connectivity gate last measured, 0
+// when there is none. Nil-safe: strategies built without a manager in tests
+// ask too.
+func (m *Manager) quicGateRTT() time.Duration {
+	if m == nil {
+		return 0
+	}
+	m.mu.RLock()
+	c := m.connectivityChecker
+	m.mu.RUnlock()
+	if c == nil {
+		return 0
+	}
+	return c.LastResult().Latency
+}
+
 // udpGateRefresh replaces a deferral with the verdict that has landed since.
 // Without it the deferral stood until the next pre-flight, which a connected
 // client only runs after preflightFailThreshold failed connects in a row, so
