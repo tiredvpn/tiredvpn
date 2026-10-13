@@ -59,6 +59,9 @@ type handshakeGate struct {
 
 	mu   sync.Mutex
 	lane map[string]*sniLane
+	// global is set only for the opt-in single-flight strategy. Its one slot
+	// covers both the handshake and the spacing wait across all donor SNIs.
+	global *sniLane
 }
 
 // sniLane holds the per-SNI state: an occupancy semaphore and the earliest
@@ -72,6 +75,12 @@ type sniLane struct {
 
 func newHandshakeGate() *handshakeGate {
 	return newHandshakeGateWith(maxConcurrentHandshakesPerSNI, minHandshakeSpacing, handshakeSpacingJitter)
+}
+
+func newSingleFlightHandshakeGate() *handshakeGate {
+	g := newHandshakeGateWith(1, 450*time.Millisecond, 150*time.Millisecond)
+	g.global = &sniLane{slots: make(chan struct{}, 1)}
+	return g
 }
 
 // newHandshakeGateWith builds a gate with explicit limits. Tests use it to run
@@ -117,7 +126,10 @@ func (g *handshakeGate) spacing() time.Duration {
 // bounds the total time spent queued, and a queued dial dies with the request
 // that asked for it rather than outliving it.
 func (g *handshakeGate) acquire(ctx context.Context, sni string) (func(), error) {
-	lane := g.laneFor(sni)
+	lane := g.global
+	if lane == nil {
+		lane = g.laneFor(sni)
+	}
 
 	select {
 	case lane.slots <- struct{}{}:
