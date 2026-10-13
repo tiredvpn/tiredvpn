@@ -287,8 +287,11 @@ func TestFindPaddingBodyIgnoresMarkerInBody(t *testing.T) {
 }
 
 // TestPaddingRoundTripAcrossKeys runs the injection and the parser over many
-// random keys and salts. About one hello in 128 carries a stray 00 15 in its
-// padding, so 2000 runs put the parser through roughly 16 collisions.
+// random keys and salts. The structural walk never reads the padding body, so
+// this is not a stress test of the walk: it is there to catch a return to a
+// byte scan for the last 00 15, which about one hello in 128 defeats, so 2000
+// runs give it roughly 16 chances. A scan for the first 00 15 passes here;
+// TestAddPaddingWithREALITYIgnoresDecoy catches that one.
 func TestPaddingRoundTripAcrossKeys(t *testing.T) {
 	t.Parallel()
 

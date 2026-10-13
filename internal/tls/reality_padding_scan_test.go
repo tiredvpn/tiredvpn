@@ -274,3 +274,62 @@ func assertRecordLengthsConsistent(t *testing.T, record []byte) {
 		t.Fatalf("extensions block is inconsistent: %v", err)
 	}
 }
+
+// TestAddPaddingWithREALITYUsesFirstOfTwoPaddings covers a ClientHello with two
+// padding extensions. uTLS does not send one, but if it ever did, the
+// credentials have to go into the first: findREALITYExtension and
+// DetectREALITYExtension on the server read the first padding they meet.
+func TestAddPaddingWithREALITYUsesFirstOfTwoPaddings(t *testing.T) {
+	t.Parallel()
+
+	const oldPaddingLen = 300
+	padding := func(fill byte) []byte {
+		e := binary.BigEndian.AppendUint16(nil, extensionPadding)
+		e = binary.BigEndian.AppendUint16(e, oldPaddingLen)
+		return append(e, bytes.Repeat([]byte{fill}, oldPaddingLen)...)
+	}
+	var exts []byte
+	exts = append(exts, padding(0xAA)...)
+	exts = append(exts, 0x00, 0x17, 0x00, 0x00) // extended_master_secret, empty
+	exts = append(exts, padding(0xBB)...)
+
+	body := []byte{0x03, 0x03}
+	body = append(body, bytes.Repeat([]byte{0x11}, helloRandomLen)...)
+	body = append(body, AuthSessionIDLen)
+	body = append(body, bytes.Repeat([]byte{0x22}, AuthSessionIDLen)...)
+	body = binary.BigEndian.AppendUint16(body, 2)
+	body = binary.BigEndian.AppendUint16(body, 0x1301)
+	body = append(body, 1, 0)
+	body = binary.BigEndian.AppendUint16(body, uint16(len(exts)))
+	firstPaddingAt := 5 + 4 + len(body)
+	body = append(body, exts...)
+
+	hello := []byte{handshakeTypeHello, byte(len(body) >> 16), byte(len(body) >> 8), byte(len(body))}
+	hello = append(hello, body...)
+	record := append([]byte{0x16, 0x03, 0x01, byte(len(hello) >> 8), byte(len(hello))}, hello...)
+
+	priv, _, err := GenerateX25519KeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ext, err := NewClientREALITYExtension([]byte("shared-secret"), priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := AddPaddingWithREALITY(record, ext, MinPaddingSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRecordLengthsConsistent(t, out)
+
+	hdr := out[firstPaddingAt : firstPaddingAt+4]
+	if typ, n := binary.BigEndian.Uint16(hdr), int(binary.BigEndian.Uint16(hdr[2:])); typ != extensionPadding || n != MinPaddingSize {
+		t.Fatalf("first extension is %#04x len %d, want padding len %d", typ, n, MinPaddingSize)
+	}
+	if !bytes.HasPrefix(out[firstPaddingAt+4:], ext.Marshal()) {
+		t.Fatal("credentials are not in the first padding extension, where the server looks")
+	}
+	if !bytes.Contains(out, bytes.Repeat([]byte{0xBB}, oldPaddingLen)) {
+		t.Fatal("the second padding extension was rewritten")
+	}
+}
