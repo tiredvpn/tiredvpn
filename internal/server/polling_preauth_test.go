@@ -222,3 +222,40 @@ func TestPollingOversizedBodyNeverReachesSession(t *testing.T) {
 		t.Fatalf("the 8 KiB chunk reached the uplink as %d bytes", len(up))
 	}
 }
+
+// TestPollingStalePollDoesNotReopenSession: after the sweep removed a session,
+// its client's next poll - with an ack and maybe a body - used to open a fresh
+// session under the same ID and get "OK" back as if it were data: two garbage
+// bytes in a SOCKS stream, a bogus frame length in TUN. It must be refused like
+// a bad token so the client opens a new session, and the client's real init
+// (no body, nothing acked) must still open one.
+func TestPollingStalePollDoesNotReopenSession(t *testing.T) {
+	withPollingLimits(t, 0, 0)
+	secret := []byte("fx-polling-cap-global-secret")
+	srvCtx := pollingCapServerContext(t, secret)
+	ekm := bytes.Repeat([]byte{0x7e}, 32)
+	want := pollingAuthFailure(t)
+
+	const id = "fxcap-stale-0000"
+	for _, c := range []struct {
+		name string
+		ack  int64
+		body []byte
+	}{
+		{"idle poll with an ack", 12345, nil},
+		{"poll with data and an ack", 12345, []byte{0, 0, 0, 0}},
+		{"poll with data, nothing acked yet", 0, []byte{0, 14, '1', '0', '.', '0', '.', '0', '.', '1', ':', '8', '0', '8', '0', 'x'}},
+	} {
+		got := pollingRawExchange(t, srvCtx, pollingHead(id, pollingTokenFor(id, secret, ekm), c.ack, len(c.body)), bytes.NewReader(c.body))
+		if !bytes.Equal(got, want) {
+			t.Errorf("%s: answered %q, want the auth-failure answer", c.name, got)
+		}
+		if pollingManager.Get(id) != nil {
+			t.Fatalf("%s: a session was opened under an ID the server had dropped", c.name)
+		}
+	}
+
+	if st := pollingOpen(t, srvCtx, id, secret); st != http.StatusOK {
+		t.Fatalf("the client's init request (no body, ack 0) answered %d", st)
+	}
+}

@@ -4774,6 +4774,7 @@ type HTTPPollingManager struct {
 
 	refusedNode    atomic.Uint64 // new sessions refused at the node ceiling
 	refusedClient  atomic.Uint64 // new sessions refused at a client's ceiling
+	tunDropped     atomic.Uint64 // TUN frames dropped on a full downlink, all sessions
 	refusalLogAt   atomic.Int64  // UnixNano of the last refusal warning
 	refusalsLogged atomic.Uint64 // refusals already reported in a warning
 }
@@ -4991,6 +4992,9 @@ func writePollingMetrics(w io.Writer) {
 	fmt.Fprintf(w, "# TYPE tiredvpn_polling_refused_total counter\n")
 	fmt.Fprintf(w, "tiredvpn_polling_refused_total{limit=\"node\"} %d\n", refusedNode)
 	fmt.Fprintf(w, "tiredvpn_polling_refused_total{limit=\"client\"} %d\n\n", refusedClient)
+	fmt.Fprintf(w, "# HELP tiredvpn_polling_tun_dropped_total TUN frames dropped because a polling client's downlink was full\n")
+	fmt.Fprintf(w, "# TYPE tiredvpn_polling_tun_dropped_total counter\n")
+	fmt.Fprintf(w, "tiredvpn_polling_tun_dropped_total %d\n\n", pollingManager.tunDropped.Load())
 }
 
 // Close closes the session and its target connection
@@ -5028,10 +5032,13 @@ func (s *HTTPPollingSession) Close() {
 // target at the bound and the target's TCP window closes, so the size only has
 // to keep the next polls supplied while the relay refills (it refills as soon
 // as a poll takes a chunk); it costs memory, not throughput. In TUN mode the
-// bound is a queue depth: frames past it are dropped (see offerToClient), and
-// at the ~100 Mbit/s a polling TUN reaches on a clean path 1 MiB is ~80 ms of
-// queue, enough to absorb a dispatcher burst without tail-dropping on a healthy
-// path. It matches the client's own uplink bound (maxPollingSendBuffered).
+// bound is a queue depth: frames past it are dropped (see offerToClient). How
+// long that queue is in time depends on the drain rate, which is one 16 KiB
+// chunk per poll round trip: at the ~100 Mbit/s a polling TUN reaches on a
+// clean LAN path 1 MiB is ~80 ms, but at a 50 ms RTT the drain is ~240 KB/s and
+// a review run measured 2-4 s of ping under load (7 s before the bound). A
+// byte bound caps memory, not latency; bounding sojourn time would be the
+// latency fix. It matches the client's own uplink bound (maxPollingSendBuffered).
 const pollingMaxToClientBuffered = 1 << 20
 
 // WriteToClient appends data to the downlink unconditionally. It is only for
@@ -5075,6 +5082,7 @@ func (s *HTTPPollingSession) offerToClient(frame []byte) bool {
 	defer s.bufLock.Unlock()
 	if s.toClient.Len()+len(frame) > pollingMaxToClientBuffered {
 		s.toClientDropped.Add(1)
+		pollingManager.tunDropped.Add(1)
 		return false
 	}
 	s.toClient.Write(frame)
@@ -5313,6 +5321,12 @@ const (
 	pollingHeadTimeout    = 10 * time.Second
 	pollingBodyTimeout    = 5 * time.Second
 )
+
+// pollingStaleSessionPoll reports a request that cannot be a session's first:
+// the client's init request has no body and acks nothing.
+func pollingStaleSessionPoll(ackSeq int64, body []byte) bool {
+	return ackSeq > 0 || len(body) > 0
+}
 
 // pollingLogID is the part of a session ID the logs show. IDs come from the
 // peer, before any check, so this must not assume a length.
@@ -5562,22 +5576,21 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 	}
 
 	if isNew {
-		logger.Info("HTTP Polling: New session %s (client: %s), body=%d bytes, contentLength=%d", pollingLogID(sessionID), clientID, len(body), contentLength)
-
-		// Write init body data (contains target address) BEFORE starting relay.
-		// The session is empty, so only a body over the whole bound is refused;
-		// no relay will ever read this session, so it goes with the body.
-		if len(body) > 0 {
-			if late || !sess.WriteFromClient(body) {
-				logger.Debug("HTTP Polling: New session %s body of %d bytes refused (late=%v)", pollingLogID(sessionID), len(body), late)
-				pollingManager.removeSession(sess)
-				sendHTTPPollingBusy(conn)
-				return false
-			}
-			logger.Debug("HTTP Polling: New session received %d bytes (target addr): %x", len(body), body)
-		} else {
-			logger.Debug("HTTP Polling: WARNING - New session has no body data!")
+		// A session opens with the client's init request, which carries no
+		// body and acks nothing (init() in internal/strategy/http_polling.go). A
+		// poll with data or an ack under an ID the server does not know belongs
+		// to a session that is gone - swept after its client went quiet past
+		// pollingSessionTimeout, a suspended laptop for one. Answering it "OK"
+		// put two garbage bytes into a SOCKS stream and a bogus frame length
+		// into TUN. It is refused the way a bad token is, so the client's polls
+		// fail, it declares the session dead and opens a new one.
+		if pollingStaleSessionPoll(ackSeq, body) {
+			logger.Debug("HTTP Polling: Poll for unknown session %s (ack=%d, body=%d bytes), not reopening it", pollingLogID(sessionID), ackSeq, len(body))
+			pollingManager.removeSession(sess)
+			sendHTTPPollingError(conn, "Authentication failed")
+			return false
 		}
+		logger.Info("HTTP Polling: New session %s (client: %s)", pollingLogID(sessionID), clientID)
 
 		// Send OK for new session
 		sendHTTPPollingResponse(conn, []byte("OK"), keepAlive)
