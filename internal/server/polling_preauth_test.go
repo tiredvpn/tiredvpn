@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -223,39 +224,129 @@ func TestPollingOversizedBodyNeverReachesSession(t *testing.T) {
 	}
 }
 
-// TestPollingStalePollDoesNotReopenSession: after the sweep removed a session,
-// its client's next poll - with an ack and maybe a body - used to open a fresh
-// session under the same ID and get "OK" back as if it were data: two garbage
-// bytes in a SOCKS stream, a bogus frame length in TUN. It must be refused like
-// a bad token so the client opens a new session, and the client's real init
-// (no body, nothing acked) must still open one.
-func TestPollingStalePollDoesNotReopenSession(t *testing.T) {
+// TestPollingStalePollGetsResetNotNewSession: after the server lost a session -
+// swept, or gone with the process on a restart - its client's next poll carries
+// an ack and often a body. Opening a fresh session under that ID left one
+// nobody reads holding a slot and answered "OK" into the client's data stream.
+// Now the ID stays unknown and the client gets one reset frame, the only answer
+// client 1.11.5 acts on at once; a second poll for the same dead ID gets the
+// auth-failure answer, so a client that keeps polling is not kept alive by an
+// endless run of successful polls. The client's real init (no body, nothing
+// acked) still opens a session.
+func TestPollingStalePollGetsResetNotNewSession(t *testing.T) {
 	withPollingLimits(t, 0, 0)
 	secret := []byte("fx-polling-cap-global-secret")
 	srvCtx := pollingCapServerContext(t, secret)
 	ekm := bytes.Repeat([]byte{0x7e}, 32)
-	want := pollingAuthFailure(t)
 
-	const id = "fxcap-stale-0000"
+	var reset bytes.Buffer
+	sendHTTPPollingResponse(&pollingRecorder{&reset}, pollingSessionResetFrame(), false)
+	authFail := pollingAuthFailure(t)
+
 	for _, c := range []struct {
 		name string
+		id   string
 		ack  int64
 		body []byte
 	}{
-		{"idle poll with an ack", 12345, nil},
-		{"poll with data and an ack", 12345, []byte{0, 0, 0, 0}},
-		{"poll with data, nothing acked yet", 0, []byte{0, 14, '1', '0', '.', '0', '.', '0', '.', '1', ':', '8', '0', '8', '0', 'x'}},
+		{"idle poll with an ack", "fxcap-stale-idle", 12345, nil},
+		{"poll with data and an ack", "fxcap-stale-data", 12345, []byte{0, 0, 0, 0}},
+		{"poll with data, nothing acked yet", "fxcap-stale-body", 0, []byte{0, 14, '1', '0', '.', '0', '.', '0', '.', '1', ':', '8', '0', '8', '0', 'x'}},
 	} {
-		got := pollingRawExchange(t, srvCtx, pollingHead(id, pollingTokenFor(id, secret, ekm), c.ack, len(c.body)), bytes.NewReader(c.body))
-		if !bytes.Equal(got, want) {
-			t.Errorf("%s: answered %q, want the auth-failure answer", c.name, got)
+		t.Cleanup(func() { pollingManager.forgetReset(c.id) })
+		got := pollingRawExchange(t, srvCtx, pollingHead(c.id, pollingTokenFor(c.id, secret, ekm), c.ack, len(c.body)), bytes.NewReader(c.body))
+		if !bytes.Equal(got, reset.Bytes()) {
+			t.Errorf("%s: answered %q, want the reset frame %q", c.name, got, reset.Bytes())
 		}
-		if pollingManager.Get(id) != nil {
+		if pollingManager.Get(c.id) != nil {
 			t.Fatalf("%s: a session was opened under an ID the server had dropped", c.name)
+		}
+		// Second poll for the same dead ID: no more resets.
+		got = pollingRawExchange(t, srvCtx, pollingHead(c.id, pollingTokenFor(c.id, secret, ekm), c.ack, len(c.body)), bytes.NewReader(c.body))
+		if !bytes.Equal(got, authFail) {
+			t.Errorf("%s, polled again: answered %q, want the auth-failure answer %q", c.name, got, authFail)
+		}
+		if pollingManager.Get(c.id) != nil {
+			t.Fatalf("%s, polled again: a session was opened under the dead ID", c.name)
 		}
 	}
 
-	if st := pollingOpen(t, srvCtx, id, secret); st != http.StatusOK {
+	const initID = "fxcap-stale-init"
+	if st := pollingOpen(t, srvCtx, initID, secret); st != http.StatusOK {
 		t.Fatalf("the client's init request (no body, ack 0) answered %d", st)
+	}
+	if pollingManager.Get(initID) == nil {
+		t.Fatal("the init request opened no session")
+	}
+}
+
+// TestPollingResetFrameIsOverTheClientCeiling ties the reset to the only thing
+// that makes client 1.11.5 drop a session at once: a downlink frame length over
+// the protocol ceiling (maxFrameLen / meekMaxFrame, 65535). A reset the client
+// reads as a valid length would be data, and the tunnel would hang until the
+// client's health grace expired - 47.9s in a measured restart.
+func TestPollingResetFrameIsOverTheClientCeiling(t *testing.T) {
+	f := pollingSessionResetFrame()
+	if len(f) != 4 {
+		t.Fatalf("the reset is %d bytes; the client reads a 4-byte length header", len(f))
+	}
+	if n := binary.BigEndian.Uint32(f); n <= 65535 {
+		t.Fatalf("the reset announces a frame of %d bytes, which the client accepts as data", n)
+	}
+}
+
+// TestPollingResetBudgetBounded: the bookkeeping of which dead IDs were told
+// must not grow without limit, since any authenticated client can invent IDs.
+func TestPollingResetBudgetBounded(t *testing.T) {
+	now := time.Now()
+	for i := range pollingMaxResetIDs + 100 {
+		pollingManager.takeResetBudget(fmt.Sprintf("fxcap-budget-%06d", i), now)
+	}
+	pollingManager.mu.RLock()
+	n := len(pollingManager.resetAt)
+	pollingManager.mu.RUnlock()
+	t.Cleanup(func() {
+		for i := range pollingMaxResetIDs + 100 {
+			pollingManager.forgetReset(fmt.Sprintf("fxcap-budget-%06d", i))
+		}
+	})
+	if n > pollingMaxResetIDs {
+		t.Fatalf("reset bookkeeping holds %d ids, the bound is %d", n, pollingMaxResetIDs)
+	}
+}
+
+// TestPollingResetUnreachableWithoutSecret (rule 8): the reset frame is a new
+// answer on the wire, so a peer that cannot authenticate must never see it. It
+// is sent only after the token verifies, which this pins by trying the same
+// stale poll with a bad token and with a different client's secret.
+func TestPollingResetUnreachableWithoutSecret(t *testing.T) {
+	withPollingLimits(t, 0, 0)
+	secret := []byte("fx-polling-cap-global-secret")
+	srvCtx := pollingCapServerContext(t, secret)
+	srvCtx.registry = newTestRegistryWithSecrets(t, map[string]string{"alice": "fx-polling-r3-alice"})
+	ekm := bytes.Repeat([]byte{0x7e}, 32)
+
+	var reset bytes.Buffer
+	sendHTTPPollingResponse(&pollingRecorder{&reset}, pollingSessionResetFrame(), false)
+	want := pollingAuthFailure(t)
+
+	for _, c := range []struct {
+		name  string
+		id    string
+		token string
+	}{
+		{"made-up token", "fxcap-nosecret-1", "AAAAAAAAAAAAAAAA"},
+		{"token for another session id", "fxcap-nosecret-2", pollingTokenFor("fxcap-nosecret-9", secret, ekm)},
+		{"token bound to another TLS session", "fxcap-nosecret-3", pollingTokenFor("fxcap-nosecret-3", secret, bytes.Repeat([]byte{0x11}, 32))},
+		{"wrong secret", "fxcap-nosecret-4", pollingTokenFor("fxcap-nosecret-4", []byte("fx-polling-r3-not-a-secret"), ekm)},
+	} {
+		t.Cleanup(func() { pollingManager.forgetReset(c.id) })
+		got := pollingRawExchange(t, srvCtx, pollingHead(c.id, c.token, 12345, 0), bytes.NewReader(nil))
+		if bytes.Equal(got, reset.Bytes()) {
+			t.Fatalf("%s: a peer with no valid secret got the reset frame", c.name)
+		}
+		if !bytes.Equal(got, want) {
+			t.Errorf("%s: answered %q, want the auth-failure answer %q", c.name, got, want)
+		}
 	}
 }

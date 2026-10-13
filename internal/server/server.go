@@ -4772,6 +4772,10 @@ type HTTPPollingManager struct {
 	maxSessions  int
 	maxPerClient int
 
+	// resetAt remembers the session IDs that were answered with a reset frame,
+	// so each dead ID gets at most one. Guarded by mu, swept with the sessions.
+	resetAt map[string]time.Time
+
 	refusedNode    atomic.Uint64 // new sessions refused at the node ceiling
 	refusedClient  atomic.Uint64 // new sessions refused at a client's ceiling
 	tunDropped     atomic.Uint64 // TUN frames dropped on a full downlink, all sessions
@@ -4827,8 +4831,37 @@ var (
 // Global polling manager
 var pollingManager = &HTTPPollingManager{
 	sessions:        make(map[string]*HTTPPollingSession),
+	resetAt:         make(map[string]time.Time),
 	cleanupInterval: pollingSweepInterval,
 	sessionTimeout:  pollingSessionTimeout,
+}
+
+// pollingMaxResetIDs bounds the reset bookkeeping. Past it a stale poll gets
+// the auth-failure answer instead of a reset: the memory of who has been told
+// is worth less than a bound on it.
+const pollingMaxResetIDs = 4096
+
+// takeResetBudget reports whether this session ID may be answered with a reset
+// frame, and records that it was. One per ID until the sweep forgets it.
+func (pm *HTTPPollingManager) takeResetBudget(sessionID string, now time.Time) bool {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	if _, told := pm.resetAt[sessionID]; told {
+		return false
+	}
+	if len(pm.resetAt) >= pollingMaxResetIDs {
+		return false
+	}
+	pm.resetAt[sessionID] = now
+	return true
+}
+
+// forgetReset drops one ID from the reset bookkeeping. Tests use it; the sweep
+// does the same by age.
+func (pm *HTTPPollingManager) forgetReset(sessionID string) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	delete(pm.resetAt, sessionID)
 }
 
 // setLimits sets the session ceilings; 0 turns one off.
@@ -4873,6 +4906,11 @@ func (pm *HTTPPollingManager) cleanup() {
 	defer pm.mu.Unlock()
 
 	now := time.Now()
+	for id, at := range pm.resetAt {
+		if now.Sub(at) > pm.sessionTimeout {
+			delete(pm.resetAt, id)
+		}
+	}
 	for id, sess := range pm.sessions {
 		// A closed session is dead whatever its clock says: nothing relays for
 		// it, yet a client still polling it would keep it in the map.
@@ -5328,6 +5366,32 @@ func pollingStaleSessionPoll(ackSeq int64, body []byte) bool {
 	return ackSeq > 0 || len(body) > 0
 }
 
+// pollingSessionResetFrame is what a client polling a session the server does
+// not have gets back: a frame header announcing a length of 4294967295.
+//
+// It exists because of what the deployed client does, not because of protocol
+// design. There is no "no such session" in the wire format, and client 1.11.5
+// treats a failed poll as a transport hiccup: it retries, and only declares the
+// session dead once no poll has succeeded within its health grace - in a
+// measured server restart, 47.9s before the tunnel came back, against 1.3s on
+// main. One signal it acts on immediately is a downlink frame length over the
+// protocol ceiling (maxFrameLen 65535 in internal/tun/vpn.go, meekMaxFrame in
+// internal/strategy/http_polling_framing.go): the relay tears the tunnel down
+// and reconnects. On main a reopened session answered "OK", whose bytes read as
+// the length 0x4f4b4f4b - over the ceiling, and that accident is what made a
+// restart recover fast. This sends the same signal on purpose, and without
+// leaving a session behind.
+//
+// For a SOCKS session these four bytes land in the proxied stream, which is
+// what "OK" did on main; the connection is finished either way, since the
+// server that held its target is gone. Sent at most once per session ID
+// (takeResetBudget), so a client that keeps polling a dead ID gets the
+// auth-failure answer afterwards rather than an endless trickle of resets that
+// would also keep its poll layer looking alive.
+func pollingSessionResetFrame() []byte {
+	return []byte{0xff, 0xff, 0xff, 0xff}
+}
+
 // pollingLogID is the part of a session ID the logs show. IDs come from the
 // peer, before any check, so this must not assume a length.
 func pollingLogID(id string) string {
@@ -5576,18 +5640,23 @@ func processHTTPPollingRequest(conn net.Conn, reader *bufio.Reader, srvCtx *serv
 	}
 
 	if isNew {
-		// A session opens with the client's init request, which carries no
-		// body and acks nothing (init() in internal/strategy/http_polling.go). A
-		// poll with data or an ack under an ID the server does not know belongs
-		// to a session that is gone - swept after its client went quiet past
-		// pollingSessionTimeout, a suspended laptop for one. Answering it "OK"
-		// put two garbage bytes into a SOCKS stream and a bogus frame length
-		// into TUN. It is refused the way a bad token is, so the client's polls
-		// fail, it declares the session dead and opens a new one.
+		// A session opens with the client's init request, which carries no body
+		// and acks nothing (init() in internal/strategy/http_polling.go). A poll
+		// with data or an ack under an ID the server does not know belongs to a
+		// session that is gone: swept after its client went quiet, or lost with
+		// the process on a restart. Opening a fresh session under that ID and
+		// answering "OK" left a session nobody reads holding a slot, so the
+		// session is dropped again here. The answer is the reset below.
 		if pollingStaleSessionPoll(ackSeq, body) {
-			logger.Debug("HTTP Polling: Poll for unknown session %s (ack=%d, body=%d bytes), not reopening it", pollingLogID(sessionID), ackSeq, len(body))
 			pollingManager.removeSession(sess)
-			sendHTTPPollingError(conn, "Authentication failed")
+			reset := pollingManager.takeResetBudget(sessionID, time.Now())
+			logger.Debug("HTTP Polling: Poll for unknown session %s (ack=%d, body=%d bytes), not reopening it (reset=%v)",
+				pollingLogID(sessionID), ackSeq, len(body), reset)
+			if reset {
+				sendHTTPPollingResponse(conn, pollingSessionResetFrame(), false)
+			} else {
+				sendHTTPPollingError(conn, "Authentication failed")
+			}
 			return false
 		}
 		logger.Info("HTTP Polling: New session %s (client: %s)", pollingLogID(sessionID), clientID)
