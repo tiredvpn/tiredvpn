@@ -28,6 +28,15 @@ type ConnectivityResult struct {
 	UDP  bool // UDP connectivity check passed
 	ICMP bool // ICMP ping succeeded (optional)
 
+	// UDPKnown is true when UDP carries a verdict from a probe that finished,
+	// this round or an earlier one. It is false on a cold start whose probe
+	// has not landed yet: UDP is then a zero value, not a "blocked" verdict,
+	// and the QUIC gate must not read it as one. The probe's only positive answer
+	// is its own read timeout, which is longer than the grace Check waits, so
+	// before this field every cold start read the placeholder as "UDP down"
+	// and a forced -strategy quic_salamander client exited on the spot.
+	UDPKnown bool
+
 	// Addr is the address that actually answered the TCP gate, empty when none
 	// did. The gate already tries several addresses and knows which one worked;
 	// reporting it costs nothing and is what lets the endpoint selector learn
@@ -197,24 +206,22 @@ func (c *ConnectivityChecker) Check(ctx context.Context) ConnectivityResult {
 		result.Error = tcpErr
 	}
 
+	auxPending := false
 	select {
 	case <-auxDone:
 		result.UDP = udpOK.Load()
 		result.ICMP = icmpOK.Load()
+		result.UDPKnown = true
 	case <-time.After(c.auxGrace):
 		// Aux probes are slow this round; reuse the last known verdict and let
-		// them refresh the cache once they land.
+		// them refresh the cache once they land. On a cold start there is no
+		// last verdict, and UDPKnown stays false to say so.
 		c.mu.RLock()
 		result.UDP = c.lastResult.UDP
 		result.ICMP = c.lastResult.ICMP
+		result.UDPKnown = c.lastResult.UDPKnown
 		c.mu.RUnlock()
-		go func() {
-			<-auxDone
-			c.mu.Lock()
-			c.lastResult.UDP = udpOK.Load()
-			c.lastResult.ICMP = icmpOK.Load()
-			c.mu.Unlock()
-		}()
+		auxPending = true
 	}
 
 	// The address that ANSWERED, not the one the walk started from. The gate
@@ -232,6 +239,20 @@ func (c *ConnectivityChecker) Check(ctx context.Context) ConnectivityResult {
 	c.mu.Lock()
 	c.lastResult = result
 	c.mu.Unlock()
+
+	// Started only after the store above: a probe landing between the select
+	// and the store would otherwise have its verdict overwritten by the
+	// placeholder this round carried.
+	if auxPending {
+		go func() {
+			<-auxDone
+			c.mu.Lock()
+			c.lastResult.UDP = udpOK.Load()
+			c.lastResult.ICMP = icmpOK.Load()
+			c.lastResult.UDPKnown = true
+			c.mu.Unlock()
+		}()
+	}
 
 	return result
 }
@@ -257,6 +278,7 @@ func (c *ConnectivityChecker) checkTCPOnly(ctx context.Context) ConnectivityResu
 	c.mu.Lock()
 	result.UDP = c.lastResult.UDP
 	result.ICMP = c.lastResult.ICMP
+	result.UDPKnown = c.lastResult.UDPKnown
 	c.lastResult = result
 	c.mu.Unlock()
 

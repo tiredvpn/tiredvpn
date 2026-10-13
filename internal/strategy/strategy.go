@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -293,6 +294,27 @@ func (m *Manager) applyUDPGate(udpOK bool) {
 	m.mu.Unlock()
 }
 
+// udpGateDeferQUIC handles a pre-flight that ended before the UDP probe did.
+//
+// Forced mode keeps QUIC: the user asked for it and there is nothing else to
+// try. Auto mode lets it sit out this scan instead, exactly as it did before
+// verdicts were tracked, and on purpose now: the probe cannot see a silent
+// drop (its "UDP works" is just its read timeout), so the pending verdict
+// adds nothing, while a QUIC dial into a dropped path costs ~10s of handshake
+// timeout ahead of every TCP strategy. The verdict lands in the checker's
+// cache and decides the next pre-flight.
+func (m *Manager) udpGateDeferQUIC() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.forced {
+		return
+	}
+	if !m.excludeUDPStrategies {
+		log.Debug("UDP verdict not in yet, QUIC strategies sit out this scan")
+	}
+	m.excludeUDPStrategies = true
+}
+
 // shouldSkipFastReconnect records a fast-reconnect attempt for strategyID and
 // reports whether the fast path should be skipped in favor of a full scan. A
 // strategy that fast-reconnects more than fastReconnectLimit times inside
@@ -535,6 +557,13 @@ func (m *Manager) sortStrategies() {
 func (m *Manager) ForceStrategy(idPrefix string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	if err := quicPlainForceError(idPrefix, m.strategies); err != nil {
+		// Logged here as well: callers wrap the error into a generic
+		// "unknown strategy" line, and the reason is the useful part.
+		log.Error("%v", err)
+		return err
+	}
 
 	var matched []Strategy
 	for _, s := range m.strategies {
@@ -1061,7 +1090,14 @@ func (m *Manager) preflightCandidate(ctx context.Context, sel *endpoint.Selector
 		}
 	}
 
-	m.applyUDPGate(result.UDP)
+	// Only a finished probe is a verdict. A cold start whose probe is still in
+	// flight carries UDP=false as a placeholder, and reading it as "blocked"
+	// left a forced -strategy quic_salamander client with no strategy at all.
+	if result.UDPKnown {
+		m.applyUDPGate(result.UDP)
+	} else {
+		m.udpGateDeferQUIC()
+	}
 
 	if sel == nil || result.Addr == "" {
 		return cand, nil
@@ -1967,25 +2003,51 @@ func registerQUICStrategies(m *Manager, cfg DefaultManagerConfig, hasServer, has
 		return
 	}
 
-	port := cfg.QUICPort
-	if port == 0 {
-		port = 443
-	}
-	quicStrat := NewQUICStrategy(m, cfg.Secret, port)
+	// The server's QUIC listener speaks exactly one dialect: Salamander by
+	// default, unwrapped QUIC only under -quic-sni-reassembly, which exists for
+	// -quic-sni-frag clients (QUICServer.wrapPacketConn). So the two client
+	// variants are exclusive, and the switch between them is QUICSNIFragEnabled.
+	// Plain QUIC used to be registered next to Salamander as well; against a
+	// default server it could only time out, costing a full handshake timeout
+	// per scan and failing every -strategy quic run.
 	if cfg.QUICSNIFragEnabled {
-		quicStrat.SetSNIFragmentation(true, nil)
-	}
-	m.Register(quicStrat)
-
-	// SNI fragmentation replaces Salamander with the fragmenting plain-QUIC
-	// variant above; only register Salamander when SNI frag is off.
-	if !cfg.QUICSNIFragEnabled {
-		salPort := cfg.QUICSalamanderPort
-		if salPort == 0 {
-			salPort = derivedSalamanderPort(cfg)
+		port := cfg.QUICPort
+		if port == 0 {
+			port = 443
 		}
-		m.Register(NewQUICSalamanderStrategy(m, cfg.Secret, salPort))
+		quicStrat := NewQUICStrategy(m, cfg.Secret, port)
+		quicStrat.SetSNIFragmentation(true, nil)
+		m.Register(quicStrat)
+		return
 	}
+
+	salPort := cfg.QUICSalamanderPort
+	if salPort == 0 {
+		salPort = derivedSalamanderPort(cfg)
+	}
+	m.Register(NewQUICSalamanderStrategy(m, cfg.Secret, salPort))
+}
+
+// quicPlainForceError explains a -strategy quic that has nothing to match.
+// Plain QUIC is only registered in SNI-fragmentation mode (see
+// registerQUICStrategies), and the prefix match in ForceStrategy would
+// otherwise hand the user Salamander under a name they did not ask for.
+// Returns nil unless idPrefix is "quic", plain QUIC is absent and Salamander
+// is present - without -quic neither exists and the plain "no strategy
+// matching" answer is the right one.
+func quicPlainForceError(idPrefix string, registered []Strategy) error {
+	if idPrefix != "quic" {
+		return nil
+	}
+	has := func(id string) bool {
+		return slices.ContainsFunc(registered, func(s Strategy) bool { return s.ID() == id })
+	}
+	if has("quic") || !has("quic_salamander") {
+		return nil
+	}
+	return fmt.Errorf("strategy quic (plain QUIC) is not available: the server's QUIC listener " +
+		"speaks Salamander unless it runs with -quic-sni-reassembly, and plain QUIC is only enabled " +
+		"with -quic-sni-frag; use -strategy quic_salamander, or -quic-sni-frag against such a server")
 }
 
 // registerTLSStrategies registers REALITY, WebSocket, HTTP Polling and HTTP/2 Stego.
