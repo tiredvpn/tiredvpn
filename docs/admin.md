@@ -51,7 +51,7 @@ tiredvpn admin add \
 | `-max-conns` | `0` | Max concurrent connections. Sent only when `> 0`; `0` means unlimited |
 | `-expires-in` | never | Expiry as a Go duration, e.g. `720h`. Sent only when non-empty |
 | `-quic` | `true` | `quic` parameter in the connection string |
-| `-quic-port` | `8443` | `quicPort` parameter |
+| `-quic-port` | `0` | `quicPort` parameter, left out when 0 |
 | `-strategy` | `auto` | `strategy` parameter |
 | `-cover` | `api.googleapis.com` | `cover` parameter |
 
@@ -115,7 +115,7 @@ tiredvpn admin qr \
 | `-server` | | **required** Server address |
 | `-secret` | | **required** Client secret |
 | `-quic` | `true` | `quic` parameter |
-| `-quic-port` | `8443` | `quicPort` parameter |
+| `-quic-port` | `0` | `quicPort` parameter, left out when 0 |
 | `-strategy` | `auto` | `strategy` parameter |
 | `-cover` | `api.googleapis.com` | `cover` parameter |
 
@@ -138,6 +138,8 @@ tired://<server-address>?secret=<secret>
 ```
 
 `rtt`, `rttProfile` and `fallback` are hardcoded; no flag changes them.
+`quicPort` is only written when `-quic-port` is set, and clients ignore it:
+they dial QUIC on the server port.
 
 ## REST API
 

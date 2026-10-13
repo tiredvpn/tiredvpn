@@ -319,7 +319,7 @@ tiredvpn client \
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-quic` | `false` | Enable QUIC transport (UDP, highest priority) |
-| `-quic-port` | `8443` | Server QUIC port |
+| `-quic-port` | `0` | Ignored, kept so old configs still parse. QUIC dials the `-server` port; a different value logs a warning |
 | `-quic-sni-frag` | `false` | Fragment QUIC Initial SNI (GFW bypass) |
 | `-tls-fingerprint` | | uTLS browser profile for the ClientHello; empty uses `firefox` |
 | `-seqovl-packet` | `false` | Packet-level TCP sequence overlap for the `seqovl` strategy; additive to the app-framing decoy. Linux + `CAP_NET_ADMIN` + an `OUTPUT` NFQUEUE rule. Off = app-framing only (works everywhere, incl. Android) |

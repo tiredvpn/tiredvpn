@@ -249,8 +249,8 @@ func TestDerivedSalamanderPortFallsBackToTheEndpointList(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := derivedSalamanderPort(c.cfg); got != c.want {
-				t.Errorf("derivedSalamanderPort = %d, want %d", got, c.want)
+			if got := derivedQUICPort(c.cfg); got != c.want {
+				t.Errorf("derivedQUICPort = %d, want %d", got, c.want)
 			}
 		})
 	}

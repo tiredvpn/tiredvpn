@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -116,11 +117,12 @@ func QUICServerMarker(secret, nonce []byte) []byte {
 type QUICStrategy struct {
 	manager *Manager // IPv6/IPv4 transport layer support
 	secret  []byte
-	port    int
+	// port is the server's UDP port for this strategy, 0 to keep the port of
+	// the pinned address. See quicDialAddr.
+	port int
 
 	// Salamander obfuscation (optional)
-	useSalamander  bool
-	salamanderPort int // Separate port for Salamander QUIC (default: 8443)
+	useSalamander bool
 
 	// SNI fragmentation for GFW bypass
 	sniFragmentEnabled bool
@@ -131,11 +133,10 @@ type QUICStrategy struct {
 // manager is required for IPv6/IPv4 transport layer support
 func NewQUICStrategy(manager *Manager, secret []byte, port int) *QUICStrategy {
 	return &QUICStrategy{
-		manager:        manager,
-		secret:         secret,
-		port:           port,
-		useSalamander:  false,
-		salamanderPort: 8443,
+		manager:       manager,
+		secret:        secret,
+		port:          port,
+		useSalamander: false,
 	}
 }
 
@@ -143,11 +144,10 @@ func NewQUICStrategy(manager *Manager, secret []byte, port int) *QUICStrategy {
 // manager is required for IPv6/IPv4 transport layer support
 func NewQUICSalamanderStrategy(manager *Manager, secret []byte, port int) *QUICStrategy {
 	return &QUICStrategy{
-		manager:        manager,
-		secret:         secret,
-		port:           port,
-		useSalamander:  true,
-		salamanderPort: port, // Use provided port
+		manager:       manager,
+		secret:        secret,
+		port:          port,
+		useSalamander: true,
 	}
 }
 
@@ -283,29 +283,28 @@ func (s *QUICStrategy) buildProbePacket() []byte {
 	return packet
 }
 
+// quicDialAddr is where this strategy's datagrams go: the pinned endpoint's
+// host (IPv6/IPv4 with automatic fallback) on the strategy's UDP port. Probe,
+// Connect and the connectivity gate's UDP check all use it, so the three never
+// disagree about which port QUIC lives on - plain QUIC used to dial the TCP
+// port as is, while Salamander replaced it.
+func (s *QUICStrategy) quicDialAddr(ctx context.Context) string {
+	addr := s.manager.GetServerAddr(ctx)
+	if s.port == 0 {
+		return addr
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	return net.JoinHostPort(host, strconv.Itoa(s.port))
+}
+
 // Connect establishes a QUIC connection
 func (s *QUICStrategy) Connect(ctx context.Context, target string) (net.Conn, error) {
-	// Get server address (IPv6/IPv4 with automatic fallback)
-	addr := s.manager.GetServerAddr(ctx)
+	addr := s.quicDialAddr(ctx)
 	secret := dialSecret(ctx, s.secret)
-
-	// Use Salamander port if enabled
-	if s.useSalamander {
-		// Replace port in address
-		host, _, err := net.SplitHostPort(addr)
-		if err != nil {
-			host = addr
-		}
-		// Preserve IPv6 bracket notation
-		if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
-			addr = fmt.Sprintf("[%s]:%d", host, s.salamanderPort)
-		} else {
-			addr = fmt.Sprintf("%s:%d", host, s.salamanderPort)
-		}
-		log.Debug("QUIC Salamander: Using server address %s", addr)
-	} else {
-		log.Debug("QUIC: Using server address %s", addr)
-	}
+	log.Debug("%s: Using server address %s", s.Name(), addr)
 
 	// Create QUIC config with evasion settings
 	quicConfig := &quic.Config{

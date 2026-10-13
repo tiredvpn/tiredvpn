@@ -1641,10 +1641,12 @@ type DefaultManagerConfig struct {
 	MuxConfig  *mux.Config // Mux configuration (nil = use default)
 
 	// QUIC configuration
-	QUICEnabled           bool // Enable QUIC strategy
-	QUICPort              int  // QUIC server port (default: 443)
+	QUICEnabled bool // Enable QUIC strategy
+	// QUICPort is what -quic-port carried. It is not a dial port: QUIC goes to
+	// derivedQUICPort, and a different value only earns a warning (see
+	// registerQUICStrategies).
+	QUICPort              int
 	QUICSalamanderEnabled bool // Enable QUIC with Salamander obfuscation
-	QUICSalamanderPort    int  // QUIC Salamander port (default: 8443)
 
 	// ICMP tunnel configuration (backup transport, requires CAP_NET_RAW)
 	ICMPTunnelEnabled bool // Enable ICMP tunnel strategy (off by default)
@@ -1893,13 +1895,15 @@ func registerAllStrategies(m *Manager, cfg DefaultManagerConfig) {
 	registerICMPStrategy(m, cfg, hasServer, hasSecret)
 }
 
-// derivedSalamanderPort picks the Salamander port when the flag left it unset:
-// the port of ServerAddr, then of the first endpoint, then 443.
+// derivedQUICPort is the UDP port both QUIC variants dial: the port of
+// ServerAddr, then of the first endpoint, then 443. The server opens its QUIC
+// listener on its -listen address unless told otherwise (-quic-listen), so the
+// TCP port the client already dials is where QUIC is.
 //
 // The endpoint fallback matters for a client configured only through
 // [[servers]], where ServerAddr is empty and the old derivation silently landed
 // on 443 - a port the exit is not listening on.
-func derivedSalamanderPort(cfg DefaultManagerConfig) int {
+func derivedQUICPort(cfg DefaultManagerConfig) int {
 	addrs := []string{cfg.ServerAddr}
 	if len(cfg.Endpoints) > 0 {
 		addrs = append(addrs, cfg.Endpoints[0].V4, cfg.Endpoints[0].V6)
@@ -1922,8 +1926,7 @@ func derivedSalamanderPort(cfg DefaultManagerConfig) int {
 // warnEndpointPinnedFlags reports the settings that a server list silently
 // makes wrong, rather than letting them fail as an unexplained dead transport.
 //
-// The QUIC Salamander port, when not given explicitly, is derived from the
-// FIRST endpoint's port and then applied to whatever host the selector picks.
+// The QUIC port is derived from the FIRST endpoint's port and then applied to whatever host the selector picks.
 // With a list whose members listen on different ports that is simply the wrong
 // port on every endpoint but one. Making it per-endpoint needs a per-endpoint
 // port in the config, which the [[servers]] section does not carry today.
@@ -1931,7 +1934,7 @@ func warnEndpointPinnedFlags(cfg DefaultManagerConfig) {
 	if len(cfg.Endpoints) < 2 {
 		return
 	}
-	if !cfg.QUICEnabled || cfg.QUICSNIFragEnabled || cfg.QUICSalamanderPort != 0 {
+	if !cfg.QUICEnabled {
 		return
 	}
 	ports := make(map[string]bool, len(cfg.Endpoints))
@@ -1946,8 +1949,8 @@ func warnEndpointPinnedFlags(cfg DefaultManagerConfig) {
 		}
 	}
 	if len(ports) > 1 {
-		log.Warn("QUIC Salamander port is derived from the first endpoint but the pool uses %d different ports; "+
-			"set quic_salamander_port explicitly or Salamander will dial the wrong port on the others", len(ports))
+		log.Warn("QUIC port is derived from the first endpoint but the pool uses %d different ports; "+
+			"QUIC will dial the wrong port on the others - keep the pool on one port to use QUIC", len(ports))
 	}
 }
 
@@ -2010,22 +2013,29 @@ func registerQUICStrategies(m *Manager, cfg DefaultManagerConfig, hasServer, has
 	// Plain QUIC used to be registered next to Salamander as well; against a
 	// default server it could only time out, costing a full handshake timeout
 	// per scan and failing every -strategy quic run.
-	if cfg.QUICSNIFragEnabled {
-		port := cfg.QUICPort
-		if port == 0 {
-			port = 443
-		}
-		quicStrat := NewQUICStrategy(m, cfg.Secret, port)
-		quicStrat.SetSNIFragmentation(true, nil)
-		m.Register(quicStrat)
-		return
+	//
+	// Both dial the server's port. -quic-port never reached a dial: plain QUIC
+	// ignored it and Salamander derived its own port, while the startup line
+	// printed the flag's 8443 default. It stays ignored rather than starting to
+	// work now, because the Android app sends -quic-port on every start with
+	// values nobody chose - its own 443 default, or the 8443 that "admin add"
+	// wrote into connection strings - and honouring them would point QUIC at
+	// ports no server listens on.
+	port := derivedQUICPort(cfg)
+	if cfg.QUICPort != 0 && cfg.QUICPort != port {
+		log.Warn("-quic-port %d is ignored: QUIC dials the server's port %d, where its QUIC listener sits "+
+			"unless the server runs with -quic-listen", cfg.QUICPort, port)
 	}
 
-	salPort := cfg.QUICSalamanderPort
-	if salPort == 0 {
-		salPort = derivedSalamanderPort(cfg)
+	var s *QUICStrategy
+	if cfg.QUICSNIFragEnabled {
+		s = NewQUICStrategy(m, cfg.Secret, port)
+		s.SetSNIFragmentation(true, nil)
+	} else {
+		s = NewQUICSalamanderStrategy(m, cfg.Secret, port)
 	}
-	m.Register(NewQUICSalamanderStrategy(m, cfg.Secret, salPort))
+	log.Info("QUIC transport: %s on UDP port %d", s.Name(), port)
+	m.Register(s)
 }
 
 // quicPlainForceError explains a -strategy quic that has nothing to match.

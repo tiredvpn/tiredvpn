@@ -145,12 +145,13 @@ CRYPTO frames — it applies to the plain `quic` strategy, and when it is on
 `quic_salamander` is **not registered at all** (the two are alternatives, not
 layers).
 
-`-quic-port` sets the plain-QUIC port (default 8443). The Salamander port has no
-flag or TOML key: it is always derived from the port of `-server`, then the
-first endpoint, then 443. With a multi-endpoint pool listening on mixed ports
-the client warns, and the warning names a `quic_salamander_port` setting that
-does not exist — the only fix today is to make the pool homogeneous on the port
-Salamander should use.
+Both variants dial UDP on the port of `-server` (then the first endpoint,
+then 443): the server opens its QUIC listener on its `-listen` address unless it
+runs with `-quic-listen`, and a server moved elsewhere that way is not reachable
+over QUIC from the client. `-quic-port` is accepted and ignored - it never
+reached a dial, and the Android app sends it with values nobody chose. With a
+multi-endpoint pool listening on mixed ports the client warns, since QUIC then
+dials the first endpoint's port everywhere.
 
 ### HTTP/2 Steganography — `http2_stego`
 
