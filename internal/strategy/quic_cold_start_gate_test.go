@@ -217,40 +217,6 @@ func TestQUICRegistrationMatchesServerDialect(t *testing.T) {
 	}
 }
 
-// TestQUICPlainForceExplains covers -strategy quic where only Salamander is
-// registered: the prefix match would quietly hand over quic_salamander, so it
-// must refuse with the reason instead. Without -quic at all the generic
-// "no strategy matching" answer stays.
-func TestQUICPlainForceExplains(t *testing.T) {
-	salamanderOnly := func() *Manager {
-		m := NewManager()
-		m.Register(&mockStrategy{id: "quic_salamander", priority: 4})
-		m.Register(&mockStrategy{id: "confusion_0", priority: 10})
-		return m
-	}
-
-	err := salamanderOnly().ForceStrategy("quic")
-	if err == nil || !strings.Contains(err.Error(), "-quic-sni-frag") {
-		t.Fatalf("forcing plain quic with only Salamander registered: %v", err)
-	}
-	if err := salamanderOnly().ForceStrategy("quic_salamander"); err != nil {
-		t.Fatalf("forcing quic_salamander: %v", err)
-	}
-
-	m := NewManager()
-	m.Register(&mockStrategy{id: "confusion_0", priority: 10})
-	if err := m.ForceStrategy("quic"); err == nil || strings.Contains(err.Error(), "-quic-sni-frag") {
-		t.Fatalf("without any QUIC strategy want the generic error, got: %v", err)
-	}
-
-	m = NewManager()
-	m.Register(&mockStrategy{id: "quic", priority: 5})
-	m.Register(&mockStrategy{id: "quic_salamander", priority: 4})
-	if err := m.ForceStrategy("quic"); err != nil {
-		t.Fatalf("plain quic registered, force must succeed: %v", err)
-	}
-}
-
 // TestUDPGateRefreshAppliesLandedVerdict: a cold start in auto mode defers
 // QUIC until the probe lands. The landed verdict used to wait for the next
 // pre-flight, which a connected client only runs after two failed connects,

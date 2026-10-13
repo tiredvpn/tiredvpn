@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -621,11 +620,11 @@ func (m *Manager) ForceStrategy(idPrefix string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if err := quicPlainForceError(idPrefix, m.strategies); err != nil {
-		// Logged here as well: callers wrap the error into a generic
-		// "unknown strategy" line, and the reason is the useful part.
-		log.Error("%v", err)
-		return err
+	if q := quicPlainForForce(idPrefix, m.strategies); q != nil {
+		log.Warn("Plain QUIC forced without -quic-sni-frag: it only reaches a server running " +
+			"-quic-sni-reassembly; a default server speaks Salamander (-strategy quic_salamander)")
+		m.strategies = append(m.strategies, q)
+		m.results[q.ID()] = &Result{Strategy: q, Confidence: 0.5}
 	}
 
 	var matched []Strategy
@@ -2102,26 +2101,33 @@ func registerQUICStrategies(m *Manager, cfg DefaultManagerConfig, hasServer, has
 	m.Register(s)
 }
 
-// quicPlainForceError explains a -strategy quic that has nothing to match.
-// Plain QUIC is only registered in SNI-fragmentation mode (see
-// registerQUICStrategies), and the prefix match in ForceStrategy would
-// otherwise hand the user Salamander under a name they did not ask for.
-// Returns nil unless idPrefix is "quic", plain QUIC is absent and Salamander
-// is present - without -quic neither exists and the plain "no strategy
-// matching" answer is the right one.
-func quicPlainForceError(idPrefix string, registered []Strategy) error {
+// quicPlainForForce builds plain QUIC for an explicit -strategy quic when
+// only Salamander is registered, or returns nil.
+//
+// Auto mode registers one dialect per client (see registerQUICStrategies),
+// but a server started with -quic-sni-reassembly speaks unwrapped QUIC to any
+// client, fragmenting or not, and main reached it with a plain -strategy quic.
+// Asking for it by name is the one signal that the server is such a one, so
+// that is when it comes back - with Salamander's port and secret, the same
+// server. Without -quic neither exists and the plain "no strategy matching"
+// answer is the right one.
+func quicPlainForForce(idPrefix string, registered []Strategy) *QUICStrategy {
 	if idPrefix != "quic" {
 		return nil
 	}
-	has := func(id string) bool {
-		return slices.ContainsFunc(registered, func(s Strategy) bool { return s.ID() == id })
+	var sal *QUICStrategy
+	for _, s := range registered {
+		if s.ID() == "quic" {
+			return nil
+		}
+		if q, ok := s.(*QUICStrategy); ok && q.useSalamander {
+			sal = q
+		}
 	}
-	if has("quic") || !has("quic_salamander") {
+	if sal == nil {
 		return nil
 	}
-	return fmt.Errorf("strategy quic (plain QUIC) is not available: the server's QUIC listener " +
-		"speaks Salamander unless it runs with -quic-sni-reassembly, and plain QUIC is only enabled " +
-		"with -quic-sni-frag; use -strategy quic_salamander, or -quic-sni-frag against such a server")
+	return NewQUICStrategy(sal.manager, sal.secret, sal.port)
 }
 
 // registerTLSStrategies registers REALITY, WebSocket, HTTP Polling and HTTP/2 Stego.
