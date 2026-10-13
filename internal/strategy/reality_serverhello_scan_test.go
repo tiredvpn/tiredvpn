@@ -105,6 +105,13 @@ func TestValidateServerHelloSkipsDecoyBeforePadding(t *testing.T) {
 		// Record header 5, handshake header 4, version 2: random starts at 11.
 		{"decoy in random", func(hello []byte, _ int) { copy(hello[11+4:], shScanDecoy) }},
 		{"decoy in key share", func(hello []byte, at int) { copy(hello[at+500:], shScanDecoy) }},
+		// A decoy whose declared body runs past the real header: a scan that
+		// skipped a failed candidate's body would never see the credentials.
+		{"decoy body spans the padding", func(hello []byte, _ int) {
+			decoyAt := 11 + 4
+			bodyLen := len(hello) - (decoyAt + 4) - 100
+			copy(hello[decoyAt:], []byte{0x00, 0x15, byte(bodyLen >> 8), byte(bodyLen)})
+		}},
 		{"two decoys", func(hello []byte, at int) {
 			copy(hello[11+4:], shScanDecoy)
 			copy(hello[at+shScanKeyShareLen-100:], shScanDecoy)
