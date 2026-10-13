@@ -156,6 +156,9 @@ type Manager struct {
 	// Connectivity checker for pre-flight checks
 	connectivityChecker  *ConnectivityChecker
 	excludeUDPStrategies bool // Temporarily exclude UDP-based strategies if UDP is blocked
+	// udpGatePending marks an exclusion set by udpGateDeferQUIC rather than by
+	// a verdict: the next scan replaces it with the verdict once it has landed.
+	udpGatePending bool
 
 	// routeReachable, when set, reports whether the host has a physical route
 	// (off the tunnel) to a candidate address's family, and whether that answer
@@ -280,6 +283,7 @@ func (m *Manager) recordConnectResult(success bool) {
 // applyUDPGate flips QUIC/UDP strategy exclusion based on a fresh UDP probe.
 func (m *Manager) applyUDPGate(udpOK bool) {
 	m.mu.Lock()
+	m.udpGatePending = false
 	if !udpOK {
 		if !m.excludeUDPStrategies {
 			log.Info("UDP not working, temporarily excluding QUIC strategies")
@@ -302,7 +306,7 @@ func (m *Manager) applyUDPGate(udpOK bool) {
 // drop (its "UDP works" is just its read timeout), so the pending verdict
 // adds nothing, while a QUIC dial into a dropped path costs ~10s of handshake
 // timeout ahead of every TCP strategy. The verdict lands in the checker's
-// cache and decides the next pre-flight.
+// cache, and udpGateRefresh applies it at the start of the next scan.
 func (m *Manager) udpGateDeferQUIC() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -313,6 +317,23 @@ func (m *Manager) udpGateDeferQUIC() {
 		log.Debug("UDP verdict not in yet, QUIC strategies sit out this scan")
 	}
 	m.excludeUDPStrategies = true
+	m.udpGatePending = true
+}
+
+// udpGateRefresh replaces a deferral with the verdict that has landed since.
+// Without it the deferral stood until the next pre-flight, which a connected
+// client only runs after preflightFailThreshold failed connects in a row, so
+// one cold start kept QUIC out of every later scan.
+func (m *Manager) udpGateRefresh() {
+	m.mu.RLock()
+	pending, checker := m.udpGatePending, m.connectivityChecker
+	m.mu.RUnlock()
+	if !pending || checker == nil {
+		return
+	}
+	if r := checker.LastResult(); r.UDPKnown {
+		m.applyUDPGate(r.UDP)
+	}
 }
 
 // shouldSkipFastReconnect records a fast-reconnect attempt for strategyID and
@@ -1192,6 +1213,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 	// where a dial that nobody labelled picks up the pinned endpoint's secret.
 	// dialEndpoints labels its own, per candidate, and that label wins.
 	ctx = m.ensureDialSecret(ctx)
+	m.udpGateRefresh()
 
 	m.mu.RLock()
 	// Check if we have a recent successful strategy to try first (for fast reconnect)

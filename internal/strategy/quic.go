@@ -283,6 +283,18 @@ func (s *QUICStrategy) buildProbePacket() []byte {
 	return packet
 }
 
+// quicAutoHandshakeIdleTimeout bounds a QUIC dial in auto mode. The UDP gate
+// cannot tell a silent drop from a working path, so the dial itself is the
+// test, and with quic-go's default (5s idle, 2x that in total) a dropped path
+// held every TCP strategy behind it for 10.9s on a cold start. quic-go aborts
+// after this long without a single packet from the server, and after twice
+// this long in any case. On a live path the server answers within an RTT
+// plus a retransmit, so what auto mode gives up is a handshake that needs
+// more than two seconds in all, and the TCP strategies behind it are a fair
+// trade for that. Forced mode keeps the default: it has nothing to fall back
+// to and gains nothing from giving up early.
+const quicAutoHandshakeIdleTimeout = time.Second
+
 // quicDialAddr is where this strategy's datagrams go: the pinned endpoint's
 // host (IPv6/IPv4 with automatic fallback) on the strategy's UDP port. Probe,
 // Connect and the connectivity gate's UDP check all use it, so the three never
@@ -314,6 +326,9 @@ func (s *QUICStrategy) Connect(ctx context.Context, target string) (net.Conn, er
 		MaxIncomingUniStreams: 100,
 		// Enable 0-RTT for faster reconnection
 		Allow0RTT: true,
+	}
+	if s.manager == nil || !s.manager.IsForced() {
+		quicConfig.HandshakeIdleTimeout = quicAutoHandshakeIdleTimeout
 	}
 
 	// TLS config - we'll use whitelisted SNI

@@ -247,3 +247,45 @@ func TestQUICPlainForceExplains(t *testing.T) {
 		t.Fatalf("plain quic registered, force must succeed: %v", err)
 	}
 }
+
+// TestUDPGateRefreshAppliesLandedVerdict: a cold start in auto mode defers
+// QUIC until the probe lands. The landed verdict used to wait for the next
+// pre-flight, which a connected client only runs after two failed connects,
+// so one cold start kept QUIC out of every later scan. The next scan must
+// pick it up.
+func TestUDPGateRefreshAppliesLandedVerdict(t *testing.T) {
+	addr := udpGateServer(t, true)
+	m := NewManager()
+	m.Register(&mockStrategy{id: "quic_salamander", name: "QUIC Salamander", priority: 4, serverAddr: addr})
+	m.Register(&mockStrategy{id: "confusion_0", priority: 10, serverAddr: addr})
+	c := NewConnectivityChecker(addr, 2*time.Second, false)
+	m.SetConnectivityChecker(c)
+
+	conn, strat, err := m.Connect(t.Context(), addr)
+	if err != nil {
+		t.Fatalf("cold start: %v", err)
+	}
+	conn.Close()
+	if strat.ID() != "confusion_0" {
+		t.Fatalf("cold start dialled %s, want confusion_0 (QUIC deferred)", strat.ID())
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for !c.LastResult().UDPKnown {
+		if time.Now().After(deadline) {
+			t.Fatal("UDP verdict never landed")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// A full scan without the TCP strategy: only QUIC is left, so the scan
+	// connects if and only if the landed verdict re-admitted it.
+	conn, strat, err = m.ConnectExcluding(t.Context(), addr, []string{"confusion_0"})
+	if err != nil {
+		t.Fatalf("scan after the verdict landed: %v", err)
+	}
+	conn.Close()
+	if strat.ID() != "quic_salamander" {
+		t.Fatalf("scan dialled %s, want quic_salamander", strat.ID())
+	}
+}
