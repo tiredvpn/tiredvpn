@@ -293,6 +293,13 @@ func TestPollingResetFrameIsOverTheClientCeiling(t *testing.T) {
 	if n := binary.BigEndian.Uint32(f); n <= 65535 {
 		t.Fatalf("the reset announces a frame of %d bytes, which the client accepts as data", n)
 	}
+	// The Android relay of 1.11.4/1.11.5 (runServerToTUN -> handleOversizedPacket)
+	// allocates the announced length before reading it. Anything past the
+	// smallest over-ceiling length buys nothing on the desktop and costs a phone
+	// that much memory: 0xffffffff was a 4 GiB allocation.
+	if n := binary.BigEndian.Uint32(f); n > 65536 {
+		t.Fatalf("the reset announces %d bytes; a 1.11.x Android client allocates that much before reading", n)
+	}
 }
 
 // TestPollingResetBudgetBounded: the bookkeeping of which dead IDs were told

@@ -5367,20 +5367,35 @@ func pollingStaleSessionPoll(ackSeq int64, body []byte) bool {
 }
 
 // pollingSessionResetFrame is what a client polling a session the server does
-// not have gets back: a frame header announcing a length of 4294967295.
+// not have gets back: a frame header announcing a length of 65536, one byte
+// over the protocol ceiling.
 //
-// It exists because of what the deployed client does, not because of protocol
+// It exists because of what the deployed clients do, not because of protocol
 // design. There is no "no such session" in the wire format, and client 1.11.5
 // treats a failed poll as a transport hiccup: it retries, and only declares the
 // session dead once no poll has succeeded within its health grace - in a
 // measured server restart, 47.9s before the tunnel came back, against 1.3s on
-// main. One signal it acts on immediately is a downlink frame length over the
-// protocol ceiling (maxFrameLen 65535 in internal/tun/vpn.go, meekMaxFrame in
-// internal/strategy/http_polling_framing.go): the relay tears the tunnel down
-// and reconnects. On main a reopened session answered "OK", whose bytes read as
-// the length 0x4f4b4f4b - over the ceiling, and that accident is what made a
-// restart recover fast. This sends the same signal on purpose, and without
-// leaving a session behind.
+// main. The one signal it acts on at once is a downlink frame length over the
+// protocol ceiling. On main a reopened session answered "OK", whose bytes read
+// as the length 0x4f4b4f4b, and that accident is what made a restart recover
+// fast. This sends the signal on purpose, without leaving a session behind.
+//
+// The value is the smallest length over the ceiling, because the clients in
+// the field read the downlink on three paths and one of them allocates the
+// announced length before reading it (checked on the v1.11.4 and v1.11.5 tags):
+//
+//   - VPNClient (desktop -tun, internal/tun/vpn.go): checks the length against
+//     maxFrameLen (65535) before allocating and disconnects at once.
+//   - runServerToTUN (the control-socket relay the Android app runs on): has no
+//     such check; a length over the MTU goes to handleOversizedPacket, which
+//     allocates that many bytes and waits for them. 0xffffffff here was a 4 GiB
+//     allocation, a fatal out-of-memory on a phone; "OK" on main was 1.33 GiB.
+//     65536 costs 64 KiB, and the wait for bytes that never come ends at the
+//     relay's 30s read deadline, which reports the connection dead to the app.
+//     Slower than the desktop, but nothing worse than before. Clients from this
+//     change on reject the length before allocating (see runServerToTUN).
+//   - The meek stream tracker (internal/strategy/http_polling_framing.go,
+//     1.11.5): stops splicing keepalives, which only lets that deadline fire.
 //
 // For a SOCKS session these four bytes land in the proxied stream, which is
 // what "OK" did on main; the connection is finished either way, since the
@@ -5389,7 +5404,7 @@ func pollingStaleSessionPoll(ackSeq int64, body []byte) bool {
 // auth-failure answer afterwards rather than an endless trickle of resets that
 // would also keep its poll layer looking alive.
 func pollingSessionResetFrame() []byte {
-	return []byte{0xff, 0xff, 0xff, 0xff}
+	return []byte{0x00, 0x01, 0x00, 0x00}
 }
 
 // pollingLogID is the part of a session ID the logs show. IDs come from the
