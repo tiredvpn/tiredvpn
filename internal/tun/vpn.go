@@ -34,8 +34,10 @@ func isTemporaryError(err error) bool {
 		strings.Contains(errStr, "would block")
 }
 
-// Keepalive packet marker (zero-length packet signals keepalive)
-const keepaliveInterval = 10 * time.Second
+// Keepalive packet marker (zero-length packet signals keepalive). A var so
+// tests can shorten the ticker.
+var keepaliveInterval = 10 * time.Second
+
 const readTimeout = 30 * time.Second           // Must be > keepaliveInterval, detect dead connection faster
 const writeTimeout = 30 * time.Second          // Write timeout (was 5s, caused i/o timeouts with bufferbloat)
 const deadConnectionTimeout = 45 * time.Second // Proactive dead connection detection timeout
@@ -129,10 +131,11 @@ type VPNClient struct {
 	reconnecting int32 // Prevents concurrent reconnect attempts
 	stopCh       chan struct{}
 	mu           sync.Mutex
-	lastActive   time.Time // Track last activity for keepalive
-	// connectedAt and lastRx exist only to explain a disconnect in the log:
-	// how long the session lived and how long the server had been silent.
-	// lastActive cannot answer the second question, uplink refreshes it too.
+	// lastRx is when the server last sent anything, data or keepalive echo.
+	// It gates the keepalive and goes into the disconnect log next to
+	// connectedAt. Only downlink counts: the server echoes keepalives and sends
+	// none of its own, so uplink that draws no reply must not hold them back,
+	// or readTimeout fires on a live tunnel.
 	connectedAt time.Time
 	lastRx      time.Time
 
@@ -502,9 +505,8 @@ func (v *VPNClient) Start(ctx context.Context) error {
 	// background reconnect loop retries.
 	v.tun.InstallRoutes()
 
-	// Initialize last activity time
 	v.mu.Lock()
-	v.lastActive = time.Now()
+	v.lastRx = time.Now()
 	v.mu.Unlock()
 
 	// Subscribe to port hop events from strategy manager
@@ -767,9 +769,8 @@ func (v *VPNClient) seamlessPortHop(newPort int) {
 	v.conn = tunnelConn
 	v.strategy = newStrategy
 	v.serverAddr = newTarget
-	v.lastActive = time.Now()
-	v.connectedAt = v.lastActive
-	v.lastRx = v.lastActive
+	v.connectedAt = time.Now()
+	v.lastRx = v.connectedAt
 	v.mu.Unlock()
 
 	// Close old connection after swap
@@ -1437,15 +1438,17 @@ func (v *VPNClient) sendKeepalive() {
 
 			v.mu.Lock()
 			conn := v.conn
-			lastActive := v.lastActive
+			lastRx := v.lastRx
 			v.mu.Unlock()
 
 			if conn == nil {
 				continue
 			}
 
-			// Only send keepalive if no recent activity
-			if time.Since(lastActive) >= keepaliveInterval-time.Second {
+			// Send unless the server spoke within the last interval. Outgoing
+			// packets do not count: they may draw no reply at all, and then the
+			// echo is the only thing keeping readFromServer under readTimeout.
+			if time.Since(lastRx) >= keepaliveInterval*9/10 {
 				// Send zero-length packet as keepalive: [length:4=0]
 				keepalivePkt := make([]byte, 4)
 				binary.BigEndian.PutUint32(keepalivePkt, 0)
@@ -1503,7 +1506,6 @@ func (v *VPNClient) readFromTun() {
 
 		v.mu.Lock()
 		conn := v.conn
-		v.lastActive = time.Now() // Update activity timestamp
 		v.mu.Unlock()
 
 		if conn == nil {
@@ -1572,8 +1574,7 @@ func (v *VPNClient) readFromServer() {
 		if pktLen == 0 {
 			log.Debug("Received keepalive from server")
 			v.mu.Lock()
-			v.lastActive = time.Now()
-			v.lastRx = v.lastActive
+			v.lastRx = time.Now()
 			v.mu.Unlock()
 			continue
 		}
@@ -1662,10 +1663,8 @@ func (v *VPNClient) readFromServer() {
 			log.Debug("Successfully wrote %d bytes to TUN", n)
 		}
 
-		// Update activity timestamp
 		v.mu.Lock()
-		v.lastActive = time.Now()
-		v.lastRx = v.lastActive
+		v.lastRx = time.Now()
 		v.mu.Unlock()
 
 		atomic.AddInt64(&v.packetsDown, 1)
