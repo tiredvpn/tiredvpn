@@ -130,6 +130,11 @@ type VPNClient struct {
 	stopCh       chan struct{}
 	mu           sync.Mutex
 	lastActive   time.Time // Track last activity for keepalive
+	// connectedAt and lastRx exist only to explain a disconnect in the log:
+	// how long the session lived and how long the server had been silent.
+	// lastActive cannot answer the second question, uplink refreshes it too.
+	connectedAt time.Time
+	lastRx      time.Time
 
 	// connCancel cancels the context of an in-flight connect() so Stop() can
 	// abort a dial/handshake that is blocked on the network without waiting
@@ -697,7 +702,7 @@ func (v *VPNClient) seamlessPortHop(newPort int) {
 		if r := recover(); r != nil {
 			log.Error("seamlessPortHop panic: %v", r)
 			atomic.StoreInt32(&v.portHopInProgress, 0)
-			v.handleDisconnect()
+			v.handleDisconnect("port hop panic", fmt.Errorf("%v", r))
 		}
 	}()
 
@@ -763,6 +768,8 @@ func (v *VPNClient) seamlessPortHop(newPort int) {
 	v.strategy = newStrategy
 	v.serverAddr = newTarget
 	v.lastActive = time.Now()
+	v.connectedAt = v.lastActive
+	v.lastRx = v.lastActive
 	v.mu.Unlock()
 
 	// Close old connection after swap
@@ -892,6 +899,8 @@ func (v *VPNClient) connect(parent context.Context) error {
 	}
 	v.conn = conn
 	v.strategy = strat
+	v.connectedAt = time.Now()
+	v.lastRx = v.connectedAt
 	if hasCaps {
 		v.serverCaps = caps
 	}
@@ -1412,7 +1421,7 @@ func (v *VPNClient) sendKeepalive() {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Error("sendKeepalive panic: %v", r)
-			v.handleDisconnect()
+			v.handleDisconnect("sendKeepalive panic", fmt.Errorf("%v", r))
 		}
 	}()
 
@@ -1443,8 +1452,7 @@ func (v *VPNClient) sendKeepalive() {
 
 				conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 				if _, err := conn.Write(keepalivePkt); err != nil {
-					log.Debug("Keepalive write error: %v", err)
-					v.handleDisconnect()
+					v.handleDisconnect("keepalive write", err)
 				} else {
 					log.Debug("Sent keepalive packet")
 				}
@@ -1461,7 +1469,7 @@ func (v *VPNClient) readFromTun() {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Error("readFromTun panic: %v", r)
-			v.handleDisconnect()
+			v.handleDisconnect("readFromTun panic", fmt.Errorf("%v", r))
 		}
 	}()
 
@@ -1506,8 +1514,7 @@ func (v *VPNClient) readFromTun() {
 		conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 		written, err := conn.Write(buf[:n+4])
 		if err != nil {
-			log.Debug("Server write error: %v", err)
-			v.handleDisconnect()
+			v.handleDisconnect("server write", err)
 			continue
 		}
 
@@ -1524,7 +1531,7 @@ func (v *VPNClient) readFromServer() {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Error("readFromServer panic: %v", r)
-			v.handleDisconnect()
+			v.handleDisconnect("readFromServer panic", fmt.Errorf("%v", r))
 		}
 	}()
 
@@ -1555,8 +1562,7 @@ func (v *VPNClient) readFromServer() {
 			if atomic.LoadInt32(&v.running) == 0 {
 				return
 			}
-			log.Debug("Server read error: %v", err)
-			v.handleDisconnect()
+			v.handleDisconnect("server read", err)
 			continue
 		}
 
@@ -1567,6 +1573,7 @@ func (v *VPNClient) readFromServer() {
 			log.Debug("Received keepalive from server")
 			v.mu.Lock()
 			v.lastActive = time.Now()
+			v.lastRx = v.lastActive
 			v.mu.Unlock()
 			continue
 		}
@@ -1577,8 +1584,7 @@ func (v *VPNClient) readFromServer() {
 		}
 
 		if pktLen > maxFrameLen {
-			log.Debug("Frame length %d exceeds protocol max, disconnecting", pktLen)
-			v.handleDisconnect()
+			v.handleDisconnect("bad frame", fmt.Errorf("length %d exceeds protocol max", pktLen))
 			continue
 		}
 
@@ -1586,8 +1592,7 @@ func (v *VPNClient) readFromServer() {
 		buf := rxBuf[:pktLen]
 		nRead, err := io.ReadFull(conn, buf)
 		if err != nil {
-			log.Debug("Server read data error: %v", err)
-			v.handleDisconnect()
+			v.handleDisconnect("server read data", err)
 			continue
 		}
 
@@ -1660,6 +1665,7 @@ func (v *VPNClient) readFromServer() {
 		// Update activity timestamp
 		v.mu.Lock()
 		v.lastActive = time.Now()
+		v.lastRx = v.lastActive
 		v.mu.Unlock()
 
 		atomic.AddInt64(&v.packetsDown, 1)
@@ -1668,8 +1674,10 @@ func (v *VPNClient) readFromServer() {
 }
 
 // handleDisconnect handles connection loss and reconnects with exponential backoff
-// and network connectivity detection
-func (v *VPNClient) handleDisconnect() {
+// and network connectivity detection. reason names the path that saw the loss
+// and err is what it saw; both go to the log, where a disconnect used to show
+// up without a cause.
+func (v *VPNClient) handleDisconnect(reason string, err error) {
 	// Skip if seamless port hop is in progress (it handles its own reconnect)
 	if atomic.LoadInt32(&v.portHopInProgress) == 1 {
 		log.Debug("Port hop in progress, skipping handleDisconnect")
@@ -1690,6 +1698,7 @@ func (v *VPNClient) handleDisconnect() {
 		v.conn = nil
 	}
 	endedStrategy := v.strategy
+	connectedAt, lastRx := v.connectedAt, v.lastRx
 	v.mu.Unlock()
 
 	// Update strategy confidence and feed the storm detector. A session that
@@ -1709,7 +1718,12 @@ func (v *VPNClient) handleDisconnect() {
 	lastNetworkCheck := time.Time{}
 	networkAvailable := true
 
-	log.Info("VPN disconnected, starting reconnect with exponential backoff")
+	strategyName := "unknown"
+	if endedStrategy != nil {
+		strategyName = endedStrategy.Name()
+	}
+	log.Warn("VPN disconnected: %s: %v (strategy=%s, session=%s, last downlink %s ago), starting reconnect with exponential backoff",
+		reason, err, strategyName, sinceOrUnknown(connectedAt), sinceOrUnknown(lastRx))
 
 	// Try to reconnect with exponential backoff
 	for atomic.LoadInt32(&v.running) == 1 {
@@ -2401,4 +2415,13 @@ func handleOversizedPacket(tunDev *TUNDevice, serverConn net.Conn, remoteIP net.
 		}
 	}
 	return "dropped"
+}
+
+// sinceOrUnknown renders time.Since(t) for the disconnect log, rounded to
+// milliseconds, or "unknown" when t was never set.
+func sinceOrUnknown(t time.Time) string {
+	if t.IsZero() {
+		return "unknown"
+	}
+	return time.Since(t).Round(time.Millisecond).String()
 }
