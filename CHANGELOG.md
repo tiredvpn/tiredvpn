@@ -7,6 +7,27 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.11.7] - 2026-10-19
+
+### Fixed
+
+- **Client: a working tunnel no longer drops when apps send without getting
+  replies.** The client skipped its keepalive whenever any packet had gone out
+  in the last 9 s. The server sends no keepalive of its own and only echoes the
+  client's, so a stream of unanswered outgoing packets (UDP to a dead host,
+  retransmits into a blackhole) held every keepalive back, nothing came in, and
+  the 30 s read timeout tore the session down. A field client lost its tunnel
+  about eleven times a day this way. On a test stand, UDP every 3 s into a
+  blackholed prefix killed the session every 30.0 s; packets 15 s apart did it
+  too, because the ticker never resets. The keepalive now goes out whenever the
+  server has been silent for 9 s, whatever the uplink does. While the server is
+  sending, no keepalive is added.
+- **Client: the disconnect log line names the cause.** It used to read
+  "VPN disconnected" with the error at debug level. It is now a warning with
+  the path that saw the loss, its error, the strategy, the session age and how
+  long the server had been silent, for example
+  `VPN disconnected: server read: timeout (strategy=REALITY Protocol, session=1m30s, last downlink 31s ago)`.
+
 ## [1.11.6] - 2026-10-13
 
 ### Security
