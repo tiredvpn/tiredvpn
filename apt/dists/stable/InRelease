@@ -4,44 +4,44 @@ Hash: SHA512
 Origin: TiredVPN
 Label: TiredVPN
 Codename: stable
-Date: Mon, 19 Oct 2026 09:33:24 UTC
+Date: Tue, 20 Oct 2026 20:34:37 UTC
 Architectures: amd64 arm64
 Components: main
 Description: TiredVPN apt repository
 MD5Sum:
- d81da3c6672aa5c4471517c5640a8e57 745 main/binary-amd64/Packages
- 940322ed5aec440a0cc6fb0ffec20ee0 523 main/binary-amd64/Packages.gz
+ a7bb8ecd5ab4cfc040caf416dc354fb9 745 main/binary-amd64/Packages
+ 39d437114ff29b7ec08f273a3d402520 525 main/binary-amd64/Packages.gz
  a1cb1598e0aa53fb7a19e480edb1fd61 106 main/binary-amd64/Release
- 478e36e0d9c0a9907abe18804f9f61ac 745 main/binary-arm64/Packages
- 5f26995f7cadfe9c8727264e6fdc6c7c 523 main/binary-arm64/Packages.gz
+ 617c14e8aec59ecb6b8197c3d5f477e7 745 main/binary-arm64/Packages
+ eb3229c17be6a3c21b0b397014e85631 526 main/binary-arm64/Packages.gz
  833f0c2c40c4bd6fc40c49fa19ba6a0e 106 main/binary-arm64/Release
 SHA1:
- aed3d9b62b8be120cfa90325f44e8bf5509d1b33 745 main/binary-amd64/Packages
- b9518fb05ddf3054242b9958ffd029ab3c121fc3 523 main/binary-amd64/Packages.gz
+ acf53bef8b240726d199ffcb753fb99010b5de33 745 main/binary-amd64/Packages
+ 2d36bac1c573cda02e00d73745da764a4104498a 525 main/binary-amd64/Packages.gz
  cbfc21b1aea4c89370605c63ec154f6fec1a0765 106 main/binary-amd64/Release
- f4f36ea47263a4a877d5bf51a4c1d13534077e41 745 main/binary-arm64/Packages
- cbb67d757e3e0cf5565633ac6fe02bdad5176e1f 523 main/binary-arm64/Packages.gz
+ 74fa7ff68c247c57f5de0f9f6747fdb4ae965a6d 745 main/binary-arm64/Packages
+ 93c888b640240ab8b1df86e2cf498d8a6178ff66 526 main/binary-arm64/Packages.gz
  3bca33c026140b27d9e2f0e3015f33da87d18e20 106 main/binary-arm64/Release
 SHA256:
- c5dae3e1735aadd26a7be7731c802d17650dddd31baf4b945692e509d1cecc73 745 main/binary-amd64/Packages
- 77cffc728c1dff506921f4c588659d9d934cc8f004125925b9b1683bf14a1bdb 523 main/binary-amd64/Packages.gz
+ c8b83a4831a7ec57e4d98da3d6d1fb5e846298cbbfb93c93a72aa98f6e2894b1 745 main/binary-amd64/Packages
+ 675fb257dc8f809a038b46ad20803587696138bb3ed21b1300404f1028714ad9 525 main/binary-amd64/Packages.gz
  f56fb9ff2142f536cc47925e506d8cc1e0f6279b4aa0d1ed26922aa43934b7c7 106 main/binary-amd64/Release
- 11451ddd5aec6f24a965b3e726fbc9ce93683bafcae16e88ef764d289eef52ec 745 main/binary-arm64/Packages
- 0dabd0686eeedc9defa0d89de452bf4637f870d0835ac521abdecd99c737857c 523 main/binary-arm64/Packages.gz
+ 140be97ea4ec6f17c2f7c3a4a1f419e60b445a7fa38d001a9ae35daeb3ec70ac 745 main/binary-arm64/Packages
+ e5044f0f1ba08b4d59df640909979c394d2c857b7701c48e7b57ac6b76b056c8 526 main/binary-arm64/Packages.gz
  2ea051df46bf72e3e60ff7def56f180e193b56db497b982353db591146d6542a 106 main/binary-arm64/Release
 -----BEGIN PGP SIGNATURE-----
 
-iQIzBAEBCgAdFiEERHHoMQRgX2u48+4LJqtRtqgl770FAmrV4+QACgkQJqtRtqgl
-773l6Q/9EV0uuuVGPe7AjbzX1uQVH0DDC2hd2W048/85eBAib8mpvC/7bCwjU7bX
-pEcHozCZHcvG5AVSKpzPLnddqUnqmWiyBRsgZodwM2m8H/Ke9jDBiCVfTegbSL4S
-oZg5CbHxnE1WEDy4NqHaQxDfXy2IfyU9jecVNHoKzgKot/lr3KVDMzPwLXB2c7gS
-o0jB7mjbJ7eKZW1tf8WvoowGu66PKOz5/HSxS6iomsEOKPCbyBH1CqQIliTT9hB3
-wmaLYQVjPCPEt8sxgLq8LR22qY3VLnuU7JCGDx/FWf51UdRoWv0Foq/rkkt4H8gh
-A/MMwod1WGhBKoXjCdnaojbi5ZuYfkSKgO+POB2JSgSdBGa2qLcNIQqTKlsQXRTy
-zs79Na+CfiU6jiSPmc8JrgNb40EFNBbuEXBdLhmFCu2MQoz5kfnUNuO9BuFe1fCl
-PWd8rp0t2QrLXbGe1/Wb8XWJF0+/bdnpBO8QU780oJBGVVTQXQuMU+80oYeg8MY8
-k5MCv2zzghojFhFDKkYgkHijWYCuuqOH/jM17Wf+KwuYkPwuZ7izMSwp+gco/Dxe
-FrEqzY0+6zmuyLtX/97inEA8k9siEKY+JGonnI9A8GykJPdHvp/spz7ErKwTn9ag
-aJfOTKYx4k2wuu3UuzQtYhWpbQ53UJqmveSUv1uUU8KmZxyPsnc=
-=z6PG
+iQIzBAEBCgAdFiEERHHoMQRgX2u48+4LJqtRtqgl770FAmrX0F0ACgkQJqtRtqgl
+771Q1A/9HnFickuvfvoBxFNVBdIx8G9bf/k2F6EhkHFQ0SNI1ZZ7mJF3KXFfYCDF
+PUZfTSMDsrToQgpuHzEZ4sYYfcuPl279dBhYYijRI2qZ5ksvioZdC/WDNCVOR53E
+KsI+o7Pzx2VnTCWTs3AMgf4cO0vDplkga+zaIOLsJtfJcCqR1tRsv3n4gh3ok6mi
+k/uxB+laz8zxqP2Q9TQvucpLvGJBBWjjeYUyoE3IgEFqCgT3mqVUTICoZgbxZsFV
+wY8QBwz8gPiJI/13Bcln2GqyPVsam3SdVmSXUtn+Ir2c1TQ7/YJc5disxMhjU6+7
+u6mu6KDTMaJGGOFKdLmOOKnRnRIUyNT/GEbF2lsY73hA4ctR5djfLYMLIPwDTp4c
+caJ+1dfPtIgOSNB0in4FRWTfQQfo8Bx2RmyNhOj9TLdSOWPkQ1gdTZn5qScfOFqt
+jpXGlArE1G3eHB/V6xZfFKj6qcLH7JOYTU868wduYvEFJnheN4HofeqIfqkFj2yI
+F9vH166MX3nC+t2BYQjuX1oZnARrHNxu7phkVn510JcFZuzzGDZf0QFgyxyUHmtn
++BbPhGMQegOcX1TBuGWly+lR1jbw0EGAinX5yBlSB+z7JJ+HFk458YWhKdzKwCw4
+bzBMDpkJtUV67CYxAOVSI75eQBDLsPpFEOul7HrmZ/bP0FTYLDs=
+=hmgI
 -----END PGP SIGNATURE-----
