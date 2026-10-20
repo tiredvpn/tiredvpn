@@ -1480,8 +1480,6 @@ func handleTLSConnection(conn *tls.Conn, srvCtx *serverContext, connID uint64) {
 	switch protoType {
 	case protocol.TypeStego:
 		handleHTTP2WithALPN(conn, srvCtx, logger)
-	case protocol.TypeRaw:
-		handleRawTunnel(conn, srvCtx, logger, clientIdentity{})
 	case protocol.TypeConfusion:
 		// Entry point 2 of 3. Nothing in the tree writes this discriminator, so
 		// the only peer that arrives here is one that chose to - which is
@@ -1496,6 +1494,9 @@ func handleTLSConnection(conn *tls.Conn, srvCtx *serverContext, connID uint64) {
 	case protocol.TypePolling:
 		handleHTTPPollingWithALPN(conn, srvCtx, logger)
 	default:
+		// TypeRaw lands here on purpose. It used to open handleRawTunnel with
+		// no credential at all, and no client sends it, so it gets exactly
+		// what any other byte we do not use gets.
 		logger.Debug("unknown dispatch type 0x%02x; falling back to legacy detection", protoType)
 		// Prepend the consumed dispatch byte so legacy detectors see the full stream.
 		prefixed := &bufferedConn{
@@ -2793,20 +2794,11 @@ func handleHTTP1(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
 		return
 	}
 
-	// Check for WebSocket upgrade
-	if bytes.Contains(buf[:n], []byte("Upgrade: websocket")) {
-		logger.Debug("WebSocket upgrade requested")
-		handleWebSocket(conn, srvCtx, logger)
-		return
-	}
-
-	// Check for protocol confusion in body
-	if idx := bytes.Index(buf[:n], []byte("TIRED")); idx > 0 {
-		logger.Debug("Found confusion magic at offset %d", idx)
-		// Extract real data after magic
-		handleConfusionData(conn, buf[idx:n], srvCtx, logger)
-		return
-	}
+	// A WebSocket upgrade without a valid X-Auth-Token, or a request with the
+	// old "TIRED" literal in it, used to be taken into a raw tunnel here with
+	// no authentication. Both are now ordinary requests to the fake site:
+	// authenticated WebSocket clients are claimed by detectWebSocketPadded
+	// before this point, and no client has sent the literal since 1.11.0.
 
 	// Serve fake response. We already drained the client's request into buf[:n]
 	// above; serveFakeWebsite starts a fresh http.ReadRequest, so without
@@ -2819,95 +2811,6 @@ func handleHTTP1(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
 		reader: io.MultiReader(bytes.NewReader(buf[:n]), conn),
 	}
 	serveFakeHTTPResponse(replay, cfg, logger)
-}
-
-// handleWebSocket handles WebSocket connections
-func handleWebSocket(conn net.Conn, srvCtx *serverContext, logger *log.Logger) {
-	// Send WebSocket upgrade response
-	response := "HTTP/1.1 101 Switching Protocols\r\n" +
-		"Upgrade: websocket\r\n" +
-		"Connection: Upgrade\r\n" +
-		"Sec-WebSocket-Accept: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
-		"\r\n"
-
-	if _, err := conn.Write([]byte(response)); err != nil {
-		logger.Debug("Failed to send WebSocket upgrade: %v", err)
-		return
-	}
-
-	logger.Info("WebSocket connection established")
-
-	// Read WebSocket frames
-	for {
-		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-
-		// Read frame header
-		header := make([]byte, 2)
-		if _, err := io.ReadFull(conn, header); err != nil {
-			logger.Debug("WebSocket read error: %v", err)
-			return
-		}
-
-		fin := header[0]&0x80 != 0
-		opcode := header[0] & 0x0F
-		masked := header[1]&0x80 != 0
-		payloadLen := int(header[1] & 0x7F)
-
-		logger.Debug("WebSocket frame: fin=%v, opcode=%d, masked=%v, len=%d",
-			fin, opcode, masked, payloadLen)
-
-		// Handle extended payload length
-		switch payloadLen {
-		case 126:
-			extLen := make([]byte, 2)
-			io.ReadFull(conn, extLen)
-			payloadLen = int(binary.BigEndian.Uint16(extLen))
-		case 127:
-			extLen := make([]byte, 8)
-			io.ReadFull(conn, extLen)
-			payloadLen = int(binary.BigEndian.Uint64(extLen))
-		}
-
-		// Read mask key
-		var maskKey []byte
-		if masked {
-			maskKey = make([]byte, 4)
-			io.ReadFull(conn, maskKey)
-		}
-
-		// Read payload
-		payload := make([]byte, payloadLen)
-		if _, err := io.ReadFull(conn, payload); err != nil {
-			logger.Debug("Failed to read WebSocket payload: %v", err)
-			return
-		}
-
-		// Unmask payload
-		if masked {
-			for i := range payload {
-				payload[i] ^= maskKey[i%4]
-			}
-		}
-
-		logger.Debug("WebSocket payload: %d bytes", len(payload))
-
-		// Close frame
-		if opcode == 8 {
-			logger.Debug("WebSocket close received")
-			return
-		}
-
-		// Handle tunnel data in payload - use raw tunnel
-		if len(payload) > 0 {
-			// Create a buffered conn with the payload as initial data
-			wsConn := &bufferedConn{
-				Conn:   conn,
-				reader: io.MultiReader(bytes.NewReader(payload), conn),
-			}
-			handleRawTunnel(wsConn, srvCtx, logger, clientIdentity{})
-			return
-		}
-	}
 }
 
 // handleAntiProbeDispatch handles anti-probe connections that arrive over the
@@ -3337,7 +3240,8 @@ func handleConfusionTUNMode(sess *confusionSession, remainingData []byte, srvCtx
 //
 // It used to fall back to the peer address when no client id was supplied. That
 // was wrong, and wrong in the direction that matters: handleTLSConnection
-// reaches this funnel with an empty id after nothing but a plain TLS handshake,
+// reached this funnel with an empty id after nothing but a plain TLS handshake
+// (the TypeRaw dispatch, since removed),
 // which anyone can complete because we serve a certificate to everyone. A peer
 // that never authenticated could therefore both measure the ceiling by opening
 // connections until refused - the exact fingerprint the placement was chosen to
@@ -3502,30 +3406,9 @@ func handleRawTunnel(conn net.Conn, srvCtx *serverContext, logger *log.Logger, c
 	}
 }
 
-// handleTUNMode handles TUN-based VPN connections
-func handleTUNMode(conn net.Conn, cfg *Config, logger *log.Logger) {
-	handleTUNModeWithContext(conn, cfg, nil, logger)
-}
-
 // handleTUNModeWithHandshake handles TUN mode with pre-read handshake data (for QUIC)
 func handleTUNModeWithHandshake(conn net.Conn, srvCtx *serverContext, logger *log.Logger, handshake []byte, clientID clientIdentity) {
 	handleTUNModeCore(conn, srvCtx.cfg, srvCtx, logger, handshake, clientID)
-}
-
-// handleTUNModeWithContext handles TUN-based VPN connections with server context (for IP pool)
-func handleTUNModeWithContext(conn net.Conn, cfg *Config, srvCtx *serverContext, logger *log.Logger) {
-	logger.Debug("Processing TUN mode connection")
-
-	// Read TUN handshake: [localIP:4][mtu:2][version:1] (7 bytes for v1 clients, 6 bytes for legacy)
-	// We read 7 bytes to support version detection, but legacy clients only send 6
-	handshake := make([]byte, 7)
-	n, err := conn.Read(handshake)
-	if err != nil || n < 6 {
-		logger.Debug("Failed to read TUN handshake: %v (got %d bytes)", err, n)
-		return
-	}
-
-	handleTUNModeCore(conn, cfg, srvCtx, logger, handshake[:n], clientIdentity{})
 }
 
 // resolveTunMTU returns the configured TUN MTU, falling back to the package
@@ -4209,24 +4092,6 @@ func (c *h2TunConn) SetWriteDeadline(t time.Time) error { return nil }
 // serveFakeHTTPResponse serves a fake HTTP response
 func serveFakeHTTPResponse(conn net.Conn, cfg *Config, logger *log.Logger) {
 	serveFakeWebsite(conn, cfg, logger)
-}
-
-// handleConfusionData handles extracted confusion data
-func handleConfusionData(conn net.Conn, data []byte, srvCtx *serverContext, logger *log.Logger) {
-	_ = srvCtx.cfg // cfg not used but keep pattern consistent
-	// Find length after TIRED magic
-	if len(data) < 9 {
-		return
-	}
-
-	dataLen := binary.BigEndian.Uint32(data[5:9])
-	logger.Debug("Confusion data length: %d", dataLen)
-
-	// Acknowledge
-	conn.Write([]byte("TIRED"))
-
-	// Continue as raw tunnel
-	handleRawTunnel(conn, srvCtx, logger, clientIdentity{})
 }
 
 // Helper functions
