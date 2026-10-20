@@ -30,7 +30,7 @@ import (
 )
 
 var (
-	Version   = "1.11.7"
+	Version   = "1.11.8"
 	BuildTime = "unknown"
 
 	// Global metrics instance (nil if metrics disabled)
