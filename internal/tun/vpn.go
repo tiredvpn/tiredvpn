@@ -1179,11 +1179,12 @@ type peekResult struct {
 //
 // The wait is bounded by a timer in readHandshakeFlags, not by a read
 // deadline on the transport. A deadline that fires inside a transport's
-// record read is not harmless: a record layer that has consumed a header and
-// then times out on the body loses its framing (confusion, for one), and some
-// transports do not honour read deadlines at all (the ICMP tunnel), so the
-// peek would hang until the first packet. A read left running past the grace
-// is not lost either: the replayConn that carries it delivers its byte first.
+// record read is only harmless when the record layer can resume after it
+// (confusion could not before #98), and a transport that ignores read
+// deadlines (the ICMP tunnel before #98) would stretch the peek to the first
+// packet. The timer keeps the reader independent of both. A read left running
+// past the grace is not lost either: the replayConn that carries it delivers
+// its byte first, or fails the session if it is a late flags byte.
 func peekHandshakeByte(conn net.Conn) <-chan peekResult {
 	ch := make(chan peekResult, 1) // buffered: the goroutine never blocks on a reader that went away
 	go func() {
@@ -1194,6 +1195,17 @@ func peekHandshakeByte(conn net.Conn) <-chan peekResult {
 	return ch
 }
 
+// errLateHandshakeFlags fails a session whose handshake flags byte arrived
+// after handshakeFlagsGrace, when the reader had already settled on a bare
+// 9-byte answer. Dropping the byte instead would keep the framing only when
+// nothing follows it: with port hopping advertised the byte is followed by
+// the rest of the port-hop layout, which would land in the stream. And a
+// session kept alive without its flags would run without the auto-MTU probe
+// and port hopping the server offered, with nothing in the log to say so; a
+// reconnect gets them back. The server writes the whole answer in one Write,
+// so only a transport stall inside that answer gets here.
+var errLateHandshakeFlags = errors.New("handshake flags byte arrived after the grace window")
+
 // replayConn returns bytes the handshake reader had to look at before the
 // packet loop reads from the underlying conn, and finishes a peek read the
 // reader stopped waiting for. It deliberately exposes no Unwrap/NetConn
@@ -1203,9 +1215,13 @@ type replayConn struct {
 	net.Conn
 	pending  []byte
 	inflight <-chan peekResult // a peek read still running, nil once collected
+	err      error             // set once the stream can no longer be framed
 }
 
 func (c *replayConn) Read(p []byte) (int, error) {
+	if c.err != nil {
+		return 0, c.err
+	}
 	if c.inflight != nil {
 		r := <-c.inflight
 		c.inflight = nil
@@ -1213,6 +1229,14 @@ func (c *replayConn) Read(p []byte) (int, error) {
 			// The read ended without a byte; whatever ended it (a deadline
 			// the caller set since, a close) is this read's answer.
 			return 0, r.err
+		}
+		if r.b != 0 {
+			// Every tunnel frame starts with 0x00, so this is a flags byte
+			// that came after the grace (issue #99). Delivering it would
+			// shift every frame after it. The error sticks: a later Read
+			// would hand out what follows the byte as frames.
+			c.err = errLateHandshakeFlags
+			return 0, c.err
 		}
 		c.pending = append(c.pending, r.b)
 	}

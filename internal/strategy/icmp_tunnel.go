@@ -341,6 +341,70 @@ type icmpTunnelConn struct {
 	// Read buffer for partial reads
 	readBuf   []byte
 	readBufMu sync.Mutex
+
+	// readDeadline bounds Read. It is kept here rather than forwarded to
+	// icmpConn: the socket is read by recvLoop only, and Read waits on
+	// recvQueue, which a socket deadline never reaches (issue #98).
+	readDeadline icmpReadDeadline
+}
+
+// icmpReadDeadline is a read deadline a Read blocked on channels can select
+// on. The zero value has no deadline set.
+type icmpReadDeadline struct {
+	mu      sync.Mutex
+	timer   *time.Timer
+	expired chan struct{} // closed while the deadline has passed
+}
+
+// set arms the deadline at t; the zero time clears it. A Read already waiting
+// on the channel from wait sees the new deadline: the channel is only
+// replaced once it has been closed, and then that Read has returned.
+func (d *icmpReadDeadline) set(t time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.expired == nil {
+		d.expired = make(chan struct{})
+	}
+	if d.timer != nil && !d.timer.Stop() {
+		<-d.expired // the timer fired; wait until its callback has closed the channel
+	}
+	d.timer = nil
+
+	closed := false
+	select {
+	case <-d.expired:
+		closed = true
+	default:
+	}
+
+	if t.IsZero() {
+		if closed {
+			d.expired = make(chan struct{})
+		}
+		return
+	}
+	if dur := time.Until(t); dur > 0 {
+		if closed {
+			d.expired = make(chan struct{})
+		}
+		expired := d.expired
+		d.timer = time.AfterFunc(dur, func() { close(expired) })
+		return
+	}
+	if !closed {
+		close(d.expired)
+	}
+}
+
+// wait returns a channel that is closed once the deadline has passed.
+func (d *icmpReadDeadline) wait() <-chan struct{} {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.expired == nil {
+		d.expired = make(chan struct{})
+	}
+	return d.expired
 }
 
 // handshake performs ICMP tunnel handshake
@@ -812,10 +876,21 @@ func (c *icmpTunnelConn) Read(b []byte) (int, error) {
 		return n, nil
 	}
 
+	// A deadline that has passed already wins over a packet waiting in the
+	// queue, as on a socket; the select below would pick either at random.
+	expired := c.readDeadline.wait()
+	select {
+	case <-expired:
+		return 0, os.ErrDeadlineExceeded
+	default:
+	}
+
 	// Wait for new data
 	select {
 	case <-c.done:
 		return 0, io.EOF
+	case <-expired:
+		return 0, os.ErrDeadlineExceeded
 	case data := <-c.recvQueue:
 		n := copy(b, data)
 		if n < len(data) {
@@ -880,12 +955,15 @@ func (c *icmpTunnelConn) RemoteAddr() net.Addr {
 
 // SetDeadline sets read and write deadlines
 func (c *icmpTunnelConn) SetDeadline(t time.Time) error {
-	return c.icmpConn.SetDeadline(t)
+	c.readDeadline.set(t)
+	return c.icmpConn.SetWriteDeadline(t)
 }
 
-// SetReadDeadline sets the read deadline
+// SetReadDeadline sets the deadline for Read. It does not touch the ICMP
+// socket: recvLoop owns its reads and arms its own deadline on each one.
 func (c *icmpTunnelConn) SetReadDeadline(t time.Time) error {
-	return c.icmpConn.SetReadDeadline(t)
+	c.readDeadline.set(t)
+	return nil
 }
 
 // SetWriteDeadline sets the write deadline

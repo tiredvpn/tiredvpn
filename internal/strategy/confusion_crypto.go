@@ -197,6 +197,14 @@ type ConfusionConn struct {
 	rErr   error
 	decBuf []byte
 	rbuf   []byte // leftover plaintext, a slice into decBuf
+
+	// A record read that a read deadline (or any other transient error)
+	// interrupted resumes here: rHdrN header bytes are in rHdr, and once the
+	// header is complete rBodyN body bytes are in decBuf. Dropping them would
+	// make the next read take body bytes for a header.
+	rHdr   [2]byte
+	rHdrN  int
+	rBodyN int
 }
 
 // NewConfusionConn wraps conn in the sealed record layer. isClient picks the
@@ -326,34 +334,62 @@ func (c *ConfusionConn) Write(p []byte) (int, error) {
 
 // readFrameLocked opens exactly one frame into c.decBuf and returns the
 // plaintext as a slice of it.
+//
+// A read error leaves the bytes of the frame read so far in place, so a call
+// that hits a read deadline mid-frame can be repeated and picks up where the
+// last one stopped (issue #98).
 func (c *ConfusionConn) readFrameLocked() ([]byte, error) {
 	if c.rErr != nil {
 		return nil, c.rErr
 	}
 
-	var hdr [2]byte
-	if _, err := io.ReadFull(c.br, hdr[:]); err != nil {
-		return nil, err
+	for c.rHdrN < len(c.rHdr) {
+		n, err := c.br.Read(c.rHdr[c.rHdrN:])
+		c.rHdrN += n
+		if c.rHdrN == len(c.rHdr) {
+			break
+		}
+		if err != nil {
+			return nil, c.frameReadErr(err)
+		}
 	}
-	bodyLen := int(binary.BigEndian.Uint16(hdr[:]))
+	bodyLen := int(binary.BigEndian.Uint16(c.rHdr[:]))
 	if bodyLen < chacha20poly1305.Overhead || bodyLen > confusionMaxBody {
 		c.rErr = ErrConfusionAuth
 		return nil, c.rErr
 	}
 
 	body := c.decBuf[:bodyLen]
-	if _, err := io.ReadFull(c.br, body); err != nil {
-		return nil, err
+	for c.rBodyN < bodyLen {
+		n, err := c.br.Read(body[c.rBodyN:])
+		c.rBodyN += n
+		if c.rBodyN == bodyLen {
+			break
+		}
+		if err != nil {
+			return nil, c.frameReadErr(err)
+		}
 	}
+	c.rHdrN, c.rBodyN = 0, 0
 
 	setConfusionNonce(&c.rNonce, c.rIV, c.rSeq)
-	plain, err := c.rAEAD.Open(body[:0], c.rNonce[:], body, hdr[:])
+	plain, err := c.rAEAD.Open(body[:0], c.rNonce[:], body, c.rHdr[:])
 	if err != nil {
 		c.rErr = ErrConfusionAuth
 		return nil, c.rErr
 	}
 	c.rSeq++
 	return plain, nil
+}
+
+// frameReadErr reports a read error hit inside readFrameLocked. EOF in the
+// middle of a frame is io.ErrUnexpectedEOF, as io.ReadFull reported it before
+// frames became resumable.
+func (c *ConfusionConn) frameReadErr(err error) error {
+	if errors.Is(err, io.EOF) && (c.rHdrN > 0 || c.rBodyN > 0) {
+		return io.ErrUnexpectedEOF
+	}
+	return err
 }
 
 // ReadFrame returns the plaintext of exactly one frame, preserving the message
