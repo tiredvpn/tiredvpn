@@ -7,6 +7,38 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.11.8] - 2026-10-20
+
+### Security
+
+- **Server: three tunnel paths on the TLS port no longer skip authentication.**
+  Two entry points could open a tunnel, or a TUN session, without checking the
+  client secret: one selected by a dispatch byte, and two legacy HTTP/1 paths
+  (a WebSocket upgrade without the auth header and a confusion-v1 trigger).
+  No client in the tree uses any of them. The dispatch branch is removed and
+  its byte is now treated like any other unassigned byte; the two HTTP paths
+  answer exactly as the decoy site answers the same request without the
+  trigger. Every remaining caller of the tunnel handlers is pinned by a test.
+  Upgrade servers.
+
+### Fixed
+
+- **Confusion transport: a read deadline mid-record no longer kills the
+  stream.** A timeout between a record's header and its body lost the bytes
+  already read, and the next read failed authentication. Partial records now
+  survive the timeout and the read resumes where it stopped (#98).
+- **ICMP transport: `Read` honours its read deadline.** The deadline used to be
+  forwarded to the ICMP socket, where it never reached `Read`; a caller waiting
+  for a timeout waited for the next packet instead (#98).
+- **TUN handshake: a flags byte arriving after the grace window fails the
+  session instead of corrupting it.** A late flags byte used to be delivered to
+  the packet loop as stream data. The session now ends with an error and the
+  client reconnects and receives the flags again (#99).
+
+### Changed
+
+- Go dependencies updated (#117). No change on the wire.
+
 ## [1.11.7] - 2026-10-19
 
 ### Fixed
