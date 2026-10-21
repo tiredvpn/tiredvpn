@@ -8,6 +8,7 @@ import (
 	"io"
 	"math/rand"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -1748,13 +1749,24 @@ func (v *VPNClient) handleDisconnect(reason string, err error) {
 	log.Warn("VPN disconnected: %s: %v (strategy=%s, session=%s, last downlink %s ago), starting reconnect with exponential backoff",
 		reason, err, strategyName, sinceOrUnknown(connectedAt), sinceOrUnknown(lastRx))
 
+	// A server that went quiet may be gone. Have the first reconnect walk the
+	// pool through the pre-flight gate instead of spending its budget on one
+	// silent address, and skip the network check below on that attempt: it
+	// stops at the first silent address after 3 seconds and tells the gate
+	// nothing, while the gate answers the same question for the whole pool.
+	gateArmed := false
+	if serverWentSilent(err) && v.manager != nil {
+		v.manager.NoteServerSilent()
+		gateArmed = v.manager.ConnectivityChecker() != nil
+	}
+
 	// Try to reconnect with exponential backoff
 	for atomic.LoadInt32(&v.running) == 1 {
 		consecutiveFailures++
 
 		// Check network connectivity periodically (every 10 failures or 30 seconds)
 		// This prevents wasting resources when network is down
-		if consecutiveFailures%10 == 0 || time.Since(lastNetworkCheck) > 30*time.Second {
+		if !gateArmed && (consecutiveFailures%10 == 0 || time.Since(lastNetworkCheck) > 30*time.Second) {
 			networkAvailable = v.checkNetworkConnectivity()
 			lastNetworkCheck = time.Now()
 
@@ -1788,6 +1800,7 @@ func (v *VPNClient) handleDisconnect(reason string, err error) {
 		ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
 		err := v.connect(ctx)
 		cancel()
+		gateArmed = false
 
 		if err == nil {
 			atomic.AddInt64(&v.reconnectsOK, 1)
@@ -1825,6 +1838,17 @@ func (v *VPNClient) handleDisconnect(reason string, err error) {
 			currentDelay = reconnectMaxDelay
 		}
 	}
+}
+
+// serverWentSilent reports a disconnect caused by a deadline - the server
+// stopped answering - as opposed to a close, a reset or a protocol error, all of
+// which prove the server was there to send them.
+func serverWentSilent(err error) bool {
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	ne, ok := errors.AsType[net.Error](err)
+	return ok && ne.Timeout()
 }
 
 // networkCheckTimeout bounds one connectivity probe from the reconnect loop.

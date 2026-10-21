@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/endpoint"
@@ -179,6 +180,11 @@ type Manager struct {
 	// Guarded by m.mu.
 	consecutiveConnectFailures int
 
+	// preflightArmed makes the next Connect run the pre-flight gate even on
+	// the hot reconnect path. Set by NoteServerSilent when the tunnel died of
+	// silence; cleared by the gate run it causes. Guarded by m.mu.
+	preflightArmed bool
+
 	// Android mode - deprioritize QUIC/UDP strategies
 	androidMode bool
 
@@ -265,10 +271,84 @@ func silenceLatency(connectTimeout time.Duration) time.Duration {
 	return connectTimeout - connectTimeout/10
 }
 
+// attemptBudget is how long a strategy attempt started now can really run: the
+// connect timeout, unless the caller's context runs out first. The reconnect
+// loop gives a whole cycle 15 seconds and a single attempt is allowed 30, so
+// measuring silence against the 30 never fired - the deadline cut the attempt
+// at 15 and the scan read that as an answer.
+func (m *Manager) attemptBudget(ctx context.Context) time.Duration {
+	budget := m.connectTimeout
+	if dl, ok := ctx.Deadline(); ok {
+		budget = min(budget, time.Until(dl))
+	}
+	return budget
+}
+
+// addrUnreachable reports a dial the network refused to deliver at all: no
+// route, or no neighbour answering for the address. Nothing came back from the
+// server; every transport aimed at the same address meets the same wall. On a
+// shared segment a dead host shows up exactly like this, after the kernel's
+// neighbour discovery gives up, rather than as a timeout.
+func addrUnreachable(err error) bool {
+	return errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.ENETUNREACH)
+}
+
+// heardNothing reports whether a failed attempt is evidence of silence: a
+// timeout, an attempt that burned (nearly) its whole budget whatever its error
+// says, or a dial that could not reach the address.
+func heardNothing(err error, latency, budget time.Duration) bool {
+	return isTimeoutError(err) || latency >= silenceLatency(budget) || addrUnreachable(err)
+}
+
+// scanOutOfTime ends a scan whose context ran out.
+//
+// A deadline that fell while the address had answered nothing is the silence
+// verdict, reached the slow way: the caller's budget ran out before
+// tcpFailuresBeforeQUIC transports could each time out. Reporting it as a plain
+// context error left the address unpunished, so the next cycle dialled the same
+// silent server with the same result.
+func scanOutOfTime(ctx context.Context, target string, scan *scanState, lastErr error) error {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) && !scan.answered && scan.timeouts > 0 {
+		log.Info("Address %s answered nothing on %d transports before the connect budget ran out",
+			target, scan.timeouts)
+		if lastErr == nil {
+			lastErr = ctx.Err()
+		}
+		return fmt.Errorf("%w: %w, last error: %w", errAddrSilent, errStrategyScanFailed, lastErr)
+	}
+	log.Warn("Connection cancelled by context")
+	return ctx.Err()
+}
+
 // preflightFailThreshold is how many consecutive failed connects must pile up
 // before Connect re-arms the blocking pre-flight connectivity check. See
 // Manager.consecutiveConnectFailures.
 const preflightFailThreshold = 2
+
+// NoteServerSilent tells the manager the tunnel died because the server went
+// quiet - a read deadline, not a reset or an EOF.
+//
+// The hot reconnect path skips the pre-flight gate on the theory that a server
+// which just reset us is back in a moment and the real connect reaches it
+// first. Silence is the opposite case: the address may be gone, and every
+// strategy dialled at it burns the reconnect budget on a SYN nobody answers.
+// The gate walks the whole pool for the price of a few TCP handshakes and pins
+// whatever answers, so the next Connect runs it instead of waiting for
+// preflightFailThreshold failed cycles - on the stand that was 42 seconds of
+// outage spent before the gate was allowed to look.
+func (m *Manager) NoteServerSilent() {
+	m.mu.Lock()
+	m.preflightArmed = true
+	m.mu.Unlock()
+}
+
+// PreflightArmed reports whether the next Connect runs the pre-flight gate
+// regardless of the hot-path rule (see NoteServerSilent).
+func (m *Manager) PreflightArmed() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.preflightArmed
+}
 
 // recordConnectResult tracks the consecutive-failure streak that gates the
 // pre-flight connectivity check on reconnect.
@@ -1070,6 +1150,11 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 			sel.Report(cand, false, 0)
 		}
 		m.logEndpointHealth(sel, cand)
+		if ctx.Err() != nil {
+			// The verdict is in; the next candidate gets the next cycle. Its
+			// pre-flight on a dead context would read as "no network" instead.
+			break
+		}
 	}
 
 	return nil, nil, lastErr
@@ -1131,16 +1216,22 @@ func (m *Manager) withHoppedPort(target string) string {
 // connect, or once several connects in a row have failed - the signal that the
 // network is genuinely down rather than a one-off server RST.
 func (m *Manager) preflightCandidate(ctx context.Context, sel *endpoint.Selector, cand endpoint.Candidate) (endpoint.Candidate, error) {
-	m.mu.RLock()
+	m.mu.Lock()
 	checker := m.connectivityChecker
 	connectedBefore := m.lastSuccessfulStrategy != nil
 	fails := m.consecutiveConnectFailures
-	m.mu.RUnlock()
+	armed := m.preflightArmed
+	if checker != nil && (!connectedBefore || fails >= preflightFailThreshold || armed) {
+		// This run is the one the flag asked for; a second candidate in the
+		// same cycle goes back to the ordinary rule.
+		m.preflightArmed = false
+	}
+	m.mu.Unlock()
 
 	if checker == nil {
 		return cand, nil
 	}
-	if connectedBefore && fails < preflightFailThreshold {
+	if connectedBefore && fails < preflightFailThreshold && !armed {
 		return cand, nil
 	}
 
@@ -1310,6 +1401,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 		default:
 			log.Info("Trying last successful strategy first: %s", lastSuccessful.Name())
 
+			budget := m.attemptBudget(ctx)
 			connectCtx, cancel := context.WithTimeout(ctx, m.connectTimeout)
 			start := time.Now()
 			conn, err := lastSuccessful.Connect(connectCtx, target)
@@ -1334,6 +1426,19 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 
 				log.Info("Fast reconnect via %s (latency=%v)", lastSuccessful.Name(), latency)
 				return conn, lastSuccessful, nil
+			}
+
+			// The fast path is the first transport of this cycle, and what it
+			// heard is evidence about the address like any other: a silent
+			// server costs the fast path the most, and leaving it out of the
+			// count is how a reconnect spent its whole budget here and then
+			// called the address "answering".
+			if !isUDPBasedStrategy(lastSuccessful) {
+				if heardNothing(err, latency, budget) {
+					scan.timeouts++
+				} else {
+					scan.answered = true
+				}
 			}
 
 			// Record the failure so a fast reconnect that keeps failing feeds the
@@ -1416,6 +1521,11 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 	addrSilent := false
 
 	for i, s := range strategies {
+		if ctx.Err() != nil {
+			// Out of time before this strategy was dialled. Dialling it anyway
+			// fails at once and charges it for the caller's deadline.
+			return nil, nil, scanOutOfTime(ctx, target, scan, lastErr)
+		}
 		if !scan.answered && scan.timeouts >= tcpFailuresThreshold && !isUDPBasedStrategy(s) {
 			// Nothing has come back from this address on any transport. Walking
 			// the rest of the list means one connect timeout per strategy for a
@@ -1498,6 +1608,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			attemptCount++
 			log.Debug("  Attempt %d/%d for %s", retry+1, m.maxRetries, s.Name())
 
+			budget := m.attemptBudget(ctx)
 			connectCtx, cancel := context.WithTimeout(ctx, m.connectTimeout)
 			start := time.Now()
 
@@ -1550,7 +1661,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			// containing the word the classifier looks for. A refusal or a
 			// reset arrives in milliseconds; only silence costs the whole
 			// budget.
-			heardNothing := timedOut || latency >= silenceLatency(m.connectTimeout)
+			silent := heardNothing(err, latency, budget)
 
 			if timedOut {
 				log.Debug("  Failed: %s TIMEOUT (latency=%v)", s.Name(), latency)
@@ -1559,7 +1670,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			}
 			strategyTimedOut = timedOut
 
-			if heardNothing {
+			if silent {
 				if !isUDPBasedStrategy(s) {
 					scan.timeouts++
 					log.Debug("TCP silence count: %d/%d", scan.timeouts, tcpFailuresThreshold)
@@ -1584,8 +1695,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			// Brief pause before retry
 			select {
 			case <-ctx.Done():
-				log.Warn("Connection cancelled by context")
-				return nil, nil, ctx.Err()
+				return nil, nil, scanOutOfTime(ctx, target, scan, lastErr)
 			case <-time.After(100 * time.Millisecond):
 			}
 		}
