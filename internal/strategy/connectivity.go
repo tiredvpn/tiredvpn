@@ -444,6 +444,15 @@ func (c *ConnectivityChecker) Check(ctx context.Context) ConnectivityResult {
 	return result
 }
 
+// CheckTCP runs the TCP leg of the gate alone, over every address it is set
+// to, and caches the result like Check does. It sends nothing but the TCP
+// handshakes: no UDP probe, and none of the extra :443/:80 dials Check's ICMP
+// leg makes. Meant for loops that ask "does anyone in the pool answer yet" on a
+// timer, where those extras would repeat with every round.
+func (c *ConnectivityChecker) CheckTCP(ctx context.Context) ConnectivityResult {
+	return c.checkTCPOnly(ctx)
+}
+
 // checkTCPOnly performs just the TCP gate, carrying forward the last known
 // UDP/ICMP verdict. Used on the hot retry path (WaitForConnectivity) where the
 // only thing that matters is whether the server's TCP port is back; pulling in

@@ -241,6 +241,14 @@ const (
 // "nothing was eligible", which say nothing about the address.
 var errStrategyScanFailed = errors.New("all strategies failed")
 
+// ErrNoServerAnswered is the pre-flight gate's verdict that it walked every
+// address it was given and not one completed a TCP handshake. It is about the
+// path to the whole pool, not about any strategy or any one endpoint: the
+// caller decides whether that means "no network" or "servers unreachable from
+// this network", and in neither case does backing off longer help it notice
+// the moment one of them answers again.
+var ErrNoServerAnswered = errors.New("no connectivity to server")
+
 // errAddrSilent narrows errStrategyScanFailed: the scan was abandoned because
 // the address accepted connections and then answered nothing, on one transport
 // after another. Every failure was a timeout at connectTimeout - no refusal, no
@@ -1248,7 +1256,7 @@ func (m *Manager) preflightCandidate(ctx context.Context, sel *endpoint.Selector
 		log.Warn("No TCP connectivity to server, waiting for network...")
 		result = checker.WaitForConnectivity(ctx, defaultProbeInterval)
 		if !result.TCP {
-			return cand, fmt.Errorf("no connectivity to server: %w", result.Error)
+			return cand, fmt.Errorf("%w: %w", ErrNoServerAnswered, result.Error)
 		}
 	}
 

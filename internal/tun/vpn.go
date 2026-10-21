@@ -1741,6 +1741,7 @@ func (v *VPNClient) handleDisconnect(reason string, err error) {
 	consecutiveFailures := 0
 	lastNetworkCheck := time.Time{}
 	networkAvailable := true
+	var poolSilentSince time.Time // when the gate first found nobody in the pool answering
 
 	strategyName := "unknown"
 	if endedStrategy != nil {
@@ -1792,7 +1793,7 @@ func (v *VPNClient) handleDisconnect(reason string, err error) {
 		log.Info("Reconnecting VPN (attempt %d, backoff %v)...", consecutiveFailures, currentDelay)
 
 		// Use shorter timeout for reconnect attempts
-		connectTimeout := 15 * time.Second
+		connectTimeout := reconnectConnectTimeout
 		if currentDelay > 30*time.Second {
 			connectTimeout = 30 * time.Second // Longer timeout for longer backoffs
 		}
@@ -1813,6 +1814,28 @@ func (v *VPNClient) handleDisconnect(reason string, err error) {
 		}
 
 		atomic.AddInt64(&v.reconnectsFail, 1)
+
+		if errors.Is(err, strategy.ErrNoServerAnswered) {
+			// The gate walked the pool and nobody answered. Doubling the pause
+			// here only stretches the time between the pool coming back and us
+			// noticing: at the 2-minute cap that was up to 156 s of outage after
+			// the provider's line returned. Wait for an answer instead, then
+			// dial at once through the gate, which pins whoever answered.
+			if poolSilentSince.IsZero() {
+				poolSilentSince = time.Now()
+			}
+			if !v.waitOutSilentPool(err, poolSilentSince) {
+				return
+			}
+			currentDelay = reconnectInitialDelay
+			lastNetworkCheck = time.Now()
+			if v.manager != nil {
+				v.manager.NoteServerSilent()
+				gateArmed = v.manager.ConnectivityChecker() != nil
+			}
+			continue
+		}
+		poolSilentSince = time.Time{}
 
 		// Classify error type for better logging
 		errType := classifyError(err)
@@ -1887,7 +1910,90 @@ func (v *VPNClient) checkNetworkConnectivity() bool {
 		}
 	}
 
-	return internetReachable()
+	return probeInternet()
+}
+
+// reconnectConnectTimeout bounds one reconnect attempt. A var so tests can
+// shorten it.
+var reconnectConnectTimeout = 15 * time.Second
+
+// Pool polling while no server answers (see waitForPool). The interval is the
+// same fixed 5 s waitForNetworkRestore has always used, so the pattern on the
+// wire is not a new one; after poolPollSlowAfter of unbroken silence it drops to
+// poolPollSlowInterval, because by then a blocked pool is a likelier story than
+// a provider outage and SYNs into a blackhole every few seconds are a pattern
+// in their own right. Vars so tests can shorten them.
+var (
+	poolPollInterval     = 5 * time.Second
+	poolPollSlowInterval = 30 * time.Second
+	poolPollSlowAfter    = 10 * time.Minute
+	poolCheckTimeout     = 30 * time.Second
+)
+
+// waitOutSilentPool decides what a "nobody in the pool answers" verdict means
+// and waits accordingly. The gateway is the third party that tells the two
+// stories apart: if it does not answer either, the network is down and the
+// usual network wait applies; if it does, the servers are unreachable from a
+// working network and only the pool itself can say when that ends. Returns
+// false only when the client was stopped.
+func (v *VPNClient) waitOutSilentPool(err error, since time.Time) bool {
+	if !probeInternet() {
+		if v.manager != nil {
+			v.manager.ResetForNetworkChange()
+		}
+		log.Warn("No network connectivity, waiting for network to restore...")
+		return v.waitForNetworkRestore()
+	}
+	log.Warn("No server in the pool answers (%v) while the local network does - polling the pool instead of backing off", err)
+	return v.waitForPool(since)
+}
+
+// waitForPool polls the pool's TCP ports until one answers, at most
+// networkParkTimeout per call, then hands back to the caller for a real
+// connect. Only TCP handshakes go out: see ConnectivityChecker.CheckTCP.
+func (v *VPNClient) waitForPool(since time.Time) bool {
+	deadline := time.Now().Add(networkParkTimeout)
+	for atomic.LoadInt32(&v.running) == 1 {
+		interval := poolPollInterval
+		if time.Since(since) >= poolPollSlowAfter {
+			interval = poolPollSlowInterval
+		}
+		select {
+		case <-v.stopCh:
+			return false
+		case <-time.After(interval):
+		}
+		if addr, ok := v.poolAnswers(); ok {
+			log.Info("Server %s answers again after %v of pool silence", addr, time.Since(since).Round(time.Second))
+			return true
+		}
+		if time.Now().After(deadline) {
+			log.Warn("Pool still silent after %v - retrying connection anyway", networkParkTimeout)
+			return true
+		}
+	}
+	return false
+}
+
+// poolAnswers runs one TCP-only round of the gate over the pool.
+func (v *VPNClient) poolAnswers() (string, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), poolCheckTimeout)
+	defer cancel()
+	if v.manager != nil {
+		if checker := v.manager.ConnectivityChecker(); checker != nil {
+			r := checker.CheckTCP(ctx)
+			return r.Addr, r.TCP
+		}
+	}
+	if v.serverAddr == "" {
+		return "", false
+	}
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", v.serverAddr)
+	if err != nil {
+		return "", false
+	}
+	conn.Close()
+	return v.serverAddr, true
 }
 
 // errMeansPathAlive reports whether a dial error still suggests the path is
@@ -1917,6 +2023,10 @@ func dialMeansAlive(addr string) bool {
 // are routinely part of the installed TUN routes, so while the tunnel is down
 // they black-hole - which is why they are probes of last resort, not first.
 var publicFallbackProbes = []string{"8.8.8.8:53", "1.1.1.1:53"}
+
+// probeInternet is internetReachable, replaceable in tests: the real one dials
+// the host's default gateway.
+var probeInternet = internetReachable
 
 // internetReachable reports whether anything outside answers. It must never
 // probe through the VPN tunnel itself: while the tunnel is down its routes
