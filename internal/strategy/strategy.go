@@ -241,6 +241,95 @@ const (
 // "nothing was eligible", which say nothing about the address.
 var errStrategyScanFailed = errors.New("all strategies failed")
 
+// errAddrRefused is the verdict that the address's port is closed: a TCP
+// strategy's dial to it came back with ECONNREFUSED, and kept doing so through
+// refusalRetries. Every TCP transport rides that one port, so the next strategy
+// in the list cannot do better, and the failure says nothing about the strategy
+// that met it. A server being restarted refuses for half a second; walking the
+// list through that half second used to land the client on whichever strategy
+// happened to be dialling when the port reopened - HTTP Polling, on the stand
+// and in production.
+//
+// Errors carrying it also carry errStrategyScanFailed: a port that stays
+// closed is an endpoint verdict, and the walk moves on to the next candidate.
+var errAddrRefused = errors.New("address refused the connection")
+
+// refusalRetries is how long a refused strategy waits before dialling the same
+// address again, one entry per retry. 1.75 s in all: a restart (0.4-0.6 s on
+// the stand) is over within it, a stopped server is not.
+var refusalRetries = []time.Duration{250 * time.Millisecond, 500 * time.Millisecond, time.Second}
+
+// connectThroughRefusal dials s, and when the address refuses, waits and dials
+// it again per refusalRetries. refused reports that the last answer was still a
+// refusal.
+func (m *Manager) connectThroughRefusal(ctx context.Context, s Strategy, target string) (conn net.Conn, latency time.Duration, refused bool, err error) {
+	for i := 0; ; i++ {
+		connectCtx, cancel := context.WithTimeout(ctx, m.connectTimeout)
+		start := time.Now()
+		conn, err = s.Connect(connectCtx, target)
+		latency = time.Since(start)
+		cancel()
+		if err == nil || isUDPBasedStrategy(s) || !refusedByAddr(err, target, m.GetServerAddr(ctx)) {
+			return conn, latency, false, err
+		}
+		if i >= len(refusalRetries) {
+			return nil, latency, true, err
+		}
+		if i == 0 {
+			log.Info("%s: %s refused the connection - waiting for the port instead of trying other transports on it", s.Name(), target)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, latency, true, err
+		case <-time.After(refusalRetries[i]):
+		}
+	}
+}
+
+// refusedScan is the error a scan ends with when the address kept refusing.
+func refusedScan(target string, err error) error {
+	log.Warn("Address %s refused every connection for %v - port closed", target, sumDurations(refusalRetries))
+	return fmt.Errorf("%w: %w: %w", errAddrRefused, errStrategyScanFailed, err)
+}
+
+func sumDurations(ds []time.Duration) time.Duration {
+	var total time.Duration
+	for _, d := range ds {
+		total += d
+	}
+	return total
+}
+
+// refusedByAddr reports whether err is a refused dial to one of addrs. The
+// address check keeps a refusal from somewhere else - a relay, another port -
+// from being read as a verdict about the server. A name instead of an IP in
+// addrs (a single-server client configured by hostname) matches on the port.
+func refusedByAddr(err error, addrs ...string) bool {
+	if !errors.Is(err, syscall.ECONNREFUSED) {
+		return false
+	}
+	opErr, ok := errors.AsType[*net.OpError](err)
+	if !ok || opErr.Op != "dial" || opErr.Addr == nil {
+		return false
+	}
+	gotHost, gotPort, err := net.SplitHostPort(opErr.Addr.String())
+	if err != nil {
+		return false
+	}
+	gotIP := net.ParseIP(gotHost)
+	for _, a := range addrs {
+		host, port, err := net.SplitHostPort(a)
+		if err != nil || port != gotPort {
+			continue
+		}
+		ip := net.ParseIP(host)
+		if ip == nil || ip.Equal(gotIP) {
+			return true
+		}
+	}
+	return false
+}
+
 // ErrNoServerAnswered is the pre-flight gate's verdict that it walked every
 // address it was given and not one completed a TCP handshake. It is about the
 // path to the whole pool, not about any strategy or any one endpoint: the
@@ -671,6 +760,18 @@ func isUDPBasedStrategy(s Strategy) bool {
 		strings.Contains(strings.ToLower(s.Name()), "quic")
 }
 
+// confidenceWeight is how many priority points the whole confidence range is
+// worth in the scan order.
+//
+// It was 10, and one failure costs about 0.33 confidence, so a single failed
+// attempt moved a strategy three priority points down: REALITY (5) fell behind
+// HTTP Polling (6), H2 Stego and seqovl (7) and WebSocket Padded (8) after one
+// bad reconnect, and the next full scan picked one of them. At 2 one failure
+// moves a strategy less than one priority point and never past its neighbour;
+// two in a row do, and the circuit breaker and storm parking still take a
+// strategy that keeps failing out of the scan altogether.
+const confidenceWeight = 2.0
+
 // sortStrategies sorts by priority and confidence
 func (m *Manager) sortStrategies() {
 	// Simple bubble sort (small list)
@@ -680,8 +781,8 @@ func (m *Manager) sortStrategies() {
 			r1, r2 := m.results[s1.ID()], m.results[s2.ID()]
 
 			// Compare by adjusted priority (priority - confidence bonus)
-			score1 := float64(s1.Priority()) - r1.Confidence*10
-			score2 := float64(s2.Priority()) - r2.Confidence*10
+			score1 := float64(s1.Priority()) - r1.Confidence*confidenceWeight
+			score2 := float64(s2.Priority()) - r2.Confidence*confidenceWeight
 
 			// Android mode: adaptive penalty for UDP/QUIC strategies
 			// Base penalty is 50, but decreases with each TCP timeout
@@ -1016,6 +1117,36 @@ func (m *Manager) RecordSessionEnd(strategyID string) (storming bool) {
 	}
 	m.mu.Unlock()
 	return true
+}
+
+// SessionEnded reports the end of a tunnel session that strategyID carried.
+//
+// useful says whether the session carried traffic for a meaningful time.
+// Only a session that did not is evidence against the strategy: a tunnel that
+// ran for fifteen minutes and then lost its server to a restart, or its
+// network to a dead link, says nothing about the transport, and charging it
+// for that dropped REALITY below HTTP Polling after a single server restart.
+//
+// A useful session also restarts the fast-reconnect clock. The clock used to
+// run from the moment the session connected, so any session longer than five
+// minutes ended with the fast path expired, and the reconnect went to a full
+// scan in confidence order.
+//
+// It feeds the storm detector exactly as RecordSessionEnd does and returns its
+// verdict.
+func (m *Manager) SessionEnded(strategyID string, useful bool) (storming bool) {
+	if !useful {
+		m.UpdateStrategyConfidence(strategyID, false)
+	}
+	storming = m.RecordSessionEnd(strategyID)
+	if useful && !storming {
+		m.mu.Lock()
+		if m.lastSuccessfulStrategy != nil && m.lastSuccessfulStrategy.ID() == strategyID {
+			m.lastSuccessfulTime = time.Now()
+		}
+		m.mu.Unlock()
+	}
+	return storming
 }
 
 // maxEndpointAttempts caps how many endpoint candidates a single Connect may
@@ -1410,11 +1541,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			log.Info("Trying last successful strategy first: %s", lastSuccessful.Name())
 
 			budget := m.attemptBudget(ctx)
-			connectCtx, cancel := context.WithTimeout(ctx, m.connectTimeout)
-			start := time.Now()
-			conn, err := lastSuccessful.Connect(connectCtx, target)
-			latency := time.Since(start)
-			cancel()
+			conn, latency, refused, err := m.connectThroughRefusal(ctx, lastSuccessful, target)
 
 			if err == nil {
 				// Success - update stats (also records the breaker success)
@@ -1434,6 +1561,11 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 
 				log.Info("Fast reconnect via %s (latency=%v)", lastSuccessful.Name(), latency)
 				return conn, lastSuccessful, nil
+			}
+
+			if refused {
+				// Not the strategy's failure: the port is closed to all of them.
+				return nil, nil, refusedScan(target, fmt.Errorf("%s: %w", lastSuccessful.Name(), err))
 			}
 
 			// The fast path is the first transport of this cycle, and what it
@@ -1617,12 +1749,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			log.Debug("  Attempt %d/%d for %s", retry+1, m.maxRetries, s.Name())
 
 			budget := m.attemptBudget(ctx)
-			connectCtx, cancel := context.WithTimeout(ctx, m.connectTimeout)
-			start := time.Now()
-
-			conn, err := s.Connect(connectCtx, target)
-			latency := time.Since(start)
-			cancel()
+			conn, latency, refused, err := m.connectThroughRefusal(ctx, s, target)
 
 			if err == nil {
 				// Success - update confidence with latency and save for fast reconnect
@@ -1655,6 +1782,10 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			}
 
 			lastErr = fmt.Errorf("%s: %w", s.Name(), err)
+
+			if refused {
+				return nil, nil, refusedScan(target, lastErr)
+			}
 
 			// Distinguish between timeout and regular errors. The circuit
 			// breaker is NOT recorded per retry here - it is recorded once when

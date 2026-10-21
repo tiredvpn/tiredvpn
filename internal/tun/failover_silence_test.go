@@ -19,13 +19,21 @@ import (
 func disconnectOnce(t *testing.T, m *strategy.Manager, readErr error) {
 	t.Helper()
 	now := time.Now()
+	disconnectSession(t, m, nil, readErr, now.Add(-5*time.Minute), now.Add(-31*time.Second))
+}
+
+// disconnectSession is disconnectOnce for a session carried by strat, which
+// connected at connectedAt and last heard from the server at lastRx.
+func disconnectSession(t *testing.T, m *strategy.Manager, strat strategy.Strategy, readErr error, connectedAt, lastRx time.Time) {
+	t.Helper()
 	v := &VPNClient{
 		running:     1,
 		stopCh:      make(chan struct{}),
 		manager:     m,
+		strategy:    strat,
 		conn:        &failingConn{err: readErr},
-		connectedAt: now.Add(-5 * time.Minute),
-		lastRx:      now.Add(-31 * time.Second),
+		connectedAt: connectedAt,
+		lastRx:      lastRx,
 	}
 	out := &stopOnDisconnectLog{v: v}
 	log.SetOutput(out)
@@ -65,6 +73,39 @@ func TestSilentDisconnectArmsTheGate(t *testing.T) {
 			disconnectOnce(t, m, tc.err)
 			if got := m.PreflightArmed(); got != tc.want {
 				t.Fatalf("after a %s disconnect the gate is armed=%v, want %v", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSessionEndChargesOnlyADeadSession pins D2's call site. A tunnel that ran
+// for minutes and then lost its server to a restart says nothing about the
+// transport; v1.11.8 charged it anyway, and one restart put REALITY behind HTTP
+// Polling. A session whose downlink died within seconds of connecting is what a
+// DPI teardown looks like and still costs the strategy.
+func TestSessionEndChargesOnlyADeadSession(t *testing.T) {
+	now := time.Now()
+	cases := []struct {
+		name                string
+		err                 error
+		connectedAt, lastRx time.Time
+		charged             bool
+	}{
+		{"restart after 15 min", io.EOF, now.Add(-15 * time.Minute), now.Add(-time.Second), false},
+		{"silence after 15 min", &net.OpError{Op: "read", Err: os.ErrDeadlineExceeded}, now.Add(-15 * time.Minute), now.Add(-31 * time.Second), false},
+		{"downlink died at once", &net.OpError{Op: "read", Err: os.ErrDeadlineExceeded}, now.Add(-32 * time.Second), now.Add(-31 * time.Second), true},
+		{"reset after 3 s", io.EOF, now.Add(-3 * time.Second), now.Add(-2 * time.Second), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := strategy.NewManager()
+			ps := &pipeStrategy{t: t}
+			m.Register(ps)
+			before := m.GetStats()[ps.ID()].Confidence
+			disconnectSession(t, m, ps, tc.err, tc.connectedAt, tc.lastRx)
+			after := m.GetStats()[ps.ID()].Confidence
+			if charged := after < before; charged != tc.charged {
+				t.Fatalf("confidence %.2f -> %.2f: charged=%v, want %v", before, after, charged, tc.charged)
 			}
 		})
 	}

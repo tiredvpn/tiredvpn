@@ -1732,8 +1732,7 @@ func (v *VPNClient) handleDisconnect(reason string, err error) {
 	// catches this by session lifetime and (in auto mode) parks the strategy so
 	// the next reconnect picks a different one.
 	if endedStrategy != nil && v.manager != nil {
-		v.manager.UpdateStrategyConfidence(endedStrategy.ID(), false)
-		v.manager.RecordSessionEnd(endedStrategy.ID())
+		v.manager.SessionEnded(endedStrategy.ID(), sessionWasUseful(connectedAt, lastRx))
 	}
 
 	// Initialize exponential backoff
@@ -1861,6 +1860,20 @@ func (v *VPNClient) handleDisconnect(reason string, err error) {
 			currentDelay = reconnectMaxDelay
 		}
 	}
+}
+
+// sessionUsefulMin is how long a session's downlink has to keep going for its
+// end to say nothing against the strategy that carried it. It is the storm
+// detector's short-session line: below it a session dying is what a DPI
+// teardown looks like; above it, it is what a server restart or a dead link
+// looks like.
+const sessionUsefulMin = 20 * time.Second
+
+// sessionWasUseful reports whether the session carried downlink for at least
+// sessionUsefulMin. lastRx, not the moment of disconnect: a tunnel frozen a
+// second after it came up still takes readTimeout to be declared dead.
+func sessionWasUseful(connectedAt, lastRx time.Time) bool {
+	return !connectedAt.IsZero() && lastRx.Sub(connectedAt) >= sessionUsefulMin
 }
 
 // serverWentSilent reports a disconnect caused by a deadline - the server
