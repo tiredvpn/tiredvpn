@@ -113,7 +113,7 @@ type Config struct {
 	ReprobeInterval  time.Duration // How often to re-probe strategies (default 5m)
 	CircuitThreshold int           // Failures before circuit opens (default 3)
 	CircuitResetTime time.Duration // Time before circuit tries half-open (default 5m)
-	EnableFallback   bool          // Enable mid-session fallback (default true)
+	EnableFallback   bool          // Allow a live tunnel to move back to a better strategy (default true)
 
 	// QUIC transport
 	QUICEnabled bool // Enable QUIC strategy
@@ -890,6 +890,10 @@ func newTUNVPNConfig(cfg *Config, mgr *strategy.Manager) (tun.VPNConfig, error) 
 		IPv6Routes:  ipv6Routes,
 		TunFd:       cfg.TunFd,       // Android VpnService TUN fd
 		ProtectPath: cfg.ProtectPath, // Android socket protection path
+		// -fallback used to be printed and nothing else. It now governs the
+		// one mid-session strategy switch there is: moving a live tunnel back
+		// to a better strategy once a reprobe finds it working.
+		NoStrategyUpgrade: !cfg.EnableFallback,
 	}, nil
 }
 

@@ -1,6 +1,7 @@
 package strategy
 
 import (
+	"cmp"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
@@ -8,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -184,6 +186,14 @@ type Manager struct {
 	// the hot reconnect path. Set by NoteServerSilent when the tunnel died of
 	// silence; cleared by the gate run it causes. Guarded by m.mu.
 	preflightArmed bool
+
+	// Strategy upgrade (see offerUpgrade). upgradeCallback receives the
+	// candidates a periodic reprobe found working; upgradeFails counts each
+	// strategy's consecutive failed upgrade dials and upgradeSkip how many more
+	// reprobes it sits out. Guarded by m.mu.
+	upgradeCallback func([]Strategy)
+	upgradeFails    map[string]int
+	upgradeSkip     map[string]int
 
 	// Android mode - deprioritize QUIC/UDP strategies
 	androidMode bool
@@ -2613,6 +2623,149 @@ func (m *Manager) doPeriodicReprobe(ctx context.Context) {
 		}
 	}
 	log.Info("Periodic reprobe complete: %d/%d strategies available", available, len(results))
+
+	m.offerUpgrade(results)
+}
+
+// SetStrategyUpgradeCallback registers fn to hear, after every periodic
+// reprobe, which strategies the reprobe found reachable and the upgrade
+// backoff lets through, most preferred first. The TUN client uses it to move a
+// live tunnel off a fallback strategy (see VPNClient.tryStrategyUpgrade). Nil
+// turns upgrades off.
+func (m *Manager) SetStrategyUpgradeCallback(fn func([]Strategy)) {
+	m.mu.Lock()
+	m.upgradeCallback = fn
+	m.mu.Unlock()
+}
+
+// upgradeMaxSkip caps how many reprobes a strategy sits out after failed
+// upgrade dials: six reprobes, half an hour at the default interval.
+const upgradeMaxSkip = 6
+
+// offerUpgrade hands the upgrade callback the strategies this reprobe found
+// reachable and that a scan would admit right now, in priority order.
+//
+// Nothing else ever moves a live tunnel off the strategy it connected with.
+// The reprobe only refreshed confidence, so a client that fell back to HTTP
+// Polling or Geneva during a fault stayed there for as long as the session
+// held - fourteen minutes and two clean reprobes in the stand's run #9.
+//
+// A probe is a TCP connect and proves only the port; the callback's real dial
+// is what proves the strategy. A strategy whose upgrade dial keeps failing
+// (REALITY under a censor that resets its handshake) sits out 1, 2, 4 and then
+// 6 reprobes after its second, third, fourth and later consecutive failure, so
+// a blocked transport is not retried on every tick. The first failure costs
+// nothing: a fault that has just been lifted is the common case.
+func (m *Manager) offerUpgrade(results []Result) {
+	m.mu.Lock()
+	cb := m.upgradeCallback
+	if cb == nil || m.forced {
+		m.mu.Unlock()
+		return
+	}
+	excludeUDP := m.excludeUDPStrategies
+	var cands []Strategy
+	for _, r := range results {
+		s := r.Strategy
+		if s == nil {
+			continue
+		}
+		id := s.ID()
+		if n := m.upgradeSkip[id]; n > 0 {
+			m.upgradeSkip[id] = n - 1 // one more reprobe sat out
+			continue
+		}
+		if !r.Success || s.Priority() <= 0 {
+			continue
+		}
+		if (excludeUDP && isUDPBasedStrategy(s)) || m.stormDetector.IsParked(id) || !m.circuitBreakers.CanTry(id) {
+			continue
+		}
+		cands = append(cands, s)
+	}
+	m.mu.Unlock()
+
+	if len(cands) == 0 {
+		return
+	}
+	slices.SortStableFunc(cands, func(a, b Strategy) int { return cmp.Compare(a.Priority(), b.Priority()) })
+	go cb(cands)
+}
+
+// recordUpgradeResultLocked books one upgrade dial of id. Caller holds m.mu.
+func (m *Manager) recordUpgradeResultLocked(id string, ok bool) {
+	if m.upgradeFails == nil {
+		m.upgradeFails = make(map[string]int)
+		m.upgradeSkip = make(map[string]int)
+	}
+	if ok {
+		delete(m.upgradeFails, id)
+		delete(m.upgradeSkip, id)
+		return
+	}
+	m.upgradeFails[id]++
+	if n := m.upgradeFails[id]; n >= 2 {
+		m.upgradeSkip[id] = min(1<<(n-2), upgradeMaxSkip)
+	}
+}
+
+// ConnectStrategy dials exactly s at the pinned endpoint, with that endpoint's
+// secret, and books the outcome the way a scan would. It is the upgrade
+// dial: the caller already has a working tunnel and wants this strategy
+// specifically, so there is no fallback to anything else and no endpoint walk.
+func (m *Manager) ConnectStrategy(ctx context.Context, s Strategy) (net.Conn, error) {
+	sel := m.selector()
+	if sel == nil {
+		return nil, fmt.Errorf("no endpoint to dial %s at", s.Name())
+	}
+	cand, ok := sel.Current()
+	if !ok {
+		return nil, fmt.Errorf("no endpoint to dial %s at", s.Name())
+	}
+	m.muxMu.Lock()
+	muxEnabled := m.muxEnabled
+	m.muxMu.Unlock()
+	if muxEnabled {
+		// The tunnel rides a shared mux carrier there; swapping the carrier is
+		// what budget recycling does, and doing it from here as well would
+		// race it.
+		return nil, fmt.Errorf("strategy upgrade is not supported with mux")
+	}
+
+	dialCtx := withDialSecret(ctx, m.secretForCandidate(cand))
+	connectCtx, cancel := context.WithTimeout(dialCtx, m.connectTimeout)
+	start := time.Now()
+	conn, err := s.Connect(connectCtx, m.withHoppedPort(cand.Addr))
+	latency := time.Since(start)
+	cancel()
+
+	m.mu.Lock()
+	m.recordUpgradeResultLocked(s.ID(), err == nil)
+	if err != nil {
+		m.updateConfidenceStats(s.ID(), false, 0)
+		if isTimeoutError(err) {
+			m.circuitBreakers.RecordTimeout(s.ID())
+		} else {
+			m.circuitBreakers.RecordFailure(s.ID())
+		}
+		m.mu.Unlock()
+		return nil, err
+	}
+	m.lastSuccessfulStrategy = s
+	m.lastSuccessfulTime = time.Now()
+	m.updateConfidenceWithLatency(s.ID(), true, latency)
+	m.sortStrategies()
+	m.lastConnectionLatency = latency
+	m.lastConnectionStrategy = s.Name()
+	m.lastConnectionStrategyID = s.ID()
+	useRTTMasking, rttProfile := m.rttMaskingEnabled, m.rttProfile
+	m.mu.Unlock()
+
+	optimizeTCPConn(conn)
+	if useRTTMasking {
+		conn = WrapWithRTTMasking(conn, rttProfile)
+	}
+	return conn, nil
 }
 
 // SetReprobeInterval changes the reprobe interval
