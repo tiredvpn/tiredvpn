@@ -301,6 +301,30 @@ func (s *TrafficMorphStrategy) Probe(ctx context.Context, target string) error {
 	if s.baseStrat != nil {
 		return s.baseStrat.Probe(ctx, target)
 	}
+	// Without a base strategy Morph dials the server itself. This used to
+	// return nil without touching the network - see probeServerTCP.
+	return probeServerTCP(ctx, s.manager, target)
+}
+
+// probeServerTCP is the shallow probe for a strategy that dials the server
+// itself: a bare TCP connect to the address its Connect would dial, the way
+// REALITY probes. Traffic Morph and State Exhaustion used to answer their probe
+// without touching the network; a reprobe with the link down then reported them
+// available, ProbeAll raised their confidence to 0.92 while every honest probe
+// failed, and the client came back from the outage on Traffic Morph instead of
+// REALITY.
+func probeServerTCP(ctx context.Context, m *Manager, target string) error {
+	addr := target
+	if m != nil {
+		if pinned := m.GetServerAddr(ctx); pinned != "" {
+			addr = pinned
+		}
+	}
+	conn, err := (&net.Dialer{Timeout: 3 * time.Second}).DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return err
+	}
+	conn.Close()
 	return nil
 }
 

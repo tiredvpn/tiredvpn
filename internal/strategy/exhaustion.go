@@ -80,19 +80,18 @@ func (s *StateExhaustionStrategy) Probe(ctx context.Context, target string) erro
 	// Android mode: warn but don't fail (will use fallback)
 	if androidModeEnabled {
 		log.Debug("State Exhaustion on Android: will use fallback mode (no raw sockets)")
-		return nil
-	}
-
-	// Quick check - can we create raw sockets?
-	// If not, we'll fallback to normal TCP in Connect()
-	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_TCP)
-	if err != nil {
+	} else if fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_TCP); err != nil {
+		// Quick check - can we create raw sockets? If not, Connect falls back
+		// to normal TCP.
 		log.Debug("State Exhaustion: raw sockets unavailable, will use fallback mode")
-		return nil // Don't fail - fallback available
+	} else {
+		syscall.Close(fd)
 	}
-	syscall.Close(fd)
 
-	return nil
+	// The raw-socket check is local. Whether the server is there is not, and
+	// answering it without a dial is what made a reprobe during an outage call
+	// this strategy available.
+	return probeServerTCP(ctx, s.manager, target)
 }
 
 func (s *StateExhaustionStrategy) Connect(ctx context.Context, target string) (net.Conn, error) {
