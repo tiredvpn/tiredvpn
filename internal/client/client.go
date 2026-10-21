@@ -359,6 +359,12 @@ func buildManager(cfg *Config, secret string) (*strategy.Manager, error) {
 			PadFlight: cfg.BurstReshapePadFlight,
 		},
 	}
+	// The family the [selection] section resolved to, so the selector the
+	// constructor builds and the "Endpoint pool" line it logs agree with the
+	// one SetEndpointSelection installs below. Without it the line printed the
+	// family the legacy flags imply - prefer_v6 under family = "v4_only".
+	family := selCfg.Family
+	mgrCfg.EndpointTuning.Family = &family
 	mgr := strategy.NewDefaultManager(mgrCfg)
 
 	// The constructor already built a selector from mgrCfg; this replaces it

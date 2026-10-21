@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -161,5 +162,55 @@ func TestDeadSessionChargesItsEndpoint(t *testing.T) {
 				t.Fatalf("endpoint parked=%v, want %v", parked, tc.parked)
 			}
 		})
+	}
+}
+
+// frameConn yields one scripted frame header and then blocks reads on EOF.
+type frameConn struct {
+	net.Conn
+	hdr []byte
+}
+
+func (c *frameConn) Read(p []byte) (int, error) {
+	if len(c.hdr) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, c.hdr)
+	c.hdr = c.hdr[n:]
+	return n, nil
+}
+func (c *frameConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *frameConn) SetWriteDeadline(time.Time) error { return nil }
+func (c *frameConn) Close() error                     { return nil }
+
+// TestPollingResetMarkerIsNamed: after an exit restart HTTP Polling sessions
+// ended with "bad frame: length 65536 exceeds protocol max" (stand run #9, all
+// five restarts). The length is the exit's deliberate session-reset marker, not
+// a desync, and the log now says so.
+func TestPollingResetMarkerIsNamed(t *testing.T) {
+	v := &VPNClient{
+		running:     1,
+		stopCh:      make(chan struct{}),
+		conn:        &frameConn{hdr: []byte{0x00, 0x01, 0x00, 0x00}},
+		connectedAt: time.Now().Add(-time.Minute),
+		lastRx:      time.Now(),
+	}
+	out := &stopOnDisconnectLog{v: v}
+	log.SetOutput(out)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	done := make(chan struct{})
+	go func() {
+		v.readFromServer()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		atomic.StoreInt32(&v.running, 0)
+		t.Fatalf("read loop did not return; log:\n%s", out)
+	}
+	if !strings.Contains(out.String(), "VPN disconnected: session reset by server") {
+		t.Fatalf("the reset marker was not named as such:\n%s", out)
 	}
 }

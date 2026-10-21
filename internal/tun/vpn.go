@@ -47,6 +47,12 @@ const deadConnectionTimeout = 45 * time.Second // Proactive dead connection dete
 // anything above it is treated as a desynced stream and drops the connection.
 const maxFrameLen = 65535
 
+// pollingResetMarker is the frame length an exit sends an HTTP Polling client
+// whose session it does not have (server.go pollingSessionResetFrame): the
+// smallest length over the ceiling, chosen so every deployed client drops the
+// session at once.
+const pollingResetMarker = maxFrameLen + 1
+
 // Reconnect configuration
 const (
 	reconnectInitialDelay = 1 * time.Second // Start with 1 second
@@ -1626,6 +1632,13 @@ func (v *VPNClient) readFromServer() {
 				nLen, pktLen, lenBuf[0], lenBuf[1], lenBuf[2], lenBuf[3])
 		}
 
+		if pktLen == pollingResetMarker {
+			// Not a desync: the exit's "no such session" for HTTP Polling,
+			// sent on purpose after it lost the session (a restart). Named so
+			// the log reads as what it is.
+			v.connLost(conn, "session reset by server", fmt.Errorf("frame length %d is the exit's session-reset marker", pktLen))
+			continue
+		}
 		if pktLen > maxFrameLen {
 			v.connLost(conn, "bad frame", fmt.Errorf("length %d exceeds protocol max", pktLen))
 			continue

@@ -904,13 +904,14 @@ func (m *Manager) ProbeAll(ctx context.Context, target string) []Result {
 	// configured endpoint on a timer would multiply this client's traffic by the
 	// size of its server list and hand an observer a periodic fan-out pattern
 	// that nothing else on the wire produces.
+	//
+	// Same endpoint, same key: the address and the secret come from one read of
+	// the pin, and travel on the context to every probe.
+	ctx = m.ensureDialSecret(ctx)
 	if addr := m.GetServerAddr(ctx); addr != "" {
 		target = addr
 		log.Debug("Probing with effective server address: %s", target)
 	}
-	// Same endpoint, same key: a probe that authenticates does it against the
-	// pinned endpoint, which is the one whose address was just resolved above.
-	ctx = m.ensureDialSecret(ctx)
 
 	m.mu.RLock()
 	// Filter out disabled strategies (priority <= 0)
@@ -1331,7 +1332,7 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 		// strategy would let a handshake authenticate to one server with another
 		// server's key. Here the address and the key are decided together and
 		// travel together.
-		dialCtx := withDialSecret(ctx, m.secretForCandidate(cand))
+		dialCtx := m.withDialCandidate(ctx, cand)
 
 		start := time.Now()
 		conn, strategy, err := m.ConnectExcluding(dialCtx, m.withHoppedPort(cand.Addr), nil)
@@ -2788,7 +2789,7 @@ func (m *Manager) ConnectStrategy(ctx context.Context, s Strategy) (net.Conn, er
 		return nil, fmt.Errorf("strategy upgrade is not supported with mux")
 	}
 
-	dialCtx := withDialSecret(ctx, m.secretForCandidate(cand))
+	dialCtx := m.withDialCandidate(ctx, cand)
 	connectCtx, cancel := context.WithTimeout(dialCtx, m.connectTimeout)
 	start := time.Now()
 	conn, err := s.Connect(connectCtx, m.withHoppedPort(cand.Addr))
@@ -3773,8 +3774,13 @@ func (m *Manager) TLSSessionCache() tls.ClientSessionCache {
 // explicit step per connect cycle (see dialEndpoints); this returns whatever
 // that step decided, so a whole scan sees one and the same address.
 //
-// The ctx parameter is retained for the fifteen existing call sites.
-func (m *Manager) GetServerAddr(_ context.Context) string {
+// A dial that was decided for a particular candidate carries its address on
+// ctx (see withDialCandidate), and that address wins over the pin: the pin may
+// have moved since the dial started, the dial's key has not.
+func (m *Manager) GetServerAddr(ctx context.Context) string {
+	if a, ok := dialAddr(ctx); ok {
+		return a
+	}
 	sel := m.selector()
 	if sel == nil {
 		return ""
