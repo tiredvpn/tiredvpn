@@ -1,11 +1,17 @@
 package strategy
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net"
+	"os"
+	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/tiredvpn/tiredvpn/internal/log"
 )
 
 // TestDeadSessionParksTheEndpoint is D6 of the 2026-10-21 stand report. Every
@@ -89,3 +95,43 @@ func TestPollingDeathReadsAsSilence(t *testing.T) {
 		t.Fatal("errPollingDead became a timeout; the SOCKS relay would keep a dead exit open")
 	}
 }
+
+// TestFamilyProbeRepinIsLogged: in the stand's run #2 the log said "switching
+// to 192.168.110.11:995/v4" and the client then turned up on another server
+// without a line at Info saying so. The probe's move has to be in the log.
+func TestFamilyProbeRepinIsLogged(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	dead := ln.Addr().String()
+	ln.Close()
+	live := newHelloListener(t)
+
+	var out bytes.Buffer
+	var mu sync.Mutex
+	log.SetOutput(writerFunc(func(p []byte) (int, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return out.Write(p)
+	}))
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	m := newSilenceManager(t, time.Second, dead, live.addr)
+	m.Register(&greetingStrategy{id: "reality", priority: 5})
+	conn, _, err := m.Connect(context.Background(), "")
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	conn.Close()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !strings.Contains(out.String(), "did not answer the family probe, switching to "+live.addr) {
+		t.Fatalf("the probe moved the pin without a line in the log:\n%s", out.String())
+	}
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }

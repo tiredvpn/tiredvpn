@@ -1316,7 +1316,14 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 		// as probed, so this is a no-op then. On the hot reconnect path, where
 		// the gate is skipped, this is the only thing that notices a dead
 		// family - which is exactly what the old one-shot IPv6 check did.
-		cand, _ = sel.ProbeCurrent(ctx)
+		probed, kept := sel.ProbeCurrent(ctx)
+		if !kept && probed.Addr != cand.Addr {
+			// The family probe moved the pin. Before this line the move was
+			// silent, and a log that announced one address went on to show
+			// the client on another.
+			log.Info("Endpoint %s did not answer the family probe, switching to %s", cand, probed)
+		}
+		cand = probed
 
 		// Name the secret for THIS candidate, on this dial's own context. The
 		// pinned candidate can move underneath us - a concurrent Connect, the

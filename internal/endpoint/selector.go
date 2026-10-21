@@ -8,6 +8,7 @@ import (
 	"net"
 	"sort"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -747,7 +748,10 @@ func (s *Selector) ProbeCurrent(ctx context.Context) (Candidate, bool) {
 	}
 	cur := s.cands[s.pinnedIdx]
 	now := s.cfg.Now()
-	need := !s.health[s.pinnedIdx].probed && s.hasFallbackAfterLocked(s.pinnedIdx, now)
+	// A family with no physical route is not probed: the dial cannot leave
+	// the host, and charging the endpoint for that blamed a live server for
+	// the client's own dead link (stand run #5c).
+	need := !s.health[s.pinnedIdx].probed && !s.unreachable[s.pinnedIdx] && s.hasFallbackAfterLocked(s.pinnedIdx, now)
 	s.mu.Unlock()
 
 	if !need {
@@ -765,6 +769,12 @@ func (s *Selector) ProbeCurrent(ctx context.Context) (Candidate, bool) {
 		return cur, true
 	}
 
+	if localNetworkError(err) {
+		// The host could not send the probe at all - no route, no network,
+		// no source address. That is the host's state, not the endpoint's:
+		// leave health and pin alone and let the connect cycle find out.
+		return cur, true
+	}
 	s.ReportProbe(cur, false, 0)
 	next, ok := s.Next(s.cfg.Now())
 	if !ok {
@@ -772,6 +782,13 @@ func (s *Selector) ProbeCurrent(ctx context.Context) (Candidate, bool) {
 	}
 	s.Pin(next)
 	return next, false
+}
+
+// localNetworkError reports a dial error raised by the local stack before
+// anything reached the network.
+func localNetworkError(err error) bool {
+	return errors.Is(err, syscall.ENETUNREACH) || errors.Is(err, syscall.ENETDOWN) ||
+		errors.Is(err, syscall.EADDRNOTAVAIL)
 }
 
 // hasFallbackAfterLocked reports whether some less-preferred candidate is
