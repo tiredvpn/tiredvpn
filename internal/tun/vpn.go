@@ -1862,8 +1862,17 @@ func (v *VPNClient) handleDisconnect(reason string, err error) {
 	// breaker never trips, but the tunnel carries no traffic. The detector
 	// catches this by session lifetime and (in auto mode) parks the strategy so
 	// the next reconnect picks a different one.
+	silent := serverWentSilent(err)
 	if endedStrategy != nil && v.manager != nil {
-		v.manager.SessionEnded(endedStrategy.ID(), sessionWasUseful(connectedAt, lastRx))
+		useful := sessionWasUseful(connectedAt, lastRx)
+		v.manager.SessionEnded(endedStrategy.ID(), useful)
+		if silent && !useful {
+			// Connected, carried a moment, then nothing until the deadline:
+			// the endpoint's verdict, not the transport's (see
+			// Manager.ReportDeadSession). A reset or an EOF proves the server
+			// was there and stays the storm detector's business.
+			v.manager.ReportDeadSession()
+		}
 	}
 
 	// Initialize exponential backoff
@@ -1886,7 +1895,7 @@ func (v *VPNClient) handleDisconnect(reason string, err error) {
 	// stops at the first silent address after 3 seconds and tells the gate
 	// nothing, while the gate answers the same question for the whole pool.
 	gateArmed := false
-	if serverWentSilent(err) && v.manager != nil {
+	if silent && v.manager != nil {
 		v.manager.NoteServerSilent()
 		gateArmed = v.manager.ConnectivityChecker() != nil
 	}
@@ -2009,9 +2018,10 @@ func sessionWasUseful(connectedAt, lastRx time.Time) bool {
 
 // serverWentSilent reports a disconnect caused by a deadline - the server
 // stopped answering - as opposed to a close, a reset or a protocol error, all of
-// which prove the server was there to send them.
+// which prove the server was there to send them. HTTP Polling's health grace
+// says the same thing in its own words (strategy.ErrServerSilent).
 func serverWentSilent(err error) bool {
-	if errors.Is(err, os.ErrDeadlineExceeded) {
+	if errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, strategy.ErrServerSilent) {
 		return true
 	}
 	ne, ok := errors.AsType[net.Error](err)

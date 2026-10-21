@@ -187,6 +187,12 @@ type Manager struct {
 	// silence; cleared by the gate run it causes. Guarded by m.mu.
 	preflightArmed bool
 
+	// sessionCand is the endpoint candidate the last successful dialEndpoints
+	// connected to - the one a tunnel session that ends now was riding.
+	// hasSessionCand says it is set. Guarded by m.mu.
+	sessionCand    endpoint.Candidate
+	hasSessionCand bool
+
 	// Strategy upgrade (see offerUpgrade). upgradeCallback receives the
 	// candidates a periodic reprobe found working; upgradeFails counts each
 	// strategy's consecutive failed upgrade dials and upgradeSkip how many more
@@ -1149,6 +1155,13 @@ func (m *Manager) SessionEnded(strategyID string, useful bool) (storming bool) {
 		m.UpdateStrategyConfidence(strategyID, false)
 	}
 	storming = m.RecordSessionEnd(strategyID)
+	if storming {
+		// A strategy whose sessions keep dying on this endpoint is evidence
+		// against the endpoint too: a freeze keyed to the address kills every
+		// transport in turn, and the storm detector alone only ever walks the
+		// strategy list on the same server, 2.5-3.5 minutes per strategy.
+		m.reportSessionEndpoint(false, "storm")
+	}
 	if useful && !storming {
 		m.mu.Lock()
 		if m.lastSuccessfulStrategy != nil && m.lastSuccessfulStrategy.ID() == strategyID {
@@ -1157,6 +1170,39 @@ func (m *Manager) SessionEnded(strategyID string, useful bool) (storming bool) {
 		m.mu.Unlock()
 	}
 	return storming
+}
+
+// ReportDeadSession tells the endpoint layer that the tunnel session just
+// lost went silent within moments of connecting: its downlink stopped long
+// before the read deadline declared it dead.
+//
+// Every connect to that endpoint succeeds - which is why the connect-based
+// health never noticed and every success reset the streak - but no session
+// survives: what a byte-count freeze on the route looks like (the TSPU #490
+// pattern, stand run #7b: ten choices of the same address in six minutes and
+// the data plane alive 4% of the time). It parks the endpoint at once, the way
+// ReportSilent does for an address that answered no transport.
+func (m *Manager) ReportDeadSession() {
+	m.reportSessionEndpoint(true, "session went silent right after connecting")
+}
+
+// reportSessionEndpoint charges the endpoint the ended session was riding:
+// park parks it at once, otherwise it is one ordinary failure.
+func (m *Manager) reportSessionEndpoint(park bool, why string) {
+	sel := m.selector()
+	m.mu.RLock()
+	cand, ok := m.sessionCand, m.hasSessionCand
+	m.mu.RUnlock()
+	if sel == nil || !ok {
+		return
+	}
+	if park {
+		sel.ReportSilent(cand)
+	} else {
+		sel.Report(cand, false, 0)
+	}
+	log.Info("Endpoint %s charged for its session (%s)", cand, why)
+	m.logEndpointHealth(sel, cand)
 }
 
 // maxEndpointAttempts caps how many endpoint candidates a single Connect may
@@ -1284,6 +1330,9 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 		conn, strategy, err := m.ConnectExcluding(dialCtx, m.withHoppedPort(cand.Addr), nil)
 		if err == nil {
 			sel.Report(cand, true, time.Since(start))
+			m.mu.Lock()
+			m.sessionCand, m.hasSessionCand = cand, true
+			m.mu.Unlock()
 			return conn, strategy, nil
 		}
 		lastErr = err

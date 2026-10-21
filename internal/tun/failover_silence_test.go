@@ -1,7 +1,9 @@
 package tun
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -9,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tiredvpn/tiredvpn/internal/endpoint"
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
 )
@@ -63,6 +66,7 @@ func TestSilentDisconnectArmsTheGate(t *testing.T) {
 		want bool
 	}{
 		{"read deadline", &net.OpError{Op: "read", Net: "tcp", Err: os.ErrDeadlineExceeded}, true},
+		{"polling health grace", fmt.Errorf("http_polling: no successful poll within the health grace: %w", strategy.ErrServerSilent), true},
 		{"EOF", io.EOF, false},
 		{"reset", &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("read", errors.New("connection reset by peer"))}, false},
 	}
@@ -106,6 +110,55 @@ func TestSessionEndChargesOnlyADeadSession(t *testing.T) {
 			after := m.GetStats()[ps.ID()].Confidence
 			if charged := after < before; charged != tc.charged {
 				t.Fatalf("confidence %.2f -> %.2f: charged=%v, want %v", before, after, charged, tc.charged)
+			}
+		})
+	}
+}
+
+// TestDeadSessionChargesItsEndpoint pins D6's call site: only a session that
+// went silent with its downlink dead from the start parks the endpoint it rode.
+// A long session that went silent is D1's case (the gate walks the pool), and a
+// short one ended by a reset is the storm detector's.
+func TestDeadSessionChargesItsEndpoint(t *testing.T) {
+	now := time.Now()
+	silence := &net.OpError{Op: "read", Err: os.ErrDeadlineExceeded}
+	cases := []struct {
+		name                string
+		err                 error
+		connectedAt, lastRx time.Time
+		parked              bool
+	}{
+		{"froze after 1 s", silence, now.Add(-31 * time.Second), now.Add(-30 * time.Second), true},
+		{"silent after 15 min", silence, now.Add(-15 * time.Minute), now.Add(-31 * time.Second), false},
+		{"reset after 3 s", io.EOF, now.Add(-3 * time.Second), now.Add(-2 * time.Second), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := strategy.NewManager()
+			// Listening addresses, so the family probe passes and the session
+			// rides the first one.
+			addrs := []string{newNetcheckListener(t).addr, newNetcheckListener(t).addr}
+			if err := m.SetEndpoints([]endpoint.Endpoint{{Name: "a", V4: addrs[0]}, {Name: "b", V4: addrs[1]}}, endpoint.V4Only); err != nil {
+				t.Fatalf("SetEndpoints: %v", err)
+			}
+			ps := &pipeStrategy{t: t, resp: bareV3Response()}
+			m.Register(ps)
+			conn, _, err := m.Connect(context.Background(), "")
+			if err != nil {
+				t.Fatalf("Connect: %v", err)
+			}
+			conn.Close()
+
+			disconnectSession(t, m, ps, tc.err, tc.connectedAt, tc.lastRx)
+
+			var parked bool
+			for _, st := range m.EndpointStates() {
+				if st.Addr == addrs[0] {
+					parked = st.CooldownUntil.After(time.Now())
+				}
+			}
+			if parked != tc.parked {
+				t.Fatalf("endpoint parked=%v, want %v", parked, tc.parked)
 			}
 		})
 	}

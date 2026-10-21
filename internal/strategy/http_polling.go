@@ -58,8 +58,21 @@ const (
 // errPollingDead is returned by Read and Write once no poll has succeeded for
 // pollingPollHealthGrace. It is deliberately not a timeout: the SOCKS relay
 // keeps a timed-out direction open, and a dead exit must end the relay rather
-// than keep it (and the uplink queue) alive forever.
-var errPollingDead = errors.New("http_polling: no successful poll within the health grace")
+// than keep it (and the uplink queue) alive forever. It does match
+// ErrServerSilent, which is what it means to the TUN client.
+var errPollingDead error = &silentError{"http_polling: no successful poll within the health grace"}
+
+// ErrServerSilent matches transport errors that mean the server stopped
+// answering without being a net.Error timeout. The TUN client treats them like
+// its own read deadline: the server may be gone (walk the pool), and a session
+// that died this way right after connecting is an endpoint verdict.
+var ErrServerSilent = errors.New("server went silent")
+
+// silentError is an error that matches ErrServerSilent and is not a timeout.
+type silentError struct{ msg string }
+
+func (e *silentError) Error() string        { return e.msg }
+func (e *silentError) Is(target error) bool { return target == ErrServerSilent }
 
 // maxPollBody caps the response Content-Length we will allocate for. A poll
 // response carries at most one relay buffer (tens of KB); 1 MiB leaves headroom
