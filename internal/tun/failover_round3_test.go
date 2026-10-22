@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -415,11 +416,15 @@ type stallingConn struct {
 	net.Conn
 	mu       sync.Mutex
 	deadline time.Time
+	smux     bool // fail the way a smux stream does, not as a raw TCP conn
+	fixed    bool // keep the deadline the test set, not the caller's
 }
 
 func (c *stallingConn) SetWriteDeadline(t time.Time) error {
 	c.mu.Lock()
-	c.deadline = t
+	if !c.fixed {
+		c.deadline = t
+	}
 	c.mu.Unlock()
 	return nil
 }
@@ -429,7 +434,10 @@ func (c *stallingConn) Write([]byte) (int, error) {
 	d := c.deadline
 	c.mu.Unlock()
 	time.Sleep(time.Until(d) + 5*time.Millisecond)
-	return 0, errors.New("timeout")
+	if c.smux {
+		return 0, errors.New("timeout")
+	}
+	return 0, &net.OpError{Op: "write", Net: "tcp", Err: os.ErrDeadlineExceeded}
 }
 func (c *stallingConn) Close() error { return nil }
 
@@ -439,29 +447,41 @@ func (c *stallingConn) Close() error { return nil }
 // armed the pool gate and could park a young session's server. Only reads
 // speak for the server.
 func TestStalledKeepaliveWriteIsNotServerSilence(t *testing.T) {
-	oldKA, oldW := keepaliveInterval, keepaliveWriteTimeout
-	keepaliveInterval, keepaliveWriteTimeout = 20*time.Millisecond, 50*time.Millisecond
-	t.Cleanup(func() { keepaliveInterval, keepaliveWriteTimeout = oldKA, oldW })
+	// A raw TCP write (Geneva, Stego, WS) runs into its deadline as a
+	// net.OpError wrapping os.ErrDeadlineExceeded - a net.Error with Timeout()
+	// - and a smux stream (REALITY) as a bare "timeout". P3-1 of the round-3
+	// review: only the second was covered.
+	for _, smux := range []bool{false, true} {
+		name := "raw TCP"
+		if smux {
+			name = "smux"
+		}
+		t.Run(name, func(t *testing.T) {
+			oldKA, oldW := keepaliveInterval, keepaliveWriteTimeout
+			keepaliveInterval, keepaliveWriteTimeout = 20*time.Millisecond, 50*time.Millisecond
+			t.Cleanup(func() { keepaliveInterval, keepaliveWriteTimeout = oldKA, oldW })
 
-	m := strategy.NewManager()
-	m.SetConnectivityChecker(strategy.NewConnectivityChecker("127.0.0.1:1", time.Second, true))
-	v := &VPNClient{running: 1, stopCh: make(chan struct{}), manager: m, conn: &stallingConn{},
-		connectedAt: time.Now().Add(-time.Minute), lastRx: time.Now().Add(-time.Minute)}
-	out := &stopOnDisconnectLog{v: v}
-	setLog(t, out)
-	done := make(chan struct{})
-	go func() { v.sendKeepalive(); close(done) }()
-	deadline := time.Now().Add(3 * time.Second)
-	for !strings.Contains(out.String(), "VPN disconnected") && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	close(v.stopCh)
-	<-done
-	if !strings.Contains(out.String(), "VPN disconnected") {
-		t.Fatal("the stalled write never ended the session - the test proves nothing")
-	}
-	if m.PreflightArmed() {
-		t.Fatal("a stalled keepalive write was taken for the server's silence")
+			m := strategy.NewManager()
+			m.SetConnectivityChecker(strategy.NewConnectivityChecker("127.0.0.1:1", time.Second, true))
+			v := &VPNClient{running: 1, stopCh: make(chan struct{}), manager: m, conn: &stallingConn{smux: smux},
+				connectedAt: time.Now().Add(-time.Minute), lastRx: time.Now().Add(-time.Minute)}
+			out := &stopOnDisconnectLog{v: v}
+			setLog(t, out)
+			done := make(chan struct{})
+			go func() { v.sendKeepalive(); close(done) }()
+			deadline := time.Now().Add(3 * time.Second)
+			for !strings.Contains(out.String(), "VPN disconnected") && time.Now().Before(deadline) {
+				time.Sleep(10 * time.Millisecond)
+			}
+			close(v.stopCh)
+			<-done
+			if !strings.Contains(out.String(), "VPN disconnected") {
+				t.Fatal("the stalled write never ended the session - the test proves nothing")
+			}
+			if m.PreflightArmed() {
+				t.Fatal("a stalled keepalive write was taken for the server's silence")
+			}
+		})
 	}
 }
 

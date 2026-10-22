@@ -1588,7 +1588,7 @@ func (v *VPNClient) sendKeepalive() {
 
 				conn.SetWriteDeadline(time.Now().Add(keepaliveWriteTimeout))
 				if _, err := conn.Write(keepalivePkt); err != nil {
-					v.connLost(conn, "keepalive write", err)
+					v.connLost(conn, "keepalive write", uplinkFailed(err))
 				} else {
 					log.Debug("Sent keepalive packet")
 				}
@@ -1649,7 +1649,7 @@ func (v *VPNClient) readFromTun() {
 		conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 		written, err := conn.Write(buf[:n+4])
 		if err != nil {
-			v.connLost(conn, "server write", err)
+			v.connLost(conn, "server write", uplinkFailed(err))
 			continue
 		}
 
@@ -2324,6 +2324,18 @@ type silenceError struct{ err error }
 func (e *silenceError) Error() string        { return e.err.Error() }
 func (e *silenceError) Unwrap() error        { return e.err }
 func (e *silenceError) Is(target error) bool { return target == strategy.ErrServerSilent }
+
+// uplinkError is a tunnel write that failed. It reads like the error it
+// wraps but matches nothing: a write that runs into its deadline says the
+// local uplink is stuck (bufferbloat), not that the server went quiet, and
+// on a raw TCP transport (Geneva, Stego, WS) that deadline comes back as a
+// net.Error with Timeout(), which serverWentSilent would take for silence.
+type uplinkError struct{ err error }
+
+func (e *uplinkError) Error() string { return e.err.Error() }
+
+// uplinkFailed hides a write error's timeout from the silence classifiers.
+func uplinkFailed(err error) error { return &uplinkError{err: err} }
 
 // serverWentSilent reports a disconnect caused by a deadline - the server
 // stopped answering - as opposed to a close, a reset or a protocol error, all of
