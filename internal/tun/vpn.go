@@ -858,6 +858,9 @@ func (v *VPNClient) seamlessPortHop(newPort int) {
 		return
 	}
 	oldConn := v.conn
+	oldStrategy, oldConnectedAt, oldLastRx := v.strategy, v.connectedAt, v.lastRx
+	oldCand, oldHasCand := v.sessionCand, v.hasSessionCand
+	abandoned := v.upgradePending
 	v.conn = tunnelConn
 	v.strategy = newStrategy
 	v.serverAddr = newTarget
@@ -866,6 +869,22 @@ func (v *VPNClient) seamlessPortHop(newPort int) {
 	v.connectedAt = time.Now()
 	v.lastRx = v.connectedAt
 	v.mu.Unlock()
+
+	// The hop replaced the session; book it like the upgrade swap does, and
+	// start the storm detector's clock with connectedAt, so the two measure
+	// the hop's session from the same moment. A pending upgrade is abandoned,
+	// not failed: the hop dialled through the scan, which goes the way the
+	// tunnel came, and its session is no evidence about the upgrade.
+	if v.manager != nil {
+		if oldStrategy != nil {
+			v.manager.SessionEnded(strategy.SessionEnd{Strategy: oldStrategy.ID(), Replaced: true,
+				Useful: sessionWasUseful(oldConnectedAt, oldLastRx), Endpoint: oldCand, HasEndpoint: oldHasCand})
+		}
+		v.manager.RecordSessionStart(newStrategy.ID())
+	}
+	if abandoned != nil {
+		log.Info("VPN: port hop abandoned the pending upgrade to %s; the next reprobe may offer it again", abandoned.Name())
+	}
 
 	// Close old connection after swap
 	if oldConn != nil {

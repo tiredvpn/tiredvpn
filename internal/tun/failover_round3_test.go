@@ -546,3 +546,42 @@ func TestOldExitIsNotUpgradedAgain(t *testing.T) {
 		t.Fatalf("%d upgrade dials to an exit that answers with another address, want 1", n)
 	}
 }
+
+// TestPortHopBooksTheSessionItReplaces is P3-3 of the round-3 review: the hop
+// reset connectedAt but neither ended the old session nor started the storm
+// detector's clock, so after a hop the storm detector and the dead-session
+// check measured the same session from different moments, and a useful
+// session the hop replaced cleared nothing.
+func TestPortHopBooksTheSessionItReplaces(t *testing.T) {
+	m, addrs, _ := poolManager(t, 2)
+	v := newCallsiteClient(m)
+	v.running = 1
+	v.stopCh = make(chan struct{})
+	setLog(t, &stampedLog{})
+	if err := v.connect(context.Background()); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	m.SessionEnded(strategy.SessionEnd{Strategy: "other", Endpoint: v.sessionCand, HasEndpoint: true, Dead: true})
+	if deadStreak(t, m, addrs[0]) != 1 {
+		t.Fatal("no dead streak - the test proves nothing")
+	}
+	v.mu.Lock()
+	v.connectedAt = time.Now().Add(-10 * time.Minute)
+	v.lastRx = time.Now()
+	v.mu.Unlock()
+
+	v.seamlessPortHop(1234)
+	v.mu.Lock()
+	hopStrategy, connectedAt := v.strategy, v.connectedAt
+	v.mu.Unlock()
+	if n := deadStreak(t, m, addrs[0]); n != 0 {
+		t.Fatalf("the useful session the hop replaced left the dead streak at %d", n)
+	}
+	opened, ok := m.SessionOpenedAt(hopStrategy.ID())
+	if !ok {
+		t.Fatal("the hop's session is not open in the storm detector")
+	}
+	if d := connectedAt.Sub(opened).Abs(); d > time.Second {
+		t.Fatalf("the storm detector times the hop's session from %v, the client from %v", opened, connectedAt)
+	}
+}

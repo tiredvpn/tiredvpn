@@ -1318,6 +1318,12 @@ func (m *Manager) RecordSessionStart(strategyID string) {
 	m.stormDetector.SessionOpened(strategyID)
 }
 
+// SessionOpenedAt reports when the storm detector's clock for strategyID's
+// open session started, for logs and tests.
+func (m *Manager) SessionOpenedAt(strategyID string) (time.Time, bool) {
+	return m.stormDetector.SessionOpenedAt(strategyID)
+}
+
 // RecordSessionEnd reports that the session for strategyID has ended and
 // returns whether the strategy is now storming (repeatedly short-lived
 // sessions). On a storm in auto-mode the strategy is parked and excluded from

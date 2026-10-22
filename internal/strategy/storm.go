@@ -152,6 +152,15 @@ func (d *StormDetector) SessionOpened(strategyID string) {
 	d.openedAt[strategyID] = d.now()
 }
 
+// SessionOpenedAt reports when the open session of strategyID started, as
+// SessionOpened recorded it.
+func (d *StormDetector) SessionOpenedAt(strategyID string) (time.Time, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	t, ok := d.openedAt[strategyID]
+	return t, ok
+}
+
 // SessionAbandoned forgets the session opened via SessionOpened without
 // recording a lifetime: it did not end on its own, the client replaced it.
 func (d *StormDetector) SessionAbandoned(strategyID string) {
