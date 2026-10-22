@@ -169,7 +169,8 @@ func allocationKey(id clientIdentity, origin string) string {
 // under a key an older server spelled for it (legacyAllocationKeys).
 func allocateTunnelIP(srvCtx *serverContext, id clientIdentity, origin string, requested net.IP) (net.IP, error) {
 	key := allocationKey(id, origin)
-	srvCtx.ipPool.AdoptAll(legacyAllocationKeys(srvCtx, id, origin), key)
+	keys, prefixes := legacyAllocationKeys(srvCtx, id, origin)
+	srvCtx.ipPool.AdoptAll(keys, prefixes, key)
 	return srvCtx.ipPool.Allocate(key, requested, "")
 }
 
@@ -184,10 +185,18 @@ func allocateTunnelIP(srvCtx *serverContext, id clientIdentity, origin string, r
 // address and leave the REALITY lease behind. Requested leases are permanent
 // in Redis, so an orphan never goes away on its own. Drop this once every exit
 // has run a release with the credential lease.
-func legacyAllocationKeys(srvCtx *serverContext, id clientIdentity, origin string) []string {
+//
+// prefixes names keys by their start instead: a registry client's REALITY
+// lease under ANY origin, "reality:<hmac>@". Its key no longer has an origin,
+// so the lease it took from another network is its own, and looking only under
+// the current origin left that one behind and handed out a new address. On the
+// global secret the origin is what tells boxes apart, and another origin's
+// REALITY lease is somebody else's: there only the current origin's key is
+// listed.
+func legacyAllocationKeys(srvCtx *serverContext, id clientIdentity, origin string) (keys, prefixes []string) {
 	lease := id.leaseID()
 	if lease == "" {
-		return nil
+		return nil, nil
 	}
 	qualify := func(k string, shared bool) string {
 		if !shared || origin == "" {
@@ -195,14 +204,19 @@ func legacyAllocationKeys(srvCtx *serverContext, id clientIdentity, origin strin
 		}
 		return k + "@" + origin
 	}
-	keys := []string{
+	keys = []string{
 		qualify(lease, !id.perClient),
 		qualify("polling:"+lease, !id.perClient),
 	}
 	if secret := credentialSecret(srvCtx, lease, id.perClient); len(secret) > 0 {
-		keys = append(keys, qualify(realityClientIdentity(secret, clientIdentity{}).id, true))
+		realityKey := realityClientIdentity(secret, clientIdentity{}).id
+		if id.perClient {
+			prefixes = append(prefixes, realityKey+"@")
+		} else {
+			keys = append(keys, qualify(realityKey, true))
+		}
 	}
-	return keys
+	return keys, prefixes
 }
 
 // credentialSecret is the secret behind a lease identity: the global secret,
