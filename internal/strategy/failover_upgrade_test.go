@@ -176,8 +176,8 @@ func TestUpgradeOfferIsNotOnTheReprobeGrid(t *testing.T) {
 		}
 		seen[d] = true
 	}
-	if len(seen) < 50 {
-		t.Fatalf("only %d distinct delays in 200 draws", len(seen))
+	if len(seen) < 195 || seen[4*time.Minute] {
+		t.Fatalf("%d distinct delays in 200 draws (cap hit: %v): values pile up on the cap", len(seen), seen[4*time.Minute])
 	}
 
 	// And the offer really waits for it.
@@ -216,8 +216,11 @@ func TestReprobeIsNotAMetronome(t *testing.T) {
 		seen[d] = true
 		sum += d
 	}
-	if len(seen) < 500 {
-		t.Fatalf("only %d distinct pauses in 1000", len(seen))
+	if len(seen) < 990 {
+		t.Fatalf("only %d distinct pauses in 1000: values pile up somewhere", len(seen))
+	}
+	if seen[2*interval] || seen[interval/2] {
+		t.Fatal("pauses land exactly on a bound")
 	}
 	if mean := sum / 1000; mean < 4*time.Minute || mean > 7*time.Minute {
 		t.Fatalf("mean pause %v strays from the %v interval", mean, interval)

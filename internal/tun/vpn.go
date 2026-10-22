@@ -2302,17 +2302,19 @@ var reconnectConnectTimeout = 15 * time.Second
 //
 // One address per round, rotating through the pool. A round of the whole pool
 // in a row - what this did first - was a sequential SYN sweep of every server
-// on a strict 17 s period (5 s pause plus 4 x 3 s timeouts on the stand), and it
-// runs exactly when the servers are silent while the local network works,
-// which is what an IP block looks like: those SYNs cross the censor.
+// on a strict 17 s period, exactly when the servers are silent while the local
+// network works, which is what an IP block looks like: those SYNs cross the
+// censor.
 //
-// A fast phase covers a provider's line flapping: a round every 5 s for the
-// first two minutes. Past it the pause grows by half each round up to a
-// minute, the way the gate's own retry backs off (nextProbeBackoff): fewer
-// SYNs the longer the silence lasts, at the cost of noticing a recovery up to
-// a minute late after a long outage. There is no measured reference
-// distribution for this; the intervals are a deterministic growing sequence,
-// not jittered (verification rule 3).
+// The pause between rounds is drawn, not fixed: RandomDelay(base/2, base,
+// 2 x base). base is 5 s for the first two minutes (a provider's line
+// flapping), then grows by half per round up to a minute. A silent dial adds
+// its own poolDialTimeout (3 s) before the pause starts. So the first two
+// minutes see a dial every ~5.5-13 s, and later every ~33-123 s; per address
+// that is pool size times as long, which bounds how late a recovered server is
+// noticed: with 4 addresses and the minute-long base, up to about 8 minutes in
+// the worst draw, about 4 on average. There is no measured reference
+// distribution; the point is no grid and fewer SYNs the longer the silence.
 var (
 	poolPollInterval = 5 * time.Second
 	poolFastPhase    = 2 * time.Minute
@@ -2325,16 +2327,21 @@ var (
 	}
 )
 
-// poolPollGrowth is the factor the pause grows by after the fast phase.
+// poolPollGrowth is the factor the base pause grows by after the fast phase.
 const poolPollGrowth = 1.5
 
-// nextPoolPoll is the pause before the next round, given the current one and
+// nextPoolBase is the base pause for the next round, given the current one and
 // how long the pool has been silent.
-func nextPoolPoll(cur, silentFor time.Duration) time.Duration {
+func nextPoolBase(cur, silentFor time.Duration) time.Duration {
 	if silentFor < poolFastPhase {
 		return poolPollInterval
 	}
 	return min(time.Duration(float64(cur)*poolPollGrowth), poolPollMax)
+}
+
+// poolPause draws the actual pause around base.
+func poolPause(base time.Duration) time.Duration {
+	return strategy.RandomDelay(base/2, base, 2*base)
 }
 
 // waitOutSilentPool decides what a "nobody in the pool answers" verdict means
@@ -2363,12 +2370,12 @@ func (v *VPNClient) waitOutSilentPool(err error, since time.Time) bool {
 // live server here and could not get to it there, round after round.
 // Returns false only when the client was stopped.
 func (v *VPNClient) waitForPool(since time.Time) bool {
-	interval := poolPollInterval
+	base := poolPollInterval
 	for atomic.LoadInt32(&v.running) == 1 {
 		select {
 		case <-v.stopCh:
 			return false
-		case <-time.After(interval):
+		case <-time.After(poolPause(base)):
 		}
 		if addr, ok := v.pollOneServer(); ok {
 			log.Info("Server %s answers again after %v of pool silence", addr, time.Since(since).Round(time.Second))
@@ -2377,7 +2384,7 @@ func (v *VPNClient) waitForPool(since time.Time) bool {
 			}
 			return true
 		}
-		interval = nextPoolPoll(interval, time.Since(since))
+		base = nextPoolBase(base, time.Since(since))
 	}
 	return false
 }

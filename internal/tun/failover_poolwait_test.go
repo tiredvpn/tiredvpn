@@ -295,17 +295,16 @@ func TestSilentAddressesAheadOfTheLiveOneStillReconnect(t *testing.T) {
 	}
 }
 
-// TestPoolPollIsOneRotatingAddressWithGrowingPauses is P1-2 of the review. The
-// poll was a sequential SYN sweep of the whole pool on a strict period (17.0 s
-// on the stand), exactly when the servers are silent and the local network
-// works - the IP-block case, where the SYNs cross the censor. Now each round is
-// one address, the next one in the pool each time, and past the fast phase the
-// pause grows to a ceiling instead of repeating.
+// TestPoolPollIsOneRotatingAddressWithGrowingPauses covers P1-2 of the round-1
+// review and P2-1 of round 2. The poll was a sequential SYN sweep of the whole
+// pool on a strict period (17.0 s on the stand), then a strict 8 s / 63 s grid.
+// Now each round is one address, the next one in the pool each time; pauses
+// are drawn, not fixed, and grow past the fast phase.
 func TestPoolPollIsOneRotatingAddressWithGrowingPauses(t *testing.T) {
 	setPoolWaitKnobs(t, true)
 	poolPollInterval = 20 * time.Millisecond
-	poolFastPhase = 100 * time.Millisecond
-	poolPollMax = 200 * time.Millisecond
+	poolFastPhase = 200 * time.Millisecond
+	poolPollMax = 100 * time.Millisecond
 
 	var mu sync.Mutex
 	type dial struct {
@@ -323,7 +322,7 @@ func TestPoolPollIsOneRotatingAddressWithGrowingPauses(t *testing.T) {
 	m, addrs, _ := poolManager(t, 3)
 	v := &VPNClient{running: 1, stopCh: make(chan struct{}), manager: m}
 	go func() {
-		time.Sleep(1500 * time.Millisecond)
+		time.Sleep(2500 * time.Millisecond)
 		atomic.StoreInt32(&v.running, 0)
 		close(v.stopCh)
 	}()
@@ -334,7 +333,7 @@ func TestPoolPollIsOneRotatingAddressWithGrowingPauses(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if len(dials) < 8 {
+	if len(dials) < 12 {
 		t.Fatalf("only %d rounds - the test proves nothing", len(dials))
 	}
 	for i, d := range dials {
@@ -342,26 +341,34 @@ func TestPoolPollIsOneRotatingAddressWithGrowingPauses(t *testing.T) {
 			t.Fatalf("round %d dialled %s, want %s: one address per round, in rotation", i, d.addr, want)
 		}
 	}
-	var prev time.Duration
-	var grew, capped bool
+	var fast, slow []time.Duration
 	for i := 1; i < len(dials); i++ {
 		gap := dials[i].at.Sub(dials[i-1].at)
-		if dials[i-1].at.Sub(start) < poolFastPhase+poolPollInterval {
-			continue // still in the fast phase
+		if dials[i-1].at.Sub(start) < poolFastPhase {
+			fast = append(fast, gap)
+		} else {
+			slow = append(slow, gap)
 		}
-		if gap > prev+poolPollInterval/2 {
-			grew = true
+		if gap > 2*poolPollMax+50*time.Millisecond {
+			t.Fatalf("pause %v past the %v ceiling", gap, 2*poolPollMax)
 		}
-		if gap > poolPollMax+100*time.Millisecond {
-			t.Fatalf("pause %v over the %v ceiling", gap, poolPollMax)
-		}
-		if gap >= poolPollMax-30*time.Millisecond {
-			capped = true
-		}
-		prev = gap
 	}
-	if !grew || !capped {
-		t.Fatalf("pauses did not grow to the ceiling past the fast phase (grew=%v capped=%v)", grew, capped)
+	mean := func(ds []time.Duration) time.Duration {
+		var sum time.Duration
+		for _, d := range ds {
+			sum += d
+		}
+		return sum / time.Duration(max(len(ds), 1))
+	}
+	if len(slow) < 4 || mean(slow) <= mean(fast) {
+		t.Fatalf("pauses did not grow past the fast phase: fast mean %v, later mean %v", mean(fast), mean(slow))
+	}
+	distinct := map[time.Duration]bool{}
+	for _, g := range slow {
+		distinct[g.Round(time.Millisecond)] = true
+	}
+	if len(distinct) < len(slow)/2 {
+		t.Fatalf("later pauses %v repeat: a grid, not drawn pauses", slow)
 	}
 }
 

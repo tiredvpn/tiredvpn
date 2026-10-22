@@ -2802,14 +2802,12 @@ func (m *Manager) StartPeriodicReprobe(ctx context.Context) {
 //
 // It was a strict time.Ticker: a burst of probe connects to the pinned server
 // every 300.000 s from process start, the cleanest metronome the client put
-// on the wire. Now each pause is half the interval plus an exponential draw
-// with a mean of the other half, capped at twice the interval: the mean stays
-// at the interval, the gaps vary, nothing lands on a fixed value (a plain
-// exponential clamped at the bottom put 39% of the pauses at exactly the
-// floor). No measured reference; not uniform jitter (verification rule 3).
+// on the wire. Now each pause is RandomDelay(interval/2, interval, 2 x
+// interval): the mean stays near the interval, the gaps vary, and nothing lands
+// on a fixed value. No measured reference; not uniform jitter (verification
+// rule 3).
 func nextReprobeDelay(interval time.Duration) time.Duration {
-	d := interval/2 + time.Duration(rand.ExpFloat64()*float64(interval/2))
-	return min(d, 2*interval)
+	return RandomDelay(interval/2, interval, 2*interval)
 }
 
 // StopPeriodicReprobe stops background re-probing
@@ -2871,14 +2869,35 @@ const upgradeMaxSkip = 6
 //
 // The offer used to go out the moment the reprobe burst finished, so on the
 // wire a burst of probe connects was followed at once by a new session to the
-// same server, on the reprobe's 5-minute grid. 20 s plus an exponential draw
-// with a mean of 70 s, capped at 4 min (mean about 90 s): an upgrade is
+// same server, on the reprobe's 5-minute grid. RandomDelay with a 20 s floor,
+// a 90 s mean and a 4 min ceiling: an upgrade is
 // one event per degradation episode, and the memoryless shape is what
 // independent user-driven events have. There is no measured reference for it;
 // it is chosen to unhook the switch from the reprobe, not to imitate anything.
 var upgradeDelay = func() time.Duration {
-	d := 20*time.Second + time.Duration(rand.ExpFloat64()*float64(70*time.Second))
-	return min(d, 4*time.Minute)
+	return RandomDelay(20*time.Second, 90*time.Second, 4*time.Minute)
+}
+
+// RandomDelay draws a pause of floor plus an exponential with mean
+// (mean - floor), redrawn - not clamped - while it exceeds ceiling.
+//
+// Clamping put a spike of exact values on the wire: about 5% of reprobe gaps
+// came out at exactly 600.000 s and 4% of upgrade delays at exactly 240 s, a
+// fixed value an observer can count. The redraw keeps the tail inside the
+// ceiling without piling it up there. There is no measured reference
+// distribution behind the shape; it is chosen to have no grid and no spike,
+// and it is not uniform jitter (verification rule 3).
+func RandomDelay(floor, mean, ceiling time.Duration) time.Duration {
+	span := float64(mean - floor)
+	if span <= 0 || ceiling <= floor {
+		return floor
+	}
+	for range 64 {
+		if d := floor + time.Duration(rand.ExpFloat64()*span); d < ceiling {
+			return d
+		}
+	}
+	return floor + time.Duration(rand.Float64()*float64(ceiling-floor))
 }
 
 // UpgradeRank is the order an upgrade compares strategies in: the base
