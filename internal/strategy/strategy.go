@@ -2936,6 +2936,34 @@ func (m *Manager) UpgradeRank(s Strategy) float64 {
 	return rank
 }
 
+// ScanScore is the score the full scan orders strategies by (sortStrategies):
+// priority minus weighted confidence, plus the Android UDP penalty. Lower is
+// better.
+func (m *Manager) ScanScore(s Strategy) float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	score := float64(s.Priority())
+	if r := m.results[s.ID()]; r != nil {
+		score -= r.Confidence * confidenceWeight
+	}
+	if m.androidMode && isUDPBasedStrategy(s) {
+		score += max(10-5*float64(m.consecutiveTCPTimeouts), 0)
+	}
+	return score
+}
+
+// UpgradeEligible reports whether a scan would admit s right now: not a UDP
+// strategy while UDP is excluded, not storm-parked, breaker closed. The offer
+// checks it when it is built; the dial comes up to minutes later and checks it
+// again.
+func (m *Manager) UpgradeEligible(s Strategy) bool {
+	m.mu.RLock()
+	excludeUDP := m.excludeUDPStrategies
+	m.mu.RUnlock()
+	id := s.ID()
+	return !(excludeUDP && isUDPBasedStrategy(s)) && !m.stormDetector.IsParked(id) && m.circuitBreakers.CanTry(id)
+}
+
 // offerUpgrade hands the upgrade callback, after upgradeDelay, the strategies
 // this reprobe found reachable and that a scan would admit right now, best
 // first.

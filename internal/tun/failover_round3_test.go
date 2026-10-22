@@ -360,3 +360,49 @@ func TestFailedUpgradeIsChargedOnce(t *testing.T) {
 		t.Fatalf("a failed upgraded session was charged %d times, want once", got)
 	}
 }
+
+// TestUpgradeSkipsACandidateTheScanRanksLower is P2-5 of the round-2 review:
+// the upgrade ranked by priority and the Android penalty only. On Linux QUIC
+// (4) always outranked REALITY (5), and the QUIC probe reports success on
+// silence: with REALITY healthy and QUIC failing, the scan stays on REALITY
+// while every reprobe offered QUIC.
+func TestUpgradeSkipsACandidateTheScanRanksLower(t *testing.T) {
+	v, m, _, _ := upgradeOnSelector(t)
+	setLog(t, &stampedLog{})
+	cur := v.strategy
+	for range 5 {
+		m.UpdateStrategyConfidence(cur.ID(), true)
+	}
+	// One priority point above the current strategy, failing: the scan puts
+	// it behind, so must the upgrade.
+	quic := &exitStrategy{id: "quic_salamander", priority: cur.Priority() - 1, t: t, onHandshake: answer(nil)}
+	var dials atomic.Int64
+	quic.onTarget = func(string) { dials.Add(1) }
+	m.Register(quic)
+	for range 4 {
+		m.UpdateStrategyConfidence(quic.ID(), false)
+	}
+
+	v.tryStrategyUpgrade([]strategy.Strategy{quic})
+	if dials.Load() != 0 {
+		t.Fatal("the upgrade dialled a candidate the scan itself ranks below the current strategy")
+	}
+}
+
+// TestUpgradeRechecksEligibilityAtTheDial: the offer is built at the reprobe
+// and the dial comes up to four minutes later. A UDP strategy offered then
+// must not be dialled once UDP is excluded.
+func TestUpgradeRechecksEligibilityAtTheDial(t *testing.T) {
+	v, m, _, _ := upgradeOnSelector(t)
+	setLog(t, &stampedLog{})
+	quic := &exitStrategy{id: "quic_salamander", priority: 4, t: t, onHandshake: answer(nil)}
+	var dials atomic.Int64
+	quic.onTarget = func(string) { dials.Add(1) }
+	m.Register(quic)
+
+	m.ResetForNetworkChange() // auto mode: QUIC sits out until the UDP verdict lands
+	v.tryStrategyUpgrade([]strategy.Strategy{quic})
+	if dials.Load() != 0 {
+		t.Fatal("a UDP candidate was dialled while UDP is excluded")
+	}
+}

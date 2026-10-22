@@ -1895,6 +1895,13 @@ func (v *VPNClient) tryStrategyUpgrade(cands []strategy.Strategy) {
 		if next.ID() == cur.ID() || v.manager.UpgradeRank(next) >= v.manager.UpgradeRank(cur) {
 			continue
 		}
+		// What the scan itself would rank lower - a QUIC that keeps failing
+		// against a REALITY that works - is no upgrade, whatever its base
+		// priority. And the offer is minutes old: what a scan would not admit
+		// now (UDP excluded, storm-parked, breaker open) is not dialled.
+		if v.manager.ScanScore(next) >= v.manager.ScanScore(cur) || !v.manager.UpgradeEligible(next) {
+			continue
+		}
 		log.Info("Strategy upgrade: %s is reachable again, moving the tunnel off %s", next.Name(), cur.Name())
 		dialCtx, dialCancel := context.WithTimeout(ctx, upgradeConnectTimeout)
 		conn, err := v.manager.ConnectStrategy(dialCtx, next, cand)
