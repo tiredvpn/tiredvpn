@@ -418,3 +418,34 @@ func TestPoolPauseStaysUnderItsBase(t *testing.T) {
 		t.Fatalf("pause shape off: %d draws under 40 s, %d at 50 s and over", low, high)
 	}
 }
+
+// TestPoolPollWaitsOutADeadSessionPark: the call site of P3-9 of the round-3
+// review. The only server answering TCP is parked for dead sessions; the poll
+// keeps polling instead of ending the wait on it.
+func TestPoolPollWaitsOutADeadSessionPark(t *testing.T) {
+	setPoolWaitKnobs(t, true)
+	poolPollInterval = 20 * time.Millisecond
+	m, addrs, _ := poolManager(t, 1)
+	for _, st := range m.EndpointStates() {
+		if st.Addr == addrs[0] {
+			m.SessionEnded(strategy.SessionEnd{Strategy: "x", Endpoint: st.Candidate, HasEndpoint: true, Dead: true})
+		}
+	}
+	var dials atomic.Int64
+	poolDial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dials.Add(1)
+		return (&net.Dialer{}).DialContext(ctx, network, addr)
+	}
+	v := &VPNClient{running: 1, stopCh: make(chan struct{}), manager: m}
+	go func() {
+		time.Sleep(400 * time.Millisecond)
+		atomic.StoreInt32(&v.running, 0)
+		close(v.stopCh)
+	}()
+	if v.waitForPool(time.Now()) {
+		t.Fatal("the wait ended on a server parked for dead sessions")
+	}
+	if n := dials.Load(); n < 3 {
+		t.Fatalf("only %d polls - the test proves nothing", n)
+	}
+}

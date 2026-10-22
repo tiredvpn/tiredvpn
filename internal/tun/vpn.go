@@ -2510,11 +2510,8 @@ func (v *VPNClient) waitForPool(since time.Time) bool {
 			return false
 		case <-time.After(poolPause(base)):
 		}
-		if addr, ok := v.pollOneServer(); ok {
+		if addr, ok := v.pollOneServer(); ok && (v.manager == nil || v.manager.PinAnswering(addr)) {
 			log.Info("Server %s answers again after %v of pool silence", addr, time.Since(since).Round(time.Second))
-			if v.manager != nil {
-				v.manager.PinAnswering(addr)
-			}
 			return true
 		}
 		base = nextPoolBase(base, time.Since(since))

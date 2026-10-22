@@ -672,6 +672,19 @@ func (s *Selector) ReportDeadSession(c Candidate) {
 	h.cooldownUntil = now.Add(s.jitter(park))
 }
 
+// ParkedForDeadSessions reports whether c is in cooldown with a dead-session
+// streak: parked because sessions there connect and then die, which a
+// completed TCP connect cannot speak against.
+func (s *Selector) ParkedForDeadSessions(c Candidate) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	idx, found := s.byAddr[c.Addr]
+	if !found {
+		return false
+	}
+	return s.health[idx].deadStreak > 0 && s.inCooldownLocked(idx, s.cfg.Now())
+}
+
 // Unpark clears c's cooldown, keeping its failure history. For a caller with
 // newer evidence than the park (see strategy.Manager.PinAnswering).
 func (s *Selector) Unpark(c Candidate) {

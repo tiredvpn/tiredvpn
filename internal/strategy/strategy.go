@@ -4518,21 +4518,32 @@ func (m *Manager) PoolAddrs() []string {
 
 // PinAnswering moves the pin to the candidate at addr after a TCP poll found it
 // answering while the rest of the pool was silent, so the reconnect that
-// follows starts there instead of walking the silent addresses first.
+// follows starts there instead of walking the silent addresses first. It
+// reports whether it did.
 //
 // A parked candidate is un-parked and pinned too. The gate refuses to switch to
 // a parked address because a blackhole answers TCP; but this poll runs only
 // when no address answered at all, and an answer after that is newer evidence
 // than the park - and the only way out. Leaving it parked sent the reconnect
 // walking the silent addresses again.
-func (m *Manager) PinAnswering(addr string) {
+//
+// Except a park for dead sessions: sessions there connect and then die, so a
+// TCP answer is exactly what that server gives and no evidence at all. Lifting
+// it undid the escalation - a server parked for one minute, then two, then
+// four was unparked by the next poll 5-8 s later and the client died on it
+// again about every 45 s. It stays parked until its cooldown runs out.
+func (m *Manager) PinAnswering(addr string) bool {
 	sel := m.selector()
 	if sel == nil {
-		return
+		return true
 	}
 	cand, ok := sel.CandidateForAddr(addr)
 	if !ok {
-		return
+		return true
+	}
+	if sel.ParkedForDeadSessions(cand) {
+		log.Debug("Pool poll: %s answers but is parked for dead sessions - waiting out its park", cand)
+		return false
 	}
 	sel.ReportProbe(cand, true, 0)
 	if sel.IsParked(cand) {
@@ -4543,6 +4554,7 @@ func (m *Manager) PinAnswering(addr string) {
 		log.Info("Pool poll: %s answered first, pinning it", cand)
 	}
 	sel.Pin(cand)
+	return true
 }
 
 // ProbeEndpointFamily runs the one-shot transport-family probe for the pinned
