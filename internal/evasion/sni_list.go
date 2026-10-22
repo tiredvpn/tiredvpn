@@ -23,7 +23,7 @@ func NormalizeSNI(h string) (string, error) {
 	labels := strings.Split(h, ".")
 	for _, l := range labels {
 		if len(l) == 0 || len(l) > 63 || l[0] == '-' || l[len(l)-1] == '-' ||
-			strings.ContainsFunc(l, func(r rune) bool { return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-') }) {
+			strings.ContainsFunc(l, func(r rune) bool { return (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' }) {
 			return "", fmt.Errorf("%q is not a hostname", h)
 		}
 	}
