@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"net"
+	"strings"
 )
 
 // globalClientID is the client identity every caller authenticated with the
@@ -162,4 +163,35 @@ func allocationKey(id clientIdentity, origin string) string {
 		return id.leaseID()
 	}
 	return id.leaseID() + "@" + origin
+}
+
+// allocateTunnelIP is the one way a TUN session gets its address: the lease
+// keyed by allocationKey, after carrying over a lease the client still holds
+// under the key an older server spelled for it.
+func allocateTunnelIP(pool *IPPool, id clientIdentity, origin string, requested net.IP) (net.IP, error) {
+	key := allocationKey(id, origin)
+	if old := legacyAllocationKey(id, origin); old != "" && old != key {
+		pool.Adopt(old, key)
+	}
+	return pool.Allocate(key, requested, "")
+}
+
+// legacyAllocationKey is the key a server before the credential lease spelled
+// for id: the transport-labelled id, qualified with the origin unless it came
+// from the registry - and REALITY's id always qualified, because it used to be
+// classified as shared even for a registry client.
+//
+// Leases a client requested by address are permanent in Redis, so without the
+// carry-over every client would leave one orphan behind and come back with a
+// different tunnel address after the update. Drop this once every exit has run
+// a release with the credential lease.
+func legacyAllocationKey(id clientIdentity, origin string) string {
+	if id.id == "" {
+		return ""
+	}
+	shared := !id.perClient || strings.HasPrefix(id.id, "reality:")
+	if !shared || origin == "" {
+		return id.id
+	}
+	return id.id + "@" + origin
 }

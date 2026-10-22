@@ -110,3 +110,74 @@ func TestGlobalSecretStillSeparatesOrigins(t *testing.T) {
 		t.Fatal("two REALITY boxes on the global secret at two origins share a lease")
 	}
 }
+
+// TestLeaseCarriesOverFromTheOldKey: a client that held an address under the
+// key an older server spelled for it - REALITY's "reality:<hmac>@origin" -
+// keeps that address after the update, and the old key is gone. Requested
+// leases are permanent in Redis; without the carry-over each client would leave
+// an orphan and come back on another address.
+func TestLeaseCarriesOverFromTheOldKey(t *testing.T) {
+	global := []byte("the-global-secret-of-this-exit-32")
+	srvCtx := &serverContext{cfg: &Config{Secret: global}}
+	reality := realityIdentityFor(t, srvCtx, global)
+	const origin = "192.0.2.170"
+
+	pool, err := NewIPPool(IPPoolConfig{Network: "10.8.1.0/24", ServerIP: "10.8.1.1"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldKey := reality.id + "@" + origin
+	had, err := pool.Allocate(oldKey, net.ParseIP("10.8.1.2"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := allocateTunnelIP(pool, reality, origin, had)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Equal(had) {
+		t.Fatalf("after the update the client got %s, it held %s", got, had)
+	}
+	if lease := pool.GetLease(had); lease == nil || lease.ClientID != allocationKey(reality, origin) {
+		t.Fatalf("lease %s is held by %+v, want the new key", had, lease)
+	}
+	// And Geneva on the same client now lands on it too.
+	geneva, err := allocateTunnelIP(pool, sharedIdentity(globalClientID), origin, net.ParseIP("10.8.1.9"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !geneva.Equal(had) {
+		t.Fatalf("Geneva got %s, the client's address is %s", geneva, had)
+	}
+}
+
+// TestRegistryRealityLeaseCarriesOver: a registry client on REALITY used to be
+// keyed "reality:<hmac>@origin" (its REALITY id was classified as shared); the
+// credential lease keys it on its client ID. The address comes along.
+func TestRegistryRealityLeaseCarriesOver(t *testing.T) {
+	secret := []byte("a-registry-client-secret-32bytes")
+	reg := NewClientRegistry(nil)
+	c1 := &ClientConfig{ID: "c1", Secret: string(secret), Enabled: true}
+	reg.byID[c1.ID] = c1
+	reg.bySecret[c1.Secret] = c1
+	srvCtx := &serverContext{cfg: &Config{}, registry: reg}
+	reality := realityIdentityFor(t, srvCtx, secret)
+	const origin = "192.0.2.170"
+
+	pool, err := NewIPPool(IPPoolConfig{Network: "10.8.1.0/24", ServerIP: "10.8.1.1"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	had, err := pool.Allocate(reality.id+"@"+origin, net.ParseIP("10.8.1.2"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := allocateTunnelIP(pool, reality, origin, had)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Equal(had) || allocationKey(reality, origin) != "c1" {
+		t.Fatalf("registry REALITY client got %s under %q, it held %s", got, allocationKey(reality, origin), had)
+	}
+}

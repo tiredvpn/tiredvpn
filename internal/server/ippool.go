@@ -448,6 +448,39 @@ func (p *IPPool) stickyLookup(clientID string) string {
 	return ip
 }
 
+// Adopt moves the lease held under oldKey to newKey, unless newKey already
+// has one. It is the carry-over for a client whose lease key changed spelling
+// between releases (see legacyAllocationKey): the client keeps its address and
+// the old key leaves nothing behind.
+func (p *IPPool) Adopt(oldKey, newKey string) {
+	if oldKey == "" || newKey == "" || oldKey == newKey {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.stickyLookup(newKey) != "" {
+		return
+	}
+	ip := p.stickyLookup(oldKey)
+	if ip == "" {
+		return
+	}
+	lease := p.leases[ip]
+	if lease == nil || lease.ClientID != oldKey {
+		return
+	}
+	delete(p.byClient, oldKey)
+	if p.redis != nil {
+		p.redis.Del(context.Background(), p.redisClientKey(oldKey))
+	}
+	lease.ClientID = newKey
+	if err := p.saveLease(lease); err != nil {
+		log.Warn("Failed to persist lease %s moved from %s to %s: %v", ip, oldKey, newKey, err)
+		return
+	}
+	log.Info("Lease %s moved from %s to %s", ip, oldKey, newKey)
+}
+
 // Allocate allocates an IP address for a client
 // If requestedIP is provided and available, it will be used
 // If clientID already has a lease, returns existing IP
