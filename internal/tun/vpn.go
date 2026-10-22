@@ -18,6 +18,7 @@ import (
 
 	"github.com/tiredvpn/tiredvpn/internal/endpoint"
 	"github.com/tiredvpn/tiredvpn/internal/log"
+	"github.com/tiredvpn/tiredvpn/internal/protect"
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
 )
 
@@ -2514,9 +2515,12 @@ func errMeansPathAlive(err error) bool {
 }
 
 // dialMeansAlive dials addr and treats both a completed connect and an
-// immediate refusal as "the path answers".
+// immediate refusal as "the path answers". The dial is protected, so on
+// Android it cannot be routed into the tunnel; elsewhere that is a plain dial.
 func dialMeansAlive(addr string) bool {
-	conn, err := net.DialTimeout("tcp", addr, networkCheckTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), networkCheckTimeout)
+	defer cancel()
+	conn, err := (&protect.ProtectDialer{}).DialContext(ctx, "tcp", addr)
 	if err == nil {
 		conn.Close()
 		return true
@@ -2541,14 +2545,21 @@ var probeLocalLink = localLinkUp
 var gatewayAddrs = physicalGateAddrs
 
 // localLinkUp reports whether the client's own link is up, for decisions that
-// charge a server: true only when a physical default-route gateway answers.
-// Without a gateway to ask (non-Linux, an exotic setup) it cannot tell and
-// says no. internetReachable falls back to public resolvers there, and those
-// sit behind the tunnel's own routes - a coin toss, and up to 6 s of waiting
-// before every reconnect - which is fine for "should I wait for the network"
-// and not for "may I blame the server".
+// charge a server: true when a physical default-route gateway answers (Linux:
+// the main table, or any table when main has no default, as on Android;
+// macOS: the routing socket), or on Android when a public resolver answers
+// over the underlying network (linkFallbackProbes). Without either it cannot
+// tell and says no. Desktop does not use public resolvers here: they sit
+// behind the tunnel's own routes - a coin toss, and up to 6 s of waiting
+// before every reconnect - which is fine for internetReachable's "should I
+// wait for the network" and not for "may I blame the server".
 func localLinkUp() bool {
 	for _, addr := range gatewayAddrs() {
+		if dialMeansAlive(addr) {
+			return true
+		}
+	}
+	for _, addr := range linkFallbackProbes {
 		if dialMeansAlive(addr) {
 			return true
 		}
