@@ -205,6 +205,11 @@ type VPNClient struct {
 	// is confirmed) or ends first (then it failed). Guarded by mu.
 	upgradePending strategy.Strategy
 
+	// upgradeOff lists endpoints whose exit answered an upgrade with another
+	// tunnel address - an exit older than the credential lease, which will do
+	// so every time. Guarded by mu.
+	upgradeOff map[string]bool
+
 	// sessionMu is held by every operation that registers a new session on
 	// the exit and installs it - connect, port hop, strategy upgrade - from
 	// the TUN handshake to the commit. The exit replaces whatever session held
@@ -1881,6 +1886,12 @@ func (v *VPNClient) tryStrategyUpgrade(cands []strategy.Strategy) {
 			return
 		}
 	}
+	v.mu.Lock()
+	off := v.upgradeOff[cand.Addr]
+	v.mu.Unlock()
+	if off {
+		return
+	}
 
 	// Shut down with the client: Stop cannot otherwise reach an upgrade
 	// dialling on its own context.
@@ -1913,7 +1924,7 @@ func (v *VPNClient) tryStrategyUpgrade(cands []strategy.Strategy) {
 			log.Info("Strategy upgrade: %s failed (%v), staying on %s", next.Name(), err, cur.Name())
 			continue
 		}
-		v.handshakeUpgrade(oldConn, conn, cur, next, localIP)
+		v.handshakeUpgrade(oldConn, conn, cur, next, localIP, cand)
 		return
 	}
 }
@@ -1921,7 +1932,7 @@ func (v *VPNClient) tryStrategyUpgrade(cands []strategy.Strategy) {
 // handshakeUpgrade runs the TUN handshake on an upgrade's fresh conn and
 // commits it, all under sessionMu so no reconnect or port hop registers a
 // session on the exit in between.
-func (v *VPNClient) handshakeUpgrade(oldConn, conn net.Conn, cur, next strategy.Strategy, localIP net.IP) {
+func (v *VPNClient) handshakeUpgrade(oldConn, conn net.Conn, cur, next strategy.Strategy, localIP net.IP, cand endpoint.Candidate) {
 	if !v.sessionMu.TryLock() {
 		// A reconnect or a port hop is mid-handshake. Registering ours now
 		// would evict theirs on the exit.
@@ -1977,6 +1988,15 @@ func (v *VPNClient) handshakeUpgrade(oldConn, conn net.Conn, cur, next strategy.
 		// old session still stands.
 		tunnelConn.Close()
 		v.manager.UpgradeOutcome(next, false)
+		// It will answer the same way every time; stop spending a dial and a
+		// handshake per reprobe cycle on it.
+		v.mu.Lock()
+		if v.upgradeOff == nil {
+			v.upgradeOff = make(map[string]bool)
+		}
+		v.upgradeOff[cand.Addr] = true
+		v.mu.Unlock()
+		log.Info("Strategy upgrade: the exit at %s leases per transport (older server), no more upgrades on it", cand.Addr)
 	default:
 		// Same address, so the exit has moved it to the new session and the
 		// old one is gone with it: whatever made us drop the new one, the

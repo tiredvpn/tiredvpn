@@ -464,3 +464,28 @@ func TestStalledKeepaliveWriteIsNotServerSilence(t *testing.T) {
 		t.Fatal("a stalled keepalive write was taken for the server's silence")
 	}
 }
+
+// TestOldExitIsNotUpgradedAgain is a P3 of the round-2 review: an exit older
+// than the credential lease answers every upgrade with another address, so
+// every reprobe cycle spent a dial and a handshake to learn the same thing.
+// After the first such answer the client stops upgrading on that endpoint.
+func TestOldExitIsNotUpgradedAgain(t *testing.T) {
+	resp := []byte{0x00}
+	resp = append(resp, callsiteServerIP.To4()...)
+	resp = append(resp, net.IPv4(10, 99, 0, 77).To4()...)
+	v, m, _, _ := upgradeOnSelector(t)
+	setLog(t, &stampedLog{})
+	old := &exitStrategy{id: "reality2", priority: 5, t: t, onHandshake: func(srv net.Conn) { _, _ = srv.Write(resp) }}
+	var dials atomic.Int64
+	old.onTarget = func(string) { dials.Add(1) }
+	m.Register(old)
+
+	v.tryStrategyUpgrade([]strategy.Strategy{old})
+	for range 5 { // the reprobes keep finding it reachable
+		m.UpdateStrategyConfidence(old.ID(), true)
+	}
+	v.tryStrategyUpgrade([]strategy.Strategy{old})
+	if n := dials.Load(); n != 1 {
+		t.Fatalf("%d upgrade dials to an exit that answers with another address, want 1", n)
+	}
+}
