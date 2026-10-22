@@ -72,6 +72,11 @@ func (s ClientServer) SNIs() ([]string, error) {
 	case nil:
 		return nil, nil
 	case string:
+		if strings.TrimSpace(v) == "" {
+			// The spelling the field had while it was recorded and never
+			// applied; an empty one meant nothing then and means no pool now.
+			return nil, nil
+		}
 		raw = []string{v}
 	case []string:
 		raw = v

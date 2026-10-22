@@ -59,11 +59,26 @@ port = 995
 // TestServersSNIRejectsNonHostnames: a comma or a port inside a name would
 // split it or smuggle a destination into a ClientHello.
 func TestServersSNIRejectsNonHostnames(t *testing.T) {
-	for _, bad := range []string{`sni = ["a.example,b.example"]`, `sni = ["a.example:443"]`, `sni = [""]`, `sni = [1]`} {
+	for _, bad := range []string{`sni = ["a.example,b.example"]`, `sni = ["a.example:443"]`, `sni = [""]`, `sni = [1]`,
+		`sni = ["*.googleapis.com"]`, `sni = ["203.0.113.10"]`, `sni = "www.google.com."`} {
 		path := writeClientTOML(t, "[[servers]]\naddress = \"203.0.113.10\"\nport = 995\n"+bad+"\n")
 		if err := applyClientTOMLConfig(&client.Config{}, path, clientFlagSetForTOML()); err == nil {
 			t.Errorf("%s was accepted", bad)
 		}
+	}
+}
+
+// TestServersEmptySNIStringIsNoPool is P3-13 of the round-3 review: `sni = ""`,
+// what the field held while it was recorded and never applied, turned into a
+// startup error. It means no pool.
+func TestServersEmptySNIStringIsNoPool(t *testing.T) {
+	path := writeClientTOML(t, "[[servers]]\naddress = \"203.0.113.10\"\nport = 995\nsni = \"\"\n")
+	cfg := &client.Config{}
+	if err := applyClientTOMLConfig(cfg, path, clientFlagSetForTOML()); err != nil {
+		t.Fatalf("sni = \"\" rejected: %v", err)
+	}
+	if got := cfg.Servers[0].SNI; len(got) != 0 {
+		t.Fatalf("sni = \"\" gave the pool %v", got)
 	}
 }
 
