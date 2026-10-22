@@ -2031,7 +2031,8 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			}
 			strategyTimedOut = timedOut
 
-			if verdict == attemptSilent {
+			switch verdict {
+			case attemptSilent:
 				if !isUDPBasedStrategy(s) {
 					scan.timeouts++
 					log.Debug("TCP silence count: %d/%d", scan.timeouts, tcpFailuresThreshold)
@@ -2044,7 +2045,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 					m.sortStrategies()
 					m.mu.Unlock()
 				}
-			} else if verdict == attemptAnswered {
+			case attemptAnswered:
 				// A refusal, a reset, a handshake that got an answer it did not
 				// like: the address is talking. Whatever is wrong here is a
 				// property of this transport, which is precisely the case the
@@ -2961,7 +2962,7 @@ func (m *Manager) UpgradeEligible(s Strategy) bool {
 	excludeUDP := m.excludeUDPStrategies
 	m.mu.RUnlock()
 	id := s.ID()
-	return !(excludeUDP && isUDPBasedStrategy(s)) && !m.stormDetector.IsParked(id) && m.circuitBreakers.CanTry(id)
+	return (!excludeUDP || !isUDPBasedStrategy(s)) && !m.stormDetector.IsParked(id) && m.circuitBreakers.CanTry(id)
 }
 
 // offerUpgrade hands the upgrade callback, after upgradeDelay, the strategies
