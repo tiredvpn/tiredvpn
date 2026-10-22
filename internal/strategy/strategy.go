@@ -1246,9 +1246,12 @@ func (m *Manager) chargeSessionEndpoint(sel *endpoint.Selector, end SessionEnd, 
 	}
 	m.mu.Lock()
 	prev := m.lastDeadEndpoint
-	if prev < 0 {
-		m.lastDeadEndpoint = end.Endpoint.EndpointIdx
-	}
+	// Moved on every decision, not only the first: kept on the first server,
+	// the marker made every later death on the second one look like "the same
+	// death on another server" and spared it forever, so a clean third server
+	// was never reached. Now a server gets one pass after a switch and is
+	// charged on its second death in a row.
+	m.lastDeadEndpoint = end.Endpoint.EndpointIdx
 	m.mu.Unlock()
 	if prev >= 0 && prev != end.Endpoint.EndpointIdx {
 		log.Info("Endpoint %s: %s, as on the previous server - the route, not the server; not parking it", end.Endpoint, why)
@@ -3435,6 +3438,7 @@ func (m *Manager) ResetForNetworkChange() {
 
 	// Storm state is tied to the old network - clear it after a network change.
 	m.stormDetector.Reset()
+	m.lastDeadEndpoint = -1
 
 	// So is the UDP verdict: it gated QUIC for the old network (or for no
 	// network at all, when this runs because the link went down). Void it,

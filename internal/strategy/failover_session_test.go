@@ -140,3 +140,43 @@ func TestFamilyProbeRepinIsLogged(t *testing.T) {
 type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
+// TestRouteRuleDoesNotLatch is P1-B of the round-2 review. The "same death on
+// two servers in a row is the route" marker was set once and only a useful
+// session cleared it, so after a death on A every later death on B was
+// compared with A and spared - forever. With A and B under a per-IP cap and C
+// clean, the client never left B. Each server now gets one pass after a
+// switch and is charged on its second death in a row.
+func TestRouteRuleDoesNotLatch(t *testing.T) {
+	a, b, c := newHelloListener(t), newHelloListener(t), newHelloListener(t)
+	m := newSilenceManager(t, time.Second, a.addr, b.addr, c.addr)
+	m.Register(&greetingStrategy{id: "reality", priority: 5})
+
+	die := func() string {
+		t.Helper()
+		conn, s, cand, ok, err := m.ConnectSession(context.Background(), "")
+		if err != nil || !ok {
+			t.Fatalf("ConnectSession: %v", err)
+		}
+		conn.Close()
+		m.SessionEnded(SessionEnd{Strategy: s.ID(), Endpoint: cand, HasEndpoint: true, Dead: true})
+		return cand.Addr
+	}
+	var rode []string
+	for range 4 {
+		rode = append(rode, die())
+	}
+	if rode[3] != c.addr {
+		t.Fatalf("sessions rode %v: with A and B dying, the client never reached the clean C", rode)
+	}
+
+	// A network change forgets the marker with everything else.
+	m.SessionEnded(SessionEnd{Strategy: "reality", Endpoint: endpoint.Candidate{Addr: a.addr, EndpointIdx: 0}, HasEndpoint: true, Dead: true})
+	m.ResetForNetworkChange()
+	m.mu.RLock()
+	marker := m.lastDeadEndpoint
+	m.mu.RUnlock()
+	if marker != -1 {
+		t.Fatalf("ResetForNetworkChange kept the route marker at %d", marker)
+	}
+}
