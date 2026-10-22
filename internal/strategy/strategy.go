@@ -1703,6 +1703,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 
 			if refused {
 				// Not the strategy's failure: the port is closed to all of them.
+				m.circuitBreakers.CancelHalfOpenAttempt(lastSuccessful.ID())
 				return nil, nil, refusedScan(target, fmt.Errorf("%s: %w", lastSuccessful.Name(), err))
 			}
 
@@ -1936,6 +1937,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			lastErr = fmt.Errorf("%s: %w", s.Name(), err)
 
 			if refused {
+				m.circuitBreakers.CancelHalfOpenAttempt(s.ID())
 				return nil, nil, refusedScan(target, lastErr)
 			}
 

@@ -265,3 +265,33 @@ func TestRefusalIsMatchedToTheAddress(t *testing.T) {
 		}
 	}
 }
+
+// TestRefusalReleasesTheHalfOpenSlot is a P3 of the PR #126 review: a refused
+// dial ends the scan right after BeginHalfOpenAttempt took a half-open slot,
+// and nothing gave it back, so a half-open breaker stalled for its whole window
+// after a server restart or two.
+func TestRefusalReleasesTheHalfOpenSlot(t *testing.T) {
+	old := refusalRetries
+	refusalRetries = []time.Duration{time.Millisecond}
+	t.Cleanup(func() { refusalRetries = old })
+
+	server := newRestartingListener(t)
+	server.stop()
+	m := newSilenceManager(t, time.Second, server.addr)
+	m.Register(&greetingStrategy{id: "reality", priority: 5})
+
+	cb := m.circuitBreakers.Get("reality")
+	cb.mu.Lock()
+	cb.openCircuit()
+	cb.mu.Unlock()
+	cb.now = func() time.Time { return time.Now().Add(time.Hour) } // the open period is over
+
+	for i := range cb.config.HalfOpenMax + 1 {
+		if _, _, err := m.Connect(context.Background(), ""); !errors.Is(err, errAddrRefused) {
+			t.Fatalf("cycle %d: err %v, want the refusal - the test proves nothing", i, err)
+		}
+	}
+	if !cb.BeginHalfOpenAttempt() {
+		t.Fatal("refused dials used up the half-open slots")
+	}
+}
