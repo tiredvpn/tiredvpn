@@ -53,7 +53,6 @@ func TestSelectDestinationSpreadsUnderLoad(t *testing.T) {
 	}
 }
 
-
 // TestSetFingerprintRejectsUnknown makes sure a config typo cannot quietly
 // change what we put on the wire.
 func TestSetFingerprintRejectsUnknown(t *testing.T) {
