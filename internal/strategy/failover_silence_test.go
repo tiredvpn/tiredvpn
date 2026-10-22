@@ -151,9 +151,13 @@ func TestDeadlineOnASilentAddressParksIt(t *testing.T) {
 	// The strategy masks its timeout the way REALITY did on the device, so the
 	// verdict has to come from the clock measured against the budget the
 	// attempt really had, not from the error text.
+	//
+	// Two transports, both silent there: one silent transport is not a verdict
+	// on the address (TestOneSwallowedTransportLeavesRoomForTheNext).
 	m := newSilenceManager(t, 2*time.Second, silent.addr, live.addr)
 	s := &maskedTimeoutStrategy{id: "s0", priority: 1}
 	m.Register(s)
+	m.Register(&maskedTimeoutStrategy{id: "s1", priority: 2})
 	markConnected(m, s)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
@@ -233,5 +237,75 @@ func TestNetUnreachableIsNotSilence(t *testing.T) {
 	}
 	if !heardNothing(hostUnreach, time.Millisecond, 15*time.Second) {
 		t.Error("EHOSTUNREACH no longer counts as silence")
+	}
+}
+
+// swallowingStrategy connects and then hears nothing until its context ends -
+// a transport whose handshake the censor swallows while the port answers.
+type swallowingStrategy struct {
+	id       string
+	priority int
+}
+
+func (s *swallowingStrategy) Name() string                       { return s.id }
+func (s *swallowingStrategy) ID() string                         { return s.id }
+func (s *swallowingStrategy) Priority() int                      { return s.priority }
+func (s *swallowingStrategy) RequiresServer() bool               { return true }
+func (s *swallowingStrategy) Description() string                { return "handshake swallowed" }
+func (s *swallowingStrategy) Probe(context.Context, string) error { return nil }
+func (s *swallowingStrategy) Connect(ctx context.Context, target string) (net.Conn, error) {
+	<-ctx.Done()
+	return nil, fmt.Errorf("reality: serverhello read failed: %w", ctx.Err())
+}
+
+// TestOneSwallowedTransportLeavesRoomForTheNext is a P2 of the PR #126 review.
+// The reconnect gives a cycle 15 s and an attempt may take 30, so a fast path
+// whose handshake is swallowed used the whole cycle; the deadline then read as
+// the address's silence and parked the server - without Polling, which works
+// there, ever being tried. The fast path now gets half the budget, and one
+// silent transport is not a verdict on the address.
+func TestOneSwallowedTransportLeavesRoomForTheNext(t *testing.T) {
+	live := newHelloListener(t)
+	other := newHelloListener(t)
+	m := newSilenceManager(t, 2*time.Second, live.addr, other.addr)
+	reality := &swallowingStrategy{id: "reality", priority: 5}
+	m.Register(reality)
+	m.Register(&greetingStrategy{id: "polling", priority: 6})
+	markConnected(m, reality)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	conn, s, err := m.Connect(ctx, "")
+	if err != nil {
+		t.Fatalf("a swallowed fast path took the whole cycle: %v", err)
+	}
+	conn.Close()
+	if s.ID() != "polling" {
+		t.Fatalf("connected via %s, want polling", s.ID())
+	}
+	if st := endpointState(t, m, live.addr); st.CooldownUntil.After(time.Now()) {
+		t.Fatal("the server was parked for one swallowed transport")
+	}
+}
+
+// TestScanLeavesRoomForTheNextTransport is the same rule without a fast path:
+// a first strategy whose handshake is swallowed may not take the whole cycle
+// while others are still to try.
+func TestScanLeavesRoomForTheNextTransport(t *testing.T) {
+	live := newHelloListener(t)
+	other := newHelloListener(t)
+	m := newSilenceManager(t, 2*time.Second, live.addr, other.addr)
+	m.Register(&swallowingStrategy{id: "reality", priority: 5})
+	m.Register(&greetingStrategy{id: "polling", priority: 6})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	conn, s, err := m.Connect(ctx, "")
+	if err != nil {
+		t.Fatalf("a swallowed first strategy took the whole cycle: %v", err)
+	}
+	conn.Close()
+	if s.ID() != "polling" {
+		t.Fatalf("connected via %s, want polling", s.ID())
 	}
 }

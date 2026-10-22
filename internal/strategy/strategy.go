@@ -274,12 +274,12 @@ var errAddrRefused = errors.New("address refused the connection")
 // the stand) is over within it, a stopped server is not.
 var refusalRetries = []time.Duration{250 * time.Millisecond, 500 * time.Millisecond, time.Second}
 
-// connectThroughRefusal dials s, and when the address refuses, waits and dials
-// it again per refusalRetries. refused reports that the last answer was still a
-// refusal.
-func (m *Manager) connectThroughRefusal(ctx context.Context, s Strategy, target string) (conn net.Conn, latency time.Duration, refused bool, err error) {
+// connectThroughRefusal dials s with an attempt limit, and when the address
+// refuses, waits and dials it again per refusalRetries. refused reports that
+// the last answer was still a refusal.
+func (m *Manager) connectThroughRefusal(ctx context.Context, s Strategy, target string, limit time.Duration) (conn net.Conn, latency time.Duration, refused bool, err error) {
 	for i := 0; ; i++ {
-		connectCtx, cancel := context.WithTimeout(ctx, m.connectTimeout)
+		connectCtx, cancel := context.WithTimeout(ctx, limit)
 		start := time.Now()
 		conn, err = s.Connect(connectCtx, target)
 		latency = time.Since(start)
@@ -422,13 +422,16 @@ func heardNothing(err error, latency, budget time.Duration) bool {
 
 // scanOutOfTime ends a scan whose context ran out.
 //
+// Two silent transports at least: one swallowed handshake is a property of that
+// transport (a censor that resets or eats only REALITY's), not of the address.
+//
 // A deadline that fell while the address had answered nothing is the silence
 // verdict, reached the slow way: the caller's budget ran out before
 // tcpFailuresBeforeQUIC transports could each time out. Reporting it as a plain
 // context error left the address unpunished, so the next cycle dialled the same
 // silent server with the same result.
 func scanOutOfTime(ctx context.Context, target string, scan *scanState, lastErr error) error {
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) && !scan.answered && scan.timeouts > 0 {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) && !scan.answered && scan.timeouts >= 2 {
 		log.Info("Address %s answered nothing on %d transports before the connect budget ran out",
 			target, scan.timeouts)
 		if lastErr == nil {
@@ -1646,6 +1649,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 		(m.forced || !m.stormDetector.IsParked(lastSuccessful.ID())) &&
 		m.circuitBreakers.CanTry(lastSuccessful.ID())
 
+	fastSilent := false // the fast path heard nothing this cycle
 	if fastEligible {
 		// Loop guard: a strategy that connects but whose tunnel dies seconds later
 		// can ride this fast path in a tight reconnect loop without ever being
@@ -1666,8 +1670,16 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 		default:
 			log.Info("Trying last successful strategy first: %s", lastSuccessful.Name())
 
+			// The fast path may not spend the whole cycle. The reconnect gives
+			// a cycle 15 s and an attempt may take 30: a transport whose
+			// handshake is swallowed used it all, and the deadline then read
+			// as the address's silence, parking a server where the next
+			// strategy works. Half is left for the scan.
 			budget := m.attemptBudget(ctx)
-			conn, latency, refused, err := m.connectThroughRefusal(ctx, lastSuccessful, target)
+			if budget < m.connectTimeout {
+				budget /= 2
+			}
+			conn, latency, refused, err := m.connectThroughRefusal(ctx, lastSuccessful, target, budget)
 
 			if err == nil {
 				// Success - update stats (also records the breaker success)
@@ -1702,6 +1714,10 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			if !isUDPBasedStrategy(lastSuccessful) {
 				if heardNothing(err, latency, budget) {
 					scan.timeouts++
+					// It had its turn this cycle; dialling it again in the
+					// scan would only spend the rest of the budget the same way.
+					excludeMap[lastSuccessful.ID()] = true
+					fastSilent = true
 				} else {
 					scan.answered = true
 				}
@@ -1772,6 +1788,11 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			log.Warn("All strategies parked by storm cooldown - unparking to avoid total outage")
 			m.stormDetector.Reset()
 			return m.connectWithRTTScan(ctx, target, excludeIDs, useRTTMasking, scan)
+		}
+		if fastSilent {
+			// The fast path was the only transport there is, and it heard
+			// nothing: that is every transport.
+			return nil, nil, fmt.Errorf("%w: %w, only transport silent", errAddrSilent, errStrategyScanFailed)
 		}
 		return nil, nil, fmt.Errorf("no available strategies (all excluded or circuit-broken)")
 	}
@@ -1874,8 +1895,13 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			attemptCount++
 			log.Debug("  Attempt %d/%d for %s", retry+1, m.maxRetries, s.Name())
 
+			// Same rule as the fast path: while other transports remain, one
+			// attempt may not take the whole of a short cycle.
 			budget := m.attemptBudget(ctx)
-			conn, latency, refused, err := m.connectThroughRefusal(ctx, s, target)
+			if budget < m.connectTimeout && i < len(strategies)-1 {
+				budget /= 2
+			}
+			conn, latency, refused, err := m.connectThroughRefusal(ctx, s, target, budget)
 
 			if err == nil {
 				// Success - update confidence with latency and save for fast reconnect
