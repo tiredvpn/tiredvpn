@@ -122,6 +122,7 @@ type Manager struct {
 	emergencyReprobeRunning bool
 	emergencyReprobeStop    chan struct{}
 	lastEmergencyReprobe    time.Time
+	emergencyInterval       time.Duration // mean pause between emergency reprobes
 
 	// Manager lifecycle. Background goroutines the manager spawns on its own
 	// (e.g. the emergency reprobe fired from a failed scan) hang off lifeCtx so
@@ -816,6 +817,7 @@ func NewManager() *Manager {
 		circuitBreakers:       NewCircuitBreakerManager(DefaultCircuitBreakerConfig()),
 		stormDetector:         NewStormDetector(StormConfig{}),
 		reprobeInterval:       5 * time.Minute,
+		emergencyInterval:     30 * time.Second,
 		stopReprobe:           make(chan struct{}),
 		tcpFailuresBeforeQUIC: 3, // Switch to QUIC after 3 TCP timeouts
 		tlsSessionCache:       tls.NewLRUClientSessionCache(64),
@@ -3763,7 +3765,18 @@ func optimizeTCPConn(conn net.Conn) {
 
 // TriggerEmergencyReprobe starts aggressive re-probing when all strategies fail
 // This helps recover from network outages by periodically retrying with short intervals
+//
+// Not while the reprobe is held (HoldReprobe): the TUN client holds it while it
+// reconnects, and a reconnect is where every failed scan used to start one -
+// ProbeAll against the pinned server every 30.000 s, next to a reconnect loop
+// already dialling it, the burst HoldReprobe exists to keep off the wire. The
+// reconnect is the recovery there. Where nothing holds it (no TUN) the pauses
+// are drawn like the periodic reprobe's, not ticked.
 func (m *Manager) TriggerEmergencyReprobe(ctx context.Context) {
+	if m.reprobeHeld.Load() {
+		log.Debug("Emergency reprobe skipped: no tunnel, the reconnect is dialling")
+		return
+	}
 	// Read the pinned candidate BEFORE taking m.mu: GetServerAddr takes the
 	// same lock to reach the selector.
 	target := m.GetServerAddr(ctx)
@@ -3806,8 +3819,8 @@ func (m *Manager) TriggerEmergencyReprobe(ctx context.Context) {
 			log.Info("Emergency reprobe stopped")
 		}()
 
-		ticker := time.NewTicker(30 * time.Second) // Aggressive: every 30 seconds
-		defer ticker.Stop()
+		timer := time.NewTimer(nextReprobeDelay(m.emergencyInterval))
+		defer timer.Stop()
 
 		maxAttempts := 10 // Try for 5 minutes max
 		attempt := 0
@@ -3818,7 +3831,12 @@ func (m *Manager) TriggerEmergencyReprobe(ctx context.Context) {
 				return
 			case <-stopCh:
 				return
-			case <-ticker.C:
+			case <-timer.C:
+				timer.Reset(nextReprobeDelay(m.emergencyInterval))
+				if m.reprobeHeld.Load() {
+					// A reconnect started since: it is the recovery now.
+					return
+				}
 				attempt++
 				if attempt > maxAttempts {
 					log.Warn("Emergency reprobe giving up after %d attempts", maxAttempts)
