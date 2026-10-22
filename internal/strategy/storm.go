@@ -152,6 +152,23 @@ func (d *StormDetector) SessionOpened(strategyID string) {
 	d.openedAt[strategyID] = d.now()
 }
 
+// SessionOpenedAt reports when the open session of strategyID started, as
+// SessionOpened recorded it.
+func (d *StormDetector) SessionOpenedAt(strategyID string) (time.Time, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	t, ok := d.openedAt[strategyID]
+	return t, ok
+}
+
+// SessionAbandoned forgets the session opened via SessionOpened without
+// recording a lifetime: it did not end on its own, the client replaced it.
+func (d *StormDetector) SessionAbandoned(strategyID string) {
+	d.mu.Lock()
+	delete(d.openedAt, strategyID)
+	d.mu.Unlock()
+}
+
 // SessionClosed records that the session opened via SessionOpened has ended.
 // It returns the same verdict as RecordSession. If no matching SessionOpened
 // was seen, it is a no-op and reports storming=false.

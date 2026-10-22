@@ -6,7 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -81,7 +84,24 @@ type IPPool struct {
 	redis    *redis.Client
 	leases   map[string]*IPLease // In-memory: IP -> Lease
 	byClient map[string]string   // In-memory: ClientID -> IP
+
+	// folded records when AdoptAll last folded the old keys of a lease key, so
+	// the next handshakes of that client skip the fold - see adoptFoldTTL.
+	// Guarded by mu.
+	folded map[string]time.Time
 }
+
+// adoptFoldTTL is how long a folded lease key is left alone. Old keys are
+// written only by servers before the credential lease, so once folded there is
+// nothing more to find, and each look was up to three Redis GETs (or a SCAN)
+// under the pool lock on every TUN handshake. Not forever: an older exit
+// sharing the same Redis can still write an old key, and this bounds how long
+// that lease waits for its fold.
+const adoptFoldTTL = 10 * time.Minute
+
+// adoptFoldMax caps folded. Shared keys carry the client's origin, so the map
+// grows with every address a global-secret client comes from.
+const adoptFoldMax = 4096
 
 // NewIPPool creates a new IP pool manager
 func NewIPPool(cfg IPPoolConfig, redisClient *redis.Client) (*IPPool, error) {
@@ -448,18 +468,31 @@ func (p *IPPool) stickyLookup(clientID string) string {
 	return ip
 }
 
-// AdoptAll folds the leases held under oldKeys into newKey: if newKey has no
-// lease, the first old one found moves to it and the client keeps its address;
-// every other old lease is released. It is the carry-over for a client whose
-// lease key changed spelling between releases (see legacyAllocationKeys), and
-// it leaves no lease behind under an old key.
-func (p *IPPool) AdoptAll(oldKeys []string, newKey string) {
+// AdoptAll folds the leases held under oldKeys, and under every key that
+// starts with one of oldPrefixes, into newKey: if newKey has no lease, the first
+// old one found moves to it and the client keeps its address; every other old
+// lease is released. It is the carry-over for a client whose lease key changed
+// spelling between releases (see legacyAllocationKeys), and it leaves no lease
+// behind under an old key.
+func (p *IPPool) AdoptAll(oldKeys, oldPrefixes []string, newKey string) {
 	if newKey == "" {
 		return
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	now := time.Now()
+	if at, ok := p.folded[newKey]; ok && now.Sub(at) < adoptFoldTTL {
+		return
+	}
+	defer p.markFolded(newKey, now)
 	have := p.stickyLookup(newKey)
+	for _, prefix := range oldPrefixes {
+		for _, k := range p.clientKeysWithPrefix(prefix) {
+			if !slices.Contains(oldKeys, k) {
+				oldKeys = append(oldKeys, k)
+			}
+		}
+	}
 	for _, oldKey := range oldKeys {
 		if oldKey == "" || oldKey == newKey {
 			continue
@@ -489,6 +522,77 @@ func (p *IPPool) AdoptAll(oldKeys []string, newKey string) {
 		p.deleteLease(ip)
 		log.Info("Lease %s under %s released: the client holds %s under %s", ip, oldKey, have, newKey)
 	}
+}
+
+// markFolded records newKey as folded at now. Caller must hold p.mu.
+func (p *IPPool) markFolded(newKey string, now time.Time) {
+	if p.folded == nil {
+		p.folded = make(map[string]time.Time)
+	}
+	if len(p.folded) >= adoptFoldMax {
+		maps.DeleteFunc(p.folded, func(_ string, at time.Time) bool { return now.Sub(at) >= adoptFoldTTL })
+		if len(p.folded) >= adoptFoldMax {
+			clear(p.folded)
+		}
+	}
+	p.folded[newKey] = now
+}
+
+// adoptScanBatch and adoptScanRounds bound the Redis SCAN of
+// clientKeysWithPrefix: a few hundred keys per round, and a stop well past any
+// keyspace an exit holds (leases, client keys, the registry) rather than a walk
+// of whatever else shares the Redis.
+const (
+	adoptScanBatch  = 512
+	adoptScanRounds = 64
+)
+
+// clientKeysWithPrefix returns the client keys starting with prefix: the ones
+// this process knows, and the ones in Redis, which a pool outside 10.0.0.0/8
+// does not load at startup (see leaseKeyPattern). Sorted, so the fold is
+// deterministic. Caller must hold p.mu.
+func (p *IPPool) clientKeysWithPrefix(prefix string) []string {
+	if prefix == "" {
+		return nil
+	}
+	found := map[string]bool{}
+	for k := range p.byClient {
+		if strings.HasPrefix(k, prefix) {
+			found[k] = true
+		}
+	}
+	if p.redis != nil {
+		ctx := context.Background()
+		ns := p.redisClientKey("")
+		match := ns + globEscape(prefix) + "*"
+		var cursor uint64
+		for range adoptScanRounds {
+			keys, next, err := p.redis.Scan(ctx, cursor, match, adoptScanBatch).Result()
+			if err != nil {
+				log.Warn("IP pool: scanning for leases under %s*: %v", prefix, err)
+				break
+			}
+			for _, k := range keys {
+				found[strings.TrimPrefix(k, ns)] = true
+			}
+			if cursor = next; cursor == 0 {
+				break
+			}
+		}
+	}
+	return slices.Sorted(maps.Keys(found))
+}
+
+// globEscape quotes the characters a Redis MATCH pattern treats as special.
+func globEscape(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if strings.ContainsRune(`*?[]\`, r) {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 // Allocate allocates an IP address for a client

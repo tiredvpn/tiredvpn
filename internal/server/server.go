@@ -2604,7 +2604,7 @@ func handleMorphTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverConte
 		serverIP = cfg.TunIP
 
 		// Register client with shared TUN using Morph framing
-		writer := srvCtx.sharedTUN.RegisterClientGated(clientIP, clientID.id, conn, morphFramePacket, gate)
+		writer := srvCtx.sharedTUN.RegisterClientGated(clientIP, clientID.id, originOf(conn.RemoteAddr()), conn, morphFramePacket, gate)
 		localSink := newLocalTUNSink(srvCtx.sharedTUN, writer, clientIP)
 		sink = localSink
 		defer func() {
@@ -3158,7 +3158,7 @@ func handleConfusionTUNMode(sess *confusionSession, remainingData []byte, srvCtx
 		serverIP = cfg.TunIP
 
 		// Register client with shared TUN (default framing: [length:4][packet:N])
-		writer := srvCtx.sharedTUN.RegisterClientGated(clientIP, clientID.id, conn, nil, gate)
+		writer := srvCtx.sharedTUN.RegisterClientGated(clientIP, clientID.id, originOf(conn.RemoteAddr()), conn, nil, gate)
 		localSink := newLocalTUNSink(srvCtx.sharedTUN, writer, clientIP)
 		sink = localSink
 		defer func() {
@@ -3575,7 +3575,7 @@ func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger
 
 	// Register client with shared TUN
 	// Default framing: [length:4][packet:N]
-	writer := srvCtx.sharedTUN.RegisterClientGated(clientIP, clientID.id, conn, nil, gate)
+	writer := srvCtx.sharedTUN.RegisterClientGated(clientIP, clientID.id, originOf(conn.RemoteAddr()), conn, nil, gate)
 	defer func() {
 		srvCtx.sharedTUN.UnregisterClient(clientIP, writer)
 		// Don't release IP - it stays allocated for reconnects
@@ -4041,7 +4041,7 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 		// Register client with shared TUN. The default [len:4][packet:N] framing
 		// is what the gate's writer wraps in a stego response, so there is no
 		// longer a frameFunc that sends on its own and returns nil.
-		writer := srvCtx.sharedTUN.RegisterClientGated(clientIP, tunnel.clientID.id, h2Conn, nil, gate)
+		writer := srvCtx.sharedTUN.RegisterClientGated(clientIP, tunnel.clientID.id, origin, h2Conn, nil, gate)
 		tunnel.sharedTUNWriter = writer
 		tunnel.sharedTUN = srvCtx.sharedTUN
 		tunnel.sink = newLocalTUNSink(srvCtx.sharedTUN, writer, clientIP)
@@ -5880,7 +5880,7 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 
 		// Register client with shared TUN using custom framer for polling
 		// Polling uses [length:4][packet:N] framing
-		writer := srvCtx.sharedTUN.RegisterClientGated(clientIP, clientID.id, pollConn, nil, gate)
+		writer := srvCtx.sharedTUN.RegisterClientGated(clientIP, clientID.id, sess.Origin, pollConn, nil, gate)
 		localSink := newLocalTUNSink(srvCtx.sharedTUN, writer, clientIP)
 		sink = localSink
 		defer func() {

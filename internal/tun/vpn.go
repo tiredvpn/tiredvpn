@@ -18,6 +18,7 @@ import (
 
 	"github.com/tiredvpn/tiredvpn/internal/endpoint"
 	"github.com/tiredvpn/tiredvpn/internal/log"
+	"github.com/tiredvpn/tiredvpn/internal/protect"
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
 )
 
@@ -40,12 +41,13 @@ func isTemporaryError(err error) bool {
 // tests can shorten the ticker.
 var keepaliveInterval = 10 * time.Second
 
-var readTimeout = 30 * time.Second             // Must be > keepaliveInterval, detect dead connection faster. A var so tests can shorten it.
-const writeTimeout = 30 * time.Second          // Write timeout (was 5s, caused i/o timeouts with bufferbloat)
+var readTimeout = 30 * time.Second    // Must be > keepaliveInterval, detect dead connection faster. A var so tests can shorten it.
+const writeTimeout = 30 * time.Second // Write timeout (was 5s, caused i/o timeouts with bufferbloat)
 
 // keepaliveWriteTimeout bounds one keepalive write. A var so tests can
 // shorten it.
 var keepaliveWriteTimeout = 5 * time.Second
+
 const deadConnectionTimeout = 45 * time.Second // Proactive dead connection detection timeout
 
 // maxFrameLen is the largest [len:4][data:N] payload the tunnel protocol accepts;
@@ -207,7 +209,10 @@ type VPNClient struct {
 
 	// upgradeOff lists endpoints whose exit answered an upgrade with another
 	// tunnel address - an exit older than the credential lease, which will do
-	// so every time. Guarded by mu.
+	// so every time - for as long as the tunnel's session there lasts. An
+	// exit is updated by restarting it, which ends that session, so the entry
+	// goes with it (disconnect): one wasted upgrade per session at most,
+	// instead of none ever again until the client restarts. Guarded by mu.
 	upgradeOff map[string]bool
 
 	// sessionMu is held by every operation that registers a new session on
@@ -856,6 +861,9 @@ func (v *VPNClient) seamlessPortHop(newPort int) {
 		return
 	}
 	oldConn := v.conn
+	oldStrategy, oldConnectedAt, oldLastRx := v.strategy, v.connectedAt, v.lastRx
+	oldCand, oldHasCand := v.sessionCand, v.hasSessionCand
+	abandoned := v.upgradePending
 	v.conn = tunnelConn
 	v.strategy = newStrategy
 	v.serverAddr = newTarget
@@ -864,6 +872,22 @@ func (v *VPNClient) seamlessPortHop(newPort int) {
 	v.connectedAt = time.Now()
 	v.lastRx = v.connectedAt
 	v.mu.Unlock()
+
+	// The hop replaced the session; book it like the upgrade swap does, and
+	// start the storm detector's clock with connectedAt, so the two measure
+	// the hop's session from the same moment. A pending upgrade is abandoned,
+	// not failed: the hop dialled through the scan, which goes the way the
+	// tunnel came, and its session is no evidence about the upgrade.
+	if v.manager != nil {
+		if oldStrategy != nil {
+			v.manager.SessionEnded(strategy.SessionEnd{Strategy: oldStrategy.ID(), Replaced: true,
+				Useful: sessionWasUseful(oldConnectedAt, oldLastRx), Endpoint: oldCand, HasEndpoint: oldHasCand})
+		}
+		v.manager.RecordSessionStart(newStrategy.ID())
+	}
+	if abandoned != nil {
+		log.Info("VPN: port hop abandoned the pending upgrade to %s; the next reprobe may offer it again", abandoned.Name())
+	}
 
 	// Close old connection after swap
 	if oldConn != nil {
@@ -1586,7 +1610,7 @@ func (v *VPNClient) sendKeepalive() {
 
 				conn.SetWriteDeadline(time.Now().Add(keepaliveWriteTimeout))
 				if _, err := conn.Write(keepalivePkt); err != nil {
-					v.connLost(conn, "keepalive write", err)
+					v.connLost(conn, "keepalive write", uplinkFailed(err))
 				} else {
 					log.Debug("Sent keepalive packet")
 				}
@@ -1647,7 +1671,7 @@ func (v *VPNClient) readFromTun() {
 		conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 		written, err := conn.Write(buf[:n+4])
 		if err != nil {
-			v.connLost(conn, "server write", err)
+			v.connLost(conn, "server write", uplinkFailed(err))
 			continue
 		}
 
@@ -1971,22 +1995,29 @@ func (v *VPNClient) handshakeUpgrade(oldConn, conn net.Conn, cur, next strategy.
 		// already have moved the client's address to the new session, and the
 		// old one with it.
 		log.Info("Strategy upgrade: %s handshake lost after the request (%v), reconnecting", next.Name(), err)
-		v.connLost(oldConn, "strategy upgrade", fmt.Errorf("%w: %w", errUpgradeRejected, err))
+		// %v, not %w: whatever the new transport ran into - a read deadline,
+		// a QUIC idle timeout - says nothing about the server going quiet on
+		// the tunnel the old conn was carrying.
+		v.connLost(oldConn, "strategy upgrade", fmt.Errorf("%w: %v", errUpgradeRejected, err))
 		return
 	}
 	caps, hasCaps := parseServerCapabilities(resp, n)
+	v.mu.Lock()
+	oldConnectedAt, oldLastRx := v.connectedAt, v.lastRx
+	sessCand, hasSessCand := v.sessionCand, v.hasSessionCand
+	v.mu.Unlock()
 	verdict := v.swapUpgradedConn(oldConn, tunnelConn, next, net.IP(resp[1:5]), net.IP(resp[5:9]), caps, hasCaps)
 	v.sessionMu.Unlock()
 
 	switch verdict {
 	case upgradeSwapped:
 		oldConn.Close()
-		// The fallback session the swap ends was useful, and the endpoint has
-		// to hear it: that clears its dead-session streak like any useful end.
-		v.mu.Lock()
-		cand, hasCand := v.sessionCand, v.hasSessionCand
-		v.mu.Unlock()
-		v.manager.SessionEnded(strategy.SessionEnd{Strategy: cur.ID(), Useful: true, Endpoint: cand, HasEndpoint: hasCand})
+		// The fallback session the swap ends did not die, it was replaced.
+		// If it was useful the endpoint has to hear it: that clears its
+		// dead-session streak like any useful end. A young one - an upgrade
+		// offered seconds after a reconnect - says nothing either way.
+		v.manager.SessionEnded(strategy.SessionEnd{Strategy: cur.ID(), Replaced: true,
+			Useful: sessionWasUseful(oldConnectedAt, oldLastRx), Endpoint: sessCand, HasEndpoint: hasSessCand})
 		v.manager.RecordSessionStart(next.ID())
 		log.Info("Strategy upgrade: tunnel moved from %s to %s, pending confirmation", cur.Name(), next.Name())
 	case upgradeOtherAddress:
@@ -2106,6 +2137,9 @@ func (v *VPNClient) disconnect(conn net.Conn, reason string, err error) {
 	sessionCand, hasSessionCand := v.sessionCand, v.hasSessionCand
 	pendingUpgrade := v.upgradePending
 	v.upgradePending = nil
+	if hasSessionCand {
+		delete(v.upgradeOff, sessionCand.Addr)
+	}
 	v.mu.Unlock()
 
 	if pendingUpgrade != nil && v.manager != nil {
@@ -2323,6 +2357,18 @@ func (e *silenceError) Error() string        { return e.err.Error() }
 func (e *silenceError) Unwrap() error        { return e.err }
 func (e *silenceError) Is(target error) bool { return target == strategy.ErrServerSilent }
 
+// uplinkError is a tunnel write that failed. It reads like the error it
+// wraps but matches nothing: a write that runs into its deadline says the
+// local uplink is stuck (bufferbloat), not that the server went quiet, and
+// on a raw TCP transport (Geneva, Stego, WS) that deadline comes back as a
+// net.Error with Timeout(), which serverWentSilent would take for silence.
+type uplinkError struct{ err error }
+
+func (e *uplinkError) Error() string { return e.err.Error() }
+
+// uplinkFailed hides a write error's timeout from the silence classifiers.
+func uplinkFailed(err error) error { return &uplinkError{err: err} }
+
 // serverWentSilent reports a disconnect caused by a deadline - the server
 // stopped answering - as opposed to a close, a reset or a protocol error, all of
 // which prove the server was there to send them. HTTP Polling's health grace
@@ -2390,15 +2436,16 @@ var reconnectConnectTimeout = 15 * time.Second
 // The pause between rounds is drawn, not fixed (see poolPause). base is 5 s
 // for the first two minutes (a provider's line flapping), then grows by half
 // per round up to a minute. A silent dial adds its own poolDialTimeout (3 s)
-// before the pause starts. Simulated over the real functions: a dial every
-// 5.5-8.0 s in the first two minutes (median 6.2), then every 33-63 s (median
-// 41.5, p90 55.6), about 40 dials in the first 15 minutes of silence. How late
-// a recovered server is noticed, 15 minutes into the silence, with 4 addresses
-// in the pool: the whole pool back (the client's own uplink returning) - median
-// 22 s, worst 63 s; one server of two (2 addresses) - median 45 s, p99 141 s,
-// worst 174 s; one address of 4 - median 87 s, p99 189 s, worst 218 s. There
-// is no measured reference distribution; the point is no grid and fewer SYNs
-// the longer the silence.
+// before the pause starts. Simulated over the real functions (2000 runs): a
+// dial every 4.3-8.0 s in the first two minutes (median 6.2), then every
+// 18-63 s (median 41.3, p90 56.7), about 42 dials in the first 15 minutes of
+// silence. How late a recovered server is noticed, 15 minutes into the
+// silence, coming back at a uniformly random moment (4000 runs): the whole
+// pool back (the client's own uplink returning) - median 23 s, worst 61 s; one
+// server of two (2 addresses) - median 43 s, p99 100 s, worst 116 s; one
+// address of 4 - median 90 s, p99 188 s, worst 220 s. There is no measured
+// reference distribution; the point is no grid, no hard minimum gap and fewer
+// SYNs the longer the silence.
 var (
 	poolPollInterval = 5 * time.Second
 	poolFastPhase    = 2 * time.Minute
@@ -2423,12 +2470,15 @@ func nextPoolBase(cur, silentFor time.Duration) time.Duration {
 	return min(time.Duration(float64(cur)*poolPollGrowth), poolPollMax)
 }
 
-// poolPause draws the actual pause under base: RandomDelay(base/2, 3/4 base,
+// poolPause draws the actual pause under base: HumpDelay(base/4, 3/4 base,
 // base). The ceiling is base, not twice it: with 2 x base (round 3) the
 // long-run gap reached 123 s, and a client whose own uplink came back waited up
 // to two minutes for the next dial, against 63 s before the pauses were drawn.
+// The shape is a hump, not RandomDelay's exponential: that put 40% of the
+// pauses in the lowest fifth of the range and made base/2 plus the dial
+// timeout a hard minimum gap (round-3 review, P3-18).
 func poolPause(base time.Duration) time.Duration {
-	return strategy.RandomDelay(base/2, 3*base/4, base)
+	return strategy.HumpDelay(base/4, 3*base/4, base)
 }
 
 // waitOutSilentPool decides what a "nobody in the pool answers" verdict means
@@ -2464,11 +2514,8 @@ func (v *VPNClient) waitForPool(since time.Time) bool {
 			return false
 		case <-time.After(poolPause(base)):
 		}
-		if addr, ok := v.pollOneServer(); ok {
+		if addr, ok := v.pollOneServer(); ok && (v.manager == nil || v.manager.PinAnswering(addr)) {
 			log.Info("Server %s answers again after %v of pool silence", addr, time.Since(since).Round(time.Second))
-			if v.manager != nil {
-				v.manager.PinAnswering(addr)
-			}
 			return true
 		}
 		base = nextPoolBase(base, time.Since(since))
@@ -2513,9 +2560,12 @@ func errMeansPathAlive(err error) bool {
 }
 
 // dialMeansAlive dials addr and treats both a completed connect and an
-// immediate refusal as "the path answers".
+// immediate refusal as "the path answers". The dial is protected, so on
+// Android it cannot be routed into the tunnel; elsewhere that is a plain dial.
 func dialMeansAlive(addr string) bool {
-	conn, err := net.DialTimeout("tcp", addr, networkCheckTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), networkCheckTimeout)
+	defer cancel()
+	conn, err := (&protect.ProtectDialer{}).DialContext(ctx, "tcp", addr)
 	if err == nil {
 		conn.Close()
 		return true
@@ -2540,14 +2590,21 @@ var probeLocalLink = localLinkUp
 var gatewayAddrs = physicalGateAddrs
 
 // localLinkUp reports whether the client's own link is up, for decisions that
-// charge a server: true only when a physical default-route gateway answers.
-// Without a gateway to ask (non-Linux, an exotic setup) it cannot tell and
-// says no. internetReachable falls back to public resolvers there, and those
-// sit behind the tunnel's own routes - a coin toss, and up to 6 s of waiting
-// before every reconnect - which is fine for "should I wait for the network"
-// and not for "may I blame the server".
+// charge a server: true when a physical default-route gateway answers (Linux:
+// the main table, or any table when main has no default, as on Android;
+// macOS: the routing socket), or on Android when a public resolver answers
+// over the underlying network (linkFallbackProbes). Without either it cannot
+// tell and says no. Desktop does not use public resolvers here: they sit
+// behind the tunnel's own routes - a coin toss, and up to 6 s of waiting
+// before every reconnect - which is fine for internetReachable's "should I
+// wait for the network" and not for "may I blame the server".
 func localLinkUp() bool {
 	for _, addr := range gatewayAddrs() {
+		if dialMeansAlive(addr) {
+			return true
+		}
+	}
+	for _, addr := range linkFallbackProbes {
 		if dialMeansAlive(addr) {
 			return true
 		}

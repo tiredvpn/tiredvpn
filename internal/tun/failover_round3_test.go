@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -112,6 +113,10 @@ func TestUpgradeSwapClearsTheDeadStreak(t *testing.T) {
 	if deadStreak(t, m, addrs[0]) != 1 {
 		t.Fatal("no dead streak to clear - the test proves nothing")
 	}
+	v.mu.Lock()
+	v.connectedAt = time.Now().Add(-10 * time.Minute) // the fallback carried ten minutes
+	v.lastRx = time.Now()
+	v.mu.Unlock()
 
 	v.tryStrategyUpgrade([]strategy.Strategy{better})
 	if v.strategy != better {
@@ -119,6 +124,32 @@ func TestUpgradeSwapClearsTheDeadStreak(t *testing.T) {
 	}
 	if n := deadStreak(t, m, addrs[0]); n != 0 {
 		t.Fatalf("the useful fallback session ended by the swap left the dead streak at %d", n)
+	}
+}
+
+// TestUpgradeSwapOfAYoungSessionIsNoEvidence is P3-4 of the round-3 review:
+// the swap booked the fallback session as useful whatever its age, so a
+// fallback a few seconds old cleared the endpoint's dead streak. A young
+// session the client replaced on purpose says nothing either way: it clears
+// nothing, and it is not a short session against its strategy either.
+func TestUpgradeSwapOfAYoungSessionIsNoEvidence(t *testing.T) {
+	v, m, addrs, better := upgradeOnSelector(t)
+	setLog(t, &stampedLog{})
+	m.SessionEnded(strategy.SessionEnd{Strategy: "other", Endpoint: v.sessionCand, HasEndpoint: true, Dead: true})
+	if deadStreak(t, m, addrs[0]) != 1 {
+		t.Fatal("no dead streak - the test proves nothing")
+	}
+	before := m.GetStats()["polling"].Confidence
+
+	v.tryStrategyUpgrade([]strategy.Strategy{better}) // the fallback is milliseconds old
+	if v.strategy != better {
+		t.Fatal("no swap")
+	}
+	if n := deadStreak(t, m, addrs[0]); n != 1 {
+		t.Fatalf("a fallback session seconds old changed the dead streak to %d", n)
+	}
+	if after := m.GetStats()["polling"].Confidence; after < before {
+		t.Fatalf("a replaced session cost its strategy confidence: %.3f -> %.3f", before, after)
 	}
 }
 
@@ -215,6 +246,7 @@ func TestLostUpgradeResponseIsTunnelLoss(t *testing.T) {
 	better := &exitStrategy{id: "reality", priority: 5, t: t, onHandshake: func(net.Conn) { select {} }}
 	v, _, _ := newUpgradeClient(t, &rankedPipeStrategy{pipeStrategy: &pipeStrategy{t: t}, id: "unused", priority: 99})
 	v.manager.Register(better)
+	v.manager.SetConnectivityChecker(strategy.NewConnectivityChecker("127.0.0.1:1", time.Second, true))
 	out := &stopOnDisconnectLog{v: v}
 	setLog(t, out)
 
@@ -224,6 +256,12 @@ func TestLostUpgradeResponseIsTunnelLoss(t *testing.T) {
 	}
 	if n := v.manager.UpgradeFailures("reality"); n != 1 {
 		t.Fatalf("upgrade failures = %d, want 1", n)
+	}
+	// P3-2 of the round-3 review: the response ran into the upgrade's own
+	// read deadline, a net.Error with Timeout(). That is the new transport's
+	// loss, not the server going quiet on the tunnel it was carrying.
+	if v.manager.PreflightArmed() {
+		t.Fatal("a lost upgrade response was taken for the server's silence")
 	}
 }
 
@@ -415,11 +453,15 @@ type stallingConn struct {
 	net.Conn
 	mu       sync.Mutex
 	deadline time.Time
+	smux     bool // fail the way a smux stream does, not as a raw TCP conn
+	fixed    bool // keep the deadline the test set, not the caller's
 }
 
 func (c *stallingConn) SetWriteDeadline(t time.Time) error {
 	c.mu.Lock()
-	c.deadline = t
+	if !c.fixed {
+		c.deadline = t
+	}
 	c.mu.Unlock()
 	return nil
 }
@@ -429,7 +471,10 @@ func (c *stallingConn) Write([]byte) (int, error) {
 	d := c.deadline
 	c.mu.Unlock()
 	time.Sleep(time.Until(d) + 5*time.Millisecond)
-	return 0, errors.New("timeout")
+	if c.smux {
+		return 0, errors.New("timeout")
+	}
+	return 0, &net.OpError{Op: "write", Net: "tcp", Err: os.ErrDeadlineExceeded}
 }
 func (c *stallingConn) Close() error { return nil }
 
@@ -439,29 +484,41 @@ func (c *stallingConn) Close() error { return nil }
 // armed the pool gate and could park a young session's server. Only reads
 // speak for the server.
 func TestStalledKeepaliveWriteIsNotServerSilence(t *testing.T) {
-	oldKA, oldW := keepaliveInterval, keepaliveWriteTimeout
-	keepaliveInterval, keepaliveWriteTimeout = 20*time.Millisecond, 50*time.Millisecond
-	t.Cleanup(func() { keepaliveInterval, keepaliveWriteTimeout = oldKA, oldW })
+	// A raw TCP write (Geneva, Stego, WS) runs into its deadline as a
+	// net.OpError wrapping os.ErrDeadlineExceeded - a net.Error with Timeout()
+	// - and a smux stream (REALITY) as a bare "timeout". P3-1 of the round-3
+	// review: only the second was covered.
+	for _, smux := range []bool{false, true} {
+		name := "raw TCP"
+		if smux {
+			name = "smux"
+		}
+		t.Run(name, func(t *testing.T) {
+			oldKA, oldW := keepaliveInterval, keepaliveWriteTimeout
+			keepaliveInterval, keepaliveWriteTimeout = 20*time.Millisecond, 50*time.Millisecond
+			t.Cleanup(func() { keepaliveInterval, keepaliveWriteTimeout = oldKA, oldW })
 
-	m := strategy.NewManager()
-	m.SetConnectivityChecker(strategy.NewConnectivityChecker("127.0.0.1:1", time.Second, true))
-	v := &VPNClient{running: 1, stopCh: make(chan struct{}), manager: m, conn: &stallingConn{},
-		connectedAt: time.Now().Add(-time.Minute), lastRx: time.Now().Add(-time.Minute)}
-	out := &stopOnDisconnectLog{v: v}
-	setLog(t, out)
-	done := make(chan struct{})
-	go func() { v.sendKeepalive(); close(done) }()
-	deadline := time.Now().Add(3 * time.Second)
-	for !strings.Contains(out.String(), "VPN disconnected") && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	close(v.stopCh)
-	<-done
-	if !strings.Contains(out.String(), "VPN disconnected") {
-		t.Fatal("the stalled write never ended the session - the test proves nothing")
-	}
-	if m.PreflightArmed() {
-		t.Fatal("a stalled keepalive write was taken for the server's silence")
+			m := strategy.NewManager()
+			m.SetConnectivityChecker(strategy.NewConnectivityChecker("127.0.0.1:1", time.Second, true))
+			v := &VPNClient{running: 1, stopCh: make(chan struct{}), manager: m, conn: &stallingConn{smux: smux},
+				connectedAt: time.Now().Add(-time.Minute), lastRx: time.Now().Add(-time.Minute)}
+			out := &stopOnDisconnectLog{v: v}
+			setLog(t, out)
+			done := make(chan struct{})
+			go func() { v.sendKeepalive(); close(done) }()
+			deadline := time.Now().Add(3 * time.Second)
+			for !strings.Contains(out.String(), "VPN disconnected") && time.Now().Before(deadline) {
+				time.Sleep(10 * time.Millisecond)
+			}
+			close(v.stopCh)
+			<-done
+			if !strings.Contains(out.String(), "VPN disconnected") {
+				t.Fatal("the stalled write never ended the session - the test proves nothing")
+			}
+			if m.PreflightArmed() {
+				t.Fatal("a stalled keepalive write was taken for the server's silence")
+			}
+		})
 	}
 }
 
@@ -487,5 +544,75 @@ func TestOldExitIsNotUpgradedAgain(t *testing.T) {
 	v.tryStrategyUpgrade([]strategy.Strategy{old})
 	if n := dials.Load(); n != 1 {
 		t.Fatalf("%d upgrade dials to an exit that answers with another address, want 1", n)
+	}
+}
+
+// TestPortHopBooksTheSessionItReplaces is P3-3 of the round-3 review: the hop
+// reset connectedAt but neither ended the old session nor started the storm
+// detector's clock, so after a hop the storm detector and the dead-session
+// check measured the same session from different moments, and a useful
+// session the hop replaced cleared nothing.
+func TestPortHopBooksTheSessionItReplaces(t *testing.T) {
+	m, addrs, _ := poolManager(t, 2)
+	v := newCallsiteClient(m)
+	v.running = 1
+	v.stopCh = make(chan struct{})
+	setLog(t, &stampedLog{})
+	if err := v.connect(context.Background()); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	m.SessionEnded(strategy.SessionEnd{Strategy: "other", Endpoint: v.sessionCand, HasEndpoint: true, Dead: true})
+	if deadStreak(t, m, addrs[0]) != 1 {
+		t.Fatal("no dead streak - the test proves nothing")
+	}
+	v.mu.Lock()
+	v.connectedAt = time.Now().Add(-10 * time.Minute)
+	v.lastRx = time.Now()
+	v.mu.Unlock()
+
+	v.seamlessPortHop(1234)
+	v.mu.Lock()
+	hopStrategy, connectedAt := v.strategy, v.connectedAt
+	v.mu.Unlock()
+	if n := deadStreak(t, m, addrs[0]); n != 0 {
+		t.Fatalf("the useful session the hop replaced left the dead streak at %d", n)
+	}
+	opened, ok := m.SessionOpenedAt(hopStrategy.ID())
+	if !ok {
+		t.Fatal("the hop's session is not open in the storm detector")
+	}
+	if d := connectedAt.Sub(opened).Abs(); d > time.Second {
+		t.Fatalf("the storm detector times the hop's session from %v, the client from %v", opened, connectedAt)
+	}
+}
+
+// TestOldExitIsOfferedUpgradesAgainAfterItsSessionEnds is P3-8 of the
+// round-3 review: upgradeOff was never cleared, so an exit updated since -
+// which takes a restart, which ends the session - was never upgraded on
+// again until the client restarted.
+func TestOldExitIsOfferedUpgradesAgainAfterItsSessionEnds(t *testing.T) {
+	resp := []byte{0x00}
+	resp = append(resp, callsiteServerIP.To4()...)
+	resp = append(resp, net.IPv4(10, 99, 0, 77).To4()...)
+	v, m, _, _ := upgradeOnSelector(t)
+	setLog(t, &stampedLog{})
+	old := &exitStrategy{id: "reality2", priority: 5, t: t, onHandshake: func(srv net.Conn) { _, _ = srv.Write(resp) }}
+	m.Register(old)
+	v.tryStrategyUpgrade([]strategy.Strategy{old})
+	v.mu.Lock()
+	addr := v.sessionCand.Addr
+	off := v.upgradeOff[addr]
+	v.mu.Unlock()
+	if !off {
+		t.Fatal("the old exit was not marked - the test proves nothing")
+	}
+
+	atomic.StoreInt32(&v.running, 0) // book the end, no reconnect loop
+	v.disconnect(nil, "server restart", io.EOF)
+	v.mu.Lock()
+	off = v.upgradeOff[addr]
+	v.mu.Unlock()
+	if off {
+		t.Fatal("the session on the old exit ended and it is still never upgraded on")
 	}
 }

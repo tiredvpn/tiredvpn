@@ -5,24 +5,36 @@ import (
 	"strings"
 )
 
-type connectedHookKey struct{}
+type dialHooksKey struct{}
 
-// WithConnectedHook returns a context that makes every ProtectDialer dialling
-// on it call fn once a TCP connection is up. The strategy manager uses it to
-// tell an attempt still waiting for its TCP connect from one whose handshake is
-// under way: the first may be cut short, the second may not.
-func WithConnectedHook(ctx context.Context, fn func()) context.Context {
-	return context.WithValue(ctx, connectedHookKey{}, fn)
+// dialHooks are the callbacks WithDialHooks puts on a context.
+type dialHooks struct {
+	started   func()
+	connected func()
 }
 
-// tcpConnected runs the hook WithConnectedHook put on ctx, if any, for a TCP
-// dial that succeeded. UDP "connects" without a packet leaving, so it says
-// nothing about the server and does not count.
-func tcpConnected(ctx context.Context, network string) {
-	if !strings.HasPrefix(network, "tcp") {
-		return
+// WithDialHooks returns a context that makes every ProtectDialer dialling on
+// it call started when a TCP dial begins and connected once the connection is
+// up. The strategy manager uses them to tell three moments of an attempt
+// apart: still waiting locally (a handshake gate, key generation) before any
+// SYN, waiting for the TCP connect, and a handshake under way. The first two
+// may be cut short; only the second is the server's silence. Either may be nil.
+func WithDialHooks(ctx context.Context, started, connected func()) context.Context {
+	return context.WithValue(ctx, dialHooksKey{}, dialHooks{started: started, connected: connected})
+}
+
+// tcpDialStarted runs the started hook for a TCP dial about to go out. UDP
+// "connects" without a packet leaving, so it says nothing about the server and
+// does not count, here or in tcpConnected.
+func tcpDialStarted(ctx context.Context, network string) {
+	if h, ok := ctx.Value(dialHooksKey{}).(dialHooks); ok && h.started != nil && strings.HasPrefix(network, "tcp") {
+		h.started()
 	}
-	if fn, ok := ctx.Value(connectedHookKey{}).(func()); ok {
-		fn()
+}
+
+// tcpConnected runs the connected hook for a TCP dial that succeeded.
+func tcpConnected(ctx context.Context, network string) {
+	if h, ok := ctx.Value(dialHooksKey{}).(dialHooks); ok && h.connected != nil && strings.HasPrefix(network, "tcp") {
+		h.connected()
 	}
 }

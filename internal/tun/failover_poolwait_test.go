@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -391,30 +392,70 @@ func TestSilentCycleCapsTheBackoffLower(t *testing.T) {
 // TestPoolPauseStaysUnderItsBase is N8 of the second acceptance of PR #126:
 // the drawn pause reached twice its base, so the long-run poll gap went from
 // 63 s to up to 123 s, and the client whose uplink came back could wait two
-// minutes for the next dial. The pause stays in [base/2, base), and it is
-// still drawn: neither stuck on a bound nor flat.
+// minutes for the next dial. The pause stays under base, and it is still
+// drawn: neither stuck on a bound nor flat.
+//
+// And, P3-18 of the round-3 review, without a hard lower edge: RandomDelay's
+// exponential over base/2 put 40% of the pauses in the lowest fifth and made
+// base/2 a minimum an observer reads off at once.
 func TestPoolPauseStaysUnderItsBase(t *testing.T) {
 	const base = time.Minute
-	var low, high int
+	draws := make([]time.Duration, 0, 10000)
 	seen := map[time.Duration]bool{}
+	var sum time.Duration
 	for range 10000 {
 		d := poolPause(base)
-		if d < base/2 || d >= base {
-			t.Fatalf("pause %v outside [%v, %v)", d, base/2, base)
+		if d < base/4 || d >= base {
+			t.Fatalf("pause %v outside [%v, %v)", d, base/4, base)
 		}
 		seen[d.Round(time.Millisecond)] = true
-		if d < 40*time.Second {
-			low++
-		} else if d >= 50*time.Second {
-			high++
-		}
+		draws = append(draws, d)
+		sum += d
 	}
 	if len(seen) < 5000 {
 		t.Fatalf("only %d distinct pauses in 10000 draws: a grid", len(seen))
 	}
-	// Exponential shape over the floor: most draws near it, a tail toward the
-	// ceiling; uniform would put a third in each band.
-	if low < 4000 || high > 2500 || high == 0 {
-		t.Fatalf("pause shape off: %d draws under 40 s, %d at 50 s and over", low, high)
+	if mean := sum / time.Duration(len(draws)); mean < 33*time.Second || mean > 48*time.Second {
+		t.Fatalf("mean pause %v, want about 3/4 of the base as before", mean)
+	}
+	slices.Sort(draws)
+	lowFifth := base/4 + (base-base/4)/5
+	n, _ := slices.BinarySearch(draws, lowFifth)
+	if share := float64(n) / float64(len(draws)); share > 0.15 {
+		t.Fatalf("%.0f%% of the pauses in the lowest fifth of the range: piled at the floor", 100*share)
+	}
+	if edge := draws[len(draws)/20] - draws[0]; edge < base/10 {
+		t.Fatalf("the lowest 5%% of pauses span only %v: a hard minimum", edge)
+	}
+}
+
+// TestPoolPollWaitsOutADeadSessionPark: the call site of P3-9 of the round-3
+// review. The only server answering TCP is parked for dead sessions; the poll
+// keeps polling instead of ending the wait on it.
+func TestPoolPollWaitsOutADeadSessionPark(t *testing.T) {
+	setPoolWaitKnobs(t, true)
+	poolPollInterval = 20 * time.Millisecond
+	m, addrs, _ := poolManager(t, 1)
+	for _, st := range m.EndpointStates() {
+		if st.Addr == addrs[0] {
+			m.SessionEnded(strategy.SessionEnd{Strategy: "x", Endpoint: st.Candidate, HasEndpoint: true, Dead: true})
+		}
+	}
+	var dials atomic.Int64
+	poolDial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dials.Add(1)
+		return (&net.Dialer{}).DialContext(ctx, network, addr)
+	}
+	v := &VPNClient{running: 1, stopCh: make(chan struct{}), manager: m}
+	go func() {
+		time.Sleep(400 * time.Millisecond)
+		atomic.StoreInt32(&v.running, 0)
+		close(v.stopCh)
+	}()
+	if v.waitForPool(time.Now()) {
+		t.Fatal("the wait ended on a server parked for dead sessions")
+	}
+	if n := dials.Load(); n < 3 {
+		t.Fatalf("only %d polls - the test proves nothing", n)
 	}
 }

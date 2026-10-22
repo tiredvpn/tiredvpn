@@ -225,3 +225,25 @@ func TestPoolPollPinsAParkedServerThatAnswers(t *testing.T) {
 		t.Fatal("still parked: the next Reconsider moves straight off it")
 	}
 }
+
+// TestPoolPollKeepsADeadSessionParkUntilItRunsOut is P3-9 of the round-3
+// review. A server parked for dead sessions answers TCP - that is how its
+// sessions start - and the pool poll's unpark cancelled the escalation: parked
+// for a minute, unparked 5-8 s later, dead again about every 45 s.
+func TestPoolPollKeepsADeadSessionParkUntilItRunsOut(t *testing.T) {
+	a, b := newHelloListener(t), newHelloListener(t)
+	m := newSilenceManager(t, time.Second, a.addr, b.addr)
+	sel := m.selector()
+	cb, _ := sel.CandidateForAddr(b.addr)
+	sel.ReportDeadSession(cb)
+
+	if m.PinAnswering(b.addr) {
+		t.Fatal("the poll took a TCP answer as evidence against a dead-session park")
+	}
+	if !sel.IsParked(cb) {
+		t.Fatal("the dead-session park was lifted")
+	}
+	if got := m.GetServerAddr(context.Background()); got == b.addr {
+		t.Fatal("pinned the server parked for dead sessions")
+	}
+}

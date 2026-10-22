@@ -175,7 +175,7 @@ func TestSharedTUNGatedWriterKeepsHandshakeFirst(t *testing.T) {
 		return err
 	})
 	clientIP := net.IPv4(10, 8, 0, 2)
-	writer := st.RegisterClientGated(clientIP, "gated-client", serverConn, nil, gate)
+	writer := st.RegisterClientGated(clientIP, "gated-client", originOf(serverConn.RemoteAddr()), serverConn, nil, gate)
 
 	// Dispatch a packet while the gate is still closed: it must be dropped, not
 	// queued ahead of the handshake and not reported as a connection error.
