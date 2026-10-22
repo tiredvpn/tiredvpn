@@ -187,11 +187,10 @@ type Manager struct {
 	// silence; cleared by the gate run it causes. Guarded by m.mu.
 	preflightArmed bool
 
-	// sessionCand is the endpoint candidate the last successful dialEndpoints
-	// connected to - the one a tunnel session that ends now was riding.
-	// hasSessionCand says it is set. Guarded by m.mu.
-	sessionCand    endpoint.Candidate
-	hasSessionCand bool
+	// lastDeadEndpoint is the endpoint index of the last session that died
+	// young (see SessionEnded), -1 when a useful session has ended since.
+	// Guarded by m.mu.
+	lastDeadEndpoint int
 
 	// Strategy upgrade (see offerUpgrade). upgradeCallback receives the
 	// candidates a periodic reprobe found working; upgradeFails counts each
@@ -621,6 +620,7 @@ func NewManager() *Manager {
 		stopReprobe:           make(chan struct{}),
 		tcpFailuresBeforeQUIC: 3, // Switch to QUIC after 3 TCP timeouts
 		tlsSessionCache:       tls.NewLRUClientSessionCache(64),
+		lastDeadEndpoint:      -1,
 	}
 	m.lifeCtx, m.lifeCancel = context.WithCancel(context.Background())
 	log.Debug("Strategy Manager created (probeTimeout=%v, connectTimeout=%v, maxRetries=%d)",
@@ -1144,74 +1144,102 @@ func (m *Manager) RecordSessionEnd(strategyID string) (storming bool) {
 	return true
 }
 
-// SessionEnded reports the end of a tunnel session that strategyID carried.
+// SessionEnd describes a tunnel session that has just ended.
+type SessionEnd struct {
+	// Strategy is the ID of the strategy that carried the session.
+	Strategy string
+
+	// Endpoint is the candidate the session rode, as ConnectSession returned
+	// it; HasEndpoint is false when there is none (no selector, mux stream).
+	Endpoint    endpoint.Candidate
+	HasEndpoint bool
+
+	// Useful says the session carried downlink for a meaningful time. Only a
+	// session that did not is evidence against the strategy: a tunnel that ran
+	// for fifteen minutes and then lost its server to a restart, or its network
+	// to a dead link, says nothing about the transport, and charging it for that
+	// dropped REALITY below HTTP Polling after a single server restart.
+	Useful bool
+
+	// Dead says the session ended in silence with its downlink dead almost from
+	// the start, while the local network was up: every connect to the endpoint
+	// succeeds - so connect-based health never notices, and each success reset
+	// its streak - but no session survives. That is what a byte-count freeze on
+	// the route looks like (the TSPU #490 pattern, stand run #7b: ten choices of
+	// one address in six minutes, the data plane alive 4% of the time).
+	Dead bool
+}
+
+// SessionEnded books the end of a tunnel session.
 //
-// useful says whether the session carried traffic for a meaningful time.
-// Only a session that did not is evidence against the strategy: a tunnel that
-// ran for fifteen minutes and then lost its server to a restart, or its
-// network to a dead link, says nothing about the transport, and charging it
-// for that dropped REALITY below HTTP Polling after a single server restart.
-//
-// A useful session also restarts the fast-reconnect clock. The clock used to
-// run from the moment the session connected, so any session longer than five
-// minutes ended with the fast path expired, and the reconnect went to a full
-// scan in confidence order.
+// A session that was not useful costs its strategy confidence. A useful one
+// restarts the fast-reconnect clock (it used to run from the moment the session
+// connected, so any session longer than five minutes ended with the fast path
+// expired) and clears the endpoint's dead-session streak. A dead session, and a
+// storm, park the endpoint - see chargeSessionEndpoint.
 //
 // It feeds the storm detector exactly as RecordSessionEnd does and returns its
 // verdict.
-func (m *Manager) SessionEnded(strategyID string, useful bool) (storming bool) {
-	if !useful {
-		m.UpdateStrategyConfidence(strategyID, false)
+func (m *Manager) SessionEnded(end SessionEnd) (storming bool) {
+	if !end.Useful {
+		m.UpdateStrategyConfidence(end.Strategy, false)
 	}
-	storming = m.RecordSessionEnd(strategyID)
-	if storming {
+	storming = m.RecordSessionEnd(end.Strategy)
+	sel := m.selector()
+
+	if end.Useful && !storming && !end.Dead {
+		m.mu.Lock()
+		if m.lastSuccessfulStrategy != nil && m.lastSuccessfulStrategy.ID() == end.Strategy {
+			m.lastSuccessfulTime = time.Now()
+		}
+		m.lastDeadEndpoint = -1
+		m.mu.Unlock()
+		if sel != nil && end.HasEndpoint {
+			sel.ReportSessionUseful(end.Endpoint)
+		}
+		return storming
+	}
+
+	switch {
+	case end.Dead:
+		m.chargeSessionEndpoint(sel, end, "session went silent right after connecting")
+	case storming:
 		// A strategy whose sessions keep dying on this endpoint is evidence
 		// against the endpoint too: a freeze keyed to the address kills every
 		// transport in turn, and the storm detector alone only ever walks the
-		// strategy list on the same server, 2.5-3.5 minutes per strategy.
-		m.reportSessionEndpoint(false, "storm")
-	}
-	if useful && !storming {
-		m.mu.Lock()
-		if m.lastSuccessfulStrategy != nil && m.lastSuccessfulStrategy.ID() == strategyID {
-			m.lastSuccessfulTime = time.Now()
-		}
-		m.mu.Unlock()
+		// strategy list on the same server, 2.5-3.5 minutes per strategy. One
+		// ordinary failure here was reset by the next connect and never parked
+		// anything.
+		m.chargeSessionEndpoint(sel, end, "storm")
 	}
 	return storming
 }
 
-// ReportDeadSession tells the endpoint layer that the tunnel session just
-// lost went silent within moments of connecting: its downlink stopped long
-// before the read deadline declared it dead.
+// chargeSessionEndpoint parks the endpoint a dead session or a storm happened
+// on, growing the park with each one in a row (Selector.ReportDeadSession).
 //
-// Every connect to that endpoint succeeds - which is why the connect-based
-// health never noticed and every success reset the streak - but no session
-// survives: what a byte-count freeze on the route looks like (the TSPU #490
-// pattern, stand run #7b: ten choices of the same address in six minutes and
-// the data plane alive 4% of the time). It parks the endpoint at once, the way
-// ReportSilent does for an address that answered no transport.
-func (m *Manager) ReportDeadSession() {
-	m.reportSessionEndpoint(true, "session went silent right after connecting")
-}
-
-// reportSessionEndpoint charges the endpoint the ended session was riding:
-// park parks it at once, otherwise it is one ordinary failure.
-func (m *Manager) reportSessionEndpoint(park bool, why string) {
-	sel := m.selector()
-	m.mu.RLock()
-	cand, ok := m.sessionCand, m.hasSessionCand
-	m.mu.RUnlock()
-	if sel == nil || !ok {
+// Unless the previous one happened on a different server with nothing useful
+// in between: the same death on two servers in a row says the route, not the
+// servers, and parking every server it touches would walk the client through
+// the whole pool - listing it for an observer and burning every address. That
+// case is left to the storm detector, which works on the strategies.
+func (m *Manager) chargeSessionEndpoint(sel *endpoint.Selector, end SessionEnd, why string) {
+	if sel == nil || !end.HasEndpoint {
 		return
 	}
-	if park {
-		sel.ReportSilent(cand)
-	} else {
-		sel.Report(cand, false, 0)
+	m.mu.Lock()
+	prev := m.lastDeadEndpoint
+	if prev < 0 {
+		m.lastDeadEndpoint = end.Endpoint.EndpointIdx
 	}
-	log.Info("Endpoint %s charged for its session (%s)", cand, why)
-	m.logEndpointHealth(sel, cand)
+	m.mu.Unlock()
+	if prev >= 0 && prev != end.Endpoint.EndpointIdx {
+		log.Info("Endpoint %s: %s, as on the previous server - the route, not the server; not parking it", end.Endpoint, why)
+		return
+	}
+	sel.ReportDeadSession(end.Endpoint)
+	log.Info("Endpoint %s charged for its session (%s)", end.Endpoint, why)
+	m.logEndpointHealth(sel, end.Endpoint)
 }
 
 // maxEndpointAttempts caps how many endpoint candidates a single Connect may
@@ -1222,6 +1250,15 @@ const maxEndpointAttempts = 2
 
 // Connect tries strategies in order until one succeeds
 func (m *Manager) Connect(ctx context.Context, target string) (net.Conn, Strategy, error) {
+	conn, s, _, _, err := m.ConnectSession(ctx, target)
+	return conn, s, err
+}
+
+// ConnectSession is Connect that also names the endpoint candidate the
+// connection rides, for a caller that books the session's end against it
+// (SessionEnded). ok is false when there is none: no selector, or a stream on
+// an existing mux carrier.
+func (m *Manager) ConnectSession(ctx context.Context, target string) (net.Conn, Strategy, endpoint.Candidate, bool, error) {
 	// Mux fast-path: if mux is enabled and a live session already exists, open a
 	// new stream on it and return immediately - do NOT dial a fresh transport.
 	// Without this, every call (e.g. every proxy CONNECT routed through
@@ -1231,13 +1268,13 @@ func (m *Manager) Connect(ctx context.Context, target string) (net.Conn, Strateg
 	// peek-buffer + admission slot) until probeReadDeadline, and under a busy
 	// client the accumulation outpaces reclamation -> server OOM.
 	if stream, strat, ok := m.tryMuxFastPath(); ok {
-		return stream, strat, nil
+		return stream, strat, endpoint.Candidate{}, false, nil
 	}
 
-	conn, strategy, err := m.dialEndpoints(ctx, target)
+	conn, strategy, cand, hasCand, err := m.dialEndpoints(ctx, target)
 	if err != nil {
 		m.recordConnectResult(false)
-		return nil, nil, err
+		return nil, nil, endpoint.Candidate{}, false, err
 	}
 	m.recordConnectResult(true)
 
@@ -1253,13 +1290,13 @@ func (m *Manager) Connect(ctx context.Context, target string) (net.Conn, Strateg
 		if muxErr != nil {
 			log.Warn("Mux wrap failed, using direct connection: %v", muxErr)
 			// Fallback to direct connection without mux
-			return conn, strategy, nil
+			return conn, strategy, cand, hasCand, nil
 		}
 		log.Debug("Connection wrapped with mux layer")
-		return muxConn, strategy, nil
+		return muxConn, strategy, cand, hasCand, nil
 	}
 
-	return conn, strategy, nil
+	return conn, strategy, cand, hasCand, nil
 }
 
 // dialEndpoints walks the endpoint candidates until one of them yields a
@@ -1271,13 +1308,14 @@ func (m *Manager) Connect(ctx context.Context, target string) (net.Conn, Strateg
 // pre-flight gate is skipped. A pre-flight that fails outright means the whole
 // network is down, not this endpoint, so it stops the loop without touching
 // anyone's health: otherwise closing a laptop lid would park every candidate.
-func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, Strategy, error) {
+func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, Strategy, endpoint.Candidate, bool, error) {
 	sel := m.selector()
 	if sel == nil {
 		if _, err := m.preflightCandidate(ctx, nil, endpoint.Candidate{Addr: target}); err != nil {
-			return nil, nil, err
+			return nil, nil, endpoint.Candidate{}, false, err
 		}
-		return m.ConnectExcluding(ctx, m.withHoppedPort(target), nil)
+		conn, s, err := m.ConnectExcluding(ctx, m.withHoppedPort(target), nil)
+		return conn, s, endpoint.Candidate{}, false, err
 	}
 
 	// Family connectivity preflight BEFORE any strategy scan: drop the families
@@ -1288,7 +1326,7 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 
 	cand, ok := sel.Reconsider(sel.Now())
 	if !ok {
-		return nil, nil, fmt.Errorf("no endpoint candidates configured")
+		return nil, nil, endpoint.Candidate{}, false, fmt.Errorf("no endpoint candidates configured")
 	}
 	// Without this line a log shows a client dialling the same address over and
 	// over and cannot say whether the endpoint layer never condemned it or
@@ -1314,7 +1352,7 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 		if err != nil {
 			// The gate found no network at all. That is not this endpoint's
 			// fault and nobody has been charged for it - see the comment above.
-			return nil, nil, err
+			return nil, nil, endpoint.Candidate{}, false, err
 		}
 		cand = gated
 
@@ -1346,10 +1384,7 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 		conn, strategy, err := m.ConnectExcluding(dialCtx, m.withHoppedPort(cand.Addr), nil)
 		if err == nil {
 			sel.Report(cand, true, time.Since(start))
-			m.mu.Lock()
-			m.sessionCand, m.hasSessionCand = cand, true
-			m.mu.Unlock()
-			return conn, strategy, nil
+			return conn, strategy, cand, true, nil
 		}
 		lastErr = err
 
@@ -1371,7 +1406,7 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 		}
 	}
 
-	return nil, nil, lastErr
+	return nil, nil, endpoint.Candidate{}, false, lastErr
 }
 
 // endpointRoster renders the pool the way a reader of the log needs it: which

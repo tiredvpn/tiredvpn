@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tiredvpn/tiredvpn/internal/endpoint"
 	"github.com/tiredvpn/tiredvpn/internal/log"
 )
 
@@ -24,13 +25,13 @@ func TestDeadSessionParksTheEndpoint(t *testing.T) {
 	m := newSilenceManager(t, time.Second, frozen.addr, other.addr)
 	m.Register(&greetingStrategy{id: "reality", priority: 5})
 
-	conn, _, err := m.Connect(context.Background(), "")
-	if err != nil {
-		t.Fatalf("Connect: %v", err)
+	conn, s, cand, ok, err := m.ConnectSession(context.Background(), "")
+	if err != nil || !ok || cand.Addr != frozen.addr {
+		t.Fatalf("ConnectSession: %v (cand %v, ok %v)", err, cand, ok)
 	}
 	conn.Close()
 
-	m.ReportDeadSession()
+	m.SessionEnded(SessionEnd{Strategy: s.ID(), Endpoint: cand, HasEndpoint: true, Dead: true})
 	if st := endpointState(t, m, frozen.addr); !st.CooldownUntil.After(time.Now()) {
 		t.Fatal("a dead session did not park its endpoint")
 	}
@@ -45,41 +46,45 @@ func TestDeadSessionParksTheEndpoint(t *testing.T) {
 	}
 }
 
-// TestStormChargesTheEndpoint: a storm is three dead sessions of one strategy;
-// the endpoint they were on takes an ordinary failure for it, so the pool joins
-// the strategy list in working around a freeze.
-func TestStormChargesTheEndpoint(t *testing.T) {
-	live := newHelloListener(t)
-	other := newHelloListener(t)
-	m := newSilenceManager(t, time.Second, live.addr, other.addr)
+// TestStormMovesTheClient is P1-7 of the PR #126 review. A storm used to charge
+// its endpoint one ordinary failure, under the threshold of two, and the next
+// connect - on another strategy, same server - cleared it, so storm after storm
+// walked the strategy list on one server and never moved the client. A storm
+// now parks the endpoint, and the following connect lands elsewhere; a later
+// storm there is the route and parks nothing.
+func TestStormMovesTheClient(t *testing.T) {
+	first := newHelloListener(t)
+	second := newHelloListener(t)
+	m := newSilenceManager(t, time.Second, first.addr, second.addr)
 	m.stormDetector = NewStormDetector(StormConfig{Grace: -1, MinSessions: 1})
 	m.Register(&greetingStrategy{id: "reality", priority: 5})
+	m.Register(&greetingStrategy{id: "polling", priority: 6})
 
-	conn, _, err := m.Connect(context.Background(), "")
-	if err != nil {
-		t.Fatalf("Connect: %v", err)
+	storm := func() endpoint.Candidate {
+		t.Helper()
+		conn, s, cand, ok, err := m.ConnectSession(context.Background(), "")
+		if err != nil || !ok {
+			t.Fatalf("ConnectSession: %v", err)
+		}
+		conn.Close()
+		m.RecordSessionStart(s.ID())
+		if !m.SessionEnded(SessionEnd{Strategy: s.ID(), Endpoint: cand, HasEndpoint: true}) {
+			t.Fatal("no storm declared - the test proves nothing")
+		}
+		return cand
 	}
-	conn.Close()
 
-	m.RecordSessionStart("reality")
-	if !m.SessionEnded("reality", false) {
-		t.Fatal("no storm declared - the test proves nothing")
+	if c := storm(); c.Addr != first.addr {
+		t.Fatalf("first session rode %s", c.Addr)
 	}
-	if st := endpointState(t, m, live.addr); st.ConsecutiveFailures != 1 {
-		t.Fatalf("storm left the endpoint with %d failures, want 1", st.ConsecutiveFailures)
+	if st := endpointState(t, m, first.addr); !st.CooldownUntil.After(time.Now()) {
+		t.Fatal("a storm did not park its endpoint")
 	}
-
-	// No storm, no charge.
-	m2 := newSilenceManager(t, time.Second, live.addr, other.addr)
-	m2.Register(&greetingStrategy{id: "reality", priority: 5})
-	conn, _, err = m2.Connect(context.Background(), "")
-	if err != nil {
-		t.Fatalf("Connect: %v", err)
+	if c := storm(); c.Addr != second.addr {
+		t.Fatalf("after a storm on %s the next session still rode %s", first.addr, c.Addr)
 	}
-	conn.Close()
-	m2.SessionEnded("reality", false)
-	if st := endpointState(t, m2, live.addr); st.ConsecutiveFailures != 0 {
-		t.Fatalf("one dead session without a storm charged the endpoint %d failures", st.ConsecutiveFailures)
+	if st := endpointState(t, m, second.addr); st.CooldownUntil.After(time.Now()) {
+		t.Fatal("the same storm on a second server right after the first parked it too")
 	}
 }
 

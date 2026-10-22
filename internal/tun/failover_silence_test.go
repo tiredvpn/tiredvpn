@@ -1,7 +1,6 @@
 package tun
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -12,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tiredvpn/tiredvpn/internal/endpoint"
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
 )
@@ -121,6 +119,10 @@ func TestSessionEndChargesOnlyADeadSession(t *testing.T) {
 // A long session that went silent is D1's case (the gate walks the pool), and a
 // short one ended by a reset is the storm detector's.
 func TestDeadSessionChargesItsEndpoint(t *testing.T) {
+	old := probeInternet
+	probeInternet = func() bool { return true }
+	t.Cleanup(func() { probeInternet = old })
+
 	now := time.Now()
 	silence := &net.OpError{Op: "read", Err: os.ErrDeadlineExceeded}
 	cases := []struct {
@@ -135,30 +137,9 @@ func TestDeadSessionChargesItsEndpoint(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			m := strategy.NewManager()
-			// Listening addresses, so the family probe passes and the session
-			// rides the first one.
-			addrs := []string{newNetcheckListener(t).addr, newNetcheckListener(t).addr}
-			if err := m.SetEndpoints([]endpoint.Endpoint{{Name: "a", V4: addrs[0]}, {Name: "b", V4: addrs[1]}}, endpoint.V4Only); err != nil {
-				t.Fatalf("SetEndpoints: %v", err)
-			}
-			ps := &pipeStrategy{t: t, resp: bareV3Response()}
-			m.Register(ps)
-			conn, _, err := m.Connect(context.Background(), "")
-			if err != nil {
-				t.Fatalf("Connect: %v", err)
-			}
-			conn.Close()
-
-			disconnectSession(t, m, ps, tc.err, tc.connectedAt, tc.lastRx)
-
-			var parked bool
-			for _, st := range m.EndpointStates() {
-				if st.Addr == addrs[0] {
-					parked = st.CooldownUntil.After(time.Now())
-				}
-			}
-			if parked != tc.parked {
+			m, _, _ := poolManager(t, 2)
+			rode := connectAndEnd(t, m, tc.err, tc.connectedAt, tc.lastRx)
+			if parked := cooldownLeft(t, m, rode) > 0; parked != tc.parked {
 				t.Fatalf("endpoint parked=%v, want %v", parked, tc.parked)
 			}
 		})

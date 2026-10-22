@@ -215,7 +215,7 @@ func TestUsefulSessionEndKeepsTheFastPath(t *testing.T) {
 	m.mu.Unlock()
 	m.RecordSessionStart("b")
 
-	m.SessionEnded("b", true)
+	m.SessionEnded(SessionEnd{Strategy: "b", Useful: true})
 
 	conn, strat, err := m.Connect(context.Background(), "")
 	if err != nil {
@@ -234,7 +234,7 @@ func TestShortSessionStillCostsConfidence(t *testing.T) {
 	m := NewManager()
 	m.Register(&greetingStrategy{id: "a", priority: 1})
 	before := m.GetStats()["a"].Confidence
-	m.SessionEnded("a", false)
+	m.SessionEnded(SessionEnd{Strategy: "a"})
 	if after := m.GetStats()["a"].Confidence; after >= before {
 		t.Fatalf("a dead session left confidence at %.2f (was %.2f)", after, before)
 	}

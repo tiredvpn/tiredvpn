@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/tiredvpn/tiredvpn/internal/endpoint"
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
 )
@@ -118,6 +119,12 @@ type VPNClient struct {
 	localIP    net.IP
 	conn       net.Conn
 	strategy   strategy.Strategy
+
+	// sessionCand is the endpoint candidate the current session rides, as
+	// ConnectSession named it; hasSessionCand is false when there is none.
+	// The session's end is booked against it. Guarded by mu.
+	sessionCand    endpoint.Candidate
+	hasSessionCand bool
 
 	// Stats
 	packetsUp   int64
@@ -887,7 +894,7 @@ func (v *VPNClient) connect(parent context.Context) error {
 	}
 
 	// Connect via strategy manager (no lock held — may block on the network).
-	conn, strat, err := v.manager.Connect(ctx, v.serverAddr)
+	conn, strat, cand, hasCand, err := v.manager.ConnectSession(ctx, v.serverAddr)
 	if err != nil {
 		return err
 	}
@@ -924,6 +931,7 @@ func (v *VPNClient) connect(parent context.Context) error {
 	}
 	v.conn = conn
 	v.strategy = strat
+	v.sessionCand, v.hasSessionCand = cand, hasCand
 	v.connectedAt = time.Now()
 	v.lastRx = v.connectedAt
 	if hasCaps {
@@ -1806,7 +1814,7 @@ func (v *VPNClient) tryStrategyUpgrade(cands []strategy.Strategy) {
 		}
 		oldConn.Close()
 		if v.manager != nil {
-			v.manager.SessionEnded(cur.ID(), true)
+			v.manager.SessionEnded(strategy.SessionEnd{Strategy: cur.ID(), Useful: true})
 			v.manager.RecordSessionStart(cand.ID())
 		}
 		log.Info("Strategy upgrade: tunnel moved from %s to %s", cur.Name(), cand.Name())
@@ -1870,6 +1878,7 @@ func (v *VPNClient) handleDisconnect(reason string, err error) {
 	}
 	endedStrategy := v.strategy
 	connectedAt, lastRx := v.connectedAt, v.lastRx
+	sessionCand, hasSessionCand := v.sessionCand, v.hasSessionCand
 	v.mu.Unlock()
 
 	// Update strategy confidence and feed the storm detector. A session that
@@ -1880,15 +1889,20 @@ func (v *VPNClient) handleDisconnect(reason string, err error) {
 	// the next reconnect picks a different one.
 	silent := serverWentSilent(err)
 	if endedStrategy != nil && v.manager != nil {
-		useful := sessionWasUseful(connectedAt, lastRx)
-		v.manager.SessionEnded(endedStrategy.ID(), useful)
-		if silent && !useful {
-			// Connected, carried a moment, then nothing until the deadline:
-			// the endpoint's verdict, not the transport's (see
-			// Manager.ReportDeadSession). A reset or an EOF proves the server
-			// was there and stays the storm detector's business.
-			v.manager.ReportDeadSession()
-		}
+		// Connected, carried a moment, then nothing until the deadline: the
+		// endpoint's verdict, not the transport's (SessionEnd.Dead). A reset
+		// or an EOF proves the server was there and stays the storm
+		// detector's business. And the client's own link is asked first: a
+		// link that dropped right after a reconnect kills the session just
+		// the same, and parking the server for it is D7 over again.
+		dead := silent && sessionDiedYoung(connectedAt, lastRx) && probeInternet()
+		v.manager.SessionEnded(strategy.SessionEnd{
+			Strategy:    endedStrategy.ID(),
+			Endpoint:    sessionCand,
+			HasEndpoint: hasSessionCand,
+			Useful:      sessionWasUseful(connectedAt, lastRx),
+			Dead:        dead,
+		})
 	}
 
 	// Initialize exponential backoff
@@ -2024,6 +2038,21 @@ func (v *VPNClient) handleDisconnect(reason string, err error) {
 // teardown looks like; above it, it is what a server restart or a dead link
 // looks like.
 const sessionUsefulMin = 20 * time.Second
+
+// deadSessionMax is the endpoint verdict's line, kept apart from
+// sessionUsefulMin: a session that ends in silence with its downlink alive for
+// less than this died young. The downlink clock is lastRx, and HTTP Polling's
+// keepalive feeder moves lastRx for the poll health grace (20 s) after the
+// last real poll, so its dead sessions measure 19.83-19.94 s (PR #126 bytecap
+// runs) and one 29.86 s; REALITY's measure 0.5-1.7 s. 40 s clears the worst
+// of them by 10 s. A useful session lives for minutes.
+const deadSessionMax = 40 * time.Second
+
+// sessionDiedYoung reports a session whose downlink stopped within
+// deadSessionMax of connecting.
+func sessionDiedYoung(connectedAt, lastRx time.Time) bool {
+	return !connectedAt.IsZero() && lastRx.Sub(connectedAt) < deadSessionMax
+}
 
 // sessionWasUseful reports whether the session carried downlink for at least
 // sessionUsefulMin. lastRx, not the moment of disconnect: a tunnel frozen a

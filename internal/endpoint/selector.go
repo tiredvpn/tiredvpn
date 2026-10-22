@@ -125,6 +125,12 @@ type health struct {
 	backoff             time.Duration
 	latencyEWMA         time.Duration
 
+	// deadStreak counts the sessions in a row that died young on this
+	// candidate (ReportDeadSession). Unlike consecutiveFailures, a successful
+	// connect does not clear it - every one of those sessions began with one -
+	// only a useful session does (ReportSessionUseful).
+	deadStreak int
+
 	// probed records that the family probe has run for this candidate since the
 	// last ResetHealth. It is the replacement for the old ipv6CheckedOnce flag:
 	// the probe costs a dial, so it must not repeat on the hot reconnect path.
@@ -637,6 +643,42 @@ func (s *Selector) ReportSilent(c Candidate) {
 	h.lastFailure = now
 	h.backoff = s.nextBackoff(h.backoff)
 	h.cooldownUntil = now.Add(s.jitter(h.backoff))
+}
+
+// ReportDeadSession parks c for a session that connected and then died
+// almost at once. Each one in a row parks longer - Cooldown, then twice that,
+// up to MaxCooldown - because a successful connect starts every such session
+// and clears the connect backoff, which left every park at the base cooldown:
+// under a freeze the client hopped addresses every half minute.
+func (s *Selector) ReportDeadSession(c Candidate) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	idx, found := s.byAddr[c.Addr]
+	if !found {
+		return
+	}
+	now := s.cfg.Now()
+	h := &s.health[idx]
+	h.deadStreak++
+	h.consecutiveFailures++
+	h.lastFailure = now
+	park := s.cfg.Cooldown
+	for i := 1; i < h.deadStreak && park < s.cfg.MaxCooldown; i++ {
+		park *= 2
+	}
+	park = min(park, s.cfg.MaxCooldown)
+	h.backoff = park
+	h.cooldownUntil = now.Add(s.jitter(park))
+}
+
+// ReportSessionUseful records that a session on c carried traffic for a
+// meaningful time, which ends its dead-session streak.
+func (s *Selector) ReportSessionUseful(c Candidate) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if idx, found := s.byAddr[c.Addr]; found {
+		s.health[idx].deadStreak = 0
+	}
 }
 
 // recordFailureLocked bumps the streak and parks the candidate once it crosses
