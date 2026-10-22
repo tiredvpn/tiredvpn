@@ -190,34 +190,7 @@ func handleREALITYAuthenticated(conn net.Conn, srvCtx *serverContext, logger *lo
 	logger.Debug("REALITY: Extension extracted, pubkey=%x", realityExt.PubKey[:8])
 
 	// Verify auth token - try per-client secrets from Redis first, then global
-	authenticated := false
-	var authClientID string
-	var usedSecret []byte
-
-	// 1. Try per-client secrets from Redis (if registry exists)
-	if srvCtx.registry != nil {
-		clients := srvCtx.registry.ListClients()
-		for _, client := range clients {
-			secretBytes := []byte(client.Secret)
-			if customtls.VerifyClientAuth(secretBytes, realityExt.PubKey, realityExt.AuthToken) {
-				logger.Info("REALITY: Auth successful (client: %s, id: %s)", client.Name, client.ID)
-				authenticated = true
-				usedSecret = secretBytes
-				authClientID = client.ID
-				break
-			}
-		}
-	}
-
-	// 2. Fallback to global secret (if not found in registry and global secret exists)
-	if !authenticated && len(srvCtx.cfg.Secret) > 0 {
-		if customtls.VerifyClientAuth(srvCtx.cfg.Secret, realityExt.PubKey, realityExt.AuthToken) {
-			logger.Info("REALITY: Auth successful (global secret)")
-			authenticated = true
-			usedSecret = srvCtx.cfg.Secret
-			authClientID = "global"
-		}
-	}
+	usedSecret, clientID, authClientID, authenticated := authenticateREALITYClient(srvCtx, realityExt, logger)
 
 	if !authenticated {
 		// Either a prober, or - far more likely - an ordinary client whose
@@ -382,8 +355,6 @@ func handleREALITYAuthenticated(conn net.Conn, srvCtx *serverContext, logger *lo
 	// Close connection to real destination (we only needed the certificate)
 	destConn.Close()
 
-	clientID := realityClientIdentity(usedSecret)
-
 	logger.Info("REALITY: Tunnel established for %s (client: %s)", conn.RemoteAddr(), clientID)
 
 	// The dispatch byte is the first *encrypted* data-layer record now, not a
@@ -402,6 +373,31 @@ func dataLayerVersion(v2 bool) int {
 		return 2
 	}
 	return 1
+}
+
+// authenticateREALITYClient finds the secret the client's auth token was made
+// with - per-client secrets from the registry first, then the global secret -
+// and returns it with the identity the REALITY session runs under and, for the
+// logs, the name of the credential that matched ("global" or the client ID).
+//
+// The session identity is spelled "reality:<hmac>" but leases under the
+// credential, the same key every other transport uses for that secret (see
+// clientIdentity.lease).
+func authenticateREALITYClient(srvCtx *serverContext, ext *customtls.REALITYExtension, logger *log.Logger) ([]byte, clientIdentity, string, bool) {
+	if srvCtx.registry != nil {
+		for _, client := range srvCtx.registry.ListClients() {
+			secret := []byte(client.Secret)
+			if customtls.VerifyClientAuth(secret, ext.PubKey, ext.AuthToken) {
+				logger.Info("REALITY: Auth successful (client: %s, id: %s)", client.Name, client.ID)
+				return secret, realityClientIdentity(secret, registryIdentity(client.ID)), client.ID, true
+			}
+		}
+	}
+	if len(srvCtx.cfg.Secret) > 0 && customtls.VerifyClientAuth(srvCtx.cfg.Secret, ext.PubKey, ext.AuthToken) {
+		logger.Info("REALITY: Auth successful (global secret)")
+		return srvCtx.cfg.Secret, realityClientIdentity(srvCtx.cfg.Secret, sharedIdentity(globalClientID)), globalClientID, true
+	}
+	return nil, clientIdentity{}, "", false
 }
 
 // handleREALITYSession wraps the post-auth REALITY connection in the same

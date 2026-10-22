@@ -241,7 +241,7 @@ func TestGlobalClientsGetDistinctIPs(t *testing.T) {
 func TestRealityIdentityIsShared(t *testing.T) {
 	secret := []byte("a-shared-secret-for-everyone-32b")
 
-	id := realityClientIdentity(secret)
+	id := realityClientIdentity(secret, sharedIdentity(globalClientID))
 	if id.perClient {
 		t.Fatal("an identity derived from a secret alone cannot be per-client: every holder of that secret produces it")
 	}
@@ -251,7 +251,7 @@ func TestRealityIdentityIsShared(t *testing.T) {
 
 	// Two different clients, one secret: the identity is the same string, which
 	// is exactly why it must not key a lease on its own.
-	if other := realityClientIdentity(secret); other.id != id.id {
+	if other := realityClientIdentity(secret, sharedIdentity(globalClientID)); other.id != id.id {
 		t.Fatalf("the same secret gave two identities, %q and %q", id.id, other.id)
 	}
 	if allocationKey(id, "192.0.2.161") == allocationKey(id, "198.51.100.152") {
@@ -259,7 +259,7 @@ func TestRealityIdentityIsShared(t *testing.T) {
 	}
 
 	// A different secret is a different user and keeps its own identity.
-	if diff := realityClientIdentity([]byte("a-different-secret-also-32-bytes")); diff.id == id.id {
+	if diff := realityClientIdentity([]byte("a-different-secret-also-32-bytes"), sharedIdentity(globalClientID)); diff.id == id.id {
 		t.Error("two different secrets collapsed to one identity")
 	}
 }

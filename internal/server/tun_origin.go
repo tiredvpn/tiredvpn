@@ -91,6 +91,26 @@ type clientIdentity struct {
 	// second lease after it changes address; the opposite default hands two
 	// clients one tunnel IP and they evict each other until one gives up.
 	perClient bool
+
+	// lease is the credential behind id, without the transport's label: the
+	// registry client's ID, or "global" for the shared secret. One client
+	// presents one credential over every transport, so this is what keys its
+	// tunnel address. Empty means id itself.
+	//
+	// It used to be id, and id differs by transport: REALITY says
+	// "reality:<hmac-of-secret>", HTTP polling "polling:global", the rest
+	// "global". A client that moved from Geneva to REALITY in the middle of a
+	// session - the strategy upgrade - arrived as somebody else and was handed
+	// another address, so the move could never be committed.
+	lease string
+}
+
+// leaseID is the identity a lease is keyed on - see lease.
+func (c clientIdentity) leaseID() string {
+	if c.lease != "" {
+		return c.lease
+	}
+	return c.id
 }
 
 // sharedIdentity marks an identity derived from a credential every client
@@ -117,7 +137,7 @@ func (c clientIdentity) prefixed(transport string) clientIdentity {
 	if c.id == "" {
 		return c
 	}
-	return clientIdentity{id: transport + ":" + c.id, perClient: c.perClient}
+	return clientIdentity{id: transport + ":" + c.id, perClient: c.perClient, lease: c.leaseID()}
 }
 
 // allocationKey qualifies the IP-pool lease key with the client's origin when
@@ -139,7 +159,7 @@ func allocationKey(id clientIdentity, origin string) string {
 	// before they get here; this keeps the function honest for the ones that do
 	// not, which is what it did before it learned about provenance.
 	if id.id == "" || id.perClient || origin == "" {
-		return id.id
+		return id.leaseID()
 	}
-	return id.id + "@" + origin
+	return id.leaseID() + "@" + origin
 }
