@@ -173,7 +173,11 @@ Two consequences to know about:
 
 Leases taken by an older server under its per-transport keys are moved to the
 credential key the first time the client connects, and any extra old lease the
-client still holds is released.
+client still holds is released. A registry client's old REALITY lease is found
+whichever address it was taken from; on the global secret only the lease taken
+from the client's current address is its own. Each credential is checked at
+most once per 10 minutes, so an older exit writing old keys into the same Redis
+has them folded within that time.
 
 Package installs set `-ip-pool 10.8.0.0/24` by default (via `TIREDVPN_IP_POOL`
 in `/etc/tiredvpn/env`). An empty `TIREDVPN_IP_POOL` (or `--proxy-only`) starts
