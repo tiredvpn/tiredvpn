@@ -115,6 +115,7 @@ type Manager struct {
 	reprobeInterval time.Duration
 	stopReprobe     chan struct{}
 	reprobeRunning  bool
+	reprobeHeld     atomic.Bool // see HoldReprobe
 
 	// Emergency re-probe (for network recovery)
 	emergencyReprobeRunning bool
@@ -2960,8 +2961,25 @@ func (m *Manager) StopPeriodicReprobe() {
 	}
 }
 
+// HoldReprobe holds periodic reprobes off while held is true. The TUN client
+// holds them while it has no tunnel and is reconnecting.
+//
+// A reprobe in an outage probed the pinned server that had just gone silent:
+// about 16 connects, 30-40 SYNs with their retransmits, within ~20 s, from a
+// client whose reconnect loop was already dialling that same pool - the burst
+// a sweep against a blocked address looks like. It found nothing (0/21 on the
+// stand), the upgrade it feeds needs a live tunnel, and the reconnect and the
+// pool poll already say when a server answers again.
+func (m *Manager) HoldReprobe(held bool) {
+	m.reprobeHeld.Store(held)
+}
+
 // doPeriodicReprobe performs a single reprobe cycle
 func (m *Manager) doPeriodicReprobe(ctx context.Context) {
+	if m.reprobeHeld.Load() {
+		log.Debug("Periodic reprobe skipped: no tunnel, the reconnect is dialling")
+		return
+	}
 	target := m.GetServerAddr(ctx)
 	if target == "" {
 		log.Warn("No reprobe target set")

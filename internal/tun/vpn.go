@@ -2086,6 +2086,10 @@ func (v *VPNClient) disconnect(conn net.Conn, reason string, err error) {
 		return
 	}
 	defer atomic.StoreInt32(&v.reconnecting, 0)
+	if v.manager != nil {
+		v.manager.HoldReprobe(true)
+		defer v.manager.HoldReprobe(false)
+	}
 
 	v.mu.Lock()
 	if conn != nil && v.conn != nil && v.conn != conn {
