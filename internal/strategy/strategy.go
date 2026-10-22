@@ -295,19 +295,24 @@ var refusalRetries = []time.Duration{250 * time.Millisecond, 500 * time.Millisec
 // HTTP Polling. Only dials through protect.ProtectDialer report the connect;
 // a strategy dialling on its own is held to dialLimit as a whole.
 func (m *Manager) connectThroughRefusal(ctx context.Context, s Strategy, target string, limit, dialLimit time.Duration, scan *scanState) (conn net.Conn, latency time.Duration, refused bool, err error) {
-	if _, ok := s.(connectReporter); !ok && dialLimit > 0 {
+	_, reporter := s.(connectReporter)
+	if !reporter && dialLimit > 0 {
 		limit, dialLimit = min(limit, dialLimit), 0
 	}
 	for i := 0; ; i++ {
 		connectCtx, cancel := context.WithTimeout(ctx, limit)
-		phase := watchConnect(connectCtx, cancel, limit, dialLimit)
+		phase := watchConnect(connectCtx, cancel, limit, dialLimit, reporter)
 		start := time.Now()
 		conn, err = s.Connect(phase.ctx, target)
 		latency = time.Since(start)
 		phase.stop()
 		cancel()
-		if err != nil && phase.wasCut() {
+		switch {
+		case err == nil:
+		case phase.wasCut():
 			err = fmt.Errorf("%w: %w", errTCPConnectCut, err)
+		case phase.neverDialled():
+			err = fmt.Errorf("%w: %w", errNotDialled, err)
 		}
 		if err != nil && phase.extended() && phase.connected() && heardNothing(err, latency, limit) {
 			scan.connectedSilent = append(scan.connectedSilent, s.ID())
@@ -342,31 +347,44 @@ func (*HTTPPollingStrategy) reportsTCPConnect() {}
 
 // Connect phases of one attempt, see watchConnect.
 const (
-	phaseDialling int32 = iota
-	phaseConnected
-	phaseCut
+	phaseLocal     int32 = iota // no TCP dial out yet: a local wait, a handshake gate
+	phaseDialling               // the TCP dial is out
+	phaseConnected              // the TCP connect is up, the handshake under way
+	phaseCut                    // cut at the dial limit while dialling
+	phaseCutLocal               // cut at the dial limit before any dial went out
 )
 
 // connectPhase follows one attempt through its TCP connect.
 type connectPhase struct {
-	ctx   context.Context
-	state atomic.Int32
-	timer *time.Timer
-	split bool
+	ctx     context.Context
+	state   atomic.Int32
+	timer   *time.Timer
+	split   bool
+	tracked bool // the strategy reports its dial, so state is known
 }
 
-// watchConnect arms the dialLimit cut of connectThroughRefusal on ctx, whose
-// cancel is cancel. Without a split (dialLimit zero or not shorter than limit)
-// the attempt simply runs to limit.
-func watchConnect(ctx context.Context, cancel context.CancelFunc, limit, dialLimit time.Duration) *connectPhase {
+// watchConnect follows an attempt on ctx, whose cancel is cancel, through its
+// TCP dial when the strategy reports it (hooked), and arms the dialLimit cut
+// of connectThroughRefusal. Without a split (dialLimit zero or not shorter
+// than limit) the attempt simply runs to limit.
+func watchConnect(ctx context.Context, cancel context.CancelFunc, limit, dialLimit time.Duration, hooked bool) *connectPhase {
 	p := &connectPhase{ctx: ctx}
+	if !hooked {
+		return p
+	}
+	p.tracked = true
+	p.ctx = protect.WithDialHooks(ctx,
+		func() { p.state.CompareAndSwap(phaseLocal, phaseDialling) },
+		func() {
+			p.state.CompareAndSwap(phaseLocal, phaseConnected)
+			p.state.CompareAndSwap(phaseDialling, phaseConnected)
+		})
 	if dialLimit <= 0 || dialLimit >= limit {
 		return p
 	}
 	p.split = true
-	p.ctx = protect.WithConnectedHook(ctx, func() { p.state.CompareAndSwap(phaseDialling, phaseConnected) })
 	p.timer = time.AfterFunc(dialLimit, func() {
-		if p.state.CompareAndSwap(phaseDialling, phaseCut) {
+		if p.state.CompareAndSwap(phaseDialling, phaseCut) || p.state.CompareAndSwap(phaseLocal, phaseCutLocal) {
 			cancel()
 		}
 	})
@@ -384,8 +402,22 @@ func (p *connectPhase) extended() bool { return p.split }
 
 func (p *connectPhase) connected() bool { return p.state.Load() == phaseConnected }
 
-// wasCut reports an attempt stopped at dialLimit with no TCP connect.
+// wasCut reports an attempt stopped at dialLimit with its TCP dial out and no
+// connect.
 func (p *connectPhase) wasCut() bool { return p.state.Load() == phaseCut }
+
+// neverDialled reports an attempt of a strategy that reports its dial which
+// ended - cut at dialLimit, out of time, or failed - before its TCP dial went
+// out at all.
+func (p *connectPhase) neverDialled() bool {
+	st := p.state.Load()
+	return p.tracked && (st == phaseLocal || st == phaseCutLocal)
+}
+
+// errNotDialled marks an attempt that ended while it was still waiting on the
+// client - REALITY queued at its per-SNI handshake gate - with no packet sent.
+// It says nothing about the address.
+var errNotDialled = errors.New("cut before any TCP dial went out")
 
 // errTCPConnectCut marks an attempt cut at its dial limit before its TCP
 // connect completed: a dial timeout, whatever the strategy made of the
@@ -524,6 +556,7 @@ const (
 	attemptAnswered     attemptSilence = iota // a refusal, a reset, a rejected handshake
 	attemptSilent                             // heard nothing: counts toward the silence verdict
 	attemptInconclusive                       // cut short by a shortened budget after TCP connected
+	attemptNotDialled                         // cut while still waiting locally: nothing went out
 )
 
 // classifyAttempt reads a failed attempt. heardNothing is the base; an attempt
@@ -534,6 +567,9 @@ const (
 // no verdict either way: counting it parked live servers whose Polling
 // handshake simply needed a couple of seconds.
 func (m *Manager) classifyAttempt(err error, latency, budget time.Duration) attemptSilence {
+	if errors.Is(err, errNotDialled) {
+		return attemptNotDialled
+	}
 	if !heardNothing(err, latency, budget) {
 		return attemptAnswered
 	}
@@ -2069,6 +2105,10 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 					excludeMap[lastSuccessful.ID()] = true
 				case attemptInconclusive:
 					scan.inconclusive = append(scan.inconclusive, lastSuccessful.ID())
+					excludeMap[lastSuccessful.ID()] = true
+				case attemptNotDialled:
+					// Still queued on this client when its dial limit came:
+					// no verdict, and the queue is not shorter in the scan.
 					excludeMap[lastSuccessful.ID()] = true
 				default:
 					scan.answered = true

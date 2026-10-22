@@ -263,6 +263,7 @@ func (d *ProtectDialer) DialContext(ctx context.Context, network, address string
 	if dialer == nil {
 		dialer = &net.Dialer{}
 	}
+	tcpDialStarted(ctx, network)
 
 	conn, err := dialer.DialContext(ctx, network, address)
 	if err != nil {

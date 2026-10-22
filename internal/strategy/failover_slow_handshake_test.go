@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -40,7 +41,7 @@ func slowHelloListener(t *testing.T, delay time.Duration) string {
 
 // protectedGreeter is greetingStrategy dialling through protect.ProtectDialer,
 // the way REALITY, Seqovl, Stego and Polling do, and declaring so. stall makes
-// it hang before its dial instead: a SYN nobody answers. swallow makes it
+// its dial hang instead: a SYN nobody answers. swallow makes it
 // connect and then hear nothing: a handshake a censor drops.
 type protectedGreeter struct {
 	id       string
@@ -60,11 +61,15 @@ func (*protectedGreeter) reportsTCPConnect()                    {}
 
 func (s *protectedGreeter) Connect(ctx context.Context, target string) (net.Conn, error) {
 	s.dials.Add(1)
+	dialer := &protect.ProtectDialer{}
 	if s.stall {
-		<-ctx.Done()
-		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: ctx.Err()}
+		// The dial goes out and its SYN is never answered.
+		dialer.Dialer = &net.Dialer{Control: func(string, string, syscall.RawConn) error {
+			<-ctx.Done()
+			return ctx.Err()
+		}}
 	}
-	conn, err := (&protect.ProtectDialer{}).DialContext(ctx, "tcp", target)
+	conn, err := dialer.DialContext(ctx, "tcp", target)
 	if err != nil {
 		return nil, err
 	}
