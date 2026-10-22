@@ -216,3 +216,36 @@ func TestUnlabelledDialsTakeThePinnedEndpointsSNI(t *testing.T) {
 	}
 	assertNamesFrom(t, "pinned endpoint with sni", a.names(), own)
 }
+
+// TestSmallSNIPoolIsNotAMetronomeAcrossCycles is P2-1 of the round-3 review
+// of PR #126/#127. TestSmallSNIPoolIsNotAMetronome makes its picks back to
+// back, so it only exercised the fallback for a pool in cooldown. Handshakes
+// 15-30 s apart - reconnect cycles, per-CONNECT handshakes in proxy mode -
+// met the 30 s cooldown rotator instead, and on a two-name pool that is a
+// strict A, B, A, B: the second name never repeated the first. Each pick here
+// is moved 16 s into the past before the next one.
+func TestSmallSNIPoolIsNotAMetronomeAcrossCycles(t *testing.T) {
+	r := NewREALITYStrategy(nil, []byte("0123456789abcdef0123456789abcdef"))
+	pool := []string{"www.google.com", "www.gstatic.com"}
+	prev, repeats := "", 0
+	const picks = 2000
+	for i := range picks {
+		dest, err := r.selectDestination(r.secret, pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		host, _, _ := net.SplitHostPort(dest)
+		if i > 0 && host == prev {
+			repeats++
+		}
+		prev = host
+		r.destMu.Lock()
+		for k, at := range r.recentDests {
+			r.recentDests[k] = at.Add(-16 * time.Second)
+		}
+		r.destMu.Unlock()
+	}
+	if share := float64(repeats) / (picks - 1); share < 0.4 || share > 0.6 {
+		t.Fatalf("the next pick repeated the last in %.0f%% of spaced picks, want about half", 100*share)
+	}
+}

@@ -622,11 +622,22 @@ func (r *REALITYStrategy) connect(ctx context.Context, target string, wrapFirstF
 	return &realityConn{Conn: stream, sess: newSess, tcpConn: tcpConn}, nil
 }
 
-// selectDestination chooses a legitimate destination from the donor pool
-// derived for secret - the endpoint's own SNI pool when it has one, the
-// built-in whitelist otherwise. Two endpoints with different secrets therefore
-// hide behind different donor domains, which is the point of derivePool.
+// selectDestination chooses a legitimate destination: from the endpoint's own
+// SNI pool when it has one, else from the built-in donor pool derived for
+// secret. Two endpoints with different secrets therefore hide behind different
+// donor domains, which is the point of derivePool.
+//
+// An endpoint's own pool is drawn from uniformly per connection (pickSNI), as
+// stego and QUIC draw from theirs. The 30 s cooldown rotator below is for the
+// built-in donor pool; on a configured pool of two names it made handshakes
+// 15-30 s apart - every reconnect cycle, every per-CONNECT handshake in proxy
+// mode - a strict A, B, A, B, and with three names a name never repeated
+// within 30 s: a sequence, not a distribution. Bursts on one name are the
+// handshake gate's business (handshake_gate.go), which holds per SNI either way.
 func (r *REALITYStrategy) selectDestination(secret []byte, snis []string) (string, error) {
+	if len(snis) > 0 {
+		return net.JoinHostPort(pickSNI(snis), "443"), nil
+	}
 	pool, rotator := r.donorsFor(secret, snis)
 
 	r.destMu.Lock()
