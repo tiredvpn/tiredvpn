@@ -199,3 +199,16 @@ func (m *Manager) setDefaultSecret(secret []byte) {
 	m.secret = secret
 	m.mu.Unlock()
 }
+
+// coverNameFor is the cover name a connection to the dial's endpoint carries,
+// for the strategies with a host of their own (HTTP Polling, WebSocket padded,
+// Geneva, anti-probe): a uniform draw from the endpoint's SNI pool when it has
+// one, else fallback, the strategy's own host. Without it an exit configured
+// with its cloud's names still saw a CDN's or OpenAI's name from the same
+// client on every fallback transport.
+func coverNameFor(ctx context.Context, fallback string) string {
+	if pool := dialSNIs(ctx); len(pool) > 0 {
+		return pickSNI(pool)
+	}
+	return fallback
+}

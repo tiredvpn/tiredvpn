@@ -101,7 +101,7 @@ func (s *AntiProbeStrategy) Connect(ctx context.Context, target string) (net.Con
 	// Phase 1: Connect with TLS first (server requires TLS)
 	tlsConfig := &tls.Config{
 		InsecureSkipVerify: true,
-		ServerName:         "www.google.com", // Mimic Google
+		ServerName:         coverNameFor(ctx, "www.google.com"), // Mimic Google, or the endpoint's own names
 		NextProtos:         []string{"http/1.1"},
 		ClientSessionCache: s.manager.TLSSessionCache(serverAddr), // resume across reconnects
 	}

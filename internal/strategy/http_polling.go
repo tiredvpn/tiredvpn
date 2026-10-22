@@ -175,7 +175,7 @@ func (s *HTTPPollingStrategy) Connect(ctx context.Context, target string) (net.C
 		manager:         s.manager,
 		serverAddr:      serverAddr,
 		secret:          secret,
-		host:            s.host,
+		host:            coverNameFor(ctx, s.host), // SNI and Host of the whole session
 		path:            s.path,
 		sessionID:       sessionID,
 		sendBuf:         bytes.NewBuffer(nil),

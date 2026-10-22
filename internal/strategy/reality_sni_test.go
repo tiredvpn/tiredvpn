@@ -1,10 +1,12 @@
 package strategy
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"net"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -247,5 +249,128 @@ func TestSmallSNIPoolIsNotAMetronomeAcrossCycles(t *testing.T) {
 	}
 	if share := float64(repeats) / (picks - 1); share < 0.4 || share > 0.6 {
 		t.Fatalf("the next pick repeated the last in %.0f%% of spaced picks, want about half", 100*share)
+	}
+}
+
+// TestFixedHostStrategiesSendTheEndpointsSNI is P3-16 of the round-3 review of
+// PR #127: the strategies outside the pool sent their own fixed host to the
+// same exit - HTTP Polling and Geneva cdn.jsdelivr.net, WebSocket padded
+// chat.openai.com, anti-probe www.google.com - so an exit configured with
+// Google names still saw a ClientHello for a CDN or OpenAI from the same
+// client. With a pool they draw from it; without one they keep their host.
+func TestFixedHostStrategiesSendTheEndpointsSNI(t *testing.T) {
+	own := []string{"www.gstatic.com", "storage.googleapis.com"}
+	secret := []byte("fixed-host-secret")
+	for _, tc := range []struct {
+		name  string
+		make  func(m *Manager) Strategy
+		fixed string
+	}{
+		{"HTTP Polling", func(m *Manager) Strategy { return NewHTTPPollingStrategy(m, secret) }, "cdn.jsdelivr.net"},
+		{"WebSocket padded", func(m *Manager) Strategy { return NewWebSocketPaddedStrategy(m, secret) }, "chat.openai.com"},
+		{"Geneva", func(m *Manager) Strategy { return NewGenevaStrategy(m, secret, "ru") }, "cdn.jsdelivr.net"},
+		{"anti-probe", func(m *Manager) Strategy { return NewAntiProbeStrategy(m, secret) }, "www.google.com"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, a, b := sniTestManager(t, own)
+			dialEach(t, m, tc.make(m), 12)
+			assertNamesFrom(t, "endpoint with sni", a.names(), own)
+			if got := a.names(); !slices.Contains(got, own[0]) || !slices.Contains(got, own[1]) {
+				t.Fatalf("endpoint with sni: %v in 12 dials, not drawn from the whole pool", got)
+			}
+			assertNamesFrom(t, "endpoint without sni", b.names(), []string{tc.fixed})
+		})
+	}
+}
+
+// TestFixedHostStrategiesKeepSNIAndHostTogether: the strategies that send an
+// HTTP request inside their TLS name the same host in both places, whichever
+// one the pool gave the connection.
+func TestFixedHostStrategiesKeepSNIAndHostTogether(t *testing.T) {
+	own := []string{"www.gstatic.com", "storage.googleapis.com"}
+	secret := []byte("fixed-host-secret")
+	for _, tc := range []struct {
+		name string
+		make func(m *Manager) Strategy
+	}{
+		{"HTTP Polling", func(m *Manager) Strategy { return NewHTTPPollingStrategy(m, secret) }},
+		{"WebSocket padded", func(m *Manager) Strategy { return NewWebSocketPaddedStrategy(m, secret) }},
+		{"Geneva", func(m *Manager) Strategy { return NewGenevaStrategy(m, secret, "ru") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{*b1TestCert(t, "x")}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { ln.Close() })
+			type pair struct{ sni, host string }
+			pairs := make(chan pair, 16)
+			go func() {
+				for {
+					c, err := ln.Accept()
+					if err != nil {
+						return
+					}
+					go func() {
+						defer c.Close()
+						tlsConn := c.(*tls.Conn)
+						_ = tlsConn.SetDeadline(time.Now().Add(2 * time.Second))
+						if tlsConn.Handshake() != nil {
+							return
+						}
+						var req []byte
+						buf := make([]byte, 4096)
+						for !bytes.Contains(req, []byte("\r\n\r\n")) {
+							n, err := tlsConn.Read(buf)
+							req = append(req, buf[:n]...)
+							if err != nil {
+								break
+							}
+						}
+						host := ""
+						for _, line := range strings.Split(string(req), "\r\n") {
+							if v, ok := strings.CutPrefix(line, "Host: "); ok {
+								host = v
+							}
+						}
+						pairs <- pair{tlsConn.ConnectionState().ServerName, host}
+					}()
+				}
+			}()
+			sel, err := endpoint.NewSelector(endpoint.Config{
+				Endpoints: []endpoint.Endpoint{{Name: "gcp", V4: ln.Addr().String(), SNI: own}},
+				Family:    endpoint.V4Only,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			m := NewManager()
+			m.endpoints = sel
+			s := tc.make(m)
+			cand := sel.Candidates()[0]
+			for range 4 {
+				ctx, cancel := context.WithTimeout(m.withDialCandidate(context.Background(), cand), 500*time.Millisecond)
+				if conn, err := s.Connect(ctx, cand.Addr); err == nil {
+					conn.Close()
+				}
+				cancel()
+			}
+			seen := 0
+			for {
+				select {
+				case p := <-pairs:
+					seen++
+					if !slices.Contains(own, p.sni) || p.host != p.sni {
+						t.Fatalf("SNI %q, Host %q: want one name from %v in both", p.sni, p.host, own)
+					}
+					continue
+				case <-time.After(time.Second):
+				}
+				break
+			}
+			if seen == 0 {
+				t.Fatal("no request reached the server - the test proves nothing")
+			}
+		})
 	}
 }

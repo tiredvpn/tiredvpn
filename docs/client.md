@@ -609,9 +609,10 @@ Notes worth reading once:
 - **`sni` is the endpoint's own cover-name pool**: `sni = ["www.google.com",
   "www.gstatic.com"]`, or a single string. REALITY, Seqovl, HTTP/2 Stego and
   QUIC take their SNI from it for that endpoint, each connection drawing a name
-  uniformly; it wins over `-reality-sni` and `-cover`. `sni = ""` means no
-  pool. HTTP Polling, WebSocket, Geneva, IMAP and anti-probe keep their own
-  hosts. Give the exit the same names with its `-reality-sni`: an exit without
+  uniformly; it wins over `-reality-sni` and `-cover`. HTTP Polling,
+  WebSocket padded, Geneva and anti-probe take their SNI and Host header from
+  it too. IMAP keeps doing what a mail client does: the dialled hostname, or
+  no SNI for an IP. `sni = ""` means no pool. Give the exit the same names with its `-reality-sni`: an exit without
   them answers a probe that replays one of these names with its cover domain's
   certificate instead of the named site's.
 - **`policy` other than `priority`, and `health_check = "active"`, are not
