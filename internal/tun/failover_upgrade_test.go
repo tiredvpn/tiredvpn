@@ -168,6 +168,7 @@ type exitStrategy struct {
 	t           *testing.T
 	onHandshake func(srv net.Conn)
 	beforeDial  func()
+	onTarget    func(target string)
 	handshakes  atomic.Int64
 }
 
@@ -177,7 +178,10 @@ func (s *exitStrategy) Priority() int                       { return s.priority 
 func (s *exitStrategy) Probe(context.Context, string) error { return nil }
 func (s *exitStrategy) RequiresServer() bool                { return true }
 func (s *exitStrategy) Description() string                 { return "scripted exit" }
-func (s *exitStrategy) Connect(context.Context, string) (net.Conn, error) {
+func (s *exitStrategy) Connect(_ context.Context, target string) (net.Conn, error) {
+	if s.onTarget != nil {
+		s.onTarget(target)
+	}
 	if s.beforeDial != nil {
 		s.beforeDial()
 	}

@@ -149,6 +149,7 @@ type CandidateState struct {
 	LatencyEWMA         time.Duration
 	Probed              bool
 	Unreachable         bool
+	DeadStreak          int
 }
 
 // Selector holds the candidate list, their health, and which one is currently
@@ -767,6 +768,7 @@ func (s *Selector) Snapshot() []CandidateState {
 			LatencyEWMA:         h.latencyEWMA,
 			Probed:              h.probed,
 			Unreachable:         s.unreachable[i],
+			DeadStreak:          h.deadStreak,
 		}
 	}
 	return out

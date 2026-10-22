@@ -1917,7 +1917,12 @@ func (v *VPNClient) handshakeUpgrade(oldConn, conn net.Conn, cur, next strategy.
 	switch verdict {
 	case upgradeSwapped:
 		oldConn.Close()
-		v.manager.SessionEnded(strategy.SessionEnd{Strategy: cur.ID(), Useful: true})
+		// The fallback session the swap ends was useful, and the endpoint has
+		// to hear it: that clears its dead-session streak like any useful end.
+		v.mu.Lock()
+		cand, hasCand := v.sessionCand, v.hasSessionCand
+		v.mu.Unlock()
+		v.manager.SessionEnded(strategy.SessionEnd{Strategy: cur.ID(), Useful: true, Endpoint: cand, HasEndpoint: hasCand})
 		v.manager.RecordSessionStart(next.ID())
 		log.Info("Strategy upgrade: tunnel moved from %s to %s, pending confirmation", cur.Name(), next.Name())
 	case upgradeOtherAddress:
@@ -2046,7 +2051,11 @@ func (v *VPNClient) disconnect(conn net.Conn, reason string, err error) {
 		// detector's business. And the client's own link is asked first: a
 		// link that dropped right after a reconnect kills the session just
 		// the same, and parking the server for it is D7 over again.
-		dead := silent && sessionDiedYoung(connectedAt, lastRx) && probeInternet()
+		//
+		// Not while an upgrade is pending: that session is the upgrade's, and
+		// its death says the new strategy failed (UpgradeOutcome above), not
+		// that the server - which just carried the fallback - is dead.
+		dead := pendingUpgrade == nil && silent && sessionDiedYoung(connectedAt, lastRx) && probeInternet()
 		v.manager.SessionEnded(strategy.SessionEnd{
 			Strategy:    endedStrategy.ID(),
 			Endpoint:    sessionCand,
