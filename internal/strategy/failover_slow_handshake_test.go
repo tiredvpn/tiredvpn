@@ -148,11 +148,8 @@ func TestAStalledConnectStillLeavesRoomForTheNext(t *testing.T) {
 	if s.ID() != "polling" {
 		t.Fatalf("connected via %s, want polling", s.ID())
 	}
-	m.mu.RLock()
-	swallowed := m.handshakeSwallowed
-	m.mu.RUnlock()
-	if swallowed != "" {
-		t.Fatalf("a connect that never came up was booked as a swallowed handshake (%s)", swallowed)
+	if skip := m.swallowSkip(addr); len(skip) != 0 {
+		t.Fatalf("a connect that never came up was booked as a swallowed handshake (%v)", skip)
 	}
 }
 

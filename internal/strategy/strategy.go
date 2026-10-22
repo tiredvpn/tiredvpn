@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math/rand/v2"
 	"net"
 	"slices"
@@ -159,12 +160,10 @@ type Manager struct {
 	fastReconnectFirst    time.Time
 	fastReconnectLast     time.Time // when the previous counted attempt happened
 
-	// A strategy whose TCP connect went through and whose handshake then ran
-	// out the rest of the cycle unanswered (see connectThroughRefusal). The
-	// next cycle leaves it out once, so the cycle after a swallowed handshake
-	// starts with the other transports. Guarded by m.mu.
-	handshakeSwallowed   string
-	handshakeSwallowedAt time.Time
+	// swallowed is, per dialled address, the run of reconnect cycles that
+	// ended with no verdict because a connected handshake heard nothing (see
+	// noteSwallowCycle). Guarded by m.mu.
+	swallowed map[string]*swallowRecord
 
 	// Connectivity checker for pre-flight checks
 	connectivityChecker  *ConnectivityChecker
@@ -295,7 +294,7 @@ var refusalRetries = []time.Duration{250 * time.Millisecond, 500 * time.Millisec
 // 7-9 s (a slow path, a server reaching its cover domain) lost the cycle to
 // HTTP Polling. Only dials through protect.ProtectDialer report the connect;
 // a strategy dialling on its own is held to dialLimit as a whole.
-func (m *Manager) connectThroughRefusal(ctx context.Context, s Strategy, target string, limit, dialLimit time.Duration) (conn net.Conn, latency time.Duration, refused bool, err error) {
+func (m *Manager) connectThroughRefusal(ctx context.Context, s Strategy, target string, limit, dialLimit time.Duration, scan *scanState) (conn net.Conn, latency time.Duration, refused bool, err error) {
 	if _, ok := s.(connectReporter); !ok && dialLimit > 0 {
 		limit, dialLimit = min(limit, dialLimit), 0
 	}
@@ -311,9 +310,7 @@ func (m *Manager) connectThroughRefusal(ctx context.Context, s Strategy, target 
 			err = fmt.Errorf("%w: %w", errTCPConnectCut, err)
 		}
 		if err != nil && phase.extended() && phase.connected() && heardNothing(err, latency, limit) {
-			m.mu.Lock()
-			m.handshakeSwallowed, m.handshakeSwallowedAt = s.ID(), time.Now()
-			m.mu.Unlock()
+			scan.connectedSilent = append(scan.connectedSilent, s.ID())
 		}
 		if err == nil || isUDPBasedStrategy(s) || !refusedByAddr(err, target, m.GetServerAddr(ctx)) {
 			return conn, latency, false, err
@@ -1503,7 +1500,10 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 		if _, err := m.preflightCandidate(ctx, nil, endpoint.Candidate{Addr: target}); err != nil {
 			return nil, nil, endpoint.Candidate{}, false, err
 		}
-		conn, s, err := m.ConnectExcluding(ctx, m.withHoppedPort(target), nil)
+		conn, s, err := m.connectScan(ctx, m.withHoppedPort(target), nil, &scanState{addr: target})
+		if err == nil {
+			m.clearSwallowed(target)
+		}
 		return conn, s, endpoint.Candidate{}, false, err
 	}
 
@@ -1570,8 +1570,10 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 		dialCtx := m.withDialCandidate(ctx, cand)
 
 		start := time.Now()
-		conn, strategy, err := m.ConnectExcluding(dialCtx, m.withHoppedPort(cand.Addr), nil)
+		scan := &scanState{addr: cand.Addr}
+		conn, strategy, err := m.connectScan(dialCtx, m.withHoppedPort(cand.Addr), nil, scan)
 		if err == nil {
+			m.clearSwallowed(cand.Addr)
 			sel.Report(cand, true, time.Since(start))
 			return conn, strategy, cand, true, nil
 		}
@@ -1762,14 +1764,76 @@ type scanState struct {
 	answered bool
 	// timeouts counts non-UDP strategies that died on the connect timeout.
 	timeouts int
+	// addr is the address the cycle's swallow record is kept under: the
+	// candidate as the endpoint layer names it, since the dial target can
+	// carry a hopped port. Empty means the dial target.
+	addr string
+	// connectedSilent lists the transports whose TCP connect came up and
+	// whose handshake then heard nothing until its attempt ran out.
+	connectedSilent []string
+}
+
+// swallowRecord is what one address's last reconnect cycles left behind.
+type swallowRecord struct {
+	// skip holds the transports whose connected handshake heard nothing; the
+	// next cycle on this address starts without them.
+	skip map[string]bool
+	last time.Time
+}
+
+// swallowWindow is how long a swallow record outlives its last cycle. The
+// reconnect backoff reaches two minutes and a cycle takes 15-30 s more, so a
+// shorter window would forget a run of cycles between two of them.
+const swallowWindow = 3 * time.Minute
+
+// swallowSkip returns the transports the next cycle on addr starts without:
+// those whose connected handshake heard nothing in the recent cycles there.
+// Empty in forced mode, which has nothing else to try, and when skipping them
+// would leave no transport at all.
+func (m *Manager) swallowSkip(addr string) map[string]bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r := m.swallowed[addr]
+	if r == nil || len(r.skip) == 0 || m.forced || time.Since(r.last) > swallowWindow {
+		return nil
+	}
+	if !slices.ContainsFunc(m.strategies, func(s Strategy) bool { return s.Priority() > 0 && !r.skip[s.ID()] }) {
+		return nil
+	}
+	return maps.Clone(r.skip)
+}
+
+// noteSwallowed books the transports whose connected handshake heard nothing
+// this cycle against addr.
+func (m *Manager) noteSwallowed(addr string, ids []string) {
+	if len(ids) == 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r := m.swallowed[addr]
+	if r == nil || time.Since(r.last) > swallowWindow {
+		r = &swallowRecord{skip: make(map[string]bool)}
+		if m.swallowed == nil {
+			m.swallowed = make(map[string]*swallowRecord)
+		}
+		m.swallowed[addr] = r
+	}
+	for _, id := range ids {
+		r.skip[id] = true
+	}
+	r.last = time.Now()
+}
+
+// clearSwallowed forgets addr's swallow record: a transport got through.
+func (m *Manager) clearSwallowed(addr string) {
+	m.mu.Lock()
+	delete(m.swallowed, addr)
+	m.mu.Unlock()
 }
 
 // ConnectExcluding tries strategies excluding specified ones (for fallback)
 func (m *Manager) ConnectExcluding(ctx context.Context, target string, excludeIDs []string) (net.Conn, Strategy, error) {
-	m.mu.RLock()
-	rttEnabled := m.rttMaskingEnabled
-	m.mu.RUnlock()
-
 	// One scan, not two. RTT masking is a post-success wrapper (WrapWithRTTMasking
 	// on an already-connected conn); it never changes whether a strategy connects.
 	// The old code scanned once WITHOUT masking and, on total failure, scanned the
@@ -1778,23 +1842,15 @@ func (m *Manager) ConnectExcluding(ctx context.Context, target string, excludeID
 	// round did not. Decide masking up front and make a single pass, so a
 	// successful connection is wrapped when masking is on and a failed scan is not
 	// paid for twice.
-	return m.connectWithRTTScan(ctx, target, excludeIDs, rttEnabled, &scanState{})
+	return m.connectScan(ctx, target, excludeIDs, &scanState{})
 }
 
-// takeSwallowed returns, once, the strategy whose handshake ran out the
-// previous cycle (handshakeSwallowed), if that was recent. A connected
-// handshake may now use the rest of a cycle, so a swallowed one costs the
-// cycle; this keeps it from costing the next one too. Forced mode has nothing
-// else to try and never skips.
-func (m *Manager) takeSwallowed() string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	id, at := m.handshakeSwallowed, m.handshakeSwallowedAt
-	m.handshakeSwallowed = ""
-	if id == "" || m.forced || len(m.strategies) < 2 || time.Since(at) > 2*m.connectTimeout {
-		return ""
-	}
-	return id
+// connectScan is ConnectExcluding on a scan state the caller reads afterwards.
+func (m *Manager) connectScan(ctx context.Context, target string, excludeIDs []string, scan *scanState) (net.Conn, Strategy, error) {
+	m.mu.RLock()
+	rttEnabled := m.rttMaskingEnabled
+	m.mu.RUnlock()
+	return m.connectWithRTTScan(ctx, target, excludeIDs, rttEnabled, scan)
 }
 
 // connectWithRTT is the internal connect method with optional RTT masking. It
@@ -1827,10 +1883,20 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 	for _, id := range excludeIDs {
 		excludeMap[id] = true
 	}
-	if id := m.takeSwallowed(); id != "" {
-		log.Info("Strategy %s ran out the last cycle in its handshake - trying the others first this time", id)
-		excludeMap[id] = true
+	// A connected handshake may use the rest of its cycle, so a swallowed one
+	// costs the cycle; the transports swallowed on this address in the recent
+	// cycles keep it from costing the next ones too. All of them, not the last
+	// one: with one slot two swallowed transports took turns, cycle after
+	// cycle, and the one that worked was never reached.
+	if scan.addr == "" {
+		scan.addr = target
 	}
+	swallowSkip := m.swallowSkip(scan.addr)
+	if len(swallowSkip) > 0 {
+		log.Info("Strategies %s ran out a recent cycle on %s in their handshake - trying the others first this time",
+			strings.Join(slices.Sorted(maps.Keys(swallowSkip)), ", "), scan.addr)
+	}
+	defer func() { m.noteSwallowed(scan.addr, scan.connectedSilent); scan.connectedSilent = nil }()
 
 	// Try last successful strategy first if it was recent (within 5 minutes), but
 	// only if it clears the same gates the full scan applies to every other
@@ -1843,6 +1909,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 	fastEligible := lastSuccessful != nil &&
 		time.Since(lastSuccessfulTime) < 5*time.Minute &&
 		!excludeMap[lastSuccessful.ID()] &&
+		!swallowSkip[lastSuccessful.ID()] &&
 		(!excludeUDP || !isUDPBasedStrategy(lastSuccessful)) &&
 		(m.forced || !m.stormDetector.IsParked(lastSuccessful.ID())) &&
 		m.circuitBreakers.CanTry(lastSuccessful.ID())
@@ -1880,7 +1947,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			if budget < m.connectTimeout {
 				dialBudget = budget / 2
 			}
-			conn, latency, refused, err := m.connectThroughRefusal(ctx, lastSuccessful, target, budget, dialBudget)
+			conn, latency, refused, err := m.connectThroughRefusal(ctx, lastSuccessful, target, budget, dialBudget, scan)
 
 			if err == nil {
 				// Success - update stats (also records the breaker success)
@@ -1956,6 +2023,13 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 		}
 		if excludeMap[s.ID()] {
 			log.Debug("Skipping excluded strategy: %s", s.Name())
+			continue
+		}
+		if swallowSkip[s.ID()] {
+			// Held back, not gone: the fast path alone being silent is not
+			// "every transport" while this one sits out its turn.
+			log.Debug("Skipping strategy %s (handshake swallowed in a recent cycle)", s.Name())
+			skippedOthers++
 			continue
 		}
 		// Check circuit breaker. This only assembles the candidate list, so use
@@ -2113,7 +2187,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			if budget < m.connectTimeout && i < len(strategies)-1 {
 				dialBudget = budget / 2
 			}
-			conn, latency, refused, err := m.connectThroughRefusal(ctx, s, target, budget, dialBudget)
+			conn, latency, refused, err := m.connectThroughRefusal(ctx, s, target, budget, dialBudget, scan)
 
 			if err == nil {
 				// Success - update confidence with latency and save for fast reconnect
@@ -3718,6 +3792,7 @@ func (m *Manager) ResetForNetworkChange() {
 	// Storm state is tied to the old network - clear it after a network change.
 	m.stormDetector.Reset()
 	m.lastDeadEndpoint = -1
+	m.swallowed = nil
 
 	// So is the UDP verdict: it gated QUIC for the old network (or for no
 	// network at all, when this runs because the link went down). Void it,
