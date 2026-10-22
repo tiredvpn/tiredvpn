@@ -585,3 +585,34 @@ func TestPortHopBooksTheSessionItReplaces(t *testing.T) {
 		t.Fatalf("the storm detector times the hop's session from %v, the client from %v", opened, connectedAt)
 	}
 }
+
+// TestOldExitIsOfferedUpgradesAgainAfterItsSessionEnds is P3-8 of the
+// round-3 review: upgradeOff was never cleared, so an exit updated since -
+// which takes a restart, which ends the session - was never upgraded on
+// again until the client restarted.
+func TestOldExitIsOfferedUpgradesAgainAfterItsSessionEnds(t *testing.T) {
+	resp := []byte{0x00}
+	resp = append(resp, callsiteServerIP.To4()...)
+	resp = append(resp, net.IPv4(10, 99, 0, 77).To4()...)
+	v, m, _, _ := upgradeOnSelector(t)
+	setLog(t, &stampedLog{})
+	old := &exitStrategy{id: "reality2", priority: 5, t: t, onHandshake: func(srv net.Conn) { _, _ = srv.Write(resp) }}
+	m.Register(old)
+	v.tryStrategyUpgrade([]strategy.Strategy{old})
+	v.mu.Lock()
+	addr := v.sessionCand.Addr
+	off := v.upgradeOff[addr]
+	v.mu.Unlock()
+	if !off {
+		t.Fatal("the old exit was not marked - the test proves nothing")
+	}
+
+	atomic.StoreInt32(&v.running, 0) // book the end, no reconnect loop
+	v.disconnect(nil, "server restart", io.EOF)
+	v.mu.Lock()
+	off = v.upgradeOff[addr]
+	v.mu.Unlock()
+	if off {
+		t.Fatal("the session on the old exit ended and it is still never upgraded on")
+	}
+}

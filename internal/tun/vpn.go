@@ -209,7 +209,10 @@ type VPNClient struct {
 
 	// upgradeOff lists endpoints whose exit answered an upgrade with another
 	// tunnel address - an exit older than the credential lease, which will do
-	// so every time. Guarded by mu.
+	// so every time - for as long as the tunnel's session there lasts. An
+	// exit is updated by restarting it, which ends that session, so the entry
+	// goes with it (disconnect): one wasted upgrade per session at most,
+	// instead of none ever again until the client restarts. Guarded by mu.
 	upgradeOff map[string]bool
 
 	// sessionMu is held by every operation that registers a new session on
@@ -2134,6 +2137,9 @@ func (v *VPNClient) disconnect(conn net.Conn, reason string, err error) {
 	sessionCand, hasSessionCand := v.sessionCand, v.hasSessionCand
 	pendingUpgrade := v.upgradePending
 	v.upgradePending = nil
+	if hasSessionCand {
+		delete(v.upgradeOff, sessionCand.Addr)
+	}
 	v.mu.Unlock()
 
 	if pendingUpgrade != nil && v.manager != nil {
