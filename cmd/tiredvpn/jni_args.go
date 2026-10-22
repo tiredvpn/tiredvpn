@@ -155,15 +155,21 @@ func parseClientArgs(args []string) (_ *client.Config, err error) {
 			}
 		// The endpoint SNI pool, same as the CLI flag. -cover above stays
 		// HTTP/2 Stego's own host and yields to a pool when there is one.
+		//
+		// A bad list fails the connect, as it fails the CLI at startup. It
+		// is not dropped with a warning like other bad values: falling back
+		// to the built-in pool would put names in the ClientHello that the
+		// operator chose this list to avoid, on an exit whose own cloud they
+		// do not belong to.
 		case "-reality-sni":
 			if i+1 < len(args) {
-				// The parse error quotes the bad name, which is raw argv; the
-				// redacted value says the same.
-				if v, err := evasion.ParseSNIList(args[i+1]); err == nil {
-					cfg.REALITYSNIs = v
-				} else {
-					log.Warn("parseClientArgs: invalid -reality-sni value %q, using the built-in pool", logArgs[i+1])
+				v, perr := evasion.ParseSNIList(args[i+1])
+				if perr != nil {
+					// The parse error quotes the bad name, which is raw argv;
+					// the redacted value says the same.
+					return nil, fmt.Errorf("invalid -reality-sni value %q", logArgs[i+1])
 				}
+				cfg.REALITYSNIs = v
 				i++
 			}
 		case "-debug":

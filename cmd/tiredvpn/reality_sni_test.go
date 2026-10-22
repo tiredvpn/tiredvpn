@@ -112,9 +112,8 @@ func TestRealitySNIFlags(t *testing.T) {
 }
 
 // TestJNIRealitySNI: the app's argv reaches the same pool as the CLI flag, and
-// -cover stays HTTP/2 Stego's own host next to it. A bad list is dropped with
-// a warning, as the parser does for every bad value, and leaves the built-in
-// pool.
+// -cover stays HTTP/2 Stego's own host next to it. A bad list fails the
+// parse, as it fails the CLI.
 func TestJNIRealitySNI(t *testing.T) {
 	cfg, err := parseClientArgs([]string{"-server", "203.0.113.10:995", "-secret", "s",
 		"-cover", "api.googleapis.com", "-reality-sni", "www.google.com, WWW.GSTATIC.COM"})
@@ -128,12 +127,10 @@ func TestJNIRealitySNI(t *testing.T) {
 		t.Errorf("CoverHost = %q", cfg.CoverHost)
 	}
 
-	cfg, err = parseClientArgs([]string{"-server", "203.0.113.10:995", "-secret", "s", "-reality-sni", "a.example,b.example:443"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.REALITYSNIs != nil {
-		t.Errorf("an invalid list was taken: %v", cfg.REALITYSNIs)
+	// P3-14 of the round-3 review: a bad list fell back to the built-in pool
+	// with a warning, where the CLI refuses to start.
+	if cfg, err = parseClientArgs([]string{"-server", "203.0.113.10:995", "-secret", "s", "-reality-sni", "a.example,b.example:443"}); err == nil {
+		t.Errorf("an invalid list was accepted (pool %v)", cfg.REALITYSNIs)
 	}
 }
 
