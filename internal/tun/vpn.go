@@ -2091,7 +2091,7 @@ func (v *VPNClient) checkNetworkConnectivity() bool {
 
 	if v.manager != nil {
 		if checker := v.manager.ConnectivityChecker(); checker != nil {
-			if checker.Check(ctx).HasBasicConnectivity() {
+			if checker.CheckTCP(ctx).HasBasicConnectivity() {
 				return true
 			}
 		} else if v.serverAddr != "" {

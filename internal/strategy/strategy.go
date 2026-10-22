@@ -438,6 +438,14 @@ func scanOutOfTime(ctx context.Context, target string, scan *scanState, lastErr 
 // Manager.consecutiveConnectFailures.
 const preflightFailThreshold = 2
 
+// hasUDPStrategies reports whether any registered strategy rides UDP - the
+// only reason to spend a UDP probe on the gate.
+func (m *Manager) hasUDPStrategies() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return slices.ContainsFunc(m.strategies, isUDPBasedStrategy)
+}
+
 // NoteServerSilent tells the manager the tunnel died because the server went
 // quiet - a read deadline, not a reset or an EOF.
 //
@@ -1448,7 +1456,15 @@ func (m *Manager) preflightCandidate(ctx context.Context, sel *endpoint.Selector
 		checker.SetAddrs(cand.Addr, sel.GateAddrs(cand)...)
 	}
 
-	result := checker.Check(ctx)
+	// TCP to the pool and nothing else: the gate's question is whether any of
+	// these addresses answers. The UDP probe only feeds the QUIC gate, so it
+	// runs only for a client that has a QUIC strategy to gate (see Check).
+	var result ConnectivityResult
+	if m.hasUDPStrategies() {
+		result = checker.Check(ctx)
+	} else {
+		result = checker.CheckTCP(ctx)
+	}
 	if !result.TCP {
 		// No TCP connectivity - wait in loop until it's restored
 		log.Warn("No TCP connectivity to server, waiting for network...")

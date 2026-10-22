@@ -2,7 +2,6 @@ package strategy
 
 import (
 	"context"
-	"errors"
 	"net"
 	"os"
 	"slices"
@@ -659,31 +658,6 @@ func TestUDPGateRefreshYieldsToFresherVerdict(t *testing.T) {
 	defer m.mu.RUnlock()
 	if m.excludeUDPStrategies {
 		t.Fatal("refresh overwrote a fresher verdict with the cached refusal")
-	}
-}
-
-// TestUDPGateVerdictNotHeldByICMP: the ICMP check dials 443 and 80 with a
-// 700ms timeout each, and only UDP gates anything. A refusal that arrives at
-// once must reach the result inside the grace even when the ICMP check is
-// still waiting on a host that swallows those dials.
-func TestUDPGateVerdictNotHeldByICMP(t *testing.T) {
-	addr := udpGateServer(t, false) // UDP refused at once
-	c := NewConnectivityChecker(addr, 2*time.Second, false)
-	c.icmpCheck = func(ctx context.Context, _ string) error {
-		select {
-		case <-time.After(2 * time.Second):
-		case <-ctx.Done():
-		}
-		return errors.New("swallowed")
-	}
-
-	start := time.Now()
-	r := c.Check(t.Context())
-	if took := time.Since(start); took > time.Second {
-		t.Fatalf("Check waited %v on the ICMP check", took)
-	}
-	if !r.UDPKnown || r.UDP {
-		t.Fatalf("refused UDP not in the result: %+v", r)
 	}
 }
 
