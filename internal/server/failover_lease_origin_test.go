@@ -4,7 +4,9 @@ import (
 	"context"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -110,5 +112,98 @@ func TestGlobalRealityLeaseOfAnotherOriginIsNotAdopted(t *testing.T) {
 	}
 	if ip := leasesOf(pool)[other]; ip != theirs.String() {
 		t.Fatalf("the other box's lease moved: %v", leasesOf(pool))
+	}
+}
+
+// commandCounter counts the Redis commands a client sends, by name.
+type commandCounter struct{ get, scan, keys atomic.Int64 }
+
+func (c *commandCounter) DialHook(next redis.DialHook) redis.DialHook { return next }
+func (c *commandCounter) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		switch cmd.Name() {
+		case "get":
+			c.get.Add(1)
+		case "scan":
+			c.scan.Add(1)
+		case "keys":
+			c.keys.Add(1)
+		}
+		return next(ctx, cmd)
+	}
+}
+func (c *commandCounter) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+// TestRepeatedHandshakesDoNotAskRedisForOldLeases is the other half of P3-6:
+// the fold ran on every TUN handshake, and every old key it missed in memory
+// was a Redis GET (a SCAN for a registry client) under the pool lock - for keys
+// that no current server writes. Once a credential is folded, its next
+// handshakes go straight to the allocation.
+func TestRepeatedHandshakesDoNotAskRedisForOldLeases(t *testing.T) {
+	global := []byte("the-global-secret-of-this-exit-32")
+	for _, tc := range []struct {
+		name   string
+		srvCtx *serverContext
+		id     func(*serverContext) clientIdentity
+	}{
+		{"global secret", &serverContext{cfg: &Config{Secret: global}}, func(*serverContext) clientIdentity { return sharedIdentity(globalClientID) }},
+		{"registry client over REALITY", registryCtx([]byte("a-registry-client-secret-32bytes")), func(c *serverContext) clientIdentity {
+			return realityIdentityFor(t, c, []byte("a-registry-client-secret-32bytes"))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rdb := startRedis(t)
+			count := &commandCounter{}
+			rdb.AddHook(count)
+			pool, err := NewIPPool(IPPoolConfig{Network: "10.8.1.0/24", ServerIP: "10.8.1.1"}, rdb)
+			if err != nil {
+				t.Fatal(err)
+			}
+			srvCtx := srvCtxWithPool(tc.srvCtx, pool)
+			id := tc.id(tc.srvCtx)
+			first, err := allocateTunnelIP(srvCtx, id, "192.0.2.170", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			gets, scans := count.get.Load(), count.scan.Load()
+			for range 5 {
+				got, err := allocateTunnelIP(srvCtx, id, "192.0.2.170", nil)
+				if err != nil || !got.Equal(first) {
+					t.Fatalf("got %v (%v), want %s", got, err, first)
+				}
+			}
+			if n := count.get.Load() - gets; n != 0 {
+				t.Errorf("5 more handshakes sent %d GETs", n)
+			}
+			if n := count.scan.Load() - scans; n != 0 {
+				t.Errorf("5 more handshakes sent %d SCANs", n)
+			}
+		})
+	}
+}
+
+// TestFoldedKeysStayBounded: a global-secret key carries its origin, so the
+// fold record grows with every address such a client comes from. It stays
+// under its cap, and an expired record lets the fold run again.
+func TestFoldedKeysStayBounded(t *testing.T) {
+	pool, err := NewIPPool(IPPoolConfig{Network: "10.8.1.0/24", ServerIP: "10.8.1.1"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range adoptFoldMax + 100 {
+		pool.AdoptAll(nil, nil, "global@"+net.IPv4(198, 51, byte(i>>8), byte(i)).String())
+	}
+	if n := len(pool.folded); n > adoptFoldMax {
+		t.Fatalf("%d fold records, cap %d", n, adoptFoldMax)
+	}
+	pool.folded["global@192.0.2.1"] = time.Now().Add(-adoptFoldTTL)
+	if _, err := pool.Allocate("polling:global@192.0.2.1", net.ParseIP("10.8.1.9"), ""); err != nil {
+		t.Fatal(err)
+	}
+	pool.AdoptAll([]string{"polling:global@192.0.2.1"}, nil, "global@192.0.2.1")
+	if _, left := leasesOf(pool)["polling:global@192.0.2.1"]; left {
+		t.Fatal("an expired fold record kept the fold from running")
 	}
 }
