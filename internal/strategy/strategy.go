@@ -3311,6 +3311,30 @@ func RandomDelay(floor, mean, ceiling time.Duration) time.Duration {
 	return floor + time.Duration(rand.Float64()*float64(ceiling-floor))
 }
 
+// HumpDelay draws a pause of floor plus a gamma of shape 3 with mean
+// (mean - floor), redrawn while it reaches ceiling.
+//
+// RandomDelay's exponential piles its draws at the floor: about 40% of them
+// land in the lowest fifth of the range, and the floor becomes a hard edge in
+// the gap distribution - a minimum an observer of many gaps reads off at once.
+// A gamma of shape 3 has no density at the floor and its bulk in the middle,
+// so the lower edge is soft. There is no measured reference distribution
+// behind the shape either (verification rule 3); it is chosen to have no
+// edge, no grid and no spike.
+func HumpDelay(floor, mean, ceiling time.Duration) time.Duration {
+	theta := float64(mean-floor) / 3
+	if theta <= 0 || ceiling <= floor {
+		return floor
+	}
+	for range 64 {
+		g := rand.ExpFloat64() + rand.ExpFloat64() + rand.ExpFloat64()
+		if d := floor + time.Duration(g*theta); d < ceiling {
+			return d
+		}
+	}
+	return floor + time.Duration(rand.Float64()*float64(ceiling-floor))
+}
+
 // UpgradeRank is the order an upgrade compares strategies in: the base
 // priority plus the Android UDP penalty the scan applies (sortStrategies).
 // Lower is better.

@@ -2436,15 +2436,16 @@ var reconnectConnectTimeout = 15 * time.Second
 // The pause between rounds is drawn, not fixed (see poolPause). base is 5 s
 // for the first two minutes (a provider's line flapping), then grows by half
 // per round up to a minute. A silent dial adds its own poolDialTimeout (3 s)
-// before the pause starts. Simulated over the real functions: a dial every
-// 5.5-8.0 s in the first two minutes (median 6.2), then every 33-63 s (median
-// 41.5, p90 55.6), about 40 dials in the first 15 minutes of silence. How late
-// a recovered server is noticed, 15 minutes into the silence, with 4 addresses
-// in the pool: the whole pool back (the client's own uplink returning) - median
-// 22 s, worst 63 s; one server of two (2 addresses) - median 45 s, p99 141 s,
-// worst 174 s; one address of 4 - median 87 s, p99 189 s, worst 218 s. There
-// is no measured reference distribution; the point is no grid and fewer SYNs
-// the longer the silence.
+// before the pause starts. Simulated over the real functions (2000 runs): a
+// dial every 4.3-8.0 s in the first two minutes (median 6.2), then every
+// 18-63 s (median 41.3, p90 56.7), about 42 dials in the first 15 minutes of
+// silence. How late a recovered server is noticed, 15 minutes into the
+// silence, coming back at a uniformly random moment (4000 runs): the whole
+// pool back (the client's own uplink returning) - median 23 s, worst 61 s; one
+// server of two (2 addresses) - median 43 s, p99 100 s, worst 116 s; one
+// address of 4 - median 90 s, p99 188 s, worst 220 s. There is no measured
+// reference distribution; the point is no grid, no hard minimum gap and fewer
+// SYNs the longer the silence.
 var (
 	poolPollInterval = 5 * time.Second
 	poolFastPhase    = 2 * time.Minute
@@ -2469,12 +2470,15 @@ func nextPoolBase(cur, silentFor time.Duration) time.Duration {
 	return min(time.Duration(float64(cur)*poolPollGrowth), poolPollMax)
 }
 
-// poolPause draws the actual pause under base: RandomDelay(base/2, 3/4 base,
+// poolPause draws the actual pause under base: HumpDelay(base/4, 3/4 base,
 // base). The ceiling is base, not twice it: with 2 x base (round 3) the
 // long-run gap reached 123 s, and a client whose own uplink came back waited up
 // to two minutes for the next dial, against 63 s before the pauses were drawn.
+// The shape is a hump, not RandomDelay's exponential: that put 40% of the
+// pauses in the lowest fifth of the range and made base/2 plus the dial
+// timeout a hard minimum gap (round-3 review, P3-18).
 func poolPause(base time.Duration) time.Duration {
-	return strategy.RandomDelay(base/2, 3*base/4, base)
+	return strategy.HumpDelay(base/4, 3*base/4, base)
 }
 
 // waitOutSilentPool decides what a "nobody in the pool answers" verdict means
