@@ -1382,13 +1382,18 @@ func (m *Manager) SessionEnded(end SessionEnd) (storming bool) {
 	switch {
 	case end.Dead:
 		m.chargeSessionEndpoint(sel, end, "session went silent right after connecting")
-	case storming:
+	case storming && !end.UpgradeFailed:
 		// A strategy whose sessions keep dying on this endpoint is evidence
 		// against the endpoint too: a freeze keyed to the address kills every
 		// transport in turn, and the storm detector alone only ever walks the
 		// strategy list on the same server, 2.5-3.5 minutes per strategy. One
 		// ordinary failure here was reset by the next connect and never parked
 		// anything.
+		//
+		// Not when the storm is completed by a failed upgrade: the storm
+		// detector keys on the strategy, so short sessions from before the
+		// switch to the fallback are still in its history, and the server the
+		// fallback carries traffic on is not what failed.
 		m.chargeSessionEndpoint(sel, end, "storm")
 	}
 	return storming
