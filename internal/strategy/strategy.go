@@ -983,6 +983,11 @@ func (m *Manager) ProbeAll(ctx context.Context, target string) []Result {
 
 			results[idx] = result
 
+			if errors.Is(err, errProbeUnknown) {
+				// Nothing learned, nothing recorded.
+				return
+			}
+
 			// Update stored results. A probe is (almost always) a bare TCP
 			// connect - it says the address is reachable, not that the strategy's
 			// handshake survives DPI. Feed it into the reachability/confidence

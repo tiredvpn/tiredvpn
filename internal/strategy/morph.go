@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	mathrand "math/rand/v2"
@@ -301,32 +302,22 @@ func (s *TrafficMorphStrategy) Probe(ctx context.Context, target string) error {
 	if s.baseStrat != nil {
 		return s.baseStrat.Probe(ctx, target)
 	}
-	// Without a base strategy Morph dials the server itself. This used to
-	// return nil without touching the network - see probeServerTCP.
-	return probeServerTCP(ctx, s.manager, target)
+	// Without a base strategy there is nothing to ask that a reprobe could
+	// trust - see errProbeUnknown.
+	return errProbeUnknown
 }
 
-// probeServerTCP is the shallow probe for a strategy that dials the server
-// itself: a bare TCP connect to the address its Connect would dial, the way
-// REALITY probes. Traffic Morph and State Exhaustion used to answer their probe
-// without touching the network; a reprobe with the link down then reported them
-// available, ProbeAll raised their confidence to 0.92 while every honest probe
-// failed, and the client came back from the outage on Traffic Morph instead of
-// REALITY.
-func probeServerTCP(ctx context.Context, m *Manager, target string) error {
-	addr := target
-	if m != nil {
-		if pinned := m.GetServerAddr(ctx); pinned != "" {
-			addr = pinned
-		}
-	}
-	conn, err := (&net.Dialer{Timeout: 3 * time.Second}).DialContext(ctx, "tcp", addr)
-	if err != nil {
-		return err
-	}
-	conn.Close()
-	return nil
-}
+// errProbeUnknown is a probe's way of saying it cannot tell. ProbeAll counts
+// it as not available and leaves confidence alone.
+//
+// Traffic Morph without a base strategy and State Table Exhaustion used to
+// answer their probe with nil without touching the network; a reprobe during
+// an outage then reported them available, raised their confidence to 0.92
+// while every honest probe failed, and the client came back from the outage on
+// Traffic Morph instead of REALITY. Making them dial instead added five bare
+// connect-and-close dials to every reprobe burst. A probe that cannot learn
+// anything a scan would use should say so and stay off the wire.
+var errProbeUnknown = errors.New("probe cannot tell")
 
 func (s *TrafficMorphStrategy) Connect(ctx context.Context, target string) (net.Conn, error) {
 	// Establish base connection

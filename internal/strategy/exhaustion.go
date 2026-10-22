@@ -88,10 +88,9 @@ func (s *StateExhaustionStrategy) Probe(ctx context.Context, target string) erro
 		syscall.Close(fd)
 	}
 
-	// The raw-socket check is local. Whether the server is there is not, and
-	// answering it without a dial is what made a reprobe during an outage call
-	// this strategy available.
-	return probeServerTCP(ctx, s.manager, target)
+	// The raw-socket check is local; whether the server is there it cannot
+	// say - see errProbeUnknown.
+	return errProbeUnknown
 }
 
 func (s *StateExhaustionStrategy) Connect(ctx context.Context, target string) (net.Conn, error) {
