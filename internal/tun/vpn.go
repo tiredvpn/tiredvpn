@@ -39,7 +39,7 @@ func isTemporaryError(err error) bool {
 // tests can shorten the ticker.
 var keepaliveInterval = 10 * time.Second
 
-const readTimeout = 30 * time.Second           // Must be > keepaliveInterval, detect dead connection faster
+var readTimeout = 30 * time.Second             // Must be > keepaliveInterval, detect dead connection faster. A var so tests can shorten it.
 const writeTimeout = 30 * time.Second          // Write timeout (was 5s, caused i/o timeouts with bufferbloat)
 const deadConnectionTimeout = 45 * time.Second // Proactive dead connection detection timeout
 
@@ -1501,9 +1501,10 @@ func (v *VPNClient) sendKeepalive() {
 				keepalivePkt := make([]byte, 4)
 				binary.BigEndian.PutUint32(keepalivePkt, 0)
 
-				conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+				wdl := time.Now().Add(5 * time.Second)
+				conn.SetWriteDeadline(wdl)
 				if _, err := conn.Write(keepalivePkt); err != nil {
-					v.connLost(conn, "keepalive write", err)
+					v.connLost(conn, "keepalive write", markSilence(err, wdl))
 				} else {
 					log.Debug("Sent keepalive packet")
 				}
@@ -1561,10 +1562,11 @@ func (v *VPNClient) readFromTun() {
 			continue
 		}
 
-		conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+		wdl := time.Now().Add(writeTimeout)
+		conn.SetWriteDeadline(wdl)
 		written, err := conn.Write(buf[:n+4])
 		if err != nil {
-			v.connLost(conn, "server write", err)
+			v.connLost(conn, "server write", markSilence(err, wdl))
 			continue
 		}
 
@@ -1606,13 +1608,14 @@ func (v *VPNClient) readFromServer() {
 		}
 
 		// Read packet length with extended timeout (keepalive keeps connection alive)
-		conn.SetReadDeadline(time.Now().Add(readTimeout))
+		deadline := time.Now().Add(readTimeout)
+		conn.SetReadDeadline(deadline)
 		nLen, err := io.ReadFull(conn, lenBuf)
 		if err != nil {
 			if atomic.LoadInt32(&v.running) == 0 {
 				return
 			}
-			v.connLost(conn, "server read", err)
+			v.connLost(conn, "server read", markSilence(err, deadline))
 			continue
 		}
 
@@ -1648,7 +1651,7 @@ func (v *VPNClient) readFromServer() {
 		buf := rxBuf[:pktLen]
 		nRead, err := io.ReadFull(conn, buf)
 		if err != nil {
-			v.connLost(conn, "server read data", err)
+			v.connLost(conn, "server read data", markSilence(err, deadline))
 			continue
 		}
 
@@ -2028,6 +2031,31 @@ const sessionUsefulMin = 20 * time.Second
 func sessionWasUseful(connectedAt, lastRx time.Time) bool {
 	return !connectedAt.IsZero() && lastRx.Sub(connectedAt) >= sessionUsefulMin
 }
+
+// markSilence tags err as the server's silence when it came back at or after
+// the deadline the client itself set on the operation.
+//
+// The error alone does not say so reliably. smux v2, which carries every
+// REALITY tunnel, reports its deadline as errors.WithStack(errors.New("timeout"))
+// - neither os.ErrDeadlineExceeded nor a net.Error - so on the stand not one of
+// fourteen REALITY silences was recognised, and neither the pool walk after a
+// silent server (D1) nor the dead-session verdict (D6) ever ran for REALITY.
+// The client knows when it armed the deadline; that is the evidence.
+func markSilence(err error, deadline time.Time) error {
+	if err == nil || time.Now().Before(deadline) {
+		return err
+	}
+	return &silenceError{err: err}
+}
+
+// silenceError is a transport error that came back at the client's own
+// deadline. It reads like the error it wraps and matches
+// strategy.ErrServerSilent.
+type silenceError struct{ err error }
+
+func (e *silenceError) Error() string        { return e.err.Error() }
+func (e *silenceError) Unwrap() error        { return e.err }
+func (e *silenceError) Is(target error) bool { return target == strategy.ErrServerSilent }
 
 // serverWentSilent reports a disconnect caused by a deadline - the server
 // stopped answering - as opposed to a close, a reset or a protocol error, all of
