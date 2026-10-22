@@ -1980,18 +1980,22 @@ func (v *VPNClient) handshakeUpgrade(oldConn, conn net.Conn, cur, next strategy.
 		return
 	}
 	caps, hasCaps := parseServerCapabilities(resp, n)
+	v.mu.Lock()
+	oldConnectedAt, oldLastRx := v.connectedAt, v.lastRx
+	sessCand, hasSessCand := v.sessionCand, v.hasSessionCand
+	v.mu.Unlock()
 	verdict := v.swapUpgradedConn(oldConn, tunnelConn, next, net.IP(resp[1:5]), net.IP(resp[5:9]), caps, hasCaps)
 	v.sessionMu.Unlock()
 
 	switch verdict {
 	case upgradeSwapped:
 		oldConn.Close()
-		// The fallback session the swap ends was useful, and the endpoint has
-		// to hear it: that clears its dead-session streak like any useful end.
-		v.mu.Lock()
-		cand, hasCand := v.sessionCand, v.hasSessionCand
-		v.mu.Unlock()
-		v.manager.SessionEnded(strategy.SessionEnd{Strategy: cur.ID(), Useful: true, Endpoint: cand, HasEndpoint: hasCand})
+		// The fallback session the swap ends did not die, it was replaced.
+		// If it was useful the endpoint has to hear it: that clears its
+		// dead-session streak like any useful end. A young one - an upgrade
+		// offered seconds after a reconnect - says nothing either way.
+		v.manager.SessionEnded(strategy.SessionEnd{Strategy: cur.ID(), Replaced: true,
+			Useful: sessionWasUseful(oldConnectedAt, oldLastRx), Endpoint: sessCand, HasEndpoint: hasSessCand})
 		v.manager.RecordSessionStart(next.ID())
 		log.Info("Strategy upgrade: tunnel moved from %s to %s, pending confirmation", cur.Name(), next.Name())
 	case upgradeOtherAddress:

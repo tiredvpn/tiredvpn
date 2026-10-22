@@ -113,6 +113,10 @@ func TestUpgradeSwapClearsTheDeadStreak(t *testing.T) {
 	if deadStreak(t, m, addrs[0]) != 1 {
 		t.Fatal("no dead streak to clear - the test proves nothing")
 	}
+	v.mu.Lock()
+	v.connectedAt = time.Now().Add(-10 * time.Minute) // the fallback carried ten minutes
+	v.lastRx = time.Now()
+	v.mu.Unlock()
 
 	v.tryStrategyUpgrade([]strategy.Strategy{better})
 	if v.strategy != better {
@@ -120,6 +124,32 @@ func TestUpgradeSwapClearsTheDeadStreak(t *testing.T) {
 	}
 	if n := deadStreak(t, m, addrs[0]); n != 0 {
 		t.Fatalf("the useful fallback session ended by the swap left the dead streak at %d", n)
+	}
+}
+
+// TestUpgradeSwapOfAYoungSessionIsNoEvidence is P3-4 of the round-3 review:
+// the swap booked the fallback session as useful whatever its age, so a
+// fallback a few seconds old cleared the endpoint's dead streak. A young
+// session the client replaced on purpose says nothing either way: it clears
+// nothing, and it is not a short session against its strategy either.
+func TestUpgradeSwapOfAYoungSessionIsNoEvidence(t *testing.T) {
+	v, m, addrs, better := upgradeOnSelector(t)
+	setLog(t, &stampedLog{})
+	m.SessionEnded(strategy.SessionEnd{Strategy: "other", Endpoint: v.sessionCand, HasEndpoint: true, Dead: true})
+	if deadStreak(t, m, addrs[0]) != 1 {
+		t.Fatal("no dead streak - the test proves nothing")
+	}
+	before := m.GetStats()["polling"].Confidence
+
+	v.tryStrategyUpgrade([]strategy.Strategy{better}) // the fallback is milliseconds old
+	if v.strategy != better {
+		t.Fatal("no swap")
+	}
+	if n := deadStreak(t, m, addrs[0]); n != 1 {
+		t.Fatalf("a fallback session seconds old changed the dead streak to %d", n)
+	}
+	if after := m.GetStats()["polling"].Confidence; after < before {
+		t.Fatalf("a replaced session cost its strategy confidence: %.3f -> %.3f", before, after)
 	}
 }
 

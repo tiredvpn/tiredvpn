@@ -1367,6 +1367,14 @@ type SessionEnd struct {
 	// dropped REALITY below HTTP Polling after a single server restart.
 	Useful bool
 
+	// Replaced says the session did not die: the client moved the tunnel
+	// off it on purpose (an upgrade swap, a port hop). A useful one ends like
+	// any useful session. A young one is no evidence about anything - not a
+	// short session for the storm detector, not a failure of its strategy -
+	// and it clears nothing either: a fallback a few seconds old said nothing
+	// about the endpoint's dead-session streak.
+	Replaced bool
+
 	// UpgradeFailed says the session was a pending strategy upgrade that died
 	// before proving itself. UpgradeOutcome has already charged the strategy,
 	// so it is not charged a second time here.
@@ -1398,6 +1406,10 @@ type SessionEnd struct {
 // It feeds the storm detector exactly as RecordSessionEnd does and returns its
 // verdict.
 func (m *Manager) SessionEnded(end SessionEnd) (storming bool) {
+	if end.Replaced && !end.Useful {
+		m.stormDetector.SessionAbandoned(end.Strategy)
+		return false
+	}
 	if !end.Useful && !end.UpgradeFailed {
 		m.UpdateStrategyConfidence(end.Strategy, false)
 	}
