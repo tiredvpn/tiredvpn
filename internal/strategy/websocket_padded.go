@@ -117,7 +117,7 @@ func (s *WebSocketPaddedStrategy) Connect(ctx context.Context, target string) (n
 		InsecureSkipVerify: true,
 		MinVersion:         tls.VersionTLS12,
 		NextProtos:         []string{"h2", "http/1.1"},
-		ClientSessionCache: s.manager.TLSSessionCache(), // resume across reconnects
+		ClientSessionCache: s.manager.TLSSessionCache(serverAddr), // resume across reconnects
 	}
 
 	tcpConn, err := dialer.DialContext(ctx, "tcp", serverAddr)

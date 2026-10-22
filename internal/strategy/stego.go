@@ -172,7 +172,7 @@ func (s *HTTP2StegoStrategy) Connect(ctx context.Context, target string) (net.Co
 		InsecureSkipVerify: true,
 		ServerName:         coverHost,
 		NextProtos:         []string{"h2", "http/1.1"},
-		ClientSessionCache: s.manager.TLSSessionCache(), // resume across reconnects
+		ClientSessionCache: s.manager.TLSSessionCache(serverAddr), // resume across reconnects
 	}
 
 	var conn *tls.Conn

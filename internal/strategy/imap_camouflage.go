@@ -204,7 +204,7 @@ func (s *IMAPCamouflageStrategy) clientTLSConfig(serverAddr string) *tls.Config 
 		MinVersion:         tls.VersionTLS12,
 	}
 	if s.manager != nil {
-		cfg.ClientSessionCache = s.manager.TLSSessionCache()
+		cfg.ClientSessionCache = s.manager.TLSSessionCache(serverAddr)
 	}
 	if host, _, err := net.SplitHostPort(serverAddr); err == nil && net.ParseIP(host) == nil {
 		cfg.ServerName = host

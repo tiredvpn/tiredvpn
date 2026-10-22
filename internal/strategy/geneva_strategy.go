@@ -159,7 +159,7 @@ func (g *GenevaStrategy) Connect(ctx context.Context, target string) (net.Conn, 
 		ServerName:         g.wsHost,
 		InsecureSkipVerify: true, // Server uses self-signed cert
 		MinVersion:         tls.VersionTLS12,
-		ClientSessionCache: g.manager.TLSSessionCache(), // resume across reconnects
+		ClientSessionCache: g.manager.TLSSessionCache(serverAddr), // resume across reconnects
 	}
 
 	tlsConn := tls.Client(genevaConn, tlsConfig)

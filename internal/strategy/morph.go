@@ -338,7 +338,7 @@ func (s *TrafficMorphStrategy) Connect(ctx context.Context, target string) (net.
 		tlsConfig := &tls.Config{
 			InsecureSkipVerify: true,
 			NextProtos:         []string{"http/1.1"},
-			ClientSessionCache: s.manager.TLSSessionCache(), // resume across reconnects
+			ClientSessionCache: s.manager.TLSSessionCache(serverAddr), // resume across reconnects
 		}
 		// Use context-aware dialing (respects Android optimized timeouts)
 		dialer := &net.Dialer{}
