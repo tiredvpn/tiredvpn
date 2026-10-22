@@ -298,7 +298,7 @@ var refusalRetries = []time.Duration{250 * time.Millisecond, 500 * time.Millisec
 func (m *Manager) connectThroughRefusal(ctx context.Context, s Strategy, target string, limit, dialLimit time.Duration, scan *scanState) (conn net.Conn, latency time.Duration, refused bool, err error) {
 	_, reporter := s.(connectReporter)
 	if !reporter && dialLimit > 0 {
-		limit, dialLimit = min(limit, dialLimit), 0
+		limit, dialLimit = attemptLimit(s, limit, dialLimit), 0
 	}
 	for i := 0; ; i++ {
 		connectCtx, cancel := context.WithTimeout(ctx, limit)
@@ -333,6 +333,19 @@ func (m *Manager) connectThroughRefusal(ctx context.Context, s Strategy, target 
 		case <-time.After(refusalRetries[i]):
 		}
 	}
+}
+
+// attemptLimit is how long connectThroughRefusal lets one attempt of s run:
+// limit, or dialLimit as a whole for a strategy that does not report its TCP
+// connect. Its silence is read against the same figure: read against limit,
+// an attempt cut at half of it never burned "nearly all of its budget", and a
+// cut that came back as "use of closed network connection" counted as an
+// answer.
+func attemptLimit(s Strategy, limit, dialLimit time.Duration) time.Duration {
+	if _, ok := s.(connectReporter); ok || dialLimit <= 0 {
+		return limit
+	}
+	return min(limit, dialLimit)
 }
 
 // connectReporter marks a strategy whose Connect dials the server only through
@@ -2116,7 +2129,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			// count is how a reconnect spent its whole budget here and then
 			// called the address "answering".
 			if !isUDPBasedStrategy(lastSuccessful) {
-				switch m.classifyAttempt(err, latency, budget) {
+				switch m.classifyAttempt(err, latency, attemptLimit(lastSuccessful, budget, dialBudget)) {
 				case attemptSilent:
 					scan.timeouts++
 					fastSilent = true
@@ -2379,7 +2392,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			// containing the word the classifier looks for. A refusal or a
 			// reset arrives in milliseconds; only silence costs the whole
 			// budget.
-			verdict := m.classifyAttempt(err, latency, budget)
+			verdict := m.classifyAttempt(err, latency, attemptLimit(s, budget, dialBudget))
 
 			if timedOut {
 				log.Debug("  Failed: %s TIMEOUT (latency=%v)", s.Name(), latency)
