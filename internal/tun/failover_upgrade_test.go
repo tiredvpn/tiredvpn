@@ -387,3 +387,27 @@ func TestRejectedUpgradeIsTunnelLoss(t *testing.T) {
 		t.Fatalf("upgrade failures = %d, want 1", n)
 	}
 }
+
+// TestFailedUpgradeDialsOnlyOneCandidate is N7 of the second acceptance of PR
+// #126: one offer from a reprobe dials one strategy. When it failed the loop
+// went on to the next candidate at once, and a single offer put the handshakes
+// of five transports on the wire within 3 ms.
+func TestFailedUpgradeDialsOnlyOneCandidate(t *testing.T) {
+	first := &rankedPipeStrategy{pipeStrategy: &pipeStrategy{t: t, resp: bareV3Response()}, id: "reality", priority: 4,
+		fail: errors.New("tls: handshake reset")}
+	v, fallback, oldConn := newUpgradeClient(t, first)
+	second := &rankedPipeStrategy{pipeStrategy: &pipeStrategy{t: t, resp: bareV3Response(), gap: silent}, id: "stego", priority: 5}
+	v.manager.Register(second)
+
+	v.tryStrategyUpgrade([]strategy.Strategy{first, second})
+
+	if first.dials.Load() != 1 {
+		t.Fatalf("the best candidate was dialled %d times, want 1", first.dials.Load())
+	}
+	if n := second.dials.Load(); n != 0 {
+		t.Fatalf("a failed upgrade went on to dial the next candidate (%d dials)", n)
+	}
+	if v.conn != oldConn || v.strategy != fallback {
+		t.Fatal("a failed upgrade touched the tunnel")
+	}
+}

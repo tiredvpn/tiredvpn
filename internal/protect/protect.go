@@ -274,6 +274,7 @@ func (d *ProtectDialer) DialContext(ctx context.Context, network, address string
 		return nil, fmt.Errorf("protect failed: %w", err)
 	}
 
+	tcpConnected(ctx, network)
 	return conn, nil
 }
 

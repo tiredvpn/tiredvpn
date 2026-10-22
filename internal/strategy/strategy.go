@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/mux"
 	"github.com/tiredvpn/tiredvpn/internal/porthopping"
+	"github.com/tiredvpn/tiredvpn/internal/protect"
 	"github.com/tiredvpn/tiredvpn/internal/shaper"
 	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 )
@@ -113,6 +115,7 @@ type Manager struct {
 	reprobeInterval time.Duration
 	stopReprobe     chan struct{}
 	reprobeRunning  bool
+	reprobeHeld     atomic.Bool // see HoldReprobe
 
 	// Emergency re-probe (for network recovery)
 	emergencyReprobeRunning bool
@@ -155,6 +158,13 @@ type Manager struct {
 	fastReconnectCount    int
 	fastReconnectFirst    time.Time
 	fastReconnectLast     time.Time // when the previous counted attempt happened
+
+	// A strategy whose TCP connect went through and whose handshake then ran
+	// out the rest of the cycle unanswered (see connectThroughRefusal). The
+	// next cycle leaves it out once, so the cycle after a swallowed handshake
+	// starts with the other transports. Guarded by m.mu.
+	handshakeSwallowed   string
+	handshakeSwallowedAt time.Time
 
 	// Connectivity checker for pre-flight checks
 	connectivityChecker  *ConnectivityChecker
@@ -278,13 +288,33 @@ var refusalRetries = []time.Duration{250 * time.Millisecond, 500 * time.Millisec
 // connectThroughRefusal dials s with an attempt limit, and when the address
 // refuses, waits and dials it again per refusalRetries. refused reports that
 // the last answer was still a refusal.
-func (m *Manager) connectThroughRefusal(ctx context.Context, s Strategy, target string, limit time.Duration) (conn net.Conn, latency time.Duration, refused bool, err error) {
+//
+// dialLimit, when shorter than limit, is how long the attempt may wait for its
+// TCP connect. An attempt whose connect is up by then runs on to limit: its
+// handshake is under way, and cutting it is how a REALITY handshake that needs
+// 7-9 s (a slow path, a server reaching its cover domain) lost the cycle to
+// HTTP Polling. Only dials through protect.ProtectDialer report the connect;
+// a strategy dialling on its own is held to dialLimit as a whole.
+func (m *Manager) connectThroughRefusal(ctx context.Context, s Strategy, target string, limit, dialLimit time.Duration) (conn net.Conn, latency time.Duration, refused bool, err error) {
+	if _, ok := s.(connectReporter); !ok && dialLimit > 0 {
+		limit, dialLimit = min(limit, dialLimit), 0
+	}
 	for i := 0; ; i++ {
 		connectCtx, cancel := context.WithTimeout(ctx, limit)
+		phase := watchConnect(connectCtx, cancel, limit, dialLimit)
 		start := time.Now()
-		conn, err = s.Connect(connectCtx, target)
+		conn, err = s.Connect(phase.ctx, target)
 		latency = time.Since(start)
+		phase.stop()
 		cancel()
+		if err != nil && phase.wasCut() {
+			err = fmt.Errorf("%w: %w", errTCPConnectCut, err)
+		}
+		if err != nil && phase.extended() && phase.connected() && heardNothing(err, latency, limit) {
+			m.mu.Lock()
+			m.handshakeSwallowed, m.handshakeSwallowedAt = s.ID(), time.Now()
+			m.mu.Unlock()
+		}
 		if err == nil || isUDPBasedStrategy(s) || !refusedByAddr(err, target, m.GetServerAddr(ctx)) {
 			return conn, latency, false, err
 		}
@@ -301,6 +331,75 @@ func (m *Manager) connectThroughRefusal(ctx context.Context, s Strategy, target 
 		}
 	}
 }
+
+// connectReporter marks a strategy whose Connect dials the server only through
+// protect.ProtectDialer, so the manager hears when its TCP connect is up (see
+// connectThroughRefusal). A strategy without it gives no such signal, and a cut
+// at the dial limit could land in the middle of its handshake.
+type connectReporter interface{ reportsTCPConnect() }
+
+func (*REALITYStrategy) reportsTCPConnect()     {}
+func (*SeqovlStrategy) reportsTCPConnect()      {}
+func (*HTTP2StegoStrategy) reportsTCPConnect()  {}
+func (*HTTPPollingStrategy) reportsTCPConnect() {}
+
+// Connect phases of one attempt, see watchConnect.
+const (
+	phaseDialling int32 = iota
+	phaseConnected
+	phaseCut
+)
+
+// connectPhase follows one attempt through its TCP connect.
+type connectPhase struct {
+	ctx   context.Context
+	state atomic.Int32
+	timer *time.Timer
+	split bool
+}
+
+// watchConnect arms the dialLimit cut of connectThroughRefusal on ctx, whose
+// cancel is cancel. Without a split (dialLimit zero or not shorter than limit)
+// the attempt simply runs to limit.
+func watchConnect(ctx context.Context, cancel context.CancelFunc, limit, dialLimit time.Duration) *connectPhase {
+	p := &connectPhase{ctx: ctx}
+	if dialLimit <= 0 || dialLimit >= limit {
+		return p
+	}
+	p.split = true
+	p.ctx = protect.WithConnectedHook(ctx, func() { p.state.CompareAndSwap(phaseDialling, phaseConnected) })
+	p.timer = time.AfterFunc(dialLimit, func() {
+		if p.state.CompareAndSwap(phaseDialling, phaseCut) {
+			cancel()
+		}
+	})
+	return p
+}
+
+func (p *connectPhase) stop() {
+	if p.timer != nil {
+		p.timer.Stop()
+	}
+}
+
+// extended reports an attempt allowed past dialLimit once connected.
+func (p *connectPhase) extended() bool { return p.split }
+
+func (p *connectPhase) connected() bool { return p.state.Load() == phaseConnected }
+
+// wasCut reports an attempt stopped at dialLimit with no TCP connect.
+func (p *connectPhase) wasCut() bool { return p.state.Load() == phaseCut }
+
+// errTCPConnectCut marks an attempt cut at its dial limit before its TCP
+// connect completed: a dial timeout, whatever the strategy made of the
+// cancellation.
+var errTCPConnectCut = tcpConnectCut{}
+
+type tcpConnectCut struct{}
+
+func (tcpConnectCut) Error() string   { return "no TCP connect within the attempt's dial limit" }
+func (tcpConnectCut) Timeout() bool   { return true }
+func (tcpConnectCut) Temporary() bool { return true }
 
 // refusedScan is the error a scan ends with when the address kept refusing.
 func refusedScan(target string, err error) error {
@@ -450,7 +549,7 @@ func (m *Manager) classifyAttempt(err error, latency, budget time.Duration) atte
 // dialNeverConnected reports a failure in the TCP connect itself: a dial that
 // timed out, or a host that could not be reached.
 func dialNeverConnected(err error) bool {
-	if addrUnreachable(err) {
+	if addrUnreachable(err) || errors.Is(err, errTCPConnectCut) {
 		return true
 	}
 	opErr, ok := errors.AsType[*net.OpError](err)
@@ -1663,6 +1762,22 @@ func (m *Manager) ConnectExcluding(ctx context.Context, target string, excludeID
 	return m.connectWithRTTScan(ctx, target, excludeIDs, rttEnabled, &scanState{})
 }
 
+// takeSwallowed returns, once, the strategy whose handshake ran out the
+// previous cycle (handshakeSwallowed), if that was recent. A connected
+// handshake may now use the rest of a cycle, so a swallowed one costs the
+// cycle; this keeps it from costing the next one too. Forced mode has nothing
+// else to try and never skips.
+func (m *Manager) takeSwallowed() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	id, at := m.handshakeSwallowed, m.handshakeSwallowedAt
+	m.handshakeSwallowed = ""
+	if id == "" || m.forced || len(m.strategies) < 2 || time.Since(at) > 2*m.connectTimeout {
+		return ""
+	}
+	return id
+}
+
 // connectWithRTT is the internal connect method with optional RTT masking. It
 // scans on its own, for callers that make a single pass.
 func (m *Manager) connectWithRTT(ctx context.Context, target string, excludeIDs []string, useRTTMasking bool) (net.Conn, Strategy, error) {
@@ -1691,6 +1806,10 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 	// both consult it.
 	excludeMap := make(map[string]bool, len(excludeIDs))
 	for _, id := range excludeIDs {
+		excludeMap[id] = true
+	}
+	if id := m.takeSwallowed(); id != "" {
+		log.Info("Strategy %s ran out the last cycle in its handshake - trying the others first this time", id)
 		excludeMap[id] = true
 	}
 
@@ -1730,16 +1849,19 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 		default:
 			log.Info("Trying last successful strategy first: %s", lastSuccessful.Name())
 
-			// The fast path may not spend the whole cycle. The reconnect gives
-			// a cycle 15 s and an attempt may take 30: a transport whose
-			// handshake is swallowed used it all, and the deadline then read
-			// as the address's silence, parking a server where the next
-			// strategy works. Half is left for the scan.
+			// The fast path may not wait out the whole cycle for a TCP
+			// connect: the reconnect gives a cycle 15 s and an attempt may
+			// take 30, and half is left for the scan. A connect that is up
+			// keeps the rest, because the handshake on it is the one that
+			// worked last time, and a slow one (7-9 s through a lossy path
+			// or a server dialling its cover) used to be cut at half and
+			// land the tunnel on HTTP Polling.
 			budget := m.attemptBudget(ctx)
+			dialBudget := budget
 			if budget < m.connectTimeout {
-				budget /= 2
+				dialBudget = budget / 2
 			}
-			conn, latency, refused, err := m.connectThroughRefusal(ctx, lastSuccessful, target, budget)
+			conn, latency, refused, err := m.connectThroughRefusal(ctx, lastSuccessful, target, budget, dialBudget)
 
 			if err == nil {
 				// Success - update stats (also records the breaker success)
@@ -1965,12 +2087,14 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			log.Debug("  Attempt %d/%d for %s", retry+1, m.maxRetries, s.Name())
 
 			// Same rule as the fast path: while other transports remain, one
-			// attempt may not take the whole of a short cycle.
+			// attempt may not wait the whole of a short cycle for its TCP
+			// connect; once connected, its handshake keeps the rest.
 			budget := m.attemptBudget(ctx)
+			dialBudget := budget
 			if budget < m.connectTimeout && i < len(strategies)-1 {
-				budget /= 2
+				dialBudget = budget / 2
 			}
-			conn, latency, refused, err := m.connectThroughRefusal(ctx, s, target, budget)
+			conn, latency, refused, err := m.connectThroughRefusal(ctx, s, target, budget, dialBudget)
 
 			if err == nil {
 				// Success - update confidence with latency and save for fast reconnect
@@ -2837,8 +2961,25 @@ func (m *Manager) StopPeriodicReprobe() {
 	}
 }
 
+// HoldReprobe holds periodic reprobes off while held is true. The TUN client
+// holds them while it has no tunnel and is reconnecting.
+//
+// A reprobe in an outage probed the pinned server that had just gone silent:
+// about 16 connects, 30-40 SYNs with their retransmits, within ~20 s, from a
+// client whose reconnect loop was already dialling that same pool - the burst
+// a sweep against a blocked address looks like. It found nothing (0/21 on the
+// stand), the upgrade it feeds needs a live tunnel, and the reconnect and the
+// pool poll already say when a server answers again.
+func (m *Manager) HoldReprobe(held bool) {
+	m.reprobeHeld.Store(held)
+}
+
 // doPeriodicReprobe performs a single reprobe cycle
 func (m *Manager) doPeriodicReprobe(ctx context.Context) {
+	if m.reprobeHeld.Load() {
+		log.Debug("Periodic reprobe skipped: no tunnel, the reconnect is dialling")
+		return
+	}
 	target := m.GetServerAddr(ctx)
 	if target == "" {
 		log.Warn("No reprobe target set")

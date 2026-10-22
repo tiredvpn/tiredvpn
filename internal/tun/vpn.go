@@ -1921,8 +1921,15 @@ func (v *VPNClient) tryStrategyUpgrade(cands []strategy.Strategy) {
 		conn, err := v.manager.ConnectStrategy(dialCtx, next, cand)
 		dialCancel()
 		if err != nil {
+			// One offer, one dial. Walking on to the next candidate put a
+			// handshake of every transport the reprobe found on the wire
+			// within milliseconds (five on the stand, all reset), a sweep no
+			// client of one protocol makes; against a censor that drops
+			// instead of resetting it would hold the tunnel's upgrade slot for
+			// a connect timeout per candidate. The next reprobe makes the next
+			// offer.
 			log.Info("Strategy upgrade: %s failed (%v), staying on %s", next.Name(), err, cur.Name())
-			continue
+			return
 		}
 		v.handshakeUpgrade(oldConn, conn, cur, next, localIP, cand)
 		return
@@ -2079,6 +2086,10 @@ func (v *VPNClient) disconnect(conn net.Conn, reason string, err error) {
 		return
 	}
 	defer atomic.StoreInt32(&v.reconnecting, 0)
+	if v.manager != nil {
+		v.manager.HoldReprobe(true)
+		defer v.manager.HoldReprobe(false)
+	}
 
 	v.mu.Lock()
 	if conn != nil && v.conn != nil && v.conn != conn {
@@ -2376,15 +2387,18 @@ var reconnectConnectTimeout = 15 * time.Second
 // network works, which is what an IP block looks like: those SYNs cross the
 // censor.
 //
-// The pause between rounds is drawn, not fixed: RandomDelay(base/2, base,
-// 2 x base). base is 5 s for the first two minutes (a provider's line
-// flapping), then grows by half per round up to a minute. A silent dial adds
-// its own poolDialTimeout (3 s) before the pause starts. So the first two
-// minutes see a dial every ~5.5-13 s, and later every ~33-123 s; per address
-// that is pool size times as long, which bounds how late a recovered server is
-// noticed: with 4 addresses and the minute-long base, up to about 8 minutes in
-// the worst draw, about 4 on average. There is no measured reference
-// distribution; the point is no grid and fewer SYNs the longer the silence.
+// The pause between rounds is drawn, not fixed (see poolPause). base is 5 s
+// for the first two minutes (a provider's line flapping), then grows by half
+// per round up to a minute. A silent dial adds its own poolDialTimeout (3 s)
+// before the pause starts. Simulated over the real functions: a dial every
+// 5.5-8.0 s in the first two minutes (median 6.2), then every 33-63 s (median
+// 41.5, p90 55.6), about 40 dials in the first 15 minutes of silence. How late
+// a recovered server is noticed, 15 minutes into the silence, with 4 addresses
+// in the pool: the whole pool back (the client's own uplink returning) - median
+// 22 s, worst 63 s; one server of two (2 addresses) - median 45 s, p99 141 s,
+// worst 174 s; one address of 4 - median 87 s, p99 189 s, worst 218 s. There
+// is no measured reference distribution; the point is no grid and fewer SYNs
+// the longer the silence.
 var (
 	poolPollInterval = 5 * time.Second
 	poolFastPhase    = 2 * time.Minute
@@ -2409,9 +2423,12 @@ func nextPoolBase(cur, silentFor time.Duration) time.Duration {
 	return min(time.Duration(float64(cur)*poolPollGrowth), poolPollMax)
 }
 
-// poolPause draws the actual pause around base.
+// poolPause draws the actual pause under base: RandomDelay(base/2, 3/4 base,
+// base). The ceiling is base, not twice it: with 2 x base (round 3) the
+// long-run gap reached 123 s, and a client whose own uplink came back waited up
+// to two minutes for the next dial, against 63 s before the pauses were drawn.
 func poolPause(base time.Duration) time.Duration {
-	return strategy.RandomDelay(base/2, base, 2*base)
+	return strategy.RandomDelay(base/2, 3*base/4, base)
 }
 
 // waitOutSilentPool decides what a "nobody in the pool answers" verdict means
