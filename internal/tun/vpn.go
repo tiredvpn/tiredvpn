@@ -201,7 +201,7 @@ type VPNClient struct {
 	upgrading         atomic.Bool
 
 	// upgradePending is the strategy an upgrade moved the tunnel to, until
-	// its session has carried traffic for sessionUsefulMin (then the upgrade
+	// its session has carried traffic for deadSessionMax (then the upgrade
 	// is confirmed) or ends first (then it failed). Guarded by mu.
 	upgradePending strategy.Strategy
 
@@ -1804,7 +1804,8 @@ func (v *VPNClient) readFromServer() {
 
 // noteDownlink records that the server just sent something, and confirms a
 // pending strategy upgrade once its session has carried traffic for
-// sessionUsefulMin: a dial and a handshake prove less than that, and a session
+// deadSessionMax - the same line past which a session no longer counts as
+// having died young: a dial and a handshake prove less than that, and a session
 // frozen a second after the swap must count as a failed upgrade, not a
 // successful one (see Manager.UpgradeOutcome).
 func (v *VPNClient) noteDownlink() {
@@ -1812,13 +1813,13 @@ func (v *VPNClient) noteDownlink() {
 	v.mu.Lock()
 	v.lastRx = now
 	var confirmed strategy.Strategy
-	if v.upgradePending != nil && now.Sub(v.connectedAt) >= sessionUsefulMin {
+	if v.upgradePending != nil && now.Sub(v.connectedAt) >= deadSessionMax {
 		confirmed, v.upgradePending = v.upgradePending, nil
 	}
 	v.mu.Unlock()
 	if confirmed != nil && v.manager != nil {
 		v.manager.UpgradeOutcome(confirmed, true)
-		log.Info("Strategy upgrade to %s confirmed: the session has carried traffic for %v", confirmed.Name(), sessionUsefulMin)
+		log.Info("Strategy upgrade to %s confirmed: the session has carried traffic for %v", confirmed.Name(), deadSessionMax)
 	}
 }
 

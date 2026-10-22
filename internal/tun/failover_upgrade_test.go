@@ -250,8 +250,18 @@ func TestUpgradeIsConfirmedOnlyByAUsefulSession(t *testing.T) {
 		t.Fatal("the upgrade was booked as a success before its session carried anything")
 	}
 
+	// Past the strategy line but short of the dead-session line: a session
+	// that died now would still count as dead young, so it is no proof yet.
 	v.mu.Lock()
-	v.connectedAt = time.Now().Add(-sessionUsefulMin - time.Second) // the session has been up long enough
+	v.connectedAt = time.Now().Add(-sessionUsefulMin - 5*time.Second)
+	v.mu.Unlock()
+	v.noteDownlink()
+	if got := v.manager.GetLastConnectionInfo().StrategyID; got == "reality" {
+		t.Fatal("confirmed between the 20 s and 40 s lines, where the same session would still count as dead")
+	}
+
+	v.mu.Lock()
+	v.connectedAt = time.Now().Add(-deadSessionMax - time.Second) // the session has been up long enough
 	v.mu.Unlock()
 	runReader(t, v)
 	close(keepalive)
