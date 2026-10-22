@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -480,4 +481,90 @@ func silentTCPAddr(t *testing.T) string {
 	}
 	t.Cleanup(func() { filler.Close(); syscall.Close(fd) })
 	return addr
+}
+
+// lateTimerCtx has a deadline whose timer never fires: Err stays nil and Done
+// never closes. It is the moment a loaded runtime makes of every deadline - the
+// netpoller already failed a dial bounded by it, the context's own timer has
+// not run yet.
+type lateTimerCtx struct {
+	context.Context
+	dl time.Time
+}
+
+func (c lateTimerCtx) Deadline() (time.Time, bool) { return c.dl, true }
+
+// TestALateDeadlineTimerStillGivesTheVerdict is the cause behind
+// TestDeadlineOnASilentAddressParksIt failing a few times in 50 runs next to
+// a full test run: the last transport's dial came back with "i/o timeout" at
+// the deadline, the scan asked ctx.Err(), the context's timer had not fired
+// yet, and the cycle ended as "all strategies failed" - then went on to the
+// live server with no time left. The deadline is read from the clock.
+func TestALateDeadlineTimerStillGivesTheVerdict(t *testing.T) {
+	silent := silentTCPAddr(t)
+	live := newHelloListener(t)
+	m := newSilenceManager(t, 2*time.Second, silent, live.addr)
+	s := &maskedTimeoutStrategy{id: "s0", priority: 1}
+	m.Register(s)
+	m.Register(&maskedTimeoutStrategy{id: "s1", priority: 2})
+	markConnected(m, s)
+	for _, c := range m.selector().Candidates() {
+		m.selector().ReportProbe(c, true, time.Millisecond)
+	}
+
+	ctx := lateTimerCtx{Context: context.Background(), dl: time.Now().Add(300 * time.Millisecond)}
+	if conn, _, err := m.Connect(ctx, ""); err == nil {
+		conn.Close()
+		t.Fatal("Connect succeeded against a blackhole - the test proves nothing")
+	} else if !errors.Is(err, errAddrSilent) {
+		t.Fatalf("err = %v, want the silence verdict", err)
+	}
+	if st := endpointState(t, m, silent); !st.CooldownUntil.After(time.Now()) {
+		t.Fatal("the silent address was not parked")
+	}
+	if st := endpointState(t, m, live.addr); st.ConsecutiveFailures != 0 {
+		t.Fatalf("the live server was charged for a cycle with no time left: %+v", st)
+	}
+}
+
+// overrunStrategy ignores its context and fails after d: a transport stuck in
+// a call that does not watch the deadline.
+type overrunStrategy struct {
+	id    string
+	prio  int
+	d     time.Duration
+	tries atomic.Int64
+}
+
+func (s *overrunStrategy) Name() string                        { return s.id }
+func (s *overrunStrategy) ID() string                          { return s.id }
+func (s *overrunStrategy) Priority() int                       { return s.prio }
+func (s *overrunStrategy) RequiresServer() bool                { return true }
+func (s *overrunStrategy) Description() string                 { return "overruns its deadline" }
+func (s *overrunStrategy) Probe(context.Context, string) error { return nil }
+func (s *overrunStrategy) Connect(context.Context, string) (net.Conn, error) {
+	s.tries.Add(1)
+	time.Sleep(s.d)
+	return nil, errors.New("stuck transport gave up")
+}
+
+// TestNoDialAfterTheDeadlineWithALateTimer: once the caller's deadline is
+// behind it the scan dials nothing more, whether or not the context's timer
+// has fired. A dial on a spent budget fails at once and charges the strategy
+// for the caller's deadline.
+func TestNoDialAfterTheDeadlineWithALateTimer(t *testing.T) {
+	live := newHelloListener(t)
+	m := newSilenceManager(t, 2*time.Second, live.addr)
+	m.Register(&overrunStrategy{id: "stuck", prio: 1, d: 200 * time.Millisecond})
+	next := &overrunStrategy{id: "next", prio: 2}
+	m.Register(next)
+
+	ctx := lateTimerCtx{Context: context.Background(), dl: time.Now().Add(100 * time.Millisecond)}
+	if conn, _, err := m.Connect(ctx, ""); err == nil {
+		conn.Close()
+		t.Fatal("connected")
+	}
+	if n := next.tries.Load(); n != 0 {
+		t.Fatalf("dialled the next strategy %d times after the deadline had passed", n)
+	}
 }

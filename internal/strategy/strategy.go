@@ -567,16 +567,35 @@ func dialNeverConnected(err error) bool {
 // context error left the address unpunished, so the next cycle dialled the same
 // silent server with the same result.
 func scanOutOfTime(ctx context.Context, target string, scan *scanState, lastErr error) error {
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) && !scan.answered && scan.timeouts >= 2 {
+	err := ctxErr(ctx)
+	if errors.Is(err, context.DeadlineExceeded) && !scan.answered && scan.timeouts >= 2 {
 		log.Info("Address %s answered nothing on %d transports before the connect budget ran out",
 			target, scan.timeouts)
 		if lastErr == nil {
-			lastErr = ctx.Err()
+			lastErr = err
 		}
 		return fmt.Errorf("%w: %w, last error: %w", errAddrSilent, errStrategyScanFailed, lastErr)
 	}
 	log.Warn("Connection cancelled by context")
-	return ctx.Err()
+	return err
+}
+
+// ctxErr is ctx.Err(), except that a deadline already behind us reads as
+// context.DeadlineExceeded even before the context's own timer has fired.
+//
+// That timer runs on its own and can be late. A dial bounded by the same
+// deadline comes back with "i/o timeout" from the netpoller first, and under
+// load the scan then found ctx.Err() still nil: the last transport's silence
+// read as an ordinary failure, the endpoint walk moved to the next server on a
+// context about to expire, and the cycle ended with no verdict at all.
+func ctxErr(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if dl, ok := ctx.Deadline(); ok && !time.Now().Before(dl) {
+		return context.DeadlineExceeded
+	}
+	return nil
 }
 
 // preflightFailThreshold is how many consecutive failed connects must pile up
@@ -1569,7 +1588,7 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 			sel.Report(cand, false, 0)
 		}
 		m.logEndpointHealth(sel, cand)
-		if ctx.Err() != nil {
+		if ctxErr(ctx) != nil {
 			// The verdict is in; the next candidate gets the next cycle. Its
 			// pre-flight on a dead context would read as "no network" instead.
 			break
@@ -1999,7 +2018,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 	addrSilent := false
 
 	for i, s := range strategies {
-		if ctx.Err() != nil {
+		if ctxErr(ctx) != nil {
 			// Out of time before this strategy was dialled. Dialling it anyway
 			// fails at once and charges it for the caller's deadline.
 			return nil, nil, scanOutOfTime(ctx, target, scan, lastErr)
@@ -2210,7 +2229,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 		log.Debug("Strategy %s exhausted, moving to next", s.Name())
 	}
 
-	if !addrSilent && ctx.Err() != nil {
+	if !addrSilent && ctxErr(ctx) != nil {
 		// The last transport ran into the caller's deadline: the same ending
 		// as running out of time between transports.
 		return nil, nil, scanOutOfTime(ctx, target, scan, lastErr)
