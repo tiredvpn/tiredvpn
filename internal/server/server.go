@@ -375,6 +375,11 @@ type Config struct {
 	// If empty, unauthorized REALITY connections are silently dropped.
 	REALITYCoverDomain string
 
+	// REALITYSNIs (-reality-sni) are operator-set donors on top of the
+	// built-in allowlist: the cover names this exit's clients are configured
+	// with. An unauthenticated connection naming one is mirrored to that site.
+	REALITYSNIs []string
+
 	// NodeMaxClients caps distinct authenticated clients on this node. 0 = off.
 	//
 	// The vector is address reputation, and it is the only confirmed one that

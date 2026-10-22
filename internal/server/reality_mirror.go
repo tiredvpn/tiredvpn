@@ -223,7 +223,7 @@ type donorHandoff struct {
 func dialDonorEagerly(peekBuf []byte, srvCtx *serverContext) <-chan donorHandoff {
 	out := make(chan donorHandoff, 1)
 
-	dest := donorDestination(peekBuf, srvCtx.cfg.REALITYCoverDomain)
+	dest := donorDestination(peekBuf, srvCtx.cfg)
 	if dest == "" {
 		out <- donorHandoff{err: errNoDonor}
 		return out

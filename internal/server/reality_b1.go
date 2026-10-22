@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -362,7 +364,7 @@ func awaitDonor(donor <-chan donorHandoff, peekBuf []byte, srvCtx *serverContext
 		return h.conn, h.dest, h.err
 	}
 
-	dest := donorDestination(peekBuf, srvCtx.cfg.REALITYCoverDomain)
+	dest := donorDestination(peekBuf, srvCtx.cfg)
 	if dest == "" {
 		return nil, "", errNoDonor
 	}
@@ -384,24 +386,28 @@ func releaseDonor(donor <-chan donorHandoff) {
 	}()
 }
 
-// donorDestination applies the destination policy to a ClientHello.
-func donorDestination(peekBuf []byte, coverDomain string) string {
+// donorDestination applies the destination policy to a ClientHello: the SNI
+// if it is a donor we allow, else the cover domain.
+func donorDestination(peekBuf []byte, cfg *Config) string {
 	sni, err := ExtractSNI(peekBuf)
-	if err == nil && sniAllowlisted(sni) {
+	if err == nil && sniAllowlisted(sni, cfg.REALITYSNIs) {
 		return sni
 	}
-	return coverDomain
+	return cfg.REALITYCoverDomain
 }
 
 // sniAllowlisted reports whether a hostname is one of the donors we are willing
-// to open a connection to.
-func sniAllowlisted(sni string) bool {
+// to open a connection to: the built-in list, or one the operator added with
+// -reality-sni. Only those two - the name comes from an unauthenticated
+// ClientHello, and dialling whatever it says would make the exit an open
+// proxy.
+func sniAllowlisted(sni string, extra []string) bool {
 	for _, entry := range evasion.WhitelistedSNIs {
 		if entry.SNI == sni {
 			return true
 		}
 	}
-	return false
+	return slices.Contains(extra, strings.ToLower(sni))
 }
 
 // proxyBothWays copies in both directions until either side finishes, passing
