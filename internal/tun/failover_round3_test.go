@@ -3,7 +3,9 @@ package tun
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -129,5 +131,72 @@ func TestUpgradeDialsTheSessionsEndpoint(t *testing.T) {
 	v.tryStrategyUpgrade([]strategy.Strategy{better})
 	if dialled != addrs[0] {
 		t.Fatalf("the upgrade dialled %q, want the session's endpoint %s", dialled, addrs[0])
+	}
+}
+
+// TestFamilyRecoveredDuringPoolWaitIsPolled is P1-C of the round-2 review. The
+// pool poll walks only the candidates marked as having a physical route, and
+// that mark is refreshed by the family preflight - which ran only inside a
+// connect cycle. Round 2 removed the wait's periodic exit to a connect, so a
+// family whose route came back mid-wait stayed excluded: here IPv4 is
+// blackholed, IPv6 has no route at first and gets it back 1.5 s in, and the
+// client must reconnect over IPv6.
+func TestFamilyRecoveredDuringPoolWaitIsPolled(t *testing.T) {
+	setPoolWaitKnobs(t, true)
+	reconnectConnectTimeout = time.Second
+
+	ln6, err := net.Listen("tcp", "[::1]:0")
+	if err != nil {
+		t.Skipf("no IPv6 loopback: %v", err)
+	}
+	t.Cleanup(func() { ln6.Close() })
+	go func() {
+		for {
+			c, err := ln6.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	v4 := silentTCPAddr(t)
+	v6 := ln6.Addr().String()
+
+	m := strategy.NewManager()
+	if err := m.SetEndpointSelection(endpoint.Config{
+		Endpoints: []endpoint.Endpoint{{Name: "a", V4: v4, V6: v6}},
+		Family:    endpoint.PreferV6,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var v6Back atomic.Bool
+	m.SetRouteReachable(func(addr string) (bool, bool) {
+		if addr == v6 {
+			return v6Back.Load(), true
+		}
+		return true, true
+	})
+	m.Register(&pipeStrategy{t: t, resp: bareV3Response(), gap: silent})
+	m.SetConnectivityChecker(strategy.NewConnectivityChecker(v4, 300*time.Millisecond, true))
+
+	out := &stampedLog{}
+	setLog(t, out)
+	v := newCallsiteClient(m)
+	v.running = 1
+	v.stopCh = make(chan struct{})
+	done := make(chan struct{})
+	go func() { v.handleDisconnect("server read", io.EOF); close(done) }()
+	time.AfterFunc(1500*time.Millisecond, func() { v6Back.Store(true) })
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		atomic.StoreInt32(&v.running, 0)
+		close(v.stopCh)
+		<-done
+		t.Fatalf("IPv6 came back mid-wait and the client never used it; log:\n%s", out)
+	}
+	if _, ok := out.first("VPN reconnected successfully"); !ok {
+		t.Fatalf("no tunnel; log:\n%s", out)
 	}
 }

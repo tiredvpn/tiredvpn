@@ -1112,7 +1112,16 @@ func (t *TUNDevice) ensureBypass(ip net.IP) {
 	}
 	resolved, err := netlink.RouteGet(ip)
 	if err == nil && len(resolved) > 0 && resolved[0].LinkIndex != link.Attrs().Index {
-		return // still leaving through a physical link, nothing to do
+		// Leaving through a physical link, nothing to pin. If this address
+		// was marked unroutable, re-admit it: this early return used to skip
+		// that, and a family whose route came back without a re-pin (a v4-only
+		// tunnel with a dual-stack pool) stayed excluded from selection.
+		if t.isBypassUnroutable(ip) {
+			if _, perr := t.physicalRouteTo(ip); perr == nil {
+				t.clearBypassUnroutable(ip)
+			}
+		}
+		return
 	}
 	// Traffic to ip would go through the tunnel (or the lookup failed): it wants
 	// a bypass pin. When we already know this family has no physical route, do

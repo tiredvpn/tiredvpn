@@ -3983,11 +3983,18 @@ func (m *Manager) GetServerAddr(ctx context.Context) string {
 
 // PoolAddrs returns the addresses of every candidate with a physical route,
 // in preference order - what a "does anyone answer" poll walks.
+//
+// The route verdicts are refreshed first. They used to be refreshed only by a
+// connect cycle's family preflight, and the pool wait does not run connect
+// cycles: a family whose route came back mid-wait stayed excluded while the
+// family that was left kept timing out. The refresh reads the routing table
+// and sends nothing.
 func (m *Manager) PoolAddrs() []string {
 	sel := m.selector()
 	if sel == nil {
 		return nil
 	}
+	m.familyReachabilityPreflight(sel)
 	var out []string
 	for _, c := range sel.Candidates() {
 		if sel.Reachable(c.Addr) {
