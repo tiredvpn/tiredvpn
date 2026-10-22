@@ -88,9 +88,9 @@ var silenceErr = &net.OpError{Op: "read", Err: os.ErrDeadlineExceeded}
 // link dropped parked the server it had just reached - D7's bug class, on the
 // session path. The local network is asked first.
 func TestDeadSessionNotChargedWhenTheLinkIsDown(t *testing.T) {
-	old := probeInternet
-	probeInternet = func() bool { return false }
-	t.Cleanup(func() { probeInternet = old })
+	old := probeLocalLink
+	probeLocalLink = func() bool { return false }
+	t.Cleanup(func() { probeLocalLink = old })
 
 	m, _, _ := poolManager(t, 2)
 	now := time.Now()
@@ -105,9 +105,9 @@ func TestDeadSessionNotChargedWhenTheLinkIsDown(t *testing.T) {
 // minute and a route-wide freeze walked the pool every half minute. The dead
 // streak now grows the park until a useful session clears it.
 func TestDeadSessionsEscalateUntilAUsefulSession(t *testing.T) {
-	old := probeInternet
-	probeInternet = func() bool { return true }
-	t.Cleanup(func() { probeInternet = old })
+	old := probeLocalLink
+	probeLocalLink = func() bool { return true }
+	t.Cleanup(func() { probeLocalLink = old })
 
 	m, addrs, _ := poolManager(t, 1)
 	now := time.Now()
@@ -133,9 +133,9 @@ func TestDeadSessionsEscalateUntilAUsefulSession(t *testing.T) {
 // observer; the second server is left alone and the storm detector works on
 // the strategies.
 func TestDeathOnTwoServersIsTheRoute(t *testing.T) {
-	old := probeInternet
-	probeInternet = func() bool { return true }
-	t.Cleanup(func() { probeInternet = old })
+	old := probeLocalLink
+	probeLocalLink = func() bool { return true }
+	t.Cleanup(func() { probeLocalLink = old })
 
 	m, addrs, _ := poolManager(t, 2)
 	now := time.Now()
@@ -158,9 +158,9 @@ func TestDeathOnTwoServersIsTheRoute(t *testing.T) {
 // through as useful at 29.9 s. The endpoint verdict line is split from the
 // strategy one and sits clear of the measured spread.
 func TestDeadSessionLineHasMargin(t *testing.T) {
-	old := probeInternet
-	probeInternet = func() bool { return true }
-	t.Cleanup(func() { probeInternet = old })
+	old := probeLocalLink
+	probeLocalLink = func() bool { return true }
+	t.Cleanup(func() { probeLocalLink = old })
 
 	polling := fmt.Errorf("http_polling: no successful poll within the health grace: %w", strategy.ErrServerSilent)
 	for _, tc := range []struct {
@@ -190,9 +190,9 @@ func logSetOutput(w io.Writer) { log.SetOutput(w) }
 // the route carried traffic, and the next server to kill a session young is
 // charged again.
 func TestUsefulSessionEndsTheRouteVerdict(t *testing.T) {
-	old := probeInternet
-	probeInternet = func() bool { return true }
-	t.Cleanup(func() { probeInternet = old })
+	old := probeLocalLink
+	probeLocalLink = func() bool { return true }
+	t.Cleanup(func() { probeLocalLink = old })
 
 	m, addrs, _ := poolManager(t, 2)
 	now := time.Now()

@@ -65,9 +65,9 @@ func deadStreak(t *testing.T, m *strategy.Manager, addr string) int {
 // had just carried ten minutes of Polling. The strategy is to blame, and the
 // failed upgrade already says so.
 func TestFailedUpgradeDoesNotParkTheFallbacksServer(t *testing.T) {
-	old := probeInternet
-	probeInternet = func() bool { return true }
-	t.Cleanup(func() { probeInternet = old })
+	old := probeLocalLink
+	probeLocalLink = func() bool { return true }
+	t.Cleanup(func() { probeLocalLink = old })
 
 	v, m, addrs, better := upgradeOnSelector(t)
 	setLog(t, &stampedLog{})
@@ -316,5 +316,47 @@ func TestPortHopChecksRunningOnBothSides(t *testing.T) {
 		if !stopDuring && exit.handshakes.Load() != 0 {
 			t.Fatal("a stopped client handshook on the exit")
 		}
+	}
+}
+
+// TestNoGatewayMeansNoDeadSessionVerdict is the "D6 outside Linux/Android" P3
+// of the round-2 review: without a physical gateway to ask, the local-network
+// check fell back to public resolvers that route into the dead tunnel, so the
+// verdict was a coin toss (and up to 6 s of waiting). With no gateway the
+// answer is "cannot tell", and no server is charged on it.
+func TestNoGatewayMeansNoDeadSessionVerdict(t *testing.T) {
+	old := gatewayAddrs
+	gatewayAddrs = func() []string { return nil }
+	t.Cleanup(func() { gatewayAddrs = old })
+	if localLinkUp() {
+		t.Fatal("no gateway known, and the local link was declared up")
+	}
+}
+
+// TestFailedUpgradeIsChargedOnce is the "double penalty" P3: a failed upgraded
+// session was charged by UpgradeOutcome and again as a session that was not
+// useful.
+func TestFailedUpgradeIsChargedOnce(t *testing.T) {
+	old := probeLocalLink
+	probeLocalLink = func() bool { return true }
+	t.Cleanup(func() { probeLocalLink = old })
+
+	v, m, _, better := upgradeOnSelector(t)
+	setLog(t, &stampedLog{})
+	v.tryStrategyUpgrade([]strategy.Strategy{better})
+	if v.strategy != better {
+		t.Fatal("no swap")
+	}
+	before := m.GetStats()["reality"].FailureCount
+	v.mu.Lock()
+	v.conn = &failingConn{err: io.EOF}
+	v.mu.Unlock()
+	out := &stopOnDisconnectLog{v: v}
+	setLog(t, out)
+	done := make(chan struct{})
+	go func() { v.readFromServer(); close(done) }()
+	<-done
+	if got := m.GetStats()["reality"].FailureCount - before; got != 1 {
+		t.Fatalf("a failed upgraded session was charged %d times, want once", got)
 	}
 }

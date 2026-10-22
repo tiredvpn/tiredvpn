@@ -180,3 +180,28 @@ func TestRouteRuleDoesNotLatch(t *testing.T) {
 		t.Fatalf("ResetForNetworkChange kept the route marker at %d", marker)
 	}
 }
+
+// TestStormChecksTheLocalNetwork is P2-4 of the round-2 review: the local-link
+// guard covered the dead-session charge but not the storm one, so a storm of
+// short sessions caused by the client's own link parked the server.
+func TestStormChecksTheLocalNetwork(t *testing.T) {
+	live := newHelloListener(t)
+	other := newHelloListener(t)
+	m := newSilenceManager(t, time.Second, live.addr, other.addr)
+	m.stormDetector = NewStormDetector(StormConfig{Grace: -1, MinSessions: 1})
+	m.Register(&greetingStrategy{id: "reality", priority: 5})
+
+	conn, s, cand, _, err := m.ConnectSession(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
+	m.RecordSessionStart(s.ID())
+	if !m.SessionEnded(SessionEnd{Strategy: s.ID(), Endpoint: cand, HasEndpoint: true,
+		LocalNetworkUp: func() bool { return false }}) {
+		t.Fatal("no storm - the test proves nothing")
+	}
+	if st := endpointState(t, m, live.addr); st.CooldownUntil.After(time.Now()) {
+		t.Fatal("a storm with the local link down parked the server")
+	}
+}

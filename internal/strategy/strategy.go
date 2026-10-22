@@ -1214,6 +1214,17 @@ type SessionEnd struct {
 	// dropped REALITY below HTTP Polling after a single server restart.
 	Useful bool
 
+	// UpgradeFailed says the session was a pending strategy upgrade that died
+	// before proving itself. UpgradeOutcome has already charged the strategy,
+	// so it is not charged a second time here.
+	UpgradeFailed bool
+
+	// LocalNetworkUp, when set, is asked before the endpoint is charged for
+	// a dead session or a storm: a link that dropped on the client's side
+	// kills sessions just the same, and parking a server for it is D7 over
+	// again. It reports false when it cannot tell. Nil means "up".
+	LocalNetworkUp func() bool
+
 	// Dead says the session ended in silence with its downlink dead almost from
 	// the start, while the local network was up: every connect to the endpoint
 	// succeeds - so connect-based health never notices, and each success reset
@@ -1234,7 +1245,7 @@ type SessionEnd struct {
 // It feeds the storm detector exactly as RecordSessionEnd does and returns its
 // verdict.
 func (m *Manager) SessionEnded(end SessionEnd) (storming bool) {
-	if !end.Useful {
+	if !end.Useful && !end.UpgradeFailed {
 		m.UpdateStrategyConfidence(end.Strategy, false)
 	}
 	storming = m.RecordSessionEnd(end.Strategy)
@@ -1278,6 +1289,10 @@ func (m *Manager) SessionEnded(end SessionEnd) (storming bool) {
 // case is left to the storm detector, which works on the strategies.
 func (m *Manager) chargeSessionEndpoint(sel *endpoint.Selector, end SessionEnd, why string) {
 	if sel == nil || !end.HasEndpoint {
+		return
+	}
+	if end.LocalNetworkUp != nil && !end.LocalNetworkUp() {
+		log.Info("Endpoint %s: %s, but the local network cannot be confirmed up - not charging it", end.Endpoint, why)
 		return
 	}
 	m.mu.Lock()

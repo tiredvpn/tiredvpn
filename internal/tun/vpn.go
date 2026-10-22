@@ -2091,13 +2091,15 @@ func (v *VPNClient) disconnect(conn net.Conn, reason string, err error) {
 		// Not while an upgrade is pending: that session is the upgrade's, and
 		// its death says the new strategy failed (UpgradeOutcome above), not
 		// that the server - which just carried the fallback - is dead.
-		dead := pendingUpgrade == nil && silent && sessionDiedYoung(connectedAt, lastRx) && probeInternet()
+		dead := pendingUpgrade == nil && silent && sessionDiedYoung(connectedAt, lastRx)
 		v.manager.SessionEnded(strategy.SessionEnd{
-			Strategy:    endedStrategy.ID(),
-			Endpoint:    sessionCand,
-			HasEndpoint: hasSessionCand,
-			Useful:      sessionWasUseful(connectedAt, lastRx),
-			Dead:        dead,
+			Strategy:       endedStrategy.ID(),
+			Endpoint:       sessionCand,
+			HasEndpoint:    hasSessionCand,
+			Useful:         sessionWasUseful(connectedAt, lastRx),
+			Dead:           dead,
+			UpgradeFailed:  pendingUpgrade != nil,
+			LocalNetworkUp: probeLocalLink,
 		})
 	}
 
@@ -2481,6 +2483,28 @@ var publicFallbackProbes = []string{"8.8.8.8:53", "1.1.1.1:53"}
 // probeInternet is internetReachable, replaceable in tests: the real one dials
 // the host's default gateway.
 var probeInternet = internetReachable
+
+// probeLocalLink is localLinkUp, replaceable in tests.
+var probeLocalLink = localLinkUp
+
+// gatewayAddrs is physicalGateAddrs, replaceable in tests.
+var gatewayAddrs = physicalGateAddrs
+
+// localLinkUp reports whether the client's own link is up, for decisions that
+// charge a server: true only when a physical default-route gateway answers.
+// Without a gateway to ask (non-Linux, an exotic setup) it cannot tell and
+// says no. internetReachable falls back to public resolvers there, and those
+// sit behind the tunnel's own routes - a coin toss, and up to 6 s of waiting
+// before every reconnect - which is fine for "should I wait for the network"
+// and not for "may I blame the server".
+func localLinkUp() bool {
+	for _, addr := range gatewayAddrs() {
+		if dialMeansAlive(addr) {
+			return true
+		}
+	}
+	return false
+}
 
 // internetReachable reports whether anything outside answers. It must never
 // probe through the VPN tunnel itself: while the tunnel is down its routes

@@ -119,9 +119,9 @@ func TestSessionEndChargesOnlyADeadSession(t *testing.T) {
 // A long session that went silent is D1's case (the gate walks the pool), and a
 // short one ended by a reset is the storm detector's.
 func TestDeadSessionChargesItsEndpoint(t *testing.T) {
-	old := probeInternet
-	probeInternet = func() bool { return true }
-	t.Cleanup(func() { probeInternet = old })
+	old := probeLocalLink
+	probeLocalLink = func() bool { return true }
+	t.Cleanup(func() { probeLocalLink = old })
 
 	now := time.Now()
 	silence := &net.OpError{Op: "read", Err: os.ErrDeadlineExceeded}
