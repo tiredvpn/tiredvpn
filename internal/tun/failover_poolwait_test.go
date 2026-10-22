@@ -349,8 +349,8 @@ func TestPoolPollIsOneRotatingAddressWithGrowingPauses(t *testing.T) {
 		} else {
 			slow = append(slow, gap)
 		}
-		if gap > 2*poolPollMax+50*time.Millisecond {
-			t.Fatalf("pause %v past the %v ceiling", gap, 2*poolPollMax)
+		if gap > poolPollMax+poolDialTimeout+50*time.Millisecond {
+			t.Fatalf("pause %v past the %v ceiling", gap, poolPollMax)
 		}
 	}
 	mean := func(ds []time.Duration) time.Duration {
@@ -385,5 +385,36 @@ func TestSilentCycleCapsTheBackoffLower(t *testing.T) {
 	}
 	if got := nextReconnectDelay(time.Second, silentCycle); got != 2*time.Second {
 		t.Fatalf("below the cap the backoff doubles: got %v", got)
+	}
+}
+
+// TestPoolPauseStaysUnderItsBase is N8 of the second acceptance of PR #126:
+// the drawn pause reached twice its base, so the long-run poll gap went from
+// 63 s to up to 123 s, and the client whose uplink came back could wait two
+// minutes for the next dial. The pause stays in [base/2, base), and it is
+// still drawn: neither stuck on a bound nor flat.
+func TestPoolPauseStaysUnderItsBase(t *testing.T) {
+	const base = time.Minute
+	var low, high int
+	seen := map[time.Duration]bool{}
+	for range 10000 {
+		d := poolPause(base)
+		if d < base/2 || d >= base {
+			t.Fatalf("pause %v outside [%v, %v)", d, base/2, base)
+		}
+		seen[d.Round(time.Millisecond)] = true
+		if d < 40*time.Second {
+			low++
+		} else if d >= 50*time.Second {
+			high++
+		}
+	}
+	if len(seen) < 5000 {
+		t.Fatalf("only %d distinct pauses in 10000 draws: a grid", len(seen))
+	}
+	// Exponential shape over the floor: most draws near it, a tail toward the
+	// ceiling; uniform would put a third in each band.
+	if low < 4000 || high > 2500 || high == 0 {
+		t.Fatalf("pause shape off: %d draws under 40 s, %d at 50 s and over", low, high)
 	}
 }
