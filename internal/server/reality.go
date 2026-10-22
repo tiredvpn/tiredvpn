@@ -197,7 +197,7 @@ func handleREALITYAuthenticated(conn net.Conn, srvCtx *serverContext, logger *lo
 		// ClientHello happens to carry a real padding extension.
 		if srvCtx.cfg.REALITYCoverDomain != "" {
 			logger.Info("REALITY: Auth failed, proxying to the cover domain")
-			handleREALITYUnauthorized(conn, clientHello, srvCtx.cfg.REALITYCoverDomain, logger)
+			handleREALITYUnauthorized(conn, clientHello, srvCtx, logger)
 			conn.Close()
 			return true, nil
 		}
@@ -229,7 +229,7 @@ func handleREALITYAuthenticated(conn net.Conn, srvCtx *serverContext, logger *lo
 		if srvCtx.cfg.REALITYRequireDataV2 {
 			logger.Info("REALITY: rejecting legacy v1 data layer from %s (client: %s)", conn.RemoteAddr(), authClientID)
 			if srvCtx.cfg.REALITYCoverDomain != "" {
-				handleREALITYUnauthorized(conn, clientHello, srvCtx.cfg.REALITYCoverDomain, logger)
+				handleREALITYUnauthorized(conn, clientHello, srvCtx, logger)
 			}
 			return true, nil
 		}
@@ -461,21 +461,29 @@ func handleREALITYSession(conn net.Conn, srvCtx *serverContext, logger *log.Logg
 	}
 }
 
-// handleREALITYUnauthorized proxies unauthorized REALITY clients to the configured
-// cover domain. coverDomain is admin-controlled (Config.REALITYCoverDomain), not
-// client-provided SNI, so there is no SSRF via attacker-controlled hostname.
+// handleREALITYUnauthorized proxies unauthorized REALITY clients to a donor
+// chosen by the same policy as the B1 path (donorDestination): the SNI when it
+// is a built-in donor or one the operator listed with -reality-sni, else the
+// configured cover domain. Both lists are admin-controlled; an SNI on neither
+// is never dialled, so there is no SSRF via an attacker-controlled hostname.
+// Before, this path always went to the cover domain, and a probe replaying a
+// configured name got another site's certificate for it.
 // realityDonorPort is the port unauthenticated connections are forwarded to.
 // A variable rather than a constant so a test can point it at a local listener;
 // production never changes it.
 var realityDonorPort = "443"
 
-func handleREALITYUnauthorized(conn net.Conn, clientHello []byte, coverDomain string, logger *log.Logger) {
-	dest := net.JoinHostPort(coverDomain, realityDonorPort)
+func handleREALITYUnauthorized(conn net.Conn, clientHello []byte, srvCtx *serverContext, logger *log.Logger) {
+	host := donorDestination(clientHello, srvCtx.cfg)
+	if host == "" {
+		return
+	}
+	dest := net.JoinHostPort(host, realityDonorPort)
 
 	logger.Info("REALITY-UNAUTH: Proxying to %s", dest)
 
 	// Connect to real destination
-	destConn, err := net.DialTimeout("tcp", dest, 10*time.Second)
+	destConn, err := srvCtx.dialDonor(dest)
 	if err != nil {
 		logger.Error("REALITY-UNAUTH: Failed to connect to %s: %v", dest, err)
 		realityDonorDialFailTotal.Add(1)

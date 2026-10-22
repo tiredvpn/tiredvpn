@@ -252,7 +252,8 @@ Two limitations, both logged at startup:
 | `-reality-max-time-diff` | `300` | Client clock skew tolerated by B1 auth, in seconds. `0` disables the check; negative aborts startup. |
 | `-reality-min-client-ver` | | Lowest client version B1 accepts, `X.Y.Z`. Empty disables the check. An unparsable value aborts startup. |
 | `-reality-mirror` | `adaptive` | Donor mirroring for sources that have not authenticated: `off`, `adaptive`, `always`. `always` dials a donor for every connection including real users - measurement only. |
-| `-reality-cover-domain` | | Hostname that unauthorised REALITY probes are transparently proxied to (port 443). Empty drops them silently. Operator-set, never derived from the client's SNI. |
+| `-reality-cover-domain` | | Hostname that unauthorised REALITY connections are transparently proxied to (port 443) when their SNI is not a donor (the built-in list or `-reality-sni`). A donor SNI is mirrored to that donor instead. Empty: a connection naming no donor is handed to the ordinary TLS path and gets the fake website. An SNI on neither list is never dialled. |
+| `-reality-sni` | | Comma-separated cover names this exit's clients are configured with (client `-reality-sni` or `[[servers]] sni`), on top of the built-in donor list. An unauthenticated REALITY connection naming one is mirrored to that site: on B1 always, on the legacy transport when `-reality-cover-domain` is set. Names match case-insensitively. Without it, a probe replaying such a name gets the cover domain's certificate for it. |
 | `-reality-require-data-v2` | `false` | Reject clients that do not negotiate the v2 data layer (per-connection keys + AEAD). Turn on only after every client is upgraded. |
 
 Turning both `-reality-b1` and `-reality-legacy` off aborts startup - no REALITY

@@ -403,7 +403,7 @@ func donorDestination(peekBuf []byte, cfg *Config) string {
 // proxy.
 func sniAllowlisted(sni string, extra []string) bool {
 	for _, entry := range evasion.WhitelistedSNIs {
-		if entry.SNI == sni {
+		if strings.EqualFold(entry.SNI, sni) {
 			return true
 		}
 	}

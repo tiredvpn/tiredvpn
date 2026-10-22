@@ -205,9 +205,10 @@ ICMP TUNNEL:
 
 REALITY OPTIONS:
   -reality-cover-domain string
-        Operator-set hostname to transparently proxy unauthorized REALITY probes to (empty = drop)
+        Operator-set hostname to proxy unauthorized REALITY connections to when their SNI is no donor
   -reality-sni string
-        Comma-separated cover names this exit's clients use beyond the built-in donors; probes naming one are mirrored to it
+        Comma-separated cover names this exit's clients use beyond the built-in donors; unauthenticated
+        connections naming one are mirrored to it (legacy transport: only with -reality-cover-domain)
   -reality-b1
         Accept the B1 transport: real TLS 1.3 with auth in session_id. Needs -reality-private-key.
   -reality-private-key string
@@ -499,16 +500,17 @@ func registerServerFlags(fs *flag.FlagSet, cfg *server.Config) *serverFlagOpts {
 	fs.StringVar(&cfg.KeyFile, "key", "server.key", "TLS key file")
 	opts.secret = fs.String("secret", "", "Shared secret for authentication (single-client mode)")
 	fs.StringVar(&cfg.FakeWebRoot, "fake-root", "./www", "Fake website root directory")
-	// Operator-set hostname that unauthorized REALITY probes are transparently
-	// proxied to (see reality.go handleREALITYUnauthorized). Empty = silently
-	// drop. Never sourced from the client's SNI, so there is no SSRF via a
-	// client-controlled hostname.
-	fs.StringVar(&cfg.REALITYCoverDomain, "reality-cover-domain", "", "Hostname to transparently proxy unauthorized REALITY probes to (operator-set, e.g. 'www.microsoft.com'); empty = silently drop. Never derived from client SNI.")
+	// Operator-set hostname that unauthorized REALITY connections are
+	// transparently proxied to when their SNI is not a donor (see reality.go
+	// handleREALITYUnauthorized and donorDestination). A client SNI is dialled
+	// only when it is on the built-in list or -reality-sni, so there is no SSRF
+	// via a client-controlled hostname.
+	fs.StringVar(&cfg.REALITYCoverDomain, "reality-cover-domain", "", "Hostname to transparently proxy unauthorized REALITY connections to when their SNI is not a donor (built-in list or -reality-sni), operator-set, e.g. 'www.microsoft.com'. A donor SNI is mirrored to that donor. Empty = no cover: such connections get the fake website. An unlisted SNI is never dialled.")
 	// Operator-set donors on top of the built-in allowlist: the names clients
 	// of this exit are configured with (-reality-sni / [[servers]] sni). A
 	// probe that replays one of them is mirrored to that site, as it is for a
 	// built-in donor, instead of to the cover domain.
-	fs.Var((*sniListFlag)(&cfg.REALITYSNIs), "reality-sni", "Comma-separated cover names (SNI) this exit's clients use beyond the built-in donor list; unauthenticated REALITY connections naming one are mirrored to that site. Operator-set, like -reality-cover-domain.")
+	fs.Var((*sniListFlag)(&cfg.REALITYSNIs), "reality-sni", "Comma-separated cover names (SNI) this exit's clients use beyond the built-in donor list; unauthenticated REALITY connections naming one are mirrored to that site (B1 always, legacy only with -reality-cover-domain). Operator-set, like -reality-cover-domain.")
 	// Transition switch for the data-layer rewrite: leave off while old clients
 	// are still around, turn on afterwards to remove the v1 downgrade path.
 	// Node ceilings. Both default to off: a non-zero default would start
