@@ -1921,8 +1921,15 @@ func (v *VPNClient) tryStrategyUpgrade(cands []strategy.Strategy) {
 		conn, err := v.manager.ConnectStrategy(dialCtx, next, cand)
 		dialCancel()
 		if err != nil {
+			// One offer, one dial. Walking on to the next candidate put a
+			// handshake of every transport the reprobe found on the wire
+			// within milliseconds (five on the stand, all reset), a sweep no
+			// client of one protocol makes; against a censor that drops
+			// instead of resetting it would hold the tunnel's upgrade slot for
+			// a connect timeout per candidate. The next reprobe makes the next
+			// offer.
 			log.Info("Strategy upgrade: %s failed (%v), staying on %s", next.Name(), err, cur.Name())
-			continue
+			return
 		}
 		v.handshakeUpgrade(oldConn, conn, cur, next, localIP, cand)
 		return
