@@ -388,7 +388,13 @@ func watchConnect(ctx context.Context, cancel context.CancelFunc, limit, dialLim
 	}
 	p.tracked = true
 	p.ctx = protect.WithDialHooks(ctx,
-		func() { p.state.CompareAndSwap(phaseLocal, phaseDialling) },
+		func() {
+			// A dial after a connect - Stego's second try without ECH - is
+			// a TCP connect still to come, and the dial limit bounds it too.
+			if !p.state.CompareAndSwap(phaseLocal, phaseDialling) {
+				p.state.CompareAndSwap(phaseConnected, phaseDialling)
+			}
+		},
 		func() {
 			p.state.CompareAndSwap(phaseLocal, phaseConnected)
 			p.state.CompareAndSwap(phaseDialling, phaseConnected)
