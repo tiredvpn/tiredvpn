@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -198,5 +199,28 @@ func TestFamilyRecoveredDuringPoolWaitIsPolled(t *testing.T) {
 	}
 	if _, ok := out.first("VPN reconnected successfully"); !ok {
 		t.Fatalf("no tunnel; log:\n%s", out)
+	}
+}
+
+// TestLostUpgradeResponseIsTunnelLoss is P2-2 of the round-2 review. Once the
+// request is out, the exit may already have registered the new session and
+// moved the client's address to it - several handlers register before they
+// answer. A response that never arrives therefore leaves the old session
+// displaced, and keeping it meant downlink went nowhere until a read deadline.
+// Only a status other than 0 says the exit registered nothing.
+func TestLostUpgradeResponseIsTunnelLoss(t *testing.T) {
+	shortHandshakeTimeout(t, 200*time.Millisecond)
+	better := &exitStrategy{id: "reality", priority: 5, t: t, onHandshake: func(net.Conn) { select {} }}
+	v, _, _ := newUpgradeClient(t, &rankedPipeStrategy{pipeStrategy: &pipeStrategy{t: t}, id: "unused", priority: 99})
+	v.manager.Register(better)
+	out := &stopOnDisconnectLog{v: v}
+	setLog(t, out)
+
+	v.tryStrategyUpgrade([]strategy.Strategy{better})
+	if !strings.Contains(out.String(), "VPN disconnected: strategy upgrade") {
+		t.Fatalf("a lost handshake response left the client on a session the exit had displaced; log:\n%s", out)
+	}
+	if n := v.manager.UpgradeFailures("reality"); n != 1 {
+		t.Fatalf("upgrade failures = %d, want 1", n)
 	}
 }

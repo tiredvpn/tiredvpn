@@ -1061,7 +1061,7 @@ func (v *VPNClient) doHandshake(conn net.Conn, localIP net.IP) ([]byte, int, net
 
 	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	if _, err := conn.Write(handshake); err != nil {
-		return nil, 0, nil, err
+		return nil, 0, nil, fmt.Errorf("%w: %w", errHandshakeNotSent, err)
 	}
 
 	// Read server response.
@@ -1079,15 +1079,25 @@ func (v *VPNClient) doHandshake(conn net.Conn, localIP net.IP) ([]byte, int, net
 	if resp[0] != 0x00 {
 		switch resp[0] {
 		case 0x01:
-			return nil, 0, nil, fmt.Errorf("server error: IP pool exhausted")
+			return nil, 0, nil, fmt.Errorf("%w: IP pool exhausted", errHandshakeRefused)
 		case 0x02:
-			return nil, 0, nil, fmt.Errorf("server error: no IP pool configured (auto IP not supported)")
+			return nil, 0, nil, fmt.Errorf("%w: no IP pool configured (auto IP not supported)", errHandshakeRefused)
 		default:
-			return nil, 0, nil, fmt.Errorf("server error: status=%d", resp[0])
+			return nil, 0, nil, fmt.Errorf("%w: status=%d", errHandshakeRefused, resp[0])
 		}
 	}
 	return resp, n, conn, nil
 }
+
+// errHandshakeNotSent and errHandshakeRefused are the two handshake failures
+// after which the exit has registered nothing: the request never left, or the
+// exit answered with an error status. Any other failure - a response that
+// never came, a read that broke - may follow a registration, which displaces
+// whatever session held the client's address.
+var (
+	errHandshakeNotSent = errors.New("TUN handshake request not sent")
+	errHandshakeRefused = errors.New("server error")
+)
 
 // handshakeRespBufSize fits the largest handshake response: the v2 layout
 // with a max-length seed (20+32) plus the 32-byte dual-stack block.
@@ -1907,7 +1917,15 @@ func (v *VPNClient) handshakeUpgrade(oldConn, conn net.Conn, cur, next strategy.
 		v.sessionMu.Unlock()
 		conn.Close()
 		v.manager.UpgradeOutcome(next, false)
-		log.Info("Strategy upgrade: %s handshake failed (%v), staying on %s", next.Name(), err, cur.Name())
+		if errors.Is(err, errHandshakeNotSent) || errors.Is(err, errHandshakeRefused) {
+			log.Info("Strategy upgrade: %s handshake failed (%v), staying on %s", next.Name(), err, cur.Name())
+			return
+		}
+		// The request went out and the answer did not come back: the exit may
+		// already have moved the client's address to the new session, and the
+		// old one with it.
+		log.Info("Strategy upgrade: %s handshake lost after the request (%v), reconnecting", next.Name(), err)
+		v.connLost(oldConn, "strategy upgrade", fmt.Errorf("%w: %w", errUpgradeRejected, err))
 		return
 	}
 	caps, hasCaps := parseServerCapabilities(resp, n)
