@@ -95,7 +95,6 @@ type ConnectivityChecker struct {
 	// Tests use it for an address that times out instead of refusing.
 	tcpDial func(ctx context.Context, network, addr string) (net.Conn, error)
 
-
 	// rttHost and rttMin are the path RTT the auto-mode QUIC budget scales
 	// with: the minimum TCP connect time to the host that answered the gate.
 	rttHost string
@@ -533,7 +532,6 @@ func (c *ConnectivityChecker) checkUDP(ctx context.Context, addr string) (udpGat
 		return udpGateVerdict{}, fmt.Errorf("UDP probe inconclusive: %w", err)
 	}
 }
-
 
 // WaitForConnectivity waits in a loop until TCP connectivity is available.
 //

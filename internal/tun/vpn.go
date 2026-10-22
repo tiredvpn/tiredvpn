@@ -40,12 +40,13 @@ func isTemporaryError(err error) bool {
 // tests can shorten the ticker.
 var keepaliveInterval = 10 * time.Second
 
-var readTimeout = 30 * time.Second             // Must be > keepaliveInterval, detect dead connection faster. A var so tests can shorten it.
-const writeTimeout = 30 * time.Second          // Write timeout (was 5s, caused i/o timeouts with bufferbloat)
+var readTimeout = 30 * time.Second    // Must be > keepaliveInterval, detect dead connection faster. A var so tests can shorten it.
+const writeTimeout = 30 * time.Second // Write timeout (was 5s, caused i/o timeouts with bufferbloat)
 
 // keepaliveWriteTimeout bounds one keepalive write. A var so tests can
 // shorten it.
 var keepaliveWriteTimeout = 5 * time.Second
+
 const deadConnectionTimeout = 45 * time.Second // Proactive dead connection detection timeout
 
 // maxFrameLen is the largest [len:4][data:N] payload the tunnel protocol accepts;
