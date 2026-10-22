@@ -400,13 +400,17 @@ func (m *Manager) attemptBudget(ctx context.Context) time.Duration {
 	return budget
 }
 
-// addrUnreachable reports a dial the network refused to deliver at all: no
-// route, or no neighbour answering for the address. Nothing came back from the
-// server; every transport aimed at the same address meets the same wall. On a
-// shared segment a dead host shows up exactly like this, after the kernel's
-// neighbour discovery gives up, rather than as a timeout.
+// addrUnreachable reports a dial that went out and found no host: nothing came
+// back from the server, and every transport aimed at the same address meets
+// the same wall. On a shared segment a dead host shows up exactly like this,
+// after the kernel's neighbour discovery gives up, rather than as a timeout.
+//
+// ENETUNREACH is not in it: that is the local stack with no route at all, the
+// client's network rather than the server, and charging the address for it
+// parked live servers whenever the link was down (the selector already reads
+// it as local, see ProbeCurrent).
 func addrUnreachable(err error) bool {
-	return errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.ENETUNREACH)
+	return errors.Is(err, syscall.EHOSTUNREACH)
 }
 
 // heardNothing reports whether a failed attempt is evidence of silence: a

@@ -219,3 +219,19 @@ func TestNoRouteToHostIsSilenceNotAnAnswer(t *testing.T) {
 		t.Fatalf("err = %v, want the silence verdict for an address no transport could reach", err)
 	}
 }
+
+// TestNetUnreachableIsNotSilence is a P2 of the PR #126 review. ENETUNREACH is
+// the local stack saying it has no route at all - the client's network, not
+// the server - and the selector already treats it as local (ProbeCurrent). The
+// scan counted it as the address's silence, which parks the server at once.
+// EHOSTUNREACH stays silence: the packet went out and nothing came back.
+func TestNetUnreachableIsNotSilence(t *testing.T) {
+	netUnreach := &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ENETUNREACH)}
+	hostUnreach := &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.EHOSTUNREACH)}
+	if heardNothing(netUnreach, time.Millisecond, 15*time.Second) {
+		t.Error("ENETUNREACH counted as the server's silence")
+	}
+	if !heardNothing(hostUnreach, time.Millisecond, 15*time.Second) {
+		t.Error("EHOSTUNREACH no longer counts as silence")
+	}
+}
