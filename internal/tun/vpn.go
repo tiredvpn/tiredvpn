@@ -196,6 +196,19 @@ type VPNClient struct {
 	noStrategyUpgrade bool
 	upgrading         atomic.Bool
 
+	// upgradePending is the strategy an upgrade moved the tunnel to, until
+	// its session has carried traffic for sessionUsefulMin (then the upgrade
+	// is confirmed) or ends first (then it failed). Guarded by mu.
+	upgradePending strategy.Strategy
+
+	// sessionMu is held by every operation that registers a new session on
+	// the exit and installs it - connect, port hop, strategy upgrade - from
+	// the TUN handshake to the commit. The exit replaces whatever session held
+	// the client's address when a new one handshakes, so two of these
+	// interleaving left the client keeping a session the exit had already
+	// evicted.
+	sessionMu sync.Mutex
+
 	// poolRound rotates waitForPool's one dial per round through the pool.
 	// Only the reconnect loop touches it.
 	poolRound int
@@ -806,7 +819,9 @@ func (v *VPNClient) seamlessPortHop(newPort int) {
 		return
 	}
 
-	// Perform TUN mode handshake on new connection
+	// Perform TUN mode handshake on new connection; see sessionMu.
+	v.sessionMu.Lock()
+	defer v.sessionMu.Unlock()
 	tunnelConn, handshakeErr := v.performHandshake(newConn)
 	if handshakeErr != nil {
 		newConn.Close()
@@ -920,7 +935,10 @@ func (v *VPNClient) connect(parent context.Context) error {
 		return err
 	}
 
-	// Perform the TUN-mode handshake on local variables (still no lock).
+	// Perform the TUN-mode handshake on local variables (still no v.mu), with
+	// sessionMu held until the session is published: see sessionMu.
+	v.sessionMu.Lock()
+	defer v.sessionMu.Unlock()
 	resp, n, tunnelConn, err := v.doHandshake(conn, localIP)
 	if err != nil {
 		conn.Close()
@@ -953,6 +971,7 @@ func (v *VPNClient) connect(parent context.Context) error {
 	v.conn = conn
 	v.strategy = strat
 	v.sessionCand, v.hasSessionCand = cand, hasCand
+	v.upgradePending = nil
 	v.connectedAt = time.Now()
 	v.lastRx = v.connectedAt
 	if hasCaps {
@@ -1653,9 +1672,7 @@ func (v *VPNClient) readFromServer() {
 		// Handle keepalive packet (zero length)
 		if pktLen == 0 {
 			log.Debug("Received keepalive from server")
-			v.mu.Lock()
-			v.lastRx = time.Now()
-			v.mu.Unlock()
+			v.noteDownlink()
 			continue
 		}
 
@@ -1750,12 +1767,30 @@ func (v *VPNClient) readFromServer() {
 			log.Debug("Successfully wrote %d bytes to TUN", n)
 		}
 
-		v.mu.Lock()
-		v.lastRx = time.Now()
-		v.mu.Unlock()
+		v.noteDownlink()
 
 		atomic.AddInt64(&v.packetsDown, 1)
 		atomic.AddInt64(&v.bytesDown, int64(pktLen))
+	}
+}
+
+// noteDownlink records that the server just sent something, and confirms a
+// pending strategy upgrade once its session has carried traffic for
+// sessionUsefulMin: a dial and a handshake prove less than that, and a session
+// frozen a second after the swap must count as a failed upgrade, not a
+// successful one (see Manager.UpgradeOutcome).
+func (v *VPNClient) noteDownlink() {
+	now := time.Now()
+	v.mu.Lock()
+	v.lastRx = now
+	var confirmed strategy.Strategy
+	if v.upgradePending != nil && now.Sub(v.connectedAt) >= sessionUsefulMin {
+		confirmed, v.upgradePending = v.upgradePending, nil
+	}
+	v.mu.Unlock()
+	if confirmed != nil && v.manager != nil {
+		v.manager.UpgradeOutcome(confirmed, true)
+		log.Info("Strategy upgrade to %s confirmed: the session has carried traffic for %v", confirmed.Name(), sessionUsefulMin)
 	}
 }
 
@@ -1765,34 +1800,32 @@ func (v *VPNClient) readFromServer() {
 // fails on its way out; reconnecting on that failure tore down the healthy
 // conn that had just been installed.
 func (v *VPNClient) connLost(conn net.Conn, reason string, err error) {
-	v.mu.Lock()
-	current := v.conn
-	v.mu.Unlock()
-	if current != nil && current != conn {
-		log.Debug("%s failed on a replaced connection (%v), the tunnel has moved on", reason, err)
-		return
-	}
-	v.handleDisconnect(reason, err)
+	v.disconnect(conn, reason, err)
 }
 
 // upgradeConnectTimeout bounds one strategy upgrade dial plus its handshake.
 const upgradeConnectTimeout = 15 * time.Second
 
+// errUpgradeRejected is the reason a session is handed to handleDisconnect
+// when an upgrade was dropped after its handshake: the exit had already moved
+// the client's address to the new session, so the old one is gone too.
+var errUpgradeRejected = errors.New("strategy upgrade rejected after the handshake")
+
 // tryStrategyUpgrade is the strategy manager's upgrade callback: cands are the
-// strategies the last periodic reprobe found reachable, most preferred first.
-// If one ranks above the strategy carrying the tunnel, the client dials it,
-// runs the TUN handshake on it, and only then swaps it in and closes the old
-// conn - make before break, so the data plane sees a swap rather than an
-// outage.
+// strategies the last periodic reprobe found reachable, best first. If one
+// ranks above the strategy carrying the tunnel (Manager.UpgradeRank - the
+// scan's own penalties, not just the base priority), the client dials it at
+// the tunnel's endpoint, runs the TUN handshake on it, and only then swaps it
+// in and closes the old conn - make before break, so the data plane sees a
+// swap rather than an outage.
 //
 // It exists because nothing else ever moved a live tunnel off a fallback: a
 // client that came back from a fault on HTTP Polling, Geneva or Traffic Morph
 // stayed there for as long as the session held, and sessions hold for hours.
 //
-// The new session must come back with the addresses the tunnel already has.
-// An exit hands a reconnecting client its sticky lease, so they match; if they
-// do not, swapping would break every flow inside the tunnel, and the upgrade is
-// dropped instead.
+// The upgrade is not booked as a success until the new session has carried
+// traffic (noteDownlink); a failed handshake, a dropped session, or a session
+// that dies first are booked as failures and feed the upgrade backoff.
 func (v *VPNClient) tryStrategyUpgrade(cands []strategy.Strategy) {
 	if atomic.LoadInt32(&v.running) == 0 || atomic.LoadInt32(&v.reconnecting) == 1 ||
 		atomic.LoadInt32(&v.portHopInProgress) == 1 {
@@ -1805,72 +1838,147 @@ func (v *VPNClient) tryStrategyUpgrade(cands []strategy.Strategy) {
 
 	v.mu.Lock()
 	cur, oldConn, localIP := v.strategy, v.conn, v.localIP
+	cand, hasCand := v.sessionCand, v.hasSessionCand
+	pending := v.upgradePending
 	v.mu.Unlock()
-	if cur == nil || oldConn == nil {
+	if cur == nil || oldConn == nil || pending != nil {
 		return
 	}
-
-	for _, cand := range cands {
-		if cand.Priority() >= cur.Priority() || cand.ID() == cur.ID() {
-			continue
-		}
-		log.Info("Strategy upgrade: %s is reachable again, moving the tunnel off %s", cand.Name(), cur.Name())
-		ctx, cancel := context.WithTimeout(context.Background(), upgradeConnectTimeout)
-		conn, err := v.manager.ConnectStrategy(ctx, cand)
-		cancel()
-		if err != nil {
-			log.Info("Strategy upgrade: %s failed (%v), staying on %s", cand.Name(), err, cur.Name())
-			continue
-		}
-		resp, n, tunnelConn, err := v.doHandshake(conn, localIP)
-		if err != nil {
-			conn.Close()
-			log.Info("Strategy upgrade: %s handshake failed (%v), staying on %s", cand.Name(), err, cur.Name())
-			continue
-		}
-		caps, hasCaps := parseServerCapabilities(resp, n)
-		if !v.swapUpgradedConn(oldConn, tunnelConn, cand, net.IP(resp[1:5]), net.IP(resp[5:9]), caps, hasCaps) {
-			tunnelConn.Close()
+	if !hasCand {
+		var ok bool
+		if cand, ok = v.manager.CurrentCandidate(); !ok {
 			return
 		}
-		oldConn.Close()
-		if v.manager != nil {
-			v.manager.SessionEnded(strategy.SessionEnd{Strategy: cur.ID(), Useful: true})
-			v.manager.RecordSessionStart(cand.ID())
+	}
+
+	// Shut down with the client: Stop cannot otherwise reach an upgrade
+	// dialling on its own context.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		select {
+		case <-v.stopCh:
+			cancel()
+		case <-ctx.Done():
 		}
-		log.Info("Strategy upgrade: tunnel moved from %s to %s", cur.Name(), cand.Name())
+	}()
+
+	for _, next := range cands {
+		if next.ID() == cur.ID() || v.manager.UpgradeRank(next) >= v.manager.UpgradeRank(cur) {
+			continue
+		}
+		log.Info("Strategy upgrade: %s is reachable again, moving the tunnel off %s", next.Name(), cur.Name())
+		dialCtx, dialCancel := context.WithTimeout(ctx, upgradeConnectTimeout)
+		conn, err := v.manager.ConnectStrategy(dialCtx, next, cand)
+		dialCancel()
+		if err != nil {
+			log.Info("Strategy upgrade: %s failed (%v), staying on %s", next.Name(), err, cur.Name())
+			continue
+		}
+		v.handshakeUpgrade(oldConn, conn, cur, next, localIP)
 		return
 	}
 }
 
+// handshakeUpgrade runs the TUN handshake on an upgrade's fresh conn and
+// commits it, all under sessionMu so no reconnect or port hop registers a
+// session on the exit in between.
+func (v *VPNClient) handshakeUpgrade(oldConn, conn net.Conn, cur, next strategy.Strategy, localIP net.IP) {
+	if !v.sessionMu.TryLock() {
+		// A reconnect or a port hop is mid-handshake. Registering ours now
+		// would evict theirs on the exit.
+		conn.Close()
+		log.Info("Strategy upgrade: another session change is in progress, not upgrading to %s now", next.Name())
+		return
+	}
+	v.mu.Lock()
+	stale := v.conn != oldConn || atomic.LoadInt32(&v.running) == 0 || atomic.LoadInt32(&v.reconnecting) == 1 ||
+		atomic.LoadInt32(&v.portHopInProgress) == 1
+	v.mu.Unlock()
+	if stale {
+		v.sessionMu.Unlock()
+		conn.Close()
+		log.Info("Strategy upgrade: the tunnel changed before the %s handshake, dropping it", next.Name())
+		return
+	}
+
+	resp, n, tunnelConn, err := v.doHandshake(conn, localIP)
+	if err != nil {
+		v.sessionMu.Unlock()
+		conn.Close()
+		v.manager.UpgradeOutcome(next, false)
+		log.Info("Strategy upgrade: %s handshake failed (%v), staying on %s", next.Name(), err, cur.Name())
+		return
+	}
+	caps, hasCaps := parseServerCapabilities(resp, n)
+	verdict := v.swapUpgradedConn(oldConn, tunnelConn, next, net.IP(resp[1:5]), net.IP(resp[5:9]), caps, hasCaps)
+	v.sessionMu.Unlock()
+
+	switch verdict {
+	case upgradeSwapped:
+		oldConn.Close()
+		v.manager.SessionEnded(strategy.SessionEnd{Strategy: cur.ID(), Useful: true})
+		v.manager.RecordSessionStart(next.ID())
+		log.Info("Strategy upgrade: tunnel moved from %s to %s, pending confirmation", cur.Name(), next.Name())
+	case upgradeOtherAddress:
+		// A different address means the exit leased the new session apart
+		// from the old one (an exit older than the credential lease), so the
+		// old session still stands.
+		tunnelConn.Close()
+		v.manager.UpgradeOutcome(next, false)
+	default:
+		// Same address, so the exit has moved it to the new session and the
+		// old one is gone with it: whatever made us drop the new one, the
+		// tunnel is lost, and keeping the old conn would only wait out the
+		// read deadline on a dead session.
+		tunnelConn.Close()
+		v.manager.UpgradeOutcome(next, false)
+		v.connLost(oldConn, "strategy upgrade", errUpgradeRejected)
+	}
+}
+
+// upgradeVerdict is what swapUpgradedConn decided.
+type upgradeVerdict int
+
+const (
+	upgradeSwapped      upgradeVerdict = iota // installed
+	upgradeOtherAddress                       // dropped: the exit gave the new session another address
+	upgradeRejected                           // dropped after the exit moved the address to it
+)
+
 // swapUpgradedConn installs an upgraded conn in place of oldConn if the tunnel
 // is still riding oldConn and the new session kept the tunnel's addresses.
 func (v *VPNClient) swapUpgradedConn(oldConn, newConn net.Conn, strat strategy.Strategy, serverIP, assignedIP net.IP,
-	caps ServerCapabilities, hasCaps bool) bool {
+	caps ServerCapabilities, hasCaps bool) upgradeVerdict {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	if v.conn != oldConn || atomic.LoadInt32(&v.reconnecting) == 1 {
-		log.Info("Strategy upgrade: the tunnel reconnected meanwhile, dropping the %s session", strat.Name())
-		return false
-	}
 	if !assignedIP.Equal(v.localIP) || (v.tun != nil && !serverIP.Equal(v.tun.remoteIP)) {
 		log.Warn("Strategy upgrade: %s came back with different tunnel addresses (server %s, assigned %s), staying put",
 			strat.Name(), serverIP, assignedIP)
-		return false
+		return upgradeOtherAddress
 	}
-	if hasCaps && (caps.DualStackEnabled != v.serverCaps.DualStackEnabled ||
-		caps.DualStackEnabled && !caps.ClientIP6.Equal(v.serverCaps.ClientIP6)) {
-		log.Warn("Strategy upgrade: %s came back with a different IPv6 assignment, staying put", strat.Name())
-		return false
+	if v.conn != oldConn || atomic.LoadInt32(&v.running) == 0 || atomic.LoadInt32(&v.reconnecting) == 1 {
+		log.Info("Strategy upgrade: the tunnel changed meanwhile, dropping the %s session", strat.Name())
+		return upgradeRejected
+	}
+	// An exit that sends no capabilities (an older one) cannot be confirmed to
+	// keep the IPv6 side the tunnel runs; a lost capability block is a
+	// mismatch, not a match.
+	if (hasCaps && (caps.DualStackEnabled != v.serverCaps.DualStackEnabled ||
+		caps.DualStackEnabled && !caps.ClientIP6.Equal(v.serverCaps.ClientIP6))) ||
+		(!hasCaps && v.serverCaps.DualStackEnabled) {
+		log.Warn("Strategy upgrade: %s came back with a different IPv6 assignment", strat.Name())
+		return upgradeRejected
 	}
 	v.conn = newConn
 	v.strategy = strat
+	v.upgradePending = strat
 	v.connectedAt = time.Now()
 	v.lastRx = v.connectedAt
 	if hasCaps {
 		v.serverCaps = caps
 	}
-	return true
+	return upgradeSwapped
 }
 
 // handleDisconnect handles connection loss and reconnects with exponential backoff
@@ -1878,6 +1986,15 @@ func (v *VPNClient) swapUpgradedConn(oldConn, newConn net.Conn, strat strategy.S
 // and err is what it saw; both go to the log, where a disconnect used to show
 // up without a cause.
 func (v *VPNClient) handleDisconnect(reason string, err error) {
+	v.disconnect(nil, reason, err)
+}
+
+// disconnect is handleDisconnect for a loss seen on conn; nil means "the
+// tunnel, whatever conn it is on". A conn the tunnel has already replaced is
+// ignored. The check is made after taking the reconnect slot and under the
+// same lock that closes the conn, so a swap landing in between cannot get its
+// fresh conn closed by a loss reported on the old one.
+func (v *VPNClient) disconnect(conn net.Conn, reason string, err error) {
 	// Skip if seamless port hop is in progress (it handles its own reconnect)
 	if atomic.LoadInt32(&v.portHopInProgress) == 1 {
 		log.Debug("Port hop in progress, skipping handleDisconnect")
@@ -1893,6 +2010,11 @@ func (v *VPNClient) handleDisconnect(reason string, err error) {
 	defer atomic.StoreInt32(&v.reconnecting, 0)
 
 	v.mu.Lock()
+	if conn != nil && v.conn != nil && v.conn != conn {
+		v.mu.Unlock()
+		log.Debug("%s failed on a replaced connection (%v), the tunnel has moved on", reason, err)
+		return
+	}
 	if v.conn != nil {
 		v.conn.Close()
 		v.conn = nil
@@ -1900,7 +2022,15 @@ func (v *VPNClient) handleDisconnect(reason string, err error) {
 	endedStrategy := v.strategy
 	connectedAt, lastRx := v.connectedAt, v.lastRx
 	sessionCand, hasSessionCand := v.sessionCand, v.hasSessionCand
+	pendingUpgrade := v.upgradePending
+	v.upgradePending = nil
 	v.mu.Unlock()
+
+	if pendingUpgrade != nil && v.manager != nil {
+		// The upgraded session ended before it had carried traffic for
+		// sessionUsefulMin: the upgrade failed, whatever the dial said.
+		v.manager.UpgradeOutcome(pendingUpgrade, false)
+	}
 
 	// Update strategy confidence and feed the storm detector. A session that
 	// connected fine but died within seconds is the signature of DPI tearing
@@ -2426,6 +2556,7 @@ func (v *VPNClient) Stop() {
 	if v.conn != nil {
 		v.conn.SetDeadline(time.Now()) // Force immediate timeout
 		v.conn.Close()
+		v.conn = nil // nothing may be swapped in on top of a stopped client
 	}
 	v.mu.Unlock()
 

@@ -49,6 +49,7 @@ func (o *upgradeOffers) next(t *testing.T) []string {
 // offer has to carry the reachable strategies in priority order and leave out
 // the one whose probe failed.
 func TestReprobeOffersAnUpgrade(t *testing.T) {
+	noUpgradeDelay(t)
 	live := newHelloListener(t)
 	m := newSilenceManager(t, time.Second, live.addr)
 	m.Register(&greetingStrategy{id: "polling", priority: 6})
@@ -70,6 +71,7 @@ func TestReprobeOffersAnUpgrade(t *testing.T) {
 // retried on every tick. The first failure is free (a fault that was just
 // lifted is the common case); after that it sits out 1, 2, 4, then 6 reprobes.
 func TestFailedUpgradesBackOff(t *testing.T) {
+	noUpgradeDelay(t)
 	live := newHelloListener(t)
 	m := newSilenceManager(t, time.Second, live.addr)
 	reality := &greetingStrategy{id: "reality", priority: 5}
@@ -117,17 +119,21 @@ func TestFailedUpgradesBackOff(t *testing.T) {
 	}
 }
 
-// TestConnectStrategyDialsThePinnedEndpointAndBooksIt: the upgrade dial goes to
-// the pinned endpoint and nowhere else, and a success makes the strategy the
-// fast path's.
-func TestConnectStrategyDialsThePinnedEndpointAndBooksIt(t *testing.T) {
+// TestConnectStrategyDialsTheSessionEndpointAndWaits: the upgrade dial goes to
+// the endpoint it is given and nowhere else, and a successful dial books
+// nothing - P1-3 of the PR #126 review: success recorded at dial time meant a
+// handshake that failed, a session the exit rejected or one that froze a second
+// later all counted as upgrades that worked, so the backoff never engaged and
+// the fast path went to a strategy that never carried a session.
+func TestConnectStrategyDialsTheSessionEndpointAndWaits(t *testing.T) {
 	live := newHelloListener(t)
 	m := newSilenceManager(t, time.Second, live.addr)
 	seen := &targetLog{}
 	reality := &greetingStrategy{id: "reality", priority: 5, seen: seen}
 	m.Register(reality)
 
-	conn, err := m.ConnectStrategy(context.Background(), reality)
+	cand, _ := m.CurrentCandidate()
+	conn, err := m.ConnectStrategy(context.Background(), reality, cand)
 	if err != nil {
 		t.Fatalf("ConnectStrategy: %v", err)
 	}
@@ -138,7 +144,109 @@ func TestConnectStrategyDialsThePinnedEndpointAndBooksIt(t *testing.T) {
 	m.mu.RLock()
 	last := m.lastSuccessfulStrategy
 	m.mu.RUnlock()
+	if last == reality {
+		t.Fatal("a dial alone made the strategy the fast-reconnect one; only a confirmed upgrade may")
+	}
+	m.UpgradeOutcome(reality, true)
+	m.mu.RLock()
+	last = m.lastSuccessfulStrategy
+	m.mu.RUnlock()
 	if last != reality {
-		t.Fatal("a successful upgrade dial did not become the fast-reconnect strategy")
+		t.Fatal("a confirmed upgrade did not become the fast-reconnect strategy")
+	}
+}
+
+func noUpgradeDelay(t *testing.T) {
+	t.Helper()
+	old := upgradeDelay
+	upgradeDelay = func() time.Duration { return 0 }
+	t.Cleanup(func() { upgradeDelay = old })
+}
+
+// TestUpgradeOfferIsNotOnTheReprobeGrid is P1-8 of the review: the offer went
+// out 10 ms after "Periodic reprobe complete", so the switch inherited the
+// reprobe's strict 5-minute grid and followed a probe burst at once. The delay
+// varies, sits between its bounds, and is not one fixed value.
+func TestUpgradeOfferIsNotOnTheReprobeGrid(t *testing.T) {
+	seen := map[time.Duration]bool{}
+	for range 200 {
+		d := upgradeDelay()
+		if d < 20*time.Second || d > 4*time.Minute {
+			t.Fatalf("upgrade delay %v outside [20s, 4m]", d)
+		}
+		seen[d] = true
+	}
+	if len(seen) < 50 {
+		t.Fatalf("only %d distinct delays in 200 draws", len(seen))
+	}
+
+	// And the offer really waits for it.
+	live := newHelloListener(t)
+	m := newSilenceManager(t, time.Second, live.addr)
+	m.Register(&greetingStrategy{id: "reality", priority: 5})
+	old := upgradeDelay
+	upgradeDelay = func() time.Duration { return 300 * time.Millisecond }
+	t.Cleanup(func() { upgradeDelay = old })
+	offers := newUpgradeOffers()
+	m.SetStrategyUpgradeCallback(offers.take)
+	start := time.Now()
+	m.offerUpgrade([]Result{{Strategy: &greetingStrategy{id: "reality", priority: 5}, Success: true}})
+	select {
+	case <-offers.got:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no offer")
+	}
+	if took := time.Since(start); took < 250*time.Millisecond {
+		t.Fatalf("offer went out %v after the reprobe, want after the delay", took)
+	}
+}
+
+// TestReprobeIsNotAMetronome: the reprobe itself was a strict time.Ticker - a
+// probe burst every 300.000 s from process start. Its pauses now vary around
+// the interval within [interval/2, 2 x interval].
+func TestReprobeIsNotAMetronome(t *testing.T) {
+	const interval = 5 * time.Minute
+	seen := map[time.Duration]bool{}
+	var sum time.Duration
+	for range 1000 {
+		d := nextReprobeDelay(interval)
+		if d < interval/2 || d > 2*interval {
+			t.Fatalf("reprobe pause %v outside [%v, %v]", d, interval/2, 2*interval)
+		}
+		seen[d] = true
+		sum += d
+	}
+	if len(seen) < 500 {
+		t.Fatalf("only %d distinct pauses in 1000", len(seen))
+	}
+	if mean := sum / 1000; mean < 4*time.Minute || mean > 7*time.Minute {
+		t.Fatalf("mean pause %v strays from the %v interval", mean, interval)
+	}
+}
+
+// TestUpgradeRankKeepsTheScansPenalties is P1-5 of the review: the upgrade
+// compared bare priorities, so on Android - where the scan puts QUIC (4) behind
+// REALITY (5) until TCP has timed out - it moved the client to QUIC anyway, and
+// with UDP excluded it still offered QUIC.
+func TestUpgradeRankKeepsTheScansPenalties(t *testing.T) {
+	m := NewManager()
+	quic := &QUICStrategy{useSalamander: true}
+	reality := &greetingStrategy{id: "reality", priority: 5}
+	if !isUDPBasedStrategy(quic) {
+		t.Skip("QUICStrategy no longer reads as UDP")
+	}
+	m.androidMode = true
+	if m.UpgradeRank(quic) <= m.UpgradeRank(reality) {
+		t.Fatalf("on Android QUIC ranks %.1f, REALITY %.1f: QUIC must not outrank REALITY before TCP times out",
+			m.UpgradeRank(quic), m.UpgradeRank(reality))
+	}
+
+	noUpgradeDelay(t)
+	offers := newUpgradeOffers()
+	m.SetStrategyUpgradeCallback(offers.take)
+	m.excludeUDPStrategies = true
+	m.offerUpgrade([]Result{{Strategy: quic, Success: true}})
+	if got := offers.next(t); got != nil {
+		t.Fatalf("offered %v while UDP is excluded", got)
 	}
 }

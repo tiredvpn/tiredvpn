@@ -3,6 +3,7 @@ package tun
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"strings"
@@ -155,5 +156,220 @@ func TestUpgradeWithDifferentAddressesIsDropped(t *testing.T) {
 	v.tryStrategyUpgrade([]strategy.Strategy{better})
 	if v.conn != oldConn || v.strategy != fallback {
 		t.Fatal("swapped in a session with a different tunnel address")
+	}
+}
+
+// exitStrategy is a strategy whose exit is scripted per test: onHandshake runs
+// on the exit's side of the pipe once the 8-byte TUN request is in, and gets
+// to answer it however the test needs.
+type exitStrategy struct {
+	id          string
+	priority    int
+	t           *testing.T
+	onHandshake func(srv net.Conn)
+	beforeDial  func()
+	handshakes  atomic.Int64
+}
+
+func (s *exitStrategy) Name() string                        { return s.id }
+func (s *exitStrategy) ID() string                          { return s.id }
+func (s *exitStrategy) Priority() int                       { return s.priority }
+func (s *exitStrategy) Probe(context.Context, string) error { return nil }
+func (s *exitStrategy) RequiresServer() bool                { return true }
+func (s *exitStrategy) Description() string                 { return "scripted exit" }
+func (s *exitStrategy) Connect(context.Context, string) (net.Conn, error) {
+	if s.beforeDial != nil {
+		s.beforeDial()
+	}
+	cli, srv := net.Pipe()
+	s.t.Cleanup(func() { cli.Close(); srv.Close() })
+	go func() {
+		req := make([]byte, 8)
+		if _, err := io.ReadFull(srv, req); err != nil {
+			return
+		}
+		s.handshakes.Add(1)
+		s.onHandshake(srv)
+	}()
+	return cli, nil
+}
+
+// answer writes the bare v3 handshake response; then is what the exit does
+// with the session afterwards.
+func answer(then func(srv net.Conn)) func(net.Conn) {
+	return func(srv net.Conn) {
+		if _, err := srv.Write(bareV3Response()); err != nil {
+			return
+		}
+		if then != nil {
+			then(srv)
+		}
+	}
+}
+
+// runReader runs the client's read loop until the test ends.
+func runReader(t *testing.T, v *VPNClient) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() { v.readFromServer(); close(done) }()
+	t.Cleanup(func() {
+		atomic.StoreInt32(&v.running, 0)
+		v.mu.Lock()
+		if v.conn != nil {
+			v.conn.Close()
+		}
+		v.mu.Unlock()
+		<-done
+	})
+}
+
+// TestUpgradeIsConfirmedOnlyByAUsefulSession is P1-3 of the PR #126 review: an
+// upgrade that dialled was booked as a success there and then. Now it is
+// pending until the new session has carried traffic for sessionUsefulMin; a
+// keepalive from the exit past that line confirms it.
+func TestUpgradeIsConfirmedOnlyByAUsefulSession(t *testing.T) {
+	keepalive := make(chan struct{})
+	better := &exitStrategy{id: "reality", priority: 5, t: t, onHandshake: answer(func(srv net.Conn) {
+		<-keepalive
+		_, _ = srv.Write([]byte{0, 0, 0, 0})
+		select {} // and then the session just lives
+	})}
+	v, _, _ := newUpgradeClient(t, &rankedPipeStrategy{pipeStrategy: &pipeStrategy{t: t}, id: "unused", priority: 99})
+	v.manager.Register(better)
+	setLog(t, &stampedLog{})
+
+	v.tryStrategyUpgrade([]strategy.Strategy{better})
+	if v.strategy != better {
+		t.Fatal("no swap - the test proves nothing")
+	}
+	if got := v.manager.GetLastConnectionInfo().StrategyID; got == "reality" {
+		t.Fatal("the upgrade was booked as a success before its session carried anything")
+	}
+
+	v.mu.Lock()
+	v.connectedAt = time.Now().Add(-sessionUsefulMin - time.Second) // the session has been up long enough
+	v.mu.Unlock()
+	runReader(t, v)
+	close(keepalive)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for v.manager.GetLastConnectionInfo().StrategyID != "reality" {
+		if time.Now().After(deadline) {
+			t.Fatal("downlink past sessionUsefulMin did not confirm the upgrade")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestUpgradedSessionThatDiesFeedsTheBackoff: the missing test from the
+// review - an upgrade whose session dies right after the swap is a failed
+// upgrade, and the backoff hears about it.
+func TestUpgradedSessionThatDiesFeedsTheBackoff(t *testing.T) {
+	better := &exitStrategy{id: "reality", priority: 5, t: t, onHandshake: answer(func(srv net.Conn) {
+		time.Sleep(50 * time.Millisecond)
+		srv.Close() // the exit drops the new session at once
+	})}
+	v, _, _ := newUpgradeClient(t, &rankedPipeStrategy{pipeStrategy: &pipeStrategy{t: t}, id: "unused", priority: 99})
+	v.manager.Register(better)
+
+	v.tryStrategyUpgrade([]strategy.Strategy{better})
+	if v.strategy != better {
+		t.Fatal("no swap - the test proves nothing")
+	}
+	out := &stopOnDisconnectLog{v: v}
+	setLog(t, out)
+	done := make(chan struct{})
+	go func() { v.readFromServer(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("the dropped session was never noticed; log:\n%s", out)
+	}
+	if n := v.manager.UpgradeFailures("reality"); n != 1 {
+		t.Fatalf("upgrade failures = %d after the upgraded session died, want 1", n)
+	}
+}
+
+// TestUpgradeHandshakeFailureFeedsTheBackoff: the other missing test - an
+// exit that refuses the upgraded session's handshake is a failed upgrade.
+func TestUpgradeHandshakeFailureFeedsTheBackoff(t *testing.T) {
+	better := &exitStrategy{id: "reality", priority: 5, t: t, onHandshake: func(srv net.Conn) {
+		_, _ = srv.Write([]byte{0x01, 0, 0, 0, 0, 0, 0, 0, 0}) // pool exhausted
+	}}
+	v, fallback, oldConn := newUpgradeClient(t, &rankedPipeStrategy{pipeStrategy: &pipeStrategy{t: t}, id: "unused", priority: 99})
+	v.manager.Register(better)
+	setLog(t, &stampedLog{})
+
+	v.tryStrategyUpgrade([]strategy.Strategy{better})
+	if v.conn != oldConn || v.strategy != fallback {
+		t.Fatal("a refused handshake touched the tunnel")
+	}
+	if n := v.manager.UpgradeFailures("reality"); n != 1 {
+		t.Fatalf("upgrade failures = %d after a refused handshake, want 1", n)
+	}
+}
+
+// TestUpgradeDoesNotHandshakeOverASessionChange is P1-4 with the exit's
+// behaviour modelled: a new session's handshake moves the client's address to
+// it and evicts whatever held it. While a reconnect or a port hop holds
+// sessionMu (it is between its own handshake and its commit), an upgrade must
+// not handshake at all - or it evicts the session the client is about to keep.
+func TestUpgradeDoesNotHandshakeOverASessionChange(t *testing.T) {
+	better := &exitStrategy{id: "reality", priority: 5, t: t, onHandshake: answer(nil)}
+	v, _, oldConn := newUpgradeClient(t, &rankedPipeStrategy{pipeStrategy: &pipeStrategy{t: t}, id: "unused", priority: 99})
+	v.manager.Register(better)
+	setLog(t, &stampedLog{})
+
+	v.sessionMu.Lock() // a reconnect mid-handshake
+	v.tryStrategyUpgrade([]strategy.Strategy{better})
+	v.sessionMu.Unlock()
+
+	time.Sleep(50 * time.Millisecond)
+	if n := better.handshakes.Load(); n != 0 {
+		t.Fatalf("the upgrade handshook %d time(s) over a session change in progress - the exit evicted the other session", n)
+	}
+	if v.conn != oldConn {
+		t.Fatal("the tunnel conn changed")
+	}
+}
+
+// TestUpgradeAfterStopInstallsNothing is the P2 "upgrade after Stop" item: a
+// client stopped while the upgrade was dialling must not get a handshaken
+// session installed on it.
+func TestUpgradeAfterStopInstallsNothing(t *testing.T) {
+	var v *VPNClient
+	better := &exitStrategy{id: "reality", priority: 5, t: t, onHandshake: answer(nil)}
+	better.beforeDial = func() { atomic.StoreInt32(&v.running, 0) } // Stop lands mid-dial
+	v, _, oldConn := newUpgradeClient(t, &rankedPipeStrategy{pipeStrategy: &pipeStrategy{t: t}, id: "unused", priority: 99})
+	v.manager.Register(better)
+	setLog(t, &stampedLog{})
+
+	v.tryStrategyUpgrade([]strategy.Strategy{better})
+	time.Sleep(50 * time.Millisecond)
+	if better.handshakes.Load() != 0 || v.conn != oldConn {
+		t.Fatal("a stopped client got an upgraded session")
+	}
+}
+
+// TestRejectedUpgradeIsTunnelLoss: once the new session has handshaken, the
+// exit has moved the client's address to it and the old session is gone. If
+// the client then drops the new one (here: the exit stopped reporting the IPv6
+// side the tunnel runs), it has no tunnel left, and must reconnect instead of
+// "staying put" on a dead conn until the read deadline.
+func TestRejectedUpgradeIsTunnelLoss(t *testing.T) {
+	better := &exitStrategy{id: "reality", priority: 5, t: t, onHandshake: answer(nil)}
+	v, _, _ := newUpgradeClient(t, &rankedPipeStrategy{pipeStrategy: &pipeStrategy{t: t}, id: "unused", priority: 99})
+	v.manager.Register(better)
+	v.serverCaps.DualStackEnabled = true // the bare response carries no capabilities
+
+	out := &stopOnDisconnectLog{v: v}
+	setLog(t, out)
+	v.tryStrategyUpgrade([]strategy.Strategy{better})
+
+	if !strings.Contains(out.String(), "VPN disconnected: strategy upgrade") {
+		t.Fatalf("a dropped upgrade after the handshake was not taken for tunnel loss; log:\n%s", out)
+	}
+	if n := v.manager.UpgradeFailures("reality"); n != 1 {
+		t.Fatalf("upgrade failures = %d, want 1", n)
 	}
 }

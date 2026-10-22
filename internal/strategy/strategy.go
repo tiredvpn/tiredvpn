@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"slices"
 	"strconv"
@@ -2719,8 +2720,8 @@ func (m *Manager) StartPeriodicReprobe(ctx context.Context) {
 	log.Info("Starting periodic reprobe (interval=%v, target=%s)", m.reprobeInterval, m.GetServerAddr(ctx))
 
 	go func() {
-		ticker := time.NewTicker(m.reprobeInterval)
-		defer ticker.Stop()
+		timer := time.NewTimer(nextReprobeDelay(m.reprobeInterval))
+		defer timer.Stop()
 
 		for {
 			select {
@@ -2730,11 +2731,26 @@ func (m *Manager) StartPeriodicReprobe(ctx context.Context) {
 			case <-m.stopReprobe:
 				log.Info("Periodic reprobe stopped")
 				return
-			case <-ticker.C:
+			case <-timer.C:
 				m.doPeriodicReprobe(ctx)
+				timer.Reset(nextReprobeDelay(m.reprobeInterval))
 			}
 		}
 	}()
+}
+
+// nextReprobeDelay is the pause before the next periodic reprobe.
+//
+// It was a strict time.Ticker: a burst of probe connects to the pinned server
+// every 300.000 s from process start, the cleanest metronome the client put
+// on the wire. Now each pause is half the interval plus an exponential draw
+// with a mean of the other half, capped at twice the interval: the mean stays
+// at the interval, the gaps vary, nothing lands on a fixed value (a plain
+// exponential clamped at the bottom put 39% of the pauses at exactly the
+// floor). No measured reference; not uniform jitter (verification rule 3).
+func nextReprobeDelay(interval time.Duration) time.Duration {
+	d := interval/2 + time.Duration(rand.ExpFloat64()*float64(interval/2))
+	return min(d, 2*interval)
 }
 
 // StopPeriodicReprobe stops background re-probing
@@ -2776,11 +2792,11 @@ func (m *Manager) doPeriodicReprobe(ctx context.Context) {
 	m.offerUpgrade(results)
 }
 
-// SetStrategyUpgradeCallback registers fn to hear, after every periodic
-// reprobe, which strategies the reprobe found reachable and the upgrade
-// backoff lets through, most preferred first. The TUN client uses it to move a
-// live tunnel off a fallback strategy (see VPNClient.tryStrategyUpgrade). Nil
-// turns upgrades off.
+// SetStrategyUpgradeCallback registers fn to hear, some time after a periodic
+// reprobe, which strategies the reprobe found reachable and the upgrade backoff
+// lets through, best first (UpgradeRank). The TUN client uses it to move a live
+// tunnel off a fallback strategy (see VPNClient.tryStrategyUpgrade). Nil turns
+// upgrades off.
 func (m *Manager) SetStrategyUpgradeCallback(fn func([]Strategy)) {
 	m.mu.Lock()
 	m.upgradeCallback = fn
@@ -2788,27 +2804,70 @@ func (m *Manager) SetStrategyUpgradeCallback(fn func([]Strategy)) {
 }
 
 // upgradeMaxSkip caps how many reprobes a strategy sits out after failed
-// upgrade dials: six reprobes, half an hour at the default interval.
+// upgrades: six reprobes, half an hour at the default interval.
 const upgradeMaxSkip = 6
 
-// offerUpgrade hands the upgrade callback the strategies this reprobe found
-// reachable and that a scan would admit right now, in priority order.
+// upgradeDelay is how long after a reprobe the upgrade offer goes out. A var
+// so tests can make it immediate.
+//
+// The offer used to go out the moment the reprobe burst finished, so on the
+// wire a burst of probe connects was followed at once by a new session to the
+// same server, on the reprobe's 5-minute grid. 20 s plus an exponential draw
+// with a mean of 70 s, capped at 4 min (mean about 90 s): an upgrade is
+// one event per degradation episode, and the memoryless shape is what
+// independent user-driven events have. There is no measured reference for it;
+// it is chosen to unhook the switch from the reprobe, not to imitate anything.
+var upgradeDelay = func() time.Duration {
+	d := 20*time.Second + time.Duration(rand.ExpFloat64()*float64(70*time.Second))
+	return min(d, 4*time.Minute)
+}
+
+// UpgradeRank is the order an upgrade compares strategies in: the base
+// priority plus the Android UDP penalty the scan applies (sortStrategies).
+// Lower is better.
+//
+// Confidence is left out on purpose. A strategy that was blocked during the
+// fault comes out of it with its confidence on the floor, and it rises by one
+// probe's worth per reprobe - two or three reprobes before it would outrank a
+// fallback that never failed, for no information the real upgrade dial does
+// not provide better. What the rank must not ignore is what the scan would
+// refuse: QUIC on Android ranks behind TCP until TCP has timed out, and a
+// UDP strategy while UDP is excluded is not offered at all.
+func (m *Manager) UpgradeRank(s Strategy) float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	rank := float64(s.Priority())
+	if m.androidMode && isUDPBasedStrategy(s) {
+		rank += max(10-5*float64(m.consecutiveTCPTimeouts), 0)
+	}
+	return rank
+}
+
+// offerUpgrade hands the upgrade callback, after upgradeDelay, the strategies
+// this reprobe found reachable and that a scan would admit right now, best
+// first.
 //
 // Nothing else ever moves a live tunnel off the strategy it connected with.
 // The reprobe only refreshed confidence, so a client that fell back to HTTP
 // Polling or Geneva during a fault stayed there for as long as the session
 // held - fourteen minutes and two clean reprobes in the stand's run #9.
 //
-// A probe is a TCP connect and proves only the port; the callback's real dial
-// is what proves the strategy. A strategy whose upgrade dial keeps failing
-// (REALITY under a censor that resets its handshake) sits out 1, 2, 4 and then
-// 6 reprobes after its second, third, fourth and later consecutive failure, so
-// a blocked transport is not retried on every tick. The first failure costs
-// nothing: a fault that has just been lifted is the common case.
+// A probe is a TCP connect and proves only the port; the callback's real dial,
+// handshake and a useful session are what prove the strategy
+// (UpgradeOutcome). A strategy whose upgrades keep failing (REALITY under a
+// censor that resets its handshake) sits out 1, 2, 4 and then 6 reprobes after
+// its second, third, fourth and later consecutive failure. The first failure
+// costs nothing: a fault that has just been lifted is the common case.
 func (m *Manager) offerUpgrade(results []Result) {
+	m.muxMu.Lock()
+	muxEnabled := m.muxEnabled
+	m.muxMu.Unlock()
+
 	m.mu.Lock()
 	cb := m.upgradeCallback
-	if cb == nil || m.forced {
+	if cb == nil || m.forced || muxEnabled {
+		// With mux the tunnel rides a shared carrier that budget recycling
+		// swaps; an upgrade from here would race it.
 		m.mu.Unlock()
 		return
 	}
@@ -2837,11 +2896,24 @@ func (m *Manager) offerUpgrade(results []Result) {
 	if len(cands) == 0 {
 		return
 	}
-	slices.SortStableFunc(cands, func(a, b Strategy) int { return cmp.Compare(a.Priority(), b.Priority()) })
-	go cb(cands)
+	slices.SortStableFunc(cands, func(a, b Strategy) int { return cmp.Compare(m.UpgradeRank(a), m.UpgradeRank(b)) })
+	delay := upgradeDelay()
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Error("strategy upgrade panic: %v", r)
+			}
+		}()
+		select {
+		case <-time.After(delay):
+		case <-m.lifeCtx.Done():
+			return
+		}
+		cb(cands)
+	}()
 }
 
-// recordUpgradeResultLocked books one upgrade dial of id. Caller holds m.mu.
+// recordUpgradeResultLocked books one upgrade of id. Caller holds m.mu.
 func (m *Manager) recordUpgradeResultLocked(id string, ok bool) {
 	if m.upgradeFails == nil {
 		m.upgradeFails = make(map[string]int)
@@ -2858,39 +2930,57 @@ func (m *Manager) recordUpgradeResultLocked(id string, ok bool) {
 	}
 }
 
-// ConnectStrategy dials exactly s at the pinned endpoint, with that endpoint's
-// secret, and books the outcome the way a scan would. It is the upgrade
-// dial: the caller already has a working tunnel and wants this strategy
-// specifically, so there is no fallback to anything else and no endpoint walk.
-func (m *Manager) ConnectStrategy(ctx context.Context, s Strategy) (net.Conn, error) {
-	sel := m.selector()
-	if sel == nil {
-		return nil, fmt.Errorf("no endpoint to dial %s at", s.Name())
-	}
-	cand, ok := sel.Current()
+// UpgradeFailures reports how many upgrades to id have failed in a row, for
+// logs and tests.
+func (m *Manager) UpgradeFailures(id string) int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.upgradeFails[id]
+}
+
+// UpgradeOutcome books how an upgrade to s ended after its dial: ok once the
+// upgraded session has carried traffic for a meaningful time, not ok when the
+// handshake failed, the session was rejected, or it died before proving
+// itself. Only a confirmed upgrade makes s the fast-reconnect strategy; until
+// then a reconnect goes back the way the tunnel came.
+func (m *Manager) UpgradeOutcome(s Strategy, ok bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.recordUpgradeResultLocked(s.ID(), ok)
 	if !ok {
-		return nil, fmt.Errorf("no endpoint to dial %s at", s.Name())
+		m.updateConfidenceStats(s.ID(), false, 0)
+		return
 	}
+	m.lastSuccessfulStrategy = s
+	m.lastSuccessfulTime = time.Now()
+	m.updateConfidenceWithLatency(s.ID(), true, 0)
+	m.sortStrategies()
+	m.lastConnectionStrategy = s.Name()
+	m.lastConnectionStrategyID = s.ID()
+}
+
+// ConnectStrategy dials exactly s at cand - the endpoint the tunnel's session
+// rides - with that endpoint's secret. It is the upgrade dial: the caller
+// already has a working tunnel and wants this strategy specifically, so there
+// is no fallback to anything else and no endpoint walk. A failed dial is booked
+// as a failed upgrade; a successful one is not booked at all until
+// UpgradeOutcome says how the session went.
+func (m *Manager) ConnectStrategy(ctx context.Context, s Strategy, cand endpoint.Candidate) (net.Conn, error) {
 	m.muxMu.Lock()
 	muxEnabled := m.muxEnabled
 	m.muxMu.Unlock()
 	if muxEnabled {
-		// The tunnel rides a shared mux carrier there; swapping the carrier is
-		// what budget recycling does, and doing it from here as well would
-		// race it.
 		return nil, fmt.Errorf("strategy upgrade is not supported with mux")
 	}
 
 	dialCtx := m.withDialCandidate(ctx, cand)
 	connectCtx, cancel := context.WithTimeout(dialCtx, m.connectTimeout)
-	start := time.Now()
 	conn, err := s.Connect(connectCtx, m.withHoppedPort(cand.Addr))
-	latency := time.Since(start)
 	cancel()
 
-	m.mu.Lock()
-	m.recordUpgradeResultLocked(s.ID(), err == nil)
 	if err != nil {
+		m.mu.Lock()
+		m.recordUpgradeResultLocked(s.ID(), false)
 		m.updateConfidenceStats(s.ID(), false, 0)
 		if isTimeoutError(err) {
 			m.circuitBreakers.RecordTimeout(s.ID())
@@ -2900,21 +2990,24 @@ func (m *Manager) ConnectStrategy(ctx context.Context, s Strategy) (net.Conn, er
 		m.mu.Unlock()
 		return nil, err
 	}
-	m.lastSuccessfulStrategy = s
-	m.lastSuccessfulTime = time.Now()
-	m.updateConfidenceWithLatency(s.ID(), true, latency)
-	m.sortStrategies()
-	m.lastConnectionLatency = latency
-	m.lastConnectionStrategy = s.Name()
-	m.lastConnectionStrategyID = s.ID()
+	m.mu.RLock()
 	useRTTMasking, rttProfile := m.rttMaskingEnabled, m.rttProfile
-	m.mu.Unlock()
+	m.mu.RUnlock()
 
 	optimizeTCPConn(conn)
 	if useRTTMasking {
 		conn = WrapWithRTTMasking(conn, rttProfile)
 	}
 	return conn, nil
+}
+
+// CurrentCandidate returns the pinned endpoint candidate.
+func (m *Manager) CurrentCandidate() (endpoint.Candidate, bool) {
+	sel := m.selector()
+	if sel == nil {
+		return endpoint.Candidate{}, false
+	}
+	return sel.Current()
 }
 
 // SetReprobeInterval changes the reprobe interval
