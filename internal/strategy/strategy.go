@@ -1580,9 +1580,16 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 		lastErr = err
 
 		if !errors.Is(err, errStrategyScanFailed) {
-			// Context cancelled, or no strategy was even eligible. Neither says
-			// anything about this endpoint.
-			break
+			// Context cancelled, or no strategy was even eligible. Neither
+			// says anything about this endpoint on its own; a run of them in
+			// which its handshakes heard nothing does (swallowCycle).
+			if !m.swallowCycle(cand.Addr, scan) {
+				break
+			}
+			err = fmt.Errorf("%w: %w, handshakes swallowed cycle after cycle: %w", errAddrSilent, errStrategyScanFailed, err)
+			lastErr = err
+		} else {
+			m.endSwallowRun(cand.Addr)
 		}
 		if errors.Is(err, errAddrSilent) {
 			sel.ReportSilent(cand)
@@ -1771,6 +1778,9 @@ type scanState struct {
 	// connectedSilent lists the transports whose TCP connect came up and
 	// whose handshake then heard nothing until its attempt ran out.
 	connectedSilent []string
+	// inconclusive lists the transports whose attempt heard nothing and was
+	// still no verdict (attemptInconclusive).
+	inconclusive []string
 }
 
 // swallowRecord is what one address's last reconnect cycles left behind.
@@ -1779,7 +1789,17 @@ type swallowRecord struct {
 	// next cycle on this address starts without them.
 	skip map[string]bool
 	last time.Time
+	// cycles counts the cycles in a row that ended with no verdict while a
+	// transport heard nothing there, and heardNothing names those
+	// transports (see swallowCycle).
+	cycles       int
+	heardNothing map[string]bool
 }
+
+// swallowCyclesMax is how many no-verdict cycles in a row, with a handshake
+// heard nothing in each, are an address's silence verdict on one transport.
+// Two cycles are enough when they span two transports.
+const swallowCyclesMax = 3
 
 // swallowWindow is how long a swallow record outlives its last cycle. The
 // reconnect backoff reaches two minutes and a cycle takes 15-30 s more, so a
@@ -1811,18 +1831,72 @@ func (m *Manager) noteSwallowed(addr string, ids []string) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	r := m.swallowRecordLocked(addr)
+	for _, id := range ids {
+		r.skip[id] = true
+	}
+}
+
+// swallowRecordLocked returns addr's swallow record, fresh if it had none or
+// its last cycle is older than swallowWindow, and stamps it now. m.mu held.
+func (m *Manager) swallowRecordLocked(addr string) *swallowRecord {
 	r := m.swallowed[addr]
 	if r == nil || time.Since(r.last) > swallowWindow {
-		r = &swallowRecord{skip: make(map[string]bool)}
+		r = &swallowRecord{skip: make(map[string]bool), heardNothing: make(map[string]bool)}
 		if m.swallowed == nil {
 			m.swallowed = make(map[string]*swallowRecord)
 		}
 		m.swallowed[addr] = r
 	}
-	for _, id := range ids {
-		r.skip[id] = true
-	}
 	r.last = time.Now()
+	return r
+}
+
+// swallowCycle books a cycle on addr that ended with no verdict and reports
+// whether the run of such cycles is now the address's silence verdict.
+//
+// Since a connected handshake may use the rest of its cycle, a server that
+// completes every TCP connect and then answers nothing ends each cycle on one
+// swallowed transport, out of time, with nothing counted: the next cycle comes
+// back to it with the next transport, and it is never charged. Two cycles in
+// a row in which the address heard nothing on two different transports, or
+// swallowCyclesMax cycles on any, are the verdict. One cycle never is - a
+// single slow handshake, Polling's included, parks nothing - and a cycle in
+// which any transport got an answer ends the run.
+func (m *Manager) swallowCycle(addr string, scan *scanState) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if scan.answered {
+		if r := m.swallowed[addr]; r != nil {
+			r.cycles, r.heardNothing = 0, make(map[string]bool)
+		}
+		return false
+	}
+	if len(scan.inconclusive) == 0 {
+		return false
+	}
+	r := m.swallowRecordLocked(addr)
+	r.cycles++
+	for _, id := range scan.inconclusive {
+		r.heardNothing[id] = true
+	}
+	if r.cycles < swallowCyclesMax && (r.cycles < 2 || len(r.heardNothing) < 2) {
+		return false
+	}
+	log.Warn("Address %s heard nothing on %s over %d cycles in a row - its silence verdict",
+		addr, strings.Join(slices.Sorted(maps.Keys(r.heardNothing)), ", "), r.cycles)
+	r.cycles, r.heardNothing = 0, make(map[string]bool)
+	return true
+}
+
+// endSwallowRun ends addr's run of no-verdict cycles: a cycle reached a
+// verdict. The skip list stays until a transport gets through.
+func (m *Manager) endSwallowRun(addr string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if r := m.swallowed[addr]; r != nil {
+		r.cycles, r.heardNothing = 0, make(map[string]bool)
+	}
 }
 
 // clearSwallowed forgets addr's swallow record: a transport got through.
@@ -1989,6 +2063,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 					// scan would only spend the rest of the budget the same way.
 					excludeMap[lastSuccessful.ID()] = true
 				case attemptInconclusive:
+					scan.inconclusive = append(scan.inconclusive, lastSuccessful.ID())
 					excludeMap[lastSuccessful.ID()] = true
 				default:
 					scan.answered = true
@@ -2262,6 +2337,8 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 					m.sortStrategies()
 					m.mu.Unlock()
 				}
+			case attemptInconclusive:
+				scan.inconclusive = append(scan.inconclusive, s.ID())
 			case attemptAnswered:
 				// A refusal, a reset, a handshake that got an answer it did not
 				// like: the address is talking. Whatever is wrong here is a
