@@ -4124,9 +4124,13 @@ func (m *Manager) PoolAddrs() []string {
 
 // PinAnswering moves the pin to the candidate at addr after a TCP poll found it
 // answering while the rest of the pool was silent, so the reconnect that
-// follows starts there instead of walking the silent addresses first. A parked
-// candidate is left where it is: a blackholed address answers TCP too, and the
-// selector's verdict on it is better evidence than a handshake.
+// follows starts there instead of walking the silent addresses first.
+//
+// A parked candidate is un-parked and pinned too. The gate refuses to switch to
+// a parked address because a blackhole answers TCP; but this poll runs only
+// when no address answered at all, and an answer after that is newer evidence
+// than the park - and the only way out. Leaving it parked sent the reconnect
+// walking the silent addresses again.
 func (m *Manager) PinAnswering(addr string) {
 	sel := m.selector()
 	if sel == nil {
@@ -4138,7 +4142,8 @@ func (m *Manager) PinAnswering(addr string) {
 	}
 	sel.ReportProbe(cand, true, 0)
 	if sel.IsParked(cand) {
-		return
+		log.Info("Pool poll: %s answered after the pool went silent - lifting its park", cand)
+		sel.Unpark(cand)
 	}
 	if cur, _ := sel.Current(); cur.Addr != cand.Addr {
 		log.Info("Pool poll: %s answered first, pinning it", cand)

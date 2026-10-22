@@ -672,6 +672,16 @@ func (s *Selector) ReportDeadSession(c Candidate) {
 	h.cooldownUntil = now.Add(s.jitter(park))
 }
 
+// Unpark clears c's cooldown, keeping its failure history. For a caller with
+// newer evidence than the park (see strategy.Manager.PinAnswering).
+func (s *Selector) Unpark(c Candidate) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if idx, found := s.byAddr[c.Addr]; found {
+		s.health[idx].cooldownUntil = time.Time{}
+	}
+}
+
 // ReportSessionUseful records that a session on c carried traffic for a
 // meaningful time, which ends its dead-session streak.
 func (s *Selector) ReportSessionUseful(c Candidate) {

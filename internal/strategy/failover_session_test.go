@@ -205,3 +205,23 @@ func TestStormChecksTheLocalNetwork(t *testing.T) {
 		t.Fatal("a storm with the local link down parked the server")
 	}
 }
+
+// TestPoolPollPinsAParkedServerThatAnswers is a P3 of the round-2 review: the
+// pool poll runs only when no address answers at all, and a parked server that
+// answers then is the only way out. PinAnswering used to leave it parked and
+// unpinned, so the reconnect walked the silent ones again.
+func TestPoolPollPinsAParkedServerThatAnswers(t *testing.T) {
+	a, b := newHelloListener(t), newHelloListener(t)
+	m := newSilenceManager(t, time.Second, a.addr, b.addr)
+	sel := m.selector()
+	cb, _ := sel.CandidateForAddr(b.addr)
+	sel.ReportSilent(cb)
+
+	m.PinAnswering(b.addr)
+	if got := m.GetServerAddr(context.Background()); got != b.addr {
+		t.Fatalf("pinned %s, want the server that answered after the pool went silent, %s", got, b.addr)
+	}
+	if sel.IsParked(cb) {
+		t.Fatal("still parked: the next Reconsider moves straight off it")
+	}
+}
