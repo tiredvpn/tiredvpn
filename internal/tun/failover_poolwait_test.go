@@ -2,15 +2,21 @@ package tun
 
 import (
 	"bytes"
+	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/tiredvpn/tiredvpn/internal/endpoint"
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
 )
@@ -60,14 +66,15 @@ func (l *stampedLog) String() string {
 // verdict for the duration of a test.
 func setPoolWaitKnobs(t *testing.T, gatewayUp bool) {
 	t.Helper()
-	oldConnect, oldPoll, oldSlow, oldAfter, oldProbe := reconnectConnectTimeout, poolPollInterval, poolPollSlowInterval, poolPollSlowAfter, probeInternet
+	oldConnect, oldPoll, oldFast, oldMax, oldDialTO, oldDial, oldProbe := reconnectConnectTimeout, poolPollInterval, poolFastPhase, poolPollMax, poolDialTimeout, poolDial, probeInternet
 	reconnectConnectTimeout = 300 * time.Millisecond
 	poolPollInterval = 50 * time.Millisecond
-	poolPollSlowInterval = 50 * time.Millisecond
-	poolPollSlowAfter = time.Hour
+	poolFastPhase = time.Hour
+	poolPollMax = time.Second
+	poolDialTimeout = 200 * time.Millisecond
 	probeInternet = func() bool { return gatewayUp }
 	t.Cleanup(func() {
-		reconnectConnectTimeout, poolPollInterval, poolPollSlowInterval, poolPollSlowAfter, probeInternet = oldConnect, oldPoll, oldSlow, oldAfter, oldProbe
+		reconnectConnectTimeout, poolPollInterval, poolFastPhase, poolPollMax, poolDialTimeout, poolDial, probeInternet = oldConnect, oldPoll, oldFast, oldMax, oldDialTO, oldDial, oldProbe
 	})
 }
 
@@ -209,34 +216,167 @@ func TestSilentPoolWithNoGatewayIsANetworkOutage(t *testing.T) {
 	}
 }
 
-// TestPoolPollSlowsDownAfterLongSilence pins the second interval: past
-// poolPollSlowAfter the poll spaces out. SYNs to a blocked pool every few
-// seconds for hours are a pattern of their own.
-func TestPoolPollSlowsDownAfterLongSilence(t *testing.T) {
+// silentTCPAddr is a loopback address whose SYNs go unanswered: a listener
+// with a zero backlog, its one queue slot taken and never accepted. That is
+// what a blackholed server looks like to a dialler - a timeout, not a refusal.
+func silentTCPAddr(t *testing.T) string {
+	t.Helper()
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatalf("socket: %v", err)
+	}
+	if err := syscall.Bind(fd, &syscall.SockaddrInet4{Addr: [4]byte{127, 0, 0, 1}}); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	if err := syscall.Listen(fd, 0); err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	sa, _ := syscall.Getsockname(fd)
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(sa.(*syscall.SockaddrInet4).Port))
+	filler, err := net.DialTimeout("tcp", addr, time.Second)
+	if err != nil {
+		t.Fatalf("filling the backlog: %v", err)
+	}
+	t.Cleanup(func() { filler.Close(); syscall.Close(fd) })
+	return addr
+}
+
+// TestSilentAddressesAheadOfTheLiveOneStillReconnect is P1-1 of the PR #126
+// review, the case the 4-address stand could not show. The pool poll walked
+// the whole pool, found the live server, and only logged it. The reconnect's
+// gate then walked from the pin - five silent addresses at its per-address
+// timeout - and ran out of budget before the live one, so it reported the pool
+// silent again, and the loop went round forever with a live server in reach.
+// The test asks for the tunnel, not for a log line.
+func TestSilentAddressesAheadOfTheLiveOneStillReconnect(t *testing.T) {
 	setPoolWaitKnobs(t, true)
-	poolPollInterval = 10 * time.Millisecond
-	poolPollSlowInterval = 400 * time.Millisecond
-	poolPollSlowAfter = time.Minute
+	reconnectConnectTimeout = time.Second
 
-	addr, revive := deadThenAliveAddr(t)
-	revive()
+	var eps []endpoint.Endpoint
+	for i := range 5 {
+		eps = append(eps, endpoint.Endpoint{Name: fmt.Sprintf("dead%d", i), V4: silentTCPAddr(t), Order: i})
+	}
+	live := newNetcheckListener(t).addr
+	eps = append(eps, endpoint.Endpoint{Name: "live", V4: live, Order: 5})
+
 	m := strategy.NewManager()
-	m.SetConnectivityChecker(strategy.NewConnectivityChecker(addr, 200*time.Millisecond, true))
-	v := &VPNClient{running: 1, stopCh: make(chan struct{}), manager: m, serverAddr: addr}
+	if err := m.SetEndpointSelection(endpoint.Config{Endpoints: eps, Family: endpoint.V4Only}); err != nil {
+		t.Fatal(err)
+	}
+	m.Register(&pipeStrategy{t: t, resp: bareV3Response(), gap: silent})
+	m.SetConnectivityChecker(strategy.NewConnectivityChecker(eps[0].V4, 300*time.Millisecond, true))
 
+	out := &stampedLog{}
+	log.SetOutput(out)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	v := newCallsiteClient(m)
+	v.running = 1
+	v.stopCh = make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		v.handleDisconnect("server read", io.EOF)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		atomic.StoreInt32(&v.running, 0)
+		close(v.stopCh)
+		<-done
+		t.Fatalf("no reconnect with a live server behind five silent ones; log:\n%s", out)
+	}
+	if _, ok := out.first("VPN reconnected successfully"); !ok {
+		t.Fatalf("reconnect loop ended without a tunnel; log:\n%s", out)
+	}
+	if got := m.GetServerAddr(context.Background()); got != live {
+		t.Fatalf("pinned %s, want the live server %s", got, live)
+	}
+}
+
+// TestPoolPollIsOneRotatingAddressWithGrowingPauses is P1-2 of the review. The
+// poll was a sequential SYN sweep of the whole pool on a strict period (17.0 s
+// on the stand), exactly when the servers are silent and the local network
+// works - the IP-block case, where the SYNs cross the censor. Now each round is
+// one address, the next one in the pool each time, and past the fast phase the
+// pause grows to a ceiling instead of repeating.
+func TestPoolPollIsOneRotatingAddressWithGrowingPauses(t *testing.T) {
+	setPoolWaitKnobs(t, true)
+	poolPollInterval = 20 * time.Millisecond
+	poolFastPhase = 100 * time.Millisecond
+	poolPollMax = 200 * time.Millisecond
+
+	var mu sync.Mutex
+	type dial struct {
+		at   time.Time
+		addr string
+	}
+	var dials []dial
+	poolDial = func(_ context.Context, _, addr string) (net.Conn, error) {
+		mu.Lock()
+		dials = append(dials, dial{time.Now(), addr})
+		mu.Unlock()
+		return nil, errors.New("silent")
+	}
+
+	m, addrs, _ := poolManager(t, 3)
+	v := &VPNClient{running: 1, stopCh: make(chan struct{}), manager: m}
+	go func() {
+		time.Sleep(1500 * time.Millisecond)
+		atomic.StoreInt32(&v.running, 0)
+		close(v.stopCh)
+	}()
 	start := time.Now()
-	if !v.waitForPool(time.Now().Add(-2 * time.Minute)) {
-		t.Fatal("waitForPool returned false on a running client")
-	}
-	if took := time.Since(start); took < 350*time.Millisecond {
-		t.Fatalf("after long silence the first poll came %v in, want the slow interval", took)
+	if v.waitForPool(start) {
+		t.Fatal("waitForPool reported an answer from a silent pool")
 	}
 
-	start = time.Now()
-	if !v.waitForPool(time.Now()) {
-		t.Fatal("waitForPool returned false on a running client")
+	mu.Lock()
+	defer mu.Unlock()
+	if len(dials) < 8 {
+		t.Fatalf("only %d rounds - the test proves nothing", len(dials))
 	}
-	if took := time.Since(start); took > 300*time.Millisecond {
-		t.Fatalf("fresh silence: first poll came %v in, want the fast interval", took)
+	for i, d := range dials {
+		if want := addrs[i%len(addrs)]; d.addr != want {
+			t.Fatalf("round %d dialled %s, want %s: one address per round, in rotation", i, d.addr, want)
+		}
+	}
+	var prev time.Duration
+	var grew, capped bool
+	for i := 1; i < len(dials); i++ {
+		gap := dials[i].at.Sub(dials[i-1].at)
+		if dials[i-1].at.Sub(start) < poolFastPhase+poolPollInterval {
+			continue // still in the fast phase
+		}
+		if gap > prev+poolPollInterval/2 {
+			grew = true
+		}
+		if gap > poolPollMax+100*time.Millisecond {
+			t.Fatalf("pause %v over the %v ceiling", gap, poolPollMax)
+		}
+		if gap >= poolPollMax-30*time.Millisecond {
+			capped = true
+		}
+		prev = gap
+	}
+	if !grew || !capped {
+		t.Fatalf("pauses did not grow to the ceiling past the fast phase (grew=%v capped=%v)", grew, capped)
+	}
+}
+
+// TestSilentCycleCapsTheBackoffLower is the P2 "D4 only freezes the backoff
+// when no TCP answers" item: a cycle where the pool answered TCP and every
+// transport then went silent still doubled to 2 minutes.
+func TestSilentCycleCapsTheBackoffLower(t *testing.T) {
+	silentCycle := fmt.Errorf("%w: all strategies failed", strategy.ErrAddrSilent)
+	if got := nextReconnectDelay(time.Minute, silentCycle); got != silentCycleMaxDelay {
+		t.Fatalf("after a silent cycle the backoff is %v, want the %v cap", got, silentCycleMaxDelay)
+	}
+	if got := nextReconnectDelay(time.Minute, errors.New("tls: handshake failure")); got != reconnectMaxDelay {
+		t.Fatalf("after an ordinary failure the backoff is %v, want %v", got, reconnectMaxDelay)
+	}
+	if got := nextReconnectDelay(time.Second, silentCycle); got != 2*time.Second {
+		t.Fatalf("below the cap the backoff doubles: got %v", got)
 	}
 }

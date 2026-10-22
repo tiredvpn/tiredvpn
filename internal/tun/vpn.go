@@ -62,6 +62,23 @@ const (
 	reconnectJitterFactor = 0.3             // +/- 30% jitter
 )
 
+// silentCycleMaxDelay caps the reconnect backoff after a cycle that ended in
+// silence (strategy.ErrAddrSilent).
+const silentCycleMaxDelay = 30 * time.Second
+
+// nextReconnectDelay is the backoff after a failed reconnect with err:
+// doubled, capped. A cycle that ended in silence - the pool answered TCP, then
+// every transport heard nothing - caps lower: it is the same "servers
+// unreachable from a working network" story as a silent pool, one layer up,
+// and the 2-minute cap slept through up to two minutes of recovered network.
+func nextReconnectDelay(cur time.Duration, err error) time.Duration {
+	maxDelay := reconnectMaxDelay
+	if errors.Is(err, strategy.ErrAddrSilent) {
+		maxDelay = silentCycleMaxDelay
+	}
+	return min(time.Duration(float64(cur)*reconnectMultiplier), maxDelay)
+}
+
 // Port hop reconnect configuration (faster than regular reconnect)
 const (
 	portHopReconnectTimeout = 5 * time.Second // Quick timeout for port hop
@@ -178,6 +195,10 @@ type VPNClient struct {
 	// while a strategy upgrade is dialling, so two reprobes never run two.
 	noStrategyUpgrade bool
 	upgrading         atomic.Bool
+
+	// poolRound rotates waitForPool's one dial per round through the pool.
+	// Only the reconnect loop touches it.
+	poolRound int
 
 	// Port hop state for seamless reconnect
 	portHopInProgress int32    // 1 if port hop reconnect in progress
@@ -2024,11 +2045,7 @@ func (v *VPNClient) handleDisconnect(reason string, err error) {
 		case <-time.After(addJitter(currentDelay)):
 		}
 
-		// Exponential backoff with cap
-		currentDelay = time.Duration(float64(currentDelay) * reconnectMultiplier)
-		if currentDelay > reconnectMaxDelay {
-			currentDelay = reconnectMaxDelay
-		}
+		currentDelay = nextReconnectDelay(currentDelay, err)
 	}
 }
 
@@ -2141,18 +2158,45 @@ func (v *VPNClient) checkNetworkConnectivity() bool {
 // shorten it.
 var reconnectConnectTimeout = 15 * time.Second
 
-// Pool polling while no server answers (see waitForPool). The interval is the
-// same fixed 5 s waitForNetworkRestore has always used, so the pattern on the
-// wire is not a new one; after poolPollSlowAfter of unbroken silence it drops to
-// poolPollSlowInterval, because by then a blocked pool is a likelier story than
-// a provider outage and SYNs into a blackhole every few seconds are a pattern
-// in their own right. Vars so tests can shorten them.
+// Pool polling while no server answers (see waitForPool). Vars so tests can
+// shorten them.
+//
+// One address per round, rotating through the pool. A round of the whole pool
+// in a row - what this did first - was a sequential SYN sweep of every server
+// on a strict 17 s period (5 s pause plus 4 x 3 s timeouts on the stand), and it
+// runs exactly when the servers are silent while the local network works,
+// which is what an IP block looks like: those SYNs cross the censor.
+//
+// A fast phase covers a provider's line flapping: a round every 5 s for the
+// first two minutes. Past it the pause grows by half each round up to a
+// minute, the way the gate's own retry backs off (nextProbeBackoff): fewer
+// SYNs the longer the silence lasts, at the cost of noticing a recovery up to
+// a minute late after a long outage. There is no measured reference
+// distribution for this; the intervals are a deterministic growing sequence,
+// not jittered (verification rule 3).
 var (
-	poolPollInterval     = 5 * time.Second
-	poolPollSlowInterval = 30 * time.Second
-	poolPollSlowAfter    = 10 * time.Minute
-	poolCheckTimeout     = 30 * time.Second
+	poolPollInterval = 5 * time.Second
+	poolFastPhase    = 2 * time.Minute
+	poolPollMax      = time.Minute
+	poolDialTimeout  = 3 * time.Second
+
+	// poolDial opens the poll's one connection. Tests replace it.
+	poolDial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, addr)
+	}
 )
+
+// poolPollGrowth is the factor the pause grows by after the fast phase.
+const poolPollGrowth = 1.5
+
+// nextPoolPoll is the pause before the next round, given the current one and
+// how long the pool has been silent.
+func nextPoolPoll(cur, silentFor time.Duration) time.Duration {
+	if silentFor < poolFastPhase {
+		return poolPollInterval
+	}
+	return min(time.Duration(float64(cur)*poolPollGrowth), poolPollMax)
+}
 
 // waitOutSilentPool decides what a "nobody in the pool answers" verdict means
 // and waits accordingly. The gateway is the third party that tells the two
@@ -2172,52 +2216,56 @@ func (v *VPNClient) waitOutSilentPool(err error, since time.Time) bool {
 	return v.waitForPool(since)
 }
 
-// waitForPool polls the pool's TCP ports until one answers, at most
-// networkParkTimeout per call, then hands back to the caller for a real
-// connect. Only TCP handshakes go out: see ConnectivityChecker.CheckTCP.
+// waitForPool polls the pool, one rotating address per round (see
+// poolPollInterval for the schedule), until an address answers, and pins the
+// candidate that did. Pinning matters: the reconnect's gate walks the pool from
+// the pin, 3 s per silent address, and with several silent addresses ahead of
+// the live one its budget ran out before reaching it, so the client found the
+// live server here and could not get to it there, round after round.
+// Returns false only when the client was stopped.
 func (v *VPNClient) waitForPool(since time.Time) bool {
-	deadline := time.Now().Add(networkParkTimeout)
+	interval := poolPollInterval
 	for atomic.LoadInt32(&v.running) == 1 {
-		interval := poolPollInterval
-		if time.Since(since) >= poolPollSlowAfter {
-			interval = poolPollSlowInterval
-		}
 		select {
 		case <-v.stopCh:
 			return false
 		case <-time.After(interval):
 		}
-		if addr, ok := v.poolAnswers(); ok {
+		if addr, ok := v.pollOneServer(); ok {
 			log.Info("Server %s answers again after %v of pool silence", addr, time.Since(since).Round(time.Second))
+			if v.manager != nil {
+				v.manager.PinAnswering(addr)
+			}
 			return true
 		}
-		if time.Now().After(deadline) {
-			log.Warn("Pool still silent after %v - retrying connection anyway", networkParkTimeout)
-			return true
-		}
+		interval = nextPoolPoll(interval, time.Since(since))
 	}
 	return false
 }
 
-// poolAnswers runs one TCP-only round of the gate over the pool.
-func (v *VPNClient) poolAnswers() (string, bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), poolCheckTimeout)
-	defer cancel()
+// pollOneServer dials the next address of the pool in rotation, TCP only.
+func (v *VPNClient) pollOneServer() (string, bool) {
+	var addrs []string
 	if v.manager != nil {
-		if checker := v.manager.ConnectivityChecker(); checker != nil {
-			r := checker.CheckTCP(ctx)
-			return r.Addr, r.TCP
-		}
+		addrs = v.manager.PoolAddrs()
 	}
-	if v.serverAddr == "" {
+	if len(addrs) == 0 && v.serverAddr != "" {
+		addrs = []string{v.serverAddr}
+	}
+	if len(addrs) == 0 {
 		return "", false
 	}
-	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", v.serverAddr)
+	addr := addrs[v.poolRound%len(addrs)]
+	v.poolRound++
+
+	ctx, cancel := context.WithTimeout(context.Background(), poolDialTimeout)
+	defer cancel()
+	conn, err := poolDial(ctx, "tcp", addr)
 	if err != nil {
 		return "", false
 	}
 	conn.Close()
-	return v.serverAddr, true
+	return addr, true
 }
 
 // errMeansPathAlive reports whether a dial error still suggests the path is

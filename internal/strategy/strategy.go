@@ -353,6 +353,10 @@ func refusedByAddr(err error, addrs ...string) bool {
 // the moment one of them answers again.
 var ErrNoServerAnswered = errors.New("no connectivity to server")
 
+// ErrAddrSilent is errAddrSilent for callers outside the package: the cycle
+// ended because an address answered no transport.
+var ErrAddrSilent = errAddrSilent
+
 // errAddrSilent narrows errStrategyScanFailed: the scan was abandoned because
 // the address accepted connections and then answered nothing, on one transport
 // after another. Every failure was a timeout at connectTimeout - no refusal, no
@@ -3841,6 +3845,46 @@ func (m *Manager) GetServerAddr(ctx context.Context) string {
 		return ""
 	}
 	return c.Addr
+}
+
+// PoolAddrs returns the addresses of every candidate with a physical route,
+// in preference order - what a "does anyone answer" poll walks.
+func (m *Manager) PoolAddrs() []string {
+	sel := m.selector()
+	if sel == nil {
+		return nil
+	}
+	var out []string
+	for _, c := range sel.Candidates() {
+		if sel.Reachable(c.Addr) {
+			out = append(out, c.Addr)
+		}
+	}
+	return out
+}
+
+// PinAnswering moves the pin to the candidate at addr after a TCP poll found it
+// answering while the rest of the pool was silent, so the reconnect that
+// follows starts there instead of walking the silent addresses first. A parked
+// candidate is left where it is: a blackholed address answers TCP too, and the
+// selector's verdict on it is better evidence than a handshake.
+func (m *Manager) PinAnswering(addr string) {
+	sel := m.selector()
+	if sel == nil {
+		return
+	}
+	cand, ok := sel.CandidateForAddr(addr)
+	if !ok {
+		return
+	}
+	sel.ReportProbe(cand, true, 0)
+	if sel.IsParked(cand) {
+		return
+	}
+	if cur, _ := sel.Current(); cur.Addr != cand.Addr {
+		log.Info("Pool poll: %s answered first, pinning it", cand)
+	}
+	sel.Pin(cand)
 }
 
 // ProbeEndpointFamily runs the one-shot transport-family probe for the pinned
