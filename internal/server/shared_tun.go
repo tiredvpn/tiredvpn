@@ -278,14 +278,23 @@ func (st *SharedTUN) registerClient(clientIP net.IP, clientID string, conn net.C
 	if hadOld {
 		oldAge := now - atomic.LoadInt64(&old.created)
 		lastSeen := now - atomic.LoadInt64(&old.lastActive)
-		if lastSeen <= sharedTUNLiveEvictionWindow {
+		sameOrigin := old.conn != nil && conn != nil && originOf(old.conn.RemoteAddr()) == originOf(conn.RemoteAddr())
+		switch {
+		case lastSeen <= sharedTUNLiveEvictionWindow && sameOrigin:
+			// A live session taken over from the same address: a client moving
+			// its own tunnel to another transport (strategy upgrade) or port.
+			// Two boxes behind one NAT on the global secret look the same and
+			// cannot be told apart here.
+			log.Info("SharedTUN: live connection for %s taken over from the same address (clientID=%s, old_age=%ds, reconnect_count=%d)",
+				ipStr, clientID, oldAge, count)
+		case lastSeen <= sharedTUNLiveEvictionWindow:
 			// The connection being replaced was carrying traffic seconds ago, so
 			// this is not a client recovering a dead session: two clients are
 			// sharing one tunnel IP and evicting each other. Usually means two
 			// boxes on the same global secret (they all authenticate as "global").
 			log.Warn("SharedTUN: replacing LIVE connection for %s (clientID=%s, old_age=%ds, last_seen=%ds ago, reconnect_count=%d) - two clients may be sharing one tunnel IP",
 				ipStr, clientID, oldAge, lastSeen, count)
-		} else {
+		default:
 			log.Info("SharedTUN: replacing connection for %s (clientID=%s, old_age=%ds, reconnect_count=%d)",
 				ipStr, clientID, oldAge, count)
 		}
