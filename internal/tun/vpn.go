@@ -42,6 +42,10 @@ var keepaliveInterval = 10 * time.Second
 
 var readTimeout = 30 * time.Second             // Must be > keepaliveInterval, detect dead connection faster. A var so tests can shorten it.
 const writeTimeout = 30 * time.Second          // Write timeout (was 5s, caused i/o timeouts with bufferbloat)
+
+// keepaliveWriteTimeout bounds one keepalive write. A var so tests can
+// shorten it.
+var keepaliveWriteTimeout = 5 * time.Second
 const deadConnectionTimeout = 45 * time.Second // Proactive dead connection detection timeout
 
 // maxFrameLen is the largest [len:4][data:N] payload the tunnel protocol accepts;
@@ -1575,10 +1579,9 @@ func (v *VPNClient) sendKeepalive() {
 				keepalivePkt := make([]byte, 4)
 				binary.BigEndian.PutUint32(keepalivePkt, 0)
 
-				wdl := time.Now().Add(5 * time.Second)
-				conn.SetWriteDeadline(wdl)
+				conn.SetWriteDeadline(time.Now().Add(keepaliveWriteTimeout))
 				if _, err := conn.Write(keepalivePkt); err != nil {
-					v.connLost(conn, "keepalive write", markSilence(err, wdl))
+					v.connLost(conn, "keepalive write", err)
 				} else {
 					log.Debug("Sent keepalive packet")
 				}
@@ -1636,11 +1639,10 @@ func (v *VPNClient) readFromTun() {
 			continue
 		}
 
-		wdl := time.Now().Add(writeTimeout)
-		conn.SetWriteDeadline(wdl)
+		conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 		written, err := conn.Write(buf[:n+4])
 		if err != nil {
-			v.connLost(conn, "server write", markSilence(err, wdl))
+			v.connLost(conn, "server write", err)
 			continue
 		}
 
@@ -2263,7 +2265,9 @@ func sessionWasUseful(connectedAt, lastRx time.Time) bool {
 }
 
 // markSilence tags err as the server's silence when it came back at or after
-// the deadline the client itself set on the operation.
+// the read deadline the client itself set. Reads only: a write that runs into
+// its deadline says the local uplink is stuck (bufferbloat), not that the
+// server went quiet.
 //
 // The error alone does not say so reliably. smux v2, which carries every
 // REALITY tunnel, reports its deadline as errors.WithStack(errors.New("timeout"))

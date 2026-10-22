@@ -2,10 +2,12 @@ package tun
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -404,5 +406,61 @@ func TestUpgradeRechecksEligibilityAtTheDial(t *testing.T) {
 	v.tryStrategyUpgrade([]strategy.Strategy{quic})
 	if dials.Load() != 0 {
 		t.Fatal("a UDP candidate was dialled while UDP is excluded")
+	}
+}
+
+// stallingConn takes writes until their deadline and then fails them the way
+// smux does, as a bufferbloated uplink would.
+type stallingConn struct {
+	net.Conn
+	mu       sync.Mutex
+	deadline time.Time
+}
+
+func (c *stallingConn) SetWriteDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.deadline = t
+	c.mu.Unlock()
+	return nil
+}
+func (c *stallingConn) SetReadDeadline(time.Time) error { return nil }
+func (c *stallingConn) Write([]byte) (int, error) {
+	c.mu.Lock()
+	d := c.deadline
+	c.mu.Unlock()
+	time.Sleep(time.Until(d) + 5*time.Millisecond)
+	return 0, errors.New("timeout")
+}
+func (c *stallingConn) Close() error { return nil }
+
+// TestStalledKeepaliveWriteIsNotServerSilence is a P3 of the round-2 review: a
+// keepalive write that runs into its own 5 s deadline says the local uplink is
+// stuck (bufferbloat), not that the server went quiet. Taking it for silence
+// armed the pool gate and could park a young session's server. Only reads
+// speak for the server.
+func TestStalledKeepaliveWriteIsNotServerSilence(t *testing.T) {
+	oldKA, oldW := keepaliveInterval, keepaliveWriteTimeout
+	keepaliveInterval, keepaliveWriteTimeout = 20*time.Millisecond, 50*time.Millisecond
+	t.Cleanup(func() { keepaliveInterval, keepaliveWriteTimeout = oldKA, oldW })
+
+	m := strategy.NewManager()
+	m.SetConnectivityChecker(strategy.NewConnectivityChecker("127.0.0.1:1", time.Second, true))
+	v := &VPNClient{running: 1, stopCh: make(chan struct{}), manager: m, conn: &stallingConn{},
+		connectedAt: time.Now().Add(-time.Minute), lastRx: time.Now().Add(-time.Minute)}
+	out := &stopOnDisconnectLog{v: v}
+	setLog(t, out)
+	done := make(chan struct{})
+	go func() { v.sendKeepalive(); close(done) }()
+	deadline := time.Now().Add(3 * time.Second)
+	for !strings.Contains(out.String(), "VPN disconnected") && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	close(v.stopCh)
+	<-done
+	if !strings.Contains(out.String(), "VPN disconnected") {
+		t.Fatal("the stalled write never ended the session - the test proves nothing")
+	}
+	if m.PreflightArmed() {
+		t.Fatal("a stalled keepalive write was taken for the server's silence")
 	}
 }
