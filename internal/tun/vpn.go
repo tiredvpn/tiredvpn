@@ -793,13 +793,15 @@ func (v *VPNClient) seamlessPortHop(newPort int) {
 	// Try to establish new connection (make)
 	var newConn net.Conn
 	var newStrategy strategy.Strategy
+	var newCand endpoint.Candidate
+	var hasNewCand bool
 	var connectErr error
 
 	for attempt := 1; attempt <= portHopMaxAttempts; attempt++ {
 		ctx, cancel := context.WithTimeout(context.Background(), portHopReconnectTimeout)
 
 		// Connect to new port using strategy manager
-		newConn, newStrategy, connectErr = v.manager.Connect(ctx, newTarget)
+		newConn, newStrategy, newCand, hasNewCand, connectErr = v.manager.ConnectSession(ctx, newTarget)
 		cancel()
 
 		if connectErr == nil {
@@ -819,9 +821,14 @@ func (v *VPNClient) seamlessPortHop(newPort int) {
 		return
 	}
 
-	// Perform TUN mode handshake on new connection; see sessionMu.
+	// Perform TUN mode handshake on new connection; see sessionMu. A hop that
+	// waited here behind an upgrade may find the client stopped meanwhile.
 	v.sessionMu.Lock()
 	defer v.sessionMu.Unlock()
+	if atomic.LoadInt32(&v.running) == 0 {
+		newConn.Close()
+		return
+	}
 	tunnelConn, handshakeErr := v.performHandshake(newConn)
 	if handshakeErr != nil {
 		newConn.Close()
@@ -830,12 +837,21 @@ func (v *VPNClient) seamlessPortHop(newPort int) {
 		return
 	}
 
-	// Atomic swap: new connection ready, swap with old (break)
+	// Atomic swap: new connection ready, swap with old (break). The hop's
+	// session is a session like any other: it rides the endpoint it was
+	// dialled at, and a pending upgrade can no longer be judged by it.
 	v.mu.Lock()
+	if atomic.LoadInt32(&v.running) == 0 {
+		v.mu.Unlock()
+		tunnelConn.Close()
+		return
+	}
 	oldConn := v.conn
 	v.conn = tunnelConn
 	v.strategy = newStrategy
 	v.serverAddr = newTarget
+	v.sessionCand, v.hasSessionCand = newCand, hasNewCand
+	v.upgradePending = nil
 	v.connectedAt = time.Now()
 	v.lastRx = v.connectedAt
 	v.mu.Unlock()
@@ -1813,7 +1829,9 @@ func (v *VPNClient) connLost(conn net.Conn, reason string, err error) {
 	v.disconnect(conn, reason, err)
 }
 
-// upgradeConnectTimeout bounds one strategy upgrade dial plus its handshake.
+// upgradeConnectTimeout bounds one strategy upgrade dial. The TUN handshake
+// that follows is bounded by its own deadlines (10 s write, handshakeReadTimeout
+// read) and is not cut short by Stop; the swap after it checks running.
 const upgradeConnectTimeout = 15 * time.Second
 
 // errUpgradeRejected is the reason a session is handed to handleDisconnect

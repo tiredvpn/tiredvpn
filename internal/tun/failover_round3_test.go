@@ -224,3 +224,97 @@ func TestLostUpgradeResponseIsTunnelLoss(t *testing.T) {
 		t.Fatalf("upgrade failures = %d, want 1", n)
 	}
 }
+
+// TestPortHopJoinsTheSessionState is P2-3 of the round-2 review: the port hop
+// swaps the session like an upgrade does, but left upgradePending and
+// sessionCand from before, so an upgrade could be confirmed or failed by the
+// hop's session, and a hop onto another endpoint booked its session's death
+// against the previous one.
+func TestPortHopJoinsTheSessionState(t *testing.T) {
+	m, addrs, _ := poolManager(t, 2)
+	v := newCallsiteClient(m)
+	v.running = 1
+	v.stopCh = make(chan struct{})
+	setLog(t, &stampedLog{})
+	if err := v.connect(context.Background()); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	v.mu.Lock()
+	v.upgradePending = v.strategy
+	v.mu.Unlock()
+	m.PinAnswering(addrs[1])
+
+	v.seamlessPortHop(1234)
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.upgradePending != nil {
+		t.Error("the hop's session inherited a pending upgrade")
+	}
+	if !v.hasSessionCand || v.sessionCand.Addr != addrs[1] {
+		t.Errorf("after the hop the session endpoint is %v, want %s", v.sessionCand, addrs[1])
+	}
+}
+
+// TestPortHopOnAStoppedClientInstallsNothing: a hop waiting on sessionMu
+// behind an upgrade could handshake and publish after Stop.
+func TestPortHopOnAStoppedClientInstallsNothing(t *testing.T) {
+	m, _, _ := poolManager(t, 1)
+	v := newCallsiteClient(m)
+	v.running = 1
+	v.stopCh = make(chan struct{})
+	setLog(t, &stampedLog{})
+	if err := v.connect(context.Background()); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	v.mu.Lock()
+	v.conn = nil // what Stop leaves
+	v.mu.Unlock()
+	v.running = 0
+
+	v.seamlessPortHop(1234)
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.conn != nil {
+		t.Fatal("a port hop published a session on a stopped client")
+	}
+}
+
+// TestPortHopChecksRunningOnBothSides: before the handshake (so a stopped
+// client registers nothing on the exit) and again before the commit (Stop may
+// land during the handshake).
+func TestPortHopChecksRunningOnBothSides(t *testing.T) {
+	for _, stopDuring := range []bool{false, true} {
+		m := strategy.NewManager()
+		addr := newNetcheckListener(t).addr
+		if err := m.SetEndpointSelection(endpoint.Config{Endpoints: []endpoint.Endpoint{{Name: "a", V4: addr}}, Family: endpoint.V4Only}); err != nil {
+			t.Fatal(err)
+		}
+		var v *VPNClient
+		exit := &exitStrategy{id: "reality", priority: 5, t: t, onHandshake: answer(nil)}
+		if stopDuring {
+			exit.onHandshake = func(srv net.Conn) {
+				atomic.StoreInt32(&v.running, 0)
+				answer(nil)(srv)
+			}
+		}
+		m.Register(exit)
+		v = newCallsiteClient(m)
+		v.stopCh = make(chan struct{})
+		setLog(t, &stampedLog{})
+		v.running = 1
+		if !stopDuring {
+			v.running = 0
+		}
+
+		v.seamlessPortHop(1234)
+		v.mu.Lock()
+		conn := v.conn
+		v.mu.Unlock()
+		if conn != nil {
+			t.Fatalf("stopDuring=%v: a stopped client got the hop's session", stopDuring)
+		}
+		if !stopDuring && exit.handshakes.Load() != 0 {
+			t.Fatal("a stopped client handshook on the exit")
+		}
+	}
+}
