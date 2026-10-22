@@ -397,7 +397,7 @@ ADVANCED EVASION:
   -rtt-profile string
         RTT profile: moscow-yandex, moscow-vk, regional-russia, siberia, cdn, beijing-baidu, tehran-aparat (default "moscow-yandex")
   -cover string
-        Cover host for traffic mimicry (default "api.googleapis.com")
+        HTTP/2 Stego cover host (SNI and :authority); an endpoint SNI pool (-reality-sni, [[servers]] sni) wins; empty = rotate (default "api.googleapis.com")
   -reality-require-data-v2
         Refuse REALITY servers still on the v1 data layer instead of silently falling back (default true; =false only for pre-1.11 servers)
   -reality-server-pubkey string
@@ -680,7 +680,7 @@ func runClient(args []string) {
 	fs.StringVar(&cfg.HTTPListenAddr, "http-listen", "", "Separate HTTP proxy address (optional)")
 	fs.StringVar(&cfg.ServerAddr, "server", "", "Remote server address (host:port)")
 	fs.StringVar(&cfg.Secret, "secret", "", "Shared secret for authentication")
-	fs.StringVar(&cfg.CoverHost, "cover", "api.googleapis.com", "Cover host for traffic mimicry")
+	fs.StringVar(&cfg.CoverHost, "cover", "api.googleapis.com", "HTTP/2 Stego cover host (SNI and :authority). An endpoint SNI pool (-reality-sni, [[servers]] sni) wins over it; empty = rotate built-in hosts.")
 	fs.StringVar(&cfg.StrategyName, "strategy", "", "Force specific strategy (http2_stego, morph, confusion, antiprobe, quic, http_polling)")
 	fs.BoolVar(&cfg.ListStrategies, "list", false, "List available strategies and exit")
 	fs.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
@@ -920,23 +920,27 @@ type adminConnFlags struct {
 	quicPort *int
 	strategy *string
 	cover    *string
+	sni      *sniListFlag
 }
 
 func registerAdminConnFlags(fs *flag.FlagSet) adminConnFlags {
+	sni := new(sniListFlag)
+	fs.Var(sni, "reality-sni", "Comma-separated SNI pool for the connection string (sni=); empty leaves it out")
 	return adminConnFlags{
 		quic:     fs.Bool("quic", true, "Enable QUIC"),
 		quicPort: fs.Int("quic-port", 0, "QUIC port for the connection string; 0 leaves it out (clients dial the server port)"),
 		strategy: fs.String("strategy", "auto", "Strategy"),
 		cover:    fs.String("cover", "api.googleapis.com", "Cover host"),
+		sni:      sni,
 	}
 }
 
 func (f adminConnFlags) connectionString(serverAddr, secret string) string {
-	return buildConnectionString(serverAddr, secret, *f.quic, *f.quicPort, *f.strategy, *f.cover)
+	return buildConnectionString(serverAddr, secret, *f.quic, *f.quicPort, *f.strategy, *f.cover, *f.sni)
 }
 
 // buildConnectionString builds a tired:// connection string
-func buildConnectionString(serverAddr, secret string, quic bool, quicPort int, strategy, cover string) string {
+func buildConnectionString(serverAddr, secret string, quic bool, quicPort int, strategy, cover string, sni []string) string {
 	params := url.Values{}
 	params.Set("secret", secret)
 	params.Set("strategy", strategy)
@@ -947,6 +951,11 @@ func buildConnectionString(serverAddr, secret string, quic bool, quicPort int, s
 		params.Set("quicPort", fmt.Sprintf("%d", quicPort))
 	}
 	params.Set("cover", cover)
+	// The endpoint's SNI pool, comma-separated like -reality-sni. Left out
+	// when empty, so strings for clients without a pool are unchanged.
+	if len(sni) > 0 {
+		params.Set("sni", strings.Join(sni, ","))
+	}
 	params.Set("rtt", "false")
 	params.Set("rttProfile", "moscow-yandex")
 	params.Set("fallback", "true")

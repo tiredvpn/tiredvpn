@@ -2293,7 +2293,7 @@ type DefaultManagerConfig struct {
 	ServerAddr string       // Server address for server-based strategies
 	Secret     []byte       // Shared secret for authentication
 	RelayNodes []*RelayNode // Mesh relay nodes (optional)
-	CoverHost  string       // Host to impersonate for HTTP/2 stego
+	CoverHost  string       // HTTP/2 stego cover host; an endpoint SNI pool wins over it
 
 	// IPv6 Transport Layer
 	ServerAddrV6 string // IPv6 server address (e.g., "[2001:db8::100]:995")

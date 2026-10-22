@@ -5,6 +5,7 @@ import (
 	"strconv"
 
 	"github.com/tiredvpn/tiredvpn/internal/client"
+	"github.com/tiredvpn/tiredvpn/internal/evasion"
 	"github.com/tiredvpn/tiredvpn/internal/log"
 )
 
@@ -150,6 +151,19 @@ func parseClientArgs(args []string) (_ *client.Config, err error) {
 		case "-cover", "-cover-host":
 			if i+1 < len(args) {
 				cfg.CoverHost = args[i+1]
+				i++
+			}
+		// The endpoint SNI pool, same as the CLI flag. -cover above stays
+		// HTTP/2 Stego's own host and yields to a pool when there is one.
+		case "-reality-sni":
+			if i+1 < len(args) {
+				// The parse error quotes the bad name, which is raw argv; the
+				// redacted value says the same.
+				if v, err := evasion.ParseSNIList(args[i+1]); err == nil {
+					cfg.REALITYSNIs = v
+				} else {
+					log.Warn("parseClientArgs: invalid -reality-sni value %q, using the built-in pool", logArgs[i+1])
+				}
 				i++
 			}
 		case "-debug":

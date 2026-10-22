@@ -2,7 +2,9 @@ package main
 
 import (
 	"flag"
+	"net/url"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/tiredvpn/tiredvpn/internal/client"
@@ -91,5 +93,63 @@ func TestRealitySNIFlags(t *testing.T) {
 	registerClientREALITYFlags(fs, &client.Config{})
 	if err := fs.Parse([]string{"-reality-sni", "evil.example:8443"}); err == nil {
 		t.Error("a name with a port was accepted")
+	}
+}
+
+// TestJNIRealitySNI: the app's argv reaches the same pool as the CLI flag, and
+// -cover stays HTTP/2 Stego's own host next to it. A bad list is dropped with
+// a warning, as the parser does for every bad value, and leaves the built-in
+// pool.
+func TestJNIRealitySNI(t *testing.T) {
+	cfg, err := parseClientArgs([]string{"-server", "203.0.113.10:995", "-secret", "s",
+		"-cover", "api.googleapis.com", "-reality-sni", "www.google.com, WWW.GSTATIC.COM"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(cfg.REALITYSNIs, []string{"www.google.com", "www.gstatic.com"}) {
+		t.Errorf("REALITYSNIs = %v", cfg.REALITYSNIs)
+	}
+	if cfg.CoverHost != "api.googleapis.com" {
+		t.Errorf("CoverHost = %q", cfg.CoverHost)
+	}
+
+	cfg, err = parseClientArgs([]string{"-server", "203.0.113.10:995", "-secret", "s", "-reality-sni", "a.example,b.example:443"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.REALITYSNIs != nil {
+		t.Errorf("an invalid list was taken: %v", cfg.REALITYSNIs)
+	}
+}
+
+// TestConnectionStringCarriesTheSNIPool: admin add and admin qr write the pool
+// as sni=, comma-separated like the flag, and leave it out when there is none,
+// so strings for clients without a pool do not change.
+func TestConnectionStringCarriesTheSNIPool(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want string
+		has  bool
+	}{
+		{nil, "", false},
+		{[]string{"-reality-sni", "www.google.com,www.gstatic.com"}, "www.google.com,www.gstatic.com", true},
+	} {
+		fs := flag.NewFlagSet("admin", flag.ContinueOnError)
+		conn := registerAdminConnFlags(fs)
+		if err := fs.Parse(tc.args); err != nil {
+			t.Fatal(err)
+		}
+		s := conn.connectionString("vpn.example.com:995", "s")
+		_, q, _ := strings.Cut(s, "?")
+		v, err := url.ParseQuery(q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v.Has("sni") != tc.has || v.Get("sni") != tc.want {
+			t.Errorf("%v: sni=%q (present %v) in %s", tc.args, v.Get("sni"), v.Has("sni"), s)
+		}
+		if v.Get("cover") != "api.googleapis.com" {
+			t.Errorf("%v: cover changed: %s", tc.args, s)
+		}
 	}
 }
