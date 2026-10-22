@@ -1973,7 +1973,10 @@ func (v *VPNClient) handshakeUpgrade(oldConn, conn net.Conn, cur, next strategy.
 		// already have moved the client's address to the new session, and the
 		// old one with it.
 		log.Info("Strategy upgrade: %s handshake lost after the request (%v), reconnecting", next.Name(), err)
-		v.connLost(oldConn, "strategy upgrade", fmt.Errorf("%w: %w", errUpgradeRejected, err))
+		// %v, not %w: whatever the new transport ran into - a read deadline,
+		// a QUIC idle timeout - says nothing about the server going quiet on
+		// the tunnel the old conn was carrying.
+		v.connLost(oldConn, "strategy upgrade", fmt.Errorf("%w: %v", errUpgradeRejected, err))
 		return
 	}
 	caps, hasCaps := parseServerCapabilities(resp, n)

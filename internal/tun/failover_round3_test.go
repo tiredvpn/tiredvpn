@@ -216,6 +216,7 @@ func TestLostUpgradeResponseIsTunnelLoss(t *testing.T) {
 	better := &exitStrategy{id: "reality", priority: 5, t: t, onHandshake: func(net.Conn) { select {} }}
 	v, _, _ := newUpgradeClient(t, &rankedPipeStrategy{pipeStrategy: &pipeStrategy{t: t}, id: "unused", priority: 99})
 	v.manager.Register(better)
+	v.manager.SetConnectivityChecker(strategy.NewConnectivityChecker("127.0.0.1:1", time.Second, true))
 	out := &stopOnDisconnectLog{v: v}
 	setLog(t, out)
 
@@ -225,6 +226,12 @@ func TestLostUpgradeResponseIsTunnelLoss(t *testing.T) {
 	}
 	if n := v.manager.UpgradeFailures("reality"); n != 1 {
 		t.Fatalf("upgrade failures = %d, want 1", n)
+	}
+	// P3-2 of the round-3 review: the response ran into the upgrade's own
+	// read deadline, a net.Error with Timeout(). That is the new transport's
+	// loss, not the server going quiet on the tunnel it was carrying.
+	if v.manager.PreflightArmed() {
+		t.Fatal("a lost upgrade response was taken for the server's silence")
 	}
 }
 
