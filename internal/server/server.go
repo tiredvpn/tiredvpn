@@ -5070,18 +5070,27 @@ func (s *HTTPPollingSession) ReadToClient(ackSeq int64) []byte {
 	// Check if we need to re-send unacked data (with grace period to allow parallel polls to ack)
 	// Only re-send if: we have unacked data, client is behind, AND enough time has passed
 	const resendGracePeriod = 500 * time.Millisecond // Wait before triggering re-send
-	if len(s.unackedBuf) > 0 && ackSeq < s.sentOffset && time.Since(s.lastSendTime) > resendGracePeriod {
+	if ackSeq < s.sentOffset {
+		// The client is behind what was sent. Nothing past ackSeq may go out
+		// now: the client appends whatever it gets at ackSeq, so new bytes
+		// here land where the missing ones belong and every frame boundary
+		// after them is off - "bad frame: length 916517968" on the client
+		// after one poll timed out. Its retry comes within ~0.2 s, inside
+		// the grace, which is exactly when the old code sent new data.
+		if time.Since(s.lastSendTime) <= resendGracePeriod {
+			return nil
+		}
 		// Client hasn't received all data after grace period - re-send from where client is
 		resendOffset := ackSeq - (s.sentOffset - int64(len(s.unackedBuf)))
-		if resendOffset >= 0 && resendOffset < int64(len(s.unackedBuf)) {
-			// Re-send from resendOffset
-			toResend := s.unackedBuf[resendOffset:]
-			if len(toResend) > maxChunk {
-				toResend = toResend[:maxChunk]
-			}
-			s.lastSendTime = time.Now() // Update send time for re-send
-			return toResend
+		if resendOffset < 0 || resendOffset >= int64(len(s.unackedBuf)) {
+			return nil
 		}
+		toResend := s.unackedBuf[resendOffset:]
+		if len(toResend) > maxChunk {
+			toResend = toResend[:maxChunk]
+		}
+		s.lastSendTime = time.Now() // Update send time for re-send
+		return toResend
 	}
 
 	// Flow control: don't send more data if unacked buffer is full. The client
