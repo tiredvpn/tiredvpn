@@ -151,6 +151,30 @@ inside `fc00::/7`. Each client's v6 address is its v4 lease embedded in the low
 32 bits of the prefix; the server takes `prefix::1`. Only clients handshaking at
 protocol version `0x04` or later receive a v6 address.
 
+#### How a client keeps its address
+
+A tunnel address is leased per **credential**, not per transport: a registry
+client by its client ID, a client on the global secret by `global` plus the
+address it connects from. The same client therefore gets the same tunnel
+address over REALITY, Polling, Geneva or any other transport, which is what lets
+a client move a live tunnel to a better transport without renumbering.
+
+Two consequences to know about:
+
+- **One registry credential on several devices.** A registry client's lease
+  carries no origin, so the client keeps its address when it roams between
+  networks. The flip side: two devices sharing one registry credential at the
+  same time share one tunnel address and push each other off it ("replacing
+  LIVE connection" in the log). Give each device its own client. Before this
+  release that was already the case on every transport except REALITY.
+- **Global secret behind one NAT.** Two boxes on the global secret behind the
+  same public address share one lease and evict each other, on any mix of
+  transports. Boxes at different addresses keep separate leases.
+
+Leases taken by an older server under its per-transport keys are moved to the
+credential key the first time the client connects, and any extra old lease the
+client still holds is released.
+
 Package installs set `-ip-pool 10.8.0.0/24` by default (via `TIREDVPN_IP_POOL`
 in `/etc/tiredvpn/env`). An empty `TIREDVPN_IP_POOL` (or `--proxy-only`) starts
 the server in proxy mode with no pool and no NAT.

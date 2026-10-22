@@ -2583,7 +2583,7 @@ func handleMorphTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverConte
 	} else {
 		// Allocate IP from pool (if available) or use requested IP as fallback
 		if srvCtx.ipPool != nil {
-			allocatedIP, err := allocateTunnelIP(srvCtx.ipPool, clientID, originOf(conn.RemoteAddr()), requestedIP)
+			allocatedIP, err := allocateTunnelIP(srvCtx, clientID, originOf(conn.RemoteAddr()), requestedIP)
 			if err != nil {
 				logger.Error("Failed to allocate IP from pool: %v", err)
 				failPacket := []byte{0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01}
@@ -3138,7 +3138,7 @@ func handleConfusionTUNMode(sess *confusionSession, remainingData []byte, srvCtx
 	} else {
 		// Allocate IP from pool
 		if srvCtx.ipPool != nil {
-			allocatedIP, err := allocateTunnelIP(srvCtx.ipPool, clientID, originOf(conn.RemoteAddr()), requestedIP)
+			allocatedIP, err := allocateTunnelIP(srvCtx, clientID, originOf(conn.RemoteAddr()), requestedIP)
 			if err != nil {
 				logger.Error("Failed to allocate IP from pool: %v", err)
 				conn.Write([]byte{0x01})
@@ -3500,7 +3500,7 @@ func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger
 	if srvCtx.ipPool != nil {
 		// Use IP Pool - it returns same IP for same lease key (from Redis leases)
 		var err error
-		clientIP, err = allocateTunnelIP(srvCtx.ipPool, clientID, originOf(conn.RemoteAddr()), requestedIP)
+		clientIP, err = allocateTunnelIP(srvCtx, clientID, originOf(conn.RemoteAddr()), requestedIP)
 		if err != nil {
 			logger.Warn("IP allocation failed: %v", err)
 			resp := make([]byte, 9)
@@ -4018,7 +4018,7 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 	} else {
 		// Allocate IP from pool
 		if srvCtx.ipPool != nil {
-			allocatedIP, err := allocateTunnelIP(srvCtx.ipPool, tunnel.clientID, origin, requestedIP)
+			allocatedIP, err := allocateTunnelIP(srvCtx, tunnel.clientID, origin, requestedIP)
 			if err != nil {
 				logger.Error("Failed to allocate IP from pool: %v", err)
 				sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, tunnel.secret)
@@ -5858,7 +5858,7 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 	} else {
 		// Allocate IP from pool
 		if srvCtx.ipPool != nil {
-			allocatedIP, err := allocateTunnelIP(srvCtx.ipPool, clientID, sess.Origin, requestedIP)
+			allocatedIP, err := allocateTunnelIP(srvCtx, clientID, sess.Origin, requestedIP)
 			if err != nil {
 				logger.Error("HTTP Polling TUN: Failed to allocate IP from pool: %v", err)
 				sess.WriteToClient([]byte{0x01}) // Failure

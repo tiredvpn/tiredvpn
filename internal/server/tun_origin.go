@@ -3,7 +3,6 @@ package server
 import (
 	"bytes"
 	"net"
-	"strings"
 )
 
 // globalClientID is the client identity every caller authenticated with the
@@ -166,32 +165,60 @@ func allocationKey(id clientIdentity, origin string) string {
 }
 
 // allocateTunnelIP is the one way a TUN session gets its address: the lease
-// keyed by allocationKey, after carrying over a lease the client still holds
-// under the key an older server spelled for it.
-func allocateTunnelIP(pool *IPPool, id clientIdentity, origin string, requested net.IP) (net.IP, error) {
+// keyed by allocationKey, after folding in every lease the client still holds
+// under a key an older server spelled for it (legacyAllocationKeys).
+func allocateTunnelIP(srvCtx *serverContext, id clientIdentity, origin string, requested net.IP) (net.IP, error) {
 	key := allocationKey(id, origin)
-	if old := legacyAllocationKey(id, origin); old != "" && old != key {
-		pool.Adopt(old, key)
-	}
-	return pool.Allocate(key, requested, "")
+	srvCtx.ipPool.AdoptAll(legacyAllocationKeys(srvCtx, id, origin), key)
+	return srvCtx.ipPool.Allocate(key, requested, "")
 }
 
-// legacyAllocationKey is the key a server before the credential lease spelled
-// for id: the transport-labelled id, qualified with the origin unless it came
-// from the registry - and REALITY's id always qualified, because it used to be
-// classified as shared even for a registry client.
+// legacyAllocationKeys lists the keys a server before the credential lease
+// could have spelled for this client, over any transport: the plain one,
+// HTTP polling's "polling:" one, and REALITY's "reality:<hmac>@origin" (always
+// origin-qualified - it used to be classified as shared even for a registry
+// client). The REALITY key needs the credential's secret, looked up here.
 //
-// Leases a client requested by address are permanent in Redis, so without the
-// carry-over every client would leave one orphan behind and come back with a
-// different tunnel address after the update. Drop this once every exit has run
-// a release with the credential lease.
-func legacyAllocationKey(id clientIdentity, origin string) string {
-	if id.id == "" {
-		return ""
+// All of them, not just the incoming transport's: a client whose lease was
+// taken over REALITY and who comes back over Geneva would otherwise get a new
+// address and leave the REALITY lease behind. Requested leases are permanent
+// in Redis, so an orphan never goes away on its own. Drop this once every exit
+// has run a release with the credential lease.
+func legacyAllocationKeys(srvCtx *serverContext, id clientIdentity, origin string) []string {
+	lease := id.leaseID()
+	if lease == "" {
+		return nil
 	}
-	shared := !id.perClient || strings.HasPrefix(id.id, "reality:")
-	if !shared || origin == "" {
-		return id.id
+	qualify := func(k string, shared bool) string {
+		if !shared || origin == "" {
+			return k
+		}
+		return k + "@" + origin
 	}
-	return id.id + "@" + origin
+	keys := []string{
+		qualify(lease, !id.perClient),
+		qualify("polling:"+lease, !id.perClient),
+	}
+	if secret := credentialSecret(srvCtx, lease, id.perClient); len(secret) > 0 {
+		keys = append(keys, qualify(realityClientIdentity(secret, clientIdentity{}).id, true))
+	}
+	return keys
+}
+
+// credentialSecret is the secret behind a lease identity: the global secret,
+// or the registry client's own.
+func credentialSecret(srvCtx *serverContext, lease string, perClient bool) []byte {
+	if !perClient {
+		if lease == globalClientID && srvCtx.cfg != nil {
+			return srvCtx.cfg.Secret
+		}
+		return nil
+	}
+	if srvCtx.registry == nil {
+		return nil
+	}
+	if c := srvCtx.registry.GetByID(lease); c != nil {
+		return []byte(c.Secret)
+	}
+	return nil
 }

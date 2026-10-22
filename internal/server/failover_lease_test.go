@@ -1,10 +1,16 @@
 package server
 
 import (
+	"context"
 	"crypto/rand"
 	"net"
+	"os/exec"
+	"strconv"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 )
@@ -132,7 +138,7 @@ func TestLeaseCarriesOverFromTheOldKey(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := allocateTunnelIP(pool, reality, origin, had)
+	got, err := allocateTunnelIP(srvCtxWithPool(srvCtx, pool), reality, origin, had)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +149,7 @@ func TestLeaseCarriesOverFromTheOldKey(t *testing.T) {
 		t.Fatalf("lease %s is held by %+v, want the new key", had, lease)
 	}
 	// And Geneva on the same client now lands on it too.
-	geneva, err := allocateTunnelIP(pool, sharedIdentity(globalClientID), origin, net.ParseIP("10.8.1.9"))
+	geneva, err := allocateTunnelIP(srvCtxWithPool(srvCtx, pool), sharedIdentity(globalClientID), origin, net.ParseIP("10.8.1.9"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,11 +179,151 @@ func TestRegistryRealityLeaseCarriesOver(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := allocateTunnelIP(pool, reality, origin, had)
+	got, err := allocateTunnelIP(srvCtxWithPool(srvCtx, pool), reality, origin, had)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !got.Equal(had) || allocationKey(reality, origin) != "c1" {
 		t.Fatalf("registry REALITY client got %s under %q, it held %s", got, allocationKey(reality, origin), had)
 	}
+}
+
+// startRedis runs a throwaway redis-server for the test, or skips.
+func startRedis(t *testing.T) *redis.Client {
+	t.Helper()
+	bin, err := exec.LookPath("redis-server")
+	if err != nil {
+		t.Skip("redis-server not installed")
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+	cmd := exec.Command(bin, "--port", strconv.Itoa(port), "--save", "", "--appendonly", "no")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+	rdb := redis.NewClient(&redis.Options{Addr: net.JoinHostPort("127.0.0.1", strconv.Itoa(port))})
+	t.Cleanup(func() { rdb.Close() })
+	deadline := time.Now().Add(5 * time.Second)
+	for rdb.Ping(context.Background()).Err() != nil {
+		if time.Now().After(deadline) {
+			t.Fatal("redis-server did not come up")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return rdb
+}
+
+func leasesOf(pool *IPPool) map[string]string { // key -> ip
+	out := map[string]string{}
+	for _, l := range pool.ListLeases() {
+		out[l.ClientID] = l.IP
+	}
+	return out
+}
+
+// TestLeaseMigrationLeavesNoOrphans is P2-6 of the round-2 review, through
+// Redis and a restart. While N2 was unfixed a client could collect two leases
+// - one under its REALITY key, one under the plain one - and Adopt returned
+// early when the new key already had a lease, leaving the other permanent. A
+// client whose old lease was REALITY and who came back over another transport
+// was not migrated at all.
+func TestLeaseMigrationLeavesNoOrphans(t *testing.T) {
+	rdb := startRedis(t)
+	global := []byte("the-global-secret-of-this-exit-32")
+	srvCtx := &serverContext{cfg: &Config{Secret: global}}
+	const origin = "192.0.2.170"
+	realityOld := realityIdentityFor(t, srvCtx, global).id + "@" + origin
+	cfg := IPPoolConfig{Network: "10.8.1.0/24", ServerIP: "10.8.1.1"}
+
+	t.Run("both leases exist", func(t *testing.T) {
+		pool, err := NewIPPool(cfg, rdb)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Allocate(realityOld, net.ParseIP("10.8.1.2"), ""); err != nil {
+			t.Fatal(err)
+		}
+		plain, err := pool.Allocate("global@"+origin, net.ParseIP("10.8.1.4"), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := allocateTunnelIP(srvCtxWithPool(srvCtx, pool), sharedIdentity(globalClientID), origin, plain)
+		if err != nil || !got.Equal(plain) {
+			t.Fatalf("got %v (%v), want %s", got, err, plain)
+		}
+		if ip, left := leasesOf(pool)[realityOld]; left {
+			t.Fatalf("the REALITY lease %s stayed behind as an orphan", ip)
+		}
+
+		// After a restart from Redis, still one lease.
+		again, err := NewIPPool(cfg, rdb)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ip, left := leasesOf(again)[realityOld]; left {
+			t.Fatalf("the orphan %s came back from Redis", ip)
+		}
+		rdb.FlushAll(context.Background())
+	})
+
+	t.Run("old lease on another transport", func(t *testing.T) {
+		pool, err := NewIPPool(cfg, rdb)
+		if err != nil {
+			t.Fatal(err)
+		}
+		had, err := pool.Allocate(realityOld, net.ParseIP("10.8.1.2"), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The client comes back over Geneva, asking for some other address.
+		got, err := allocateTunnelIP(srvCtxWithPool(srvCtx, pool), sharedIdentity(globalClientID), origin, net.ParseIP("10.8.1.9"))
+		if err != nil || !got.Equal(had) {
+			t.Fatalf("over Geneva the client got %v (%v), its address is %s", got, err, had)
+		}
+		if _, left := leasesOf(pool)[realityOld]; left {
+			t.Fatal("the REALITY lease was not migrated")
+		}
+		rdb.FlushAll(context.Background())
+	})
+
+	t.Run("concurrent", func(t *testing.T) {
+		pool, err := NewIPPool(cfg, rdb)
+		if err != nil {
+			t.Fatal(err)
+		}
+		had, err := pool.Allocate(realityOld, net.ParseIP("10.8.1.2"), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		reality := realityIdentityFor(t, srvCtx, global)
+		var wg sync.WaitGroup
+		got := make([]net.IP, 8)
+		for i := range got {
+			id := sharedIdentity(globalClientID)
+			if i%2 == 0 {
+				id = reality
+			}
+			wg.Go(func() {
+				got[i], _ = allocateTunnelIP(srvCtxWithPool(srvCtx, pool), id, origin, nil)
+			})
+		}
+		wg.Wait()
+		for i, ip := range got {
+			if !ip.Equal(had) {
+				t.Fatalf("allocation %d got %v, want %s", i, ip, had)
+			}
+		}
+		if n := len(leasesOf(pool)); n != 1 {
+			t.Fatalf("%d leases after concurrent migration, want 1: %v", n, leasesOf(pool))
+		}
+	})
+}
+
+func srvCtxWithPool(srvCtx *serverContext, pool *IPPool) *serverContext {
+	return &serverContext{cfg: srvCtx.cfg, registry: srvCtx.registry, ipPool: pool}
 }

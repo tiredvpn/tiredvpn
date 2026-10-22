@@ -448,37 +448,47 @@ func (p *IPPool) stickyLookup(clientID string) string {
 	return ip
 }
 
-// Adopt moves the lease held under oldKey to newKey, unless newKey already
-// has one. It is the carry-over for a client whose lease key changed spelling
-// between releases (see legacyAllocationKey): the client keeps its address and
-// the old key leaves nothing behind.
-func (p *IPPool) Adopt(oldKey, newKey string) {
-	if oldKey == "" || newKey == "" || oldKey == newKey {
+// AdoptAll folds the leases held under oldKeys into newKey: if newKey has no
+// lease, the first old one found moves to it and the client keeps its address;
+// every other old lease is released. It is the carry-over for a client whose
+// lease key changed spelling between releases (see legacyAllocationKeys), and
+// it leaves no lease behind under an old key.
+func (p *IPPool) AdoptAll(oldKeys []string, newKey string) {
+	if newKey == "" {
 		return
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.stickyLookup(newKey) != "" {
-		return
+	have := p.stickyLookup(newKey)
+	for _, oldKey := range oldKeys {
+		if oldKey == "" || oldKey == newKey {
+			continue
+		}
+		ip := p.stickyLookup(oldKey)
+		if ip == "" {
+			continue
+		}
+		lease := p.leases[ip]
+		delete(p.byClient, oldKey)
+		if p.redis != nil {
+			p.redis.Del(context.Background(), p.redisClientKey(oldKey))
+		}
+		if lease == nil || lease.ClientID != oldKey {
+			continue
+		}
+		if have == "" {
+			lease.ClientID = newKey
+			if err := p.saveLease(lease); err != nil {
+				log.Warn("Failed to persist lease %s moved from %s to %s: %v", ip, oldKey, newKey, err)
+				continue
+			}
+			have = ip
+			log.Info("Lease %s moved from %s to %s", ip, oldKey, newKey)
+			continue
+		}
+		p.deleteLease(ip)
+		log.Info("Lease %s under %s released: the client holds %s under %s", ip, oldKey, have, newKey)
 	}
-	ip := p.stickyLookup(oldKey)
-	if ip == "" {
-		return
-	}
-	lease := p.leases[ip]
-	if lease == nil || lease.ClientID != oldKey {
-		return
-	}
-	delete(p.byClient, oldKey)
-	if p.redis != nil {
-		p.redis.Del(context.Background(), p.redisClientKey(oldKey))
-	}
-	lease.ClientID = newKey
-	if err := p.saveLease(lease); err != nil {
-		log.Warn("Failed to persist lease %s moved from %s to %s: %v", ip, oldKey, newKey, err)
-		return
-	}
-	log.Info("Lease %s moved from %s to %s", ip, oldKey, newKey)
 }
 
 // Allocate allocates an IP address for a client
