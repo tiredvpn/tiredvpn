@@ -421,6 +421,42 @@ func heardNothing(err error, latency, budget time.Duration) bool {
 	return isTimeoutError(err) || latency >= silenceLatency(budget) || addrUnreachable(err)
 }
 
+// attemptSilence is what one failed attempt says about the address.
+type attemptSilence int
+
+const (
+	attemptAnswered     attemptSilence = iota // a refusal, a reset, a rejected handshake
+	attemptSilent                             // heard nothing: counts toward the silence verdict
+	attemptInconclusive                       // cut short by a shortened budget after TCP connected
+)
+
+// classifyAttempt reads a failed attempt. heardNothing is the base; an attempt
+// whose budget was shortened below connectTimeout (half of a short cycle) is
+// silence only if the TCP connect itself never completed - a dial timeout or
+// an unreachable host. A handshake still waiting when the shortened budget ran
+// out heard nothing in less time than a server is given to answer, so it is
+// no verdict either way: counting it parked live servers whose Polling
+// handshake simply needed a couple of seconds.
+func (m *Manager) classifyAttempt(err error, latency, budget time.Duration) attemptSilence {
+	if !heardNothing(err, latency, budget) {
+		return attemptAnswered
+	}
+	if budget < m.connectTimeout && !dialNeverConnected(err) {
+		return attemptInconclusive
+	}
+	return attemptSilent
+}
+
+// dialNeverConnected reports a failure in the TCP connect itself: a dial that
+// timed out, or a host that could not be reached.
+func dialNeverConnected(err error) bool {
+	if addrUnreachable(err) {
+		return true
+	}
+	opErr, ok := errors.AsType[*net.OpError](err)
+	return ok && opErr.Op == "dial" && opErr.Timeout()
+}
+
 // scanOutOfTime ends a scan whose context ran out.
 //
 // Two silent transports at least: one swallowed handshake is a property of that
@@ -1722,13 +1758,16 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			// count is how a reconnect spent its whole budget here and then
 			// called the address "answering".
 			if !isUDPBasedStrategy(lastSuccessful) {
-				if heardNothing(err, latency, budget) {
+				switch m.classifyAttempt(err, latency, budget) {
+				case attemptSilent:
 					scan.timeouts++
+					fastSilent = true
 					// It had its turn this cycle; dialling it again in the
 					// scan would only spend the rest of the budget the same way.
 					excludeMap[lastSuccessful.ID()] = true
-					fastSilent = true
-				} else {
+				case attemptInconclusive:
+					excludeMap[lastSuccessful.ID()] = true
+				default:
 					scan.answered = true
 				}
 			}
@@ -1752,6 +1791,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 	// Filter out disabled strategies (priority <= 0) and excluded strategies
 	var strategies []Strategy
 	var quicStrategies []Strategy // Collect QUIC strategies separately for fast fallback
+	skippedOthers := 0            // held back by a breaker, a storm park or the UDP gate
 
 	for _, s := range m.strategies {
 		if s.Priority() <= 0 {
@@ -1767,17 +1807,20 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 		// actual dial, so listing a strategy never burns a recovery attempt.
 		if !m.circuitBreakers.CanTry(s.ID()) {
 			log.Debug("Skipping strategy %s (circuit breaker open)", s.Name())
+			skippedOthers++
 			continue
 		}
 		// Skip strategies parked by the storm detector (auto-mode only).
 		// Forced mode keeps its single strategy regardless.
 		if !m.forced && m.stormDetector.IsParked(s.ID()) {
 			log.Debug("Skipping strategy %s (storm cooldown)", s.Name())
+			skippedOthers++
 			continue
 		}
 		// Skip UDP-based strategies (like QUIC) if UDP is not working
 		if excludeUDP && isUDPBasedStrategy(s) {
 			log.Debug("Skipping UDP strategy %s (UDP connectivity issue)", s.Name())
+			skippedOthers++
 			continue
 		}
 
@@ -1799,9 +1842,10 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			m.stormDetector.Reset()
 			return m.connectWithRTTScan(ctx, target, excludeIDs, useRTTMasking, scan)
 		}
-		if fastSilent {
+		if fastSilent && skippedOthers == 0 {
 			// The fast path was the only transport there is, and it heard
-			// nothing: that is every transport.
+			// nothing: that is every transport. Not when the others were only
+			// held back by a breaker, a storm park or the UDP gate.
 			return nil, nil, fmt.Errorf("%w: %w, only transport silent", errAddrSilent, errStrategyScanFailed)
 		}
 		return nil, nil, fmt.Errorf("no available strategies (all excluded or circuit-broken)")
@@ -1963,7 +2007,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			// containing the word the classifier looks for. A refusal or a
 			// reset arrives in milliseconds; only silence costs the whole
 			// budget.
-			silent := heardNothing(err, latency, budget)
+			verdict := m.classifyAttempt(err, latency, budget)
 
 			if timedOut {
 				log.Debug("  Failed: %s TIMEOUT (latency=%v)", s.Name(), latency)
@@ -1972,7 +2016,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			}
 			strategyTimedOut = timedOut
 
-			if silent {
+			if verdict == attemptSilent {
 				if !isUDPBasedStrategy(s) {
 					scan.timeouts++
 					log.Debug("TCP silence count: %d/%d", scan.timeouts, tcpFailuresThreshold)
@@ -1985,13 +2029,20 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 					m.sortStrategies()
 					m.mu.Unlock()
 				}
-			} else {
+			} else if verdict == attemptAnswered {
 				// A refusal, a reset, a handshake that got an answer it did not
 				// like: the address is talking. Whatever is wrong here is a
 				// property of this transport, which is precisely the case the
 				// full scan exists for, so the address is no longer a candidate
 				// for the silence verdict this cycle.
 				scan.answered = true
+			}
+			if verdict != attemptAnswered {
+				// Silence once per transport per cycle, not once per attempt:
+				// with the desktop's two attempts a single swallowed transport
+				// made "two silent transports", and the retry spent the budget
+				// the next transport needed.
+				break
 			}
 
 			// Brief pause before retry
@@ -2019,6 +2070,11 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 		log.Debug("Strategy %s exhausted, moving to next", s.Name())
 	}
 
+	if !addrSilent && ctx.Err() != nil {
+		// The last transport ran into the caller's deadline: the same ending
+		// as running out of time between transports.
+		return nil, nil, scanOutOfTime(ctx, target, scan, lastErr)
+	}
 	if addrSilent {
 		// No emergency reprobe here: it exists to find a way back to an address
 		// that went dark, and this scan's whole point is that the client should
