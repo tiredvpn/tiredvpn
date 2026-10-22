@@ -1,6 +1,7 @@
 package strategy
 
 import (
+	"strings"
 	"sync"
 
 	"github.com/tiredvpn/tiredvpn/internal/evasion"
@@ -22,7 +23,7 @@ type realityShared struct {
 	gate *handshakeGate
 
 	mu     sync.Mutex
-	donors map[string]*donorSet // keyed by secret; includes the construction secret
+	donors map[string]*donorSet // keyed by secret and SNI pool; includes the construction secret
 }
 
 func newRealityShared() *realityShared {
@@ -32,31 +33,41 @@ func newRealityShared() *realityShared {
 	}
 }
 
-// donorSetFor returns the pool+rotator for secret, deriving and caching it once
-// per secret so two REALITY instances on the same Manager walk the same rotator.
-func (s *realityShared) donorSetFor(secret []byte) *donorSet {
+// donorSetFor returns the pool+rotator for secret and an endpoint's own SNI
+// pool (nil for the built-in one), deriving and caching it once per pair so two
+// REALITY instances on the same Manager walk the same rotator.
+func (s *realityShared) donorSetFor(secret []byte, snis []string) *donorSet {
+	key := string(secret) + "\x00" + strings.Join(snis, ",")
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if d, ok := s.donors[string(secret)]; ok {
+	if d, ok := s.donors[key]; ok {
 		return d
 	}
 	d := &donorSet{}
-	d.pool, d.rotator = buildDonorSet(secret)
-	s.donors[string(secret)] = d
+	d.pool, d.rotator = buildDonorSet(secret, snis)
+	s.donors[key] = d
 	return d
 }
 
 // buildDonorSet derives the cover-domain pool for a secret and a cooldown
 // rotator over it. Kept here so the constructor and the per-secret cache share
 // one derivation instead of two copies drifting apart.
-func buildDonorSet(secret []byte) ([]string, *evasion.SNIRotator) {
-	developerPool := make([]string, 0, 8)
-	for _, entry := range evasion.WhitelistedSNIs {
-		if entry.Category == "developer" {
-			developerPool = append(developerPool, entry.SNI)
+//
+// snis, when set, is the endpoint's own pool ([[servers]] sni, -reality-sni)
+// and replaces the built-in developer donors. derivePool still runs over it:
+// with the whole list kept, it only fixes a per-secret order, so two users of
+// one exit with the same configured names do not share a sequence.
+func buildDonorSet(secret []byte, snis []string) ([]string, *evasion.SNIRotator) {
+	base := snis
+	if len(base) == 0 {
+		base = make([]string, 0, 8)
+		for _, entry := range evasion.WhitelistedSNIs {
+			if entry.Category == "developer" {
+				base = append(base, entry.SNI)
+			}
 		}
 	}
-	pool := derivePool(developerPool, secret, len(developerPool))
+	pool := derivePool(base, secret, len(base))
 	if len(pool) == 0 {
 		// Fallback to the legacy Tier 1 list if derivation yields nothing.
 		pool = getRussianSNIsStatic()

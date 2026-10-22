@@ -2,8 +2,11 @@ package toml
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"time"
+
+	"github.com/tiredvpn/tiredvpn/internal/evasion"
 )
 
 // ClientConfig is the root TOML schema for tiredvpn client.
@@ -50,13 +53,50 @@ type ClientServer struct {
 	// priority policy, which is the only one implemented today.
 	Weight int `toml:"weight,omitempty"`
 
-	// Secret and SNI are per-endpoint overrides. Both are carried through to
-	// the endpoint description; see internal/client.ResolveEndpoints for what
-	// the runtime does with them today. Secret is honoured: it is the key this
-	// endpoint is dialled with, and entries may disagree. SNI is still recorded
-	// and not applied.
+	// Secret is the key this endpoint is dialled with; entries may disagree.
 	Secret string `toml:"secret,omitempty"`
-	SNI    string `toml:"sni,omitempty"`
+
+	// SNI is the endpoint's own cover-name pool: `sni = "www.google.com"` or
+	// `sni = ["www.google.com", "www.gstatic.com"]`. When set it replaces the
+	// built-in donor pool for this endpoint - REALITY (and seqovl, which rides
+	// it), HTTP/2 stego and QUIC draw their SNI from it. Absent means the
+	// built-in pool, as before. Read it through SNIs, which accepts both
+	// spellings; a bare string is what the field was before it took a list.
+	SNI any `toml:"sni,omitempty"`
+}
+
+// SNIs returns the endpoint's SNI pool, whichever spelling the file used.
+func (s ClientServer) SNIs() ([]string, error) {
+	var raw []string
+	switch v := s.SNI.(type) {
+	case nil:
+		return nil, nil
+	case string:
+		raw = []string{v}
+	case []string:
+		raw = v
+	case []any:
+		for i, e := range v {
+			str, ok := e.(string)
+			if !ok {
+				return nil, fmt.Errorf("sni[%d] is %T, want a hostname", i, e)
+			}
+			raw = append(raw, str)
+		}
+	default:
+		return nil, fmt.Errorf("sni is %T, want a hostname or a list of hostnames", v)
+	}
+	out := make([]string, 0, len(raw))
+	for i, h := range raw {
+		norm, err := evasion.NormalizeSNI(h)
+		if err != nil {
+			return nil, fmt.Errorf("sni[%d]: %w", i, err)
+		}
+		if !slices.Contains(out, norm) {
+			out = append(out, norm)
+		}
+	}
+	return out, nil
 }
 
 // hasAddress reports whether the entry names a server at all. A port on its own
@@ -349,6 +389,9 @@ func (c *ClientConfig) Validate() error {
 			if err := validatePort(where+".port_v6", s.PortV6); err != nil {
 				return err
 			}
+		}
+		if _, err := s.SNIs(); err != nil {
+			return fmt.Errorf("%s: %w", where, err)
 		}
 		if s.Name == "" {
 			continue

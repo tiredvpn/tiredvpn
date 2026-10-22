@@ -148,6 +148,11 @@ type Config struct {
 	// already exists, not because it needs protecting.
 	REALITYServerPubKey string
 
+	// REALITYSNIs is -reality-sni: a cover-name pool for every endpoint that
+	// does not set its own `sni` in the config file. Empty means the built-in
+	// donor pool.
+	REALITYSNIs []string
+
 	// RTT Masking
 	RTTMaskingEnabled bool   // Enable RTT masking
 	RTTProfile        string // RTT profile name

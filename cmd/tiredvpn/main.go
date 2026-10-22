@@ -17,6 +17,7 @@ import (
 
 	"github.com/skip2/go-qrcode"
 	"github.com/tiredvpn/tiredvpn/internal/client"
+	"github.com/tiredvpn/tiredvpn/internal/evasion"
 	"github.com/tiredvpn/tiredvpn/internal/server"
 	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 	"github.com/tiredvpn/tiredvpn/internal/tun"
@@ -205,6 +206,8 @@ ICMP TUNNEL:
 REALITY OPTIONS:
   -reality-cover-domain string
         Operator-set hostname to transparently proxy unauthorized REALITY probes to (empty = drop)
+  -reality-sni string
+        Comma-separated cover names this exit's clients use beyond the built-in donors; probes naming one are mirrored to it
   -reality-b1
         Accept the B1 transport: real TLS 1.3 with auth in session_id. Needs -reality-private-key.
   -reality-private-key string
@@ -399,6 +402,8 @@ ADVANCED EVASION:
         Refuse REALITY servers still on the v1 data layer instead of silently falling back (default true; =false only for pre-1.11 servers)
   -reality-server-pubkey string
         Server's static REALITY public key, base64. Set it to speak the B1 transport; empty uses the legacy one.
+  -reality-sni string
+        Comma-separated cover names (SNI) instead of the built-in donor pool, for REALITY, HTTP/2 stego and QUIC; a [[servers]] entry's own sni wins
 
 ICMP TUNNEL (backup transport):
   -icmp-tunnel
@@ -464,6 +469,21 @@ type serverFlagOpts struct {
 // without editing runClient, which everyone shares.
 func registerClientREALITYFlags(fs *flag.FlagSet, cfg *client.Config) {
 	fs.StringVar(&cfg.REALITYServerPubKey, "reality-server-pubkey", "", "Server's static REALITY public key, base64. Set it to speak the B1 transport; empty uses the legacy one. No probing, no downgrade on error.")
+	fs.Var((*sniListFlag)(&cfg.REALITYSNIs), "reality-sni", "Comma-separated cover names (SNI) to use instead of the built-in donor pool for REALITY, HTTP/2 stego and QUIC, e.g. 'www.google.com,www.gstatic.com'. A [[servers]] entry's own sni wins. Empty = built-in pool.")
+}
+
+// sniListFlag is a comma-separated hostname list flag (-reality-sni).
+type sniListFlag []string
+
+func (f *sniListFlag) String() string { return strings.Join(*f, ",") }
+
+func (f *sniListFlag) Set(s string) error {
+	list, err := evasion.ParseSNIList(s)
+	if err != nil {
+		return err
+	}
+	*f = list
+	return nil
 }
 
 // registerServerFlags binds every server flag onto fs and cfg. It is split out
@@ -484,6 +504,11 @@ func registerServerFlags(fs *flag.FlagSet, cfg *server.Config) *serverFlagOpts {
 	// drop. Never sourced from the client's SNI, so there is no SSRF via a
 	// client-controlled hostname.
 	fs.StringVar(&cfg.REALITYCoverDomain, "reality-cover-domain", "", "Hostname to transparently proxy unauthorized REALITY probes to (operator-set, e.g. 'www.microsoft.com'); empty = silently drop. Never derived from client SNI.")
+	// Operator-set donors on top of the built-in allowlist: the names clients
+	// of this exit are configured with (-reality-sni / [[servers]] sni). A
+	// probe that replays one of them is mirrored to that site, as it is for a
+	// built-in donor, instead of to the cover domain.
+	fs.Var((*sniListFlag)(&cfg.REALITYSNIs), "reality-sni", "Comma-separated cover names (SNI) this exit's clients use beyond the built-in donor list; unauthenticated REALITY connections naming one are mirrored to that site. Operator-set, like -reality-cover-domain.")
 	// Transition switch for the data-layer rewrite: leave off while old clients
 	// are still around, turn on afterwards to remove the v1 downgrade path.
 	// Node ceilings. Both default to off: a non-zero default would start

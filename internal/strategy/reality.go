@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	mathrand "math/rand/v2"
 	"net"
 	"sort"
 	"sync"
@@ -125,7 +126,7 @@ func NewREALITYStrategy(manager *Manager, secret []byte) *REALITYStrategy {
 	// seqovl one enforce the same per-SNI ceiling and walk the same rotator
 	// instead of each running its own.
 	shared := sharedRealityState(manager)
-	base := shared.donorSetFor(secret)
+	base := shared.donorSetFor(secret, nil)
 
 	// No key pair here on purpose: the X25519 key is generated per connection in
 	// connect(). A process-wide key made the data-layer key a constant, so every
@@ -150,19 +151,23 @@ type donorSet struct {
 	rotator *evasion.SNIRotator
 }
 
-// donorsFor returns the donor pool and rotator belonging to secret.
+// donorsFor returns the donor pool and rotator belonging to secret and to the
+// endpoint's own SNI pool (nil for the built-in one).
 //
-// The set built at construction answers for the constructor's own secret and
-// for a dial that named none, which is every single-server client. Any other
-// secret gets its own set, derived on first use and kept.
-func (r *REALITYStrategy) donorsFor(secret []byte) ([]string, *evasion.SNIRotator) {
-	if len(secret) == 0 || string(secret) == string(r.secret) {
+// The set built at construction answers for the constructor's own secret with
+// the built-in pool, which is every single-server client without -reality-sni.
+// Any other pair gets its own set, derived on first use and kept.
+func (r *REALITYStrategy) donorsFor(secret []byte, snis []string) ([]string, *evasion.SNIRotator) {
+	if len(snis) == 0 && (len(secret) == 0 || string(secret) == string(r.secret)) {
 		return r.destPool, r.sniRotator
 	}
+	if len(secret) == 0 {
+		secret = r.secret
+	}
 
-	// Other secrets get their own set, derived on first use and cached in the
+	// Other pairs get their own set, derived on first use and cached in the
 	// shared state so both REALITY instances of this Manager reuse it.
-	d := r.shared.donorSetFor(secret)
+	d := r.shared.donorSetFor(secret, snis)
 	return d.pool, d.rotator
 }
 
@@ -363,7 +368,7 @@ func (r *REALITYStrategy) connect(ctx context.Context, target string, wrapFirstF
 	// handshake across two keys.
 	secret := dialSecret(ctx, r.secret)
 
-	dest, err := r.selectDestination(secret)
+	dest, err := r.selectDestination(secret, dialSNIs(ctx))
 	if err != nil {
 		return nil, fmt.Errorf("reality: destination selection failed: %w", err)
 	}
@@ -617,11 +622,12 @@ func (r *REALITYStrategy) connect(ctx context.Context, target string, wrapFirstF
 	return &realityConn{Conn: stream, sess: newSess, tcpConn: tcpConn}, nil
 }
 
-// selectDestination chooses a legitimate destination from the SNI whitelist
-// derived for secret. Two endpoints with different secrets therefore hide behind
-// different donor domains, which is the point of derivePool.
-func (r *REALITYStrategy) selectDestination(secret []byte) (string, error) {
-	pool, rotator := r.donorsFor(secret)
+// selectDestination chooses a legitimate destination from the donor pool
+// derived for secret - the endpoint's own SNI pool when it has one, the
+// built-in whitelist otherwise. Two endpoints with different secrets therefore
+// hide behind different donor domains, which is the point of derivePool.
+func (r *REALITYStrategy) selectDestination(secret []byte, snis []string) (string, error) {
+	pool, rotator := r.donorsFor(secret, snis)
 
 	r.destMu.Lock()
 	defer r.destMu.Unlock()
@@ -661,39 +667,26 @@ func (r *REALITYStrategy) selectDestination(secret []byte) (string, error) {
 		return dest, nil
 	}
 
-	// Every donor is inside its cooldown window. Pick the least recently used
-	// one rather than a fixed fallback: the previous code returned
-	// getRussianSNIsStatic()[0] here, so under any sustained load — which with
-	// a four-domain donor pool and a fresh handshake per CONNECT arrives fast —
-	// every dial past the first few piled onto yandex.ru. That is precisely the
-	// burst pattern the per-SNI freeze looks for, manufactured by us.
-	sni := r.leastRecentlyUsedDestLocked(pool)
+	// Every donor is inside its cooldown window. Pick one uniformly at random.
+	// Not a fixed fallback: the code before returned getRussianSNIsStatic()[0]
+	// here, so under sustained load every dial past the first few piled onto
+	// yandex.ru - the burst pattern the per-SNI freeze looks for. And not the
+	// least recently used one either, which replaced it: that is a fixed
+	// rotation, and on a small pool - an exit configured with two Google
+	// names - it turned a burst into a strict A, B, A, B alternation per
+	// client, a sequence an observer can key on (verification rule 3).
+	sni := randomDestLocked(pool)
 	r.recentDests[sni] = time.Now()
 	return net.JoinHostPort(sni, "443"), nil
 }
 
-// leastRecentlyUsedDestLocked returns the donor SNI whose last use is furthest
-// in the past. Callers must hold destMu.
-func (r *REALITYStrategy) leastRecentlyUsedDestLocked(pool []string) string {
+// randomDestLocked returns a donor SNI drawn uniformly from pool. Callers must
+// hold destMu.
+func randomDestLocked(pool []string) string {
 	if len(pool) == 0 {
 		pool = getRussianSNIsStatic()
 	}
-
-	var (
-		best    string
-		bestUse time.Time
-	)
-	for _, sni := range pool {
-		lastUse, used := r.recentDests[sni]
-		if !used {
-			// Never used at all: nothing can be less recent than that.
-			return sni
-		}
-		if best == "" || lastUse.Before(bestUse) {
-			best, bestUse = sni, lastUse
-		}
-	}
-	return best
+	return pool[mathrand.IntN(len(pool))]
 }
 
 // derivePool derives a deterministic per-user subpool of size n from globalPool.

@@ -274,7 +274,7 @@ func TestDonorPoolFollowsEndpointSecret(t *testing.T) {
 
 	r := NewREALITYStrategy(nil, []byte("secret-a"))
 
-	poolA, rotA := r.donorsFor([]byte("secret-a"))
+	poolA, rotA := r.donorsFor([]byte("secret-a"), nil)
 	if !slices.Equal(poolA, derivePool(developer, []byte("secret-a"), len(developer))) {
 		t.Fatalf("pool for the construction secret = %v, want the derived one", poolA)
 	}
@@ -282,7 +282,7 @@ func TestDonorPoolFollowsEndpointSecret(t *testing.T) {
 		t.Fatal("construction secret got a fresh rotator instead of the strategy's own")
 	}
 
-	poolB, rotB := r.donorsFor([]byte("secret-b"))
+	poolB, rotB := r.donorsFor([]byte("secret-b"), nil)
 	if !slices.Equal(poolB, derivePool(developer, []byte("secret-b"), len(developer))) {
 		t.Fatalf("pool for the second secret = %v, want the pool derived from THAT secret", poolB)
 	}
@@ -295,12 +295,12 @@ func TestDonorPoolFollowsEndpointSecret(t *testing.T) {
 
 	// Cached, not re-derived: a second ask must hand back the same rotator, or
 	// the cooldown that rotator carries restarts on every dial.
-	if _, again := r.donorsFor([]byte("secret-b")); again != rotB {
+	if _, again := r.donorsFor([]byte("secret-b"), nil); again != rotB {
 		t.Fatal("donorsFor re-derived the pool instead of caching it")
 	}
 
 	// And the destination actually chosen comes from the second pool.
-	dest, err := r.selectDestination([]byte("secret-b"))
+	dest, err := r.selectDestination([]byte("secret-b"), nil)
 	if err != nil {
 		t.Fatalf("selectDestination: %v", err)
 	}

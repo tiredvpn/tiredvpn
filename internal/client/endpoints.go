@@ -21,10 +21,11 @@ type ServerSpec struct {
 	AddrV6 string
 	Weight int
 
-	// Secret and SNI are per-endpoint overrides from the config file. See
-	// ResolveEndpoints for what is and is not honoured today.
+	// Secret and SNI are per-endpoint overrides from the config file. SNI is
+	// the endpoint's cover-name pool; empty means -reality-sni, and that empty
+	// means the built-in donor pool.
 	Secret string
-	SNI    string
+	SNI    []string
 }
 
 // SelectionSpec is the runtime form of the [selection] block: durations
@@ -85,7 +86,7 @@ func ResolveEndpoints(cfg *Config) ([]endpoint.Endpoint, error) {
 			Weight: s.Weight,
 			Order:  i,
 			Secret: s.Secret,
-			SNI:    s.SNI,
+			SNI:    sniOrDefault(s.SNI, cfg.REALITYSNIs),
 		}.Normalized()
 		if err != nil {
 			return nil, fmt.Errorf("servers[%d] (%s): %w", i, specName(i, s.Name), err)
@@ -224,6 +225,15 @@ func selectorConfig(cfg *Config, eps []endpoint.Endpoint) (endpoint.Config, erro
 	}, nil
 }
 
+// sniOrDefault is an endpoint's own SNI pool, or the -reality-sni one when it
+// has none.
+func sniOrDefault(own, flag []string) []string {
+	if len(own) > 0 {
+		return own
+	}
+	return flag
+}
+
 // selectionPolicyName spells out the implicit default so a log line never
 // reads policy=.
 func selectionPolicyName(p string) string {
@@ -294,10 +304,6 @@ func warnUnappliedSelection(cfg *Config, eps []endpoint.Endpoint) {
 		log.Warn("selection.recheck_interval is set but health_check is off; it has no effect")
 	}
 	for i, e := range eps {
-		if e.SNI != "" {
-			log.Warn("servers[%d] (%s): per-server sni is recorded but not applied yet; "+
-				"the cover host is process-wide (-cover)", i, specName(i, e.Name))
-		}
 		if e.Weight != 0 && cfg.Selection.Policy != "weighted" {
 			log.Debug("servers[%d] (%s): weight=%d is only used by the weighted policy",
 				i, specName(i, e.Name), e.Weight)

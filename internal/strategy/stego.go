@@ -154,9 +154,13 @@ func (s *HTTP2StegoStrategy) Connect(ctx context.Context, target string) (net.Co
 	// an hour-of-day index that moves every client at once) keeps the SNI a
 	// donor TSPU does not IP-range-check against us, and keeps the two views of
 	// the same name - the cleartext SNI and the encrypted :authority - agreeing.
-	// A caller that pinned a cover host in config keeps it.
+	// A caller that pinned a cover host in config keeps it - unless the endpoint
+	// has its own SNI pool ([[servers]] sni / -reality-sni), which is the more
+	// specific setting and wins.
 	coverHost := s.coverHost
-	if coverHost == "" {
+	if pool := dialSNIs(ctx); len(pool) > 0 {
+		coverHost = pickSNI(pool)
+	} else if coverHost == "" {
 		coverHost = stegoCoverRotator.Next()
 	}
 	log.Debug("HTTP/2 Stego: Using server address: %s (cover %s)", serverAddr, coverHost)

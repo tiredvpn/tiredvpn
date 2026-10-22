@@ -166,7 +166,7 @@ func TestQUICSelectSNIFromSharedPoolNotHourly(t *testing.T) {
 	pool := evasionPoolSet()
 	seen := map[string]bool{}
 	for i := 0; i < 200; i++ {
-		sni := s.selectSNI()
+		sni := s.selectSNI(context.Background())
 		if !pool[sni] {
 			t.Fatalf("QUIC SNI %q is not from the shared evasion pool", sni)
 		}
