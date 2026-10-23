@@ -87,8 +87,12 @@ func (a *androidSession) localLinkUp() bool {
 	if a.linkUp != nil {
 		return a.linkUp()
 	}
-	return tun.LocalLinkUp()
+	return localLinkUp()
 }
+
+// localLinkUp is the link check of a core's session. Tests that run whole
+// cores replace it, because the real one probes the machine's network.
+var localLinkUp = tun.LocalLinkUp
 
 // androidControlConfig is the control server's configuration for cfg: how it
 // connects, reconnects and books the sessions it carries on mgr.
