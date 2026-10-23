@@ -52,10 +52,12 @@ Versions follow [Semantic Versioning](https://semver.org/).
   proxied to the donor there. Exits without `-reality-b1` are not affected.
   With the flag on, the tag carries the client's clock, as B1 does: a client
   more than `-reality-max-time-diff` off has its fallbacks sent to the donor.
-- **Server and client: a weak secret is warned about at startup** (under 16
-  bytes, under about 96 bits, or fewer than 8 distinct characters). One
-  captured fallback-transport tag lets anyone test guesses at the secret
-  offline.
+- **Server and client: a weak secret is warned about** (under 16 bytes,
+  fewer than 8 distinct characters, a repeating string, a common word, or
+  under about 90 bits): the client's own at startup, the server's global
+  `-secret` at startup, and with `-reality-fallback-tag` each weak registry
+  secret once. One captured fallback-transport tag lets anyone test guesses
+  at the secret offline; a secret that passes is not therefore safe.
 - **Client: TLS session tickets are kept per server**, so a ticket from one
   exit is never offered to another that shares a cover name.
 - **Client: failover to another server in the pool works when a server goes

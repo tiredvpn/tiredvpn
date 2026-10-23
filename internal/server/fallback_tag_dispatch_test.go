@@ -598,3 +598,36 @@ func TestStartupWarnsAboutSecrets(t *testing.T) {
 		})
 	}
 }
+
+// TestWeakRegistrySecretsAreSaidWithTheTag is P3-9 of the round-6 review:
+// only the global -secret was checked, while the flag's advice is to use
+// per-client registry secrets. With the tag admitted, each weak one is said
+// once, not on every rebuild; with it off, none is.
+func TestWeakRegistrySecretsAreSaidWithTheTag(t *testing.T) {
+	log.SetDedupWindow(0) // count each line, repeats included
+	t.Cleanup(func() { log.SetDedupWindow(5 * time.Second) })
+	for _, on := range []bool{true, false} {
+		var out bytes.Buffer
+		log.SetOutput(&out)
+		srv := newTagServer(t, "")
+		srv.srvCtx.cfg.REALITYFallbackTag = on
+		reg := NewClientRegistry(nil)
+		for _, c := range []*ClientConfig{
+			{ID: "weak", Secret: "changeme-changeme-changeme", Enabled: true},
+			{ID: "strong", Secret: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", Enabled: true},
+		} {
+			reg.byID[c.ID], reg.bySecret[c.Secret] = c, c
+		}
+		srv.srvCtx.registry = reg
+		srv.srvCtx.b1Gate.index.rebuildFrom(srv.srvCtx)
+		srv.srvCtx.b1Gate.index.rebuildFrom(srv.srvCtx)
+		log.SetOutput(os.Stderr)
+		got := strings.Count(out.String(), "Registry client weak has a weak secret")
+		if want := map[bool]int{true: 1, false: 0}[on]; got != want {
+			t.Fatalf("flag %v: the weak client was named %d times over two rebuilds, want %d:\n%s", on, got, want, out.String())
+		}
+		if strings.Contains(out.String(), "Registry client strong") {
+			t.Fatal("the strong client was called weak")
+		}
+	}
+}

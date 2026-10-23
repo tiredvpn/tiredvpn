@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -289,11 +291,43 @@ func TestWeakSecret(t *testing.T) {
 		{"Xq7#mP2$vL9@kR4", true}, // 15 bytes: rich, but short
 		{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", true},
 		{"correcthorsebattery", true}, // 19 lowercase: about 89 bits
+		{"tiredvpn-secret-2026", true},
+		{"MyVpnSecret2026!", true},
+		{"changeme-changeme-changeme", true},
+		{"Xk9#pQ2w-Xk9#pQ2w-Xk9#pQ2w", true}, // no word, but the same eight characters three times
+		{"zq7Kp2Lm9Wx4Rt8N", false},          // 16 random base64-like characters
 		{"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", false},
 		{"Xq7#mP2$vL9@kR4!wN6&zT3*", false},
 	} {
 		if why, weak := WeakSecret([]byte(tc.secret)); weak != tc.weak {
 			t.Errorf("%q: weak=%v (%s), want %v", tc.secret, weak, why, tc.weak)
 		}
+	}
+
+	// No false alarms on random secrets of the usual forms: hex of 16 and 32
+	// bytes, base64 of 24 and 32 bytes, UUIDs. Sixteen characters of base64
+	// (12 bytes) sit near the line: the reviewer saw 60% of them flagged.
+	// Now only a draw that happens to lack a whole letter case is - about
+	// one in two thousand.
+	short := 0
+	const draws = 2000
+	for n := range draws {
+		var b [32]byte
+		_, _ = rand.Read(b[:])
+		for _, sec := range []string{
+			hex.EncodeToString(b[:16]), hex.EncodeToString(b[:]),
+			base64.StdEncoding.EncodeToString(b[:24]), base64.RawURLEncoding.EncodeToString(b[:]),
+			fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]),
+		} {
+			if why, weak := WeakSecret([]byte(sec)); weak {
+				t.Fatalf("draw %d: random %q flagged: %s", n, sec, why)
+			}
+		}
+		if _, weak := WeakSecret([]byte(base64.RawStdEncoding.EncodeToString(b[:12]))); weak {
+			short++
+		}
+	}
+	if short > draws/100 {
+		t.Fatalf("%d of %d random 16-character base64 secrets flagged", short, draws)
 	}
 }

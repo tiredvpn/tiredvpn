@@ -277,13 +277,19 @@ func readFrom(fn string) bool {
 	}
 }
 
-// WeakSecret reports whether a client secret is too weak to stand an offline
-// guessing run, and why. A captured fallback-transport tag is checked with
-// the secret alone, so its strength is all that stands between one tag and
-// the secret (P2-1 of the round-5 review). The estimate is generous - length
-// times the bits of the character classes it uses - and still flags what an
-// operator types by hand: under 16 bytes, under 96 estimated bits, or fewer
-// than 8 distinct characters. A random 32-byte secret in hex has about 330.
+// WeakSecret reports whether a client secret is plainly too weak to stand
+// an offline guessing run, and why. A captured fallback-transport tag is
+// checked with the secret alone, so its strength is all that stands between
+// one tag and the secret (P2-1 of the round-5 review).
+//
+// It flags what can be told from the string: under 16 bytes, fewer than 8
+// distinct characters, a string that repeats itself, a common word in it
+// (secret, password, changeme, ...), or under 90 bits by length times
+// the character classes used. A 16-character random base64 string passes,
+// at about 95 bits; a random 32-byte secret in hex is credited about 330,
+// though it carries 256. Passing says nothing more: any secret a person
+// chose, however it looks, falls to a dictionary that knows how people
+// choose (P3-9 of the round-6 review).
 func WeakSecret(secret []byte) (why string, weak bool) {
 	if len(secret) < 16 {
 		return fmt.Sprintf("%d bytes, under 16", len(secret)), true
@@ -308,6 +314,15 @@ func WeakSecret(secret []byte) (why string, weak bool) {
 	if len(distinct) < 8 {
 		return fmt.Sprintf("%d distinct characters", len(distinct)), true
 	}
+	if p := period(secret); p > 0 {
+		return fmt.Sprintf("repeats itself every %d characters", p), true
+	}
+	low := strings.ToLower(string(secret))
+	for _, w := range commonSecretWords {
+		if strings.Contains(low, w) {
+			return fmt.Sprintf("contains %q", w), true
+		}
+	}
 	alphabet := 0
 	for _, c := range []struct {
 		on bool
@@ -317,8 +332,32 @@ func WeakSecret(secret []byte) (why string, weak bool) {
 			alphabet += c.n
 		}
 	}
-	if bits := float64(len(secret)) * math.Log2(float64(alphabet)); bits < 96 {
+	if bits := float64(len(secret)) * math.Log2(float64(alphabet)); bits < 90 {
 		return fmt.Sprintf("about %.0f bits", bits), true
 	}
 	return "", false
+}
+
+// commonSecretWords are words that put a secret in any guessing list. Five
+// characters at least: a shorter one ("vpn") turns up in random strings.
+var commonSecretWords = []string{
+	"secret", "password", "passwd", "passw0rd", "tiredvpn", "changeme", "admin", "qwerty",
+	"letmein", "default", "welcome", "123456",
+}
+
+// period returns the shortest p for which s, most of it, repeats with period
+// p ("changeme-changeme-changeme"), or 0.
+func period(s []byte) int {
+	for p := 1; p <= len(s)/2; p++ {
+		same := 0
+		for i := p; i < len(s); i++ {
+			if s[i] == s[i-p] {
+				same++
+			}
+		}
+		if same*5 >= (len(s)-p)*4 {
+			return p
+		}
+	}
+	return 0
 }

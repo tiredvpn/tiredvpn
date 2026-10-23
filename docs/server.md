@@ -344,9 +344,13 @@ for 1.11.10. Until then:
   with the flag on (the server warns at startup otherwise);
 - use random secrets of 32 bytes or more. One captured tag lets anyone test
   guesses at the secret offline; a secret like `pass-424242` falls to a
-  dictionary in about a second. Server and client both warn at startup about
-  a secret under 16 bytes, under about 96 bits by its character classes, or
-  with fewer than 8 distinct characters.
+  dictionary in about a second. The client warns at startup about each weak
+  secret it uses, and the server about its global `-secret` and, with the
+  flag on, about each weak registry secret (once per client). Weak means
+  under 16 bytes, fewer than 8 distinct characters, a string that repeats
+  itself, a common word in it, or under about 90 bits by its character
+  classes. Passing the check is not "safe": any secret a person chose can be
+  guessed by a dictionary that knows how people choose. Generate secrets.
 
 The tag is not a B1 credential and a B1 `session_id` is not a tag. It looks
 like the random value it replaces to anyone without the secret, differs on

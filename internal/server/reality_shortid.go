@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/tiredvpn/tiredvpn/internal/log"
 	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 )
 
@@ -44,6 +45,10 @@ type shortIDIndex struct {
 	// tagLookups counts MatchFallbackTag calls: the HMAC loop a tag check
 	// costs, for /metrics-free tests of when it runs.
 	tagLookups atomic.Uint64
+
+	// weakWarned holds the registry clients already warned about for a weak
+	// secret, so a rebuild every 30 s does not repeat it. Guarded by mu.
+	weakWarned map[string]bool
 
 	// refreshing serialises rebuilds and, with lastRefresh, rate-limits the
 	// ones triggered by a lookup miss. Without that limit an attacker who
@@ -184,7 +189,30 @@ func (i *shortIDIndex) rebuildFrom(srvCtx *serverContext) {
 	i.Rebuild(clients, srvCtx.cfg.Secret)
 	i.mu.Lock()
 	i.gen = gen
+	if srvCtx.cfg.REALITYFallbackTag && srvCtx.cfg.REALITYB1Enabled {
+		i.warnWeakLocked(clients)
+	}
 	i.mu.Unlock()
+}
+
+// warnWeakLocked warns, once per client, about registry clients whose secret
+// is weak while the fallback tag is admitted: each of their tags lets anyone
+// test guesses at it offline (P3-9 of the round-6 review - only the global
+// -secret was checked). i.mu held.
+func (i *shortIDIndex) warnWeakLocked(clients []*ClientConfig) {
+	if i.weakWarned == nil {
+		i.weakWarned = make(map[string]bool)
+	}
+	for _, c := range clients {
+		if c == nil || c.Secret == "" || i.weakWarned[c.ID] {
+			continue
+		}
+		if why, weak := customtls.WeakSecret([]byte(c.Secret)); weak {
+			i.weakWarned[c.ID] = true
+			log.Warn("Registry client %s has a weak secret (%s): with -reality-fallback-tag, one captured tag "+
+				"lets anyone check guesses against it offline", c.ID, why)
+		}
+	}
 }
 
 // behind reports whether the registry has changed since the index was built.
