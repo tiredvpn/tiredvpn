@@ -104,6 +104,9 @@ func TestAndroidDegradedVerdictMovesTheClient(t *testing.T) {
 	if got := s.last(); got != androidPool[0] {
 		t.Fatalf("first session on %s", got)
 	}
+	if got := ccfg.SessionStrategyFn(); got != s {
+		t.Fatalf("the relay would be told the session rides %v", got)
+	}
 	ccfg.SessionEndedFn(tun.RelaySessionEnd{Lifetime: 2 * time.Minute, Degraded: true, Stall: 30 * time.Second})
 
 	res, err := ccfg.ReconnectFn(t.Context(), reconnClientIP, 1280, false)

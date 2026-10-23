@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/log"
+	"github.com/tiredvpn/tiredvpn/internal/strategy"
 	"golang.org/x/sys/unix"
 )
 
@@ -183,6 +184,13 @@ type ControlConfig struct {
 	// DisconnectedFn, when set, is told that the host asked for the tunnel
 	// to go down ("disconnect": the user's stop, not a dead connection).
 	DisconnectedFn func()
+
+	// SessionStrategyFn, when set, names the strategy carrying the current
+	// session, for the relay's stall detector: a conn whose keepalive counter
+	// sits under a wrapper the detector cannot see through is then still
+	// known by its strategy, and a strategy that makes up keepalives (HTTP
+	// Polling's feeder) is not judged on them. Nil leaves only the conn.
+	SessionStrategyFn func() strategy.Strategy
 }
 
 // NewControlServer creates a new control server
@@ -570,7 +578,7 @@ func (cs *ControlServer) handleSetFdWithReceivedFd(ctx context.Context, fd int) 
 		cs.relayGeneration++
 		myGen := cs.relayGeneration
 
-		cs.relay = startTUNRelay(tunDev, cs.serverConn, cs.assignedIP, cs.serverIP, cs.relayStopCh, &RelayCallbacks{
+		cs.relay = cs.startRelay(tunDev, cs.serverConn, cs.assignedIP, cs.serverIP, cs.relayStopCh, &RelayCallbacks{
 			OnError: func(reason string) {
 				cs.mu.Lock()
 				current := cs.relayGeneration
@@ -907,7 +915,7 @@ func (cs *ControlServer) handleReconnect(ctx context.Context, reason string, new
 	cs.relayStopCh = make(chan struct{})
 	cs.relayGeneration++
 	myRelayGen := cs.relayGeneration
-	cs.relay = startTUNRelay(cs.tunDev, cs.serverConn, cs.assignedIP, cs.serverIP, cs.relayStopCh, &RelayCallbacks{
+	cs.relay = cs.startRelay(cs.tunDev, cs.serverConn, cs.assignedIP, cs.serverIP, cs.relayStopCh, &RelayCallbacks{
 		OnError: func(reason string) {
 			cs.mu.Lock()
 			current := cs.relayGeneration
@@ -1350,7 +1358,7 @@ func (cs *ControlServer) attemptReconnect(ctx context.Context, networkChanged bo
 	cs.relayStopCh = make(chan struct{})
 	cs.relayGeneration++
 	myAutoGen := cs.relayGeneration
-	cs.relay = startTUNRelay(cs.tunDev, cs.serverConn, cs.assignedIP, cs.serverIP, cs.relayStopCh, &RelayCallbacks{
+	cs.relay = cs.startRelay(cs.tunDev, cs.serverConn, cs.assignedIP, cs.serverIP, cs.relayStopCh, &RelayCallbacks{
 		OnError: func(reason string) {
 			cs.mu.Lock()
 			current := cs.relayGeneration
@@ -1552,6 +1560,21 @@ func (cs *ControlServer) performTUNHandshake(ctx context.Context) (assignedIP, s
 
 	log.Debug("TUN handshake successful: assigned=%s, server=%s", assignedIP, serverIP)
 	return assignedIP, serverIP, nil
+}
+
+// startRelay is startTUNRelay with the session's strategy named in the
+// callbacks, for the relay's stall detector (SessionStrategyFn).
+func (cs *ControlServer) startRelay(tunDev *TUNDevice, serverConn net.Conn, localIP, remoteIP net.IP, stopCh chan struct{}, cb *RelayCallbacks) *tunRelay {
+	cb.Strategy = cs.sessionStrategy()
+	return startTUNRelay(tunDev, serverConn, localIP, remoteIP, stopCh, cb)
+}
+
+// sessionStrategy is SessionStrategyFn's answer, nil when there is none.
+func (cs *ControlServer) sessionStrategy() strategy.Strategy {
+	if cs.config == nil || cs.config.SessionStrategyFn == nil {
+		return nil
+	}
+	return cs.config.SessionStrategyFn()
 }
 
 // sessionEnded hands the end of the relay's session to SessionEndedFn.

@@ -365,12 +365,16 @@ type relayStallHarness struct {
 	app      *os.File
 	reasons  chan string
 	degraded atomic.Int64
+	log      *stampedLog
 }
 
-func newRelayStallHarness(t *testing.T, wrap func(net.Conn) net.Conn) *relayStallHarness {
+// newRelayStallHarness starts the relay; strat, when given, is the strategy
+// its callbacks name for the session.
+func newRelayStallHarness(t *testing.T, wrap func(net.Conn) net.Conn, strat ...strategy.Strategy) *relayStallHarness {
 	t.Helper()
 	shortStallClocks(t)
-	setLog(t, &stampedLog{})
+	out := &stampedLog{}
+	setLog(t, out)
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -385,10 +389,15 @@ func newRelayStallHarness(t *testing.T, wrap func(net.Conn) net.Conn) *relayStal
 	if wrap != nil {
 		conn = wrap(cli)
 	}
-	h := &relayStallHarness{exit: exit, app: app, reasons: make(chan string, 4)}
+	h := &relayStallHarness{exit: exit, app: app, reasons: make(chan string, 4), log: out}
+	var sessionStrategy strategy.Strategy
+	if len(strat) > 0 {
+		sessionStrategy = strat[0]
+	}
 	stop := make(chan struct{})
 	h.r = startTUNRelay(dev, conn, net.IPv4(10, 9, 0, 2), net.IPv4(10, 9, 0, 1), stop, &RelayCallbacks{
-		OnError: func(reason string) { h.reasons <- reason },
+		Strategy: sessionStrategy,
+		OnError:  func(reason string) { h.reasons <- reason },
 		OnSessionEnd: func(end RelaySessionEnd) {
 			if end.Degraded {
 				h.degraded.Add(1)
@@ -464,6 +473,31 @@ func TestRelayMadeUpKeepalivesAreNoEcho(t *testing.T) {
 	h.exit.feeder.Store(true)
 	if r := h.reason(2 * time.Second); !strings.HasPrefix(r, "session_degraded") {
 		t.Fatalf("relay ended with %q, want a degraded session", r)
+	}
+}
+
+// TestRelayMadeUpKeepaliveStrategyWithoutItsCountIsNotJudged is P3-7 of the
+// round-5 review, the Android half of r4 P3-7: the relay looked for the
+// keepalive counter on the conn only. A Polling conn under a wrapper that
+// hides its count fell back to the generic count - the feeder's made-up
+// frames included - and every confirmation passed. Named by its strategy,
+// the session is not judged instead.
+func TestRelayMadeUpKeepaliveStrategyWithoutItsCountIsNotJudged(t *testing.T) {
+	polling := &keepaliveMakingStrategy{rankedPipeStrategy{pipeStrategy: &pipeStrategy{t: t}, id: "polling", priority: 6}}
+	h := newRelayStallHarness(t, nil, polling)
+	h.exit.feeder.Store(true)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := h.log.first("not judged: the strategy makes up keepalives"); ok {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, ok := h.log.first("not judged: the strategy makes up keepalives"); !ok {
+		t.Fatalf("no skip:\n%s", h.log)
+	}
+	if h.exit.gotEcho.Load() != 0 {
+		t.Fatal("keepalives went out to confirm against a count that includes made-up frames")
 	}
 }
 
@@ -729,5 +763,33 @@ func TestAQueuedKeepaliveIsTimedFromItsDelivery(t *testing.T) {
 	}
 	if strings.Contains(h.out.String(), "Session degraded") {
 		t.Fatalf("a live tunnel behind a queue was given up:\n%s", h.out)
+	}
+}
+
+// TestControlRelaysNameTheSessionStrategy: every relay the control server
+// starts carries the session's strategy, for the test above to matter on a
+// phone.
+func TestControlRelaysNameTheSessionStrategy(t *testing.T) {
+	polling := &keepaliveMakingStrategy{rankedPipeStrategy{pipeStrategy: &pipeStrategy{t: t}, id: "polling", priority: 6}}
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dev := &TUNDevice{file: os.NewFile(uintptr(fds[0]), "tun"), mtu: 1500, atomicMTU: 1500}
+	app := os.NewFile(uintptr(fds[1]), "app")
+	cli, srv := net.Pipe()
+	stop := make(chan struct{})
+	cs := &ControlServer{config: &ControlConfig{SessionStrategyFn: func() strategy.Strategy { return polling }}}
+	r := cs.startRelay(dev, cli, net.IPv4(10, 9, 0, 2), net.IPv4(10, 9, 0, 1), stop, &RelayCallbacks{})
+	t.Cleanup(func() {
+		close(stop)
+		cli.Close()
+		srv.Close()
+		app.Close()
+		dev.file.Close()
+		<-r.done
+	})
+	if r.callbacks.Strategy != polling {
+		t.Fatalf("the relay carries strategy %v, want the session's", r.callbacks.Strategy)
 	}
 }

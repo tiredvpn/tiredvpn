@@ -28,10 +28,11 @@ type androidSession struct {
 	// linkUp is asked before an endpoint is charged; tun.LocalLinkUp when nil.
 	linkUp func() bool
 
-	mu      sync.Mutex
-	strat   string
-	cand    endpoint.Candidate
-	hasCand bool
+	mu       sync.Mutex
+	strat    string
+	stratObj strategy.Strategy
+	cand     endpoint.Candidate
+	hasCand  bool
 
 	// stopped is set when the host takes the tunnel down on purpose (the
 	// user's stop): what this core learned is not handed to the next one.
@@ -44,7 +45,7 @@ func (a *androidSession) started(s strategy.Strategy, cand endpoint.Candidate, h
 		return
 	}
 	a.mu.Lock()
-	a.strat, a.cand, a.hasCand = s.ID(), cand, hasCand
+	a.strat, a.stratObj, a.cand, a.hasCand = s.ID(), s, cand, hasCand
 	a.mu.Unlock()
 	a.mgr.RecordSessionStart(s.ID())
 }
@@ -73,6 +74,13 @@ func (a *androidSession) ended(end tun.RelaySessionEnd) {
 		Degraded:       end.Degraded,
 		LocalNetworkUp: a.localLinkUp,
 	})
+}
+
+// strategy returns the strategy of the session in progress, nil if none.
+func (a *androidSession) strategy() strategy.Strategy {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.stratObj
 }
 
 func (a *androidSession) localLinkUp() bool {
@@ -141,6 +149,10 @@ func androidControlConfig(cfg *Config, mgr *strategy.Manager, dualStack bool, se
 		// DisconnectedFn: the user stopped the tunnel. The next start is a
 		// fresh one, perhaps on another network: no carry (carryFrom).
 		DisconnectedFn: func() { sess.stopped.Store(true) },
+
+		// SessionStrategyFn: the relay's stall detector judges the session by
+		// the strategy that carries it, as the desktop's does.
+		SessionStrategyFn: sess.strategy,
 
 		// StartVPNFn is NOT set - let control.go use the default path
 		// which includes RunTUNRelayWithCallbacks with keepalive events
