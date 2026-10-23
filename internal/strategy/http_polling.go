@@ -296,6 +296,11 @@ type HTTPPollingConn struct {
 	ackSeq  int64 // Total bytes received (sent to server as ack)
 	ackLock sync.Mutex
 
+	// uplinkAccepted counts the bytes Write has queued, uplinkSent those a
+	// poll has delivered to the server, in order (see UplinkProgress).
+	uplinkAccepted atomic.Uint64
+	uplinkSent     atomic.Uint64
+
 	// lastPollOK is the unix-nano time of the most recent successful poll. It is
 	// meek's true liveness signal: the poll layer round-trips every ~50ms-2s
 	// independent of tunnel payload. runKeepaliveFeeder reads it to decide
@@ -511,6 +516,8 @@ func (c *HTTPPollingConn) poll() (ok bool, moved bool) {
 		c.statsMu.Unlock()
 	}
 
+	c.uplinkSent.Add(uint64(len(sendData)))
+
 	c.statsMu.Lock()
 	c.successfulPolls++
 	c.statsMu.Unlock()
@@ -588,6 +595,15 @@ func (c *HTTPPollingConn) feedKeepalive() bool {
 	c.recvBuf.Write([]byte{0, 0, 0, 0})
 	c.recvCond.Broadcast()
 	return true
+}
+
+// UplinkProgress reports how many bytes Write has accepted and how many of
+// them a poll has delivered so far. A Write returns once its bytes are
+// queued, up to 1 MiB ahead of the polls; the bytes of a given Write are on
+// their way to the server once sent has reached accepted as it stood after
+// that Write.
+func (c *HTTPPollingConn) UplinkProgress() (accepted, sent uint64) {
+	return c.uplinkAccepted.Load(), c.uplinkSent.Load()
 }
 
 // ServerKeepalives counts the zero-length frames the server really sent:
@@ -890,6 +906,7 @@ func (c *HTTPPollingConn) Write(p []byte) (int, error) {
 		return 0, err
 	}
 	n, err := c.sendBuf.Write(p)
+	c.uplinkAccepted.Add(uint64(n))
 	c.sendLock.Unlock()
 
 	c.lastSend = time.Now()

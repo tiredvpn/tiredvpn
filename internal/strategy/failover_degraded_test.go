@@ -58,3 +58,26 @@ func TestDegradedSessionChargesItsEndpoint(t *testing.T) {
 		t.Fatal("a degraded session cleared the endpoint's dead streak")
 	}
 }
+
+// TestPollingReportsItsUplinkProgress: a Write only queues; a poll that took
+// the bytes to the server moves "sent" up to them. The stall detector times
+// a keepalive's echo from there (P2-6 of the round-4 review).
+func TestPollingReportsItsUplinkProgress(t *testing.T) {
+	c := newScriptedPollingConn(t, [][]byte{{}})
+	if _, err := c.Write([]byte{meekTUNMode, 0, 0, 0, 0, 0x05, 0xdc, 0x04}); err != nil {
+		t.Fatal(err)
+	}
+	q, ok := UplinkQueueOf(&StrategyConn{Conn: c})
+	if !ok {
+		t.Fatal("the polling conn's queue is not found under its wrapper")
+	}
+	if accepted, sent := q.UplinkProgress(); accepted != 8 || sent != 0 {
+		t.Fatalf("after a write: accepted %d, sent %d; want 8 and 0", accepted, sent)
+	}
+	if ok, _ := c.poll(); !ok {
+		t.Fatal("poll failed")
+	}
+	if accepted, sent := q.UplinkProgress(); accepted != 8 || sent != 8 {
+		t.Fatalf("after the poll: accepted %d, sent %d; want 8 and 8", accepted, sent)
+	}
+}

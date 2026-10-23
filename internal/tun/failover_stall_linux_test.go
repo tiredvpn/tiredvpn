@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -629,5 +630,62 @@ func TestRelayRefusedVerdictIsJudgedAgainAfterTheQuiet(t *testing.T) {
 	}
 	if r := h.reason(3 * time.Second); !strings.HasPrefix(r, "session_degraded") {
 		t.Fatalf("relay ended with %q, want a verdict after the quiet period", r)
+	}
+}
+
+// queueingConn is a tunnel conn whose Write only queues, as HTTP Polling's
+// does: a write reaches the exit lag later, in order, and UplinkProgress
+// says how far the queue has gone.
+type queueingConn struct {
+	net.Conn
+	lag      time.Duration
+	mu       sync.Mutex
+	accepted uint64
+	sent     atomic.Uint64
+	queue    chan []byte
+}
+
+func newQueueingConn(c net.Conn, lag time.Duration) *queueingConn {
+	q := &queueingConn{Conn: c, lag: lag, queue: make(chan []byte, 64)}
+	go func() {
+		for p := range q.queue {
+			time.Sleep(q.lag)
+			if _, err := q.Conn.Write(p); err != nil {
+				return
+			}
+			q.sent.Add(uint64(len(p)))
+		}
+	}()
+	return q
+}
+
+func (q *queueingConn) Write(p []byte) (int, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.accepted += uint64(len(p))
+	q.queue <- append([]byte(nil), p...)
+	return len(p), nil
+}
+
+func (q *queueingConn) UplinkProgress() (uint64, uint64) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.accepted, q.sent.Load()
+}
+
+// TestAQueuedKeepaliveIsTimedFromItsDelivery is P2-6 of the round-4 review:
+// on Polling a keepalive Write only queues, and the echo window ran from the
+// queueing. Behind an upload both keepalives could sit in the queue for the
+// whole confirmation and a live tunnel was given up. Here every write reaches
+// the exit 400 ms late (the windows are 150 ms) and the exit echoes at once;
+// the peer behind the stalled flow is dead.
+func TestAQueuedKeepaliveIsTimedFromItsDelivery(t *testing.T) {
+	h := newStallHarness(t, func(c net.Conn) net.Conn { return newQueueingConn(c, 400*time.Millisecond) })
+	h.exit.echo.Store(true)
+	if !h.wait("Session alive", 3*time.Second) {
+		t.Fatalf("the queued keepalive's echo was not waited for:\n%s", h.out)
+	}
+	if strings.Contains(h.out.String(), "Session degraded") {
+		t.Fatalf("a live tunnel behind a queue was given up:\n%s", h.out)
 	}
 }

@@ -2579,17 +2579,36 @@ type ServerKeepaliveCounter interface {
 // ServerKeepaliveCounterOf finds a ServerKeepaliveCounter in conn or under
 // its wrappers (anything with NetConn).
 func ServerKeepaliveCounterOf(conn net.Conn) (ServerKeepaliveCounter, bool) {
+	return findUnder[ServerKeepaliveCounter](conn)
+}
+
+// UplinkQueue is implemented by a tunnel conn whose Write only queues: HTTP
+// Polling, where a write is on its way only when a poll takes it. See
+// HTTPPollingConn.UplinkProgress.
+type UplinkQueue interface {
+	UplinkProgress() (accepted, sent uint64)
+}
+
+// UplinkQueueOf finds an UplinkQueue in conn or under its wrappers.
+func UplinkQueueOf(conn net.Conn) (UplinkQueue, bool) {
+	return findUnder[UplinkQueue](conn)
+}
+
+// findUnder looks for a T in conn and under its wrappers (anything with
+// NetConn), a few levels deep.
+func findUnder[T any](conn net.Conn) (T, bool) {
 	for range 8 {
-		if c, ok := conn.(ServerKeepaliveCounter); ok {
+		if c, ok := conn.(T); ok {
 			return c, true
 		}
 		w, ok := conn.(interface{ NetConn() net.Conn })
 		if !ok {
-			return nil, false
+			break
 		}
 		conn = w.NetConn()
 	}
-	return nil, false
+	var zero T
+	return zero, false
 }
 
 // Strategy returns the strategy used for this connection

@@ -519,7 +519,7 @@ func (v *VPNClient) watchStalls() {
 		}
 		stall := suspect.stall
 		log.Info("Session suspect: a flow has waited %v for an answer - confirming with keepalives", stall.Round(time.Millisecond))
-		alive, sent, err := mon.confirm(v.stopCh, keepaliveSender(conn), v.echoCounter(conn))
+		alive, sent, err := mon.confirm(v.stopCh, keepaliveSender(conn, v.stopCh), v.echoCounter(conn))
 		v.mu.Lock()
 		current := v.conn == conn
 		v.mu.Unlock()
@@ -587,13 +587,51 @@ func serverKeepaliveCount(conn net.Conn) (func() uint64, bool) {
 	return nil, false
 }
 
-// keepaliveSender writes one zero-length keepalive frame to conn.
-func keepaliveSender(conn net.Conn) func() error {
+// keepaliveSender writes one zero-length keepalive frame to conn, and returns
+// once it is on its way. On HTTP Polling a Write only queues (up to 1 MiB
+// ahead of the polls, about 32 s at 256 kbit/s): the send waits until a poll
+// has taken the keepalive, so the echo window starts when the server can see
+// it, not while it sits behind a bulk upload. Order in the stream is kept -
+// the keepalive goes through the queue like everything else. A keepalive
+// still queued after stallDeliveryMax is no question asked: an error, so no
+// verdict.
+func keepaliveSender(conn net.Conn, stop <-chan struct{}) func() error {
+	q, queued := uplinkQueue(conn)
 	return func() error {
 		_ = conn.SetWriteDeadline(time.Now().Add(keepaliveWriteTimeout))
-		_, err := conn.Write([]byte{0, 0, 0, 0})
-		return err
+		if _, err := conn.Write([]byte{0, 0, 0, 0}); err != nil {
+			return err
+		}
+		if !queued {
+			return nil
+		}
+		target, _ := q.UplinkProgress()
+		deadline := time.Now().Add(stallDeliveryMax)
+		for {
+			if _, sent := q.UplinkProgress(); sent >= target {
+				return nil
+			}
+			if time.Now().After(deadline) {
+				return errKeepaliveQueued
+			}
+			if !sleepOrStop(stop, 50*time.Millisecond) {
+				return errConfirmStopped
+			}
+		}
 	}
+}
+
+// stallDeliveryMax bounds the wait for a queued keepalive to go out.
+const stallDeliveryMax = time.Minute
+
+var errKeepaliveQueued = errors.New("keepalive still queued behind the uplink")
+
+// uplinkQueue finds the conn's uplink queue, under a replayConn too.
+func uplinkQueue(conn net.Conn) (strategy.UplinkQueue, bool) {
+	if rc, ok := conn.(*replayConn); ok {
+		conn = rc.Conn
+	}
+	return strategy.UplinkQueueOf(conn)
 }
 
 // relayStall is the stall detector's state on the control socket's relay.
@@ -633,7 +671,7 @@ func (r *tunRelay) watchStalls() {
 		}
 		stall := suspect.stall
 		log.Info("TUN relay: a flow has waited %v for an answer - confirming with keepalives", stall.Round(time.Millisecond))
-		alive, sent, err := mon.confirm(r.stopCh, keepaliveSender(r.serverConn), echoes)
+		alive, sent, err := mon.confirm(r.stopCh, keepaliveSender(r.serverConn, r.stopCh), echoes)
 		select {
 		case <-r.done:
 			return
