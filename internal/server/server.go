@@ -3770,7 +3770,7 @@ func runIdleWatchedBridge(a, b net.Conn, idleTimeout time.Duration, logger *log.
 	}
 
 	var lastActivity atomic.Int64
-	lastActivity.Store(time.Now().UnixNano())
+	lastActivity.Store(monoNow())
 	watchdogDone := make(chan struct{})
 	go func() {
 		// Poll at a quarter of the timeout so the bridge is reaped within
@@ -3786,7 +3786,7 @@ func runIdleWatchedBridge(a, b net.Conn, idleTimeout time.Duration, logger *log.
 			case <-watchdogDone:
 				return
 			case <-ticker.C:
-				idle := time.Since(time.Unix(0, lastActivity.Load()))
+				idle := monoSince(lastActivity.Load())
 				if idle >= idleTimeout {
 					if logger != nil {
 						logger.Info("Relay TUN bridge idle for %s, force-closing", idle.Round(time.Second))
@@ -3814,8 +3814,8 @@ func runIdleWatchedBridge(a, b net.Conn, idleTimeout time.Duration, logger *log.
 	close(watchdogDone)
 }
 
-// copyWithActivity is io.Copy with an activity stamp: it records time.Now (as
-// UnixNano) into lastActivity on every successful read from src. The relay
+// copyWithActivity is io.Copy with an activity stamp: it records a monotonic
+// stamp (monoNow) into lastActivity on every successful read from src. The relay
 // idle-watchdog reads this stamp to detect a silent bridge and force-close it.
 // Buffer size matches io.Copy's internal 32KB.
 func copyWithActivity(dst io.Writer, src io.Reader, lastActivity *atomic.Int64) (int64, error) {
@@ -3824,7 +3824,7 @@ func copyWithActivity(dst io.Writer, src io.Reader, lastActivity *atomic.Int64) 
 	for {
 		nr, rerr := src.Read(buf)
 		if nr > 0 {
-			lastActivity.Store(time.Now().UnixNano())
+			lastActivity.Store(monoNow())
 			nw, werr := dst.Write(buf[:nr])
 			written += int64(nw)
 			if werr != nil {

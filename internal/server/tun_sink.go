@@ -79,7 +79,7 @@ type relayTUNSink struct {
 	done    chan struct{}
 	once    sync.Once
 
-	// lastUp and lastDown are the UnixNano of the last frame the relay sent
+	// lastUp and lastDown are monoNow stamps of the last frame the relay sent
 	// to the exit and read from it, keepalives and their echoes included;
 	// lastActivity that of the downstream client's last sign of life
 	// (UpdateActivity). quietFor is the silence the keepalive timer waits
@@ -93,6 +93,11 @@ type relayTUNSink struct {
 	// why is what ended the leg, set by the pump when the exit's side ended
 	// it; logged once, at Info, when the leg closes.
 	why atomic.Pointer[string]
+
+	// closing turns away writes that were waiting for writeMu when Close
+	// came: each would have set a fresh write deadline and held Close up to
+	// relayWriteTimeout more.
+	closing atomic.Bool
 }
 
 // dualAddrs returns the exit-assigned IPv6 tunnel addresses for the downstream
@@ -124,13 +129,54 @@ func (s *relayTUNSink) WritePacket(pkt []byte) error {
 	binary.BigEndian.PutUint32(frame[:4], uint32(len(pkt)))
 	copy(frame[4:], pkt)
 
+	if s.closing.Load() {
+		return net.ErrClosed
+	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	s.up.SetWriteDeadline(time.Now().Add(30 * time.Second))
-	_, err := s.up.Write(frame)
-	s.lastUp.Store(time.Now().UnixNano())
+	err := s.writeUp(frame)
+	s.lastUp.Store(monoNow())
 	return err
 }
+
+// relayWriteTimeoutNs bounds one write up the leg; atomic so tests can scale
+// it with the leg's other clocks.
+var relayWriteTimeoutNs atomic.Int64
+
+func init() { relayWriteTimeoutNs.Store(int64(30 * time.Second)) }
+
+func relayWriteTimeout() time.Duration { return time.Duration(relayWriteTimeoutNs.Load()) }
+
+// writeUp writes p up the leg within relayWriteTimeout and clears the
+// deadline again. Left set, it went stale: the HTTP/2 stego conn also writes
+// from its read path (WINDOW_UPDATE every 256 KB down), and a flush that
+// landed after the deadline failed, and tls.Conn makes a failed write
+// permanent - a leg with a steady download and nothing up died within two
+// minutes (P2-1 of the round-7 review). Called with writeMu held.
+func (s *relayTUNSink) writeUp(p []byte) error {
+	if s.closing.Load() {
+		return net.ErrClosed
+	}
+	_ = s.up.SetWriteDeadline(time.Now().Add(relayWriteTimeout()))
+	if s.closing.Load() {
+		// Close cut the deadline between the check and the line above.
+		_ = s.up.SetWriteDeadline(time.Now())
+	}
+	_, err := s.up.Write(p)
+	_ = s.up.SetWriteDeadline(time.Time{})
+	return err
+}
+
+// monoBase anchors the leg's stamps to the monotonic clock: a wall-clock
+// stamp stepped back by NTP held keepalives off until the clock caught up
+// (P3-6 of the round-7 review).
+var monoBase = time.Now()
+
+// monoNow is a monotonic stamp, in nanoseconds since monoBase.
+func monoNow() int64 { return int64(time.Since(monoBase)) }
+
+// monoSince is how long ago a monoNow stamp was taken.
+func monoSince(stamp int64) time.Duration { return time.Duration(monoNow() - stamp) }
 
 func (s *relayTUNSink) Done() <-chan struct{} { return s.done }
 
@@ -181,7 +227,7 @@ var relayKeepaliveSent atomic.Pointer[func()]
 // UpdateActivity records that the downstream client is alive, which keeps
 // the keepalive timer sending (startKeepalive).
 func (s *relayTUNSink) UpdateActivity() {
-	s.lastActivity.Store(time.Now().UnixNano())
+	s.lastActivity.Store(monoNow())
 }
 
 // startKeepalive arms the timer that keeps the upstream leg alive while the
@@ -191,7 +237,7 @@ func (s *relayTUNSink) UpdateActivity() {
 // leg died of the second, a download-only one of the first, while one
 // keepalive per silence covered neither (P1-A of the round-6 review).
 func (s *relayTUNSink) startKeepalive() {
-	now := time.Now().UnixNano()
+	now := monoNow()
 	s.lastUp.CompareAndSwap(0, now)
 	s.lastDown.CompareAndSwap(0, now)
 	s.lastActivity.CompareAndSwap(0, now)
@@ -208,28 +254,34 @@ func (s *relayTUNSink) keepaliveTick() {
 		return
 	default:
 	}
-	now := time.Now()
 	quiet := time.Duration(s.quietFor.Load())
-	oldest := time.Unix(0, min(s.lastUp.Load(), s.lastDown.Load()))
-	active := now.Sub(time.Unix(0, s.lastActivity.Load())) < relayClientActiveWindow()
-	if active && now.Sub(oldest) >= quiet {
+	sinceOldest := max(monoSince(s.lastUp.Load()), monoSince(s.lastDown.Load()))
+	active := monoSince(s.lastActivity.Load()) < relayClientActiveWindow()
+	if active && sinceOldest >= quiet {
 		s.writeMu.Lock()
-		s.up.SetWriteDeadline(now.Add(30 * time.Second))
-		_, err := s.up.Write([]byte{0, 0, 0, 0})
+		err := s.writeUp([]byte{0, 0, 0, 0})
 		s.writeMu.Unlock()
 		if err != nil {
 			s.logger.Debug("Relay TUN: keepalive up failed: %v", err)
 		} else if f := relayKeepaliveSent.Load(); f != nil {
 			(*f)()
 		}
-		s.lastUp.Store(now.UnixNano())
+		s.lastUp.Store(monoNow())
 		quiet = relayKeepaliveAfter()
 		s.quietFor.Store(int64(quiet))
-		oldest = time.Unix(0, min(s.lastUp.Load(), s.lastDown.Load()))
+		sinceOldest = max(monoSince(s.lastUp.Load()), monoSince(s.lastDown.Load()))
 	}
-	next := oldest.Add(quiet).Sub(now)
-	if next < 100*time.Millisecond {
-		next = quiet // the echo has not come back yet, or the client is gone
+	// The tick can come a few ms before the keepalive is due - it was armed
+	// on the other direction's stamp, which has moved since. Waiting a whole
+	// quiet period then left the exit up to two of them without a frame, past
+	// its 60 s deadline (P2-1 of the round-7 review). Only a deadline already
+	// passed - the echo is not back yet, or the client is gone - waits a
+	// whole period.
+	next := quiet - sinceOldest
+	if next <= 0 {
+		next = quiet
+	} else if next < 100*time.Millisecond {
+		next = 100 * time.Millisecond
 	}
 	if t := s.keepalive.Load(); t != nil {
 		t.Reset(next)
@@ -245,17 +297,29 @@ func (s *relayTUNSink) Close() {
 		if w := s.why.Load(); w != nil {
 			why = *w
 		}
-		now := time.Now()
 		s.logger.Info("Relay TUN leg closed: %s (last frame up %s ago, down %s ago)", why,
-			now.Sub(time.Unix(0, s.lastUp.Load())).Round(time.Second),
-			now.Sub(time.Unix(0, s.lastDown.Load())).Round(time.Second))
+			monoSince(s.lastUp.Load()).Round(time.Second), monoSince(s.lastDown.Load()).Round(time.Second))
 		// Closing writes too (HTTP/2 stego sends GOAWAY), so it takes the
-		// write lock like WritePacket and the keepalive; a write stuck on a
-		// dead leg is cut first.
-		_ = s.up.SetWriteDeadline(time.Now())
-		s.writeMu.Lock()
-		s.up.Close()
-		s.writeMu.Unlock()
+		// write lock like WritePacket and the keepalive. Only a write stuck
+		// on a dead leg is cut: cutting the deadline with nothing stuck made
+		// GOAWAY fail, which spent a TLS record number, and the exit read
+		// "bad record MAC" instead of a clean close (P3-1 of the round-7
+		// review).
+		s.closing.Store(true)
+		if s.writeMu.TryLock() {
+			s.up.Close()
+			s.writeMu.Unlock()
+		} else {
+			// A write is stuck on a dead leg: cut it, and let the TLS
+			// close finish in the background - its close_notify waits up
+			// to 5 s on a peer that reads nothing.
+			_ = s.up.SetWriteDeadline(time.Now())
+			s.writeMu.Lock()
+			go func() {
+				s.up.Close()
+				s.writeMu.Unlock()
+			}()
+		}
 		close(s.done)
 	})
 }
@@ -289,7 +353,7 @@ func (s *relayTUNSink) pump(deliver func(pkt []byte) error) {
 			s.why.CompareAndSwap(nil, new("upstream read: "+legReadEnd(err, idle)))
 			return
 		}
-		s.lastDown.Store(time.Now().UnixNano())
+		s.lastDown.Store(monoNow())
 		n := binary.BigEndian.Uint32(header)
 		if n == 0 {
 			continue
