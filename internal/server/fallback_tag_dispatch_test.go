@@ -600,29 +600,45 @@ func TestStartupWarnsAboutSecrets(t *testing.T) {
 	}
 }
 
-// TestWeakRegistrySecretsAreSaidWithTheTag is P3-9 of the round-6 review:
-// only the global -secret was checked, while the flag's advice is to use
-// per-client registry secrets. With the tag admitted, each weak one is said
-// once, not on every rebuild; with it off, none is.
+// TestWeakRegistrySecretsAreSaidWithTheTag: with the fallback tag admitted,
+// each tag of a registry client lets anyone test guesses at its secret
+// offline, so a weak one is named - once per client, not on every rebuild.
+// Driven through the dispatcher: the registry changes, a stranger's hello
+// comes in, and the gate's own refresh rebuilds the index.
 func TestWeakRegistrySecretsAreSaidWithTheTag(t *testing.T) {
 	log.SetDedupWindow(0) // count each line, repeats included
 	t.Cleanup(func() { log.SetDedupWindow(5 * time.Second) })
+	stranger := captureFallbackHello(t, tagFallbackStrategies[0].make, "a-stranger-who-holds-no-secret-of-ours")
 	for _, on := range []bool{true, false} {
 		var out bytes.Buffer
 		log.SetOutput(&out)
 		srv := newTagServer(t, "")
 		srv.srvCtx.cfg.REALITYFallbackTag = on
 		reg := NewClientRegistry(nil)
-		for _, c := range []*ClientConfig{
-			{ID: "weak", Secret: "changeme-changeme-changeme", Enabled: true},
-			{ID: "strong", Secret: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", Enabled: true},
-		} {
-			reg.byID[c.ID], reg.bySecret[c.Secret] = c, c
-		}
 		srv.srvCtx.registry = reg
-		srv.srvCtx.b1Gate.index.rebuildFrom(srv.srvCtx)
-		srv.srvCtx.b1Gate.index.rebuildFrom(srv.srvCtx)
+		gate := srv.srvCtx.b1Gate
+		gate.index.rebuildFrom(srv.srvCtx) // as at startup: an empty registry
+
+		add := func(c *ClientConfig) {
+			reg.mu.Lock()
+			reg.byID[c.ID], reg.bySecret[c.Secret] = c, c
+			reg.mu.Unlock()
+			reg.generation.Add(1)
+			// The refresh after a miss runs at most once a second.
+			time.Sleep(shortIDMissRefreshInterval + 100*time.Millisecond)
+			expectDonor(t, srv, stranger)
+			deadline := time.Now().Add(2 * time.Second)
+			for gate.index.behind(srv.srvCtx) {
+				if time.Now().After(deadline) {
+					t.Fatal("the gate did not rebuild its index after the registry changed")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+		add(&ClientConfig{ID: "weak", Secret: "changeme-changeme-changeme", Enabled: true})
+		add(&ClientConfig{ID: "strong", Secret: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", Enabled: true})
 		log.SetOutput(os.Stderr)
+
 		got := strings.Count(out.String(), "Registry client weak has a weak secret")
 		if want := map[bool]int{true: 1, false: 0}[on]; got != want {
 			t.Fatalf("flag %v: the weak client was named %d times over two rebuilds, want %d:\n%s", on, got, want, out.String())
@@ -630,6 +646,22 @@ func TestWeakRegistrySecretsAreSaidWithTheTag(t *testing.T) {
 		if strings.Contains(out.String(), "Registry client strong") {
 			t.Fatal("the strong client was called weak")
 		}
+	}
+}
+
+// TestRunWarnsAboutAWeakSecret: the startup warning is said by Run itself,
+// before anything that can fail. Here the REALITY key is missing, so Run
+// stops right after the warnings.
+func TestRunWarnsAboutAWeakSecret(t *testing.T) {
+	var out bytes.Buffer
+	log.SetOutput(&out)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	err := Run(&Config{Secret: []byte("pass-424242"), REALITYB1Enabled: true})
+	if !errors.Is(err, errNoREALITYKey) {
+		t.Fatalf("Run: %v, want the missing-key error - the test proves nothing", err)
+	}
+	if !strings.Contains(out.String(), "global -secret is weak") {
+		t.Fatalf("Run said nothing about the weak secret:\n%s", out.String())
 	}
 }
 
