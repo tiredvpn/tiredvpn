@@ -170,3 +170,58 @@ func TestTheSwallowRunCrossesACoreRestart(t *testing.T) {
 		t.Fatal("the history is shared with the old manager, not copied")
 	}
 }
+
+// TestRouteHistoryFollowsServersByAddress is P3-2 of the round-6 review: the
+// route memory named servers by their index in the pool, and a pool
+// reordered between two cores put a park on the wrong server. It is matched
+// by address now.
+func TestRouteHistoryFollowsServersByAddress(t *testing.T) {
+	a, b := newHelloListener(t), newHelloListener(t)
+	m1 := newSilenceManager(t, time.Second, a.addr, b.addr)
+	m1.Register(&protectedGreeter{id: "reality", priority: 5})
+	m1.Register(&protectedGreeter{id: "polling", priority: 6})
+	m1.Register(&protectedGreeter{id: "ws", priority: 7})
+	m1.noteSwallowed(a.addr, []string{"reality"})
+	m1.mu.Lock()
+	m1.routeParked = map[int]map[string]time.Time{0: {"polling": time.Now().Add(time.Minute)}}
+	m1.lastDeath = deathMark{server: 0, class: deathDegraded, ids: []string{"polling"}, at: time.Now()}
+	m1.mu.Unlock()
+
+	m2 := newSilenceManager(t, time.Second, b.addr, a.addr) // the same two, reordered
+	m2.Register(&protectedGreeter{id: "reality", priority: 5})
+	m2.Register(&protectedGreeter{id: "polling", priority: 6})
+	m2.Register(&protectedGreeter{id: "ws", priority: 7})
+	m2.AdoptRouteHistory(m1.RouteHistory())
+	if !m2.routeSkip(a.addr)["polling"] || len(m2.routeSkip(b.addr)) != 0 {
+		t.Fatalf("route park after the reorder: a %v, b %v - want it on a only", m2.routeSkip(a.addr), m2.routeSkip(b.addr))
+	}
+	if !m2.swallowSkip(a.addr)["reality"] || len(m2.swallowSkip(b.addr)) != 0 {
+		t.Fatalf("swallow skip after the reorder: a %v, b %v", m2.swallowSkip(a.addr), m2.swallowSkip(b.addr))
+	}
+	m2.mu.RLock()
+	mark := m2.lastDeath
+	m2.mu.RUnlock()
+	if cand, _ := m2.selector().CandidateForAddr(a.addr); mark.server != cand.EndpointIdx {
+		t.Fatalf("the route mark points at server %d, want a's %d", mark.server, cand.EndpointIdx)
+	}
+}
+
+// TestASuccessOnOneFamilyKeepsTheOthersSkipList is P3-6 of the round-6
+// review: a connect on v4 deleted the server's whole swallow record, v6's
+// skip list with it, and the next return to v6 lost a cycle to the
+// swallowed transport again.
+func TestASuccessOnOneFamilyKeepsTheOthersSkipList(t *testing.T) {
+	a6, a4 := newHelloListenerAt(t, "[::1]:0"), newHelloListener(t)
+	m := dualStackPool(t, 2*time.Second, nil, [2]string{a6.addr, a4.addr})
+	m.Register(&protectedGreeter{id: "reality", priority: 5})
+	m.Register(&protectedGreeter{id: "polling", priority: 6})
+	m.noteSwallowed(a6.addr, []string{"reality"})
+	m.noteSwallowed(a4.addr, []string{"polling"})
+	m.clearSwallowed(a4.addr)
+	if !m.swallowSkip(a6.addr)["reality"] {
+		t.Fatal("a success on v4 wiped v6's skip list")
+	}
+	if len(m.swallowSkip(a4.addr)) != 0 {
+		t.Fatal("a success on v4 kept v4's own skip list")
+	}
+}
