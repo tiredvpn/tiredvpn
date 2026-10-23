@@ -1941,7 +1941,10 @@ func handleH2DataFrame(conn net.Conn, f *http2.DataFrame, framer *http2.Framer, 
 // not fit (int(pktLen) > len(payload)-4), black-holing every inner packet above
 // ~996 bytes on relay chains. We now buffer across payloads like the morph path.
 func forwardH2TUNPacket(tunnel *h2TunnelState, streamID uint32, payload []byte, logger *log.Logger) {
+	// Every write down reads streamID under tunnel.mu; so must this.
+	tunnel.mu.Lock()
 	tunnel.streamID = streamID
+	tunnel.mu.Unlock()
 	if tunnel.sink == nil {
 		return
 	}
