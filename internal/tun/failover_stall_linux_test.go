@@ -5,6 +5,7 @@ package tun
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -500,5 +501,35 @@ func TestAConfirmationCannotTouchTheNextSession(t *testing.T) {
 	time.Sleep(300 * time.Millisecond) // the echo arrives, the old confirmation ends
 	if s := next.stalledFor(time.Now()); s == 0 {
 		t.Fatal("the old session's confirmation marked the new session's flows as answered")
+	}
+}
+
+// keepaliveRefusingConn fails every keepalive write and passes the rest.
+type keepaliveRefusingConn struct{ net.Conn }
+
+func (c keepaliveRefusingConn) Write(p []byte) (int, error) {
+	if len(p) == 4 && p[0]|p[1]|p[2]|p[3] == 0 {
+		return 0, errors.New("uplink stuck")
+	}
+	return c.Conn.Write(p)
+}
+
+// TestAKeepaliveThatCannotGoOutIsNoAnswer is P3-8 of the round-4 review: a
+// confirmation whose keepalive could not be sent came back "alive" with 0
+// sent, logged "a keepalive echoed (0 sent)" and was asked again at the next
+// check. It is no answer: no verdict, nothing marked, and the next question
+// after one threshold.
+func TestAKeepaliveThatCannotGoOutIsNoAnswer(t *testing.T) {
+	h := newStallHarness(t, func(c net.Conn) net.Conn { return keepaliveRefusingConn{c} })
+	if !h.wait("could not confirm", 2*time.Second) {
+		t.Fatalf("no failed confirmation:\n%s", h.out)
+	}
+	time.Sleep(200 * time.Millisecond) // under one threshold (300 ms)
+	out := h.out.String()
+	if strings.Contains(out, "Session alive") || strings.Contains(out, "Session degraded") {
+		t.Fatalf("a keepalive that never went out gave an answer:\n%s", out)
+	}
+	if n := strings.Count(out, "Session suspect: a flow"); n != 1 {
+		t.Fatalf("%d suspicions within one threshold of a failed confirmation", n)
 	}
 }

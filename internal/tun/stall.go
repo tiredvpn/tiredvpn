@@ -2,6 +2,7 @@ package tun
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"net"
@@ -310,35 +311,58 @@ func (m *stallMonitor) suspect(sessionAge time.Duration) (time.Duration, bool) {
 	return stall, stall >= m.threshold
 }
 
-// confirm asks the session whether it is alive: a keepalive, stallEchoWait
-// for an echo, then once more after a pause of 1-3 s. echoes must count only
-// what the server really sent - HTTP Polling makes up keepalive frames of its
-// own (see strategy.ServerKeepaliveCounter), and counting those passed every
-// confirmation. It reports whether an echo came and how many keepalives went
-// out. A failed send ends it: the session is going down on its own.
-func (m *stallMonitor) confirm(stop <-chan struct{}, send func() error, echoes func() uint64) (alive bool, sent int) {
-	for attempt := range 2 {
-		if attempt > 0 && !sleepOrStop(stop, m.pause()) {
-			return true, sent
+// confirm asks the session whether it is alive: a keepalive, a window of
+// echoWait, a pause of 1-3 s, a second keepalive and its window. An echo at
+// any point of all that counts - the baseline is taken once, before the first
+// send, and it is looked for once more after the last window - so an echo
+// that came late, during the pause, is not lost. echoes must count only what
+// the server really sent - HTTP Polling makes up keepalive frames of its own
+// (see strategy.ServerKeepaliveCounter), and counting those passed every
+// confirmation.
+//
+// It reports whether an echo came and how many keepalives went out. A send
+// that fails, or a stop, gives err: no answer either way.
+func (m *stallMonitor) confirm(stop <-chan struct{}, send func() error, echoes func() uint64) (alive bool, sent int, err error) {
+	before := echoes()
+	echoed := func() bool {
+		if echoes() != before {
+			m.flows.ignorePending()
+			return true
 		}
-		before := echoes()
+		return false
+	}
+	// wait watches for an echo for d; false means stopped.
+	wait := func(d time.Duration) (bool, error) {
+		deadline := time.Now().Add(d)
+		for time.Now().Before(deadline) {
+			if echoed() {
+				return true, nil
+			}
+			if !sleepOrStop(stop, min(50*time.Millisecond, time.Until(deadline))) {
+				return false, errConfirmStopped
+			}
+		}
+		return false, nil
+	}
+	for attempt := range 2 {
+		if attempt > 0 {
+			if ok, err := wait(m.pause()); ok || err != nil {
+				return ok, sent, err
+			}
+		}
 		if err := send(); err != nil {
-			return true, sent
+			return false, sent, err
 		}
 		sent++
-		deadline := time.Now().Add(m.echoWait)
-		for time.Now().Before(deadline) {
-			if echoes() != before {
-				m.flows.ignorePending()
-				return true, sent
-			}
-			if !sleepOrStop(stop, 50*time.Millisecond) {
-				return true, sent
-			}
+		if ok, err := wait(m.echoWait); ok || err != nil {
+			return ok, sent, err
 		}
 	}
-	return false, sent
+	return echoed(), sent, nil
 }
+
+// errConfirmStopped: the confirmation ended because its session did.
+var errConfirmStopped = errors.New("confirmation stopped")
 
 // sleepOrStop waits d, or less if stop closes; false means stopped.
 func sleepOrStop(stop <-chan struct{}, d time.Duration) bool {
@@ -419,7 +443,8 @@ func (e *sessionDegradedError) Is(target error) bool { return target == strategy
 // process-wide verdict limit. Sessions on Android run through the control
 // socket's relay, which carries its own (tunRelay.watchStalls).
 func (v *VPNClient) watchStalls() {
-	var judged net.Conn // the session that has had its verdict
+	var judged net.Conn     // the session that has had its verdict
+	var holdUntil time.Time // no suspicion before this
 	ticker := time.NewTicker(stallClocks().checkEvery)
 	defer ticker.Stop()
 	for {
@@ -434,7 +459,7 @@ func (v *VPNClient) watchStalls() {
 		v.mu.Lock()
 		conn, flows, connectedAt, lastRx, strat := v.conn, v.stall, v.connectedAt, v.lastRx, v.strategy
 		v.mu.Unlock()
-		if conn == nil || flows == nil || conn == judged {
+		if conn == nil || flows == nil || conn == judged || time.Now().Before(holdUntil) {
 			continue
 		}
 		// The table of this conn's session, read with it: a confirmation
@@ -446,11 +471,20 @@ func (v *VPNClient) watchStalls() {
 			continue
 		}
 		log.Info("Session suspect: a flow has waited %v for an answer - confirming with keepalives", stall.Round(time.Millisecond))
-		alive, sent := mon.confirm(v.stopCh, keepaliveSender(conn), v.echoCounter(conn))
+		alive, sent, err := mon.confirm(v.stopCh, keepaliveSender(conn), v.echoCounter(conn))
 		v.mu.Lock()
 		current := v.conn == conn
 		v.mu.Unlock()
 		if !current {
+			continue
+		}
+		if err != nil {
+			// No keepalive could go out: no answer either way. Not "alive",
+			// which would leave the flows ignored, and no verdict; the
+			// session is likely going down on its own. Asked again after
+			// one threshold.
+			log.Info("Session suspect: could not confirm (%v) - no verdict", err)
+			holdUntil = time.Now().Add(mon.threshold)
 			continue
 		}
 		if alive {
@@ -523,6 +557,7 @@ func (r *tunRelay) watchStalls() {
 	if count, ok := serverKeepaliveCount(r.serverConn); ok {
 		echoes = count
 	}
+	var holdUntil time.Time // no suspicion before this
 	ticker := time.NewTicker(stallClocks().checkEvery)
 	defer ticker.Stop()
 	for {
@@ -533,16 +568,24 @@ func (r *tunRelay) watchStalls() {
 			return
 		case <-ticker.C:
 		}
+		if time.Now().Before(holdUntil) {
+			continue
+		}
 		stall, ok := mon.suspect(time.Since(r.startedAt))
 		if !ok {
 			continue
 		}
 		log.Info("TUN relay: a flow has waited %v for an answer - confirming with keepalives", stall.Round(time.Millisecond))
-		alive, sent := mon.confirm(r.stopCh, keepaliveSender(r.serverConn), echoes)
+		alive, sent, err := mon.confirm(r.stopCh, keepaliveSender(r.serverConn), echoes)
 		select {
 		case <-r.done:
 			return
 		default:
+		}
+		if err != nil && !r.ownerStopped() {
+			log.Info("TUN relay: could not confirm (%v) - no verdict", err)
+			holdUntil = time.Now().Add(mon.threshold)
+			continue
 		}
 		if alive || r.ownerStopped() {
 			if alive {

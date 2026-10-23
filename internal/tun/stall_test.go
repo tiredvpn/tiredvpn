@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -335,5 +336,41 @@ func TestFlowTableReset(t *testing.T) {
 	ft.reset()
 	if s := ft.stalledFor(pkts[5].at.Add(time.Minute)); s != 0 {
 		t.Fatalf("pending demand survived the reset: %v", s)
+	}
+}
+
+// slowEchoes is a keepalive peer whose echo takes rtt.
+type slowEchoes struct {
+	rtt time.Duration
+	n   atomic.Uint64
+}
+
+func (e *slowEchoes) send() error {
+	time.AfterFunc(e.rtt, func() { e.n.Add(1) })
+	return nil
+}
+
+// TestASlowEchoStillCounts is P2-2 of the round-4 review: the baseline was
+// taken anew before the second keepalive, so an echo of the first that came
+// after its window - during the pause - was folded into the baseline and
+// counted as nothing. On a slow channel both echoes came and the session was
+// given up. Window 150 ms, pause 100 ms, echo after 200 ms.
+func TestASlowEchoStillCounts(t *testing.T) {
+	mon := &stallMonitor{flows: newFlowTable(), echoWait: 150 * time.Millisecond, now: time.Now,
+		pause: func() time.Duration { return 100 * time.Millisecond }}
+	peer := &slowEchoes{rtt: 200 * time.Millisecond}
+	if alive, sent, _ := mon.confirm(make(chan struct{}), peer.send, peer.n.Load); !alive {
+		t.Fatalf("both echoes came (%d sent) and the session was given up", sent)
+	}
+}
+
+// TestALateLastEchoStillCounts: an echo of the last keepalive that lands at
+// the very end of its window is still looked for once more.
+func TestALateLastEchoStillCounts(t *testing.T) {
+	mon := &stallMonitor{flows: newFlowTable(), echoWait: 100 * time.Millisecond, now: time.Now,
+		pause: func() time.Duration { return 500 * time.Millisecond }}
+	peer := &slowEchoes{rtt: 700 * time.Millisecond}
+	if alive, _, _ := mon.confirm(make(chan struct{}), peer.send, peer.n.Load); !alive {
+		t.Fatal("an echo landing at the very end of the last window was dropped")
 	}
 }
