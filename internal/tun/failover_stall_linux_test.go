@@ -872,7 +872,7 @@ func TestTheUplinkKeepaliveFillsSilenceOnly(t *testing.T) {
 // gap between frames going up may exceed one period by much.
 func TestTheUplinkKeepaliveIsNeverAPeriodLate(t *testing.T) {
 	h := newQuietStallHarness(t, nil)
-	const period = 300 * time.Millisecond
+	const period = time.Second
 	restore := SetUplinkKeepaliveDraw(func() time.Duration { return period })
 	t.Cleanup(func() { SetUplinkKeepaliveDraw(restore) })
 	go h.v.keepUplinkAlive()
@@ -881,7 +881,7 @@ func TestTheUplinkKeepaliveIsNeverAPeriodLate(t *testing.T) {
 	frames := func() int64 { return h.exit.gotEcho.Load() + h.exit.gotData.Load() }
 	last, lastAt, echoes := frames(), time.Now(), h.exit.gotEcho.Load()
 	var worst time.Duration
-	for end := time.Now().Add(4 * time.Second); time.Now().Before(end); time.Sleep(5 * time.Millisecond) {
+	for end := time.Now().Add(8 * time.Second); time.Now().Before(end); time.Sleep(5 * time.Millisecond) {
 		if n := h.exit.gotEcho.Load(); n != echoes {
 			echoes = n
 			time.Sleep(20 * time.Millisecond)
@@ -895,9 +895,11 @@ func TestTheUplinkKeepaliveIsNeverAPeriodLate(t *testing.T) {
 		}
 	}
 	if echoes < 5 {
-		t.Fatalf("%d keepalives in 4 s - the test proves nothing", echoes)
+		t.Fatalf("%d keepalives in 8 s - the test proves nothing", echoes)
 	}
-	if worst > period+150*time.Millisecond {
+	// A whole period late is two periods; a loaded -race run adds a few
+	// hundred ms at most.
+	if worst > period+period/2 {
 		t.Fatalf("the uplink went %v without a frame, against a %v period", worst, period)
 	}
 }

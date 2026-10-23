@@ -1684,7 +1684,8 @@ func monoNow() int64 { return int64(time.Since(monoBase)) }
 // quiet period is drawn like the relay's, 20-45 s (HumpDelay, mean 30 s), well
 // inside every exit's deadline and off any grid; there is no measured
 // reference distribution for it. A busy uplink, or the server-silence
-// keepalive every 10 s, keeps it from ever firing.
+// keepalive every 10 s, keeps it from ever firing. A tick that comes before
+// the period is up waits out the rest of it, never a whole period.
 func (v *VPNClient) keepUplinkAlive() {
 	defer func() {
 		if r := recover(); r != nil {
@@ -1721,10 +1722,7 @@ func (v *VPNClient) keepUplinkAlive() {
 			quiet = (*uplinkKeepaliveDraw.Load())()
 			silent = 0
 		}
-		next := quiet - silent
-		if next < 100*time.Millisecond {
-			next = 100 * time.Millisecond
-		}
+		next := max(quiet-silent, 10*time.Millisecond)
 		timer.Reset(next)
 	}
 }
