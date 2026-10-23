@@ -3808,11 +3808,18 @@ func (m *Manager) ScanScore(s Strategy) float64 {
 	return score
 }
 
-// UpgradeEligible reports whether a scan would admit s right now: not a UDP
-// strategy while UDP is excluded, not storm-parked, breaker closed. The offer
+// UpgradeEligible reports whether a scan on addr would admit s right now: not
+// a UDP strategy while UDP is excluded, not storm-parked, breaker closed, and
+// not set aside on addr's server by a route verdict (routeSkip). The offer
 // checks it when it is built; the dial comes up to minutes later and checks it
-// again.
-func (m *Manager) UpgradeEligible(s Strategy) bool {
+// again. Without the last check an upgrade moved the tunnel straight back
+// onto the transport the route had just killed there, and its next death
+// charged the server - the false charge the route rule exists to prevent
+// (P2-B of the round-6 review).
+func (m *Manager) UpgradeEligible(s Strategy, addr string) bool {
+	if m.routeSkip(addr)[s.ID()] {
+		return false
+	}
 	m.mu.RLock()
 	excludeUDP := m.excludeUDPStrategies
 	m.mu.RUnlock()
@@ -3840,6 +3847,14 @@ func (m *Manager) offerUpgrade(results []Result) {
 	muxEnabled := m.muxEnabled
 	m.muxMu.Unlock()
 
+	// The reprobe ran against the pinned server, and the tunnel rides it.
+	var routeSkip map[string]bool
+	if sel := m.selector(); sel != nil {
+		if cand, ok := sel.Current(); ok {
+			routeSkip = m.routeSkip(cand.Addr)
+		}
+	}
+
 	m.mu.Lock()
 	cb := m.upgradeCallback
 	if cb == nil || m.forced || muxEnabled {
@@ -3863,7 +3878,8 @@ func (m *Manager) offerUpgrade(results []Result) {
 		if !r.Success || s.Priority() <= 0 {
 			continue
 		}
-		if (excludeUDP && isUDPBasedStrategy(s)) || m.stormDetector.IsParked(id) || !m.circuitBreakers.CanTry(id) {
+		if (excludeUDP && isUDPBasedStrategy(s)) || m.stormDetector.IsParked(id) || !m.circuitBreakers.CanTry(id) ||
+			routeSkip[id] {
 			continue
 		}
 		cands = append(cands, s)

@@ -1960,7 +1960,7 @@ func (v *VPNClient) tryStrategyUpgrade(cands []strategy.Strategy) {
 		// against a REALITY that works - is no upgrade, whatever its base
 		// priority. And the offer is minutes old: what a scan would not admit
 		// now (UDP excluded, storm-parked, breaker open) is not dialled.
-		if v.manager.ScanScore(next) >= v.manager.ScanScore(cur) || !v.manager.UpgradeEligible(next) {
+		if v.manager.ScanScore(next) >= v.manager.ScanScore(cur) || !v.manager.UpgradeEligible(next, cand.Addr) {
 			continue
 		}
 		log.Info("Strategy upgrade: %s is reachable again, moving the tunnel off %s", next.Name(), cur.Name())

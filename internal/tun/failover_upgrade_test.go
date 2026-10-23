@@ -411,3 +411,32 @@ func TestFailedUpgradeDialsOnlyOneCandidate(t *testing.T) {
 		t.Fatal("a failed upgrade touched the tunnel")
 	}
 }
+
+// TestAnUpgradeDoesNotGoBackOntoATransportTheRouteKilled is P2-B of the
+// round-6 review at the tunnel's end: REALITY died the same way on a and on b,
+// and the route rule set it aside on both. An upgrade offered on b must not
+// dial it there.
+func TestAnUpgradeDoesNotGoBackOntoATransportTheRouteKilled(t *testing.T) {
+	better := &rankedPipeStrategy{pipeStrategy: &pipeStrategy{t: t, resp: bareV3Response(), gap: silent}, id: "reality", priority: 5}
+	v, _, oldConn := newUpgradeClient(t, better)
+	m := v.manager
+	if err := m.SetEndpoints([]endpoint.Endpoint{{Name: "a", V4: "203.0.113.10:443"}, {Name: "b", V4: "203.0.113.11:443", Order: 1}},
+		endpoint.V4Only); err != nil {
+		t.Fatalf("SetEndpoints: %v", err)
+	}
+	cands := map[string]endpoint.Candidate{}
+	for _, st := range m.EndpointStates() {
+		cands[st.Addr] = st.Candidate
+	}
+	for _, addr := range []string{"203.0.113.10:443", "203.0.113.11:443"} {
+		m.SessionEnded(strategy.SessionEnd{Strategy: "reality", Endpoint: cands[addr], HasEndpoint: true, Degraded: true})
+	}
+	v.mu.Lock()
+	v.sessionCand, v.hasSessionCand, v.serverAddr = cands["203.0.113.11:443"], true, "203.0.113.11:443"
+	v.mu.Unlock()
+
+	v.tryStrategyUpgrade([]strategy.Strategy{better})
+	if n := better.dials.Load(); n != 0 || v.conn != oldConn {
+		t.Fatalf("the upgrade dialled REALITY %d times on b, where the route set it aside", n)
+	}
+}

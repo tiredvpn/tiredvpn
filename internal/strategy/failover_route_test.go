@@ -309,3 +309,47 @@ func TestARouteParkRunsOut(t *testing.T) {
 		t.Fatal("b has nothing set aside")
 	}
 }
+
+// TestARouteParkHoldsAgainstAnUpgrade is P2-B of the round-6 review: the
+// route verdict set REALITY aside on b, but the reprobe offered it back and
+// the upgrade check admitted it - the tunnel went straight back onto the
+// transport the route had killed there. Neither the offer nor the dial's
+// check admits it on b; on c, where nothing died, both do.
+func TestARouteParkHoldsAgainstAnUpgrade(t *testing.T) {
+	a, b, c := newHelloListener(t), newHelloListener(t), newHelloListener(t)
+	m := newSilenceManager(t, time.Second, a.addr, b.addr, c.addr)
+	reality := &greetingStrategy{id: "reality", priority: 5}
+	m.Register(reality)
+	m.Register(&greetingStrategy{id: "polling", priority: 6})
+	m.mu.Lock()
+	m.routeParked = map[int]map[string]time.Time{0: {"reality": time.Now().Add(time.Minute)}, 1: {"reality": time.Now().Add(time.Minute)}}
+	m.mu.Unlock()
+
+	if m.UpgradeEligible(reality, b.addr) {
+		t.Fatal("REALITY eligible for an upgrade on b, where the route set it aside")
+	}
+	if !m.UpgradeEligible(reality, c.addr) {
+		t.Fatal("REALITY not eligible on c, where nothing died")
+	}
+
+	noUpgradeDelay(t)
+	offer := func(pin string) bool {
+		cand, _ := m.selector().CandidateForAddr(pin)
+		m.selector().Pin(cand)
+		offers := newUpgradeOffers()
+		m.SetStrategyUpgradeCallback(offers.take)
+		m.offerUpgrade([]Result{{Strategy: reality, Success: true}})
+		select {
+		case <-offers.got:
+			return true
+		case <-time.After(300 * time.Millisecond):
+			return false
+		}
+	}
+	if offer(b.addr) {
+		t.Fatal("the reprobe on b offered REALITY back")
+	}
+	if !offer(c.addr) {
+		t.Fatal("the reprobe on c did not offer REALITY - the test proves nothing")
+	}
+}
