@@ -399,3 +399,44 @@ func TestRelayUpstreamReachesAB1ExitWithACoverDomain(t *testing.T) {
 		t.Fatalf("the cover domain took %d upstream connections", n)
 	}
 }
+
+// TestANewRegistryClientsTagIsSeenSoon is P3-2 of the round-5 review: a tag
+// miss looks like any stranger's hello and triggered no index refresh, so a
+// client just added to the registry had its TLS fallbacks sent to the donor
+// until the periodic rebuild, up to 30 s later. The registry's generation now
+// says the index is behind.
+func TestANewRegistryClientsTagIsSeenSoon(t *testing.T) {
+	srv := newTagServer(t, "")
+	reg := NewClientRegistry(nil)
+	srv.srvCtx.registry = reg
+	gate := srv.srvCtx.b1Gate
+	gate.index.rebuildFrom(srv.srvCtx)
+
+	carol := &ClientConfig{ID: "carol", Secret: "carol-own-secret", Enabled: true}
+	reg.mu.Lock()
+	reg.byID[carol.ID], reg.bySecret[carol.Secret] = carol, carol
+	reg.mu.Unlock()
+	reg.generation.Add(1)
+
+	hello := captureFallbackHello(t, tagFallbackStrategies[0].make, carol.Secret)
+	sid, err := customtls.SessionIDFrom(hello[5:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := gate.index.MatchFallbackTag(sid); ok {
+		t.Fatal("the index knew the new client before any refresh - the test proves nothing")
+	}
+	// The first hello goes to the donor and starts the refresh.
+	expectDonor(t, srv, hello)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		// Caught up means both: the client is in, and the index knows it is
+		// current - or every later hello would rebuild it again.
+		if e, _, ok := gate.index.MatchFallbackTag(sid); ok && e.clientID == registryIdentity("carol") &&
+			!gate.index.behind(srv.srvCtx) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("two seconds on, the index has not caught up with the registry (behind=%v)", gate.index.behind(srv.srvCtx))
+}

@@ -37,6 +37,8 @@ type shortIDIndex struct {
 	mu      sync.RWMutex
 	entries map[[customtls.AuthShortIDLen]byte]shortIDEntry
 	built   time.Time
+	// gen is the registry generation the entries were built from.
+	gen uint64
 
 	// refreshing serialises rebuilds and, with lastRefresh, rate-limits the
 	// ones triggered by a lookup miss. Without that limit an attacker who
@@ -160,12 +162,33 @@ func (i *shortIDIndex) refreshAsync(srvCtx *serverContext, minInterval time.Dura
 
 	go func() {
 		defer i.refreshing.Unlock()
-		var clients []*ClientConfig
-		if srvCtx.registry != nil {
-			clients = srvCtx.registry.ListClients()
-		}
-		i.Rebuild(clients, srvCtx.cfg.Secret)
+		i.rebuildFrom(srvCtx)
 	}()
+}
+
+// rebuildFrom rebuilds the index from srvCtx's registry and global secret,
+// and notes the registry generation it was built from.
+func (i *shortIDIndex) rebuildFrom(srvCtx *serverContext) {
+	var clients []*ClientConfig
+	var gen uint64
+	if srvCtx.registry != nil {
+		gen = srvCtx.registry.Generation()
+		clients = srvCtx.registry.ListClients()
+	}
+	i.Rebuild(clients, srvCtx.cfg.Secret)
+	i.mu.Lock()
+	i.gen = gen
+	i.mu.Unlock()
+}
+
+// behind reports whether the registry has changed since the index was built.
+func (i *shortIDIndex) behind(srvCtx *serverContext) bool {
+	if srvCtx.registry == nil {
+		return false
+	}
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.gen != srvCtx.registry.Generation()
 }
 
 // replayCache remembers the session_id values already accepted, so the same

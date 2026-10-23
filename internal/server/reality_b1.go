@@ -77,11 +77,7 @@ func gateFor(srvCtx *serverContext) *realityB1Gate {
 	}
 	b1GateOnce.Do(func() {
 		b1Gate = newREALITYB1Gate(srvCtx.cfg.REALITYMaxTimeDiff)
-		var clients []*ClientConfig
-		if srvCtx.registry != nil {
-			clients = srvCtx.registry.ListClients()
-		}
-		b1Gate.index.Rebuild(clients, srvCtx.cfg.Secret)
+		b1Gate.index.rebuildFrom(srvCtx)
 	})
 	return b1Gate
 }
@@ -310,6 +306,13 @@ func (g *realityB1Gate) fallbackTag(srvCtx *serverContext, helloRaw []byte, now 
 func (g *realityB1Gate) refreshIndexIfNeeded(srvCtx *serverContext, verdict b1Verdict) {
 	switch {
 	case verdict.reason == reasonUnknownID:
+		g.index.refreshAsync(srvCtx, shortIDMissRefreshInterval)
+	case g.index.behind(srvCtx):
+		// A client added or changed in the registry: its fallback-transport
+		// tag opens with nothing in the index, and nothing about a tag miss
+		// says so - the miss looks like every stranger's. The periodic
+		// rebuild left a new client's TLS fallbacks at the donor for up to
+		// 30 s (P3-2 of the round-5 review); the registry's generation tells.
 		g.index.refreshAsync(srvCtx, shortIDMissRefreshInterval)
 	case g.index.stale(time.Now()):
 		g.index.refreshAsync(srvCtx, shortIDRefreshInterval)
