@@ -2006,14 +2006,16 @@ func (m *Manager) swallowEvidence(s Strategy, allowance time.Duration) bool {
 	return !isUDPBasedStrategy(s) && allowance >= m.connectTimeout/3
 }
 
-// swallowRecord is what one server's last reconnect cycles left behind. It is
-// kept per server, not per address: a server that swallows handshakes on one
-// family is checked on its other family next (N9 of the 1.11.9 acceptance),
-// and the run counts the cycles on both.
+// swallowRecord is what one server's last reconnect cycles left behind. The
+// run is kept per server: a server that swallows handshakes on one family is
+// checked on its other family next (N9 of the 1.11.9 acceptance), and the run
+// counts the cycles on both. The skip lists stay per address: under a censor
+// the two families are often in different states, and a transport swallowed
+// on v6 may well work on v4 (P1-3 of the round-5 review).
 type swallowRecord struct {
-	// skip holds the transports whose connected handshake heard nothing; the
-	// next cycle on this server starts without them.
-	skip map[string]bool
+	// skip holds, per address, the transports whose connected handshake heard
+	// nothing there; the next cycle on that address starts without them.
+	skip map[string]map[string]bool
 	last time.Time
 	// cycles counts the cycles in a row that ended with no verdict while a
 	// transport heard nothing there, and heardNothing names those
@@ -2070,13 +2072,14 @@ func (m *Manager) swallowSkip(addr string) map[string]bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r := m.swallowed[key]
-	if r == nil || len(r.skip) == 0 || m.forced || swallowStale(r, parked) {
+	if r == nil || len(r.skip[addr]) == 0 || m.forced || swallowStale(r, parked) {
 		return nil
 	}
-	if !slices.ContainsFunc(m.strategies, func(s Strategy) bool { return s.Priority() > 0 && !r.skip[s.ID()] }) {
+	skip := r.skip[addr]
+	if !slices.ContainsFunc(m.strategies, func(s Strategy) bool { return s.Priority() > 0 && !skip[s.ID()] }) {
 		return nil
 	}
-	return maps.Clone(r.skip)
+	return maps.Clone(skip)
 }
 
 // noteSwallowed books the transports whose connected handshake heard nothing
@@ -2090,8 +2093,11 @@ func (m *Manager) noteSwallowed(addr string, ids []string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r := m.swallowRecordLocked(key, parked)
+	if r.skip[addr] == nil {
+		r.skip[addr] = make(map[string]bool)
+	}
 	for _, id := range ids {
-		r.skip[id] = true
+		r.skip[addr][id] = true
 	}
 }
 
@@ -2101,7 +2107,7 @@ func (m *Manager) noteSwallowed(addr string, ids []string) {
 func (m *Manager) swallowRecordLocked(key string, parked bool) *swallowRecord {
 	r := m.swallowed[key]
 	if r == nil || swallowStale(r, parked) {
-		r = &swallowRecord{skip: make(map[string]bool), heardNothing: make(map[string]bool), addrs: make(map[string]bool)}
+		r = &swallowRecord{skip: make(map[string]map[string]bool), heardNothing: make(map[string]bool), addrs: make(map[string]bool)}
 		if m.swallowed == nil {
 			m.swallowed = make(map[string]*swallowRecord)
 		}
