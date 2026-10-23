@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/endpoint"
+	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
 	"github.com/tiredvpn/tiredvpn/internal/tun"
 )
@@ -156,6 +157,134 @@ func TestACoreShutdownKeepsTheCarryAUserStopDoesNot(t *testing.T) {
 	}
 }
 
+// send writes one control command and does not wait for its answer, as the
+// app does with "disconnect" before it stops the core.
+func send(t *testing.T, sock, cmd string) net.Conn {
+	t.Helper()
+	c, err := net.Dial("unix", sock)
+	for deadline := time.Now().Add(3 * time.Second); err != nil && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+		c, err = net.Dial("unix", sock)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	if _, err := c.Write([]byte(cmd)); err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+// carryCleared reports whether the last core left no carry.
+func carryCleared() bool {
+	androidCarry.mu.Lock()
+	defer androidCarry.mu.Unlock()
+	return androidCarry.at.IsZero()
+}
+
+// TestAUserStopTheAppDoesNotWaitForIsStillAStop is P3-2 of the round-7
+// review. The app writes "disconnect" and stops the core at once, without
+// reading the answer: the core often went before it had read the command,
+// and the carry survived the user's stop in about one stop in five. A
+// "disconnect" written while a "connect" was still running on the same
+// connection was never read at all. And a "connect" after a "disconnect"
+// in one core did not take the stop back.
+func TestAUserStopTheAppDoesNotWaitForIsStillAStop(t *testing.T) {
+	pool := fourExitPool(t)
+	t.Cleanup(clearCarry)
+	var dials []string
+	var mu sync.Mutex
+	park := func(sock string, ctl *tun.ControlConfig) {
+		connectThroughTheSocket(t, sock, &dials, &mu)
+		ctl.SessionEndedFn(degraded)
+	}
+
+	t.Run("not waited for", func(t *testing.T) {
+		for i := range 30 {
+			runCore(t, coreOn(t, pool, &dials, &mu), pool, os.Interrupt, func(sock string, ctl *tun.ControlConfig) {
+				// One connection for both, as the app's control channel.
+				c := send(t, sock, `{"command":"connect"}`)
+				if _, err := c.Read(make([]byte, 4096)); err != nil {
+					t.Fatal(err)
+				}
+				ctl.SessionEndedFn(degraded)
+				if _, err := c.Write([]byte(`{"command":"disconnect"}`)); err != nil {
+					t.Fatal(err)
+				}
+			})
+			if !carryCleared() {
+				t.Fatalf("stop %d: the carry survived a disconnect the core was stopped right after", i+1)
+			}
+		}
+	})
+
+	t.Run("behind a running connect", func(t *testing.T) {
+		runCore(t, coreOn(t, pool, &dials, &mu), pool, os.Interrupt, park)
+		if carryCleared() {
+			t.Fatal("no carry to clear - the test proves nothing")
+		}
+		hangingDial = true
+		t.Cleanup(func() { hangingDial = false })
+		runCore(t, coreOn(t, pool, &dials, &mu), pool, os.Interrupt, func(sock string, _ *tun.ControlConfig) {
+			c := send(t, sock, `{"command":"connect"}`)
+			time.Sleep(100 * time.Millisecond) // the connect is dialling
+			if _, err := c.Write([]byte(`{"command":"disconnect"}`)); err != nil {
+				t.Fatal(err)
+			}
+		})
+		hangingDial = false
+		if !carryCleared() {
+			t.Fatal("the carry survived a disconnect sent behind a running connect")
+		}
+	})
+
+	t.Run("connect takes it back", func(t *testing.T) {
+		runCore(t, coreOn(t, pool, &dials, &mu), pool, os.Interrupt, func(sock string, ctl *tun.ControlConfig) {
+			command(t, sock, `{"command":"disconnect"}`)
+			park(sock, ctl)
+		})
+		if carryCleared() {
+			t.Fatal("a connect after a disconnect in the same core did not take the stop back")
+		}
+	})
+}
+
+// TestAHostThatHangsUpUnreadIsNoPanic is P3-9 of the round-7 review: a
+// read that ends in an error after waiting - the host gone without reading
+// the answer, the core's own stop cutting the read - returns n = -1, and
+// buf[:n] panicked in the control server (recovered, and logged as an
+// error). Here hosts hang up unread, and one stays connected and idle while
+// the core stops.
+func TestAHostThatHangsUpUnreadIsNoPanic(t *testing.T) {
+	out := &lockedBuffer{}
+	log.SetOutput(out)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	pool := fourExitPool(t)
+	t.Cleanup(clearCarry)
+	var dials []string
+	var mu sync.Mutex
+	runCore(t, coreOn(t, pool, &dials, &mu), pool, os.Interrupt, func(sock string, _ *tun.ControlConfig) {
+		for range 20 {
+			// Gone for reading, still there for writing: the answer
+			// fails, the core closes the connection under its blocked
+			// reader.
+			c := send(t, sock, `{"command":"status"}`)
+			if err := c.(*net.UnixConn).CloseRead(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		idle := send(t, sock, `{"command":"status"}`)
+		if _, err := idle.Read(make([]byte, 4096)); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(200 * time.Millisecond)
+	})
+	if strings.Contains(out.String(), "panic") {
+		t.Fatalf("the control server panicked:\n%s", out.String())
+	}
+}
+
 // TestAStaleCarryIsNotTaken: P3-5 of the round-5 review and P3-3 of round 6.
 // A carry is for the restart right after a dead connection; one older than
 // androidCarryTTL is not taken. Its stamp is wall-clock time, so a phone
@@ -196,6 +325,39 @@ func TestAStaleCarryIsNotTaken(t *testing.T) {
 	if got := next(); got != "reality@"+pool[0] {
 		t.Fatalf("a stale carry was taken: dialled %s", got)
 	}
+}
+
+// TestACarryFromAnotherPoolDoesNotKeepStaleParks is P2-3 of the round-7
+// review: a degraded session parks the first server of pool X; the app then
+// runs cores on pool Y, and comes back to X without a stop by the user. The
+// carry from Y was fresh, so nothing reset X's selector, which the process
+// had kept cached with the old park in it: the first dial on X skipped its
+// first server. The carry names its pool; a core on another pool starts
+// from nothing.
+func TestACarryFromAnotherPoolDoesNotKeepStaleParks(t *testing.T) {
+	x, y := fourExitPool(t), fourExitPool(t)
+	t.Cleanup(clearCarry)
+	var dials []string
+	var mu sync.Mutex
+	runCore(t, coreOn(t, x, &dials, &mu), x, os.Interrupt, func(sock string, ctl *tun.ControlConfig) {
+		if got := connectThroughTheSocket(t, sock, &dials, &mu); got != "reality@"+x[0] {
+			t.Fatalf("the first core dialled %s", got)
+		}
+		ctl.SessionEndedFn(degraded)
+	})
+	runCore(t, coreOn(t, x, &dials, &mu), x, os.Interrupt, func(sock string, _ *tun.ControlConfig) {
+		if got := connectThroughTheSocket(t, sock, &dials, &mu); got == "reality@"+x[0] {
+			t.Fatal("the park on pool X did not hold for the next core - the test proves nothing")
+		}
+	})
+	runCore(t, coreOn(t, y, &dials, &mu), y, os.Interrupt, func(sock string, _ *tun.ControlConfig) {
+		connectThroughTheSocket(t, sock, &dials, &mu)
+	})
+	runCore(t, coreOn(t, x, &dials, &mu), x, os.Interrupt, func(sock string, _ *tun.ControlConfig) {
+		if got := connectThroughTheSocket(t, sock, &dials, &mu); got != "reality@"+x[0] {
+			t.Fatalf("back on pool X after a core on Y, the first dial went to %s: the cached park held", got)
+		}
+	})
 }
 
 // TestAndroidRouteVerdictCrossesCoresByAddress is P1-4 of the round-5 review
@@ -245,17 +407,19 @@ type carrySnapshot struct {
 	health []endpoint.HealthRecord
 	storm  *strategy.StormDetector
 	route  strategy.RouteMemory
+	pool   string
 	at     time.Time
 }
 
 func snapshotCarry() carrySnapshot {
 	androidCarry.mu.Lock()
 	defer androidCarry.mu.Unlock()
-	return carrySnapshot{androidCarry.health, androidCarry.storm, androidCarry.route, androidCarry.at}
+	return carrySnapshot{androidCarry.health, androidCarry.storm, androidCarry.route, androidCarry.pool, androidCarry.at}
 }
 
 func restoreCarry(c carrySnapshot) {
 	androidCarry.mu.Lock()
 	defer androidCarry.mu.Unlock()
-	androidCarry.health, androidCarry.storm, androidCarry.route, androidCarry.at = c.health, c.storm, c.route, c.at
+	androidCarry.health, androidCarry.storm, androidCarry.route = c.health, c.storm, c.route
+	androidCarry.pool, androidCarry.at = c.pool, c.at
 }

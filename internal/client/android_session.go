@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -155,6 +157,9 @@ func androidControlConfig(cfg *Config, mgr *strategy.Manager, dualStack bool, se
 		// so no endpoint health either - carryInto resets the selector the
 		// cores share (P2-F of the round-6 review).
 		DisconnectedFn: func() { sess.stopped.Store(true) },
+		// A "connect" after a "disconnect" in the same core takes the stop
+		// back (P3-2 of the round-7 review).
+		ConnectRequestedFn: func() { sess.stopped.Store(false) },
 
 		// SessionStrategyFn: the relay's stall detector judges the session by
 		// the strategy that carries it, as the desktop's does.
@@ -174,7 +179,7 @@ func androidControlConfig(cfg *Config, mgr *strategy.Manager, dualStack bool, se
 // sessions, and the route rule never saw a death on the previous server -
 // so on Android the client walked every exit on a transport the route had
 // killed (P1-4 of the round-5 review). Endpoint health is matched by
-// address, so a core over a different pool takes over nothing of it.
+// address; pool names the pool the carry was made on.
 //
 // It is for that restart only. A carry older than androidCarryTTL is
 // dropped, and a core the user stopped leaves none: either may have been
@@ -184,7 +189,18 @@ var androidCarry struct {
 	health []endpoint.HealthRecord
 	storm  *strategy.StormDetector
 	route  strategy.RouteMemory
+	pool   string
 	at     time.Time
+}
+
+// poolOf names mgr's pool: its candidate addresses, sorted.
+func poolOf(mgr *strategy.Manager) string {
+	var addrs []string
+	for _, st := range mgr.EndpointStates() {
+		addrs = append(addrs, st.Addr)
+	}
+	slices.Sort(addrs)
+	return strings.Join(addrs, ",")
 }
 
 // androidCarryTTL is how long a carry waits for the next core. The app
@@ -211,6 +227,16 @@ func carryInto(mgr *strategy.Manager) {
 		mgr.ResetHealth()
 		return
 	}
+	if pool := poolOf(mgr); pool != androidCarry.pool {
+		// The carry was made on another pool. The selector this core gets
+		// back for its own pool may be one cached from minutes ago, still
+		// holding parks from then: the carry stamped in between by a core
+		// on the other pool was fresh, so nothing reset them (P2-3 of the
+		// round-7 review). Start from nothing, and take over what the
+		// carry knows of the addresses the two pools share.
+		log.Info("Previous core ran another pool - starting this one's server verdicts afresh")
+		mgr.ResetHealth()
+	}
 	mgr.ImportEndpointHealth(androidCarry.health)
 	mgr.AdoptStormHistory(androidCarry.storm)
 	mgr.AdoptRouteHistory(androidCarry.route)
@@ -223,12 +249,13 @@ func carryFrom(mgr *strategy.Manager, sess *androidSession) {
 	defer androidCarry.mu.Unlock()
 	if sess != nil && sess.stopped.Load() {
 		androidCarry.health, androidCarry.storm = nil, nil
-		androidCarry.route, androidCarry.at = strategy.RouteMemory{}, time.Time{}
+		androidCarry.route, androidCarry.pool, androidCarry.at = strategy.RouteMemory{}, "", time.Time{}
 		return
 	}
 	androidCarry.health = mgr.EndpointHealth()
 	androidCarry.storm = mgr.StormHistory()
 	androidCarry.route = mgr.RouteHistory()
+	androidCarry.pool = poolOf(mgr)
 	// Wall clock (Round(0) drops the monotonic reading): a phone that sleeps
 	// between two cores must see the sleep in the carry's age (P3-3 of the
 	// round-6 review).
