@@ -167,6 +167,11 @@ type Manager struct {
 	// swallowCycle). Guarded by m.mu.
 	swallowed map[string]*swallowRecord
 
+	// unansweredHS is, per server (swallowKey), the run of session
+	// handshakes that went unanswered after their transport had connected
+	// (HandshakeUnanswered). Guarded by m.mu.
+	unansweredHS map[string]*handshakeRun
+
 	// Connectivity checker for pre-flight checks
 	connectivityChecker  *ConnectivityChecker
 	excludeUDPStrategies bool // Temporarily exclude UDP-based strategies if UDP is blocked
@@ -391,6 +396,10 @@ type connectPhase struct {
 	connectedAt atomic.Int64 // UnixNano of the TCP connect, 0 before
 }
 
+// dialCutTimer arms an attempt's dialLimit cut. A var so a test can fire the
+// cut itself rather than race a wall-clock budget under load.
+var dialCutTimer = time.AfterFunc
+
 // watchConnect follows an attempt on ctx, whose cancel is cancel, through its
 // TCP dial when the strategy reports it (hooked), and arms the dialLimit cut
 // of connectThroughRefusal. Without a split (dialLimit zero or not shorter
@@ -418,7 +427,7 @@ func watchConnect(ctx context.Context, cancel context.CancelFunc, limit, dialLim
 		return p
 	}
 	p.split = true
-	p.timer = time.AfterFunc(dialLimit, func() {
+	p.timer = dialCutTimer(dialLimit, func() {
 		if p.state.CompareAndSwap(phaseDialling, phaseCut) || p.state.CompareAndSwap(phaseLocal, phaseCutLocal) {
 			cancel()
 		}
@@ -2366,6 +2375,109 @@ func (m *Manager) swallowCycle(addr string, scan *scanState) (verdict bool, cove
 	heard = slices.Sorted(maps.Keys(r.heardNothing))
 	r.endRun()
 	return true, covered, heard
+}
+
+// handshakeRun is a server's run of unanswered session handshakes.
+type handshakeRun struct {
+	count int
+	addrs map[string]bool
+	ids   map[string]bool
+	last  time.Time
+}
+
+// handshakeRunVerdict is how many unanswered session handshakes in a row
+// are the server's verdict: two, so the server's other family gets one try
+// in between, as with a swallowed transport handshake.
+const handshakeRunVerdict = 2
+
+// HandshakeUnanswered books a session handshake the server never answered:
+// s connected to cand, the tunnel's request went out, and nothing came
+// back before the read deadline. Some transports connect without hearing
+// from the server at all (Protocol Confusion), so their connect had been
+// booked as a success: the fast path took the same transport to the same
+// server every cycle, the server was never parked, and two swallowing
+// servers kept the client from the healthy third for over seven minutes,
+// the backoff growing to 2 minutes (R1 of the fix9 stand run).
+//
+// The transport is set aside on that address like a swallowed one and loses
+// the fast path; the server's other family gets the next try; a second
+// unanswered handshake on the server is its silence verdict, or the route's
+// when the same transport died that way on the server before (routeDeath).
+// The error to wrap the handshake failure in is returned: ErrAddrSilent on
+// a verdict, ErrCycleUnanswered otherwise - both cap the reconnect backoff
+// at the silence cap.
+func (m *Manager) HandshakeUnanswered(s Strategy, cand endpoint.Candidate, hasCand bool) error {
+	if s == nil {
+		return ErrCycleUnanswered
+	}
+	id := s.ID()
+	m.mu.Lock()
+	if m.lastSuccessfulStrategy != nil && m.lastSuccessfulStrategy.ID() == id {
+		m.lastSuccessfulStrategy = nil
+	}
+	m.updateConfidence(id, false)
+	m.sortStrategies()
+	m.mu.Unlock()
+
+	sel := m.selector()
+	if sel == nil || !hasCand {
+		return ErrCycleUnanswered
+	}
+	m.noteSwallowed(cand.Addr, []string{id})
+	key := m.swallowKey(cand.Addr)
+	now := time.Now().Round(0)
+	m.mu.Lock()
+	if m.unansweredHS == nil {
+		m.unansweredHS = make(map[string]*handshakeRun)
+	}
+	r := m.unansweredHS[key]
+	if r == nil || now.Sub(r.last) > routeDeathWindow {
+		r = &handshakeRun{addrs: make(map[string]bool), ids: make(map[string]bool)}
+		m.unansweredHS[key] = r
+	}
+	r.count++
+	r.addrs[cand.Addr] = true
+	r.ids[id] = true
+	r.last = now
+	covered := slices.Sorted(maps.Keys(r.addrs))
+	ids := slices.Sorted(maps.Keys(r.ids))
+	verdict := r.count >= handshakeRunVerdict
+	if verdict {
+		delete(m.unansweredHS, key)
+	}
+	m.mu.Unlock()
+
+	if !verdict {
+		if sib, ok := m.swallowSibling(sel, cand, covered); ok {
+			log.Info("Endpoint %s: the %s session handshake went unanswered - the next cycle tries the server's other address %s", cand, s.Name(), sib)
+			sel.Pin(sib)
+		} else {
+			log.Info("Endpoint %s: the %s session handshake went unanswered", cand, s.Name())
+		}
+		return ErrCycleUnanswered
+	}
+	log.Warn("%s left %d session handshakes unanswered in a row (%s on %s) - its silence verdict",
+		key, handshakeRunVerdict, strings.Join(ids, ", "), strings.Join(covered, ", "))
+	if m.routeDeath(cand, deathSwallowed, "its session handshake went unanswered", ids) {
+		return ErrCycleUnanswered
+	}
+	if sel.ReportSilent(cand, covered...) {
+		log.Warn("Endpoint %s: every address of the server has a verdict - parking the server", cand)
+	}
+	m.logEndpointHealth(sel, cand)
+	return ErrAddrSilent
+}
+
+// HandshakeAnswered ends cand's server's run of unanswered session
+// handshakes: the server answered one.
+func (m *Manager) HandshakeAnswered(cand endpoint.Candidate, hasCand bool) {
+	if !hasCand {
+		return
+	}
+	key := m.swallowKey(cand.Addr)
+	m.mu.Lock()
+	delete(m.unansweredHS, key)
+	m.mu.Unlock()
 }
 
 // endSwallowRun ends addr's run of no-verdict cycles: a cycle reached a
@@ -4563,6 +4675,7 @@ func (m *Manager) ResetForNetworkChange() {
 	m.stormDetector.Reset()
 	m.lastDeath = deathMark{server: -1}
 	m.swallowed = nil
+	m.unansweredHS = nil
 	m.routeParked = nil
 
 	// So is the UDP verdict: it gated QUIC for the old network (or for no
@@ -4638,6 +4751,10 @@ type RouteMemory struct {
 	deathAddr string
 	swallowed map[string]*swallowRecord // key: server address, or the dial address without a selector
 	parked    map[string]map[string]time.Time
+	// handshakes are the runs of unanswered session handshakes, by server
+	// address: on Android every unanswered handshake ends the core, and a run
+	// that did not cross the restart never reached its verdict.
+	handshakes map[string]*handshakeRun
 }
 
 // serverAddr names endpoint idx by its first candidate address; "" if none.
@@ -4673,6 +4790,18 @@ func (m *Manager) RouteHistory() RouteMemory {
 			out.parked[addr] = maps.Clone(ids)
 		}
 	}
+	for k, r := range m.unansweredHS {
+		var idx int
+		if _, err := fmt.Sscanf(k, "server %d", &idx); err != nil {
+			continue
+		}
+		if addr := serverAddr(sel, idx); addr != "" {
+			if out.handshakes == nil {
+				out.handshakes = make(map[string]*handshakeRun)
+			}
+			out.handshakes[addr] = &handshakeRun{count: r.count, addrs: maps.Clone(r.addrs), ids: maps.Clone(r.ids), last: r.last}
+		}
+	}
 	for k, r := range m.swallowed {
 		c := &swallowRecord{
 			skip:         make(map[string]map[string]bool, len(r.skip)),
@@ -4700,7 +4829,7 @@ func (m *Manager) RouteHistory() RouteMemory {
 // names a server this manager's pool does not have is dropped. The zero
 // RouteMemory changes nothing.
 func (m *Manager) AdoptRouteHistory(rm RouteMemory) {
-	if rm.swallowed == nil && rm.death.at.IsZero() {
+	if rm.swallowed == nil && rm.death.at.IsZero() && rm.handshakes == nil {
 		return
 	}
 	sel := m.selector()
@@ -4728,11 +4857,18 @@ func (m *Manager) AdoptRouteHistory(rm RouteMemory) {
 			swallowed[fmt.Sprintf("server %d", idx)] = r
 		}
 	}
+	handshakes := make(map[string]*handshakeRun, len(rm.handshakes))
+	for addr, r := range rm.handshakes {
+		if idx, ok := server(addr); ok {
+			handshakes[fmt.Sprintf("server %d", idx)] = r
+		}
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.lastDeath = death
 	m.swallowed = swallowed
 	m.routeParked = parked
+	m.unansweredHS = handshakes
 }
 
 // ResetStrategyBlocks closes every circuit breaker and puts every strategy's

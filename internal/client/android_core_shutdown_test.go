@@ -368,6 +368,41 @@ func TestACoreThatNeverDialledLeavesTheCarryAlone(t *testing.T) {
 	}
 }
 
+// TestAndroidCoresLeaveServersThatSwallowTheSessionHandshake is R1 of the
+// fix9 stand run on Android: the transport connects, the server swallows
+// the session handshake, and the app answers the failed connect by
+// restarting the core. Booked as a success, the same transport went back
+// to the same server on every core. The unanswered handshake is booked on
+// the server, the run crosses the core restart, and the cores reach the
+// healthy third server.
+func TestAndroidCoresLeaveServersThatSwallowTheSessionHandshake(t *testing.T) {
+	old := tun.SetHandshakeReadTimeout(200 * time.Millisecond)
+	t.Cleanup(func() { tun.SetHandshakeReadTimeout(old) })
+	pool := fourExitPool(t)
+	muteExits = map[string]bool{pool[0]: true, pool[1]: true}
+	t.Cleanup(func() { muteExits = nil })
+	t.Cleanup(clearCarry)
+	var dials []string
+	var mu sync.Mutex
+	for core := 1; core <= 8; core++ {
+		var resp string
+		runCore(t, coreOn(t, pool, &dials, &mu), pool, os.Interrupt, func(sock string, _ *tun.ControlConfig) {
+			resp = command(t, sock, `{"command":"connect"}`)
+		})
+		mu.Lock()
+		last := dials[len(dials)-1]
+		mu.Unlock()
+		if strings.Contains(resp, "waiting_fd") {
+			if !strings.HasSuffix(last, "@"+pool[2]) && !strings.HasSuffix(last, "@"+pool[3]) {
+				t.Fatalf("core %d connected through %s", core, last)
+			}
+			t.Logf("connected on core %d: %v", core, dials)
+			return
+		}
+	}
+	t.Fatalf("eight cores never left the two swallowing servers: %v", dials)
+}
+
 // TestAStaleCarryIsNotTaken: P3-5 of the round-5 review and P3-3 of round 6.
 // A carry is for the restart right after a dead connection; one older than
 // androidCarryTTL is not taken. Its stamp is wall-clock time, so a phone

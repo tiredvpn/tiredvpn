@@ -1,6 +1,7 @@
 package strategy
 
 import (
+	"context"
 	"errors"
 	"net"
 	"testing"
@@ -65,9 +66,20 @@ func TestAQueuedREALITYHandshakeIsNotSilence(t *testing.T) {
 // TestAQueuedFastPathGivesTheCycleToTheOthers: a fast path still queued at
 // its gate when its dial limit came is not dialled again in the same cycle -
 // the queue is no shorter there - and the next transport connects first time.
+//
+// No wall-clock budget decides it: the cycle and the attempts have an hour,
+// and the fast path's dial-limit cut is fired by the test the moment it is
+// armed. Under -race load the 1 s cycle this used to run in sometimes ran
+// out before Polling had connected.
 func TestAQueuedFastPathGivesTheCycleToTheOthers(t *testing.T) {
+	old := dialCutTimer
+	dialCutTimer = func(_ time.Duration, cut func()) *time.Timer {
+		go cut()
+		return time.NewTimer(time.Hour)
+	}
+	t.Cleanup(func() { dialCutTimer = old })
 	live := newHelloListener(t)
-	m := newSilenceManager(t, 2*time.Second, live.addr)
+	m := newSilenceManager(t, 2*time.Hour, live.addr)
 	r := NewREALITYStrategy(m, []byte("gate-wait-secret"))
 	r.gate = newHandshakeGateWith(1, time.Hour, 0)
 	for _, dest := range r.destPool {
@@ -81,9 +93,13 @@ func TestAQueuedFastPathGivesTheCycleToTheOthers(t *testing.T) {
 	m.Register(&greetingStrategy{id: "polling", priority: 200})
 	markConnected(m, r)
 
-	if err := oneCycle(m); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Hour) // shorter than connectTimeout: the fast path is split
+	defer cancel()
+	conn, _, err := m.Connect(ctx, "")
+	if err != nil {
 		t.Fatalf("cycle: %v", err)
 	}
+	conn.Close()
 	if info := m.GetLastConnectionInfo(); info.StrategyID != "polling" || info.Attempts != 1 {
 		t.Fatalf("connected via %s after %d scan attempts, want polling on the first", info.StrategyID, info.Attempts)
 	}

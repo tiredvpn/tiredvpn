@@ -741,8 +741,14 @@ func reconnectTUN(ctx context.Context, mgr *strategy.Manager, serverAddr string,
 	tunnelConn, serverIP, assignedIP, serverIP6, assignedIP6, err := reconnectHandshake(ctx, conn, currentIP, mtu, dualStack)
 	if err != nil {
 		conn.Close()
+		if tun.IsHandshakeUnanswered(err) {
+			// Booked on the server like the desktop's (R1 of the fix9 stand
+			// run): the transport connected, the server said nothing.
+			err = fmt.Errorf("%w: %w", mgr.HandshakeUnanswered(sess.strat, sess.cand, sess.hasCand), err)
+		}
 		return tun.ReconnectResult{}, reconnectedSession{}, err
 	}
+	mgr.HandshakeAnswered(sess.cand, sess.hasCand)
 
 	log.Info("Reconnect handshake complete (server: %s, assigned: %s)", serverIP, assignedIP)
 

@@ -811,16 +811,33 @@ func (s *Selector) Unpark(c Candidate) {
 }
 
 // ReportSessionUseful records that a session on c carried traffic for a
-// meaningful time, which ends its dead-session streak.
+// meaningful time. The server works, so what grows its parks starts over:
+// the server's backoff and verdicts, and the backoff, dead streak and
+// failure count of every address of the server - the next verdict on any of
+// them is a first one again. It used to clear only the server's backoff and
+// c's own dead streak, while a verdict's park is the larger of the server's
+// and the address's, so a useful session on v6 left v4's park growing: 1m7s,
+// then 2m4s after 70 s of traffic (N14 of the fix9 stand run). A park in
+// force on another address stays: that family's failure is its own evidence,
+// and it runs out on its own.
 func (s *Selector) ReportSessionUseful(c Candidate) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if idx, found := s.byAddr[c.Addr]; found {
-		s.health[idx].deadStreak = 0
-		sc := &s.servers[s.cands[idx].EndpointIdx]
-		sc.backoff = 0
-		clear(sc.verdicts)
+	idx, found := s.byAddr[c.Addr]
+	if !found {
+		return
 	}
+	server := s.cands[idx].EndpointIdx
+	for i, cand := range s.cands {
+		if cand.EndpointIdx != server {
+			continue
+		}
+		h := &s.health[i]
+		h.deadStreak, h.backoff, h.consecutiveFailures = 0, 0, 0
+	}
+	sc := &s.servers[server]
+	sc.backoff = 0
+	clear(sc.verdicts)
 }
 
 // recordFailureLocked bumps the streak and parks the candidate once it crosses

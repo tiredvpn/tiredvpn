@@ -190,6 +190,19 @@ func androidControlConfig(cfg *Config, mgr *strategy.Manager, dualStack bool, se
 		// A "connect" after a "disconnect" in the same core takes the stop
 		// back (P3-2 of the round-7 review).
 		ConnectRequestedFn: func() { sess.stopped.Store(false) },
+		// HandshakeOutcomeFn: a session handshake the server never answered
+		// is booked on the session's server, as on the desktop (R1 of the
+		// fix9 stand run).
+		HandshakeOutcomeFn: func(answered bool, err error) error {
+			sess.mu.Lock()
+			strat, cand, hasCand := sess.stratObj, sess.cand, sess.hasCand
+			sess.mu.Unlock()
+			if answered {
+				mgr.HandshakeAnswered(cand, hasCand)
+				return nil
+			}
+			return fmt.Errorf("%w: %w", mgr.HandshakeUnanswered(strat, cand, hasCand), err)
+		},
 		// NetworkFn: the network the app is on now (network_id), which the
 		// carry is taken over on and handed on with.
 		NetworkFn: func(id string) { sess.network.Store(&id) },

@@ -688,3 +688,25 @@ func TestASwallowedTransportSitsOutThoughTheRouteSetItAside(t *testing.T) {
 		t.Fatalf("REALITY, swallowed on b, was dialled there %d times", n)
 	}
 }
+
+// TestAHealthyThirdServerGetsTheBestTransportAfterRouteWideSilence is R2 of
+// the fix9 stand run: a and b went silent one after the other - every
+// transport connected and heard nothing - and the route rule parked REALITY
+// for every server, so the healthy c got HTTP Polling for 5 minutes. Since
+// round 10 the set-aside holds on the two servers it was decided on: c gets
+// REALITY.
+func TestAHealthyThirdServerGetsTheBestTransportAfterRouteWideSilence(t *testing.T) {
+	a, b, c := newHelloListener(t), newHelloListener(t), newHelloListener(t)
+	m := newSilenceManager(t, 300*time.Millisecond, a.addr, b.addr, c.addr)
+	dead := map[string]bool{a.addr: true, b.addr: true}
+	for i, id := range []string{"reality", "polling", "stego", "ws"} {
+		m.Register(&swallowAtGreeter{protectedGreeter{id: id, priority: 5 + i}, dead})
+	}
+	s, cycles := connectCycles(t, m, 4, 3*time.Second)
+	if s == nil {
+		t.Fatalf("not connected after %d cycles", cycles)
+	}
+	if got := m.GetServerAddr(context.Background()); got != c.addr || s.ID() != "reality" {
+		t.Fatalf("connected via %s on %s, want REALITY on c %s", s.ID(), got, c.addr)
+	}
+}

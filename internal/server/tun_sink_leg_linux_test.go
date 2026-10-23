@@ -474,20 +474,36 @@ func (p *stallProxy) start(t *testing.T, exitAddr string) string {
 // keepaliveLog records when the relay sent each keepalive up, for the test.
 func keepaliveLog(t *testing.T) func() []time.Time {
 	t.Helper()
+	at, _ := keepaliveRecord(t)
+	return at
+}
+
+// sentKeepalive is one keepalive as the relay saw its leg when it sent it.
+type sentKeepalive struct{ sinceUp, sinceDown, quiet time.Duration }
+
+// keepaliveRecord is keepaliveLog with the state of the leg at each send.
+func keepaliveRecord(t *testing.T) (func() []time.Time, func() []sentKeepalive) {
+	t.Helper()
 	var mu sync.Mutex
 	var at []time.Time
-	f := func() {
+	var sent []sentKeepalive
+	f := func(up, down, quiet time.Duration) {
 		mu.Lock()
 		at = append(at, time.Now())
+		sent = append(sent, sentKeepalive{up, down, quiet})
 		mu.Unlock()
 	}
 	relayKeepaliveSent.Store(&f)
 	t.Cleanup(func() { relayKeepaliveSent.Store(nil) })
 	return func() []time.Time {
-		mu.Lock()
-		defer mu.Unlock()
-		return append([]time.Time(nil), at...)
-	}
+			mu.Lock()
+			defer mu.Unlock()
+			return append([]time.Time(nil), at...)
+		}, func() []sentKeepalive {
+			mu.Lock()
+			defer mu.Unlock()
+			return append([]sentKeepalive(nil), sent...)
+		}
 }
 
 // exitWriterFor returns the exit's writer for the relay's tunnel address.
@@ -620,12 +636,14 @@ func TestARelayLegWithoutAClientGetsNoKeepalive(t *testing.T) {
 
 // TestABusyRelayLegGetsNoKeepalive: traffic both ways is all the two read
 // deadlines need, and a keepalive on a busy leg would only add a frame. A
-// real leg carries a packet each way every 40 ms against a 500 ms quiet
-// period - long enough that a scheduling stall under -race load is not
-// taken for a quiet leg.
+// real leg carries a packet each way every 40 ms against a 200 ms quiet
+// period. Whether a keepalive goes out at all depends on scheduling - a
+// stall under -race load is a quiet leg, and earns one - so the test checks
+// each keepalive instead: one direction had to be silent for the period
+// drawn when it went.
 func TestABusyRelayLegGetsNoKeepalive(t *testing.T) {
-	setKeepaliveDraw(t, func(time.Duration) time.Duration { return 500 * time.Millisecond })
-	sent := keepaliveLog(t)
+	setKeepaliveDraw(t, func(time.Duration) time.Duration { return 200 * time.Millisecond })
+	_, sent := keepaliveRecord(t)
 	exit, sink, clientIP, down := dialLeg(t)
 	w := exitWriterFor(t, exit, clientIP)
 	pkt := ipv4Packet(net.IPv4(10, 8, 7, 9), clientIP)
@@ -639,9 +657,7 @@ func TestABusyRelayLegGetsNoKeepalive(t *testing.T) {
 	if down.Load() < 20 {
 		t.Fatalf("%d packets came down - the leg was not busy both ways", down.Load())
 	}
-	if n := len(sent()); n != 0 {
-		t.Fatalf("%d keepalives on a leg busy both ways", n)
-	}
+	busy := len(sent())
 
 	// Control: the same leg gone quiet one way gets its keepalive.
 	for range 25 {
@@ -649,8 +665,14 @@ func TestABusyRelayLegGetsNoKeepalive(t *testing.T) {
 		_ = sink.WritePacket(up)
 		time.Sleep(40 * time.Millisecond)
 	}
-	if len(sent()) == 0 {
+	all := sent()
+	if len(all) == busy {
 		t.Fatal("no keepalive once nothing came down - the test proves nothing")
+	}
+	for i, k := range all {
+		if max(k.sinceUp, k.sinceDown) < k.quiet {
+			t.Fatalf("keepalive %d went with the leg silent %v up and %v down, against a %v period", i+1, k.sinceUp, k.sinceDown, k.quiet)
+		}
 	}
 }
 

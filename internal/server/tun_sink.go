@@ -221,8 +221,9 @@ func relayClientActiveWindow() time.Duration {
 }
 
 // relayKeepaliveSent, when a test sets it, is called for each keepalive the
-// relay sends up. Nil in production.
-var relayKeepaliveSent atomic.Pointer[func()]
+// relay sends up, with how long each direction had been silent and the quiet
+// period drawn. Nil in production.
+var relayKeepaliveSent atomic.Pointer[func(sinceUp, sinceDown, quiet time.Duration)]
 
 // UpdateActivity records that the downstream client is alive, which keeps
 // the keepalive timer sending (startKeepalive).
@@ -258,13 +259,14 @@ func (s *relayTUNSink) keepaliveTick() {
 	sinceOldest := max(monoSince(s.lastUp.Load()), monoSince(s.lastDown.Load()))
 	active := monoSince(s.lastActivity.Load()) < relayClientActiveWindow()
 	if active && sinceOldest >= quiet {
+		sinceUp, sinceDown := monoSince(s.lastUp.Load()), monoSince(s.lastDown.Load())
 		s.writeMu.Lock()
 		err := s.writeUp([]byte{0, 0, 0, 0})
 		s.writeMu.Unlock()
 		if err != nil {
 			s.logger.Debug("Relay TUN: keepalive up failed: %v", err)
 		} else if f := relayKeepaliveSent.Load(); f != nil {
-			(*f)()
+			(*f)(sinceUp, sinceDown, quiet)
 		}
 		s.lastUp.Store(monoNow())
 		quiet = relayKeepaliveAfter()
