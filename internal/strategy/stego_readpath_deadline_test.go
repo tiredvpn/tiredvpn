@@ -85,13 +85,14 @@ func TestAOneWayDownloadDoesNotBreakTheStegoConn(t *testing.T) {
 		t.Fatalf("the first write after a one-way download failed: %v", err)
 	}
 	select {
-	case b := <-got:
-		if string(b) != "after the download" {
-			t.Fatalf("the server read %q", b)
-		}
 	case err := <-srvErr:
-		t.Fatalf("server: %v", err)
+		if err != nil {
+			t.Fatalf("server: %v", err)
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the server read nothing after the download")
+	}
+	if b := <-got; string(b) != "after the download" {
+		t.Fatalf("the server read %q", b)
 	}
 }
