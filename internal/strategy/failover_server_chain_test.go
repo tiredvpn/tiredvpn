@@ -120,6 +120,7 @@ type swallowAtGreeter struct {
 
 func (s *swallowAtGreeter) Connect(ctx context.Context, target string) (net.Conn, error) {
 	if s.at[target] {
+		s.dials.Add(1)
 		swallowed := protectedGreeter{id: s.id, priority: s.priority, swallow: true}
 		return swallowed.Connect(ctx, target)
 	}
