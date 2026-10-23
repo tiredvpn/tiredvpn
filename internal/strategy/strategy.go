@@ -161,9 +161,9 @@ type Manager struct {
 	fastReconnectFirst    time.Time
 	fastReconnectLast     time.Time // when the previous counted attempt happened
 
-	// swallowed is, per dialled address, the run of reconnect cycles that
+	// swallowed is, per server (swallowKey), the run of reconnect cycles that
 	// ended with no verdict because a connected handshake heard nothing (see
-	// noteSwallowCycle). Guarded by m.mu.
+	// swallowCycle). Guarded by m.mu.
 	swallowed map[string]*swallowRecord
 
 	// Connectivity checker for pre-flight checks
@@ -1528,8 +1528,11 @@ func (m *Manager) chargeSessionEndpoint(sel *endpoint.Selector, end SessionEnd, 
 		log.Info("Endpoint %s: %s, as on the previous server - the route, not the server; not parking it", end.Endpoint, why)
 		return
 	}
-	sel.ReportDeadSession(end.Endpoint)
-	log.Info("Endpoint %s charged for its session (%s)", end.Endpoint, why)
+	if sel.ReportDeadSession(end.Endpoint) {
+		log.Warn("Endpoint %s charged for its session (%s); every address of the server has a verdict - parking the server", end.Endpoint, why)
+	} else {
+		log.Info("Endpoint %s charged for its session (%s)", end.Endpoint, why)
+	}
 	m.logEndpointHealth(sel, end.Endpoint)
 }
 
@@ -1676,6 +1679,7 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 
 		start := time.Now()
 		scan := &scanState{addr: cand.Addr}
+		var swallowedOn []string
 		conn, strategy, err := m.connectScan(dialCtx, m.withHoppedPort(cand.Addr), nil, scan)
 		if err == nil {
 			m.clearSwallowed(cand.Addr)
@@ -1688,19 +1692,33 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 			// Context cancelled, or no strategy was even eligible. Neither
 			// says anything about this endpoint on its own; a run of them in
 			// which its handshakes heard nothing does (swallowCycle).
-			if !m.swallowCycle(cand.Addr, scan) {
+			verdict, covered, _ := m.swallowCycle(cand.Addr, scan)
+			if !verdict {
 				if !scan.answered && (scan.timeouts > 0 || scan.unheard > 0) {
 					lastErr = fmt.Errorf("%w: %w", ErrCycleUnanswered, err)
+				}
+				// The run is the server's. Its other family gets the next
+				// cycle, once: under a censor the two are often in different
+				// states, and two cycles on one family before it reached the
+				// other were how a swallowing server kept the client for five.
+				if len(covered) > 0 {
+					if sib, ok := m.swallowSibling(sel, cand, covered); ok {
+						log.Info("Endpoint %s heard nothing this cycle - the next one tries the server's other address %s", cand, sib)
+						sel.Pin(sib)
+					}
 				}
 				break
 			}
 			err = fmt.Errorf("%w: %w, handshakes swallowed cycle after cycle: %w", errAddrSilent, errStrategyScanFailed, err)
 			lastErr = err
+			swallowedOn = covered
 		} else {
 			m.endSwallowRun(cand.Addr)
 		}
 		if errors.Is(err, errAddrSilent) {
-			sel.ReportSilent(cand)
+			if sel.ReportSilent(cand, swallowedOn...) {
+				log.Warn("Endpoint %s: every address of the server has a verdict - parking the server", cand)
+			}
 		} else {
 			sel.Report(cand, false, 0)
 		}
@@ -1914,10 +1932,13 @@ func (m *Manager) swallowEvidence(s Strategy, allowance time.Duration) bool {
 	return !isUDPBasedStrategy(s) && allowance >= m.connectTimeout/3
 }
 
-// swallowRecord is what one address's last reconnect cycles left behind.
+// swallowRecord is what one server's last reconnect cycles left behind. It is
+// kept per server, not per address: a server that swallows handshakes on one
+// family is checked on its other family next (N9 of the 1.11.9 acceptance),
+// and the run counts the cycles on both.
 type swallowRecord struct {
 	// skip holds the transports whose connected handshake heard nothing; the
-	// next cycle on this address starts without them.
+	// next cycle on this server starts without them.
 	skip map[string]bool
 	last time.Time
 	// cycles counts the cycles in a row that ended with no verdict while a
@@ -1925,6 +1946,34 @@ type swallowRecord struct {
 	// transports (see swallowCycle).
 	cycles       int
 	heardNothing map[string]bool
+	// addrs are the server's addresses those cycles ran on.
+	addrs map[string]bool
+}
+
+// swallowKey names the swallow record addr belongs to: its server when the
+// selector knows the address, else the address itself. Takes m.mu (through
+// selector): not to be called with it held.
+func (m *Manager) swallowKey(addr string) string {
+	if sel := m.selector(); sel != nil {
+		if cand, ok := sel.CandidateForAddr(addr); ok {
+			return fmt.Sprintf("server %d", cand.EndpointIdx)
+		}
+	}
+	return addr
+}
+
+// swallowSibling returns the address of cand's server that the run has not
+// covered yet - routable and not parked - for the next cycle to try. False when
+// there is none: the run has seen every family of the server, or it has one.
+func (m *Manager) swallowSibling(sel *endpoint.Selector, cand endpoint.Candidate, covered []string) (endpoint.Candidate, bool) {
+	for _, addr := range sel.Siblings(cand) {
+		sib, ok := sel.CandidateForAddr(addr)
+		if !ok || slices.Contains(covered, addr) || !sel.Reachable(addr) || sel.IsParked(sib) {
+			continue
+		}
+		return sib, true
+	}
+	return endpoint.Candidate{}, false
 }
 
 // swallowCyclesMax is how many no-verdict cycles in a row, with a handshake
@@ -1943,9 +1992,10 @@ const swallowWindow = 3 * time.Minute
 // would leave no transport at all.
 func (m *Manager) swallowSkip(addr string) map[string]bool {
 	parked := m.addrParked(addr)
+	key := m.swallowKey(addr)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	r := m.swallowed[addr]
+	r := m.swallowed[key]
 	if r == nil || len(r.skip) == 0 || m.forced || swallowStale(r, parked) {
 		return nil
 	}
@@ -1962,25 +2012,26 @@ func (m *Manager) noteSwallowed(addr string, ids []string) {
 		return
 	}
 	parked := m.addrParked(addr)
+	key := m.swallowKey(addr)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	r := m.swallowRecordLocked(addr, parked)
+	r := m.swallowRecordLocked(key, parked)
 	for _, id := range ids {
 		r.skip[id] = true
 	}
 }
 
-// swallowRecordLocked returns addr's swallow record, fresh if it had none or
-// it is stale (swallowStale), and stamps it now. m.mu held; parked is
-// addrParked(addr), asked before taking it.
-func (m *Manager) swallowRecordLocked(addr string, parked bool) *swallowRecord {
-	r := m.swallowed[addr]
+// swallowRecordLocked returns the swallow record under key, fresh if it had
+// none or it is stale (swallowStale), and stamps it now. m.mu held; parked is
+// addrParked for the address in hand, asked before taking it.
+func (m *Manager) swallowRecordLocked(key string, parked bool) *swallowRecord {
+	r := m.swallowed[key]
 	if r == nil || swallowStale(r, parked) {
-		r = &swallowRecord{skip: make(map[string]bool), heardNothing: make(map[string]bool)}
+		r = &swallowRecord{skip: make(map[string]bool), heardNothing: make(map[string]bool), addrs: make(map[string]bool)}
 		if m.swallowed == nil {
 			m.swallowed = make(map[string]*swallowRecord)
 		}
-		m.swallowed[addr] = r
+		m.swallowed[key] = r
 	}
 	r.last = time.Now()
 	return r
@@ -1994,19 +2045,32 @@ func swallowStale(r *swallowRecord, parked bool) bool {
 	return !parked && time.Since(r.last) > swallowWindow
 }
 
-// addrParked reports whether the candidate at addr is parked. Takes m.mu
-// (through selector): not to be called with it held.
+// addrParked reports whether the server at addr is parked - any of its
+// addresses. Takes m.mu (through selector): not to be called with it held.
 func (m *Manager) addrParked(addr string) bool {
 	sel := m.selector()
 	if sel == nil {
 		return false
 	}
 	cand, ok := sel.CandidateForAddr(addr)
-	return ok && sel.IsParked(cand)
+	if !ok {
+		return false
+	}
+	if sel.IsParked(cand) {
+		return true
+	}
+	for _, sib := range sel.Siblings(cand) {
+		if c, ok := sel.CandidateForAddr(sib); ok && sel.IsParked(c) {
+			return true
+		}
+	}
+	return false
 }
 
 // swallowCycle books a cycle on addr that ended with no verdict and reports
-// whether the run of such cycles is now the address's silence verdict.
+// whether the run of such cycles is now the silence verdict, with the
+// addresses of the server the run covered (addr among them) and, on a
+// verdict, the transports that heard nothing.
 //
 // Since a connected handshake may use the rest of its cycle, a server that
 // completes every TCP connect and then answers nothing ends each cycle on one
@@ -2016,47 +2080,55 @@ func (m *Manager) addrParked(addr string) bool {
 // swallowCyclesMax cycles on any, are the verdict. One cycle never is - a
 // single slow handshake, Polling's included, parks nothing - and a cycle in
 // which any transport got an answer ends the run.
-func (m *Manager) swallowCycle(addr string, scan *scanState) bool {
+//
+// The run is the server's: cycles on both its families count together.
+func (m *Manager) swallowCycle(addr string, scan *scanState) (verdict bool, covered, heard []string) {
 	parked := m.addrParked(addr)
+	key := m.swallowKey(addr)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if scan.answered {
-		if r := m.swallowed[addr]; r != nil {
-			r.cycles, r.heardNothing = 0, make(map[string]bool)
+		if r := m.swallowed[key]; r != nil {
+			r.cycles, r.heardNothing, r.addrs = 0, make(map[string]bool), make(map[string]bool)
 		}
-		return false
+		return false, nil, nil
 	}
 	if len(scan.inconclusive) == 0 {
-		return false
+		return false, nil, nil
 	}
-	r := m.swallowRecordLocked(addr, parked)
+	r := m.swallowRecordLocked(key, parked)
 	r.cycles++
+	r.addrs[addr] = true
 	for _, id := range scan.inconclusive {
 		r.heardNothing[id] = true
 	}
+	covered = slices.Sorted(maps.Keys(r.addrs))
 	if r.cycles < swallowCyclesMax && (r.cycles < 2 || len(r.heardNothing) < 2) {
-		return false
+		return false, covered, nil
 	}
-	log.Warn("Address %s heard nothing on %s over %d cycles in a row - its silence verdict",
-		addr, strings.Join(slices.Sorted(maps.Keys(r.heardNothing)), ", "), r.cycles)
-	r.cycles, r.heardNothing = 0, make(map[string]bool)
-	return true
+	log.Warn("%s heard nothing on %s over %d cycles in a row (%s) - its silence verdict",
+		key, strings.Join(slices.Sorted(maps.Keys(r.heardNothing)), ", "), r.cycles, strings.Join(covered, ", "))
+	heard = slices.Sorted(maps.Keys(r.heardNothing))
+	r.cycles, r.heardNothing, r.addrs = 0, make(map[string]bool), make(map[string]bool)
+	return true, covered, heard
 }
 
 // endSwallowRun ends addr's run of no-verdict cycles: a cycle reached a
 // verdict. The skip list stays until a transport gets through.
 func (m *Manager) endSwallowRun(addr string) {
+	key := m.swallowKey(addr)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if r := m.swallowed[addr]; r != nil {
-		r.cycles, r.heardNothing = 0, make(map[string]bool)
+	if r := m.swallowed[key]; r != nil {
+		r.cycles, r.heardNothing, r.addrs = 0, make(map[string]bool), make(map[string]bool)
 	}
 }
 
 // clearSwallowed forgets addr's swallow record: a transport got through.
 func (m *Manager) clearSwallowed(addr string) {
+	key := m.swallowKey(addr)
 	m.mu.Lock()
-	delete(m.swallowed, addr)
+	delete(m.swallowed, key)
 	m.mu.Unlock()
 }
 

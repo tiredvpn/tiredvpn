@@ -31,6 +31,16 @@ const (
 
 	// latencyAlpha is the EWMA weight for a fresh latency sample.
 	latencyAlpha = 0.3
+
+	// siblingTryHold is how long a verdict on one address of a server keeps
+	// that address parked while the client tries the server's other address,
+	// and how long the verdict counts toward a verdict on the whole server. It
+	// covers a connect cycle on the other address and a session there dying
+	// the same way: a dead session lives up to a minute under load, a stall
+	// verdict comes 40-45 s in. The base cooldown (1 min, jittered) expired
+	// in the middle of that, and the client went back to the first address
+	// instead of on to the next server.
+	siblingTryHold = 3 * time.Minute
 )
 
 // DialFunc is the dialer the selector uses for its family probe. Injected so
@@ -165,6 +175,10 @@ type Selector struct {
 	pinnedIdx int
 	pinnedAt  time.Time
 
+	// servers holds, per endpoint, the verdicts against its addresses that
+	// may add up to a verdict on the whole server. Guarded by mu.
+	servers []serverChain
+
 	// unreachable marks candidates whose address family has no physical route
 	// off the tunnel right now - e.g. an IPv6 endpoint on a host with no IPv6
 	// at all. Unlike a cooldown it is not time-based and not an endpoint
@@ -174,6 +188,23 @@ type Selector struct {
 	// preflight and from the TUN bypass watcher; cleared the moment the route
 	// reappears. Guarded by mu.
 	unreachable []bool
+}
+
+// serverChain is one server's record of verdicts against its addresses.
+//
+// A verdict - silence, a dead session, a stall, swallowed handshakes - lands
+// on an address. Under a censor the two families of one server are often in
+// different states, so the server's other address is worth one try. If that
+// one gets a verdict too, the whole server is parked and the client goes on
+// to the next one: before, each address was parked on its own, and the client
+// walked v6, v4, v6 of one server without ever reaching its neighbour.
+type serverChain struct {
+	// verdicts maps a candidate index to when its address got a verdict in
+	// the current chain.
+	verdicts map[int]time.Time
+	// backoff is the server's own park: Cooldown, doubling with each verdict
+	// on the whole server up to MaxCooldown, cleared by a useful session.
+	backoff time.Duration
 }
 
 // NewSelector builds a selector from cfg, or returns the process-scoped one
@@ -207,6 +238,7 @@ func newSelector(cfg Config) (*Selector, error) {
 		health:      make([]health, len(cands)),
 		byAddr:      byAddr,
 		pinnedAt:    cfg.Now(),
+		servers:     make([]serverChain, len(eps)),
 		unreachable: make([]bool, len(cands)),
 	}, nil
 }
@@ -631,19 +663,30 @@ func (s *Selector) IsParked(c Candidate) bool {
 // would confirm what the first one established at the price of another full
 // scan. On a phone, where the service restarts the client after every failed
 // cycle, that second scan may never finish.
-func (s *Selector) ReportSilent(c Candidate) {
+//
+// alsoSilent names other addresses of the same server that heard nothing in
+// the same run of cycles (a swallow run spans both families); they join the
+// server's chain without a park of their own. It reports whether the whole
+// server is parked now - see addrVerdictLocked.
+func (s *Selector) ReportSilent(c Candidate, alsoSilent ...string) (serverParked bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	idx, found := s.byAddr[c.Addr]
 	if !found {
-		return
+		return false
 	}
 	now := s.cfg.Now()
+	for _, a := range alsoSilent {
+		if j, ok := s.byAddr[a]; ok && j != idx && s.cands[j].EndpointIdx == s.cands[idx].EndpointIdx {
+			s.chainLocked(j)[j] = now
+		}
+	}
 	h := &s.health[idx]
 	h.consecutiveFailures++
 	h.lastFailure = now
 	h.backoff = s.nextBackoff(h.backoff)
 	h.cooldownUntil = now.Add(s.jitter(h.backoff))
+	return s.addrVerdictLocked(idx, now)
 }
 
 // ReportDeadSession parks c for a session that connected and then died
@@ -651,12 +694,14 @@ func (s *Selector) ReportSilent(c Candidate) {
 // up to MaxCooldown - because a successful connect starts every such session
 // and clears the connect backoff, which left every park at the base cooldown:
 // under a freeze the client hopped addresses every half minute.
-func (s *Selector) ReportDeadSession(c Candidate) {
+//
+// It reports whether the whole server is parked now (addrVerdictLocked).
+func (s *Selector) ReportDeadSession(c Candidate) (serverParked bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	idx, found := s.byAddr[c.Addr]
 	if !found {
-		return
+		return false
 	}
 	now := s.cfg.Now()
 	h := &s.health[idx]
@@ -670,6 +715,63 @@ func (s *Selector) ReportDeadSession(c Candidate) {
 	park = min(park, s.cfg.MaxCooldown)
 	h.backoff = park
 	h.cooldownUntil = now.Add(s.jitter(park))
+	return s.addrVerdictLocked(idx, now)
+}
+
+// chainLocked returns the verdict map of the server candidate idx belongs to.
+func (s *Selector) chainLocked(idx int) map[int]time.Time {
+	sc := &s.servers[s.cands[idx].EndpointIdx]
+	if sc.verdicts == nil {
+		sc.verdicts = make(map[int]time.Time)
+	}
+	return sc.verdicts
+}
+
+// addrVerdictLocked widens a verdict the caller has just booked and parked on
+// candidate idx to its server.
+//
+// While the server has another routable address that has neither a verdict
+// in this chain nor a park, that address gets the next try: idx stays parked
+// for at least siblingTryHold, so its park cannot run out while the other
+// address is tried and a session there dies. Once every routable address of
+// the server is condemned, the whole server is parked for its own growing
+// backoff and the chain starts over - the next connect goes to another
+// server. A server with one usable address is parked by its first verdict.
+func (s *Selector) addrVerdictLocked(idx int, now time.Time) (serverParked bool) {
+	verdicts := s.chainLocked(idx)
+	verdicts[idx] = now
+	ep := s.cands[idx].EndpointIdx
+
+	open := false
+	for j, c := range s.cands {
+		if c.EndpointIdx != ep || j == idx || s.unreachable[j] {
+			continue
+		}
+		if at, ok := verdicts[j]; ok && now.Sub(at) <= siblingTryHold {
+			continue
+		}
+		if s.inCooldownLocked(j, now) {
+			continue
+		}
+		open = true
+	}
+	if open {
+		if until := now.Add(siblingTryHold); s.health[idx].cooldownUntil.Before(until) {
+			s.health[idx].cooldownUntil = until
+		}
+		return false
+	}
+
+	sc := &s.servers[ep]
+	sc.backoff = s.nextBackoff(sc.backoff)
+	until := now.Add(s.jitter(sc.backoff))
+	for j, c := range s.cands {
+		if c.EndpointIdx == ep && s.health[j].cooldownUntil.Before(until) {
+			s.health[j].cooldownUntil = until
+		}
+	}
+	clear(verdicts)
+	return true
 }
 
 // ParkedForDeadSessions reports whether c is in cooldown with a dead-session
@@ -702,6 +804,9 @@ func (s *Selector) ReportSessionUseful(c Candidate) {
 	defer s.mu.Unlock()
 	if idx, found := s.byAddr[c.Addr]; found {
 		s.health[idx].deadStreak = 0
+		sc := &s.servers[s.cands[idx].EndpointIdx]
+		sc.backoff = 0
+		clear(sc.verdicts)
 	}
 }
 
@@ -763,6 +868,9 @@ func (s *Selector) ResetHealth() {
 	for i := range s.health {
 		s.health[i] = health{}
 	}
+	for i := range s.servers {
+		s.servers[i] = serverChain{}
+	}
 	// A network change can bring a family up (LTE without v6 to Wi-Fi with it),
 	// so clear the route verdicts too and let the next preflight re-mark. Leaving
 	// them set would keep a family excluded on a network that now carries it.
@@ -783,6 +891,12 @@ type HealthRecord struct {
 	CooldownUntil       time.Time
 	Backoff             time.Duration
 	DeadStreak          int
+
+	// ServerBackoff is the server's own park (serverChain.backoff), the same
+	// on every address of one server. The chain's verdicts need no carrying:
+	// each comes with a park of at least siblingTryHold, and the park is
+	// carried.
+	ServerBackoff time.Duration
 }
 
 // ExportHealth returns every candidate's failure history and park.
@@ -792,8 +906,10 @@ func (s *Selector) ExportHealth() []HealthRecord {
 	out := make([]HealthRecord, len(s.cands))
 	for i, c := range s.cands {
 		h := s.health[i]
+		sc := s.servers[c.EndpointIdx]
 		out[i] = HealthRecord{Addr: c.Addr, ConsecutiveFailures: h.consecutiveFailures, LastSuccess: h.lastSuccess,
-			LastFailure: h.lastFailure, CooldownUntil: h.cooldownUntil, Backoff: h.backoff, DeadStreak: h.deadStreak}
+			LastFailure: h.lastFailure, CooldownUntil: h.cooldownUntil, Backoff: h.backoff, DeadStreak: h.deadStreak,
+			ServerBackoff: sc.backoff}
 	}
 	return out
 }
@@ -812,6 +928,8 @@ func (s *Selector) ImportHealth(recs []HealthRecord) {
 		h := &s.health[idx]
 		h.consecutiveFailures, h.lastSuccess, h.lastFailure = r.ConsecutiveFailures, r.LastSuccess, r.LastFailure
 		h.cooldownUntil, h.backoff, h.deadStreak = r.CooldownUntil, r.Backoff, r.DeadStreak
+		sc := &s.servers[s.cands[idx].EndpointIdx]
+		sc.backoff = max(sc.backoff, r.ServerBackoff)
 	}
 }
 
