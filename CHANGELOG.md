@@ -19,8 +19,19 @@ Versions follow [Semantic Versioning](https://semver.org/).
   Polling never noticed them. At most three such verdicts in ten minutes.
   Works on the desktop TUN client and on Android.
 
+- **Client: an SNI pool per server.** `[[servers]] sni = ["name", ...]` or
+  `-reality-sni name,name` gives an endpoint its own cover names; REALITY,
+  Seqovl, HTTP/2 Stego, QUIC, HTTP Polling, WebSocket, Geneva and anti-probe
+  draw from it, one uniformly chosen name per connection. Names must be DNS
+  host names. Set the same names on the exit with its own `-reality-sni`, so
+  that a probe replaying one is mirrored to that site.
+- **Server: `-reality-sni`** adds operator-chosen donor names to the built-in
+  list, on the B1 and the legacy unauthenticated paths.
+
 ### Fixed
 
+- **Client: TLS session tickets are kept per server**, so a ticket from one
+  exit is never offered to another that shares a cover name.
 - **Client: failover to another server in the pool works when a server goes
   silent, swallows handshakes, or kills every session young.** Dead sessions
   and storms park the server with a growing cooldown; a server that accepts
