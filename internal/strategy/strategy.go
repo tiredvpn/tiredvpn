@@ -1418,6 +1418,13 @@ type SessionEnd struct {
 	// the route looks like (the TSPU #490 pattern, stand run #7b: ten choices of
 	// one address in six minutes, the data plane alive 4% of the time).
 	Dead bool
+
+	// Degraded says the client gave the session up as alive but useless: a
+	// TCP flow inside it waited 30 s for an answer and two keepalives went
+	// unanswered (tun's stall detector). It is booked like Dead whatever the
+	// session's age - a session under a per-flow byte cap can live for hours
+	// while nothing gets through it - and never as useful.
+	Degraded bool
 }
 
 // SessionEnded books the end of a tunnel session.
@@ -1441,7 +1448,7 @@ func (m *Manager) SessionEnded(end SessionEnd) (storming bool) {
 	storming = m.RecordSessionEnd(end.Strategy)
 	sel := m.selector()
 
-	if end.Useful && !storming && !end.Dead {
+	if end.Useful && !storming && !end.Dead && !end.Degraded {
 		m.mu.Lock()
 		if m.lastSuccessfulStrategy != nil && m.lastSuccessfulStrategy.ID() == end.Strategy {
 			m.lastSuccessfulTime = time.Now()
@@ -1457,6 +1464,8 @@ func (m *Manager) SessionEnded(end SessionEnd) (storming bool) {
 	switch {
 	case end.Dead:
 		m.chargeSessionEndpoint(sel, end, "session went silent right after connecting")
+	case end.Degraded:
+		m.chargeSessionEndpoint(sel, end, "session degraded: a flow stalled and keepalives went unanswered")
 	case storming && !end.UpgradeFailed:
 		// A strategy whose sessions keep dying on this endpoint is evidence
 		// against the endpoint too: a freeze keyed to the address kills every
@@ -2532,6 +2541,34 @@ func (m *Manager) GetLastConnectionInfo() ConnectionInfo {
 type StrategyConn struct {
 	net.Conn
 	strategy Strategy
+}
+
+// NetConn returns the wrapped connection.
+func (sc *StrategyConn) NetConn() net.Conn { return sc.Conn }
+
+// ServerKeepaliveCounter is implemented by a tunnel conn that splices
+// keepalive frames of its own into what it delivers - HTTP Polling's feeder,
+// which keeps the TUN reader's deadline fed while polls succeed.
+// ServerKeepalives counts only the zero-length frames the server sent, which
+// is what a keepalive echo has to be judged by.
+type ServerKeepaliveCounter interface {
+	ServerKeepalives() uint64
+}
+
+// ServerKeepaliveCounterOf finds a ServerKeepaliveCounter in conn or under
+// its wrappers (anything with NetConn).
+func ServerKeepaliveCounterOf(conn net.Conn) (ServerKeepaliveCounter, bool) {
+	for range 8 {
+		if c, ok := conn.(ServerKeepaliveCounter); ok {
+			return c, true
+		}
+		w, ok := conn.(interface{ NetConn() net.Conn })
+		if !ok {
+			return nil, false
+		}
+		conn = w.NetConn()
+	}
+	return nil, false
 }
 
 // Strategy returns the strategy used for this connection
