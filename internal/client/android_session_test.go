@@ -72,14 +72,24 @@ func androidPoolManager(t *testing.T) (*strategy.Manager, *targetPipeStrategy) {
 		}
 	}
 	m := strategy.NewManager()
-	var eps []endpoint.Endpoint
+	// Configured as buildManager configures it: a selector shared by every
+	// core of the process.
+	cfg := &Config{Selection: SelectionSpec{FailureThreshold: 2, Cooldown: time.Minute, MaxCooldown: 30 * time.Minute}}
 	for i, a := range androidPool {
-		eps = append(eps, endpoint.Endpoint{Name: fmt.Sprintf("ep%d", i), V4: a, Order: i})
+		cfg.Servers = append(cfg.Servers, ServerSpec{Name: fmt.Sprintf("ep%d", i), Addr: a})
 	}
-	if err := m.SetEndpointSelection(endpoint.Config{Endpoints: eps, Family: endpoint.V4Only, FailureThreshold: 2,
-		Cooldown: time.Minute, MaxCooldown: 30 * time.Minute}); err != nil {
+	eps, err := ResolveEndpoints(cfg)
+	if err != nil {
 		t.Fatal(err)
 	}
+	selCfg, err := selectorConfig(cfg, eps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SetEndpointSelection(selCfg); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(endpoint.ResetSharedSelectors) // the next test starts clean
 	s := &targetPipeStrategy{t: t}
 	m.Register(s)
 	return m, s
@@ -240,123 +250,27 @@ func fourExitPool(t *testing.T) []string {
 func coreOn(t *testing.T, pool []string, log *[]string, mu *sync.Mutex) *strategy.Manager {
 	t.Helper()
 	m := strategy.NewManager()
-	var eps []endpoint.Endpoint
+	// The selector is configured the way buildManager configures it
+	// (ResolveEndpoints, selectorConfig): shared by every core of the
+	// process. Without it the tests missed that parks outlived a stop (P2-F
+	// of the round-6 review). Only the transports are the test's own.
+	cfg := &Config{Selection: SelectionSpec{FailureThreshold: 2, Cooldown: time.Minute, MaxCooldown: 30 * time.Minute}}
 	for i, a := range pool {
-		eps = append(eps, endpoint.Endpoint{Name: fmt.Sprintf("ep%d", i), V4: a, Order: i})
+		cfg.Servers = append(cfg.Servers, ServerSpec{Name: fmt.Sprintf("ep%d", i), Addr: a})
 	}
-	// Shared, as buildManager has it in production (selectorConfig): every
-	// core of the process gets the same selector back (P2-F of the round-6
-	// review - without it the tests missed that parks outlived a stop).
-	if err := m.SetEndpointSelection(endpoint.Config{Endpoints: eps, Family: endpoint.V4Only, FailureThreshold: 2,
-		Cooldown: time.Minute, MaxCooldown: 30 * time.Minute, Shared: true}); err != nil {
+	eps, err := ResolveEndpoints(cfg)
+	if err != nil {
 		t.Fatal(err)
 	}
+	selCfg, err := selectorConfig(cfg, eps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SetEndpointSelection(selCfg); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(endpoint.ResetSharedSelectors) // the next test starts clean
 	m.Register(&namedPipeStrategy{t: t, id: "reality", prio: 1, log: log, mu: mu})
 	m.Register(&namedPipeStrategy{t: t, id: "ws", prio: 2, log: log, mu: mu})
 	return m
-}
-
-// TestAndroidRouteVerdictSurvivesACoreRestart is P1-4 of the round-5 review:
-// every session ends Degraded, the route kills REALITY everywhere, and the
-// app restarts the core after each one. A core that forgot the previous
-// core's death on A took the death on B for a first one and walked the pool
-// on REALITY: A, B, C, D. With the marker carried the sessions run as on the
-// desktop: REALITY on A and B, then WebSocket on B.
-func TestAndroidRouteVerdictSurvivesACoreRestart(t *testing.T) {
-	pool := fourExitPool(t)
-	t.Cleanup(clearCarry)
-	var dials []string
-	var mu sync.Mutex
-	var rode []string
-	for range 3 {
-		m := coreOn(t, pool, &dials, &mu)
-		carryInto(m)
-		sess := &androidSession{mgr: m, linkUp: func() bool { return true }}
-		ccfg := androidControlConfig(&Config{ServerAddr: pool[0], TunMTU: 1280}, m, false, sess)
-		_, _, conn, err := ccfg.ConnectFn(t.Context())
-		if err != nil {
-			t.Fatalf("connect: %v", err)
-		}
-		conn.Close()
-		mu.Lock()
-		rode = append(rode, dials[len(dials)-1])
-		mu.Unlock()
-		ccfg.SessionEndedFn(tun.RelaySessionEnd{Lifetime: 2 * time.Minute, Degraded: true, Stall: 30 * time.Second})
-		carryFrom(m, sess)
-	}
-	want := []string{"reality@" + pool[0], "reality@" + pool[1], "ws@" + pool[1]}
-	if fmt.Sprint(rode) != fmt.Sprint(want) {
-		t.Fatalf("sessions rode %v, want %v", rode, want)
-	}
-}
-
-// TestAndroidCarryIsForTheRestartOnly: P3-5 of the round-5 review - parks
-// carried across a user's stop and start, and across any delay. A stopped
-// core leaves nothing; a carry older than androidCarryTTL is not taken.
-func TestAndroidCarryIsForTheRestartOnly(t *testing.T) {
-	pool := fourExitPool(t)
-	t.Cleanup(clearCarry)
-	var dials []string
-	var mu sync.Mutex
-
-	parkFirst := func(sess *androidSession, m *strategy.Manager) {
-		ccfg := androidControlConfig(&Config{ServerAddr: pool[0], TunMTU: 1280}, m, false, sess)
-		_, _, conn, err := ccfg.ConnectFn(t.Context())
-		if err != nil {
-			t.Fatalf("connect: %v", err)
-		}
-		conn.Close()
-		ccfg.SessionEndedFn(tun.RelaySessionEnd{Lifetime: 2 * time.Minute, Degraded: true})
-	}
-	firstDial := func() string {
-		m := coreOn(t, pool, &dials, &mu)
-		carryInto(m)
-		ccfg := androidControlConfig(&Config{ServerAddr: pool[0], TunMTU: 1280}, m, false, &androidSession{mgr: m})
-		_, _, conn, err := ccfg.ConnectFn(t.Context())
-		if err != nil {
-			t.Fatalf("connect: %v", err)
-		}
-		conn.Close()
-		mu.Lock()
-		defer mu.Unlock()
-		return dials[len(dials)-1]
-	}
-
-	// Control: a dead connection's restart takes the park over.
-	m := coreOn(t, pool, &dials, &mu)
-	sess := &androidSession{mgr: m, linkUp: func() bool { return true }}
-	parkFirst(sess, m)
-	carryFrom(m, sess)
-	androidCarry.mu.Lock()
-	at := androidCarry.at
-	androidCarry.mu.Unlock()
-	if at != at.Round(0) {
-		t.Fatal("the carry is stamped with a monotonic clock, which stops while the phone sleeps")
-	}
-	if got := firstDial(); got != "reality@"+pool[1] {
-		t.Fatalf("restart after a dead connection dialled %s - the carry proves nothing", got)
-	}
-
-	// The user stopped the tunnel.
-	m = coreOn(t, pool, &dials, &mu)
-	sess = &androidSession{mgr: m, linkUp: func() bool { return true }}
-	parkFirst(sess, m)
-	ccfg := androidControlConfig(&Config{ServerAddr: pool[0]}, m, false, sess)
-	ccfg.DisconnectedFn()
-	carryFrom(m, sess)
-	if got := firstDial(); got != "reality@"+pool[0] {
-		t.Fatalf("after the user's stop the next start dialled %s", got)
-	}
-
-	// A carry that waited too long.
-	m = coreOn(t, pool, &dials, &mu)
-	sess = &androidSession{mgr: m, linkUp: func() bool { return true }}
-	parkFirst(sess, m)
-	carryFrom(m, sess)
-	androidCarry.mu.Lock()
-	androidCarry.at = time.Now().Add(-androidCarryTTL - time.Second)
-	androidCarry.mu.Unlock()
-	if got := firstDial(); got != "reality@"+pool[0] {
-		t.Fatalf("a stale carry was taken: dialled %s", got)
-	}
 }

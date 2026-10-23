@@ -162,7 +162,17 @@ func relayKeepaliveAfter() time.Duration { return (*relayKeepaliveDraw.Load())()
 // sign of life the relay keeps its upstream leg alive with keepalives. A
 // downstream client sends something at least every 10 s (its keepalive, or a
 // Polling poll); one silent for this long is gone, and its leg may go too.
-const relayClientActiveWindow = time.Minute
+var relayClientActiveWindowNs atomic.Int64
+
+func init() { relayClientActiveWindowNs.Store(int64(time.Minute)) }
+
+func relayClientActiveWindow() time.Duration {
+	return time.Duration(relayClientActiveWindowNs.Load())
+}
+
+// relayKeepaliveSent, when a test sets it, is called for each keepalive the
+// relay sends up. Nil in production.
+var relayKeepaliveSent atomic.Pointer[func()]
 
 // UpdateActivity records that the downstream client is alive, which keeps
 // the keepalive timer sending (startKeepalive).
@@ -197,7 +207,7 @@ func (s *relayTUNSink) keepaliveTick() {
 	now := time.Now()
 	quiet := time.Duration(s.quietFor.Load())
 	oldest := time.Unix(0, min(s.lastUp.Load(), s.lastDown.Load()))
-	active := now.Sub(time.Unix(0, s.lastActivity.Load())) < relayClientActiveWindow
+	active := now.Sub(time.Unix(0, s.lastActivity.Load())) < relayClientActiveWindow()
 	if active && now.Sub(oldest) >= quiet {
 		s.writeMu.Lock()
 		s.up.SetWriteDeadline(now.Add(30 * time.Second))
@@ -205,6 +215,8 @@ func (s *relayTUNSink) keepaliveTick() {
 		s.writeMu.Unlock()
 		if err != nil {
 			s.logger.Debug("Relay TUN: keepalive up failed: %v", err)
+		} else if f := relayKeepaliveSent.Load(); f != nil {
+			(*f)()
 		}
 		s.lastUp.Store(now.UnixNano())
 		quiet = relayKeepaliveAfter()

@@ -322,21 +322,49 @@ func TestARouteParkRunsOut(t *testing.T) {
 	}
 }
 
+// dieOnTheRoute drives sessions through ConnectSession and SessionEnded, each
+// ending degraded, until want sessions have ridden; it returns where they
+// rode as "strategy@addr".
+func dieOnTheRoute(t *testing.T, m *Manager, want int) []string {
+	t.Helper()
+	var rode []string
+	for range want {
+		conn, s, cand, ok, err := m.ConnectSession(context.Background(), "")
+		if err != nil || !ok {
+			t.Fatalf("ConnectSession: %v", err)
+		}
+		conn.Close()
+		rode = append(rode, s.ID()+"@"+cand.Addr)
+		m.SessionEnded(SessionEnd{Strategy: s.ID(), Endpoint: cand, HasEndpoint: true, Degraded: true})
+	}
+	return rode
+}
+
 // TestARouteParkHoldsAgainstAnUpgrade is P2-B of the round-6 review: the
 // route verdict set REALITY aside on b, but the reprobe offered it back and
 // the upgrade check admitted it - the tunnel went straight back onto the
-// transport the route had killed there. Neither the offer nor the dial's
-// check admits it on b; on c, where nothing died, both do.
+// transport the route had killed there. REALITY dies on a and on b, the
+// client rides Polling on b, and the periodic reprobe there offers nothing;
+// once the set-aside has run out, the same reprobe offers REALITY.
 func TestARouteParkHoldsAgainstAnUpgrade(t *testing.T) {
+	noUpgradeDelay(t)
 	a, b, c := newHelloListener(t), newHelloListener(t), newHelloListener(t)
 	m := newSilenceManager(t, time.Second, a.addr, b.addr, c.addr)
 	reality := &greetingStrategy{id: "reality", priority: 5}
 	m.Register(reality)
 	m.Register(&greetingStrategy{id: "polling", priority: 6})
-	m.mu.Lock()
-	m.routeParked = map[int]map[string]time.Time{0: {"reality": time.Now().Add(time.Minute)}, 1: {"reality": time.Now().Add(time.Minute)}}
-	m.mu.Unlock()
 
+	if rode := dieOnTheRoute(t, m, 2); !slices.Equal(rode, []string{"reality@" + a.addr, "reality@" + b.addr}) {
+		t.Fatalf("sessions rode %v - the route was not killed the way the test needs", rode)
+	}
+	conn, s, cand, ok, err := m.ConnectSession(context.Background(), "")
+	if err != nil || !ok {
+		t.Fatalf("ConnectSession: %v", err)
+	}
+	conn.Close()
+	if s.ID() != "polling" || cand.Addr != b.addr {
+		t.Fatalf("the session after the route verdict rode %s@%s, want polling on b", s.ID(), cand.Addr)
+	}
 	if m.UpgradeEligible(reality, b.addr) {
 		t.Fatal("REALITY eligible for an upgrade on b, where the route set it aside")
 	}
@@ -344,25 +372,24 @@ func TestARouteParkHoldsAgainstAnUpgrade(t *testing.T) {
 		t.Fatal("REALITY not eligible on c, where nothing died")
 	}
 
-	noUpgradeDelay(t)
-	offer := func(pin string) bool {
-		cand, _ := m.selector().CandidateForAddr(pin)
-		m.selector().Pin(cand)
-		offers := newUpgradeOffers()
-		m.SetStrategyUpgradeCallback(offers.take)
-		m.offerUpgrade([]Result{{Strategy: reality, Success: true}})
-		select {
-		case <-offers.got:
-			return true
-		case <-time.After(300 * time.Millisecond):
-			return false
+	offers := newUpgradeOffers()
+	m.SetStrategyUpgradeCallback(offers.take)
+	m.doPeriodicReprobe(context.Background())
+	if got := offers.next(t); slices.Contains(got, "reality") {
+		t.Fatalf("the reprobe on b offered %v, REALITY included", got)
+	}
+
+	// Control: the same reprobe, once the set-aside has run out.
+	m.mu.Lock()
+	for _, ids := range m.routeParked {
+		for id := range ids {
+			ids[id] = time.Now().Add(-time.Second)
 		}
 	}
-	if offer(b.addr) {
-		t.Fatal("the reprobe on b offered REALITY back")
-	}
-	if !offer(c.addr) {
-		t.Fatal("the reprobe on c did not offer REALITY - the test proves nothing")
+	m.mu.Unlock()
+	m.doPeriodicReprobe(context.Background())
+	if got := offers.next(t); !slices.Contains(got, "reality") {
+		t.Fatalf("the reprobe on b offered %v once the set-aside ran out - the test proves nothing", got)
 	}
 }
 
@@ -379,6 +406,8 @@ func TestARescanWithOneTransportLeftChargesTheServer(t *testing.T) {
 	t.Cleanup(func() { rescanPause = old })
 	a, b, c := newHelloListener(t), newHelloListener(t), newHelloListener(t)
 	m := newSilenceManager(t, 300*time.Millisecond, a.addr, b.addr, c.addr)
+	// The pre-flight gate runs, as on a client that has never connected.
+	m.SetConnectivityChecker(NewConnectivityChecker(a.addr, time.Second, true))
 	dead := map[string]bool{a.addr: true, b.addr: true}
 	var counters []*targetCounter
 	for i, id := range []string{"reality", "polling", "stego", "ws"} {
@@ -409,6 +438,15 @@ func TestARescanWithOneTransportLeftChargesTheServer(t *testing.T) {
 	// back to back.
 	if n := pauses.Load(); n != 1 {
 		t.Fatalf("%d pauses drawn for one rescan", n)
+	}
+	// P3-7: one pre-flight connect on b, before the first scan; the rescan
+	// dials the transport left and nothing else.
+	dials := int64(0)
+	for _, c := range counters {
+		dials += int64(c.at(b.addr))
+	}
+	if extra := b.accepts.Load() - dials; extra != 1 {
+		t.Fatalf("%d bare connects on b besides the %d dials, want the one pre-flight", extra, dials)
 	}
 }
 
@@ -462,26 +500,30 @@ func (s *blockedThenSwallowed) Connect(ctx context.Context, target string) (net.
 
 // TestASetAsideTransportIsTriedLastNotSkipped is P2-E of the round-6 review:
 // the transports a route verdict set aside were left out while anything else
-// was eligible. With REALITY set aside on both servers and Polling refused on
-// both, cycle after cycle failed on Polling - each one charging the servers -
-// and REALITY, which works, was never dialled. It goes last, and connects.
+// was eligible. REALITY dies on a and on b, Polling is refused on both, and
+// cycle after cycle failed on Polling - each one charging the servers - while
+// REALITY, which connects, was never dialled. It goes last, and connects.
 func TestASetAsideTransportIsTriedLastNotSkipped(t *testing.T) {
 	a, b := newHelloListener(t), newHelloListener(t)
 	m := newSilenceManager(t, time.Second, a.addr, b.addr)
-	seen := &targetLog{}
-	m.Register(&greetingStrategy{id: "reality", priority: 5, seen: seen})
-	m.Register(&greetingStrategy{id: "polling", priority: 6, refuse: true})
-	m.mu.Lock()
-	m.routeParked = map[int]map[string]time.Time{0: {"reality": time.Now().Add(time.Minute)}, 1: {"reality": time.Now().Add(time.Minute)}}
-	m.mu.Unlock()
+	m.Register(&greetingStrategy{id: "reality", priority: 5})
+	polling := &atomic.Int64{}
+	m.Register(&greetingStrategy{id: "polling", priority: 6, refuse: true, tries: polling})
 
+	if rode := dieOnTheRoute(t, m, 2); !slices.Equal(rode, []string{"reality@" + a.addr, "reality@" + b.addr}) {
+		t.Fatalf("sessions rode %v - the route was not killed the way the test needs", rode)
+	}
+	before := polling.Load()
 	conn, s, err := m.Connect(context.Background(), "")
 	if err != nil {
-		t.Fatalf("the first cycle failed: %v", err)
+		t.Fatalf("the first cycle after the route verdict failed: %v", err)
 	}
 	conn.Close()
 	if s.ID() != "reality" {
 		t.Fatalf("connected through %s", s.ID())
+	}
+	if polling.Load() == before {
+		t.Fatal("Polling was not tried before REALITY - nothing was set aside")
 	}
 }
 
@@ -491,10 +533,30 @@ func TestASetAsideTransportIsTriedLastNotSkipped(t *testing.T) {
 func TestDifferentTransportsDyingAreNotTheRoute(t *testing.T) {
 	a, b, c := newHelloListener(t), newHelloListener(t), newHelloListener(t)
 	m := newSilenceManager(t, time.Second, a.addr, b.addr, c.addr)
+	m.Register(&refuseAtGreeter{greetingStrategy: greetingStrategy{id: "reality", priority: 5}, at: map[string]bool{b.addr: true}})
+	m.Register(&greetingStrategy{id: "polling", priority: 6})
+
+	if rode := dieOnTheRoute(t, m, 2); !slices.Equal(rode, []string{"reality@" + a.addr, "polling@" + b.addr}) {
+		t.Fatalf("sessions rode %v, want REALITY on a, then Polling on b", rode)
+	}
+	for _, addr := range []string{a.addr, b.addr} {
+		if skip := m.routeSkip(addr); len(skip) != 0 {
+			t.Fatalf("%v set aside on %s: two different transports were taken for the route", skip, addr)
+		}
+	}
+	if st := endpointState(t, m, b.addr); !st.CooldownUntil.After(time.Now()) {
+		t.Fatalf("b was not charged for its own death: %+v", st)
+	}
+}
+
+// TestTheRouteMarkNamesTheTransports is the mark's own rule, unit by unit: a
+// verdict with no transport does not move it, and the route needs a
+// transport that died on both servers.
+func TestTheRouteMarkNamesTheTransports(t *testing.T) {
+	a, b, c := newHelloListener(t), newHelloListener(t), newHelloListener(t)
+	m := newSilenceManager(t, time.Second, a.addr, b.addr, c.addr)
 	candA, _ := m.selector().CandidateForAddr(a.addr)
 	candB, _ := m.selector().CandidateForAddr(b.addr)
-	// P2-D of the round-6 review: a verdict naming no transport (an IP block)
-	// leaves the mark where it was.
 	m.routeDeath(candB, deathSilent, "test", nil)
 	m.mu.RLock()
 	mark := m.lastDeath

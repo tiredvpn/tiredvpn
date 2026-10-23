@@ -620,6 +620,11 @@ func initProtector(cfg *Config) {
 
 // runControlSocketMode runs in Android control socket mode
 // Android app connects to socket, sends "connect", gets IP, creates VPN interface, sends fd
+// onControlConfig, when a test sets it, is handed the control configuration
+// runControlSocketMode builds, so the test can play the relay's session end
+// on the core's own session. Nil in production.
+var onControlConfig func(*tun.ControlConfig)
+
 func runControlSocketMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Signal) error {
 	log.Info("Starting control socket mode on %s", cfg.ControlSocket)
 
@@ -643,6 +648,9 @@ func runControlSocketMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Si
 	defer carryFrom(mgr, sess)
 
 	ctrlCfg := androidControlConfig(cfg, mgr, dualStack, sess)
+	if onControlConfig != nil {
+		onControlConfig(ctrlCfg)
+	}
 
 	ctrlServer, err := tun.NewControlServer(cfg.ControlSocket, ctrlCfg)
 	if err != nil {

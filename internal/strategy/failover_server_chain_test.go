@@ -148,6 +148,11 @@ func TestATransportSwallowedOnOneFamilyIsTriedOnTheOther(t *testing.T) {
 	if cycles > 2 {
 		t.Fatalf("connected on cycle %d, want the second", cycles)
 	}
+	// P3-6 of the round-6 review: the success on v4 clears v4's list only.
+	// REALITY is still swallowed on v6, and the next return there skips it.
+	if !m.swallowSkip(a6.addr)["reality"] {
+		t.Fatal("the success on a's v4 wiped the skip list of its v6")
+	}
 }
 
 // TestOneTransportSwallowedOnBothFamiliesParksNothing: on a, REALITY is

@@ -23,16 +23,20 @@ import (
 
 const legScale = 25
 
-// scaleLegClocks divides the leg's three clocks by legScale for the test.
+// scaleLegClocks divides the leg's clocks by legScale for the test: the
+// exit's read deadline, the relay's, the keepalive draw and how long the
+// relay keeps a leg for a silent client.
 func scaleLegClocks(t *testing.T) {
 	t.Helper()
-	oldRead, oldIdle := h2FrameReadTimeoutNs.Load(), relayTUNIdleTimeoutNs.Load()
+	oldRead, oldIdle, oldWindow := h2FrameReadTimeoutNs.Load(), relayTUNIdleTimeoutNs.Load(), relayClientActiveWindowNs.Load()
 	h2FrameReadTimeoutNs.Store(oldRead / legScale)
 	relayTUNIdleTimeoutNs.Store(oldIdle / legScale)
+	relayClientActiveWindowNs.Store(oldWindow / legScale)
 	setKeepaliveDraw(t, func(d time.Duration) time.Duration { return d / legScale })
 	t.Cleanup(func() {
 		h2FrameReadTimeoutNs.Store(oldRead)
 		relayTUNIdleTimeoutNs.Store(oldIdle)
+		relayClientActiveWindowNs.Store(oldWindow)
 	})
 }
 
@@ -134,16 +138,7 @@ func TestARelayLegOutlivesTheExitsReadDeadline(t *testing.T) {
 	}{{"idle", legIdle}, {"upload only", legUpload}, {"download only", legDownload}} {
 		t.Run(tc.name, func(t *testing.T) {
 			scaleLegClocks(t)
-			secret := []byte("relay-leg-secret-0123456789abcdef")
-			exit := newLegExit(t, secret)
-			relayCtx := &serverContext{cfg: &Config{}, upstreamDialer: NewUpstreamDialer(exit.addr, secret)}
-			var down atomic.Int64
-			sink, _, clientIP, err := dialRelayTUN(relayCtx, testLogger(t), dialTUNHandshake(), "origin",
-				func([]byte) error { down.Add(1); return nil })
-			if err != nil {
-				t.Fatalf("dialRelayTUN: %v", err)
-			}
-			defer sink.Close()
+			exit, sink, clientIP, down := dialLeg(t)
 
 			pkt := ipv4Packet(net.IPv4(10, 8, 7, 9), clientIP)
 			up := ipv4Packet(clientIP, net.IPv4(10, 8, 7, 9))
@@ -178,6 +173,42 @@ func TestARelayLegOutlivesTheExitsReadDeadline(t *testing.T) {
 	}
 }
 
+// dialLeg starts an exit and dials a relay leg to it with dialRelayTUN; down
+// counts the packets the leg delivered to the downstream side.
+func dialLeg(t *testing.T) (exit *legExit, sink *relayTUNSink, clientIP net.IP, down *atomic.Int64) {
+	t.Helper()
+	secret := []byte("relay-leg-secret-0123456789abcdef")
+	exit = newLegExit(t, secret)
+	relayCtx := &serverContext{cfg: &Config{}, upstreamDialer: NewUpstreamDialer(exit.addr, secret)}
+	down = &atomic.Int64{}
+	sink, _, clientIP, err := dialRelayTUN(relayCtx, testLogger(t), dialTUNHandshake(), "origin",
+		func([]byte) error { down.Add(1); return nil })
+	if err != nil {
+		t.Fatalf("dialRelayTUN: %v", err)
+	}
+	t.Cleanup(sink.Close)
+	return exit, sink, clientIP, down
+}
+
+// keepaliveLog records when the relay sent each keepalive up, for the test.
+func keepaliveLog(t *testing.T) func() []time.Time {
+	t.Helper()
+	var mu sync.Mutex
+	var at []time.Time
+	f := func() {
+		mu.Lock()
+		at = append(at, time.Now())
+		mu.Unlock()
+	}
+	relayKeepaliveSent.Store(&f)
+	t.Cleanup(func() { relayKeepaliveSent.Store(nil) })
+	return func() []time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]time.Time(nil), at...)
+	}
+}
+
 // exitWriterFor returns the exit's writer for the relay's tunnel address.
 func exitWriterFor(t *testing.T, e *legExit, clientIP net.IP) *ClientWriter {
 	t.Helper()
@@ -203,26 +234,14 @@ func ipv4Packet(src, dst net.IP) []byte {
 
 // TestTheRelayKeepaliveIsOffTheClientsGrid is P2-A: keepalives went out only
 // from UpdateActivity, so whatever the draw, the gaps on the wire were whole
-// multiples of the client's 10 s keepalive. With the downstream client on a
-// 100 ms grid here, the gaps between keepalives must not sit on it.
+// multiples of the client's 10 s keepalive. On a real leg, with the
+// downstream client on a 100 ms grid here, the gaps between keepalives must
+// not sit on it.
 func TestTheRelayKeepaliveIsOffTheClientsGrid(t *testing.T) {
 	setKeepaliveDraw(t, func(d time.Duration) time.Duration { return d / 100 }) // 200-450 ms
-	sink, upstream := newTestRelaySink(t)
-	sink.startKeepalive()
+	sent := keepaliveLog(t)
+	_, sink, _, _ := dialLeg(t)
 
-	var mu sync.Mutex
-	var at []time.Time
-	go func() {
-		buf := make([]byte, 4)
-		for {
-			if _, err := readFullConn(upstream, buf); err != nil {
-				return
-			}
-			mu.Lock()
-			at = append(at, time.Now())
-			mu.Unlock()
-		}
-	}()
 	grid := time.NewTicker(100 * time.Millisecond)
 	defer grid.Stop()
 	stop := time.After(8 * time.Second)
@@ -231,12 +250,13 @@ loop:
 		select {
 		case <-grid.C:
 			sink.UpdateActivity()
+		case <-sink.Done():
+			t.Fatal("the leg closed")
 		case <-stop:
 			break loop
 		}
 	}
-	mu.Lock()
-	defer mu.Unlock()
+	at := sent()
 	if len(at) < 12 {
 		t.Fatalf("%d keepalives in 8 s - the test proves nothing", len(at))
 	}
@@ -292,68 +312,63 @@ func TestRelayKeepalivePauseShape(t *testing.T) {
 
 // TestARelayLegWithoutAClientGetsNoKeepalive: the keepalive keeps a leg
 // alive for its downstream client. Once that client has shown nothing for
-// relayClientActiveWindow, the relay stops, and the leg may close.
+// relayClientActiveWindow, the relay stops sending, and the exit closes the
+// leg on its read deadline. On a real leg, clocks scaled: the client shows
+// one sign of life and then nothing.
 func TestARelayLegWithoutAClientGetsNoKeepalive(t *testing.T) {
-	setKeepaliveDraw(t, func(time.Duration) time.Duration { return 100 * time.Millisecond })
-	sink, upstream := newTestRelaySink(t)
-	sink.startKeepalive()
-	sink.lastActivity.Store(time.Now().Add(-relayClientActiveWindow - time.Second).UnixNano())
-
-	got := make(chan struct{}, 1)
-	go func() {
-		buf := make([]byte, 4)
-		if _, err := readFullConn(upstream, buf); err == nil {
-			got <- struct{}{}
-		}
-	}()
-	select {
-	case <-got:
-		t.Fatal("a keepalive went up for a client gone a minute")
-	case <-time.After(600 * time.Millisecond):
-	}
+	scaleLegClocks(t)
+	sent := keepaliveLog(t)
+	_, sink, _, _ := dialLeg(t)
 	sink.UpdateActivity()
+	gone := time.Now().Add(relayClientActiveWindow())
+
 	select {
-	case <-got:
-	case <-time.After(time.Second):
-		t.Fatal("no keepalive once the client was back")
+	case <-sink.Done():
+	case <-time.After(relayClientActiveWindow() + 3*h2FrameReadTimeout()):
+		t.Fatal("the leg of a client gone for good is still up")
+	}
+	if len(sent()) == 0 {
+		t.Fatal("no keepalive while the client was there - the test proves nothing")
+	}
+	for _, at := range sent() {
+		if at.After(gone.Add(h2FrameReadTimeout() / 10)) {
+			t.Fatalf("a keepalive went up %v after the client was gone", at.Sub(gone))
+		}
 	}
 }
 
 // TestABusyRelayLegGetsNoKeepalive: traffic both ways is all the two read
-// deadlines need, and a keepalive on a busy leg would only add a frame.
+// deadlines need, and a keepalive on a busy leg would only add a frame. A
+// real leg carries a packet each way every 40 ms against a 200 ms quiet
+// period.
 func TestABusyRelayLegGetsNoKeepalive(t *testing.T) {
 	setKeepaliveDraw(t, func(time.Duration) time.Duration { return 200 * time.Millisecond })
-	sink, upstream := newTestRelaySink(t)
-	go sink.pump(func([]byte) error { return nil })
-	sink.startKeepalive()
-
-	var keepalives atomic.Int64
-	go func() {
-		hdr := make([]byte, 4)
-		for {
-			if _, err := readFullConn(upstream, hdr); err != nil {
-				return
-			}
-			n := binary.BigEndian.Uint32(hdr)
-			if n == 0 {
-				keepalives.Add(1)
-				continue
-			}
-			if _, err := readFullConn(upstream, make([]byte, n)); err != nil {
-				return
-			}
-		}
-	}()
-	pkt := ipv4Packet(net.IPv4(10, 0, 0, 1), net.IPv4(10, 0, 0, 2))
-	down := append(binary.BigEndian.AppendUint32(nil, uint32(len(pkt))), pkt...)
+	sent := keepaliveLog(t)
+	exit, sink, clientIP, down := dialLeg(t)
+	w := exitWriterFor(t, exit, clientIP)
+	pkt := ipv4Packet(net.IPv4(10, 8, 7, 9), clientIP)
+	up := ipv4Packet(clientIP, net.IPv4(10, 8, 7, 9))
 	for range 30 {
 		sink.UpdateActivity()
-		go func() { _ = sink.WritePacket(pkt) }()
-		_, _ = upstream.Write(down)
+		_ = sink.WritePacket(up)
+		_ = w.SendPacket(pkt)
 		time.Sleep(40 * time.Millisecond)
 	}
-	if n := keepalives.Load(); n != 0 {
+	if down.Load() < 20 {
+		t.Fatalf("%d packets came down - the leg was not busy both ways", down.Load())
+	}
+	if n := len(sent()); n != 0 {
 		t.Fatalf("%d keepalives on a leg busy both ways", n)
+	}
+
+	// Control: the same leg gone quiet one way gets its keepalive.
+	for range 10 {
+		sink.UpdateActivity()
+		_ = sink.WritePacket(up)
+		time.Sleep(40 * time.Millisecond)
+	}
+	if len(sent()) == 0 {
+		t.Fatal("no keepalive once nothing came down - the test proves nothing")
 	}
 }
 
