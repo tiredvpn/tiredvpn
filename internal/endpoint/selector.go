@@ -915,8 +915,8 @@ func (s *Selector) ExportHealth() []HealthRecord {
 }
 
 // ImportHealth takes over the failure history and parks of the candidates in
-// recs whose address this selector also has; others are ignored. It moves
-// the pin off a candidate it parks, as Reconsider would.
+// recs whose address this selector also has; others are ignored. It does not
+// move the pin: the next connect's Reconsider moves off a parked one.
 func (s *Selector) ImportHealth(recs []HealthRecord) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
