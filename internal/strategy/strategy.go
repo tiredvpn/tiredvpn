@@ -1680,8 +1680,11 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 	budget := min(maxEndpointAttempts, len(sel.Candidates()))
 	var lastErr error
 
-	for attempt := range budget {
-		if attempt > 0 {
+	// stayHere repeats the scan on the same candidate once, after a route
+	// verdict parked the transports that died there (routeDeath).
+	stayHere, rescanned := false, false
+	for attempt := 0; attempt < budget; attempt++ {
+		if attempt > 0 && !stayHere {
 			next, ok := sel.Next(sel.Now())
 			if !ok {
 				break
@@ -1690,6 +1693,7 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 			sel.Pin(next)
 			cand = next
 		}
+		stayHere = false
 
 		gated, err := m.preflightCandidate(ctx, sel, cand)
 		if err != nil {
@@ -1767,9 +1771,17 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 				class, died = deathSwallowed, swallowedTransports
 			}
 			if m.routeDeath(cand, class, "it answered nothing", died) {
-				// Not the server's: stay, and let the next cycle try the
-				// transports still standing here.
-				break
+				// Not the server's: the transports still standing get their
+				// turn here, now, without counting as another candidate. If
+				// they are silent too, the second verdict on this server is
+				// its own and charges it: the route verdict costs a server
+				// that is down for good one scan, not a cycle of its own.
+				if rescanned || ctxErr(ctx) != nil {
+					break
+				}
+				rescanned, stayHere = true, true
+				attempt--
+				continue
 			}
 			if sel.ReportSilent(cand, swallowedOn...) {
 				log.Warn("Endpoint %s: every address of the server has a verdict - parking the server", cand)
@@ -1969,8 +1981,12 @@ type scanState struct {
 	// unheard counts the attempts that heard nothing and were no verdict,
 	// evidence or not: what makes a cycle "unanswered" (ErrCycleUnanswered).
 	unheard int
-	// silent lists the non-UDP transports whose attempt was silence
-	// (attemptSilent): what a silence verdict says died.
+	// silent lists the non-UDP transports whose TCP connect completed and
+	// whose attempt was then silence (attemptSilent): what a silence verdict
+	// says died. A SYN nobody answered is left out - every transport dials
+	// the same host:port, so it says the address is unreachable (an IP
+	// block, a dead host), nothing about the transports, and counting it
+	// parked working transports for the route (P1-2 of the round-5 review).
 	silent []string
 }
 
@@ -2343,7 +2359,9 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 				switch m.classifyAttempt(err, latency, attemptLimit(lastSuccessful, budget, dialBudget)) {
 				case attemptSilent:
 					scan.timeouts++
-					scan.silent = append(scan.silent, lastSuccessful.ID())
+					if !dialNeverConnected(err) {
+						scan.silent = append(scan.silent, lastSuccessful.ID())
+					}
 					fastSilent = true
 					// It had its turn this cycle; dialling it again in the
 					// scan would only spend the rest of the budget the same way.
@@ -2649,7 +2667,9 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			case attemptSilent:
 				if !isUDPBasedStrategy(s) {
 					scan.timeouts++
-					scan.silent = append(scan.silent, s.ID())
+					if !dialNeverConnected(err) {
+						scan.silent = append(scan.silent, s.ID())
+					}
 					log.Debug("TCP silence count: %d/%d", scan.timeouts, tcpFailuresThreshold)
 				}
 				// Track TCP timeouts for Android fast fallback
@@ -2706,6 +2726,15 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 		log.Debug("Strategy %s exhausted, moving to next", s.Name())
 	}
 
+	if !addrSilent && !scan.answered && scan.timeouts >= tcpFailuresThreshold {
+		// The last transport walked was the one that completed the count:
+		// the same verdict as abandoning the scan before the next one. It
+		// read as an ordinary failure, under the threshold of two, so a
+		// server whose remaining transports were all silent after a route
+		// verdict was not charged (routeDeath).
+		log.Info("Address %s answered nothing on %d transports%s", target, scan.timeouts, modeStr)
+		addrSilent = true
+	}
 	if !addrSilent && ctxErr(ctx) != nil {
 		// The last transport ran into the caller's deadline: the same ending
 		// as running out of time between transports.
