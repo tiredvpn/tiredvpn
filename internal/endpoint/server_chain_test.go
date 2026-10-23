@@ -244,3 +244,21 @@ func TestAnImportedServerBackoffStillDecays(t *testing.T) {
 		t.Fatalf("after an import and a quiet park-length the server is parked for %v, want the base %v", got, base)
 	}
 }
+
+// TestAUsefulSessionOnOneFamilyStartsTheOthersParksOver is N14 of the fix9
+// stand run: a silence verdict parked both addresses of a; the client came
+// back on a's v6 and carried traffic for 70 s; the next verdict, on a's v4,
+// parked it for twice the base. A useful session on any address of the
+// server makes the next verdict on every address a first one.
+func TestAUsefulSessionOnOneFamilyStartsTheOthersParksOver(t *testing.T) {
+	s, clk := twoDualStackServers(t)
+	s.ReportSilent(candFor(t, s, aV4), aV6)
+	base := stateOf(t, s, aV4).CooldownUntil.Sub(clk.Now())
+	clk.Advance(base + time.Second)
+	s.ReportSessionUseful(candFor(t, s, aV6))
+	clk.Advance(70 * time.Second)
+	s.ReportSilent(candFor(t, s, aV4), aV6) // the server's verdict again, as on the stand
+	if got := stateOf(t, s, aV4).CooldownUntil.Sub(clk.Now()); got != base {
+		t.Fatalf("after a useful session on v6 the next verdict on v4 parks it for %v, want the base %v", got, base)
+	}
+}
