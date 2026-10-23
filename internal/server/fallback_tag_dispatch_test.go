@@ -610,8 +610,8 @@ func TestWeakRegistrySecretsAreSaidWithTheTag(t *testing.T) {
 	t.Cleanup(func() { log.SetDedupWindow(5 * time.Second) })
 	stranger := captureFallbackHello(t, tagFallbackStrategies[0].make, "a-stranger-who-holds-no-secret-of-ours")
 	for _, on := range []bool{true, false} {
-		var out bytes.Buffer
-		log.SetOutput(&out)
+		out := &lockedLog{}
+		log.SetOutput(out)
 		srv := newTagServer(t, "")
 		srv.srvCtx.cfg.REALITYFallbackTag = on
 		reg := NewClientRegistry(nil)
@@ -649,12 +649,31 @@ func TestWeakRegistrySecretsAreSaidWithTheTag(t *testing.T) {
 	}
 }
 
+// lockedLog is a log sink the server's connection goroutines can write to
+// while the test reads it.
+type lockedLog struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *lockedLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *lockedLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
+}
+
 // TestRunWarnsAboutAWeakSecret: the startup warning is said by Run itself,
 // before anything that can fail. Here the REALITY key is missing, so Run
 // stops right after the warnings.
 func TestRunWarnsAboutAWeakSecret(t *testing.T) {
-	var out bytes.Buffer
-	log.SetOutput(&out)
+	out := &lockedLog{}
+	log.SetOutput(out)
 	t.Cleanup(func() { log.SetOutput(os.Stderr) })
 	err := Run(&Config{Secret: []byte("pass-424242"), REALITYB1Enabled: true})
 	if !errors.Is(err, errNoREALITYKey) {
