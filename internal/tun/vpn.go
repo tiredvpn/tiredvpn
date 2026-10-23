@@ -1019,8 +1019,15 @@ func (v *VPNClient) connect(parent context.Context) error {
 	resp, n, tunnelConn, err := v.doHandshake(conn, localIP)
 	if err != nil {
 		conn.Close()
+		if IsHandshakeUnanswered(err) {
+			// The transport connected and the server swallowed the session
+			// handshake: not a success of the transport, and a cycle that
+			// heard nothing (R1 of the fix9 stand run).
+			return fmt.Errorf("%w: %w", v.manager.HandshakeUnanswered(strat, cand, hasCand), err)
+		}
 		return err
 	}
+	v.manager.HandshakeAnswered(cand, hasCand)
 	// From here on the tunnel is read through tunnelConn: the handshake reader
 	// may have had to look at the first byte of the first frame.
 	conn = tunnelConn
@@ -1168,6 +1175,19 @@ func (v *VPNClient) doHandshake(conn net.Conn, localIP net.IP) ([]byte, int, net
 	return resp, n, conn, nil
 }
 
+// IsHandshakeUnanswered reports whether a session handshake failed because
+// the request went out and no answer came before the read deadline.
+func IsHandshakeUnanswered(err error) bool {
+	if errors.Is(err, errHandshakeNotSent) || errors.Is(err, errHandshakeRefused) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true // the cycle ran out while the handshake waited
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
 // errHandshakeNotSent and errHandshakeRefused are the two handshake failures
 // after which the exit has registered nothing: the request never left, or the
 // exit answered with an error status. Any other failure - a response that
@@ -1216,6 +1236,14 @@ func ParseTUNHandshakeCapabilities(resp []byte) (ServerCapabilities, bool) {
 // response, used when the caller has no deadline of its own. A var so tests
 // can shorten it.
 var handshakeReadTimeout = 10 * time.Second
+
+// SetHandshakeReadTimeout replaces handshakeReadTimeout for a test in
+// another package and returns the old value. Not for concurrent tests.
+func SetHandshakeReadTimeout(d time.Duration) time.Duration {
+	old := handshakeReadTimeout
+	handshakeReadTimeout = d
+	return old
+}
 
 // handshakeFlagsGrace bounds the wait for the byte after the 9-byte prefix of
 // a success response to a client below v0x04, the only case where the reader

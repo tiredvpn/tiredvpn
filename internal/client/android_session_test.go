@@ -1,6 +1,7 @@
 package client
 
 import (
+	"io"
 	"context"
 	"fmt"
 	"net"
@@ -220,6 +221,10 @@ func (s *namedPipeStrategy) Connect(ctx context.Context, target string) (net.Con
 	s.mu.Unlock()
 	cli, srv := net.Pipe()
 	s.t.Cleanup(func() { cli.Close(); srv.Close() })
+	if muteExits[target] {
+		go func() { _, _ = io.Copy(io.Discard, srv) }()
+		return cli, nil
+	}
 	playReconnectExit(srv)
 	return cli, nil
 }
@@ -282,3 +287,7 @@ func coreOn(t *testing.T, pool []string, log *[]string, mu *sync.Mutex) *strateg
 // hangingDial, while set, makes every dial hang until its context ends - a
 // connect that is still running when the next command comes.
 var hangingDial bool
+
+// muteExits, while set, are the targets whose exit takes the session
+// handshake and never answers it.
+var muteExits map[string]bool

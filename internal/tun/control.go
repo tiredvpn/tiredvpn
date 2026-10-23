@@ -202,6 +202,11 @@ type ControlConfig struct {
 	DisconnectedFn     func()
 	ConnectRequestedFn func()
 
+	// HandshakeOutcomeFn, when set, is told how the session handshake after
+	// a connect went: answered, or unanswered (IsHandshakeUnanswered). For an
+	// unanswered one it returns the error to answer the host with instead.
+	HandshakeOutcomeFn func(answered bool, err error) error
+
 	// NetworkFn, when set, is told the network_id of every command that
 	// carries one, in the order the host sent them, the moment it is read:
 	// the network the host is on now.
@@ -648,7 +653,13 @@ func (cs *ControlServer) handleConnect(ctx context.Context) ControlResponse {
 	if err != nil {
 		conn.Close()
 		cs.serverConn = nil
+		if cs.config.HandshakeOutcomeFn != nil && IsHandshakeUnanswered(err) {
+			err = cs.config.HandshakeOutcomeFn(false, err)
+		}
 		return ControlResponse{Status: "error", Error: fmt.Sprintf("TUN handshake failed: %v", err)}
+	}
+	if cs.config.HandshakeOutcomeFn != nil {
+		_ = cs.config.HandshakeOutcomeFn(true, nil)
 	}
 
 	cs.assignedIP = realAssignedIP
@@ -1652,7 +1663,7 @@ func (cs *ControlServer) performTUNHandshake(ctx context.Context) (assignedIP, s
 
 	log.Debug("Sending TUN handshake: mode=0x02, mtu=%d, version=0x%02x", mtu, version)
 	if _, err := cs.serverConn.Write(handshake); err != nil {
-		return nil, nil, fmt.Errorf("handshake write failed: %w", err)
+		return nil, nil, fmt.Errorf("handshake write failed: %w: %w", errHandshakeNotSent, err)
 	}
 
 	// Read the response for the version just sent. readHandshakeResponse reads
