@@ -2934,8 +2934,9 @@ func (v *VPNClient) Stop() {
 	v.tun.SetReadDeadline(time.Now())
 	v.tun.Close()
 
-	log.Info("VPN tunnel stopped (packets: up=%d down=%d, bytes: up=%d down=%d)",
-		v.packetsUp, v.packetsDown, v.bytesUp, v.bytesDown)
+	// Through Stats: the packet loops may still be counting.
+	pu, pd, bu, bd := v.Stats()
+	log.Info("VPN tunnel stopped (packets: up=%d down=%d, bytes: up=%d down=%d)", pu, pd, bu, bd)
 }
 
 // Stats returns current VPN statistics
