@@ -440,19 +440,34 @@ func TestANewRegistryClientsTagIsSeenSoon(t *testing.T) {
 	if _, _, ok := gate.index.MatchFallbackTag(sid); ok {
 		t.Fatal("the index knew the new client before any refresh - the test proves nothing")
 	}
-	// The first hello goes to the donor and starts the refresh.
-	expectDonor(t, srv, hello)
+	// The first hello starts the refresh. The refresh runs in the
+	// background, ahead of the tag check of that same hello, so the hello
+	// itself may go either way: to the donor, or - when the rebuild wins the
+	// race, as it can on a loaded machine - to our own TLS. The test used to
+	// require the donor and failed under load.
+	conn, err := net.Dial("tcp", srv.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write(hello); err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
 	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
+	for {
 		// Caught up means both: the client is in, and the index knows it is
 		// current - or every later hello would rebuild it again.
 		if e, _, ok := gate.index.MatchFallbackTag(sid); ok && e.clientID == registryIdentity("carol") &&
 			!gate.index.behind(srv.srvCtx) {
-			return
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("two seconds on, the index has not caught up with the registry (behind=%v)", gate.index.behind(srv.srvCtx))
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("two seconds on, the index has not caught up with the registry (behind=%v)", gate.index.behind(srv.srvCtx))
+	// And carol's next fallback is hers.
+	expectTLSPath(t, srv, captureFallbackHello(t, tagFallbackStrategies[0].make, carol.Secret))
 }
 
 // TestALegacyHelloIsNotCheckedForATag is P3-1 of the round-5 review: the tag
