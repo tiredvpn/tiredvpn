@@ -25,6 +25,9 @@ Versions follow [Semantic Versioning](https://semver.org/).
   draw from it, one uniformly chosen name per connection. Names must be DNS
   host names. Set the same names on the exit with its own `-reality-sni`, so
   that a probe replaying one is mirrored to that site.
+  **Clients 1.11.8 and older do not start with a config that has
+  `sni = [...]`** ("cannot decode TOML array into ... SNI of type string").
+  Hand such configs out only after the clients are updated.
 - **Server: `-reality-sni`** adds operator-chosen donor names to the built-in
   list, on the B1 and the legacy unauthenticated paths.
 - **Server: `reality_fallback_tag_total`** counts the TLS fallback connections
