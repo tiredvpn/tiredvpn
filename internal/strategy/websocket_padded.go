@@ -20,6 +20,7 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/padding"
 	"github.com/tiredvpn/tiredvpn/internal/protocol"
+	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 )
 
 // browserUserAgent is a plausible desktop-browser User-Agent for the WebSocket
@@ -127,7 +128,7 @@ func (s *WebSocketPaddedStrategy) Connect(ctx context.Context, target string) (n
 		return nil, fmt.Errorf("websocket_padded: tcp dial failed: %w", err)
 	}
 
-	tlsConn := tls.Client(tcpConn, tlsConfig)
+	tlsConn := tls.Client(tcpConn, customtls.WithFallbackTag(tlsConfig, secret))
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		tcpConn.Close()
 		return nil, fmt.Errorf("websocket_padded: tls handshake failed: %w", err)

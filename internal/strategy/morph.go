@@ -17,6 +17,7 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/protocol"
 	"github.com/tiredvpn/tiredvpn/internal/shaper"
+	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 )
 
 // TrafficMorphStrategy morphs traffic to match target application patterns
@@ -357,7 +358,7 @@ func (s *TrafficMorphStrategy) Connect(ctx context.Context, target string) (net.
 		fragConn := evasion.NewFragmentedWriter(tcpConn, fragConfig)
 		log.Debug("Morph: TLS ClientHello fragmentation enabled (size=%d)", fragConfig.FragmentSize)
 
-		tlsConn := tls.Client(fragConn, tlsConfig)
+		tlsConn := tls.Client(fragConn, customtls.WithFallbackTag(tlsConfig, secret))
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			tcpConn.Close()
 			return nil, err

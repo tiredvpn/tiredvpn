@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/binary"
 	"io"
 	"runtime"
@@ -106,6 +107,19 @@ func (k FallbackTagKey) prf(label byte, msg []byte) []byte {
 	h.Write([]byte{label})
 	h.Write(msg)
 	return h.Sum(nil)
+}
+
+// WithFallbackTag returns cfg for one handshake to a tiredvpn server, with the
+// session_id carrying a fresh tag for secret. Call it at every tls.Client: the
+// reader it installs serves exactly one ClientHello, and a dial that retries
+// (the ECH fallbacks) needs a second one. An empty secret leaves cfg alone.
+func WithFallbackTag(cfg *tls.Config, secret []byte) *tls.Config {
+	if len(secret) == 0 {
+		return cfg
+	}
+	c := cfg.Clone()
+	c.Rand = NewFallbackTagRand(secret)
+	return c
 }
 
 // NewFallbackTagRand returns a crypto/tls Config.Rand that writes a fresh tag

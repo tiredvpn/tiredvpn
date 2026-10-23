@@ -122,7 +122,7 @@ func (s *AntiProbeStrategy) Connect(ctx context.Context, target string) (net.Con
 			return nil, dialErr
 		}
 
-		tlsConn = tls.Client(tcpConn, tlsConfig)
+		tlsConn = tls.Client(tcpConn, customtls.WithFallbackTag(tlsConfig, secret))
 		if err = tlsConn.HandshakeContext(ctx); err != nil {
 			tcpConn.Close()
 			// Fallback to non-ECH
@@ -131,7 +131,7 @@ func (s *AntiProbeStrategy) Connect(ctx context.Context, target string) (net.Con
 			if dialErr != nil {
 				return nil, dialErr
 			}
-			tlsConn = tls.Client(tcpConn2, tlsConfig)
+			tlsConn = tls.Client(tcpConn2, customtls.WithFallbackTag(tlsConfig, secret))
 			if err = tlsConn.HandshakeContext(ctx); err != nil {
 				tcpConn2.Close()
 				return nil, err
@@ -142,7 +142,7 @@ func (s *AntiProbeStrategy) Connect(ctx context.Context, target string) (net.Con
 		if dialErr != nil {
 			return nil, dialErr
 		}
-		tlsConn = tls.Client(tcpConn, tlsConfig)
+		tlsConn = tls.Client(tcpConn, customtls.WithFallbackTag(tlsConfig, secret))
 		if err = tlsConn.HandshakeContext(ctx); err != nil {
 			tcpConn.Close()
 			return nil, err

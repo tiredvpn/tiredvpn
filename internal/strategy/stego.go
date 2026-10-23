@@ -193,7 +193,7 @@ func (s *HTTP2StegoStrategy) Connect(ctx context.Context, target string) (net.Co
 			return nil, dialErr
 		}
 
-		conn = tls.Client(tcpConn, tlsConfig)
+		conn = tls.Client(tcpConn, customtls.WithFallbackTag(tlsConfig, secret))
 		if err = conn.HandshakeContext(ctx); err != nil {
 			tcpConn.Close()
 			// Fallback to non-ECH on failure
@@ -202,7 +202,7 @@ func (s *HTTP2StegoStrategy) Connect(ctx context.Context, target string) (net.Co
 			if dialErr != nil {
 				return nil, dialErr
 			}
-			conn = tls.Client(tcpConn2, tlsConfig)
+			conn = tls.Client(tcpConn2, customtls.WithFallbackTag(tlsConfig, secret))
 			if err = conn.HandshakeContext(ctx); err != nil {
 				tcpConn2.Close()
 				return nil, err
@@ -213,7 +213,7 @@ func (s *HTTP2StegoStrategy) Connect(ctx context.Context, target string) (net.Co
 		if dialErr != nil {
 			return nil, dialErr
 		}
-		conn = tls.Client(tcpConn, tlsConfig)
+		conn = tls.Client(tcpConn, customtls.WithFallbackTag(tlsConfig, secret))
 		if err = conn.HandshakeContext(ctx); err != nil {
 			tcpConn.Close()
 			return nil, err

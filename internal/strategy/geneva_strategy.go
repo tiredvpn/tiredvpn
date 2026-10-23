@@ -16,6 +16,7 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/geneva"
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/padding"
+	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 )
 
 // GenevaStrategy applies Geneva-style packet manipulation to evade DPI
@@ -164,7 +165,7 @@ func (g *GenevaStrategy) Connect(ctx context.Context, target string) (net.Conn, 
 		ClientSessionCache: g.manager.TLSSessionCache(serverAddr), // resume across reconnects
 	}
 
-	tlsConn := tls.Client(genevaConn, tlsConfig)
+	tlsConn := tls.Client(genevaConn, customtls.WithFallbackTag(tlsConfig, secret))
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		genevaConn.Close()
 		return nil, fmt.Errorf("geneva tls handshake: %w", err)

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/log"
+	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 )
 
 // androidModeEnabled disables strategies that require root (raw sockets, ICMP, etc.)
@@ -140,7 +141,7 @@ func (s *StateExhaustionStrategy) Connect(ctx context.Context, target string) (n
 		ClientSessionCache: s.manager.TLSSessionCache(target), // resume across reconnects
 	}
 	dialer := &net.Dialer{Timeout: 30 * time.Second}
-	conn, err := tls.DialWithDialer(dialer, "tcp", target, tlsConfig)
+	conn, err := tls.DialWithDialer(dialer, "tcp", target, customtls.WithFallbackTag(tlsConfig, secret))
 	if err != nil {
 		return nil, err
 	}

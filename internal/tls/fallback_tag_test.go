@@ -5,8 +5,10 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
+	"slices"
 	"testing"
 	"time"
 )
@@ -190,5 +192,33 @@ func TestFallbackTagRandTagsOnlyTheSessionIDRead(t *testing.T) {
 		if _, ok := key.Open(b); ok {
 			t.Fatalf("read %d from outside crypto/tls came back as a tag", i)
 		}
+	}
+}
+
+// TestFallbackTagKeepsTheStdlibFingerprint (verification rule 8): the tag must
+// not make the hello any less like the plain crypto/tls one it was. Same
+// length, same extensions in the same order with the same body lengths; only
+// the values crypto/tls randomises anyway may differ.
+func TestFallbackTagKeepsTheStdlibFingerprint(t *testing.T) {
+	shape := func(hello []byte) (n int, exts []string) {
+		block, err := helloExtensions(hello)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = walkExtensions(block, func(_ int, typ uint16, body []byte) bool {
+			exts = append(exts, fmt.Sprintf("%04x/%d", typ, len(body)))
+			return false
+		})
+		return len(hello), exts
+	}
+	plain := taggedConfig(nil)
+	plain.Rand = nil
+	n0, e0 := shape(stdlibHello(t, plain))
+	n1, e1 := shape(stdlibHello(t, WithFallbackTag(plain, []byte("fingerprint"))))
+	if n0 != n1 || !slices.Equal(e0, e1) {
+		t.Fatalf("tagged hello differs from plain crypto/tls:\nplain  %d %v\ntagged %d %v", n0, e0, n1, e1)
+	}
+	if len(e0) < 8 {
+		t.Fatalf("only %d extensions parsed - the comparison sees nothing", len(e0))
 	}
 }

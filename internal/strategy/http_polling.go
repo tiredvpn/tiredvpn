@@ -22,6 +22,7 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/protect"
 	"github.com/tiredvpn/tiredvpn/internal/protocol"
+	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 )
 
 // Meek keepalive feeder tuning. The shared TUN relay tears a session down if no
@@ -690,7 +691,7 @@ func (c *HTTPPollingConn) acquireConn(ctx context.Context) (*tls.Conn, *bufio.Re
 		NextProtos:         []string{"http/1.1"},
 		ClientSessionCache: c.tlsSessionCache, // TLS session resumption
 	}
-	tlsConn := tls.Client(tcpConn, tlsConfig)
+	tlsConn := tls.Client(tcpConn, customtls.WithFallbackTag(tlsConfig, c.secret))
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		tcpConn.Close()
 		return nil, nil, err
