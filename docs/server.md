@@ -349,7 +349,12 @@ each a way for a probe to tell the exit from the site it imitates:
 Before turning the flag on, know what it opens. The tag binds neither the
 hello nor the exit, so a copy works once on every exit that shares the secret
 (previous section). Binding it to the hello's random and key share is planned
-for 1.11.10. Until then:
+for 1.11.10, as tag version 2 under its own key (HKDF info
+`tiredvpn-fallback-tag-v2`). The plan is that a 1.11.10 exit with the flag on
+admits v2 tags only: TLS fallbacks of 1.11.9 clients go to the donor there,
+as with the flag off, so upgrade the clients before you turn the flag on.
+Admitting v1 next to v2 would keep the exposure and would take an opt-in of
+its own. Until then:
 
 - use per-client registry secrets, not one global `-secret`, on any exit
   with the flag on (the server warns at startup otherwise);
