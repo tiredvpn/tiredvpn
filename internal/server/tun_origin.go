@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"net"
 )
 
@@ -170,7 +171,11 @@ func allocationKey(id clientIdentity, origin string) string {
 func allocateTunnelIP(srvCtx *serverContext, id clientIdentity, origin string, requested net.IP) (net.IP, error) {
 	key := allocationKey(id, origin)
 	keys, prefixes := legacyAllocationKeys(srvCtx, id, origin)
-	srvCtx.ipPool.AdoptAll(keys, prefixes, key)
+	// Bounded: the Redis search for old leases must not hold a handshake up
+	// for long (adoptScanTimeout); one that runs out is retried next time.
+	ctx, cancel := context.WithTimeout(context.Background(), adoptScanTimeout)
+	defer cancel()
+	srvCtx.ipPool.AdoptAll(ctx, keys, prefixes, key)
 	return srvCtx.ipPool.Allocate(key, requested, "")
 }
 

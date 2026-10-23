@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"net"
 	"strings"
 	"sync/atomic"
@@ -193,7 +194,7 @@ func TestFoldedKeysStayBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := range adoptFoldMax + 100 {
-		pool.AdoptAll(nil, nil, "global@"+net.IPv4(198, 51, byte(i>>8), byte(i)).String())
+		pool.AdoptAll(context.Background(), nil, nil, "global@"+net.IPv4(198, 51, byte(i>>8), byte(i)).String())
 	}
 	if n := len(pool.folded); n > adoptFoldMax {
 		t.Fatalf("%d fold records, cap %d", n, adoptFoldMax)
@@ -202,8 +203,94 @@ func TestFoldedKeysStayBounded(t *testing.T) {
 	if _, err := pool.Allocate("polling:global@192.0.2.1", net.ParseIP("10.8.1.9"), ""); err != nil {
 		t.Fatal(err)
 	}
-	pool.AdoptAll([]string{"polling:global@192.0.2.1"}, nil, "global@192.0.2.1")
+	pool.AdoptAll(context.Background(), []string{"polling:global@192.0.2.1"}, nil, "global@192.0.2.1")
 	if _, left := leasesOf(pool)["polling:global@192.0.2.1"]; left {
 		t.Fatal("an expired fold record kept the fold from running")
+	}
+}
+
+// scanGate holds every SCAN until release is closed, or fails it when fail
+// is set.
+type scanGate struct {
+	release chan struct{}
+	fail    atomic.Bool
+	scans   atomic.Int64
+}
+
+func (g *scanGate) DialHook(next redis.DialHook) redis.DialHook { return next }
+func (g *scanGate) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if cmd.Name() == "scan" {
+			g.scans.Add(1)
+			if g.fail.Load() {
+				return errors.New("scan refused")
+			}
+			<-g.release
+		}
+		return next(ctx, cmd)
+	}
+}
+func (g *scanGate) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+// TestTheLeaseSearchDoesNotHoldThePool is P3-4 of the round-4 review: the
+// Redis SCAN for a registry client's old REALITY leases ran under the pool
+// lock - up to 64 round trips - and every allocation of every other client
+// waited behind it.
+func TestTheLeaseSearchDoesNotHoldThePool(t *testing.T) {
+	rdb := startRedis(t)
+	gate := &scanGate{release: make(chan struct{})}
+	rdb.AddHook(gate)
+	pool, err := NewIPPool(IPPoolConfig{Network: "10.8.1.0/24", ServerIP: "10.8.1.1"}, rdb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	searched := make(chan struct{})
+	go func() {
+		pool.AdoptAll(context.Background(), nil, []string{"reality:abc@"}, "c1")
+		close(searched)
+	}()
+	for gate.scans.Load() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	allocated := make(chan error, 1)
+	go func() { _, err := pool.Allocate("someone-else", nil, ""); allocated <- err }()
+	select {
+	case err := <-allocated:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		close(gate.release)
+		<-searched
+		t.Fatal("an allocation waited for another client's lease search")
+	}
+	close(gate.release)
+	<-searched
+}
+
+// TestAnUnfinishedLeaseSearchIsRetried: a search that failed or was cut
+// short was still recorded as folded for 10 minutes, and a lease it missed
+// was missed again and again.
+func TestAnUnfinishedLeaseSearchIsRetried(t *testing.T) {
+	rdb := startRedis(t)
+	gate := &scanGate{release: make(chan struct{})}
+	close(gate.release)
+	gate.fail.Store(true)
+	rdb.AddHook(gate)
+	pool, err := NewIPPool(IPPoolConfig{Network: "10.8.1.0/24", ServerIP: "10.8.1.1"}, rdb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.AdoptAll(context.Background(), nil, []string{"reality:abc@"}, "c1")
+	gate.fail.Store(false)
+	pool.AdoptAll(context.Background(), nil, []string{"reality:abc@"}, "c1")
+	if n := gate.scans.Load(); n != 2 {
+		t.Fatalf("%d searches, want the failed one retried", n)
+	}
+	pool.AdoptAll(context.Background(), nil, []string{"reality:abc@"}, "c1")
+	if n := gate.scans.Load(); n != 2 {
+		t.Fatal("a finished search was repeated within its record")
 	}
 }
