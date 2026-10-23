@@ -13,6 +13,7 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/protocol"
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
+	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 	"github.com/tiredvpn/tiredvpn/internal/tun"
 )
 
@@ -106,8 +107,10 @@ func (d *UpstreamDialer) connectStego(ctx context.Context) (net.Conn, *tls.Conn,
 		tc.SetWriteBuffer(sockBuf)
 	}
 
-	// TLS handshake on the optimized TCP connection
-	tlsConn := tls.Client(tcpConn, d.tlsConfig)
+	// TLS handshake on the optimized TCP connection. The session_id carries
+	// the fallback-transport tag, so an exit running -reality-b1 takes the
+	// relay for one of its own clients rather than a stranger for the donor.
+	tlsConn := tls.Client(tcpConn, customtls.WithFallbackTag(d.tlsConfig, d.upstreamSecret))
 
 	// Set deadline for handshake
 	if hasDeadline {

@@ -380,3 +380,22 @@ func expectTLSPath(t *testing.T, srv *tagServer, record []byte) {
 		t.Fatalf("the donor took %d connections", n)
 	}
 }
+
+// TestRelayUpstreamReachesAB1ExitWithACoverDomain: a relay's upstream leg is
+// a TLS fallback too. Its fixed SNI is no donor, but an exit with a cover
+// domain used to hand it to the cover all the same.
+func TestRelayUpstreamReachesAB1ExitWithACoverDomain(t *testing.T) {
+	srv := newTagServer(t, "www.microsoft.com")
+	d := NewUpstreamDialer(srv.addr, []byte(tagTestSecret))
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	conn, tlsConn, err := d.connectStego(ctx)
+	if err != nil {
+		t.Fatalf("upstream handshake: %v (donor took %d connections)", err, srv.donor.conns.Load())
+	}
+	conn.Close()
+	tlsConn.Close()
+	if n := srv.donor.conns.Load(); n != 0 {
+		t.Fatalf("the cover domain took %d upstream connections", n)
+	}
+}
