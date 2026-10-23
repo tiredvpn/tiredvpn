@@ -533,3 +533,47 @@ func TestAKeepaliveThatCannotGoOutIsNoAnswer(t *testing.T) {
 		t.Fatalf("%d suspicions within one threshold of a failed confirmation", n)
 	}
 }
+
+// TestAFlowAnsweredDuringTheConfirmationIsNoVerdict is P2-3 of the round-4
+// review: a stalled flow that got its answer while the keepalives were out -
+// its packet queued behind a downlink burst - still ended the session. The
+// exit stays silent to keepalives and answers the flow once the confirmation
+// has started.
+func TestAFlowAnsweredDuringTheConfirmationIsNoVerdict(t *testing.T) {
+	h := newStallHarness(t, nil)
+	deadline := time.Now().Add(2 * time.Second)
+	for h.exit.gotEcho.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("no confirmation started:\n%s", h.out)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := h.exit.writeFrame(fixtureFlows(t)[8].data); err != nil {
+		t.Fatal(err)
+	}
+	if !h.wait("got its answer during the confirmation", 2*time.Second) {
+		t.Fatalf("no recheck of the flow:\n%s", h.out)
+	}
+	if strings.Contains(h.out.String(), "Session degraded") {
+		t.Fatalf("a session whose flow was answered was given up:\n%s", h.out)
+	}
+}
+
+// TestRelayFlowAnsweredDuringTheConfirmationIsNoVerdict: the same on the
+// Android relay.
+func TestRelayFlowAnsweredDuringTheConfirmationIsNoVerdict(t *testing.T) {
+	h := newRelayStallHarness(t, nil)
+	deadline := time.Now().Add(2 * time.Second)
+	for h.exit.gotEcho.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("no confirmation started")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := h.exit.writeFrame(fixtureFlows(t)[8].data); err != nil {
+		t.Fatal(err)
+	}
+	if r := h.reason(1500 * time.Millisecond); r != "" || h.degraded.Load() != 0 {
+		t.Fatalf("a relay whose flow was answered was given up: %q", r)
+	}
+}

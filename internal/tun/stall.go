@@ -265,6 +265,32 @@ func (t *flowTable) stalledFor(now time.Time) time.Duration {
 	return stall
 }
 
+// oldestPending names the flow whose demand has waited longest (not
+// ignored), and since when.
+func (t *flowTable) oldestPending() (flowKey, time.Time, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var key flowKey
+	var since time.Time
+	for k, f := range t.flows {
+		if f.ignored || f.pendingSince.IsZero() {
+			continue
+		}
+		if since.IsZero() || f.pendingSince.Before(since) {
+			key, since = k, f.pendingSince
+		}
+	}
+	return key, since, !since.IsZero()
+}
+
+// stillPending reports whether key's demand from since is still unanswered.
+func (t *flowTable) stillPending(key flowKey, since time.Time) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	f := t.flows[key]
+	return f != nil && !f.ignored && f.pendingSince.Equal(since)
+}
+
 // ignorePending marks every waiting flow as confirmed alive: the session
 // answered a keepalive, so whatever those flows wait for is their peer's
 // business (a dead server behind a healthy tunnel). Their next answer clears
@@ -303,12 +329,31 @@ func newStallMonitor(flows *flowTable) *stallMonitor {
 
 // suspect reports a stall past the threshold on a session at least as old
 // as the threshold.
-func (m *stallMonitor) suspect(sessionAge time.Duration) (time.Duration, bool) {
+func (m *stallMonitor) suspect(sessionAge time.Duration) (stalledFlow, bool) {
 	if sessionAge < m.threshold {
-		return 0, false
+		return stalledFlow{}, false
 	}
-	stall := m.flows.stalledFor(m.now())
-	return stall, stall >= m.threshold
+	key, since, ok := m.flows.oldestPending()
+	if !ok {
+		return stalledFlow{}, false
+	}
+	f := stalledFlow{key: key, since: since, stall: m.now().Sub(since)}
+	return f, f.stall >= m.threshold
+}
+
+// stalledFlow is the flow a suspicion is about.
+type stalledFlow struct {
+	key   flowKey
+	since time.Time
+	stall time.Duration
+}
+
+// unanswered reports whether the suspected flow is still waiting for the
+// same demand: a verdict on a flow that got its answer during the
+// confirmation - its packet queued behind a downlink burst - would end a
+// session that works.
+func (m *stallMonitor) unanswered(f stalledFlow) bool {
+	return m.flows.stillPending(f.key, f.since)
 }
 
 // confirm asks the session whether it is alive: a keepalive, a window of
@@ -466,10 +511,11 @@ func (v *VPNClient) watchStalls() {
 		// still running when a swap or a hop replaces the session works on
 		// the old table and can not mark the new session's flows.
 		mon := newStallMonitor(flows)
-		stall, ok := mon.suspect(time.Since(connectedAt))
+		suspect, ok := mon.suspect(time.Since(connectedAt))
 		if !ok {
 			continue
 		}
+		stall := suspect.stall
 		log.Info("Session suspect: a flow has waited %v for an answer - confirming with keepalives", stall.Round(time.Millisecond))
 		alive, sent, err := mon.confirm(v.stopCh, keepaliveSender(conn), v.echoCounter(conn))
 		v.mu.Lock()
@@ -489,6 +535,10 @@ func (v *VPNClient) watchStalls() {
 		}
 		if alive {
 			log.Info("Session alive: a keepalive echoed (%d sent); the stalled flow's peer is slow or gone, not the tunnel", sent)
+			continue
+		}
+		if !mon.unanswered(suspect) {
+			log.Info("Session alive: the stalled flow got its answer during the confirmation")
 			continue
 		}
 		judged = conn
@@ -571,10 +621,11 @@ func (r *tunRelay) watchStalls() {
 		if time.Now().Before(holdUntil) {
 			continue
 		}
-		stall, ok := mon.suspect(time.Since(r.startedAt))
+		suspect, ok := mon.suspect(time.Since(r.startedAt))
 		if !ok {
 			continue
 		}
+		stall := suspect.stall
 		log.Info("TUN relay: a flow has waited %v for an answer - confirming with keepalives", stall.Round(time.Millisecond))
 		alive, sent, err := mon.confirm(r.stopCh, keepaliveSender(r.serverConn), echoes)
 		select {
@@ -591,6 +642,10 @@ func (r *tunRelay) watchStalls() {
 			if alive {
 				log.Info("TUN relay: a keepalive echoed (%d sent); the stalled flow's peer is slow or gone, not the tunnel", sent)
 			}
+			continue
+		}
+		if !mon.unanswered(suspect) {
+			log.Info("TUN relay: the stalled flow got its answer during the confirmation")
 			continue
 		}
 		if !stallVerdicts().allow(time.Now()) {
