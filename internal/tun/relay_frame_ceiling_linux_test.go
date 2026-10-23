@@ -40,7 +40,7 @@ func TestRelayRejectsFrameOverCeilingBeforeAllocating(t *testing.T) {
 		var before, after runtime.MemStats
 		runtime.ReadMemStats(&before)
 		go func() {
-			done <- runServerToTUN(stop, func() {}, &tunPtr, cli, net.IPv4(10, 9, 0, 1), func() {}, nil)
+			done <- runServerToTUN(stop, func() {}, &tunPtr, cli, net.IPv4(10, 9, 0, 1), func() {}, nil, nil)
 		}()
 		var hdr [4]byte
 		binary.BigEndian.PutUint32(hdr[:], announced)
@@ -94,7 +94,7 @@ func TestRelayStillDropsOversizedPacketWithinCeiling(t *testing.T) {
 	done := make(chan string, 1)
 	stop := make(chan struct{})
 	go func() {
-		done <- runServerToTUN(stop, func() {}, &tunPtr, cli, net.IPv4(10, 9, 0, 1), func() {}, nil)
+		done <- runServerToTUN(stop, func() {}, &tunPtr, cli, net.IPv4(10, 9, 0, 1), func() {}, nil, nil)
 	}()
 
 	const size = 1500 // over the 1280 MTU, well under the ceiling

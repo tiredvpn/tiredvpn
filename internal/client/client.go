@@ -655,6 +655,21 @@ func runControlSocketMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Si
 			}
 		},
 
+		// SessionDegradedFn books a stall verdict of the relay against the
+		// endpoint the session rode, as VPNClient's disconnect does on the
+		// desktop, and has the next connect walk the pool through the gate.
+		SessionDegradedFn: func(time.Duration) {
+			mgr.NoteServerSilent()
+			cand, ok := mgr.CurrentCandidate()
+			mgr.SessionEnded(strategy.SessionEnd{
+				Strategy:       mgr.GetLastConnectionInfo().StrategyID,
+				Endpoint:       cand,
+				HasEndpoint:    ok,
+				Degraded:       true,
+				LocalNetworkUp: tun.LocalLinkUp,
+			})
+		},
+
 		// StartVPNFn is NOT set - let control.go use the default path
 		// which includes RunTUNRelayWithCallbacks with keepalive events
 		// and dead connection detection

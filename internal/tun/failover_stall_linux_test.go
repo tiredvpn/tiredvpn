@@ -1,0 +1,458 @@
+//go:build linux
+
+package tun
+
+import (
+	"context"
+	"encoding/binary"
+	"io"
+	"net"
+	"os"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
+
+	"github.com/tiredvpn/tiredvpn/internal/strategy"
+)
+
+// shortStallClocks scales the detector down: T 300 ms, echo wait 150 ms.
+func shortStallClocks(t *testing.T) {
+	t.Helper()
+	oldT, oldEcho, oldEvery, oldPause := stallThreshold, stallEchoWait, stallCheckEvery, stallConfirmPause
+	stallThreshold, stallEchoWait, stallCheckEvery = 300*time.Millisecond, 150*time.Millisecond, 20*time.Millisecond
+	stallConfirmPause = func() time.Duration { return 50 * time.Millisecond }
+	oldLimiter := stallVerdicts
+	stallVerdicts = &verdictLimiter{}
+	t.Cleanup(func() {
+		stallThreshold, stallEchoWait, stallCheckEvery, stallConfirmPause = oldT, oldEcho, oldEvery, oldPause
+		stallVerdicts = oldLimiter
+	})
+}
+
+// stallExit is the far side of a tunnel conn: it answers data with the
+// stand's own ACK for the flow (fixture frame 9) when answerData is set,
+// echoes keepalives when echo is set, and with feeder set splices a
+// zero-length frame into the downlink every 100 ms, as HTTP Polling's feeder
+// does on the client.
+type stallExit struct {
+	conn       net.Conn
+	answer     []byte
+	answerData atomic.Bool
+	echo       atomic.Bool
+	feeder     atomic.Bool
+	gotData    atomic.Int64
+}
+
+func (e *stallExit) writeFrame(p []byte) error {
+	frame := make([]byte, 4+len(p))
+	binary.BigEndian.PutUint32(frame, uint32(len(p)))
+	copy(frame[4:], p)
+	_, err := e.conn.Write(frame)
+	return err
+}
+
+func (e *stallExit) serve() {
+	go func() {
+		for {
+			time.Sleep(100 * time.Millisecond)
+			if e.feeder.Load() && e.writeFrame(nil) != nil {
+				return
+			}
+		}
+	}()
+	hdr := make([]byte, 4)
+	for {
+		if _, err := io.ReadFull(e.conn, hdr); err != nil {
+			return
+		}
+		n := binary.BigEndian.Uint32(hdr)
+		if _, err := io.ReadFull(e.conn, make([]byte, n)); err != nil {
+			return
+		}
+		switch {
+		case n == 0 && e.echo.Load():
+			_ = e.writeFrame(nil)
+		case n > 0:
+			e.gotData.Add(1)
+			if e.answerData.Load() {
+				_ = e.writeFrame(e.answer)
+			}
+		}
+	}
+}
+
+// pollingLike is a tunnel conn that makes up keepalives of its own and says
+// so: the server itself sent none.
+type pollingLike struct{ net.Conn }
+
+func (pollingLike) ServerKeepalives() uint64 { return 0 }
+
+type stallHarness struct {
+	v    *VPNClient
+	m    *strategy.Manager
+	exit *stallExit
+	app  *os.File // the application side of the TUN
+	out  *stopOnDisconnectLog
+	addr string
+}
+
+// newStallHarness runs a VPNClient's packet loops and stall watcher over a
+// scripted exit and a TUN made of a seqpacket socket pair, on a pool of two
+// servers, with the session riding the first.
+func newStallHarness(t *testing.T, wrap func(net.Conn) net.Conn) *stallHarness {
+	t.Helper()
+	shortStallClocks(t)
+	oldLink := probeLocalLink
+	probeLocalLink = func() bool { return true }
+	t.Cleanup(func() { probeLocalLink = oldLink })
+
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dev := &TUNDevice{file: os.NewFile(uintptr(fds[0]), "tun"), mtu: 1500, atomicMTU: 1500}
+	app := os.NewFile(uintptr(fds[1]), "app")
+
+	pkts := fixtureFlows(t)
+	cli, srv := net.Pipe()
+	exit := &stallExit{conn: srv, answer: pkts[8].data}
+	go exit.serve()
+
+	m, addrs, _ := poolManager(t, 2)
+	m.SetConnectivityChecker(strategy.NewConnectivityChecker(addrs[0], time.Second, true))
+	cand, ok := m.CurrentCandidate()
+	if !ok {
+		t.Fatal("no candidate")
+	}
+	conn := cli
+	if wrap != nil {
+		conn = wrap(cli)
+	}
+	v := &VPNClient{running: 1, stopCh: make(chan struct{}), manager: m, conn: conn, tun: dev,
+		strategy:    &rankedPipeStrategy{pipeStrategy: &pipeStrategy{t: t}, id: "polling", priority: 6},
+		sessionCand: cand, hasSessionCand: true,
+		connectedAt: time.Now().Add(-time.Hour), lastRx: time.Now()}
+	out := &stopOnDisconnectLog{v: v}
+	setLog(t, out)
+	go v.readFromTun()
+	go v.readFromServer()
+	go v.watchStalls()
+	t.Cleanup(func() {
+		atomic.StoreInt32(&v.running, 0)
+		select {
+		case <-v.stopCh:
+		default:
+			close(v.stopCh)
+		}
+		cli.Close()
+		srv.Close()
+		app.Close()
+		dev.file.Close()
+	})
+
+	h := &stallHarness{v: v, m: m, exit: exit, app: app, out: out, addr: addrs[0]}
+	go func() { // the application drains what comes down
+		buf := make([]byte, 2048)
+		for {
+			if _, err := app.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+	// The flow is answered once (the stand's SYN-ACK, frame 3), then the
+	// application sends its GET (frame 6) into it.
+	if err := exit.writeFrame(pkts[2].data); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if _, err := app.Write(pkts[5].data); err != nil {
+		t.Fatal(err)
+	}
+	return h
+}
+
+// wait polls for a log line for up to d.
+func (h *stallHarness) wait(line string, d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if strings.Contains(h.out.String(), line) {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return strings.Contains(h.out.String(), line)
+}
+
+// TestHealthySessionHasNoStall: the exit answers the flow; no suspicion, no
+// keepalive sent for confirmation, no verdict, over several thresholds.
+func TestHealthySessionHasNoStall(t *testing.T) {
+	h := newStallHarness(t, nil)
+	h.exit.answerData.Store(true)
+	h.exit.echo.Store(true)
+	pkts := fixtureFlows(t)
+	for range 10 { // the application keeps asking, the exit keeps answering
+		time.Sleep(100 * time.Millisecond)
+		_, _ = h.app.Write(pkts[5].data)
+	}
+	if h.wait("Session suspect", 300*time.Millisecond) {
+		t.Fatalf("a healthy session was suspected:\n%s", h.out)
+	}
+	if h.exit.gotData.Load() == 0 {
+		t.Fatal("no data reached the exit - the test proves nothing")
+	}
+}
+
+// TestFrozenSessionIsGivenUp is the detector end to end: the exit takes the
+// data and answers neither it nor the keepalives. Within the threshold plus
+// the two confirmations the session ends as degraded; the endpoint is
+// charged like a dead session, and the next reconnect walks the pool.
+func TestFrozenSessionIsGivenUp(t *testing.T) {
+	h := newStallHarness(t, nil)
+	if !h.wait("VPN disconnected: session degraded", 2*time.Second) {
+		t.Fatalf("a frozen session was not given up:\n%s", h.out)
+	}
+	if !strings.Contains(h.out.String(), "keepalive echo 0/2") {
+		t.Fatalf("the verdict did not come from two unanswered keepalives:\n%s", h.out)
+	}
+	if d := cooldownLeft(t, h.m, h.addr); d <= 0 {
+		t.Fatal("the degraded session's endpoint was not charged")
+	}
+	if !h.m.PreflightArmed() {
+		t.Fatal("the reconnect after a degraded session does not walk the pool through the gate")
+	}
+}
+
+// TestDeadPeerBehindALiveTunnelIsNotDegraded: the stalled flow's own server
+// is gone but the tunnel answers keepalives (h_deadpeer). Suspected,
+// confirmed alive, no verdict.
+func TestDeadPeerBehindALiveTunnelIsNotDegraded(t *testing.T) {
+	h := newStallHarness(t, nil)
+	h.exit.echo.Store(true)
+	if !h.wait("Session alive", 2*time.Second) {
+		t.Fatalf("the stalled flow was never confirmed alive:\n%s", h.out)
+	}
+	if h.wait("Session degraded", 500*time.Millisecond) {
+		t.Fatalf("a live tunnel was given up for a dead peer:\n%s", h.out)
+	}
+	// Confirmed once: the flows waiting then are left alone until they are
+	// answered, not re-confirmed with a keepalive every check.
+	if n := strings.Count(h.out.String(), "Session suspect"); n != 1 {
+		t.Fatalf("%d confirmations for one stall", n)
+	}
+}
+
+// TestMadeUpKeepalivesAreNoEcho: HTTP Polling feeds zero-length frames of its
+// own into the downlink. Counting those as echoes confirmed every frozen
+// Polling session alive - the main case the detector exists for.
+func TestMadeUpKeepalivesAreNoEcho(t *testing.T) {
+	h := newStallHarness(t, func(c net.Conn) net.Conn { return pollingLike{c} })
+	h.exit.feeder.Store(true)
+	if !h.wait("VPN disconnected: session degraded", 2*time.Second) {
+		t.Fatalf("a frozen Polling session was confirmed alive by its own feeder:\n%s", h.out)
+	}
+}
+
+// TestOneVerdictLimitPerWindow: three verdicts in ten minutes, then ten
+// minutes of log only.
+func TestOneVerdictLimitPerWindow(t *testing.T) {
+	var l verdictLimiter
+	now := time.Now()
+	for i := range stallVerdictMax {
+		if !l.allow(now.Add(time.Duration(i) * time.Minute)) {
+			t.Fatalf("verdict %d refused", i+1)
+		}
+	}
+	if l.allow(now.Add(4 * time.Minute)) {
+		t.Fatal("a fourth verdict within the window was allowed")
+	}
+	if l.allow(now.Add(13 * time.Minute)) {
+		t.Fatal("a verdict inside the quiet period was allowed")
+	}
+	if !l.allow(now.Add(15 * time.Minute)) {
+		t.Fatal("verdicts did not come back after the quiet period")
+	}
+}
+
+// pendingFlow leaves the flow table with demand waiting since an hour ago.
+func pendingFlow(t *testing.T, ft *flowTable) {
+	t.Helper()
+	pkts := fixtureFlows(t)
+	then := time.Now().Add(-time.Hour)
+	ft.down(pkts[2].data, then)
+	ft.up(pkts[5].data, then.Add(time.Second))
+	if ft.stalledFor(time.Now()) == 0 {
+		t.Fatal("no pending flow - the test proves nothing")
+	}
+}
+
+// TestEveryNewConnectionStartsWithNoFlows: connect, the port hop and the
+// upgrade swap each start a session on a new connection. Demand left from the
+// old one (an echo answered after a reconnect inside the same stall, as the
+// stand's REALITY b_bc runs showed) must not be judged against the new.
+func TestEveryNewConnectionStartsWithNoFlows(t *testing.T) {
+	t.Run("connect", func(t *testing.T) {
+		v := newCallsiteClient(newPipeManager(t))
+		pendingFlow(t, &v.stall)
+		if err := v.connect(t.Context()); err != nil {
+			t.Fatalf("connect: %v", err)
+		}
+		if s := v.stall.stalledFor(time.Now()); s != 0 {
+			t.Fatalf("connect kept demand from the old session: %v", s)
+		}
+	})
+	t.Run("port hop", func(t *testing.T) {
+		m, _, _ := poolManager(t, 1)
+		v := newCallsiteClient(m)
+		v.stopCh = make(chan struct{})
+		setLog(t, &stampedLog{})
+		if err := v.connect(context.Background()); err != nil {
+			t.Fatalf("connect: %v", err)
+		}
+		pendingFlow(t, &v.stall)
+		v.seamlessPortHop(1234)
+		if s := v.stall.stalledFor(time.Now()); s != 0 {
+			t.Fatalf("the port hop kept demand from the old session: %v", s)
+		}
+	})
+	t.Run("upgrade swap", func(t *testing.T) {
+		v, _, _, better := upgradeOnSelector(t)
+		setLog(t, &stampedLog{})
+		pendingFlow(t, &v.stall)
+		v.tryStrategyUpgrade([]strategy.Strategy{better})
+		if v.strategy != better {
+			t.Fatal("no swap - the test proves nothing")
+		}
+		if s := v.stall.stalledFor(time.Now()); s != 0 {
+			t.Fatalf("the swap kept demand from the old session: %v", s)
+		}
+	})
+}
+
+// relayStallHarness runs the control socket's relay (Android) over a
+// scripted exit, the same way.
+type relayStallHarness struct {
+	r        *tunRelay
+	exit     *stallExit
+	app      *os.File
+	reasons  chan string
+	degraded atomic.Int64
+}
+
+func newRelayStallHarness(t *testing.T, wrap func(net.Conn) net.Conn) *relayStallHarness {
+	t.Helper()
+	shortStallClocks(t)
+	setLog(t, &stampedLog{})
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dev := &TUNDevice{file: os.NewFile(uintptr(fds[0]), "tun"), mtu: 1500, atomicMTU: 1500}
+	app := os.NewFile(uintptr(fds[1]), "app")
+	pkts := fixtureFlows(t)
+	cli, srv := net.Pipe()
+	exit := &stallExit{conn: srv, answer: pkts[8].data}
+	go exit.serve()
+	conn := cli
+	if wrap != nil {
+		conn = wrap(cli)
+	}
+	h := &relayStallHarness{exit: exit, app: app, reasons: make(chan string, 4)}
+	stop := make(chan struct{})
+	h.r = startTUNRelay(dev, conn, net.IPv4(10, 9, 0, 2), net.IPv4(10, 9, 0, 1), stop, &RelayCallbacks{
+		OnError:    func(reason string) { h.reasons <- reason },
+		OnDegraded: func(time.Duration) { h.degraded.Add(1) },
+	})
+	t.Cleanup(func() {
+		close(stop)
+		cli.Close()
+		srv.Close()
+		app.Close()
+		dev.file.Close()
+		<-h.r.done
+	})
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			if _, err := app.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+	if err := exit.writeFrame(pkts[2].data); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if _, err := app.Write(pkts[5].data); err != nil {
+		t.Fatal(err)
+	}
+	return h
+}
+
+func (h *relayStallHarness) reason(d time.Duration) string {
+	select {
+	case r := <-h.reasons:
+		return r
+	case <-time.After(d):
+		return ""
+	}
+}
+
+// TestRelayGivesUpAFrozenSession is the detector on the Android path: the
+// control socket's relay carries its own hooks and watcher. Without them a
+// phone never noticed.
+func TestRelayGivesUpAFrozenSession(t *testing.T) {
+	h := newRelayStallHarness(t, nil)
+	if r := h.reason(2 * time.Second); !strings.HasPrefix(r, "session_degraded") {
+		t.Fatalf("relay ended with %q, want a degraded session", r)
+	}
+	if h.degraded.Load() != 1 {
+		t.Fatalf("OnDegraded called %d times", h.degraded.Load())
+	}
+}
+
+// TestRelayKeepsAHealthySession: answered flows, echoed keepalives.
+func TestRelayKeepsAHealthySession(t *testing.T) {
+	h := newRelayStallHarness(t, nil)
+	h.exit.answerData.Store(true)
+	h.exit.echo.Store(true)
+	pkts := fixtureFlows(t)
+	for range 10 {
+		time.Sleep(100 * time.Millisecond)
+		_, _ = h.app.Write(pkts[5].data)
+	}
+	if r := h.reason(300 * time.Millisecond); r != "" || h.degraded.Load() != 0 {
+		t.Fatalf("a healthy relay ended: %q", r)
+	}
+}
+
+// TestRelayMadeUpKeepalivesAreNoEcho: the Polling feeder on the Android path.
+func TestRelayMadeUpKeepalivesAreNoEcho(t *testing.T) {
+	h := newRelayStallHarness(t, func(c net.Conn) net.Conn { return pollingLike{c} })
+	h.exit.feeder.Store(true)
+	if r := h.reason(2 * time.Second); !strings.HasPrefix(r, "session_degraded") {
+		t.Fatalf("relay ended with %q, want a degraded session", r)
+	}
+}
+
+// TestRelayDeadPeerIsNotDegraded: h_deadpeer on the Android path.
+func TestRelayDeadPeerIsNotDegraded(t *testing.T) {
+	h := newRelayStallHarness(t, nil)
+	h.exit.echo.Store(true)
+	if r := h.reason(1500 * time.Millisecond); r != "" || h.degraded.Load() != 0 {
+		t.Fatalf("a live relay was given up for a dead peer: %q", r)
+	}
+}
+
+// TestPollingKeepaliveCountSurvivesTheHandshakeWrapper: the TUN handshake may
+// hand the tunnel back wrapped in a replayConn; the Polling count under it
+// must still be what the detector reads, or the feeder's frames count again.
+func TestPollingKeepaliveCountSurvivesTheHandshakeWrapper(t *testing.T) {
+	v := &VPNClient{}
+	v.keepaliveEchoes.Add(7)
+	if got := v.echoCounter(&replayConn{Conn: pollingLike{}})(); got != 0 {
+		t.Fatalf("read %d echoes through the wrapper: the generic count, not the server's", got)
+	}
+}
