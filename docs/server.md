@@ -332,8 +332,19 @@ client in its index - each registry client's own secret and the global
   or the cover domain, exactly as an unauthenticated stranger does.
 
 Without the flag - the default - the tag is not looked at, costs nothing, and
-a tagged hello is mirrored like any other, as in 1.11.8. So on a B1 exit the
+a tagged hello is treated like any other, as in 1.11.8. So on a B1 exit the
 TLS fallbacks of clients with a donor-name pool work only with the flag on.
+
+"Treated like any other" is not "mirrored": the flag only decides tag
+admission. These hellos reach the exit's own TLS stack whatever it says,
+each a way for a probe to tell the exit from the site it imitates:
+
+- a valid ClientHello with no X25519 key share (P-256 only, say), which the
+  B1 gate cannot read;
+- any ClientHello when no donor can be dialled;
+- a hello with a padding extension of 64 bytes or more, with
+  `-reality-legacy` on (it goes to the legacy path, see the probe table);
+- IMAP STARTTLS on the IMAP camouflage port, which runs its own TLS server.
 
 Before turning the flag on, know what it opens. The tag binds neither the
 hello nor the exit, so a copy works once on every exit that shares the secret

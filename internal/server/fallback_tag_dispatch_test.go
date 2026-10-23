@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -630,4 +631,34 @@ func TestWeakRegistrySecretsAreSaidWithTheTag(t *testing.T) {
 			t.Fatal("the strong client was called weak")
 		}
 	}
+}
+
+// TestHelloShapesThatReachTheExitsOwnTLS documents P3-8 of the round-6
+// review: the flag off means no tag admission, not that every hello is
+// mirrored. These shapes predate the tag and reach the exit's own TLS stack
+// whatever the flag says - each is a probe oracle of its own, listed in
+// docs/server.md:
+//   - a valid hello with no X25519 key share (P-256 only): the B1 gate cannot
+//     parse it as B1 and hands it on;
+//   - any hello when no donor can be dialled.
+func TestHelloShapesThatReachTheExitsOwnTLS(t *testing.T) {
+	srv := newTagServer(t, "")
+	srv.srvCtx.cfg.REALITYFallbackTag = false
+
+	client, server := net.Pipe()
+	go func() {
+		_ = tls.Client(client, &tls.Config{ServerName: "www.google.com", InsecureSkipVerify: true, //nolint:gosec // a probe
+			CurvePreferences: []tls.CurveID{tls.CurveP256}}).Handshake()
+	}()
+	_ = server.SetReadDeadline(time.Now().Add(5 * time.Second))
+	p256, err := readRecord(server)
+	client.Close()
+	server.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectTLSPath(t, srv, p256)
+
+	srv.srvCtx.donorDialer = func(string) (net.Conn, error) { return nil, errors.New("donor unreachable") }
+	expectTLSPath(t, srv, proberHello(t, "www.google.com"))
 }
