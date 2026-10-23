@@ -244,8 +244,11 @@ func coreOn(t *testing.T, pool []string, log *[]string, mu *sync.Mutex) *strateg
 	for i, a := range pool {
 		eps = append(eps, endpoint.Endpoint{Name: fmt.Sprintf("ep%d", i), V4: a, Order: i})
 	}
+	// Shared, as buildManager has it in production (selectorConfig): every
+	// core of the process gets the same selector back (P2-F of the round-6
+	// review - without it the tests missed that parks outlived a stop).
 	if err := m.SetEndpointSelection(endpoint.Config{Endpoints: eps, Family: endpoint.V4Only, FailureThreshold: 2,
-		Cooldown: time.Minute, MaxCooldown: 30 * time.Minute}); err != nil {
+		Cooldown: time.Minute, MaxCooldown: 30 * time.Minute, Shared: true}); err != nil {
 		t.Fatal(err)
 	}
 	m.Register(&namedPipeStrategy{t: t, id: "reality", prio: 1, log: log, mu: mu})
@@ -324,6 +327,12 @@ func TestAndroidCarryIsForTheRestartOnly(t *testing.T) {
 	sess := &androidSession{mgr: m, linkUp: func() bool { return true }}
 	parkFirst(sess, m)
 	carryFrom(m, sess)
+	androidCarry.mu.Lock()
+	at := androidCarry.at
+	androidCarry.mu.Unlock()
+	if at != at.Round(0) {
+		t.Fatal("the carry is stamped with a monotonic clock, which stops while the phone sleeps")
+	}
 	if got := firstDial(); got != "reality@"+pool[1] {
 		t.Fatalf("restart after a dead connection dialled %s - the carry proves nothing", got)
 	}

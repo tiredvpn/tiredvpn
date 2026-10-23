@@ -1574,7 +1574,9 @@ const routeDeathWindow = 10 * time.Minute
 // spared it forever. A server gets one pass after a switch and is charged on
 // its second death in a row.
 func (m *Manager) routeDeath(cand endpoint.Candidate, class deathClass, why string, ids []string) bool {
-	now := time.Now()
+	// Wall clock: the mark crosses Android core restarts, and a phone asleep
+	// between two deaths must count the sleep (P3-3 of the round-6 review).
+	now := time.Now().Round(0)
 	m.mu.Lock()
 	prev := m.lastDeath
 	m.lastDeath = deathMark{server: cand.EndpointIdx, class: class, at: now}

@@ -236,6 +236,12 @@ func TestAnOldDeathIsNotTheRoute(t *testing.T) {
 			t.Fatalf("a death on a %v ago: route=%v, want %v", tc.age, got, tc.route)
 		}
 	}
+	m.mu.RLock()
+	at := m.lastDeath.at
+	m.mu.RUnlock()
+	if at != at.Round(0) {
+		t.Fatal("the route mark is stamped with a monotonic clock, which stops while a phone sleeps")
+	}
 }
 
 // refuseAtGreeter is greetingStrategy refused at the listed addresses.
