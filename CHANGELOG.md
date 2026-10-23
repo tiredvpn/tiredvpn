@@ -45,9 +45,12 @@ Versions follow [Semantic Versioning](https://semver.org/).
 - **Client: fewer probes and polls on a fixed period.** Reprobes, pool polls,
   upgrade offers and emergency reprobes are spaced by drawn pauses, and no
   reprobe runs while the client is reconnecting.
-- **Android: a stall verdict and the session's endpoint survive the app's
-  core restart**, so the client does not come straight back to the server it
-  just left; Android sessions now feed the storm detector.
+- **Android: what the client learned about the servers survives the app's
+  core restart after a dead connection** - parks, the route verdict, the
+  swallowed transports, the storm history - so it does not come straight
+  back to the server it just left; Android sessions now feed the storm
+  detector. A stop by the user, and a restart more than 2 minutes later,
+  start from nothing.
 - **Server: an idle HTTP Polling session is no longer dropped after ~6
   minutes** while its client keeps polling, directly or through a relay.
 - **Server: a client keeps its tunnel address across transports and
