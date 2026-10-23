@@ -79,11 +79,20 @@ const silentCycleMaxDelay = 30 * time.Second
 // unreachable from a working network" story as a silent pool, one layer up,
 // and the 2-minute cap slept through up to two minutes of recovered network.
 func nextReconnectDelay(cur time.Duration, err error) time.Duration {
+	return capReconnectDelay(time.Duration(float64(cur)*reconnectMultiplier), err)
+}
+
+// capReconnectDelay caps a backoff for the failure err: silentCycleMaxDelay
+// after a silent or unanswered cycle, reconnectMaxDelay otherwise. Applied to
+// the pause about to be slept as well, not only to the next one: a silent
+// cycle after answered failures slept the old backoff first, up to 2 minutes
+// plus jitter.
+func capReconnectDelay(d time.Duration, err error) time.Duration {
 	maxDelay := reconnectMaxDelay
 	if errors.Is(err, strategy.ErrAddrSilent) || errors.Is(err, strategy.ErrCycleUnanswered) {
 		maxDelay = silentCycleMaxDelay
 	}
-	return min(time.Duration(float64(cur)*reconnectMultiplier), maxDelay)
+	return min(d, maxDelay)
 }
 
 // Port hop reconnect configuration (faster than regular reconnect)
@@ -2298,6 +2307,10 @@ func (v *VPNClient) disconnect(conn net.Conn, reason string, err error) {
 			continue
 		}
 		poolSilentSince = time.Time{}
+
+		// A cycle that heard nothing waits no longer than the silence cap,
+		// whatever the backoff grew to on failures before it.
+		currentDelay = capReconnectDelay(currentDelay, err)
 
 		// Classify error type for better logging
 		errType := classifyError(err)
