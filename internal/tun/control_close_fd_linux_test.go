@@ -162,8 +162,17 @@ type ctlHarness struct {
 
 func newCtlHarness(t *testing.T) *ctlHarness {
 	t.Helper()
+	return newCtlHarnessWith(t, &ControlConfig{MTU: 1280})
+}
+
+// newCtlHarnessWith is newCtlHarness over cfg. The hooks the connection's
+// reader calls (DisconnectedFn, ConnectRequestedFn) are read without the
+// server's lock, as in production, where the config is complete before the
+// server starts: set them here, not on the running server.
+func newCtlHarnessWith(t *testing.T, cfg *ControlConfig) *ctlHarness {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), "ctl.sock")
-	cs, err := NewControlServer(path, &ControlConfig{MTU: 1280})
+	cs, err := NewControlServer(path, cfg)
 	if err != nil {
 		t.Fatalf("NewControlServer: %v", err)
 	}
@@ -806,21 +815,14 @@ func TestControlTunFdCountAcrossSwaps(t *testing.T) {
 // (P3-5 of the round-5 review). Close is every shutdown - after a dead
 // connection too - and must not (P1-B of the round-6 review).
 func TestOnlyTheDisconnectCommandIsTheUsersStop(t *testing.T) {
-	h := newCtlHarness(t)
 	var called atomic.Int32
-	h.cs.mu.Lock()
-	h.cs.config.DisconnectedFn = func() { called.Add(1) }
-	h.cs.mu.Unlock()
-
+	h := newCtlHarnessWith(t, &ControlConfig{MTU: 1280, DisconnectedFn: func() { called.Add(1) }})
 	_ = h.cs.Close()
 	if n := called.Load(); n != 0 {
 		t.Fatalf("Close told DisconnectedFn %d times", n)
 	}
 
-	h = newCtlHarness(t)
-	h.cs.mu.Lock()
-	h.cs.config.DisconnectedFn = func() { called.Add(1) }
-	h.cs.mu.Unlock()
+	h = newCtlHarnessWith(t, &ControlConfig{MTU: 1280, DisconnectedFn: func() { called.Add(1) }})
 	h.send(`{"command":"disconnect"}`, -1)
 	if n := called.Load(); n != 1 {
 		t.Fatalf("the disconnect command told DisconnectedFn %d times, want 1", n)
