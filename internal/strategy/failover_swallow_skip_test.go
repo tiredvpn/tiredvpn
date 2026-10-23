@@ -77,8 +77,9 @@ func TestTheSkipListOutlivesAPark(t *testing.T) {
 	m.Register(&protectedGreeter{id: "reality", priority: 5})
 	m.Register(&protectedGreeter{id: "polling", priority: 6})
 	m.noteSwallowed(addr, []string{"reality"})
+	key := m.swallowKey(addr)
 	m.mu.Lock()
-	m.swallowed[addr].last = time.Now().Add(-2 * swallowWindow)
+	m.swallowed[key].last = time.Now().Add(-2 * swallowWindow)
 	m.mu.Unlock()
 	if len(m.swallowSkip(addr)) != 0 {
 		t.Fatal("a stale record on an address that is not parked still skips - the test proves nothing")

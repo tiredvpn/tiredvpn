@@ -275,6 +275,21 @@ func (d *StormDetector) RecordSession(strategyID string, lifetime time.Duration)
 	return false
 }
 
+// Park excludes strategyID from selection for the cooldown, as a storm would:
+// for a verdict reached elsewhere (Manager.routeDeath).
+func (d *StormDetector) Park(strategyID string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	st := d.byID[strategyID]
+	if st == nil {
+		st = &strategyStorm{}
+		d.byID[strategyID] = st
+	}
+	st.parkedUntil = d.now().Add(d.cfg.Cooldown)
+	st.consecutiveShort = 0
+	st.lastShortEnd = time.Time{}
+}
+
 // IsParked reports whether strategyID is currently excluded from selection due
 // to a recent storm. Parking expires automatically after the cooldown.
 func (d *StormDetector) IsParked(strategyID string) bool {
