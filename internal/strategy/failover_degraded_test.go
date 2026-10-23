@@ -17,6 +17,9 @@ func TestPollingCountsOnlyTheServersKeepalives(t *testing.T) {
 	bodies := [][]byte{hs, keepalive, tunFrame(60, 0xb2), keepalive}
 	c := newScriptedPollingConn(t, bodies)
 	fc := useFakeClock(c)
+	if _, tracked := c.ServerKeepalives(); tracked {
+		t.Fatal("a count before the TUN frame stream claims to be tracked")
+	}
 	if _, err := c.Write([]byte{meekTUNMode, 0, 0, 0, 0, 0x05, 0xdc, 0x04}); err != nil {
 		t.Fatal(err)
 	}
@@ -28,7 +31,7 @@ func TestPollingCountsOnlyTheServersKeepalives(t *testing.T) {
 	if !ok {
 		t.Fatal("the polling conn is not found under its wrapper")
 	}
-	if n := counter.ServerKeepalives(); n != 2 {
+	if n, tracked := counter.ServerKeepalives(); n != 2 || !tracked {
 		t.Fatalf("counted %d server keepalives, want 2 (the feeder spliced %d)", n, len(spliced))
 	}
 }

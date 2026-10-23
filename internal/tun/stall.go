@@ -491,6 +491,7 @@ func (e *sessionDegradedError) Is(target error) bool { return target == strategy
 // socket's relay, which carries its own (tunRelay.watchStalls).
 func (v *VPNClient) watchStalls() {
 	var judged net.Conn     // the session that has had its verdict
+	var unjudged net.Conn   // the session that can not be judged, logged once
 	var holdUntil time.Time // no suspicion before this
 	ticker := time.NewTicker(stallClocks().checkEvery)
 	defer ticker.Stop()
@@ -517,9 +518,17 @@ func (v *VPNClient) watchStalls() {
 		if !ok {
 			continue
 		}
+		echoes := echoSourceFor(conn, strat, v.keepaliveEchoes.Load)
+		if !echoes.usable() {
+			if unjudged != conn {
+				log.Info("Session suspect but not judged: %s", echoes.why)
+				unjudged = conn
+			}
+			continue
+		}
 		stall := suspect.stall
 		log.Info("Session suspect: a flow has waited %v for an answer - confirming with keepalives", stall.Round(time.Millisecond))
-		alive, sent, err := mon.confirm(v.stopCh, keepaliveSender(conn, v.stopCh), v.echoCounter(conn))
+		alive, sent, err := mon.confirm(v.stopCh, keepaliveSender(conn, v.stopCh), echoes.count)
 		v.mu.Lock()
 		current := v.conn == conn
 		v.mu.Unlock()
@@ -563,28 +572,37 @@ func (v *VPNClient) watchStalls() {
 	}
 }
 
-// echoCounter is what a confirmation counts as the server's echo on conn:
-// the zero-length frames the conn says the server sent, when it makes up its
-// own (HTTP Polling), else every zero-length frame read off the tunnel.
-func (v *VPNClient) echoCounter(conn net.Conn) func() uint64 {
-	if count, ok := serverKeepaliveCount(conn); ok {
-		return count
-	}
-	return v.keepaliveEchoes.Load
+// echoSource is what a confirmation counts as the server's echo on a conn,
+// and whether that count can be had at all.
+type echoSource struct {
+	count  func() uint64
+	usable func() bool
+	why    string // when not usable
 }
 
-// serverKeepaliveCount finds the server's own keepalive count under conn.
-// The TUN handshake may hand the tunnel back as a replayConn, which keeps its
-// inner conn to itself on purpose (reads must go through it); only the count
-// is looked up underneath.
-func serverKeepaliveCount(conn net.Conn) (func() uint64, bool) {
+// echoSourceFor reads echoes on conn, carried by strat (nil when unknown):
+// the zero-length frames the conn says the server sent, when it makes up its
+// own (HTTP Polling), else every zero-length frame read off the tunnel
+// (generic). A conn that makes up its own but has lost count - or whose
+// count is out of reach under a wrapper - is not judged: the generic count
+// includes the made-up frames and would pass every confirmation, and a count
+// stuck after lost framing would fail every one.
+func echoSourceFor(conn net.Conn, strat strategy.Strategy, generic func() uint64) echoSource {
 	if rc, ok := conn.(*replayConn); ok {
 		conn = rc.Conn
 	}
 	if c, ok := strategy.ServerKeepaliveCounterOf(conn); ok {
-		return c.ServerKeepalives, true
+		return echoSource{
+			count:  func() uint64 { n, _ := c.ServerKeepalives(); return n },
+			usable: func() bool { _, tracked := c.ServerKeepalives(); return tracked },
+			why:    "the conn has lost track of the server's keepalives",
+		}
 	}
-	return nil, false
+	if km, ok := strat.(strategy.KeepaliveMaker); ok && km.MakesUpKeepalives() {
+		return echoSource{count: generic, usable: func() bool { return false },
+			why: "the strategy makes up keepalives and their count is out of reach"}
+	}
+	return echoSource{count: generic, usable: func() bool { return true }}
 }
 
 // keepaliveSender writes one zero-length keepalive frame to conn, and returns
@@ -647,10 +665,8 @@ type relayStall struct {
 // reconnects on it as on any dead connection.
 func (r *tunRelay) watchStalls() {
 	mon := newStallMonitor(&r.stall.flows)
-	echoes := r.stall.echoes.Load
-	if count, ok := serverKeepaliveCount(r.serverConn); ok {
-		echoes = count
-	}
+	echoes := echoSourceFor(r.serverConn, nil, r.stall.echoes.Load)
+	var unjudgedLogged bool
 	var holdUntil time.Time // no suspicion before this
 	ticker := time.NewTicker(stallClocks().checkEvery)
 	defer ticker.Stop()
@@ -669,9 +685,16 @@ func (r *tunRelay) watchStalls() {
 		if !ok {
 			continue
 		}
+		if !echoes.usable() {
+			if !unjudgedLogged {
+				log.Info("TUN relay: suspect but not judged: %s", echoes.why)
+				unjudgedLogged = true
+			}
+			continue
+		}
 		stall := suspect.stall
 		log.Info("TUN relay: a flow has waited %v for an answer - confirming with keepalives", stall.Round(time.Millisecond))
-		alive, sent, err := mon.confirm(r.stopCh, keepaliveSender(r.serverConn, r.stopCh), echoes)
+		alive, sent, err := mon.confirm(r.stopCh, keepaliveSender(r.serverConn, r.stopCh), echoes.count)
 		select {
 		case <-r.done:
 			return

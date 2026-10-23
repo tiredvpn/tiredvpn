@@ -99,7 +99,18 @@ func (e *stallExit) serve() {
 // so: the server itself sent none.
 type pollingLike struct{ net.Conn }
 
-func (pollingLike) ServerKeepalives() uint64 { return 0 }
+func (pollingLike) ServerKeepalives() (uint64, bool) { return 0, true }
+
+// lostTrackConn is a Polling-like conn whose tracker lost the framing.
+type lostTrackConn struct{ net.Conn }
+
+func (lostTrackConn) ServerKeepalives() (uint64, bool) { return 0, false }
+
+// keepaliveMakingStrategy is a strategy that says its conns make up
+// keepalives, as HTTP Polling does.
+type keepaliveMakingStrategy struct{ rankedPipeStrategy }
+
+func (*keepaliveMakingStrategy) MakesUpKeepalives() bool { return true }
 
 type stallHarness struct {
 	v    *VPNClient
@@ -469,10 +480,41 @@ func TestRelayDeadPeerIsNotDegraded(t *testing.T) {
 // hand the tunnel back wrapped in a replayConn; the Polling count under it
 // must still be what the detector reads, or the feeder's frames count again.
 func TestPollingKeepaliveCountSurvivesTheHandshakeWrapper(t *testing.T) {
-	v := &VPNClient{}
-	v.keepaliveEchoes.Add(7)
-	if got := v.echoCounter(&replayConn{Conn: pollingLike{}})(); got != 0 {
+	generic := func() uint64 { return 7 }
+	if got := echoSourceFor(&replayConn{Conn: pollingLike{}}, nil, generic).count(); got != 0 {
 		t.Fatalf("read %d echoes through the wrapper: the generic count, not the server's", got)
+	}
+}
+
+// TestAConnThatLostCountIsNotJudged is P3-6 of the round-4 review: once the
+// Polling tracker loses the framing it stops counting the server's
+// keepalives, and every later confirmation failed - toward a verdict. Such a
+// session is not judged at all.
+func TestAConnThatLostCountIsNotJudged(t *testing.T) {
+	h := newStallHarness(t, func(c net.Conn) net.Conn { return lostTrackConn{c} })
+	if !h.wait("not judged: the conn has lost track", 2*time.Second) {
+		t.Fatalf("no skip:\n%s", h.out)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if strings.Contains(h.out.String(), "Session degraded") || h.exit.gotEcho.Load() != 0 {
+		t.Fatalf("a session without a usable echo count was judged:\n%s", h.out)
+	}
+}
+
+// TestAMadeUpKeepaliveStrategyWithoutItsCountIsNotJudged is P3-7: a conn of
+// a strategy that makes up keepalives, wrapped in something that hides its
+// count, fell back to the generic count - which includes the made-up frames
+// and passes every confirmation. It is not judged instead.
+func TestAMadeUpKeepaliveStrategyWithoutItsCountIsNotJudged(t *testing.T) {
+	h := newStallHarness(t, nil)
+	h.v.mu.Lock()
+	h.v.strategy = &keepaliveMakingStrategy{rankedPipeStrategy{pipeStrategy: &pipeStrategy{t: t}, id: "polling", priority: 6}}
+	h.v.mu.Unlock()
+	if !h.wait("not judged: the strategy makes up keepalives", 2*time.Second) {
+		t.Fatalf("no skip:\n%s", h.out)
+	}
+	if h.exit.gotEcho.Load() != 0 {
+		t.Fatal("keepalives went out to confirm against a count that includes made-up frames")
 	}
 }
 

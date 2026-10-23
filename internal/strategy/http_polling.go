@@ -610,11 +610,18 @@ func (c *HTTPPollingConn) UplinkProgress() (accepted, sent uint64) {
 // keepalive echoes. The feeder splices frames that look the same into what
 // Read returns, so a reader that counts those as echoes hears an answer from a
 // server that may be saying nothing (see strategy.ServerKeepaliveCounter).
-func (c *HTTPPollingConn) ServerKeepalives() uint64 {
+//
+// tracked is false outside the TUN frame stream: on a SOCKS stream, before
+// the handshake is through, or after the tracker lost the framing - then no
+// count can be had, and an echo judged without one would be judged wrong.
+func (c *HTTPPollingConn) ServerKeepalives() (n uint64, tracked bool) {
 	c.recvLock.Lock()
 	defer c.recvLock.Unlock()
-	return c.stream.keepalives
+	return c.stream.keepalives, c.stream.state == meekDownFrames
 }
+
+// MakesUpKeepalives: the feeder splices keepalive frames of its own.
+func (*HTTPPollingStrategy) MakesUpKeepalives() bool { return true }
 
 // doRequest performs one HTTP poll request, reusing the previous request's TLS
 // connection (HTTP/1.1 keep-alive) when one is live and within the reuse bounds,

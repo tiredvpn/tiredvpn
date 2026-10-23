@@ -2573,7 +2573,18 @@ func (sc *StrategyConn) NetConn() net.Conn { return sc.Conn }
 // ServerKeepalives counts only the zero-length frames the server sent, which
 // is what a keepalive echo has to be judged by.
 type ServerKeepaliveCounter interface {
-	ServerKeepalives() uint64
+	// ServerKeepalives returns the count; tracked is false while the conn
+	// can not tell the server's frames apart (before the TUN frame stream,
+	// or after losing its framing), and the count then says nothing.
+	ServerKeepalives() (n uint64, tracked bool)
+}
+
+// KeepaliveMaker is implemented by a strategy whose conns splice keepalive
+// frames of their own into the downlink (HTTP Polling). A caller that judges
+// echoes needs those conns' ServerKeepaliveCounter, and must not judge them
+// without it.
+type KeepaliveMaker interface {
+	MakesUpKeepalives() bool
 }
 
 // ServerKeepaliveCounterOf finds a ServerKeepaliveCounter in conn or under
