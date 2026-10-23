@@ -5908,6 +5908,12 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 	lenBuf := make([]byte, 4)
 	var packetsUp int64
 	var pending []byte // a frame's head whose tail has not arrived yet
+	// polledAt is the last poll this loop has passed on to the shared TUN as
+	// activity. A Polling client proves it is alive by polling, idle or not;
+	// before polls counted, an idle session was cleaned as inactive after
+	// ~340 s on the 2026-10-22 stand, and the client saw a session reset on a
+	// healthy idle tunnel. Works for every client version.
+	var polledAt int64
 
 	for {
 		select {
@@ -5924,6 +5930,11 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 		if sess.closed.Load() {
 			logger.Debug("HTTP Polling TUN: session closed")
 			return
+		}
+
+		if at := sess.lastActive.Load(); at != polledAt {
+			polledAt = at
+			sink.UpdateActivity()
 		}
 
 		// Read packet from client via polling buffer. pending is the tail of a

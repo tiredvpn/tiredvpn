@@ -69,7 +69,8 @@ const (
 )
 
 // silentCycleMaxDelay caps the reconnect backoff after a cycle that ended in
-// silence (strategy.ErrAddrSilent).
+// silence (strategy.ErrAddrSilent) or heard nothing back without a verdict
+// (strategy.ErrCycleUnanswered).
 const silentCycleMaxDelay = 30 * time.Second
 
 // nextReconnectDelay is the backoff after a failed reconnect with err:
@@ -79,7 +80,7 @@ const silentCycleMaxDelay = 30 * time.Second
 // and the 2-minute cap slept through up to two minutes of recovered network.
 func nextReconnectDelay(cur time.Duration, err error) time.Duration {
 	maxDelay := reconnectMaxDelay
-	if errors.Is(err, strategy.ErrAddrSilent) {
+	if errors.Is(err, strategy.ErrAddrSilent) || errors.Is(err, strategy.ErrCycleUnanswered) {
 		maxDelay = silentCycleMaxDelay
 	}
 	return min(time.Duration(float64(cur)*reconnectMultiplier), maxDelay)
@@ -175,6 +176,12 @@ type VPNClient struct {
 	// or readTimeout fires on a live tunnel.
 	connectedAt time.Time
 	lastRx      time.Time
+
+	// stall follows the session's TCP flows for the stall detector
+	// (watchStalls); reset with every new tunnel connection.
+	// keepaliveEchoes counts the zero-length frames read off the tunnel.
+	stall           flowTable
+	keepaliveEchoes atomic.Uint64
 
 	// connCancel cancels the context of an in-flight connect() so Stop() can
 	// abort a dial/handshake that is blocked on the network without waiting
@@ -611,6 +618,7 @@ func (v *VPNClient) Start(ctx context.Context) error {
 	go v.readFromTun()
 	go v.readFromServer()
 	go v.sendKeepalive()
+	go v.watchStalls()
 
 	// Auto-MTU: measure the real end-to-end ceiling and apply min(probed, cap).
 	// readFromServer is already running so PROBE_REPLY frames can be routed to the
@@ -871,6 +879,7 @@ func (v *VPNClient) seamlessPortHop(newPort int) {
 	v.upgradePending = nil
 	v.connectedAt = time.Now()
 	v.lastRx = v.connectedAt
+	v.stall.reset()
 	v.mu.Unlock()
 
 	// The hop replaced the session; book it like the upgrade swap does, and
@@ -1023,6 +1032,7 @@ func (v *VPNClient) connect(parent context.Context) error {
 	v.upgradePending = nil
 	v.connectedAt = time.Now()
 	v.lastRx = v.connectedAt
+	v.stall.reset()
 	if hasCaps {
 		v.serverCaps = caps
 	}
@@ -1667,6 +1677,7 @@ func (v *VPNClient) readFromTun() {
 			log.Debug("TUN->Server: conn is nil, dropping %d bytes", n)
 			continue
 		}
+		v.stall.up(buf[4:4+n], time.Now())
 
 		conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 		written, err := conn.Write(buf[:n+4])
@@ -1729,6 +1740,7 @@ func (v *VPNClient) readFromServer() {
 		// Handle keepalive packet (zero length)
 		if pktLen == 0 {
 			log.Debug("Received keepalive from server")
+			v.keepaliveEchoes.Add(1)
 			v.noteDownlink()
 			continue
 		}
@@ -1824,6 +1836,7 @@ func (v *VPNClient) readFromServer() {
 			log.Debug("Successfully wrote %d bytes to TUN", n)
 		}
 
+		v.stall.down(actualBuf, time.Now())
 		v.noteDownlink()
 
 		atomic.AddInt64(&v.packetsDown, 1)
@@ -2084,6 +2097,7 @@ func (v *VPNClient) swapUpgradedConn(oldConn, newConn net.Conn, strat strategy.S
 	v.upgradePending = strat
 	v.connectedAt = time.Now()
 	v.lastRx = v.connectedAt
+	v.stall.reset()
 	if hasCaps {
 		v.serverCaps = caps
 	}
@@ -2166,13 +2180,18 @@ func (v *VPNClient) disconnect(conn net.Conn, reason string, err error) {
 		// Not while an upgrade is pending: that session is the upgrade's, and
 		// its death says the new strategy failed (UpgradeOutcome above), not
 		// that the server - which just carried the fallback - is dead.
-		dead := pendingUpgrade == nil && silent && sessionDiedYoung(connectedAt, lastRx)
+		//
+		// A degraded session (the stall detector's verdict) is booked the
+		// same way whatever its age, once: not also as dead.
+		_, degraded := errors.AsType[*sessionDegradedError](err)
+		dead := pendingUpgrade == nil && silent && !degraded && sessionDiedYoung(connectedAt, lastRx)
 		v.manager.SessionEnded(strategy.SessionEnd{
 			Strategy:       endedStrategy.ID(),
 			Endpoint:       sessionCand,
 			HasEndpoint:    hasSessionCand,
-			Useful:         sessionWasUseful(connectedAt, lastRx),
+			Useful:         sessionWasUseful(connectedAt, lastRx) && !degraded,
 			Dead:           dead,
+			Degraded:       degraded && pendingUpgrade == nil,
 			UpgradeFailed:  pendingUpgrade != nil,
 			LocalNetworkUp: probeLocalLink,
 		})
@@ -2283,11 +2302,7 @@ func (v *VPNClient) disconnect(conn net.Conn, reason string, err error) {
 		errType := classifyError(err)
 		log.Warn("Reconnect failed (%s): %v, next attempt in %v", errType, err, currentDelay)
 
-		// If all strategies are blocked (circuit breakers open), reset them
-		if v.manager != nil && !v.manager.HasAvailableStrategies() {
-			log.Warn("All strategies blocked by circuit breakers, resetting...")
-			v.manager.ResetForNetworkChange()
-		}
+		v.unblockStrategies()
 
 		// Wait with jitter before next attempt
 		select {
@@ -2298,6 +2313,17 @@ func (v *VPNClient) disconnect(conn net.Conn, reason string, err error) {
 		}
 
 		currentDelay = nextReconnectDelay(currentDelay, err)
+	}
+}
+
+// unblockStrategies resets the strategies when every one of them is blocked
+// (circuit breakers open, confidence on the floor) - the strategies only: the
+// network did not change, and what the client learned about the endpoints
+// stays (see Manager.ResetStrategyBlocks).
+func (v *VPNClient) unblockStrategies() {
+	if v.manager != nil && !v.manager.HasAvailableStrategies() {
+		log.Warn("All strategies blocked by circuit breakers, resetting...")
+		v.manager.ResetStrategyBlocks()
 	}
 }
 
@@ -2790,6 +2816,11 @@ type RelayErrorCallback func(reason string)
 type RelayCallbacks struct {
 	OnError     func(reason string) // Called when relay dies (timeout, read error, etc.)
 	OnKeepalive func()              // Called when keepalive received from server
+	// OnDegraded is called when the stall detector gives the session up as
+	// alive but useless, just before the relay closes the connection (OnError
+	// follows with a "session_degraded" reason). stall is how long the
+	// oldest demand waited.
+	OnDegraded func(stall time.Duration)
 }
 
 // RunTUNRelayWithStop runs packet relay with external stop control
@@ -2837,6 +2868,13 @@ type tunRelay struct {
 	tun          atomic.Pointer[TUNDevice] // where server->TUN writes go
 	lastActivity atomic.Int64
 
+	// stall is the stall detector's state for this relay's session (one
+	// relay, one server connection); startedAt is when the session began and
+	// degraded the detector's verdict, once given.
+	stall     relayStall
+	startedAt time.Time
+	degraded  atomic.Pointer[sessionDegradedError]
+
 	// firstDev/firstStop are the reader run starts with, fixed at
 	// construction: a SwapTUN that lands before run gets going must still
 	// find - and stop - the reader of the device it replaces.
@@ -2859,6 +2897,7 @@ func newTUNRelay(tunDev *TUNDevice, serverConn net.Conn, localIP, remoteIP net.I
 		safeClose:  safeClose,
 		readerStop: make(chan struct{}),
 		done:       make(chan struct{}),
+		startedAt:  time.Now(),
 	}
 	r.ownerStopped = func() bool {
 		if externalStopCh == nil {
@@ -2910,9 +2949,13 @@ func (r *tunRelay) run() {
 	// after a restart, into a control connection that no longer exists.
 	go runDeadConnectionMonitor(r.stopCh, r.done, r.safeClose, r.idleDuration, r.callbacks)
 	go runKeepaliveSender(r.stopCh, r.done, r.serverConn, r.connFailed)
-	go runTUNToServer(r.stopCh, r.firstStop, r.safeClose, r.firstDev, r.serverConn, r.updateActivity, r.connFailed)
+	go runTUNToServer(r.stopCh, r.firstStop, r.safeClose, r.firstDev, r.serverConn, r.updateActivity, r.connFailed, &r.stall)
+	go r.watchStalls()
 
-	errorReason := runServerToTUN(r.stopCh, r.safeClose, &r.tun, r.serverConn, r.remoteIP, r.updateActivity, r.callbacks)
+	errorReason := runServerToTUN(r.stopCh, r.safeClose, &r.tun, r.serverConn, r.remoteIP, r.updateActivity, r.callbacks, &r.stall)
+	if d := r.degraded.Load(); d != nil {
+		errorReason = "session_degraded: " + d.Error()
+	}
 
 	r.safeClose()
 	if r.ownerStopped() {
@@ -2950,7 +2993,7 @@ func (r *tunRelay) SwapTUN(newDev *TUNDevice) bool {
 	close(r.readerStop)
 	r.readerStop = make(chan struct{})
 	r.tun.Store(newDev)
-	go runTUNToServer(r.stopCh, r.readerStop, r.safeClose, newDev, r.serverConn, r.updateActivity, r.connFailed)
+	go runTUNToServer(r.stopCh, r.readerStop, r.safeClose, newDev, r.serverConn, r.updateActivity, r.connFailed, &r.stall)
 	return true
 }
 
@@ -3015,7 +3058,9 @@ func runKeepaliveSender(stopCh chan struct{}, relayDone <-chan struct{}, serverC
 // runTUNToServer reads IP packets from one TUN device and frames them to
 // serverConn. readerStop ends this reader alone (the relay moved to another
 // device); stopCh ends the whole relay.
-func runTUNToServer(stopCh, readerStop chan struct{}, safeClose func(), tunDev *TUNDevice, serverConn net.Conn, updateActivity func(), connFailed func()) {
+//
+// stall, when set, sees every packet on its way up (the stall detector).
+func runTUNToServer(stopCh, readerStop chan struct{}, safeClose func(), tunDev *TUNDevice, serverConn net.Conn, updateActivity func(), connFailed func(), stall *relayStall) {
 	buf := make([]byte, tunDev.mtu+4)
 	pktCount := 0
 	for {
@@ -3054,6 +3099,9 @@ func runTUNToServer(stopCh, readerStop chan struct{}, safeClose func(), tunDev *
 
 		ClampTCPMSS(buf[4:4+n], tunDev.mtu)
 		binary.BigEndian.PutUint32(buf[:4], uint32(n))
+		if stall != nil {
+			stall.flows.up(buf[4:4+n], time.Now())
+		}
 
 		serverConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		if _, err := serverConn.Write(buf[:n+4]); err != nil {
@@ -3069,7 +3117,10 @@ func runTUNToServer(stopCh, readerStop chan struct{}, safeClose func(), tunDev *
 // runServerToTUN reads framed packets from serverConn and writes them to the
 // relay's current TUN device, re-read per packet so a swap takes effect on
 // the next one. Returns an error reason string (empty if stopped intentionally).
-func runServerToTUN(stopCh chan struct{}, safeClose func(), tun *atomic.Pointer[TUNDevice], serverConn net.Conn, remoteIP net.IP, updateActivity func(), callbacks *RelayCallbacks) string {
+//
+// stall, when set, sees every packet that reaches the TUN and counts the
+// keepalive echoes (the stall detector).
+func runServerToTUN(stopCh chan struct{}, safeClose func(), tun *atomic.Pointer[TUNDevice], serverConn net.Conn, remoteIP net.IP, updateActivity func(), callbacks *RelayCallbacks, stall *relayStall) string {
 	lenBuf := make([]byte, 4)
 	pktCount := 0
 	for {
@@ -3094,6 +3145,9 @@ func runServerToTUN(stopCh chan struct{}, safeClose func(), tun *atomic.Pointer[
 
 		if pktLen == 0 {
 			log.Debug("Received keepalive from server")
+			if stall != nil {
+				stall.echoes.Add(1)
+			}
 			if callbacks != nil && callbacks.OnKeepalive != nil {
 				callbacks.OnKeepalive()
 			}
@@ -3134,6 +3188,8 @@ func runServerToTUN(stopCh chan struct{}, safeClose func(), tun *atomic.Pointer[
 
 		if _, err := tunDev.Write(buf); err != nil {
 			log.Debug("TUN write error: %v", err)
+		} else if stall != nil {
+			stall.flows.down(buf, time.Now())
 		}
 	}
 }

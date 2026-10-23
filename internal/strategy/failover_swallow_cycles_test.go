@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -210,5 +211,31 @@ func TestAVerdictEndsTheRun(t *testing.T) {
 	}
 	if st := endpointState(t, m, addr); st.CooldownUntil.After(time.Now()) {
 		t.Fatalf("parked: %+v", st)
+	}
+}
+
+// TestAnUnansweredCycleSaysSo is side finding 2 of the degraded-session
+// report. With one transport left (forced, or the rest held back) the fast
+// path that heard nothing excluded itself and the cycle ended as "no
+// available strategies" - read as a circuit-breaker problem, and the
+// reconnect backoff doubled to 2 minutes. The cycle now ends with the fast
+// path's own failure, marked as unanswered.
+func TestAnUnansweredCycleSaysSo(t *testing.T) {
+	swallower := newBlackholeListener(t)
+	other := newHelloListener(t)
+	m := newSilenceManager(t, 2*time.Second, swallower.addr, other.addr)
+	geneva := &closingStrategy{id: "geneva", priority: 5}
+	m.Register(geneva)
+	markConnected(m, geneva)
+
+	err := oneCycle(m)
+	if err == nil {
+		t.Fatal("connected to a server that answers nothing")
+	}
+	if strings.Contains(err.Error(), "no available strategies") {
+		t.Fatalf("the cycle hid the transport's failure: %v", err)
+	}
+	if !errors.Is(err, ErrCycleUnanswered) {
+		t.Fatalf("err = %v, want it marked as unanswered", err)
 	}
 }

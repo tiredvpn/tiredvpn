@@ -169,6 +169,12 @@ type ControlConfig struct {
 
 	// GetConnectionInfoFn returns metadata about the last connection (for Android UI)
 	GetConnectionInfoFn func() ConnectionMetadata
+
+	// SessionDegradedFn, when set, is told that the relay's stall detector
+	// gave the session up as alive but useless, before the relay reports it
+	// dead. It books the session's end against its endpoint: nothing else on
+	// this path does.
+	SessionDegradedFn func(stall time.Duration)
 }
 
 // NewControlServer creates a new control server
@@ -577,6 +583,7 @@ func (cs *ControlServer) handleSetFdWithReceivedFd(ctx context.Context, fd int) 
 			OnKeepalive: func() {
 				cs.sendEvent("keepalive", "")
 			},
+			OnDegraded: cs.sessionDegraded,
 		})
 	}
 
@@ -899,6 +906,7 @@ func (cs *ControlServer) handleReconnect(ctx context.Context, reason string, new
 		OnKeepalive: func() {
 			cs.sendEvent("keepalive", "")
 		},
+		OnDegraded: cs.sessionDegraded,
 	})
 
 	// Clear reconnecting flag - we're done, future events should be sent
@@ -1342,6 +1350,7 @@ func (cs *ControlServer) attemptReconnect(ctx context.Context) bool {
 		OnKeepalive: func() {
 			cs.sendEvent("keepalive", "")
 		},
+		OnDegraded: cs.sessionDegraded,
 	})
 
 	log.Info("Auto-reconnect: TUN relay restarted (server IP: %s)", serverIP)
@@ -1520,4 +1529,11 @@ func (cs *ControlServer) performTUNHandshake(ctx context.Context) (assignedIP, s
 
 	log.Debug("TUN handshake successful: assigned=%s, server=%s", assignedIP, serverIP)
 	return assignedIP, serverIP, nil
+}
+
+// sessionDegraded hands the relay's stall verdict to SessionDegradedFn.
+func (cs *ControlServer) sessionDegraded(stall time.Duration) {
+	if cs.config != nil && cs.config.SessionDegradedFn != nil {
+		cs.config.SessionDegradedFn(stall)
+	}
 }

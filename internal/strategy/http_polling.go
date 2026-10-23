@@ -582,13 +582,22 @@ func (c *HTTPPollingConn) feedKeepalive() bool {
 	if c.hsDrainedAt.IsZero() || now.Sub(c.hsDrainedAt) < pollingHandshakePeekGuard {
 		return false // the handshake reader may still be waiting for a flags byte
 	}
-	// A zero-length frame: observeDownlink leaves the tracker on the boundary,
-	// the call only keeps it in step with what recvBuf holds.
-	keepalive := []byte{0, 0, 0, 0}
-	c.stream.observeDownlink(keepalive)
-	c.recvBuf.Write(keepalive)
+	// A zero-length frame. It is kept out of the tracker on purpose: on the
+	// boundary a zero frame leaves it where it is anyway, and the tracker's
+	// count of keepalives is the server's alone (ServerKeepalives).
+	c.recvBuf.Write([]byte{0, 0, 0, 0})
 	c.recvCond.Broadcast()
 	return true
+}
+
+// ServerKeepalives counts the zero-length frames the server really sent:
+// keepalive echoes. The feeder splices frames that look the same into what
+// Read returns, so a reader that counts those as echoes hears an answer from a
+// server that may be saying nothing (see strategy.ServerKeepaliveCounter).
+func (c *HTTPPollingConn) ServerKeepalives() uint64 {
+	c.recvLock.Lock()
+	defer c.recvLock.Unlock()
+	return c.stream.keepalives
 }
 
 // doRequest performs one HTTP poll request, reusing the previous request's TLS
