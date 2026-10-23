@@ -1784,10 +1784,15 @@ func runH2FrameLoop(connPtr *net.Conn, framerPtr **http2.Framer, hpackDec *hpack
 	for {
 		conn := *connPtr
 		framer := *framerPtr
-		conn.SetReadDeadline(time.Now().Add(h2FrameReadTimeout()))
+		deadline := h2FrameReadTimeout()
+		conn.SetReadDeadline(time.Now().Add(deadline))
 		frame, err := framer.ReadFrame()
 		if err != nil {
-			if err != io.EOF {
+			if t := *tunnel; t != nil && t.tunGate != nil {
+				// A TUN session's end, and what ended it: the read deadline,
+				// the client, or an error.
+				logger.Info("H2 TUN session ended: %s", legReadEnd(err, deadline))
+			} else if err != io.EOF {
 				logger.Debug("Frame read error: %v", err)
 			}
 			return

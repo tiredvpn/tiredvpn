@@ -89,6 +89,10 @@ type relayTUNSink struct {
 	lastActivity atomic.Int64
 	quietFor     atomic.Int64
 	keepalive    atomic.Pointer[time.Timer]
+
+	// why is what ended the leg, set by the pump when the exit's side ended
+	// it; logged once, at Info, when the leg closes.
+	why atomic.Pointer[string]
 }
 
 // dualAddrs returns the exit-assigned IPv6 tunnel addresses for the downstream
@@ -237,6 +241,14 @@ func (s *relayTUNSink) Close() {
 		if t := s.keepalive.Load(); t != nil {
 			t.Stop()
 		}
+		why := "the downstream session ended"
+		if w := s.why.Load(); w != nil {
+			why = *w
+		}
+		now := time.Now()
+		s.logger.Info("Relay TUN leg closed: %s (last frame up %s ago, down %s ago)", why,
+			now.Sub(time.Unix(0, s.lastUp.Load())).Round(time.Second),
+			now.Sub(time.Unix(0, s.lastDown.Load())).Round(time.Second))
 		// Closing writes too (HTTP/2 stego sends GOAWAY), so it takes the
 		// write lock like WritePacket and the keepalive; a write stuck on a
 		// dead leg is cut first.
@@ -248,6 +260,20 @@ func (s *relayTUNSink) Close() {
 	})
 }
 
+// legReadEnd names what ended a read on a TUN leg: the read deadline, which
+// is given, the peer closing it, or the error.
+func legReadEnd(err error, deadline time.Duration) string {
+	var ne net.Error
+	switch {
+	case errors.As(err, &ne) && ne.Timeout():
+		return fmt.Sprintf("no frame for %s (read deadline)", deadline)
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		return "the peer closed it"
+	default:
+		return err.Error()
+	}
+}
+
 // pump reads [len:4][pkt:N] frames from the upstream exit and hands each packet
 // to deliver, which re-frames it in the downstream transport's own format.
 // Zero-length frames are the upstream's keepalive echo and are dropped: the
@@ -257,11 +283,10 @@ func (s *relayTUNSink) pump(deliver func(pkt []byte) error) {
 
 	header := make([]byte, 4)
 	for {
-		s.up.SetReadDeadline(time.Now().Add(relayTUNIdleTimeout()))
+		idle := relayTUNIdleTimeout()
+		s.up.SetReadDeadline(time.Now().Add(idle))
 		if _, err := io.ReadFull(s.up, header); err != nil {
-			if !errors.Is(err, io.EOF) {
-				s.logger.Debug("Relay TUN: upstream read ended: %v", err)
-			}
+			s.why.CompareAndSwap(nil, new("upstream read: "+legReadEnd(err, idle)))
 			return
 		}
 		s.lastDown.Store(time.Now().UnixNano())
@@ -273,15 +298,16 @@ func (s *relayTUNSink) pump(deliver func(pkt []byte) error) {
 			// The stream is desynced; a length above the IP ceiling can never
 			// resync by reading more, so drop the leg instead of buffering.
 			s.logger.Warn("Relay TUN: invalid upstream frame length %d, closing", n)
+			s.why.CompareAndSwap(nil, new("invalid upstream frame length"))
 			return
 		}
 		pkt := make([]byte, n)
 		if _, err := io.ReadFull(s.up, pkt); err != nil {
-			s.logger.Debug("Relay TUN: upstream payload read ended: %v", err)
+			s.why.CompareAndSwap(nil, new("upstream payload read: "+legReadEnd(err, idle)))
 			return
 		}
 		if err := deliver(pkt); err != nil {
-			s.logger.Debug("Relay TUN: downstream delivery failed: %v", err)
+			s.why.CompareAndSwap(nil, new("downstream delivery: "+err.Error()))
 			return
 		}
 	}
