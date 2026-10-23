@@ -632,3 +632,59 @@ func (s *targetCounter) at(target string) int {
 	defer s.mu.Unlock()
 	return s.n[target]
 }
+
+// TestATransportSetAsideIsReachedWhenTheOthersTimeOut is P2-2 and P3-5 of
+// the round-7 review. REALITY died on a and on b and was set aside there;
+// it works again, while Polling, Stego and WS now complete TCP on a and b
+// and answer nothing. The scan on b gave up after three timeouts, before
+// the set-aside transports at the end of the list, and the rescan after the
+// route verdict left out every transport set aside on b, REALITY included:
+// "no available strategies". The scan reaches REALITY on b and connects.
+func TestATransportSetAsideIsReachedWhenTheOthersTimeOut(t *testing.T) {
+	a, b, c := newHelloListener(t), newHelloListener(t), newHelloListener(t)
+	m := newSilenceManager(t, 300*time.Millisecond, a.addr, b.addr, c.addr)
+	reality := &targetCounter{Strategy: &protectedGreeter{id: "reality", priority: 5}}
+	m.Register(reality)
+	dead := map[string]bool{a.addr: true, b.addr: true}
+	for i, id := range []string{"polling", "stego", "ws"} {
+		m.Register(&swallowAtGreeter{protectedGreeter{id: id, priority: 6 + i}, dead})
+	}
+	if rode := dieOnTheRoute(t, m, 2); !slices.Equal(rode, []string{"reality@" + a.addr, "reality@" + b.addr}) {
+		t.Fatalf("sessions rode %v - the route was not killed the way the test needs", rode)
+	}
+
+	s, cycles := connectCycles(t, m, 1, 3*time.Second)
+	if s == nil {
+		t.Fatalf("no connection in %d cycle", cycles)
+	}
+	if got := m.GetServerAddr(context.Background()); s.ID() != "reality" || got != b.addr {
+		t.Fatalf("connected via %s on %s, want REALITY on b %s", s.ID(), got, b.addr)
+	}
+}
+
+// TestASwallowedTransportSitsOutThoughTheRouteSetItAside: P3-5 of the
+// round-7 review. A transport both set aside by the route and swallowed on
+// this server went to the end of the list before the swallow check, and was
+// dialled every cycle instead of sitting out its turn. The swallow record is
+// planted by hand; the route verdict and the cycle are real.
+func TestASwallowedTransportSitsOutThoughTheRouteSetItAside(t *testing.T) {
+	a, b, c := newHelloListener(t), newHelloListener(t), newHelloListener(t)
+	m := newSilenceManager(t, 2*time.Second, a.addr, b.addr, c.addr)
+	reality := &targetCounter{Strategy: &protectedGreeter{id: "reality", priority: 5}}
+	m.Register(reality)
+	m.Register(&refuseAtGreeter{greetingStrategy: greetingStrategy{id: "polling", priority: 6}, at: map[string]bool{b.addr: true}})
+	if rode := dieOnTheRoute(t, m, 2); !slices.Equal(rode, []string{"reality@" + a.addr, "reality@" + b.addr}) {
+		t.Fatalf("sessions rode %v - the route was not killed the way the test needs", rode)
+	}
+	m.noteSwallowed(b.addr, []string{"reality"})
+	before := reality.at(b.addr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if conn, _, err := m.Connect(ctx, ""); err == nil {
+		conn.Close()
+	}
+	if n := reality.at(b.addr) - before; n != 0 {
+		t.Fatalf("REALITY, swallowed on b, was dialled there %d times", n)
+	}
+}
