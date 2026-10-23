@@ -100,6 +100,12 @@ Versions follow [Semantic Versioning](https://semver.org/).
   ordinary write had left, failed, and a failed write breaks a TLS
   connection for good. Through a relay, a leg with a steady download and
   nothing going up died within two minutes.
+- **Client: a one-way download with nothing going up no longer drops after
+  about a minute.** The client sent a keepalive only when the server had been
+  silent; a server streaming down never is, and the exit closed the session
+  on its read deadline (about 68 s for HTTP/2 Stego, 120 s for Morph and
+  Confusion). The desktop client now also sends one when nothing has gone up
+  for a while.
 - **Server: a client keeps its tunnel address across transports and
   networks.** Leases are keyed on the credential, and leases an older server
   wrote under other keys are folded into it.
@@ -113,8 +119,9 @@ Versions follow [Semantic Versioning](https://semver.org/).
   download trickles; HTTP Polling leaves a frozen server 32-42 s in; a relay
   whose client is active sends a keepalive to its exit, on a timer of its
   own, once either direction of the leg has been silent for a period drawn
-  anew each time between 20 and 45 s; a leg busy both ways gets none. No
-  change to the protocol.
+  anew each time between 20 and 45 s; a leg busy both ways gets none; the
+  desktop client does the same for its own uplink, on top of its keepalive
+  when the server is silent. No change to the protocol.
 - On the wire: the TLS fallback transports' `session_id` is a keyed tag
   instead of random bytes. Same 32 bytes, different on every connection; the
   rest of the ClientHello is unchanged.
