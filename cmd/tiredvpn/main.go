@@ -205,18 +205,20 @@ ICMP TUNNEL:
 
 REALITY OPTIONS:
   -reality-cover-domain string
-        Operator-set hostname to proxy unauthorized REALITY connections to when their SNI is no donor
+        Operator-set hostname to proxy unauthorized REALITY connections to when their SNI is no donor.
+        A ClientHello with a valid fallback-transport tag is never taken
   -reality-sni string
         Comma-separated cover names this exit's clients use beyond the built-in donors; unauthenticated
         connections naming one are mirrored to it (legacy transport: only with -reality-cover-domain)
   -reality-b1
         Accept the B1 transport: real TLS 1.3 with auth in session_id. Needs -reality-private-key.
+        TLS fallback transports get past the gate on a session_id tag from the client's secret
   -reality-private-key string
         Server's static X25519 key, base64 (or TIREDVPN_REALITY_PRIVATE_KEY). Generate with: tiredvpn reality-keygen
   -reality-legacy
         Accept the legacy transport, credentials in padding extension 0x0015 (default true)
   -reality-max-time-diff int
-        Client clock skew tolerated by B1 auth, seconds; 0 = do not check (default 300)
+        Client clock skew tolerated by B1 auth and the fallback tag, seconds; 0 = do not check (default 300)
   -reality-min-client-ver string
         Lowest client version B1 accepts, X.Y.Z (empty = do not check)
   -reality-mirror string
