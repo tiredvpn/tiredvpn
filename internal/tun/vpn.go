@@ -69,7 +69,8 @@ const (
 )
 
 // silentCycleMaxDelay caps the reconnect backoff after a cycle that ended in
-// silence (strategy.ErrAddrSilent).
+// silence (strategy.ErrAddrSilent) or heard nothing back without a verdict
+// (strategy.ErrCycleUnanswered).
 const silentCycleMaxDelay = 30 * time.Second
 
 // nextReconnectDelay is the backoff after a failed reconnect with err:
@@ -79,7 +80,7 @@ const silentCycleMaxDelay = 30 * time.Second
 // and the 2-minute cap slept through up to two minutes of recovered network.
 func nextReconnectDelay(cur time.Duration, err error) time.Duration {
 	maxDelay := reconnectMaxDelay
-	if errors.Is(err, strategy.ErrAddrSilent) {
+	if errors.Is(err, strategy.ErrAddrSilent) || errors.Is(err, strategy.ErrCycleUnanswered) {
 		maxDelay = silentCycleMaxDelay
 	}
 	return min(time.Duration(float64(cur)*reconnectMultiplier), maxDelay)
@@ -2301,11 +2302,7 @@ func (v *VPNClient) disconnect(conn net.Conn, reason string, err error) {
 		errType := classifyError(err)
 		log.Warn("Reconnect failed (%s): %v, next attempt in %v", errType, err, currentDelay)
 
-		// If all strategies are blocked (circuit breakers open), reset them
-		if v.manager != nil && !v.manager.HasAvailableStrategies() {
-			log.Warn("All strategies blocked by circuit breakers, resetting...")
-			v.manager.ResetForNetworkChange()
-		}
+		v.unblockStrategies()
 
 		// Wait with jitter before next attempt
 		select {
@@ -2316,6 +2313,17 @@ func (v *VPNClient) disconnect(conn net.Conn, reason string, err error) {
 		}
 
 		currentDelay = nextReconnectDelay(currentDelay, err)
+	}
+}
+
+// unblockStrategies resets the strategies when every one of them is blocked
+// (circuit breakers open, confidence on the floor) - the strategies only: the
+// network did not change, and what the client learned about the endpoints
+// stays (see Manager.ResetStrategyBlocks).
+func (v *VPNClient) unblockStrategies() {
+	if v.manager != nil && !v.manager.HasAvailableStrategies() {
+		log.Warn("All strategies blocked by circuit breakers, resetting...")
+		v.manager.ResetStrategyBlocks()
 	}
 }
 

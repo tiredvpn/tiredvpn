@@ -506,6 +506,13 @@ var ErrNoServerAnswered = errors.New("no connectivity to server")
 // ended because an address answered no transport.
 var ErrAddrSilent = errAddrSilent
 
+// ErrCycleUnanswered marks a connect cycle that ended with no verdict on the
+// address while the transports it dialled heard nothing back: a swallowed
+// handshake that used up the cycle, a cut attempt. Not silence yet (one cycle
+// is never a verdict), but nothing a longer backoff helps with either: the
+// reconnect loop caps its backoff as it does for silence.
+var ErrCycleUnanswered = errors.New("connect cycle heard nothing back")
+
 // errAddrSilent narrows errStrategyScanFailed: the scan was abandoned because
 // the address accepted connections and then answered nothing, on one transport
 // after another. Every failure was a timeout at connectTimeout - no refusal, no
@@ -1673,6 +1680,9 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 			// says anything about this endpoint on its own; a run of them in
 			// which its handshakes heard nothing does (swallowCycle).
 			if !m.swallowCycle(cand.Addr, scan) {
+				if !scan.answered && (scan.timeouts > 0 || len(scan.inconclusive) > 0) {
+					lastErr = fmt.Errorf("%w: %w", ErrCycleUnanswered, err)
+				}
 				break
 			}
 			err = fmt.Errorf("%w: %w, handshakes swallowed cycle after cycle: %w", errAddrSilent, errStrategyScanFailed, err)
@@ -2078,6 +2088,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 		m.circuitBreakers.CanTry(lastSuccessful.ID())
 
 	fastSilent := false // the fast path heard nothing this cycle
+	var fastErr error   // how the fast path failed this cycle, if it was dialled
 	if fastEligible {
 		// Loop guard: a strategy that connects but whose tunnel dies seconds later
 		// can ride this fast path in a tight reconnect loop without ever being
@@ -2163,6 +2174,8 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 				}
 			}
 
+			fastErr = fmt.Errorf("%s: %w", lastSuccessful.Name(), err)
+
 			// Record the failure so a fast reconnect that keeps failing feeds the
 			// breaker and confidence stats instead of looping invisibly past them.
 			// Mirror the scan: one record per attempt, timeout counted as timeout.
@@ -2245,6 +2258,14 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			// nothing: that is every transport. Not when the others were only
 			// held back by a breaker, a storm park or the UDP gate.
 			return nil, nil, fmt.Errorf("%w: %w, only transport silent", errAddrSilent, errStrategyScanFailed)
+		}
+		if fastErr != nil {
+			// The fast path was the only transport left and it was dialled:
+			// its failure is the cycle's. "No available strategies" read as a
+			// circuit-breaker problem and doubled the backoff to 2 minutes
+			// (Geneva on the 2026-10-22 stand: back 63 s after the fault
+			// ended).
+			return nil, nil, fastErr
 		}
 		return nil, nil, fmt.Errorf("no available strategies (all excluded or circuit-broken)")
 	}
@@ -4013,19 +4034,7 @@ func (m *Manager) ResetForNetworkChange() {
 	defer m.mu.Unlock()
 
 	log.Info("Network change detected - resetting all circuit breakers and confidences")
-
-	// Reset all circuit breakers
-	for _, s := range m.strategies {
-		cb := m.circuitBreakers.Get(s.ID())
-		cb.Reset()
-
-		// Reset confidence to neutral (0.5) - don't punish strategies for old network failures
-		if result, exists := m.results[s.ID()]; exists {
-			result.Confidence = 0.5
-			result.ConsecutiveFail = 0
-			result.LastFailure = time.Time{}
-		}
-	}
+	m.resetStrategyBlocksLocked()
 
 	// Storm state is tied to the old network - clear it after a network change.
 	m.stormDetector.Reset()
@@ -4059,6 +4068,37 @@ func (m *Manager) ResetForNetworkChange() {
 
 	// Re-sort strategies by priority (confidence is now neutral for all)
 	m.sortStrategies()
+}
+
+// ResetStrategyBlocks closes every circuit breaker and puts every strategy's
+// confidence back to neutral, and nothing else. It is for a reconnect whose
+// strategies are all blocked on the same network - not a network change, so
+// what the client learned about the endpoints (parks, swallowed handshakes,
+// the route marker, the UDP verdict) stays. The reconnect loop used to call
+// ResetForNetworkChange here, once per failed cycle, which wiped that every
+// 15 s: a run of swallowed cycles never reached its verdict, and parks were
+// lifted as soon as they were set.
+func (m *Manager) ResetStrategyBlocks() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	log.Info("Resetting circuit breakers and confidences (endpoint health kept)")
+	m.resetStrategyBlocksLocked()
+	m.sortStrategies()
+}
+
+// resetStrategyBlocksLocked is ResetStrategyBlocks without the lock and the
+// re-sort. m.mu held.
+func (m *Manager) resetStrategyBlocksLocked() {
+	for _, s := range m.strategies {
+		m.circuitBreakers.Get(s.ID()).Reset()
+		// Neutral confidence: don't punish strategies for failures that were
+		// the network's.
+		if result, exists := m.results[s.ID()]; exists {
+			result.Confidence = 0.5
+			result.ConsecutiveFail = 0
+			result.LastFailure = time.Time{}
+		}
+	}
 }
 
 // ConnectForReconnect is optimized for network change scenarios
