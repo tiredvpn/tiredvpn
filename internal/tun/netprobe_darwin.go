@@ -29,7 +29,7 @@ func physicalGateAddrs() []string {
 		if !ok || rm.Flags&syscall.RTF_UP == 0 || rm.Flags&syscall.RTF_GATEWAY == 0 {
 			continue
 		}
-		if r, ok := darwinDefaultRoute(rm.Addrs, rm.Index); ok {
+		if r, ok := darwinDefaultRoute(rm.Addrs, rm.Index, rm.Flags&syscall.RTF_IFSCOPE != 0); ok {
 			routes = append(routes, r)
 		}
 	}
@@ -38,7 +38,7 @@ func physicalGateAddrs() []string {
 
 // darwinDefaultRoute reads a routing message's addresses, indexed by RTAX_*,
 // as a default route (see bsdDefaultRoute).
-func darwinDefaultRoute(addrs []route.Addr, index int) (ribRoute, bool) {
+func darwinDefaultRoute(addrs []route.Addr, index int, ifscope bool) (ribRoute, bool) {
 	at := func(i int) *ribAddr {
 		if i >= len(addrs) {
 			return nil
@@ -51,5 +51,5 @@ func darwinDefaultRoute(addrs []route.Addr, index int) (ribRoute, bool) {
 		}
 		return nil
 	}
-	return bsdDefaultRoute(at(syscall.RTAX_DST), at(syscall.RTAX_NETMASK), at(syscall.RTAX_GATEWAY), index)
+	return bsdDefaultRoute(at(syscall.RTAX_DST), at(syscall.RTAX_NETMASK), at(syscall.RTAX_GATEWAY), index, ifscope)
 }

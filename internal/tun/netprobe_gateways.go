@@ -58,8 +58,13 @@ type ribAddr struct {
 // gateway, reached on interface index unless the gateway carries its own
 // zone. The tunnel's 0/1 and 128/1 carry a one-bit netmask and are not
 // defaults; a gateway that is a link-layer address is not an IP to dial.
-func bsdDefaultRoute(dst, mask, gw *ribAddr, index int) (ribRoute, bool) {
-	if dst == nil || !dst.ip.IsUnspecified() {
+//
+// An interface-scoped default (RTF_IFSCOPE on macOS) is not the host's
+// default: macOS keeps one per interface, including "default fe80::%utunN"
+// on the tunnel's own utun, and dialling those only adds silent addresses
+// to the link check.
+func bsdDefaultRoute(dst, mask, gw *ribAddr, index int, ifscope bool) (ribRoute, bool) {
+	if ifscope || dst == nil || !dst.ip.IsUnspecified() {
 		return ribRoute{}, false
 	}
 	if mask != nil && !mask.ip.IsUnspecified() {

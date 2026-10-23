@@ -2658,14 +2658,31 @@ var gatewayAddrs = physicalGateAddrs
 // behind the tunnel's own routes - a coin toss, and up to 6 s of waiting
 // before every reconnect - which is fine for internetReachable's "should I
 // wait for the network" and not for "may I blame the server".
+//
+// The addresses of each group are dialled at once, not one after another:
+// one silent gateway (an interface-scoped default on macOS, a dead family)
+// cost networkCheckTimeout each, and the answer holds up the end of a
+// session. The fallback probes go out together for the same reason, and so
+// carry no fixed order on the wire.
 func localLinkUp() bool {
-	for _, addr := range gatewayAddrs() {
-		if dialMeansAlive(addr) {
-			return true
-		}
+	if anyDialAlive(gatewayAddrs()) {
+		return true
 	}
-	for _, addr := range linkFallbackProbes {
-		if dialMeansAlive(addr) {
+	return anyDialAlive(linkFallbackProbes)
+}
+
+// anyDialAlive dials every address at once and reports whether one answered
+// (dialMeansAlive), as soon as one does.
+func anyDialAlive(addrs []string) bool {
+	if len(addrs) == 0 {
+		return false
+	}
+	alive := make(chan bool, len(addrs))
+	for _, addr := range addrs {
+		go func() { alive <- dialMeansAlive(addr) }()
+	}
+	for range addrs {
+		if <-alive {
 			return true
 		}
 	}
