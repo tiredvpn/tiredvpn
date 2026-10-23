@@ -192,6 +192,10 @@ type VPNClient struct {
 	// stall follows the session's TCP flows for the stall detector
 	// (watchStalls): one table per tunnel connection, replaced together with
 	// conn under mu, so whatever works on a table works on its own session.
+	// lastTx is a monoNow stamp of the last frame written up the tunnel,
+	// keepalives included (keepUplinkAlive).
+	lastTx atomic.Int64
+
 	// keepaliveEchoes counts the zero-length frames read off the tunnel.
 	stall           *flowTable
 	keepaliveEchoes atomic.Uint64
@@ -631,6 +635,7 @@ func (v *VPNClient) Start(ctx context.Context) error {
 	go v.readFromTun()
 	go v.readFromServer()
 	go v.sendKeepalive()
+	go v.keepUplinkAlive()
 	go v.watchStalls()
 
 	// Auto-MTU: measure the real end-to-end ceiling and apply min(probed, cap).
@@ -1637,6 +1642,7 @@ func (v *VPNClient) sendKeepalive() {
 				if _, err := conn.Write(keepalivePkt); err != nil {
 					v.connLost(conn, "keepalive write", uplinkFailed(err))
 				} else {
+					v.lastTx.Store(monoNow())
 					log.Debug("Sent keepalive packet")
 				}
 			}
@@ -1644,6 +1650,82 @@ func (v *VPNClient) sendKeepalive() {
 		case <-v.stopCh:
 			return
 		}
+	}
+}
+
+// uplinkKeepaliveDraw draws how long the uplink may stay silent before
+// keepUplinkAlive sends a keepalive. Atomic so tests in other packages can
+// scale it (SetUplinkKeepaliveDraw).
+var uplinkKeepaliveDraw atomic.Pointer[func() time.Duration]
+
+func init() {
+	draw := func() time.Duration { return strategy.HumpDelay(20*time.Second, 30*time.Second, 45*time.Second) }
+	uplinkKeepaliveDraw.Store(&draw)
+}
+
+// SetUplinkKeepaliveDraw replaces the draw for a test and returns the one it
+// replaced.
+func SetUplinkKeepaliveDraw(draw func() time.Duration) func() time.Duration {
+	return *uplinkKeepaliveDraw.Swap(&draw)
+}
+
+// monoBase anchors monoNow to the monotonic clock.
+var monoBase = time.Now()
+
+// monoNow is a monotonic stamp, in nanoseconds since monoBase.
+func monoNow() int64 { return int64(time.Since(monoBase)) }
+
+// keepUplinkAlive sends a keepalive when nothing has gone up for a drawn
+// quiet period, on a timer of its own. sendKeepalive answers only the
+// server's silence: on a download with nothing going up - a one-way UDP
+// stream - the server is never silent, the client wrote nothing, and the
+// exit closed the session on its read deadline (60 s for HTTP/2 Stego, 120 s
+// for Morph and Confusion), about 68 s in (P3-13 of the round-7 review). The
+// quiet period is drawn like the relay's, 20-45 s (HumpDelay, mean 30 s), well
+// inside every exit's deadline and off any grid; there is no measured
+// reference distribution for it. A busy uplink, or the server-silence
+// keepalive every 10 s, keeps it from ever firing.
+func (v *VPNClient) keepUplinkAlive() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error("keepUplinkAlive panic: %v", r)
+		}
+	}()
+	v.lastTx.CompareAndSwap(0, monoNow())
+	quiet := (*uplinkKeepaliveDraw.Load())()
+	timer := time.NewTimer(quiet)
+	defer timer.Stop()
+	for {
+		select {
+		case <-v.stopCh:
+			return
+		case <-timer.C:
+		}
+		if atomic.LoadInt32(&v.running) == 0 {
+			return
+		}
+		silent := time.Duration(monoNow() - v.lastTx.Load())
+		if silent >= quiet {
+			v.mu.Lock()
+			conn := v.conn
+			v.mu.Unlock()
+			if conn != nil {
+				_ = conn.SetWriteDeadline(time.Now().Add(keepaliveWriteTimeout))
+				if _, err := conn.Write([]byte{0, 0, 0, 0}); err != nil {
+					v.connLost(conn, "keepalive write", uplinkFailed(err))
+				} else {
+					v.lastTx.Store(monoNow())
+					log.Debug("Sent keepalive packet (uplink silent %v)", silent.Round(time.Millisecond))
+				}
+			}
+			quiet = (*uplinkKeepaliveDraw.Load())()
+			silent = 0
+		}
+		next := quiet - silent
+		if next < 100*time.Millisecond {
+			next = 100 * time.Millisecond
+		}
+		timer.Reset(next)
 	}
 }
 
@@ -1700,6 +1782,7 @@ func (v *VPNClient) readFromTun() {
 			v.connLost(conn, "server write", uplinkFailed(err))
 			continue
 		}
+		v.lastTx.Store(monoNow())
 
 		if log.DebugEnabled() {
 			log.Debug("TUN->Server: sent %d bytes (payload=%d) to server", written, n)

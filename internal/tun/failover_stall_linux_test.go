@@ -833,3 +833,71 @@ func TestDataDownIsStampedAndEchoesAreNot(t *testing.T) {
 	}
 	t.Fatal("a data packet down was not stamped")
 }
+
+// TestTheUplinkKeepaliveFillsSilenceOnly is P3-13 of the round-7 review from
+// the client's side, through its own loops: keepUplinkAlive adds a keepalive
+// only when nothing has gone up for its drawn period. Packets going up every
+// 50 ms against a 200 ms period draw none; once they stop, one comes.
+func TestTheUplinkKeepaliveFillsSilenceOnly(t *testing.T) {
+	h := newQuietStallHarness(t, nil)
+	restore := SetUplinkKeepaliveDraw(func() time.Duration { return 200 * time.Millisecond })
+	t.Cleanup(func() { SetUplinkKeepaliveDraw(restore) })
+	go h.v.keepUplinkAlive()
+
+	pkt := fixtureFlows(t)[5].data
+	for range 40 {
+		if _, err := h.app.Write(pkt); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if h.exit.gotData.Load() < 30 {
+		t.Fatalf("%d packets went up - the uplink was not busy", h.exit.gotData.Load())
+	}
+	if n := h.exit.gotEcho.Load(); n != 0 {
+		t.Fatalf("%d keepalives on a busy uplink", n)
+	}
+	time.Sleep(time.Second)
+	if h.exit.gotEcho.Load() == 0 {
+		t.Fatal("no keepalive once the uplink went quiet - the test proves nothing")
+	}
+}
+
+// TestTheUplinkKeepaliveIsNeverAPeriodLate: a packet going up just after a
+// keepalive moves the uplink's stamp after the timer was armed, so the timer
+// ticks a little before the next keepalive is due. Waiting a whole period
+// from that tick left the uplink up to two periods silent - past the exit's
+// deadline at the longer draws, the fault the relay leg had (P2-1 of the
+// round-7 review). Here a packet follows every keepalive by 20 ms, and no
+// gap between frames going up may exceed one period by much.
+func TestTheUplinkKeepaliveIsNeverAPeriodLate(t *testing.T) {
+	h := newQuietStallHarness(t, nil)
+	const period = 300 * time.Millisecond
+	restore := SetUplinkKeepaliveDraw(func() time.Duration { return period })
+	t.Cleanup(func() { SetUplinkKeepaliveDraw(restore) })
+	go h.v.keepUplinkAlive()
+
+	pkt := fixtureFlows(t)[5].data
+	frames := func() int64 { return h.exit.gotEcho.Load() + h.exit.gotData.Load() }
+	last, lastAt, echoes := frames(), time.Now(), h.exit.gotEcho.Load()
+	var worst time.Duration
+	for end := time.Now().Add(4 * time.Second); time.Now().Before(end); time.Sleep(5 * time.Millisecond) {
+		if n := h.exit.gotEcho.Load(); n != echoes {
+			echoes = n
+			time.Sleep(20 * time.Millisecond)
+			if _, err := h.app.Write(pkt); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if n := frames(); n != last {
+			worst = max(worst, time.Since(lastAt))
+			last, lastAt = n, time.Now()
+		}
+	}
+	if echoes < 5 {
+		t.Fatalf("%d keepalives in 4 s - the test proves nothing", echoes)
+	}
+	if worst > period+150*time.Millisecond {
+		t.Fatalf("the uplink went %v without a frame, against a %v period", worst, period)
+	}
+}
