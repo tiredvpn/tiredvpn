@@ -673,7 +673,11 @@ type relayStall struct {
 // reconnects on it as on any dead connection.
 func (r *tunRelay) watchStalls() {
 	mon := newStallMonitor(&r.stall.flows)
-	echoes := echoSourceFor(r.serverConn, nil, r.stall.echoes.Load)
+	var strat strategy.Strategy
+	if r.callbacks != nil {
+		strat = r.callbacks.Strategy
+	}
+	echoes := echoSourceFor(r.serverConn, strat, r.stall.echoes.Load)
 	var unjudgedLogged bool
 	var holdUntil time.Time // no suspicion before this
 	ticker := time.NewTicker(stallClocks().checkEvery)

@@ -88,8 +88,9 @@ Versions follow [Semantic Versioning](https://semver.org/).
   transport instead of dialling the rest of the pool.
 - On the wire: up to two keepalives when a flow stalls, also while a
   download trickles; HTTP Polling leaves a frozen server 32-42 s in; a relay
-  sends a keepalive to its exit at most every 30 s while its client is
-  active. No change to the protocol.
+  whose client is active sends a keepalive to its exit only after the leg
+  has been silent for 60-150 s (drawn anew each time), never while it
+  carries traffic. No change to the protocol.
 - On the wire: the TLS fallback transports' `session_id` is a keyed tag
   instead of random bytes. Same 32 bytes, different on every connection; the
   rest of the ClientHello is unchanged.

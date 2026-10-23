@@ -365,11 +365,15 @@ func TestASlowEchoStillCounts(t *testing.T) {
 }
 
 // TestALateLastEchoStillCounts: an echo of the last keepalive that lands at
-// the very end of its window is still looked for once more.
+// the very end of its window is still looked for once more. The window polls
+// every 50 ms: the last poll inside it falls at 650 ms, the window closes at
+// 700 ms, and the echo lands at 675 ms - between the two, where only the
+// check after the window sees it. It used to land at 700 ms exactly, and a
+// timer firing a little late or early decided the run.
 func TestALateLastEchoStillCounts(t *testing.T) {
 	mon := &stallMonitor{flows: newFlowTable(), echoWait: 100 * time.Millisecond, now: time.Now,
 		pause: func() time.Duration { return 500 * time.Millisecond }}
-	peer := &slowEchoes{rtt: 700 * time.Millisecond}
+	peer := &slowEchoes{rtt: 675 * time.Millisecond}
 	if alive, _, _ := mon.confirm(make(chan struct{}), peer.send, peer.n.Load); !alive {
 		t.Fatal("an echo landing at the very end of the last window was dropped")
 	}

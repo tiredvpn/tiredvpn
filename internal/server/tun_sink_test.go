@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/binary"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -140,44 +141,117 @@ func (s *nopTUNSink) Close()                {}
 // idle HTTP Polling session through a relay sent nothing up - the Polling
 // client sends no keepalive and the relay answers keepalives itself - and the
 // upstream leg died after relayTUNIdleTimeout. The downstream client's
-// activity now sends a keepalive up, at most one per relayKeepaliveEvery.
+// activity now sends a keepalive up once the leg has been silent for its
+// drawn quiet period - and, since P2-5 of round 5, not while the leg carries
+// traffic in either direction.
 func TestRelaySinkKeepsTheUpstreamLegAlive(t *testing.T) {
-	old := relayKeepaliveEvery
-	relayKeepaliveEvery = 200 * time.Millisecond
-	t.Cleanup(func() { relayKeepaliveEvery = old })
+	old := relayKeepaliveAfter
+	var draws atomic.Int32
+	relayKeepaliveAfter = func() time.Duration { draws.Add(1); return 300 * time.Millisecond }
+	t.Cleanup(func() { relayKeepaliveAfter = old })
 	sink, upstream := newTestRelaySink(t)
 
-	frames := make(chan []byte, 8)
+	frames := make(chan []byte, 16)
 	go func() {
 		for {
-			buf := make([]byte, 4)
-			if _, err := readFullConn(upstream, buf); err != nil {
+			hdr := make([]byte, 4)
+			if _, err := readFullConn(upstream, hdr); err != nil {
 				return
 			}
-			frames <- buf
+			body := make([]byte, binary.BigEndian.Uint32(hdr))
+			if _, err := readFullConn(upstream, body); err != nil {
+				return
+			}
+			frames <- append(hdr, body...)
 		}
 	}()
-	for range 5 { // a burst of polls: one keepalive
+	keepalive := func(want bool, what string) {
+		t.Helper()
+		select {
+		case f := <-frames:
+			if !want {
+				t.Fatalf("%s: a frame went up (%x)", what, f)
+			}
+			if binary.BigEndian.Uint32(f) != 0 {
+				t.Fatalf("%s: frame %x is not a keepalive", what, f)
+			}
+		case <-time.After(150 * time.Millisecond):
+			if want {
+				t.Fatalf("%s: no keepalive went up", what)
+			}
+		}
+	}
+
+	for range 5 { // a burst of polls on a silent leg: one keepalive
 		sink.UpdateActivity()
 	}
-	select {
-	case f := <-frames:
-		if binary.BigEndian.Uint32(f) != 0 {
-			t.Fatalf("frame %x is not a keepalive", f)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("no keepalive went up for the downstream client's activity")
-	}
-	select {
-	case <-frames:
-		t.Fatal("a burst of activity sent more than one keepalive")
-	case <-time.After(100 * time.Millisecond):
-	}
-	time.Sleep(200 * time.Millisecond)
+	keepalive(true, "silent leg")
 	sink.UpdateActivity()
-	select {
-	case <-frames:
-	case <-time.After(2 * time.Second):
-		t.Fatal("no keepalive after the interval")
+	keepalive(false, "right after a keepalive")
+
+	// Traffic up resets the silence.
+	time.Sleep(200 * time.Millisecond)
+	go func() { _ = sink.WritePacket([]byte{0x45, 0, 0, 20}) }()
+	if f := <-frames; binary.BigEndian.Uint32(f) == 0 {
+		t.Fatal("the data frame came up as a keepalive")
+	}
+	time.Sleep(150 * time.Millisecond)
+	sink.UpdateActivity()
+	keepalive(false, "150 ms after a packet up")
+
+	// So does traffic down, the exit's echo included.
+	down := make(chan []byte, 4)
+	go sink.pump(func(pkt []byte) error { down <- pkt; return nil })
+	time.Sleep(200 * time.Millisecond)
+	go func() { _, _ = upstream.Write([]byte{0, 0, 0, 0}) }()
+	time.Sleep(150 * time.Millisecond)
+	sink.UpdateActivity()
+	keepalive(false, "150 ms after the exit's echo")
+
+	time.Sleep(350 * time.Millisecond)
+	sink.UpdateActivity()
+	keepalive(true, "after the quiet period")
+	// A quiet period is drawn for the first silence and after each keepalive:
+	// one value for every period would be the grid the draw is there to avoid.
+	if n := draws.Load(); n < 3 {
+		t.Fatalf("%d quiet periods drawn for two keepalives", n)
+	}
+}
+
+// TestRelayKeepalivePauseHasNoGrid checks the shape of the drawn quiet
+// period (verification rule 3): inside 60-150 s, under the 3 min the leg dies
+// at, spread out rather than on a grid, and not flat - half the draws sit in
+// the hump at 75-95 s, where a uniform draw puts a fifth, and the lowest
+// tenth of the range is no more crowded than a uniform draw would make it.
+func TestRelayKeepalivePauseHasNoGrid(t *testing.T) {
+	const n = 4000
+	seen := map[time.Duration]bool{}
+	var sum time.Duration
+	low, mid := 0, 0
+	for range n {
+		d := relayKeepaliveAfter()
+		if d < 60*time.Second || d >= 150*time.Second || d >= relayTUNIdleTimeout {
+			t.Fatalf("drew %v, outside [60 s, 150 s)", d)
+		}
+		seen[d.Round(100*time.Millisecond)] = true
+		sum += d
+		if d < 69*time.Second {
+			low++
+		}
+		if d >= 75*time.Second && d < 95*time.Second {
+			mid++
+		}
+	}
+	if len(seen) < n/10 {
+		t.Fatalf("only %d distinct values in %d draws: a grid", len(seen), n)
+	}
+	if mean := sum / n; mean < 80*time.Second || mean > 100*time.Second {
+		t.Fatalf("mean %v, want about 90 s", mean)
+	}
+	if mid < n*35/100 {
+		t.Fatalf("%d of %d draws in 75-95 s: flat, not a hump", mid, n)
+	}
+	if low > n/10 {
+		t.Fatalf("%d of %d draws in the lowest tenth of the range: a pile-up at the floor", low, n)
 	}
 }

@@ -46,7 +46,8 @@ func (s *closingStrategy) Connect(ctx context.Context, target string) (net.Conn,
 // round 4's P2-4, no evidence of a swallow either: it had only half a cycle).
 func TestACutNonReporterIsNotAnAnswer(t *testing.T) {
 	swallower := newBlackholeListener(t)
-	m := newSilenceManager(t, 2*time.Second, swallower.addr)
+	healthy := newHelloListener(t)
+	m := newSilenceManager(t, 2*time.Second, swallower.addr, healthy.addr)
 	geneva := &closingStrategy{id: "geneva", priority: 5}
 	m.Register(geneva)
 	m.Register(&closingStrategy{id: "ws", priority: 6})
@@ -55,15 +56,28 @@ func TestACutNonReporterIsNotAnAnswer(t *testing.T) {
 
 	scan := &scanState{addr: swallower.addr}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
 	if conn, _, err := m.connectScan(ctx, swallower.addr, nil, scan); err == nil {
 		conn.Close()
+		cancel()
 		t.Fatal("connected to a server that answers nothing")
 	}
+	cancel()
 	if scan.answered {
 		t.Fatal("a cut attempt that heard nothing was taken for the server's answer")
 	}
 	if scan.unheard == 0 {
 		t.Fatal("the cut attempts were not seen as unanswered")
+	}
+
+	// And the client still leaves. None of these transports reports its
+	// connect, so no cycle is evidence of swallowing (swallowEvidence); the
+	// round-4 assertion was dropped then, and with it the guarantee. Cycles
+	// with no answer at all are the backstop: after swallowUnansweredMax of
+	// them the server is left (P3-12 of the round-5 review).
+	if s, cycles := connectCycles(t, m, swallowUnansweredMax+1, time.Second); s == nil {
+		t.Fatalf("still not connected after %d cycles; A: %+v", cycles, endpointState(t, m, swallower.addr))
+	}
+	if got := m.GetServerAddr(context.Background()); got != healthy.addr {
+		t.Fatalf("connected through %s, want %s", got, healthy.addr)
 	}
 }

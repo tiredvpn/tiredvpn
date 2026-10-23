@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"context"
+	"net"
 	"slices"
 	"testing"
 	"time"
@@ -156,5 +157,82 @@ func TestRouteWideSilenceChangesTheTransportOnTheSecondServer(t *testing.T) {
 	}
 	if n := c.accepts.Load(); n != 0 {
 		t.Fatalf("the third server was dialled %d times", n)
+	}
+}
+
+// synBlockedGreeter is protectedGreeter on a network where the listed
+// addresses are IP-blocked: the SYN goes out and nothing ever comes back, for
+// every transport alike.
+type synBlockedGreeter struct {
+	protectedGreeter
+	blocked map[string]bool
+}
+
+func (s *synBlockedGreeter) Connect(ctx context.Context, target string) (net.Conn, error) {
+	if s.blocked[target] {
+		stalled := protectedGreeter{id: s.id, priority: s.priority, stall: true}
+		return stalled.Connect(ctx, target)
+	}
+	return s.protectedGreeter.Connect(ctx, target)
+}
+
+// TestAnIPBlockedServerIsNotTheRoute is P1-2 of the round-5 review: a and b
+// never answer a SYN - an IP block, the TSPU's commonest action - and c is
+// healthy. Every transport dials the same host:port, so a SYN nobody answers
+// says nothing about the transports: the client must reach c on REALITY with
+// nothing parked, not on the fourth transport after parking three.
+func TestAnIPBlockedServerIsNotTheRoute(t *testing.T) {
+	// a and b listen, so the family probe - a plain dial outside the
+	// strategies - finds them up; only the strategies' SYNs are blocked.
+	a, b, c := newHelloListener(t).addr, newHelloListener(t).addr, newHelloListener(t)
+	m := newSilenceManager(t, 300*time.Millisecond, a, b, c.addr)
+	blocked := map[string]bool{a: true, b: true}
+	for i, id := range []string{"reality", "polling", "stego", "ws"} {
+		s := &synBlockedGreeter{protectedGreeter: protectedGreeter{id: id, priority: 5 + i}, blocked: blocked}
+		m.Register(s)
+		if id == "reality" {
+			markConnected(m, s) // the fast path's attempt counts like the scan's
+		}
+	}
+
+	s, cycles := connectCycles(t, m, 3, 3*time.Second)
+	if s == nil {
+		t.Fatalf("not connected after %d cycles", cycles)
+	}
+	if got := m.GetServerAddr(context.Background()); got != c.addr {
+		t.Fatalf("connected on %s, want %s", got, c.addr)
+	}
+	if s.ID() != "reality" {
+		t.Fatalf("connected through %s: an IP block parked the transports that work", s.ID())
+	}
+	for _, id := range []string{"reality", "polling", "stego"} {
+		if m.stormDetector.IsParked(id) {
+			t.Fatalf("%s is parked for the route", id)
+		}
+	}
+}
+
+// TestAnOldDeathIsNotTheRoute: the route marker now outlives an Android core
+// restart, so it carries a time. A death on another server more than
+// routeDeathWindow ago is no evidence about the route now: the second death
+// charges its server.
+func TestAnOldDeathIsNotTheRoute(t *testing.T) {
+	a, b := newHelloListener(t), newHelloListener(t)
+	m := newSilenceManager(t, time.Second, a.addr, b.addr)
+	m.Register(&greetingStrategy{id: "reality", priority: 5})
+	candB, _ := m.selector().CandidateForAddr(b.addr)
+	for _, tc := range []struct {
+		age   time.Duration
+		route bool
+	}{
+		{time.Minute, true},
+		{routeDeathWindow + time.Minute, false},
+	} {
+		m.mu.Lock()
+		m.lastDeath = deathMark{server: 0, class: deathDegraded, at: time.Now().Add(-tc.age)}
+		m.mu.Unlock()
+		if got := m.routeDeath(candB, deathDegraded, "test", []string{"reality"}); got != tc.route {
+			t.Fatalf("a death on a %v ago: route=%v, want %v", tc.age, got, tc.route)
+		}
 	}
 }

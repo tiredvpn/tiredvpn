@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/tiredvpn/tiredvpn/internal/endpoint"
 )
 
 // TestSwallowedTransportsDoNotTakeTurns is P3-10 of the round-3 review of PR
@@ -88,5 +90,83 @@ func TestTheSkipListOutlivesAPark(t *testing.T) {
 	m.selector().ReportSilent(cand)
 	if !m.swallowSkip(addr)["reality"] {
 		t.Fatal("the skip list was forgotten while its address is still parked")
+	}
+}
+
+// TestTheSkipListIsThereOnTheReturnAfterALongPark is P2-3 of the round-5
+// review: the skip list was kept while the server was parked, but a park of
+// more than three minutes (the third server verdict in a row) outlived it,
+// and the first cycle back lost itself on the swallowed transport again.
+// This drives the return itself: the park is over, the last cycle is five
+// minutes old, and the cycle must go straight to the transport that works.
+func TestTheSkipListIsThereOnTheReturnAfterALongPark(t *testing.T) {
+	a, b := newHelloListener(t), "127.0.0.1:1"
+	clk := newEndpointClock()
+	m := newMultiEndpointManager(t, clk, endpoint.Config{Cooldown: time.Minute}, a.addr, b)
+	reality := &swallowAtGreeter{protectedGreeter{id: "reality", priority: 5}, map[string]bool{a.addr: true}}
+	m.Register(reality)
+	m.Register(&protectedGreeter{id: "ws", priority: 6})
+	markConnected(m, reality)
+	if err := oneCycle(m); err == nil {
+		t.Fatal("the first cycle connected - REALITY was not swallowed")
+	}
+	if !m.swallowSkip(a.addr)["reality"] {
+		t.Fatal("no skip list after the swallowed cycle - the test proves nothing")
+	}
+
+	// Three server verdicts in a row: a 4-minute park.
+	cand, _ := m.selector().CandidateForAddr(a.addr)
+	for range 3 {
+		m.selector().ReportSilent(cand)
+	}
+	park := endpointState(t, m, a.addr).CooldownUntil.Sub(clk.Now())
+	if park <= swallowWindow {
+		t.Fatalf("park %v is no longer than the skip window - the test proves nothing", park)
+	}
+	clk.Advance(park + 10*time.Second)
+	key := m.swallowKey(a.addr)
+	m.mu.Lock()
+	m.swallowed[key].last = time.Now().Add(-park - 10*time.Second)
+	m.mu.Unlock()
+
+	markConnected(m, reality)
+	conn, s, err := m.Connect(context.Background(), "")
+	if err != nil {
+		t.Fatalf("the cycle back after the park: %v", err)
+	}
+	conn.Close()
+	if s.ID() != "ws" {
+		t.Fatalf("connected through %s", s.ID())
+	}
+	if n := reality.dials.Load(); n != 1 {
+		t.Fatalf("REALITY dialled %d times: the return tried the swallowed transport again", n)
+	}
+
+}
+
+// TestTheSwallowRunCrossesACoreRestart: on Android the app restarts the core
+// after a failed connect, and a run of two or three swallowed cycles could
+// never build up across fresh managers (P1-4 of the round-5 review).
+// RouteHistory hands the runs and their skip lists to the next manager, as a
+// copy: the old one cannot change them afterwards.
+func TestTheSwallowRunCrossesACoreRestart(t *testing.T) {
+	addr := slowHelloListener(t, 0)
+	other := newHelloListener(t)
+	m1 := newSilenceManager(t, 2*time.Second, addr, other.addr)
+	m1.Register(&protectedGreeter{id: "reality", priority: 5})
+	m1.Register(&protectedGreeter{id: "polling", priority: 6})
+	m1.noteSwallowed(addr, []string{"reality"})
+
+	m2 := newSilenceManager(t, 2*time.Second, addr, other.addr)
+	m2.Register(&protectedGreeter{id: "reality", priority: 5})
+	m2.Register(&protectedGreeter{id: "polling", priority: 6})
+	m2.Register(&protectedGreeter{id: "ws", priority: 7})
+	m2.AdoptRouteHistory(m1.RouteHistory())
+	if !m2.swallowSkip(addr)["reality"] {
+		t.Fatal("the next manager does not know which transport the server swallows")
+	}
+	m1.noteSwallowed(addr, []string{"polling"})
+	if m2.swallowSkip(addr)["polling"] {
+		t.Fatal("the history is shared with the old manager, not copied")
 	}
 }

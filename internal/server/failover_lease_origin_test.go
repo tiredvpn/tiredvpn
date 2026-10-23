@@ -199,7 +199,7 @@ func TestFoldedKeysStayBounded(t *testing.T) {
 	if n := len(pool.folded); n > adoptFoldMax {
 		t.Fatalf("%d fold records, cap %d", n, adoptFoldMax)
 	}
-	pool.folded["global@192.0.2.1"] = time.Now().Add(-adoptFoldTTL)
+	pool.folded["global@192.0.2.1"] = time.Now().Add(-time.Second) // the record has run out
 	if _, err := pool.Allocate("polling:global@192.0.2.1", net.ParseIP("10.8.1.9"), ""); err != nil {
 		t.Fatal(err)
 	}
@@ -272,7 +272,9 @@ func TestTheLeaseSearchDoesNotHoldThePool(t *testing.T) {
 
 // TestAnUnfinishedLeaseSearchIsRetried: a search that failed or was cut
 // short was still recorded as folded for 10 minutes, and a lease it missed
-// was missed again and again.
+// was missed again and again. Then it was not recorded at all, and on a Redis
+// where the search never finishes every handshake paid for it again (P3-8 of
+// the round-5 review). It is retried after adoptRetryAfter.
 func TestAnUnfinishedLeaseSearchIsRetried(t *testing.T) {
 	rdb := startRedis(t)
 	gate := &scanGate{release: make(chan struct{})}
@@ -283,11 +285,27 @@ func TestAnUnfinishedLeaseSearchIsRetried(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	expire := func() {
+		pool.mu.Lock()
+		pool.folded["c1"] = time.Now().Add(-time.Second)
+		pool.mu.Unlock()
+	}
 	pool.AdoptAll(context.Background(), nil, []string{"reality:abc@"}, "c1")
+	pool.AdoptAll(context.Background(), nil, []string{"reality:abc@"}, "c1")
+	if n := gate.scans.Load(); n != 1 {
+		t.Fatalf("%d searches: an unfinished one was repeated on the next handshake", n)
+	}
+	pool.mu.Lock()
+	wait := time.Until(pool.folded["c1"])
+	pool.mu.Unlock()
+	if wait > adoptRetryAfter || wait < adoptRetryAfter-time.Second {
+		t.Fatalf("an unfinished search waits %v, want %v", wait, adoptRetryAfter)
+	}
 	gate.fail.Store(false)
+	expire()
 	pool.AdoptAll(context.Background(), nil, []string{"reality:abc@"}, "c1")
 	if n := gate.scans.Load(); n != 2 {
-		t.Fatalf("%d searches, want the failed one retried", n)
+		t.Fatalf("%d searches, want the failed one retried once its wait ran out", n)
 	}
 	pool.AdoptAll(context.Background(), nil, []string{"reality:abc@"}, "c1")
 	if n := gate.scans.Load(); n != 2 {
