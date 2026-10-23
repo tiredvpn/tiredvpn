@@ -249,10 +249,10 @@ Two limitations, both logged at startup:
 | `-reality-legacy` | `true` | Accept the legacy transport (credentials in padding extension `0x0015`). |
 | `-reality-b1` | `false` | Accept the B1 transport: real TLS 1.3, authentication in `session_id`. Requires `-reality-private-key`. |
 | `-reality-private-key` | | Server's static X25519 key, base64. Falls back to `TIREDVPN_REALITY_PRIVATE_KEY`. Generate with `tiredvpn reality-keygen`. |
-| `-reality-max-time-diff` | `300` | Client clock skew tolerated by B1 auth, in seconds. `0` disables the check; negative aborts startup. |
+| `-reality-max-time-diff` | `300` | Client clock skew tolerated by B1 auth and by the fallback-transport tag, in seconds. `0` disables the check; negative aborts startup. |
 | `-reality-min-client-ver` | | Lowest client version B1 accepts, `X.Y.Z`. Empty disables the check. An unparsable value aborts startup. |
 | `-reality-mirror` | `adaptive` | Donor mirroring for sources that have not authenticated: `off`, `adaptive`, `always`. `always` dials a donor for every connection including real users - measurement only. |
-| `-reality-cover-domain` | | Hostname that unauthorised REALITY connections are transparently proxied to (port 443) when their SNI is not a donor (the built-in list or `-reality-sni`). A donor SNI is mirrored to that donor instead. Empty: a connection naming no donor is handed to the ordinary TLS path and gets the fake website. An SNI on neither list is never dialled. |
+| `-reality-cover-domain` | | Hostname that unauthorised REALITY connections are transparently proxied to (port 443) when their SNI is not a donor (the built-in list or `-reality-sni`). A donor SNI is mirrored to that donor instead. Empty: a connection naming no donor is handed to the ordinary TLS path and gets the fake website. An SNI on neither list is never dialled. A ClientHello with a valid fallback-transport tag is never taken (see below). |
 | `-reality-sni` | | Comma-separated cover names this exit's clients are configured with (client `-reality-sni` or `[[servers]] sni`), on top of the built-in donor list. An unauthenticated REALITY connection naming one is mirrored to that site: on B1 always, on the legacy transport when `-reality-cover-domain` is set. Names match case-insensitively. Without it, a probe replaying such a name gets the cover domain's certificate for it. |
 | `-reality-require-data-v2` | `false` | Reject clients that do not negotiate the v2 data layer (per-connection keys + AEAD). Turn on only after every client is upgraded. |
 
@@ -262,6 +262,45 @@ key pair at boot, so B1 clients pinning a public key must not rely on it. With
 `-reality-b1` and no key, startup fails rather than silently generating a
 throwaway that would drop every client on the next restart. The public half is
 printed in the startup log.
+
+#### TLS fallback transports on a B1 server
+
+With `-reality-b1` the gate reads every TLS ClientHello on the port, not only
+REALITY's. HTTP Polling, WebSocket padded, Geneva, anti-probe, HTTP/2 Stego,
+Traffic Morph, State Exhaustion and a relay's `-upstream` leg all open with a
+plain crypto/tls ClientHello, and their SNI comes from the endpoint's pool -
+donor names by design. Without more, the gate proxies them to the donor and
+they never reach their handlers.
+
+They carry a fallback-transport tag in `session_id` instead of 32 random
+bytes: a nonce, the time masked by a keyed pad, and a MAC, with the key
+derived (HKDF, its own info string) from the secret the client dials with.
+The gate checks it against every client in its index - each registry client's
+own secret and the global `-secret`:
+
+- a fresh tag (inside `-reality-max-time-diff`, not seen before) hands the
+  connection to the ordinary TLS path and its dispatch byte, ahead of the
+  donor and `-reality-cover-domain`;
+- a replayed or stale tag, an unknown key, and no tag at all go to the donor
+  or the cover domain, exactly as an unauthenticated stranger does.
+
+The tag is not a B1 credential and a B1 `session_id` is not a tag. It looks
+like the random value it replaces, differs on every connection, and leaves the
+rest of the ClientHello as crypto/tls builds it.
+
+Compatibility:
+
+- Clients built before the tag (1.11.8 and older) on a B1 server: their TLS
+  fallbacks still go to the donor when the SNI is a donor name, and to the
+  cover domain when one is set. REALITY, QUIC and the non-TLS transports are
+  not affected. Update the clients.
+- New clients on a server without the tag check, or without `-reality-b1`:
+  the tag is ignored and everything works as before.
+
+Cost: one HMAC per index entry for each ClientHello B1 turns down, about 1 µs
+per client (0.9 ms at 1000 clients), on the order of the TLS handshake the
+connection costs anyway. `reality_fallback_tag_total` on `/metrics` counts the
+connections let through on a tag.
 
 ### Burst reshaping
 

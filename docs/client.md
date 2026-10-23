@@ -611,7 +611,11 @@ Notes worth reading once:
   QUIC take their SNI from it for that endpoint, each connection drawing a name
   uniformly; it wins over `-reality-sni` and `-cover`. HTTP Polling,
   WebSocket padded, Geneva and anti-probe take their SNI and Host header from
-  it too. IMAP keeps doing what a mail client does: the dialled hostname, or
+  it too. Those TLS fallbacks (and HTTP/2 Stego, Traffic Morph, State
+  Exhaustion) put a tag derived from the endpoint's secret in the ClientHello
+  `session_id`, so an exit running `-reality-b1` hands them to their handlers
+  rather than to the donor the name belongs to; an exit without the check
+  ignores it. IMAP keeps doing what a mail client does: the dialled hostname, or
   no SNI for an IP. `sni = ""` means no pool. Give the exit the same names with its `-reality-sni`: an exit without
   them answers a probe that replays one of these names with its cover domain's
   certificate instead of the named site's.

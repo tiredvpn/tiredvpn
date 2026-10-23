@@ -505,7 +505,7 @@ func registerServerFlags(fs *flag.FlagSet, cfg *server.Config) *serverFlagOpts {
 	// handleREALITYUnauthorized and donorDestination). A client SNI is dialled
 	// only when it is on the built-in list or -reality-sni, so there is no SSRF
 	// via a client-controlled hostname.
-	fs.StringVar(&cfg.REALITYCoverDomain, "reality-cover-domain", "", "Hostname to transparently proxy unauthorized REALITY connections to when their SNI is not a donor (built-in list or -reality-sni), operator-set, e.g. 'www.microsoft.com'. A donor SNI is mirrored to that donor. Empty = no cover: such connections get the fake website. An unlisted SNI is never dialled.")
+	fs.StringVar(&cfg.REALITYCoverDomain, "reality-cover-domain", "", "Hostname to transparently proxy unauthorized REALITY connections to when their SNI is not a donor (built-in list or -reality-sni), operator-set, e.g. 'www.microsoft.com'. A donor SNI is mirrored to that donor. Empty = no cover: such connections get the fake website. An unlisted SNI is never dialled. A ClientHello carrying a valid fallback-transport tag is never taken.")
 	// Operator-set donors on top of the built-in allowlist: the names clients
 	// of this exit are configured with (-reality-sni / [[servers]] sni). A
 	// probe that replays one of them is mirrored to that site, as it is for a
@@ -532,9 +532,9 @@ func registerServerFlags(fs *flag.FlagSet, cfg *server.Config) *serverFlagOpts {
 	// code path that does nothing yet. Flip the default in the release that
 	// ships the handler (task 005).
 	fs.StringVar(&cfg.REALITYPrivateKey, "reality-private-key", "", "Server's static X25519 key for REALITY B1, base64 (falls back to TIREDVPN_REALITY_PRIVATE_KEY). Generate with `tiredvpn reality-keygen`. Required with -reality-b1.")
-	fs.BoolVar(&cfg.REALITYB1Enabled, "reality-b1", false, "Accept the REALITY B1 transport (real TLS 1.3, auth in session_id). Requires -reality-private-key.")
+	fs.BoolVar(&cfg.REALITYB1Enabled, "reality-b1", false, "Accept the REALITY B1 transport (real TLS 1.3, auth in session_id). Requires -reality-private-key. The TLS fallback transports get past the B1 gate on a session_id tag derived from the client's secret.")
 	fs.BoolVar(&cfg.REALITYLegacyEnabled, "reality-legacy", true, "Accept the legacy REALITY transport (credentials in padding extension 0x0015). Turn off once no client uses it.")
-	fs.IntVar(&cfg.REALITYMaxTimeDiff, "reality-max-time-diff", 300, "Client clock skew tolerated by B1 auth, seconds (0 = do not check)")
+	fs.IntVar(&cfg.REALITYMaxTimeDiff, "reality-max-time-diff", 300, "Client clock skew tolerated by B1 auth and the fallback-transport tag, seconds (0 = do not check)")
 	fs.StringVar(&cfg.REALITYMinClientVer, "reality-min-client-ver", "", "Lowest client version B1 accepts, X.Y.Z (empty = do not check)")
 	fs.StringVar(&cfg.REALITYMirrorMode, "reality-mirror", "adaptive", "Mirror the handshake to the real donor for unauthenticated sources: off, adaptive (default), always. 'always' dials a donor for every connection including users - measurement only.")
 	fs.StringVar(&cfg.BurstReshape, "burst-reshape", "off", "Split the inner TLS handshake with a nudge/ack exchange so the nDPI burst heuristic stops matching: off, on. MUST match the client setting - a one-sided 'on' corrupts streams.")
