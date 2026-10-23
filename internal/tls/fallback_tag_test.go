@@ -222,3 +222,30 @@ func TestFallbackTagKeepsTheStdlibFingerprint(t *testing.T) {
 		t.Fatalf("only %d extensions parsed - the comparison sees nothing", len(e0))
 	}
 }
+
+// TestFallbackTagOpenerAgreesWithTheKey: the prepared opener the server uses
+// gives the key's answer on its own tags, on another key's and on noise.
+func TestFallbackTagOpenerAgreesWithTheKey(t *testing.T) {
+	key := DeriveFallbackTagKey([]byte("opener"))
+	o := NewFallbackTagOpener(key)
+	other := DeriveFallbackTagKey([]byte("someone else"))
+	for i := range 200 {
+		var sid [AuthSessionIDLen]byte
+		switch i % 3 {
+		case 0:
+			sid, _ = FallbackTag(key, time.Unix(int64(1_800_000_000+i), 0))
+		case 1:
+			sid, _ = FallbackTag(other, time.Now())
+		default:
+			_, _ = rand.Read(sid[:])
+		}
+		at1, ok1 := key.Open(sid)
+		at2, ok2 := o.Open(sid)
+		if ok1 != ok2 || at1 != at2 {
+			t.Fatalf("case %d: key says (%d, %v), opener (%d, %v)", i%3, at1, ok1, at2, ok2)
+		}
+		if i%3 == 0 && !ok2 {
+			t.Fatal("the opener rejected its own key's tag")
+		}
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/binary"
+	"hash"
 	"io"
 	"runtime"
 	"strings"
@@ -99,6 +100,45 @@ func (k FallbackTagKey) Open(sid [AuthSessionIDLen]byte) (unix uint32, ok bool) 
 		return 0, false
 	}
 	pad := k.prf(0x01, sid[:fallbackTagNonceLen])
+	return binary.BigEndian.Uint32(sid[fallbackTagNonceLen:]) ^ binary.BigEndian.Uint32(pad), true
+}
+
+// FallbackTagOpener is a FallbackTagKey with its MAC state prepared: a
+// server checks one session_id against every client's key, and a fresh HMAC
+// per key cost 1.6 us and 9 allocations (P3-1 of the round-5 review).
+// Cloning the keyed state roughly halves that. Safe for concurrent use.
+type FallbackTagOpener struct {
+	key FallbackTagKey
+	mac hash.Cloner // HMAC(key) with the MAC label written
+}
+
+// NewFallbackTagOpener prepares key for Open.
+func NewFallbackTagOpener(key FallbackTagKey) *FallbackTagOpener {
+	h := hmac.New(sha256.New, key[:])
+	h.Write([]byte{0x02})
+	o := &FallbackTagOpener{key: key}
+	if c, ok := h.(hash.Cloner); ok {
+		o.mac = c
+	}
+	return o
+}
+
+// Open is FallbackTagKey.Open.
+func (o *FallbackTagOpener) Open(sid [AuthSessionIDLen]byte) (unix uint32, ok bool) {
+	if o.mac == nil {
+		return o.key.Open(sid)
+	}
+	h, err := o.mac.Clone()
+	if err != nil {
+		return o.key.Open(sid)
+	}
+	h.Write(sid[:fallbackTagNonceLen+fallbackTagTimeLen])
+	var buf [sha256.Size]byte
+	mac := h.Sum(buf[:0])
+	if !hmac.Equal(mac[:fallbackTagMACLen], sid[fallbackTagNonceLen+fallbackTagTimeLen:]) {
+		return 0, false
+	}
+	pad := o.key.prf(0x01, sid[:fallbackTagNonceLen])
 	return binary.BigEndian.Uint32(sid[fallbackTagNonceLen:]) ^ binary.BigEndian.Uint32(pad), true
 }
 

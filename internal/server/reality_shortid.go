@@ -16,10 +16,10 @@ type shortIDEntry struct {
 	clientID clientIdentity
 	secret   []byte
 
-	// tagKey checks the fallback-transport tag a client's TLS fallbacks put
-	// in their session_id (customtls.FallbackTag). Derived here, once per
-	// rebuild, so the connection path pays HMACs and no HKDF.
-	tagKey customtls.FallbackTagKey
+	// tag checks the fallback-transport tag a client's TLS fallbacks put in
+	// their session_id (customtls.FallbackTag). Derived and keyed here, once
+	// per rebuild, so the connection path pays one cloned HMAC and no HKDF.
+	tag *customtls.FallbackTagOpener
 }
 
 // shortIDIndex maps the 8-byte identifier carried in session_id to a client.
@@ -78,7 +78,7 @@ func (i *shortIDIndex) Rebuild(clients []*ClientConfig, globalSecret []byte) {
 		next[customtls.ShortIDFor(secret)] = shortIDEntry{
 			clientID: registryIdentity(c.ID),
 			secret:   secret,
-			tagKey:   customtls.DeriveFallbackTagKey(secret),
+			tag:      customtls.NewFallbackTagOpener(customtls.DeriveFallbackTagKey(secret)),
 		}
 	}
 
@@ -91,7 +91,7 @@ func (i *shortIDIndex) Rebuild(clients []*ClientConfig, globalSecret []byte) {
 			next[id] = shortIDEntry{
 				clientID: sharedIdentity(globalClientID),
 				secret:   globalSecret,
-				tagKey:   customtls.DeriveFallbackTagKey(globalSecret),
+				tag:      customtls.NewFallbackTagOpener(customtls.DeriveFallbackTagKey(globalSecret)),
 			}
 		}
 	}
@@ -122,10 +122,10 @@ func (i *shortIDIndex) MatchFallbackTag(sid [customtls.AuthSessionIDLen]byte) (s
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 	for _, e := range i.entries {
-		if e.tagKey == (customtls.FallbackTagKey{}) {
-			continue // an entry built without a key; the zero key is public
+		if e.tag == nil {
+			continue // an entry built without a key
 		}
-		if at, ok := e.tagKey.Open(sid); ok {
+		if at, ok := e.tag.Open(sid); ok {
 			return e, at, true
 		}
 	}

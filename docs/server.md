@@ -328,10 +328,12 @@ Compatibility:
 - New clients on a server without the tag check, or without `-reality-b1`:
   the tag is ignored and everything works as before.
 
-Cost: one HMAC per index entry for each ClientHello B1 turns down, about 1 µs
-per client (0.9 ms at 1000 clients), on the order of the TLS handshake the
-connection costs anyway. `reality_fallback_tag_total` on `/metrics` counts the
-connections let through on a tag.
+Cost: one HMAC per index entry for each ClientHello that B1 turns down and the
+legacy transport does not take: about 0.8 µs and five small allocations per
+client, measured (0.8 ms at 1000 clients), on the order of the TLS handshake
+the connection costs anyway. A legacy-REALITY hello skips it.
+`reality_fallback_tag_total` on `/metrics` counts the connections let through
+on a tag.
 
 ### Burst reshaping
 

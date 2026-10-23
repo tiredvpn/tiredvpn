@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/ecdh"
 	"crypto/rand"
 	"encoding/binary"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/endpoint"
+	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
 	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 )
@@ -267,12 +269,18 @@ func TestFallbackTagMatchesRegistryClients(t *testing.T) {
 	}
 	expectDonor(t, srv, captureFallbackHello(t, tagFallbackStrategies[0].make, tagTestSecret))
 
+	// An entry built without a tag key matches nothing - not its client's
+	// tag, and not one made under the zero key, which anyone can compute.
+	fresh := captureFallbackHello(t, tagFallbackStrategies[0].make, "bob-own-secret")
 	gate.index.mu.Lock()
 	for id, e := range gate.index.entries {
-		e.tagKey = customtls.FallbackTagKey{}
+		e.tag = nil
 		gate.index.entries[id] = e
 	}
 	gate.index.mu.Unlock()
+	if _, ok := gate.fallbackTag(srv.srvCtx, fresh[5:], time.Now()); ok {
+		t.Fatal("an entry without a tag key accepted its client's tag")
+	}
 	zero, err := customtls.FallbackTag(customtls.FallbackTagKey{}, time.Now())
 	if err != nil {
 		t.Fatal(err)
@@ -439,4 +447,45 @@ func TestANewRegistryClientsTagIsSeenSoon(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("two seconds on, the index has not caught up with the registry (behind=%v)", gate.index.behind(srv.srvCtx))
+}
+
+// TestALegacyHelloIsNotCheckedForATag is P3-1 of the round-5 review: the tag
+// was looked for before the legacy check, so every legacy-REALITY hello paid
+// one HMAC per registry client for nothing - crypto/tls sends no padding
+// extension, so a legacy hello is never a tagged one. Here a legacy hello
+// carries a valid tag all the same: it must go to the legacy transport
+// without the tag being checked.
+func TestALegacyHelloIsNotCheckedForATag(t *testing.T) {
+	srv := newTagServer(t, "")
+	srv.srvCtx.cfg.REALITYLegacyEnabled = true
+	eph, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hello := buildHelloWithKeyShare(t, eph.PublicKey().Bytes())
+	bare := append([]byte{0x16, 0x03, 0x01, byte(len(hello) >> 8), byte(len(hello))}, hello...)
+	ext, err := customtls.NewClientREALITYExtension([]byte(tagTestSecret), [32]byte{7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := customtls.AddPaddingWithREALITY(bare, ext, customtls.MinPaddingSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tag, err := customtls.FallbackTag(customtls.DeriveFallbackTagKey([]byte(tagTestSecret)), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	setSessionID(t, record, tag)
+	if !DetectREALITYExtension(record) {
+		t.Fatal("fixture is not a legacy hello")
+	}
+
+	before := realityFallbackTagTotal.Load()
+	if tryREALITYB1(&nopConn{}, record, srv.srvCtx, log.WithPrefix("test")) {
+		t.Fatal("the gate claimed a legacy hello")
+	}
+	if realityFallbackTagTotal.Load() != before {
+		t.Fatal("the tag was checked - and accepted - on a legacy hello")
+	}
 }

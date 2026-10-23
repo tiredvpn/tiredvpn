@@ -132,20 +132,6 @@ func tryREALITYB1(conn net.Conn, peekBuf []byte, srvCtx *serverContext, logger *
 	if !verdict.ok {
 		gate.refreshIndexIfNeeded(srvCtx, verdict)
 
-		// Our own TLS fallback transports. They speak plain crypto/tls, so B1
-		// turns them down, and their SNI comes from the endpoint's pool - donor
-		// names by design - so the donor fallback below would hand them to a
-		// real site. A valid tag in session_id says the hello is ours: hand it
-		// back for the ordinary TLS path and its dispatch byte. Ahead of the
-		// cover domain too, which used to take every one of them.
-		if entry, ok := gate.fallbackTag(srvCtx, helloRaw, now); ok {
-			releaseDonor(donor)
-			reputation.remember(conn.RemoteAddr(), now)
-			realityFallbackTagTotal.Add(1)
-			logger.Debug("REALITY B1: fallback-transport tag accepted (client: %s), continuing as ordinary TLS", entry.clientID)
-			return false
-		}
-
 		// A client on the old transport reaches this point too, and its
 		// ClientHello parses perfectly well - it just was not sealed to our
 		// static key, because the legacy scheme does not use one. Sending it to
@@ -160,6 +146,23 @@ func tryREALITYB1(conn net.Conn, peekBuf []byte, srvCtx *serverContext, logger *
 		if srvCtx.cfg.REALITYLegacyEnabled && DetectREALITYExtension(peekBuf) {
 			logger.Debug("REALITY B1: no match (%s), deferring to the legacy transport", verdict.reason)
 			releaseDonor(donor)
+			return false
+		}
+
+		// Our own TLS fallback transports. They speak plain crypto/tls, so B1
+		// turns them down, and their SNI comes from the endpoint's pool - donor
+		// names by design - so the donor fallback below would hand them to a
+		// real site. A valid tag in session_id says the hello is ours: hand it
+		// back for the ordinary TLS path and its dispatch byte. Ahead of the
+		// cover domain too, which used to take every one of them. After the
+		// legacy check: crypto/tls never sends a padding extension, so a legacy
+		// hello is never a tagged one, and it no longer pays an HMAC per
+		// client for nothing (P3-1 of the round-5 review).
+		if entry, ok := gate.fallbackTag(srvCtx, helloRaw, now); ok {
+			releaseDonor(donor)
+			reputation.remember(conn.RemoteAddr(), now)
+			realityFallbackTagTotal.Add(1)
+			logger.Debug("REALITY B1: fallback-transport tag accepted (client: %s), continuing as ordinary TLS", entry.clientID)
 			return false
 		}
 
