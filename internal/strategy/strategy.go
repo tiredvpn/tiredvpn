@@ -2037,6 +2037,14 @@ type swallowRecord struct {
 	heardNothing map[string]bool
 	// addrs are the server's addresses those cycles ran on.
 	addrs map[string]bool
+	// unanswered counts the cycles in a row that ended with no verdict and
+	// no answer at all, evidence or not (see swallowUnansweredMax).
+	unanswered int
+}
+
+// endRun ends the run of no-verdict cycles; the skip lists stay.
+func (r *swallowRecord) endRun() {
+	r.cycles, r.unanswered, r.heardNothing, r.addrs = 0, 0, make(map[string]bool), make(map[string]bool)
 }
 
 // swallowKey names the swallow record addr belongs to: its server when the
@@ -2069,6 +2077,16 @@ func (m *Manager) swallowSibling(sel *endpoint.Selector, cand endpoint.Candidate
 // heard nothing in each, are an address's silence verdict on one transport.
 // Two cycles are enough when they span two transports.
 const swallowCyclesMax = 3
+
+// swallowUnansweredMax is how many cycles in a row with no verdict and no
+// answer from any transport are the server's silence verdict, whether or not
+// a cycle had evidence (swallowEvidence). The backstop for transports that do
+// not report their TCP connect and so never count as swallowed: a server that
+// swallows every handshake of a forced Geneva, or of a set without a
+// reporting transport, kept the client for good (P3-12 of the round-5
+// review). Four cycles, one more than swallowCyclesMax, because these cycles
+// prove less.
+const swallowUnansweredMax = 4
 
 // swallowWindow is how long a swallow record outlives its last cycle. The
 // reconnect backoff reaches two minutes and a cycle takes 15-30 s more, so a
@@ -2191,27 +2209,30 @@ func (m *Manager) swallowCycle(addr string, scan *scanState) (verdict bool, cove
 	defer m.mu.Unlock()
 	if scan.answered {
 		if r := m.swallowed[key]; r != nil {
-			r.cycles, r.heardNothing, r.addrs = 0, make(map[string]bool), make(map[string]bool)
+			r.endRun()
 		}
 		return false, nil, nil
 	}
-	if len(scan.inconclusive) == 0 {
+	if len(scan.inconclusive) == 0 && scan.unheard == 0 {
 		return false, nil, nil
 	}
 	r := m.swallowRecordLocked(key, sincePark)
-	r.cycles++
 	r.addrs[addr] = true
-	for _, id := range scan.inconclusive {
-		r.heardNothing[id] = true
+	r.unanswered++
+	if len(scan.inconclusive) > 0 {
+		r.cycles++
+		for _, id := range scan.inconclusive {
+			r.heardNothing[id] = true
+		}
 	}
 	covered = slices.Sorted(maps.Keys(r.addrs))
-	if r.cycles < swallowCyclesMax && (r.cycles < 2 || len(r.heardNothing) < 2) {
+	if r.unanswered < swallowUnansweredMax && r.cycles < swallowCyclesMax && (r.cycles < 2 || len(r.heardNothing) < 2) {
 		return false, covered, nil
 	}
 	log.Warn("%s heard nothing on %s over %d cycles in a row (%s) - its silence verdict",
 		key, strings.Join(slices.Sorted(maps.Keys(r.heardNothing)), ", "), r.cycles, strings.Join(covered, ", "))
 	heard = slices.Sorted(maps.Keys(r.heardNothing))
-	r.cycles, r.heardNothing, r.addrs = 0, make(map[string]bool), make(map[string]bool)
+	r.endRun()
 	return true, covered, heard
 }
 
@@ -2222,7 +2243,7 @@ func (m *Manager) endSwallowRun(addr string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if r := m.swallowed[key]; r != nil {
-		r.cycles, r.heardNothing, r.addrs = 0, make(map[string]bool), make(map[string]bool)
+		r.endRun()
 	}
 }
 
@@ -4421,6 +4442,7 @@ func (m *Manager) RouteHistory() RouteMemory {
 			skip:         make(map[string]map[string]bool, len(r.skip)),
 			last:         r.last,
 			cycles:       r.cycles,
+			unanswered:   r.unanswered,
 			heardNothing: maps.Clone(r.heardNothing),
 			addrs:        maps.Clone(r.addrs),
 		}
