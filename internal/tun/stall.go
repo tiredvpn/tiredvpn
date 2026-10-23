@@ -7,6 +7,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/netip"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -151,8 +152,9 @@ type flowState struct {
 // flowTable follows the session's TCP flows. Safe for concurrent use: the
 // TUN reader, the tunnel reader and the monitor each touch it.
 type flowTable struct {
-	mu    sync.Mutex
-	flows map[flowKey]*flowState
+	mu        sync.Mutex
+	flows     map[flowKey]*flowState
+	evictions int // full scans for room, for tests
 }
 
 func newFlowTable() *flowTable {
@@ -213,34 +215,40 @@ func (t *flowTable) up(pkt []byte, now time.Time) {
 	f.pendingSince = now
 }
 
-// evictLocked makes room: flows with nothing pending and no answer within
-// stallFlowFresh go first; if that frees nothing, the idle flow answered
-// longest ago, and only in a table full of waiting flows a waiting one.
+// evictLocked makes room, and enough of it that the scan is not repeated
+// for every new flow of a busy client (a torrent client opens one after
+// another): down to stallMaxFlows - stallMaxFlows/8. Flows with nothing
+// pending and no answer within stallFlowFresh go first, then idle flows
+// answered longest ago, and waiting flows only in a table full of them.
 func (t *flowTable) evictLocked(now time.Time) {
-	var idle, busy flowKey
-	var idleAt, busyAt time.Time
+	t.evictions++
+	target := stallMaxFlows - stallMaxFlows/8
+	var idle, busy []flowKey
 	for k, f := range t.flows {
 		switch {
 		case f.pendingSince.IsZero() && now.Sub(f.lastDown) > stallFlowFresh:
 			delete(t.flows, k)
 		case f.pendingSince.IsZero():
-			if idleAt.IsZero() || f.lastDown.Before(idleAt) {
-				idle, idleAt = k, f.lastDown
-			}
+			idle = append(idle, k)
 		default:
-			if busyAt.IsZero() || f.lastDown.Before(busyAt) {
-				busy, busyAt = k, f.lastDown
-			}
+			busy = append(busy, k)
 		}
 	}
-	if len(t.flows) < stallMaxFlows {
-		return
+	byAge := func(keys []flowKey) {
+		slices.SortFunc(keys, func(a, b flowKey) int { return t.flows[a].lastDown.Compare(t.flows[b].lastDown) })
 	}
-	if !idleAt.IsZero() {
-		delete(t.flows, idle)
-		return
+	for _, keys := range [][]flowKey{idle, busy} {
+		if len(t.flows) <= target {
+			return
+		}
+		byAge(keys)
+		for _, k := range keys {
+			if len(t.flows) <= target {
+				return
+			}
+			delete(t.flows, k)
+		}
 	}
-	delete(t.flows, busy)
 }
 
 // reset forgets every flow: a new tunnel connection starts with none.

@@ -374,3 +374,27 @@ func TestALateLastEchoStillCounts(t *testing.T) {
 		t.Fatal("an echo landing at the very end of the last window was dropped")
 	}
 }
+
+// TestEvictionIsAmortized is P3-5 of the round-4 review: at the cap every new
+// flow scanned the whole table on the downlink path. Room is now made for an
+// eighth of the table at once.
+func TestEvictionIsAmortized(t *testing.T) {
+	pkts := fixtureFlows(t)
+	down := pkts[2].data
+	ft := newFlowTable()
+	now := pkts[2].at
+	const extra = 4 * stallMaxFlows
+	for i := range stallMaxFlows + extra {
+		p := append([]byte(nil), down...)
+		ihl := int(p[0]&0x0f) * 4
+		binary.BigEndian.PutUint16(p[ihl:], uint16(i%60000+1))
+		binary.BigEndian.PutUint16(p[ihl+2:], uint16(i/60000+1))
+		ft.down(p, now.Add(time.Duration(i)*time.Millisecond))
+	}
+	if max := extra/(stallMaxFlows/8) + 1; ft.evictions > max {
+		t.Fatalf("%d full scans for %d new flows past the cap, want at most %d", ft.evictions, extra, max)
+	}
+	if n := len(ft.flows); n > stallMaxFlows {
+		t.Fatalf("%d flows, cap %d", n, stallMaxFlows)
+	}
+}
