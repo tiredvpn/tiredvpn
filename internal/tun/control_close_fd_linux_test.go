@@ -800,3 +800,29 @@ func TestControlTunFdCountAcrossSwaps(t *testing.T) {
 		}
 	}
 }
+
+// TestOnlyTheDisconnectCommandIsTheUsersStop: the user's stop reaches
+// DisconnectedFn, so the core does not hand its verdicts to the next start
+// (P3-5 of the round-5 review). Close is every shutdown - after a dead
+// connection too - and must not (P1-B of the round-6 review).
+func TestOnlyTheDisconnectCommandIsTheUsersStop(t *testing.T) {
+	h := newCtlHarness(t)
+	var called atomic.Int32
+	h.cs.mu.Lock()
+	h.cs.config.DisconnectedFn = func() { called.Add(1) }
+	h.cs.mu.Unlock()
+
+	_ = h.cs.Close()
+	if n := called.Load(); n != 0 {
+		t.Fatalf("Close told DisconnectedFn %d times", n)
+	}
+
+	h = newCtlHarness(t)
+	h.cs.mu.Lock()
+	h.cs.config.DisconnectedFn = func() { called.Add(1) }
+	h.cs.mu.Unlock()
+	h.send(`{"command":"disconnect"}`, -1)
+	if n := called.Load(); n != 1 {
+		t.Fatalf("the disconnect command told DisconnectedFn %d times, want 1", n)
+	}
+}

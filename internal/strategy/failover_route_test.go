@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net"
 	"slices"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -230,22 +232,39 @@ func TestAnOldDeathIsNotTheRoute(t *testing.T) {
 		{routeDeathWindow + time.Minute, false},
 	} {
 		m.mu.Lock()
-		m.lastDeath = deathMark{server: 0, class: deathDegraded, at: time.Now().Add(-tc.age)}
+		m.lastDeath = deathMark{server: 0, class: deathDegraded, ids: []string{"reality"}, at: time.Now().Add(-tc.age)}
 		m.mu.Unlock()
 		if got := m.routeDeath(candB, deathDegraded, "test", []string{"reality"}); got != tc.route {
 			t.Fatalf("a death on a %v ago: route=%v, want %v", tc.age, got, tc.route)
 		}
 	}
+	m.mu.RLock()
+	at := m.lastDeath.at
+	m.mu.RUnlock()
+	if at != at.Round(0) {
+		t.Fatal("the route mark is stamped with a monotonic clock, which stops while a phone sleeps")
+	}
 }
 
-// refuseAtGreeter is greetingStrategy refused at the listed addresses.
+// refuseAtGreeter is greetingStrategy refused at the listed addresses, after
+// the number of dials there given in after (0: from the first).
 type refuseAtGreeter struct {
 	greetingStrategy
-	at map[string]bool
+	at    map[string]bool
+	after int
+	mu    sync.Mutex
+	dials map[string]int
 }
 
 func (s *refuseAtGreeter) Connect(ctx context.Context, target string) (net.Conn, error) {
-	if s.at[target] {
+	s.mu.Lock()
+	if s.dials == nil {
+		s.dials = map[string]int{}
+	}
+	s.dials[target]++
+	n := s.dials[target]
+	s.mu.Unlock()
+	if s.at[target] && n > s.after {
 		if s.seen != nil {
 			s.seen.add(target)
 		}
@@ -258,14 +277,13 @@ func (s *refuseAtGreeter) Connect(ctx context.Context, target string) (net.Conn,
 // review: the route verdict parked the transport on every server for five
 // minutes and dropped it from the fast path, so when a and b died on REALITY
 // and c was healthy, c was dialled on Polling. Now REALITY is set aside on a
-// and b only. Here Polling is refused on b, so the next connect walks on to c,
-// and c gets REALITY first, through the fast path.
+// and b only. Here b refuses everything after REALITY's session there, so the
+// next connect walks on to c, and c gets REALITY first, through the fast path.
 func TestARouteParkStaysWithTheServersItWasDecidedOn(t *testing.T) {
 	a, b, c := newHelloListener(t), newHelloListener(t), newHelloListener(t)
 	m := newSilenceManager(t, time.Second, a.addr, b.addr, c.addr)
-	seen := &targetLog{}
-	m.Register(&greetingStrategy{id: "reality", priority: 5, seen: seen})
-	m.Register(&refuseAtGreeter{greetingStrategy{id: "polling", priority: 6}, map[string]bool{b.addr: true}})
+	m.Register(&refuseAtGreeter{greetingStrategy: greetingStrategy{id: "reality", priority: 5}, at: map[string]bool{b.addr: true}, after: 1})
+	m.Register(&refuseAtGreeter{greetingStrategy: greetingStrategy{id: "polling", priority: 6}, at: map[string]bool{b.addr: true}})
 
 	var rode []string
 	for range 3 {
@@ -302,4 +320,253 @@ func TestARouteParkRunsOut(t *testing.T) {
 	if len(m.routeSkip(b.addr)) != 0 {
 		t.Fatal("b has nothing set aside")
 	}
+}
+
+// TestARouteParkHoldsAgainstAnUpgrade is P2-B of the round-6 review: the
+// route verdict set REALITY aside on b, but the reprobe offered it back and
+// the upgrade check admitted it - the tunnel went straight back onto the
+// transport the route had killed there. Neither the offer nor the dial's
+// check admits it on b; on c, where nothing died, both do.
+func TestARouteParkHoldsAgainstAnUpgrade(t *testing.T) {
+	a, b, c := newHelloListener(t), newHelloListener(t), newHelloListener(t)
+	m := newSilenceManager(t, time.Second, a.addr, b.addr, c.addr)
+	reality := &greetingStrategy{id: "reality", priority: 5}
+	m.Register(reality)
+	m.Register(&greetingStrategy{id: "polling", priority: 6})
+	m.mu.Lock()
+	m.routeParked = map[int]map[string]time.Time{0: {"reality": time.Now().Add(time.Minute)}, 1: {"reality": time.Now().Add(time.Minute)}}
+	m.mu.Unlock()
+
+	if m.UpgradeEligible(reality, b.addr) {
+		t.Fatal("REALITY eligible for an upgrade on b, where the route set it aside")
+	}
+	if !m.UpgradeEligible(reality, c.addr) {
+		t.Fatal("REALITY not eligible on c, where nothing died")
+	}
+
+	noUpgradeDelay(t)
+	offer := func(pin string) bool {
+		cand, _ := m.selector().CandidateForAddr(pin)
+		m.selector().Pin(cand)
+		offers := newUpgradeOffers()
+		m.SetStrategyUpgradeCallback(offers.take)
+		m.offerUpgrade([]Result{{Strategy: reality, Success: true}})
+		select {
+		case <-offers.got:
+			return true
+		case <-time.After(300 * time.Millisecond):
+			return false
+		}
+	}
+	if offer(b.addr) {
+		t.Fatal("the reprobe on b offered REALITY back")
+	}
+	if !offer(c.addr) {
+		t.Fatal("the reprobe on c did not offer REALITY - the test proves nothing")
+	}
+}
+
+// TestARescanWithOneTransportLeftChargesTheServer is P2-C of the round-6
+// review: after the route verdict on b set three transports aside, the
+// rescan had one left, and one timeout never reached the silence threshold
+// of three - b was left uncharged, to be dialled again next cycle. A rescan
+// whose transports all heard nothing is b's own second verdict, however few
+// they were; the same Connect then goes on to c.
+func TestARescanWithOneTransportLeftChargesTheServer(t *testing.T) {
+	old := rescanPause
+	var pauses atomic.Int32
+	rescanPause = func() time.Duration { pauses.Add(1); return 10 * time.Millisecond }
+	t.Cleanup(func() { rescanPause = old })
+	a, b, c := newHelloListener(t), newHelloListener(t), newHelloListener(t)
+	m := newSilenceManager(t, 300*time.Millisecond, a.addr, b.addr, c.addr)
+	dead := map[string]bool{a.addr: true, b.addr: true}
+	var counters []*targetCounter
+	for i, id := range []string{"reality", "polling", "stego", "ws"} {
+		c := &targetCounter{Strategy: &swallowAtGreeter{protectedGreeter{id: id, priority: 5 + i}, dead}}
+		counters = append(counters, c)
+		m.Register(c)
+	}
+
+	s, cycles := connectCycles(t, m, 2, 6*time.Second)
+	if s == nil {
+		t.Fatalf("not connected after %d cycles", cycles)
+	}
+	// Each transport was dialled once on b: the three in the first scan, the
+	// fourth in the rescan, which leaves the three set aside a moment before
+	// out - and b, charged by the rescan, was not dialled again in cycle 2.
+	for _, c := range counters {
+		if n := c.at(b.addr); n != 1 {
+			t.Fatalf("%s dialled %d times on b", c.ID(), n)
+		}
+	}
+	if got := m.GetServerAddr(context.Background()); got != c.addr {
+		t.Fatalf("connected on %s, want c %s", got, c.addr)
+	}
+	if st := endpointState(t, m, b.addr); !st.CooldownUntil.After(time.Now()) {
+		t.Fatalf("b was not charged for its second silence: %+v", st)
+	}
+	// P3-7: the rescan waits a moment first, so b does not see two volleys
+	// back to back.
+	if n := pauses.Load(); n != 1 {
+		t.Fatalf("%d pauses drawn for one rescan", n)
+	}
+}
+
+// TestAnIPBlockedServerDoesNotMakeTheNextOneTheRoute is P2-D of the round-6
+// review: a is IP-blocked (its SYNs go unanswered), b accepts and swallows
+// everything, c is healthy. a's verdict names no transport and must not be
+// the "previous death": b's silence is b's own, nothing is set aside, and
+// the client reaches c.
+func TestAnIPBlockedServerDoesNotMakeTheNextOneTheRoute(t *testing.T) {
+	a, b, c := newHelloListener(t).addr, newHelloListener(t), newHelloListener(t)
+	m := newSilenceManager(t, 300*time.Millisecond, a, b.addr, c.addr)
+	for i, id := range []string{"reality", "polling", "stego", "ws"} {
+		m.Register(&blockedThenSwallowed{Strategy: &protectedGreeter{id: id, priority: 5 + i}, blocked: a, swallowed: b.addr})
+	}
+
+	s, cycles := connectCycles(t, m, 3, 6*time.Second)
+	if s == nil {
+		t.Fatalf("not connected after %d cycles", cycles)
+	}
+	if got := m.GetServerAddr(context.Background()); got != c.addr {
+		t.Fatalf("connected on %s, want c %s", got, c.addr)
+	}
+	for _, addr := range []string{a, b.addr, c.addr} {
+		if skip := m.routeSkip(addr); len(skip) != 0 {
+			t.Fatalf("%v set aside on %s after an IP block and a swallow", skip, addr)
+		}
+	}
+}
+
+// blockedThenSwallowed wraps a strategy: SYN-blocked at blocked, swallowed
+// at swallowed, the strategy's own behaviour elsewhere.
+type blockedThenSwallowed struct {
+	Strategy
+	blocked, swallowed string
+}
+
+func (*blockedThenSwallowed) reportsTCPConnect() {}
+
+func (s *blockedThenSwallowed) Connect(ctx context.Context, target string) (net.Conn, error) {
+	switch target {
+	case s.blocked:
+		stalled := protectedGreeter{id: s.ID(), priority: s.Priority(), stall: true}
+		return stalled.Connect(ctx, target)
+	case s.swallowed:
+		swallowed := protectedGreeter{id: s.ID(), priority: s.Priority(), swallow: true}
+		return swallowed.Connect(ctx, target)
+	}
+	plain := protectedGreeter{id: s.ID(), priority: s.Priority()}
+	return plain.Connect(ctx, target)
+}
+
+// TestASetAsideTransportIsTriedLastNotSkipped is P2-E of the round-6 review:
+// the transports a route verdict set aside were left out while anything else
+// was eligible. With REALITY set aside on both servers and Polling refused on
+// both, cycle after cycle failed on Polling - each one charging the servers -
+// and REALITY, which works, was never dialled. It goes last, and connects.
+func TestASetAsideTransportIsTriedLastNotSkipped(t *testing.T) {
+	a, b := newHelloListener(t), newHelloListener(t)
+	m := newSilenceManager(t, time.Second, a.addr, b.addr)
+	seen := &targetLog{}
+	m.Register(&greetingStrategy{id: "reality", priority: 5, seen: seen})
+	m.Register(&greetingStrategy{id: "polling", priority: 6, refuse: true})
+	m.mu.Lock()
+	m.routeParked = map[int]map[string]time.Time{0: {"reality": time.Now().Add(time.Minute)}, 1: {"reality": time.Now().Add(time.Minute)}}
+	m.mu.Unlock()
+
+	conn, s, err := m.Connect(context.Background(), "")
+	if err != nil {
+		t.Fatalf("the first cycle failed: %v", err)
+	}
+	conn.Close()
+	if s.ID() != "reality" {
+		t.Fatalf("connected through %s", s.ID())
+	}
+}
+
+// TestDifferentTransportsDyingAreNotTheRoute: the same death is the same
+// transport. REALITY stalling on a and Polling stalling on b are two servers'
+// faults, and b is charged.
+func TestDifferentTransportsDyingAreNotTheRoute(t *testing.T) {
+	a, b, c := newHelloListener(t), newHelloListener(t), newHelloListener(t)
+	m := newSilenceManager(t, time.Second, a.addr, b.addr, c.addr)
+	candA, _ := m.selector().CandidateForAddr(a.addr)
+	candB, _ := m.selector().CandidateForAddr(b.addr)
+	// P2-D of the round-6 review: a verdict naming no transport (an IP block)
+	// leaves the mark where it was.
+	m.routeDeath(candB, deathSilent, "test", nil)
+	m.mu.RLock()
+	mark := m.lastDeath
+	m.mu.RUnlock()
+	if mark.server != -1 {
+		t.Fatalf("a verdict with no transport moved the mark to %+v", mark)
+	}
+	if m.routeDeath(candA, deathDegraded, "test", []string{"reality"}) {
+		t.Fatal("a first death was the route")
+	}
+	if m.routeDeath(candB, deathDegraded, "test", []string{"polling"}) {
+		t.Fatal("Polling stalling on b after REALITY stalled on a was taken for the route")
+	}
+	if !m.routeDeath(candA, deathDegraded, "test", []string{"polling", "ws"}) {
+		t.Fatal("Polling stalling on a after it stalled on b was not the route")
+	}
+	if skip := m.routeSkip(a.addr); !skip["polling"] || skip["ws"] {
+		t.Fatalf("set aside on a: %v, want polling only - the transport that died on both", skip)
+	}
+}
+
+// TestForcedModeDoesNotRescan is P3-1 of the round-6 review: in forced mode
+// the route verdict still rescanned the server, and the one forced transport
+// was dialled twice in a row on it. a and b answer nothing; the forced
+// transport's silence on b, after the same on a, is the route - and with
+// nothing else to try, the cycle moves on without dialling b again.
+func TestForcedModeDoesNotRescan(t *testing.T) {
+	old := rescanPause
+	rescanPause = func() time.Duration { return 10 * time.Millisecond }
+	t.Cleanup(func() { rescanPause = old })
+	a, b, c := newHelloListener(t), newHelloListener(t), newHelloListener(t)
+	m := newSilenceManager(t, 300*time.Millisecond, a.addr, b.addr, c.addr)
+	reality := &targetCounter{Strategy: &swallowAtGreeter{protectedGreeter{id: "reality", priority: 5}, map[string]bool{a.addr: true, b.addr: true}}}
+	m.Register(reality)
+	if err := m.ForceStrategy("reality"); err != nil {
+		t.Fatal(err)
+	}
+	markConnected(m, reality)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if conn, _, err := m.Connect(ctx, ""); err == nil {
+		conn.Close()
+	}
+	if n := reality.at(a.addr); n != 1 {
+		t.Fatalf("a dialled %d times - the test proves nothing", n)
+	}
+	if n := reality.at(b.addr); n != 1 {
+		t.Fatalf("the forced transport was dialled %d times in a row on b", n)
+	}
+}
+
+// targetCounter counts a strategy's dials per target.
+type targetCounter struct {
+	Strategy
+	mu sync.Mutex
+	n  map[string]int
+}
+
+func (*targetCounter) reportsTCPConnect() {}
+
+func (s *targetCounter) Connect(ctx context.Context, target string) (net.Conn, error) {
+	s.mu.Lock()
+	if s.n == nil {
+		s.n = map[string]int{}
+	}
+	s.n[target]++
+	s.mu.Unlock()
+	return s.Strategy.Connect(ctx, target)
+}
+
+func (s *targetCounter) at(target string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.n[target]
 }

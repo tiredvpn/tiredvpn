@@ -199,6 +199,11 @@ func TestFoldedKeysStayBounded(t *testing.T) {
 	if n := len(pool.folded); n > adoptFoldMax {
 		t.Fatalf("%d fold records, cap %d", n, adoptFoldMax)
 	}
+	// P3-12 of the round-6 review: a full map dropped every record, and
+	// every key searched again at once. Half of them stay.
+	if n := len(pool.folded); n < adoptFoldMax/2 {
+		t.Fatalf("%d fold records left after the cap was hit: the throttle was cleared", n)
+	}
 	pool.folded["global@192.0.2.1"] = time.Now().Add(-time.Second) // the record has run out
 	if _, err := pool.Allocate("polling:global@192.0.2.1", net.ParseIP("10.8.1.9"), ""); err != nil {
 		t.Fatal(err)

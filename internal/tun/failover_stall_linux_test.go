@@ -793,3 +793,38 @@ func TestControlRelaysNameTheSessionStrategy(t *testing.T) {
 		t.Fatalf("the relay carries strategy %v, want the session's", r.callbacks.Strategy)
 	}
 }
+
+// TestDataDownIsStampedAndEchoesAreNot: Stop books a session as useful by
+// its last data packet down (P3-4 of the round-6 review). A keepalive echo
+// moves lastRx and nothing else; a data packet moves lastData.
+func TestDataDownIsStampedAndEchoesAreNot(t *testing.T) {
+	h := newStallHarness(t, nil)
+	h.exit.echo.Store(true)
+	h.v.mu.Lock()
+	h.v.lastData = time.Time{}
+	h.v.mu.Unlock()
+	if err := h.exit.writeFrame(nil); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	h.v.mu.Lock()
+	data := h.v.lastData
+	h.v.mu.Unlock()
+	if !data.IsZero() {
+		t.Fatal("a keepalive echo was stamped as data")
+	}
+	if err := h.exit.writeFrame(fixtureFlows(t)[8].data); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		h.v.mu.Lock()
+		data = h.v.lastData
+		h.v.mu.Unlock()
+		if !data.IsZero() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("a data packet down was not stamped")
+}

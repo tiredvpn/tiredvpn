@@ -221,3 +221,26 @@ func TestASilenceNamingBothFamiliesParksTheServer(t *testing.T) {
 		t.Fatal("another server's address completed a's chain")
 	}
 }
+
+// TestAnImportedServerBackoffStillDecays is P3-5 of the round-6 review: the
+// decay is measured from the end of the server's last park, which did not
+// travel with the backoff, so after an import the next verdict doubled it
+// however long the server had been quiet.
+func TestAnImportedServerBackoffStillDecays(t *testing.T) {
+	s, clk := twoDualStackServers(t)
+	s.ReportSilent(candFor(t, s, aV4), aV6)
+	base := stateOf(t, s, aV6).CooldownUntil.Sub(clk.Now())
+	clk.Advance(base + time.Second)
+	s.ReportSilent(candFor(t, s, aV4), aV6) // grown
+	grown := stateOf(t, s, aV6).CooldownUntil.Sub(clk.Now())
+	recs := s.ExportHealth()
+
+	next, nclk := twoDualStackServers(t)
+	nclk.Advance(base + time.Second) // the same moment as clk
+	next.ImportHealth(recs)
+	nclk.Advance(2*grown + time.Second) // the park, then as long again in quiet
+	next.ReportSilent(candFor(t, next, aV4), aV6)
+	if got := stateOf(t, next, aV6).CooldownUntil.Sub(nclk.Now()); got != base {
+		t.Fatalf("after an import and a quiet park-length the server is parked for %v, want the base %v", got, base)
+	}
+}

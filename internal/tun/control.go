@@ -427,6 +427,13 @@ func (cs *ControlServer) dispatchControl(ctx context.Context, m controlMsg) (Con
 		case "connect":
 			resp = cs.handleConnect(ctx)
 		case "disconnect":
+			// The host's own stop. Told here, not in handleDisconnect: Close
+			// runs that too, on every core shutdown - after a dead connection
+			// as well - and the carry for the next core was wiped each time
+			// (P1-B of the round-6 review).
+			if cs.config.DisconnectedFn != nil {
+				cs.config.DisconnectedFn()
+			}
 			resp = cs.handleDisconnect()
 		case "status":
 			resp = cs.handleStatus()
@@ -681,9 +688,6 @@ func (cs *ControlServer) handleDisconnect() ControlResponse {
 	// the host ended on purpose.
 	cs.sessionGen++
 	cs.relayGeneration++
-	if cs.config.DisconnectedFn != nil {
-		cs.config.DisconnectedFn()
-	}
 
 	// Stop the relay and close the TUN copy this process received over
 	// SCM_RIGHTS. The host closing its own descriptor does not take the

@@ -910,6 +910,12 @@ type HealthRecord struct {
 	// each comes with a park of at least siblingTryHold, and the park is
 	// carried.
 	ServerBackoff time.Duration
+	// ServerParkEnd and ServerParked are when the server's last park ended
+	// and how long it lasted: what the backoff's decay is measured from.
+	// Without them an imported backoff doubled on the next verdict however
+	// long the server had been quiet (P3-5 of the round-6 review).
+	ServerParkEnd time.Time
+	ServerParked  time.Duration
 }
 
 // ExportHealth returns every candidate's failure history and park.
@@ -922,7 +928,7 @@ func (s *Selector) ExportHealth() []HealthRecord {
 		sc := s.servers[c.EndpointIdx]
 		out[i] = HealthRecord{Addr: c.Addr, ConsecutiveFailures: h.consecutiveFailures, LastSuccess: h.lastSuccess,
 			LastFailure: h.lastFailure, CooldownUntil: h.cooldownUntil, Backoff: h.backoff, DeadStreak: h.deadStreak,
-			ServerBackoff: sc.backoff}
+			ServerBackoff: sc.backoff, ServerParkEnd: sc.until, ServerParked: sc.parked}
 	}
 	return out
 }
@@ -942,7 +948,9 @@ func (s *Selector) ImportHealth(recs []HealthRecord) {
 		h.consecutiveFailures, h.lastSuccess, h.lastFailure = r.ConsecutiveFailures, r.LastSuccess, r.LastFailure
 		h.cooldownUntil, h.backoff, h.deadStreak = r.CooldownUntil, r.Backoff, r.DeadStreak
 		sc := &s.servers[s.cands[idx].EndpointIdx]
-		sc.backoff = max(sc.backoff, r.ServerBackoff)
+		if r.ServerBackoff > sc.backoff {
+			sc.backoff, sc.until, sc.parked = r.ServerBackoff, r.ServerParkEnd, r.ServerParked
+		}
 	}
 }
 

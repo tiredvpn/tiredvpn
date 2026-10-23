@@ -147,7 +147,9 @@ func androidControlConfig(cfg *Config, mgr *strategy.Manager, dualStack bool, se
 		SessionEndedFn: sess.ended,
 
 		// DisconnectedFn: the user stopped the tunnel. The next start is a
-		// fresh one, perhaps on another network: no carry (carryFrom).
+		// fresh one, perhaps on another network: no carry (carryFrom), and
+		// so no endpoint health either - carryInto resets the selector the
+		// cores share (P2-F of the round-6 review).
 		DisconnectedFn: func() { sess.stopped.Store(true) },
 
 		// SessionStrategyFn: the relay's stall detector judges the session by
@@ -187,14 +189,22 @@ var androidCarry struct {
 const androidCarryTTL = 2 * time.Minute
 
 // carryInto hands mgr what the previous core learned. Call before connecting.
+//
+// Without a carry, or with one too old, mgr starts from nothing: that
+// includes the endpoint health in the selector the process shares between
+// cores (Config.Shared), whose parks and server backoff otherwise outlived a
+// user's stop and the carry's TTL by up to the selector's 10 minutes (P2-F of
+// the round-6 review).
 func carryInto(mgr *strategy.Manager) {
 	androidCarry.mu.Lock()
 	defer androidCarry.mu.Unlock()
 	if androidCarry.at.IsZero() {
+		mgr.ResetHealth()
 		return
 	}
-	if age := time.Since(androidCarry.at); age > androidCarryTTL {
+	if age := time.Now().Round(0).Sub(androidCarry.at); age > androidCarryTTL {
 		log.Info("Not taking over the previous core's server verdicts: %v old", age.Round(time.Second))
+		mgr.ResetHealth()
 		return
 	}
 	mgr.ImportEndpointHealth(androidCarry.health)
@@ -215,5 +225,8 @@ func carryFrom(mgr *strategy.Manager, sess *androidSession) {
 	androidCarry.health = mgr.EndpointHealth()
 	androidCarry.storm = mgr.StormHistory()
 	androidCarry.route = mgr.RouteHistory()
-	androidCarry.at = time.Now()
+	// Wall clock (Round(0) drops the monotonic reading): a phone that sleeps
+	// between two cores must see the sleep in the carry's age (P3-3 of the
+	// round-6 review).
+	androidCarry.at = time.Now().Round(0)
 }
