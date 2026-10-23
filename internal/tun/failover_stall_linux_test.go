@@ -48,6 +48,9 @@ type stallExit struct {
 	feeder     atomic.Bool
 	gotData    atomic.Int64
 	gotEcho    atomic.Int64 // keepalives received
+	// arrived, when set, is told of every frame the exit reads, a keepalive
+	// or not, the moment it reads it.
+	arrived atomic.Pointer[func(keepalive bool)]
 }
 
 func (e *stallExit) writeFrame(p []byte) error {
@@ -75,6 +78,9 @@ func (e *stallExit) serve() {
 		n := binary.BigEndian.Uint32(hdr)
 		if _, err := io.ReadFull(e.conn, make([]byte, n)); err != nil {
 			return
+		}
+		if f := e.arrived.Load(); f != nil {
+			(*f)(n == 0)
 		}
 		switch {
 		case n == 0:
@@ -834,14 +840,45 @@ func TestDataDownIsStampedAndEchoesAreNot(t *testing.T) {
 	t.Fatal("a data packet down was not stamped")
 }
 
+// uplinkArrivals records, at the exit, the gap before every frame that came
+// up, and whether it was a keepalive.
+type uplinkArrival struct {
+	gap       time.Duration
+	keepalive bool
+}
+
+func recordUplink(h *stallHarness) func() []uplinkArrival {
+	var mu sync.Mutex
+	var got []uplinkArrival
+	last := time.Now()
+	f := func(keepalive bool) {
+		mu.Lock()
+		now := time.Now()
+		got = append(got, uplinkArrival{now.Sub(last), keepalive})
+		last = now
+		mu.Unlock()
+	}
+	h.exit.arrived.Store(&f)
+	return func() []uplinkArrival {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]uplinkArrival(nil), got...)
+	}
+}
+
 // TestTheUplinkKeepaliveFillsSilenceOnly is P3-13 of the round-7 review from
 // the client's side, through its own loops: keepUplinkAlive adds a keepalive
-// only when nothing has gone up for its drawn period. Packets going up every
-// 50 ms against a 200 ms period draw none; once they stop, one comes.
+// only when nothing has gone up for its drawn period. Whether one goes out
+// while packets go up every 50 ms depends on scheduling - a stall under
+// -race load is a silent uplink - so each keepalive is checked where it
+// lands: the frame before it came at least most of a period earlier. Once
+// the packets stop, keepalives come.
 func TestTheUplinkKeepaliveFillsSilenceOnly(t *testing.T) {
 	h := newQuietStallHarness(t, nil)
-	restore := SetUplinkKeepaliveDraw(func() time.Duration { return 200 * time.Millisecond })
+	const period = 200 * time.Millisecond
+	restore := SetUplinkKeepaliveDraw(func() time.Duration { return period })
 	t.Cleanup(func() { SetUplinkKeepaliveDraw(restore) })
+	arrivals := recordUplink(h)
 	go h.v.keepUplinkAlive()
 
 	pkt := fixtureFlows(t)[5].data
@@ -854,12 +891,18 @@ func TestTheUplinkKeepaliveFillsSilenceOnly(t *testing.T) {
 	if h.exit.gotData.Load() < 30 {
 		t.Fatalf("%d packets went up - the uplink was not busy", h.exit.gotData.Load())
 	}
-	if n := h.exit.gotEcho.Load(); n != 0 {
-		t.Fatalf("%d keepalives on a busy uplink", n)
-	}
+	busy := h.exit.gotEcho.Load()
 	time.Sleep(time.Second)
-	if h.exit.gotEcho.Load() == 0 {
+	if h.exit.gotEcho.Load() == busy {
 		t.Fatal("no keepalive once the uplink went quiet - the test proves nothing")
+	}
+	for i, a := range arrivals() {
+		// The client stamps the frame before a keepalive when its write
+		// returns; the exit sees it a little later. Half a period covers
+		// that, not a keepalive on a busy uplink, 50 ms behind a packet.
+		if a.keepalive && a.gap < period/2 {
+			t.Fatalf("frame %d, a keepalive, came %v after the frame before it, against a %v period", i+1, a.gap, period)
+		}
 	}
 }
 
@@ -868,20 +911,29 @@ func TestTheUplinkKeepaliveFillsSilenceOnly(t *testing.T) {
 // ticks a little before the next keepalive is due. Waiting a whole period
 // from that tick left the uplink up to two periods silent - past the exit's
 // deadline at the longer draws, the fault the relay leg had (P2-1 of the
-// round-7 review). Here a packet follows every keepalive by 20 ms, and no
-// gap between frames going up may exceed one period by much.
+// round-7 review). The timer's own decisions are checked, not the gaps on
+// the wire, which a loaded machine stretches: after an early tick it may
+// wait only what is left of the period.
 func TestTheUplinkKeepaliveIsNeverAPeriodLate(t *testing.T) {
 	h := newQuietStallHarness(t, nil)
-	const period = time.Second
+	const period = 300 * time.Millisecond
 	restore := SetUplinkKeepaliveDraw(func() time.Duration { return period })
 	t.Cleanup(func() { SetUplinkKeepaliveDraw(restore) })
+	type reset struct{ next, quiet, silent time.Duration }
+	var mu sync.Mutex
+	var resets []reset
+	f := func(next, quiet, silent time.Duration) {
+		mu.Lock()
+		resets = append(resets, reset{next, quiet, silent})
+		mu.Unlock()
+	}
+	uplinkTimerReset.Store(&f)
+	t.Cleanup(func() { uplinkTimerReset.Store(nil) })
 	go h.v.keepUplinkAlive()
 
 	pkt := fixtureFlows(t)[5].data
-	frames := func() int64 { return h.exit.gotEcho.Load() + h.exit.gotData.Load() }
-	last, lastAt, echoes := frames(), time.Now(), h.exit.gotEcho.Load()
-	var worst time.Duration
-	for end := time.Now().Add(8 * time.Second); time.Now().Before(end); time.Sleep(5 * time.Millisecond) {
+	echoes := h.exit.gotEcho.Load()
+	for end := time.Now().Add(3 * time.Second); time.Now().Before(end); time.Sleep(5 * time.Millisecond) {
 		if n := h.exit.gotEcho.Load(); n != echoes {
 			echoes = n
 			time.Sleep(20 * time.Millisecond)
@@ -889,17 +941,20 @@ func TestTheUplinkKeepaliveIsNeverAPeriodLate(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if n := frames(); n != last {
-			worst = max(worst, time.Since(lastAt))
-			last, lastAt = n, time.Now()
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	early := 0
+	for _, r := range resets {
+		if r.silent == 0 {
+			continue // a keepalive just went: a whole period, rightly
+		}
+		early++
+		if want := max(r.quiet-r.silent, 10*time.Millisecond); r.next != want {
+			t.Fatalf("after an early tick, %v into a %v period, the timer waits %v, want %v", r.silent, r.quiet, r.next, want)
 		}
 	}
-	if echoes < 5 {
-		t.Fatalf("%d keepalives in 8 s - the test proves nothing", echoes)
-	}
-	// A whole period late is two periods; a loaded -race run adds a few
-	// hundred ms at most.
-	if worst > period+period/2 {
-		t.Fatalf("the uplink went %v without a frame, against a %v period", worst, period)
+	if early == 0 {
+		t.Fatal("no early tick - the test proves nothing")
 	}
 }

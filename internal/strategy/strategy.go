@@ -396,6 +396,10 @@ type connectPhase struct {
 	connectedAt atomic.Int64 // UnixNano of the TCP connect, 0 before
 }
 
+// dialCutTimer arms an attempt's dialLimit cut. A var so a test can fire the
+// cut itself rather than race a wall-clock budget under load.
+var dialCutTimer = time.AfterFunc
+
 // watchConnect follows an attempt on ctx, whose cancel is cancel, through its
 // TCP dial when the strategy reports it (hooked), and arms the dialLimit cut
 // of connectThroughRefusal. Without a split (dialLimit zero or not shorter
@@ -423,7 +427,7 @@ func watchConnect(ctx context.Context, cancel context.CancelFunc, limit, dialLim
 		return p
 	}
 	p.split = true
-	p.timer = time.AfterFunc(dialLimit, func() {
+	p.timer = dialCutTimer(dialLimit, func() {
 		if p.state.CompareAndSwap(phaseDialling, phaseCut) || p.state.CompareAndSwap(phaseLocal, phaseCutLocal) {
 			cancel()
 		}

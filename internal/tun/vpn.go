@@ -1691,6 +1691,11 @@ func init() {
 	uplinkKeepaliveDraw.Store(&draw)
 }
 
+// uplinkTimerReset, when a test sets it, is told of every reset of the
+// uplink keepalive's timer: the wait chosen, the period, and how long the
+// uplink had been silent. Nil in production.
+var uplinkTimerReset atomic.Pointer[func(next, quiet, silent time.Duration)]
+
 // SetUplinkKeepaliveDraw replaces the draw for a test and returns the one it
 // replaced.
 func SetUplinkKeepaliveDraw(draw func() time.Duration) func() time.Duration {
@@ -1751,6 +1756,9 @@ func (v *VPNClient) keepUplinkAlive() {
 			silent = 0
 		}
 		next := max(quiet-silent, 10*time.Millisecond)
+		if f := uplinkTimerReset.Load(); f != nil {
+			(*f)(next, quiet, silent)
+		}
 		timer.Reset(next)
 	}
 }
