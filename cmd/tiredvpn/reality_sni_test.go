@@ -132,6 +132,11 @@ func TestJNIRealitySNI(t *testing.T) {
 	if cfg, err = parseClientArgs([]string{"-server", "203.0.113.10:995", "-secret", "s", "-reality-sni", "a.example,b.example:443"}); err == nil {
 		t.Errorf("an invalid list was accepted (pool %v)", cfg.REALITYSNIs)
 	}
+	// P3-14 of the round-4 review: a bare trailing flag was skipped and the
+	// built-in pool used.
+	if cfg, err = parseClientArgs([]string{"-server", "203.0.113.10:995", "-secret", "s", "-reality-sni"}); err == nil {
+		t.Errorf("a -reality-sni without a value was accepted (pool %v)", cfg.REALITYSNIs)
+	}
 }
 
 // TestConnectionStringCarriesTheSNIPool: admin add and admin qr write the pool
