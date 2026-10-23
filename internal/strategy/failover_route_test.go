@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"context"
+	"errors"
 	"net"
 	"slices"
 	"testing"
@@ -54,11 +55,11 @@ func TestARouteWideDeathChangesTheTransportAfterTwoServers(t *testing.T) {
 				clk.Advance(45 * time.Second)
 				m.SessionEnded(tc.end(SessionEnd{Strategy: s.ID(), Endpoint: cand, HasEndpoint: true}))
 				if len(rode) == 3 {
-					m.mu.RLock()
-					fast := m.lastSuccessfulStrategy
-					m.mu.RUnlock()
-					if fast != nil && fast.ID() == "reality" {
-						t.Fatal("the route's verdict left REALITY on the fast path")
+					// Set aside where it died - a and b - and nowhere else.
+					for i, want := range []bool{true, true, false} {
+						if got := m.routeSkip(addrs[i][0])["reality"]; got != want {
+							t.Fatalf("server %d: REALITY set aside %v, want %v", i, got, want)
+						}
 					}
 				}
 			}
@@ -205,9 +206,9 @@ func TestAnIPBlockedServerIsNotTheRoute(t *testing.T) {
 	if s.ID() != "reality" {
 		t.Fatalf("connected through %s: an IP block parked the transports that work", s.ID())
 	}
-	for _, id := range []string{"reality", "polling", "stego"} {
-		if m.stormDetector.IsParked(id) {
-			t.Fatalf("%s is parked for the route", id)
+	for _, addr := range []string{a, b, c.addr} {
+		if skip := m.routeSkip(addr); len(skip) != 0 {
+			t.Fatalf("%v set aside on %s for the route", skip, addr)
 		}
 	}
 }
@@ -234,5 +235,71 @@ func TestAnOldDeathIsNotTheRoute(t *testing.T) {
 		if got := m.routeDeath(candB, deathDegraded, "test", []string{"reality"}); got != tc.route {
 			t.Fatalf("a death on a %v ago: route=%v, want %v", tc.age, got, tc.route)
 		}
+	}
+}
+
+// refuseAtGreeter is greetingStrategy refused at the listed addresses.
+type refuseAtGreeter struct {
+	greetingStrategy
+	at map[string]bool
+}
+
+func (s *refuseAtGreeter) Connect(ctx context.Context, target string) (net.Conn, error) {
+	if s.at[target] {
+		if s.seen != nil {
+			s.seen.add(target)
+		}
+		return nil, errors.New("connection refused by peer")
+	}
+	return s.greetingStrategy.Connect(ctx, target)
+}
+
+// TestARouteParkStaysWithTheServersItWasDecidedOn is P2-2 of the round-5
+// review: the route verdict parked the transport on every server for five
+// minutes and dropped it from the fast path, so when a and b died on REALITY
+// and c was healthy, c was dialled on Polling. Now REALITY is set aside on a
+// and b only. Here Polling is refused on b, so the next connect walks on to c,
+// and c gets REALITY first, through the fast path.
+func TestARouteParkStaysWithTheServersItWasDecidedOn(t *testing.T) {
+	a, b, c := newHelloListener(t), newHelloListener(t), newHelloListener(t)
+	m := newSilenceManager(t, time.Second, a.addr, b.addr, c.addr)
+	seen := &targetLog{}
+	m.Register(&greetingStrategy{id: "reality", priority: 5, seen: seen})
+	m.Register(&refuseAtGreeter{greetingStrategy{id: "polling", priority: 6}, map[string]bool{b.addr: true}})
+
+	var rode []string
+	for range 3 {
+		conn, s, cand, ok, err := m.ConnectSession(context.Background(), "")
+		if err != nil || !ok {
+			t.Fatalf("ConnectSession: %v", err)
+		}
+		conn.Close()
+		rode = append(rode, s.ID()+"@"+cand.Addr)
+		if cand.Addr == c.addr {
+			break
+		}
+		m.SessionEnded(SessionEnd{Strategy: s.ID(), Endpoint: cand, HasEndpoint: true, Degraded: true})
+	}
+	want := []string{"reality@" + a.addr, "reality@" + b.addr, "reality@" + c.addr}
+	if !slices.Equal(rode, want) {
+		t.Fatalf("sessions rode %v, want %v", rode, want)
+	}
+}
+
+// TestARouteParkRunsOut: the transports a route verdict set aside come back
+// on those servers after stormCooldown.
+func TestARouteParkRunsOut(t *testing.T) {
+	a, b := newHelloListener(t), newHelloListener(t)
+	m := newSilenceManager(t, time.Second, a.addr, b.addr)
+	m.Register(&greetingStrategy{id: "reality", priority: 5})
+	m.mu.Lock()
+	m.routeParked = map[int]map[string]time.Time{0: {"reality": time.Now().Add(time.Minute), "polling": time.Now().Add(-time.Second)}}
+	m.mu.Unlock()
+	skip := m.routeSkip(a.addr)
+	if !skip["reality"] || skip["polling"] {
+		t.Fatalf("set aside on a: %v, want reality only", skip)
+	}
+	if len(m.routeSkip(b.addr)) != 0 {
+		t.Fatal("b has nothing set aside")
 	}
 }

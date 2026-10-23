@@ -32,9 +32,11 @@ Versions follow [Semantic Versioning](https://semver.org/).
   longer each time, and the client goes to the next one. It used to go back
   and forth between the two addresses of one server.
 - **Client: a transport that dies the same way on two servers in a row is
-  set aside.** The route is blamed, not the servers: the transport is parked
-  for 5 minutes and the client tries another one on the second server,
-  instead of walking the whole pool on a transport that works nowhere.
+  set aside.** The route is blamed, not the servers: the transport is set
+  aside for 5 minutes on those two servers, and the client tries another one
+  on the second server instead of walking the whole pool on a transport that
+  works nowhere. A third server is not assumed to share their fate: it pays
+  one death of its own before the rule applies there.
 - **Client: the tunnel moves back to a better strategy after a fault.** After
   a periodic reprobe finds it working again, the client switches over without
   dropping the tunnel, and keeps the old strategy if the new one fails.
