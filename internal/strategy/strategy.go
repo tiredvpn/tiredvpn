@@ -4794,6 +4794,26 @@ func (m *Manager) PinAnswering(addr string) bool {
 	return true
 }
 
+// PinParkedAnswering pins the candidate at addr whatever its park says, and
+// lifts the park, keeping its history: for a pool poll that has heard only
+// this server, parked for dead sessions, for long enough (see the TUN
+// client's waitForPool). The dead-session park doubles up to MaxCooldown, and
+// a single-server pool would otherwise wait it out in full.
+func (m *Manager) PinParkedAnswering(addr string) {
+	sel := m.selector()
+	if sel == nil {
+		return
+	}
+	cand, ok := sel.CandidateForAddr(addr)
+	if !ok {
+		return
+	}
+	log.Info("Pool poll: %s answers and nothing else does - lifting its park for dead sessions", cand)
+	sel.ReportProbe(cand, true, 0)
+	sel.Unpark(cand)
+	sel.Pin(cand)
+}
+
 // ProbeEndpointFamily runs the one-shot transport-family probe for the pinned
 // candidate and returns the address that came out of it.
 //

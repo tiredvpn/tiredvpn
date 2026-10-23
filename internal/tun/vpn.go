@@ -2546,22 +2546,42 @@ func (v *VPNClient) waitOutSilentPool(err error, since time.Time) bool {
 // the live one its budget ran out before reaching it, so the client found the
 // live server here and could not get to it there, round after round.
 // Returns false only when the client was stopped.
+//
+// A server parked for dead sessions that answers is passed over (see
+// Manager.PinAnswering), but not for longer than poolDeadParkWait: that park
+// doubles up to MaxCooldown, 30 minutes by default, and with nothing else
+// answering - a single-server pool - the client would wait it out in full.
 func (v *VPNClient) waitForPool(since time.Time) bool {
 	base := poolPollInterval
+	var parkedSince time.Time // when a dead-session-parked server first answered
 	for atomic.LoadInt32(&v.running) == 1 {
 		select {
 		case <-v.stopCh:
 			return false
 		case <-time.After(poolPause(base)):
 		}
-		if addr, ok := v.pollOneServer(); ok && (v.manager == nil || v.manager.PinAnswering(addr)) {
+		addr, ok := v.pollOneServer()
+		if ok && (v.manager == nil || v.manager.PinAnswering(addr)) {
 			log.Info("Server %s answers again after %v of pool silence", addr, time.Since(since).Round(time.Second))
 			return true
+		}
+		if ok {
+			if parkedSince.IsZero() {
+				parkedSince = time.Now()
+			} else if time.Since(parkedSince) >= poolDeadParkWait {
+				v.manager.PinParkedAnswering(addr)
+				return true
+			}
 		}
 		base = nextPoolBase(base, time.Since(since))
 	}
 	return false
 }
+
+// poolDeadParkWait is how long the pool poll passes over a server parked for
+// dead sessions that answers while nothing else does. A var so tests can
+// shorten it.
+var poolDeadParkWait = 2 * time.Minute
 
 // pollOneServer dials the next address of the pool in rotation, TCP only.
 func (v *VPNClient) pollOneServer() (string, bool) {
