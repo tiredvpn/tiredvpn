@@ -107,7 +107,7 @@ func TestAServerVerdictGrows(t *testing.T) {
 		return park
 	}
 	parks := []time.Duration{serverPark(), serverPark(), serverPark()}
-	if !(parks[0] < parks[1] && parks[1] < parks[2]) {
+	if parks[0] >= parks[1] || parks[1] >= parks[2] {
 		t.Fatalf("server parks %v do not grow", parks)
 	}
 	s.ReportSessionUseful(candFor(t, s, aV4))
