@@ -225,3 +225,54 @@ func TestASuccessOnOneFamilyKeepsTheOthersSkipList(t *testing.T) {
 		t.Fatal("a success on v4 kept v4's own skip list")
 	}
 }
+
+// TestStampsThatCrossACoreRestartAreWallClock is P3-6 of the round-7 review:
+// the swallow records and the storm history travel in the Android carry,
+// and a phone may sleep between two cores. Stamped on the monotonic clock,
+// which stops during the sleep, a run or a storm from before a long doze
+// still counted after waking. Both are stamped here through the real paths
+// - a swallowed cycle, a session started as the tunnel starts one - and must
+// carry no monotonic reading.
+func TestStampsThatCrossACoreRestartAreWallClock(t *testing.T) {
+	a, b := newHelloListener(t), newHelloListener(t)
+	m := newSilenceManager(t, 300*time.Millisecond, a.addr, b.addr)
+	dead := map[string]bool{a.addr: true}
+	reality := &swallowAtGreeter{protectedGreeter{id: "reality", priority: 5}, dead}
+	m.Register(reality)
+	m.Register(&swallowAtGreeter{protectedGreeter{id: "polling", priority: 6}, dead})
+	markConnected(m, reality)
+	connectCycles(t, m, 1, 500*time.Millisecond)
+	m.mu.RLock()
+	var stamps []time.Time
+	for _, r := range m.swallowed {
+		stamps = append(stamps, r.last)
+	}
+	m.mu.RUnlock()
+	if len(stamps) == 0 {
+		t.Fatal("no swallow record - the test proves nothing")
+	}
+
+	m2 := newSilenceManager(t, time.Second, b.addr)
+	m2.Register(&protectedGreeter{id: "reality", priority: 5})
+	conn, s, _, ok, err := m2.ConnectSession(context.Background(), "")
+	if err != nil || !ok {
+		t.Fatalf("ConnectSession: %v", err)
+	}
+	conn.Close()
+	m2.RecordSessionStart(s.ID()) // as the tunnel does once the session is up
+	d := m2.StormHistory()
+	d.mu.Lock()
+	stamps = append(stamps, d.startedAt)
+	for _, at := range d.openedAt {
+		stamps = append(stamps, at)
+	}
+	d.mu.Unlock()
+	if len(stamps) < 3 {
+		t.Fatalf("%d stamps - the session left no trace in the storm history", len(stamps))
+	}
+	for _, at := range stamps {
+		if at != at.Round(0) {
+			t.Fatalf("stamp %v carries a monotonic reading, which stops while the phone sleeps", at)
+		}
+	}
+}

@@ -2,8 +2,13 @@ package server
 
 import (
 	"encoding/binary"
+	"fmt"
+	"io"
 	"math"
 	"net"
+	"os"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -11,6 +16,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/tun"
 )
 
@@ -24,19 +30,22 @@ import (
 const legScale = 25
 
 // scaleLegClocks divides the leg's clocks by legScale for the test: the
-// exit's read deadline, the relay's, the keepalive draw and how long the
-// relay keeps a leg for a silent client.
+// exit's read deadline, the relay's, the relay's write deadline, the
+// keepalive draw and how long the relay keeps a leg for a silent client.
 func scaleLegClocks(t *testing.T) {
 	t.Helper()
 	oldRead, oldIdle, oldWindow := h2FrameReadTimeoutNs.Load(), relayTUNIdleTimeoutNs.Load(), relayClientActiveWindowNs.Load()
+	oldWrite := relayWriteTimeoutNs.Load()
 	h2FrameReadTimeoutNs.Store(oldRead / legScale)
 	relayTUNIdleTimeoutNs.Store(oldIdle / legScale)
 	relayClientActiveWindowNs.Store(oldWindow / legScale)
+	relayWriteTimeoutNs.Store(oldWrite / legScale)
 	setKeepaliveDraw(t, func(d time.Duration) time.Duration { return d / legScale })
 	t.Cleanup(func() {
 		h2FrameReadTimeoutNs.Store(oldRead)
 		relayTUNIdleTimeoutNs.Store(oldIdle)
 		relayClientActiveWindowNs.Store(oldWindow)
+		relayWriteTimeoutNs.Store(oldWrite)
 	})
 }
 
@@ -127,59 +136,286 @@ const (
 	legDownload
 )
 
+// legDeadlines is how many of the exit's read deadlines a leg must outlive.
+// The keepalive draw tops out at 45 s and the relay's own deadline is three
+// of the exit's; five cover both with room.
+const legDeadlines = 5
+
 // TestARelayLegOutlivesTheExitsReadDeadline: an idle leg, one that only
-// uploads and one that only downloads each stay up for three of
-// the exit's read deadlines, while the downstream client shows a sign of life
+// uploads and one that only downloads each stay up for legDeadlines of the
+// exit's read deadlines, while the downstream client shows a sign of life
 // every 10 s (scaled) as its keepalive would.
 func TestARelayLegOutlivesTheExitsReadDeadline(t *testing.T) {
+	scaleLegClocks(t)
 	for _, tc := range []struct {
 		name string
 		kind legTraffic
 	}{{"idle", legIdle}, {"upload only", legUpload}, {"download only", legDownload}} {
 		t.Run(tc.name, func(t *testing.T) {
-			scaleLegClocks(t)
-			exit, sink, clientIP, down := dialLeg(t)
+			t.Parallel()
+			runLeg(t, tc.kind)
+		})
+	}
+}
 
-			pkt := ipv4Packet(net.IPv4(10, 8, 7, 9), clientIP)
-			up := ipv4Packet(clientIP, net.IPv4(10, 8, 7, 9))
-			deadline := time.Now().Add(3 * h2FrameReadTimeout())
-			clientTick := time.NewTicker(10 * time.Second / legScale)
-			defer clientTick.Stop()
-			trafficTick := time.NewTicker(h2FrameReadTimeout() / 5)
-			defer trafficTick.Stop()
-			for time.Now().Before(deadline) {
+// TestASteadyOneWayDownloadKeepsTheLeg is P2-1 of the round-7 review: a leg
+// with a steady download and nothing going up died, of two causes.
+//
+// Bulk (1400-byte datagrams every 5 ms): the relay's write deadline was set
+// for each keepalive and never cleared, and the stego conn's WINDOW_UPDATE
+// flush from the read path (every 256 KB down) landed after it. The write
+// failed, tls.Conn made that permanent, and the exit closed the leg on its
+// read deadline. Bites when the quiet period is longer than the write
+// deadline: at 45 s, every time.
+//
+// Sparse (28-byte datagrams every 20 ms, no flush within the run): the
+// keepalive timer, armed on the downlink's stamp, ticked a few ms before the
+// keepalive was due and waited a whole quiet period more - up to two of
+// them without a frame for the exit.
+//
+// -short runs the 45 s draw only.
+func TestASteadyOneWayDownloadKeepsTheLeg(t *testing.T) {
+	draws := []time.Duration{45 * time.Second}
+	if !testing.Short() {
+		draws = append(draws, 20*time.Second, 30*time.Second)
+	}
+	scaleLegClocks(t)
+	for _, flow := range []struct {
+		name  string
+		size  int
+		every time.Duration
+	}{{"bulk", 1400, 5 * time.Millisecond}, {"sparse", 28, 20 * time.Millisecond}} {
+		for _, q := range draws {
+			t.Run(flow.name+"/"+q.String(), func(t *testing.T) {
+				setKeepaliveDraw(t, func(time.Duration) time.Duration { return q / legScale })
+				steadyDownload(t, flow.size, flow.every)
+			})
+		}
+	}
+}
+
+// steadyDownload runs a leg for legDeadlines exit deadlines with a datagram
+// of size bytes coming down every interval and nothing going up but the
+// relay's keepalives.
+func steadyDownload(t *testing.T, size int, every time.Duration) {
+	t.Helper()
+	exit, sink, clientIP, down := dialLeg(t)
+	w := exitWriterFor(t, exit, clientIP)
+	pkt := ipv4Packet(net.IPv4(10, 8, 7, 9), clientIP)
+	pkt = append(pkt, make([]byte, size-len(pkt))...)
+	binary.BigEndian.PutUint16(pkt[2:], uint16(len(pkt)))
+	span := legDeadlines * h2FrameReadTimeout()
+	deadline := time.Now().Add(span)
+	clientTick := time.NewTicker(10 * time.Second / legScale)
+	defer clientTick.Stop()
+	stream := time.NewTicker(every)
+	defer stream.Stop()
+	sent := int64(0)
+	for time.Now().Before(deadline) {
+		select {
+		case <-sink.Done():
+			t.Fatalf("the leg closed after %v (exit read deadline %v): %s",
+				span-time.Until(deadline), h2FrameReadTimeout(), closeReason(sink))
+		case <-clientTick.C:
+			sink.UpdateActivity()
+		case <-stream.C:
+			if w.SendPacket(pkt) == nil {
+				sent++
+			}
+		}
+	}
+	if got := down.Load(); got < sent*9/10 {
+		t.Fatalf("%d of %d packets came down", got, sent)
+	}
+}
+
+// TestARelayLegClosesCleanly is P3-1 of the round-7 review: Close cut the
+// write deadline whether or not a write was stuck, GOAWAY then failed and
+// spent a TLS record number, and the exit read "bad record MAC" instead of a
+// clean close. GOAWAY was also written outside the stego conn's lock while
+// the read path wrote WINDOW_UPDATE under it; the leg closes here in the
+// middle of a download, which -race watches.
+func TestARelayLegClosesCleanly(t *testing.T) {
+	out := &lockedLog{}
+	log.SetOutput(out)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	exit, sink, clientIP, down := dialLeg(t)
+	w := exitWriterFor(t, exit, clientIP)
+	pkt := ipv4Packet(net.IPv4(10, 8, 7, 9), clientIP)
+	pkt = append(pkt, make([]byte, 1372)...)
+	binary.BigEndian.PutUint16(pkt[2:], uint16(len(pkt)))
+	stop := make(chan struct{})
+	streamed := make(chan struct{})
+	go func() {
+		defer close(streamed)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = w.SendPacket(pkt)
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}()
+	for down.Load() < 400 { // past the first WINDOW_UPDATE flush
+		time.Sleep(5 * time.Millisecond)
+	}
+	sink.Close()
+	close(stop)
+	<-streamed
+	deadline := time.Now().Add(5 * time.Second)
+	for exit.ended.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if exit.ended.Load() == 0 {
+		t.Fatal("the exit did not end the session")
+	}
+	if strings.Contains(out.String(), "bad record MAC") {
+		t.Fatalf("the exit read a broken TLS record at the close:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "H2 TUN session ended: the peer closed it") {
+		t.Fatalf("the exit did not see a clean close:\n%s", out.String())
+	}
+}
+
+// TestARelayLegClosesWhileAWriteIsStuck: P3-1 of the round-7 review saw
+// Close wait 30 s behind a stuck write. Here the exit stops reading, writes
+// back up, and Close has to return at once: the stuck write is cut, and the
+// TLS close, whose close_notify waits up to 5 s on a peer that reads
+// nothing, finishes in the background.
+func TestARelayLegClosesWhileAWriteIsStuck(t *testing.T) {
+	proxy := &stallProxy{}
+	_, sink, clientIP, _ := dialLegVia(t, proxy)
+	up := ipv4Packet(clientIP, net.IPv4(10, 8, 7, 9))
+	up = append(up, make([]byte, 1372)...)
+	binary.BigEndian.PutUint16(up[2:], uint16(len(up)))
+	proxy.stalled.Store(true)
+	var last atomic.Int64 // monoNow of the last write that came back
+	last.Store(monoNow())
+	for range 3 {
+		go func() {
+			for sink.WritePacket(up) == nil {
+				last.Store(monoNow())
+			}
+		}()
+	}
+	// Stuck: no write has come back for half a second.
+	deadline := time.Now().Add(20 * time.Second)
+	for monoSince(last.Load()) < 500*time.Millisecond {
+		if time.Now().After(deadline) {
+			t.Fatal("the writes never blocked - the test cannot tell a stuck one")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	start := time.Now()
+	sink.Close()
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("Close took %v with a write stuck and others queued", took)
+	}
+}
+
+// TestRelayLegsUnderLoad is the same legs, many at once, with every CPU kept
+// busy: the one unexplained drop of a download-only leg happened while other
+// test processes loaded the machine. Not in -short.
+func TestRelayLegsUnderLoad(t *testing.T) {
+	if testing.Short() {
+		t.Skip("a minute of CPU load")
+	}
+	scaleLegClocks(t)
+	stop := make(chan struct{})
+	var burners sync.WaitGroup
+	for range runtime.NumCPU() {
+		burners.Go(func() {
+			x := 0
+			for {
 				select {
-				case <-sink.Done():
-					t.Fatalf("the leg closed after %v (exit read deadline %v)",
-						3*h2FrameReadTimeout()-time.Until(deadline), h2FrameReadTimeout())
-				case <-clientTick.C:
-					sink.UpdateActivity()
-				case <-trafficTick.C:
-					switch tc.kind {
-					case legUpload:
-						_ = sink.WritePacket(up)
-					case legDownload:
-						exitWriterFor(t, exit, clientIP).SendPacket(pkt) //nolint:errcheck
+				case <-stop:
+					return
+				default:
+					for i := range 100000 {
+						x += i
 					}
 				}
 			}
-			if tc.kind == legDownload && down.Load() == 0 {
-				t.Fatal("nothing came down - the download leg proves nothing")
-			}
-			if n := exit.ended.Load(); n != 0 {
-				t.Fatalf("the exit ended %d connections", n)
-			}
 		})
 	}
+	t.Cleanup(func() { close(stop); burners.Wait() })
+	kinds := []legTraffic{legIdle, legUpload}
+	for range 10 {
+		kinds = append(kinds, legDownload)
+	}
+	for i, kind := range kinds {
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			t.Parallel()
+			runLeg(t, kind)
+		})
+	}
+}
+
+// runLeg dials one leg and drives it for legDeadlines of the exit's read
+// deadlines: the downstream client's sign of life every 10 s (scaled), and a
+// packet up or down every fifth of the deadline, as kind says.
+func runLeg(t *testing.T, kind legTraffic) {
+	t.Helper()
+	exit, sink, clientIP, down := dialLeg(t)
+	pkt := ipv4Packet(net.IPv4(10, 8, 7, 9), clientIP)
+	up := ipv4Packet(clientIP, net.IPv4(10, 8, 7, 9))
+	span := legDeadlines * h2FrameReadTimeout()
+	deadline := time.Now().Add(span)
+	clientTick := time.NewTicker(10 * time.Second / legScale)
+	defer clientTick.Stop()
+	trafficTick := time.NewTicker(h2FrameReadTimeout() / 5)
+	defer trafficTick.Stop()
+	for time.Now().Before(deadline) {
+		select {
+		case <-sink.Done():
+			t.Fatalf("the leg closed after %v (exit read deadline %v): %s",
+				span-time.Until(deadline), h2FrameReadTimeout(), closeReason(sink))
+		case <-clientTick.C:
+			sink.UpdateActivity()
+		case <-trafficTick.C:
+			switch kind {
+			case legUpload:
+				_ = sink.WritePacket(up)
+			case legDownload:
+				exitWriterFor(t, exit, clientIP).SendPacket(pkt) //nolint:errcheck
+			}
+		}
+	}
+	if kind == legDownload && down.Load() == 0 {
+		t.Fatal("nothing came down - the download leg proves nothing")
+	}
+	if n := exit.ended.Load(); n != 0 {
+		t.Fatalf("the exit ended %d connections", n)
+	}
+}
+
+// closeReason is what the relay recorded as the end of a closed leg.
+func closeReason(s *relayTUNSink) string {
+	if w := s.why.Load(); w != nil {
+		return *w
+	}
+	return "no reason recorded"
 }
 
 // dialLeg starts an exit and dials a relay leg to it with dialRelayTUN; down
 // counts the packets the leg delivered to the downstream side.
 func dialLeg(t *testing.T) (exit *legExit, sink *relayTUNSink, clientIP net.IP, down *atomic.Int64) {
 	t.Helper()
+	return dialLegVia(t, nil)
+}
+
+// dialLegVia is dialLeg with the leg running through proxy, when not nil.
+func dialLegVia(t *testing.T, proxy *stallProxy) (exit *legExit, sink *relayTUNSink, clientIP net.IP, down *atomic.Int64) {
+	t.Helper()
 	secret := []byte("relay-leg-secret-0123456789abcdef")
 	exit = newLegExit(t, secret)
-	relayCtx := &serverContext{cfg: &Config{}, upstreamDialer: NewUpstreamDialer(exit.addr, secret)}
+	addr := exit.addr
+	if proxy != nil {
+		addr = proxy.start(t, exit.addr)
+	}
+	relayCtx := &serverContext{cfg: &Config{}, upstreamDialer: NewUpstreamDialer(addr, secret)}
 	down = &atomic.Int64{}
 	sink, _, clientIP, err := dialRelayTUN(relayCtx, testLogger(t), dialTUNHandshake(), "origin",
 		func([]byte) error { down.Add(1); return nil })
@@ -188,6 +424,51 @@ func dialLeg(t *testing.T) (exit *legExit, sink *relayTUNSink, clientIP net.IP, 
 	}
 	t.Cleanup(sink.Close)
 	return exit, sink, clientIP, down
+}
+
+// stallProxy forwards a leg to the exit and, once stalled, stops reading
+// what the relay sends: the relay's writes then back up and block, as on a
+// leg whose path went dead.
+type stallProxy struct{ stalled atomic.Bool }
+
+func (p *stallProxy) start(t *testing.T, exitAddr string) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			e, err := net.Dial("tcp", exitAddr)
+			if err != nil {
+				c.Close()
+				return
+			}
+			t.Cleanup(func() { c.Close(); e.Close() })
+			go func() { _, _ = io.Copy(c, e) }()
+			go func() {
+				buf := make([]byte, 32*1024)
+				for {
+					for p.stalled.Load() {
+						time.Sleep(5 * time.Millisecond)
+					}
+					n, err := c.Read(buf)
+					if err != nil {
+						return
+					}
+					if _, err := e.Write(buf[:n]); err != nil {
+						return
+					}
+				}
+			}()
+		}
+	}()
+	return ln.Addr().String()
 }
 
 // keepaliveLog records when the relay sent each keepalive up, for the test.

@@ -1756,7 +1756,7 @@ func (v *VPNClient) readFromServer() {
 		if pktLen == 0 {
 			log.Debug("Received keepalive from server")
 			v.keepaliveEchoes.Add(1)
-			v.noteDownlink()
+			v.noteDownlink(false)
 			continue
 		}
 
@@ -1852,10 +1852,7 @@ func (v *VPNClient) readFromServer() {
 		}
 
 		flows.down(actualBuf, time.Now())
-		v.noteDownlink()
-		v.mu.Lock()
-		v.lastData = time.Now()
-		v.mu.Unlock()
+		v.noteDownlink(true)
 
 		atomic.AddInt64(&v.packetsDown, 1)
 		atomic.AddInt64(&v.bytesDown, int64(pktLen))
@@ -1868,10 +1865,17 @@ func (v *VPNClient) readFromServer() {
 // having died young: a dial and a handshake prove less than that, and a session
 // frozen a second after the swap must count as a failed upgrade, not a
 // successful one (see Manager.UpgradeOutcome).
-func (v *VPNClient) noteDownlink() {
+//
+// data is whether it was a packet for the TUN rather than a keepalive echo:
+// lastData, which Stop books a session as useful by, is stamped under the
+// same lock (P3-8 of the round-7 review).
+func (v *VPNClient) noteDownlink(data bool) {
 	now := time.Now()
 	v.mu.Lock()
 	v.lastRx = now
+	if data {
+		v.lastData = now
+	}
 	var confirmed strategy.Strategy
 	if v.upgradePending != nil && now.Sub(v.connectedAt) >= deadSessionMax {
 		confirmed, v.upgradePending = v.upgradePending, nil

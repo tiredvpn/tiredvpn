@@ -653,8 +653,24 @@ func (sc *HTTP2StegoConn) proactiveFlushWindowUpdate() {
 		return
 	}
 	sc.mu.Lock()
-	sc.flushWindowUpdate()
+	sc.readPathWrite(sc.flushWindowUpdate)
 	sc.mu.Unlock()
+}
+
+// stegoReadPathWriteTimeout bounds a write the read path makes on its own:
+// WINDOW_UPDATE credit, a SETTINGS ack.
+const stegoReadPathWriteTimeout = 10 * time.Second
+
+// readPathWrite runs write, a write the read path makes on its own, under a
+// deadline of its own. The caller's last deadline belongs to the caller's
+// last write and may long have passed: a one-way download writes nothing
+// else, and a WINDOW_UPDATE flush that hit a stale deadline failed, which
+// tls.Conn makes permanent - every later write on the conn failed and the
+// tunnel died (P2-1 of the round-7 review). The deadline is left set: every
+// writer sets its own before it writes. Must be called with sc.mu held.
+func (sc *HTTP2StegoConn) readPathWrite(write func()) {
+	_ = sc.SetWriteDeadline(time.Now().Add(stegoReadPathWriteTimeout))
+	write()
 }
 
 // Write sends data using various steganographic channels
@@ -1160,7 +1176,7 @@ func (sc *HTTP2StegoConn) extractCovertData(frame http2.Frame) []byte {
 		return nil
 	case *http2.SettingsFrame:
 		if !f.IsAck() {
-			sc.framer.WriteSettingsAck()
+			sc.readPathWrite(func() { sc.framer.WriteSettingsAck() })
 		}
 		return nil
 	default:
@@ -1224,8 +1240,16 @@ func (sc *HTTP2StegoConn) allocateStreamID() uint32 {
 
 // Close closes the connection
 func (sc *HTTP2StegoConn) Close() error {
-	// Send GOAWAY frame
+	// GOAWAY goes through the framer like every other write, so under sc.mu:
+	// the read path writes WINDOW_UPDATE under it, and a teardown during a
+	// download touched the framer from two goroutines (P3-1 of the round-7
+	// review). A deadline of its own: whatever deadline the last write left
+	// may have passed, and a GOAWAY failing on it would spend a TLS record
+	// number before close_notify.
+	_ = sc.SetWriteDeadline(time.Now().Add(time.Second))
+	sc.mu.Lock()
 	sc.framer.WriteGoAway(sc.nextStreamID, http2.ErrCodeNo, nil)
+	sc.mu.Unlock()
 	return sc.Conn.Close()
 }
 

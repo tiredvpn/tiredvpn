@@ -191,7 +191,7 @@ func clearCarry() {
 	androidCarry.mu.Lock()
 	defer androidCarry.mu.Unlock()
 	androidCarry.health, androidCarry.storm = nil, nil
-	androidCarry.route, androidCarry.at = strategy.RouteMemory{}, time.Time{}
+	androidCarry.route, androidCarry.pool, androidCarry.at = strategy.RouteMemory{}, "", time.Time{}
 }
 
 // namedPipeStrategy is targetPipeStrategy under a name of its own, logging
@@ -202,6 +202,7 @@ type namedPipeStrategy struct {
 	prio int
 	log  *[]string
 	mu   *sync.Mutex
+	hang bool
 }
 
 func (s *namedPipeStrategy) Name() string                        { return s.id }
@@ -210,7 +211,11 @@ func (s *namedPipeStrategy) Priority() int                       { return s.prio
 func (s *namedPipeStrategy) Probe(context.Context, string) error { return nil }
 func (s *namedPipeStrategy) RequiresServer() bool                { return true }
 func (s *namedPipeStrategy) Description() string                 { return "pipe exit" }
-func (s *namedPipeStrategy) Connect(_ context.Context, target string) (net.Conn, error) {
+func (s *namedPipeStrategy) Connect(ctx context.Context, target string) (net.Conn, error) {
+	if s.hang {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	s.mu.Lock()
 	*s.log = append(*s.log, s.id+"@"+target)
 	s.mu.Unlock()
@@ -270,7 +275,11 @@ func coreOn(t *testing.T, pool []string, log *[]string, mu *sync.Mutex) *strateg
 		t.Fatal(err)
 	}
 	t.Cleanup(endpoint.ResetSharedSelectors) // the next test starts clean
-	m.Register(&namedPipeStrategy{t: t, id: "reality", prio: 1, log: log, mu: mu})
-	m.Register(&namedPipeStrategy{t: t, id: "ws", prio: 2, log: log, mu: mu})
+	m.Register(&namedPipeStrategy{t: t, id: "reality", prio: 1, log: log, mu: mu, hang: hangingDial})
+	m.Register(&namedPipeStrategy{t: t, id: "ws", prio: 2, log: log, mu: mu, hang: hangingDial})
 	return m
 }
+
+// hangingDial, while set, makes every dial hang until its context ends - a
+// connect that is still running when the next command comes.
+var hangingDial bool

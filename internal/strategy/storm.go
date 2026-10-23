@@ -132,14 +132,20 @@ type StormDetector struct {
 	startedAt time.Time            // start of the current grace window (start / last Reset)
 }
 
+// wallNow is the wall clock without the monotonic reading. The storm history
+// crosses an Android core restart in the carry, and a phone may sleep in
+// between; the monotonic clock stops while it does, and a storm from before
+// a long doze could still count after waking (P3-6 of the round-7 review).
+func wallNow() time.Time { return time.Now().Round(0) }
+
 // NewStormDetector creates a detector with the given config (defaults applied).
 func NewStormDetector(cfg StormConfig) *StormDetector {
 	return &StormDetector{
 		cfg:       cfg.withDefaults(),
-		now:       time.Now,
+		now:       wallNow,
 		byID:      make(map[string]*strategyStorm),
 		openedAt:  make(map[string]time.Time),
-		startedAt: time.Now(),
+		startedAt: wallNow(),
 	}
 }
 

@@ -92,6 +92,12 @@ Versions follow [Semantic Versioning](https://semver.org/).
   start from nothing.
 - **Server: an idle HTTP Polling session is no longer dropped after ~6
   minutes** while its client keeps polling, directly or through a relay.
+- **Client and relay: an HTTP/2 Stego connection carrying a one-way download
+  no longer breaks.** Every 256 KB down the connection returns flow-control
+  credit from its read path; that write ran into the deadline the last
+  ordinary write had left, failed, and a failed write breaks a TLS
+  connection for good. Through a relay, a leg with a steady download and
+  nothing going up died within two minutes.
 - **Server: a client keeps its tunnel address across transports and
   networks.** Leases are keyed on the credential, and leases an older server
   wrote under other keys are folded into it.
@@ -104,9 +110,9 @@ Versions follow [Semantic Versioning](https://semver.org/).
 - On the wire: up to two keepalives when a flow stalls, also while a
   download trickles; HTTP Polling leaves a frozen server 32-42 s in; a relay
   whose client is active sends a keepalive to its exit, on a timer of its
-  own, when either direction of the leg has been silent for 20-45 s (drawn
-  anew each time); a leg busy both ways gets none. No change to the
-  protocol.
+  own, once either direction of the leg has been silent for a period drawn
+  anew each time between 20 and 45 s; a leg busy both ways gets none. No
+  change to the protocol.
 - On the wire: the TLS fallback transports' `session_id` is a keyed tag
   instead of random bytes. Same 32 bytes, different on every connection; the
   rest of the ClientHello is unchanged.

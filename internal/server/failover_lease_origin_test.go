@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"sync/atomic"
@@ -315,5 +316,26 @@ func TestAnUnfinishedLeaseSearchIsRetried(t *testing.T) {
 	pool.AdoptAll(context.Background(), nil, []string{"reality:abc@"}, "c1")
 	if n := gate.scans.Load(); n != 2 {
 		t.Fatal("a finished search was repeated within its record")
+	}
+}
+
+// TestAFullFoldMapWithTiedRecordsStillShrinks is P3-12 of the round-7
+// review: the half to drop was picked by a cut time, and with every record
+// ending at the same moment the cut deleted nothing, so the map grew past its
+// cap. The map is filled by hand with tied records; the next fold goes
+// through AdoptAll.
+func TestAFullFoldMapWithTiedRecordsStillShrinks(t *testing.T) {
+	pool, err := NewIPPool(IPPoolConfig{Network: "10.8.1.0/24", ServerIP: "10.8.1.1"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	until := time.Now().Add(time.Hour)
+	pool.folded = make(map[string]time.Time)
+	for i := range adoptFoldMax {
+		pool.folded[fmt.Sprintf("global@tied-%d", i)] = until
+	}
+	pool.AdoptAll(context.Background(), nil, nil, "global@192.0.2.7")
+	if n := len(pool.folded); n > adoptFoldMax/2+1 {
+		t.Fatalf("%d fold records after the cap was hit with tied records, want about half of %d", n, adoptFoldMax)
 	}
 }

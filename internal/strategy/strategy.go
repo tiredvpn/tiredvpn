@@ -1779,6 +1779,7 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 	// stayHere repeats the scan on the same candidate once, after a route
 	// verdict parked the transports that died there (routeDeath).
 	stayHere, rescanned := false, false
+	var rescanExclude []string // the transports the route verdict was about
 	for attempt := 0; attempt < budget; attempt++ {
 		if attempt > 0 && !stayHere {
 			next, ok := sel.Next(sel.Now())
@@ -1841,9 +1842,12 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 		var swallowedOn, swallowedTransports []string
 		var exclude []string
 		if rescan {
-			// Only the transports still standing: the ones the verdict set
-			// aside died here a moment ago.
-			exclude = slices.Collect(maps.Keys(m.routeSkip(cand.Addr)))
+			// Only the transports still standing: the ones this verdict was
+			// about died here a moment ago. Not every route park on the
+			// server - an older one may be on a transport that works again,
+			// and leaving it out left nothing to dial (P2-2 of the round-7
+			// review).
+			exclude = rescanExclude
 		}
 		conn, strategy, err := m.connectScan(dialCtx, m.withHoppedPort(cand.Addr), exclude, scan)
 		if err == nil {
@@ -1854,12 +1858,14 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 		lastErr = err
 
 		if rescan && errors.Is(err, errStrategyScanFailed) && !errors.Is(err, errAddrSilent) &&
-			!scan.answered && scan.timeouts+scan.unheard > 0 {
+			!scan.answered && scan.timeouts > 0 && scan.unheard == 0 {
 			// The rescan heard nothing from the transports left after the
 			// route verdict, however few: with one or two left the scan
 			// never reached the silence threshold, and the server was not
 			// charged (P2-C of the round-6 review). It is the server's
-			// second verdict.
+			// second verdict - if each of them ran out its own timeout. An
+			// attempt the cycle cut short is no verdict either way (P3-3
+			// of the round-7 review).
 			err = fmt.Errorf("%w: %w, the transports left heard nothing either: %w", errAddrSilent, errStrategyScanFailed, err)
 			lastErr = err
 		}
@@ -1908,7 +1914,7 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 					// review).
 					break
 				}
-				rescanned, stayHere = true, true
+				rescanned, stayHere, rescanExclude = true, true, died
 				attempt--
 				continue
 			}
@@ -2260,7 +2266,10 @@ func (m *Manager) swallowRecordLocked(key string, sincePark time.Duration) *swal
 		}
 		m.swallowed[key] = r
 	}
-	r.last = time.Now()
+	// Wall clock: the record crosses an Android core restart, and the
+	// monotonic clock stops while the phone sleeps (P3-6 of the round-7
+	// review).
+	r.last = time.Now().Round(0)
 	return r
 }
 
@@ -2633,18 +2642,21 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			continue
 		}
 
-		if routeLast[s.ID()] {
-			last = append(last, s)
-			continue
-		}
-
 		if swallowSkip[s.ID()] {
 			// Held back, not gone: the fast path alone being silent is not
 			// "every transport" while this one sits out its turn. Checked
-			// last, so only an otherwise eligible transport sits out.
+			// after the gates, so only an otherwise eligible transport sits
+			// out - and before the route's set-aside: a transport swallowed
+			// here sits out even if the route also set it aside (P3-5 of
+			// the round-7 review).
 			log.Debug("Skipping strategy %s (handshake swallowed in a recent cycle)", s.Name())
 			skippedOthers++
 			sittingOut = append(sittingOut, s)
+			continue
+		}
+
+		if routeLast[s.ID()] {
+			last = append(last, s)
 			continue
 		}
 
@@ -2663,6 +2675,8 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 		}
 		strategies = append(strategies, s)
 	}
+	// strategies[lastFrom:] are the set-aside transports.
+	lastFrom := len(strategies) - len(last)
 
 	if len(strategies) == 0 && len(sittingOut) > 0 {
 		// Every eligible transport is sitting out its turn: the skip list
@@ -2714,6 +2728,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 	var lastErr error
 	attemptCount := 0
 	addrSilent := false
+	toLast := false // skipping to the set-aside transports
 
 	for i, s := range strategies {
 		if ctxErr(ctx) != nil {
@@ -2721,7 +2736,19 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			// fails at once and charges it for the caller's deadline.
 			return nil, nil, scanOutOfTime(ctx, target, scan, lastErr)
 		}
-		if !scan.answered && scan.timeouts >= tcpFailuresThreshold && !isUDPBasedStrategy(s) {
+		if !scan.answered && scan.timeouts >= tcpFailuresThreshold && !isUDPBasedStrategy(s) && len(last) > 0 && i < lastFrom {
+			// The verdict is in, but the transports the route set aside here
+			// have not been dialled: they died elsewhere, and may be what
+			// works here now. Abandoning the scan before them left them
+			// never tried on a server where everything else timed out (P3-5
+			// of the round-7 review).
+			if !toLast {
+				log.Info("Address %s answered nothing on %d transports - trying the ones set aside before giving up", target, scan.timeouts)
+				toLast = true
+			}
+			continue
+		}
+		if !scan.answered && scan.timeouts >= tcpFailuresThreshold && !isUDPBasedStrategy(s) && len(last) == 0 {
 			// Nothing has come back from this address on any transport. Walking
 			// the rest of the list means one connect timeout per strategy for a
 			// verdict already in hand, and the endpoint layer is waiting for

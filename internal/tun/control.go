@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net"
@@ -112,6 +113,14 @@ type ControlServer struct {
 	// Control connection for sending events back to Android
 	controlConn net.Conn
 
+	// readers are the control connections' readers. Close gives them a
+	// moment to read what the host has already sent - a "disconnect" the
+	// app wrote just before stopping the core - before the core goes. Kept
+	// apart from mu, which a running command holds.
+	readersMu   sync.Mutex
+	readerConns map[net.Conn]struct{}
+	readers     sync.WaitGroup
+
 	// Config for connection
 	config *ControlConfig
 	// netCheck replaces checkNetworkConnectivity's probe in tests.
@@ -183,7 +192,11 @@ type ControlConfig struct {
 
 	// DisconnectedFn, when set, is told that the host asked for the tunnel
 	// to go down ("disconnect": the user's stop, not a dead connection).
-	DisconnectedFn func()
+	// ConnectRequestedFn is told that the host asked for it to come up
+	// ("connect"), which takes a stop back. Both are told in the order the
+	// host sent the commands, the moment they are read.
+	DisconnectedFn     func()
+	ConnectRequestedFn func()
 
 	// SessionStrategyFn, when set, names the strategy carrying the current
 	// session, for the relay's stall detector: a conn whose keepalive counter
@@ -312,17 +325,103 @@ func (cs *ControlServer) handleConnection(ctx context.Context, conn net.Conn) {
 	// part of one. Parsing each read as a single JSON value turned the host's
 	// network_available + network_changed, written back to back, into a parse
 	// error, a closed connection and a full core restart on the host.
+	//
+	// Reading runs apart from the commands. A "disconnect" is the user's
+	// stop, and the host does not wait for its answer before it stops the
+	// core: read only after a running "connect" returned, or after the stop
+	// had begun, it was lost, and the carry for the next core survived the
+	// user's stop (P3-2 of the round-7 review). The reader tells
+	// DisconnectedFn the moment it reads one, and ConnectRequestedFn of a
+	// "connect", which takes the stop back; the commands themselves run in
+	// turn, below.
+	batches := make(chan controlBatch, 8)
+	if !cs.addReader(conn) {
+		return
+	}
+	go cs.readControl(unixConn, batches)
+	defer func() {
+		// The reader may still be handing over batches; their descriptors
+		// are ours to close.
+		go func() {
+			for b := range batches {
+				for _, m := range b.msgs {
+					releaseReceivedFd(m.fd)
+				}
+			}
+		}()
+	}()
+
+	for b := range batches {
+		for i, m := range b.msgs {
+			resp, ok := cs.dispatchControl(ctx, m)
+			if !ok {
+				continue
+			}
+			if err := encoder.Encode(resp); err != nil {
+				log.Debug("Control encode error: %v", err)
+				for _, rest := range b.msgs[i+1:] {
+					releaseReceivedFd(rest.fd)
+				}
+				return
+			}
+		}
+	}
+}
+
+// controlBatch is what one read of a control connection completed.
+type controlBatch struct{ msgs []controlMsg }
+
+// addReader registers conn's reader, unless Close has begun.
+func (cs *ControlServer) addReader(conn net.Conn) bool {
+	cs.readersMu.Lock()
+	defer cs.readersMu.Unlock()
+	if cs.closed.Load() {
+		return false
+	}
+	if cs.readerConns == nil {
+		cs.readerConns = make(map[net.Conn]struct{})
+	}
+	cs.readerConns[conn] = struct{}{}
+	cs.readers.Add(1)
+	return true
+}
+
+// readControl reads conn's commands into batches until the connection ends,
+// and tells DisconnectedFn and ConnectRequestedFn at once of every
+// "disconnect" and "connect" it reads.
+func (cs *ControlServer) readControl(conn *net.UnixConn, batches chan<- controlBatch) {
+	var drainedOnce sync.Once
+	drained := func() { drainedOnce.Do(cs.readers.Done) }
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error("control reader panic: %v", r)
+		}
+		cs.readersMu.Lock()
+		delete(cs.readerConns, conn)
+		cs.readersMu.Unlock()
+		close(batches)
+		drained()
+	}()
 	framer := newControlFramer()
 	defer framer.release()
 	buf := make([]byte, 4096)
 	// Room for a few descriptors: the host sends one, and any extra that
 	// arrive are closed below rather than left to the kernel's truncation.
 	oob := make([]byte, unix.CmsgSpace(4*4))
-
 	for {
-		n, oobn, flags, _, err := unixConn.ReadMsgUnix(buf, oob)
+		n, oobn, flags, _, err := conn.ReadMsgUnix(buf, oob)
 		fd := receivedFd(oob[:oobn], flags)
-		if n == 0 {
+		if n <= 0 && errors.Is(err, os.ErrDeadlineExceeded) && cs.closed.Load() {
+			// Close's read window ran out: everything the host had sent
+			// is in. The connection stays: a command it sends from now on
+			// is answered, with an error.
+			drained()
+			_ = conn.SetReadDeadline(time.Time{})
+			continue
+		}
+		if n <= 0 {
+			// n is -1 with some errors, and buf[:n] panicked (P3-9 of the
+			// round-7 review).
 			releaseReceivedFd(fd)
 			if err != nil {
 				log.Debug("Control read: %v", err)
@@ -330,18 +429,20 @@ func (cs *ControlServer) handleConnection(ctx context.Context, conn net.Conn) {
 			return
 		}
 		msgs, ferr := framer.feed(buf[:n], fd)
-		for i, m := range msgs {
-			resp, ok := cs.dispatchControl(ctx, m)
-			if !ok {
-				continue
-			}
-			if err := encoder.Encode(resp); err != nil {
-				log.Debug("Control encode error: %v", err)
-				for _, rest := range msgs[i+1:] {
-					releaseReceivedFd(rest.fd)
+		for _, m := range msgs {
+			switch controlCommandName(m.data) {
+			case "disconnect":
+				if cs.config.DisconnectedFn != nil {
+					cs.config.DisconnectedFn()
 				}
-				return
+			case "connect":
+				if cs.config.ConnectRequestedFn != nil {
+					cs.config.ConnectRequestedFn()
+				}
 			}
+		}
+		if len(msgs) > 0 {
+			batches <- controlBatch{msgs: msgs}
 		}
 		if ferr != nil {
 			log.Warn("Control: %v, closing the connection", ferr)
@@ -351,6 +452,38 @@ func (cs *ControlServer) handleConnection(ctx context.Context, conn net.Conn) {
 			log.Debug("Control read: %v", err)
 			return
 		}
+	}
+}
+
+// controlCommandName is the command data names, "" if none.
+func controlCommandName(data []byte) string {
+	var cmd struct {
+		Command string `json:"command"`
+	}
+	if json.Unmarshal(data, &cmd) != nil {
+		return ""
+	}
+	return cmd.Command
+}
+
+// closeReadWait is how long Close lets the control readers take in what the
+// host has already sent.
+const closeReadWait = 100 * time.Millisecond
+
+// drainReaders gives every control reader closeReadWait to read what is
+// already in its socket, and waits until each has.
+func (cs *ControlServer) drainReaders() {
+	cs.readersMu.Lock()
+	cut := time.Now().Add(closeReadWait)
+	for c := range cs.readerConns {
+		_ = c.SetReadDeadline(cut)
+	}
+	cs.readersMu.Unlock()
+	done := make(chan struct{})
+	go func() { cs.readers.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * closeReadWait):
 	}
 }
 
@@ -427,13 +560,11 @@ func (cs *ControlServer) dispatchControl(ctx context.Context, m controlMsg) (Con
 		case "connect":
 			resp = cs.handleConnect(ctx)
 		case "disconnect":
-			// The host's own stop. Told here, not in handleDisconnect: Close
-			// runs that too, on every core shutdown - after a dead connection
-			// as well - and the carry for the next core was wiped each time
+			// The host's own stop. DisconnectedFn was told when the command
+			// was read (readControl), not in handleDisconnect: Close runs
+			// that too, on every core shutdown - after a dead connection as
+			// well - and the carry for the next core was wiped each time
 			// (P1-B of the round-6 review).
-			if cs.config.DisconnectedFn != nil {
-				cs.config.DisconnectedFn()
-			}
 			resp = cs.handleDisconnect()
 		case "status":
 			resp = cs.handleStatus()
@@ -1040,12 +1171,15 @@ const closeTeardownWait = 500 * time.Millisecond
 // frees (the command, seeing closed, installs nothing on the way out).
 func (cs *ControlServer) Close() error {
 	cs.closeOnce.Do(func() {
+		cs.readersMu.Lock()
 		cs.closed.Store(true)
+		cs.readersMu.Unlock()
 		if cs.lifeCancel != nil {
 			cs.lifeCancel()
 		}
 		cs.closeErr = cs.listener.Close()
 		cs.removeOwnSocket()
+		cs.drainReaders()
 
 		done := make(chan struct{})
 		go func() {
