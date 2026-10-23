@@ -296,7 +296,6 @@ func (t *TUNDevice) v6BlockIsInstalled() bool {
 	return t.v6BlockInstalled
 }
 
-
 // ApplyIPv6LeakBlock installs the block when the policy asks for it. Called
 // once the tunnel's IPv6 fate is known: right after a declined dual-stack
 // negotiation, or right after connect under -tun-ipv6=block. Never before —
