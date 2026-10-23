@@ -378,3 +378,29 @@ func TestAHandshakeCutByTheCycleIsNotSkipped(t *testing.T) {
 		t.Fatal("a handshake with half a cycle went on the skip list")
 	}
 }
+
+// TestTheSkipListCanNotEmptyACycle is P3-1 of the round-4 review: the skip
+// list was checked against registration, not eligibility. With REALITY
+// swallowed and QUIC held back by the UDP gate, the next cycle had nothing
+// to dial: "no available strategies", no verdict, a growing backoff - A was
+// never left and B never dialled.
+func TestTheSkipListCanNotEmptyACycle(t *testing.T) {
+	swallower := newBlackholeListener(t)
+	healthy := newHelloListener(t)
+	m := newSilenceManager(t, 2*time.Second, swallower.addr, healthy.addr)
+	reality := &protectedGreeter{id: "reality", priority: 5}
+	m.Register(reality)
+	m.Register(&quicBlackhole{priority: 4})
+	m.mu.Lock()
+	m.excludeUDPStrategies = true
+	m.mu.Unlock()
+	markConnected(m, reality)
+
+	s, cycles := connectCycles(t, m, swallowCyclesMax+1, time.Second)
+	if s == nil {
+		t.Fatalf("still not connected after %d cycles; A: %+v", cycles, endpointState(t, m, swallower.addr))
+	}
+	if got := m.GetServerAddr(context.Background()); got != healthy.addr {
+		t.Fatalf("connected through %s, want %s", got, healthy.addr)
+	}
+}

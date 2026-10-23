@@ -2231,6 +2231,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 	var strategies []Strategy
 	var quicStrategies []Strategy // Collect QUIC strategies separately for fast fallback
 	skippedOthers := 0            // held back by a breaker, a storm park or the UDP gate
+	var sittingOut []Strategy     // eligible, but swallowed in a recent cycle here
 
 	for _, s := range m.strategies {
 		if s.Priority() <= 0 {
@@ -2239,13 +2240,6 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 		}
 		if excludeMap[s.ID()] {
 			log.Debug("Skipping excluded strategy: %s", s.Name())
-			continue
-		}
-		if swallowSkip[s.ID()] {
-			// Held back, not gone: the fast path alone being silent is not
-			// "every transport" while this one sits out its turn.
-			log.Debug("Skipping strategy %s (handshake swallowed in a recent cycle)", s.Name())
-			skippedOthers++
 			continue
 		}
 		// Check circuit breaker. This only assembles the candidate list, so use
@@ -2270,6 +2264,16 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			continue
 		}
 
+		if swallowSkip[s.ID()] {
+			// Held back, not gone: the fast path alone being silent is not
+			// "every transport" while this one sits out its turn. Checked
+			// last, so only an otherwise eligible transport sits out.
+			log.Debug("Skipping strategy %s (handshake swallowed in a recent cycle)", s.Name())
+			skippedOthers++
+			sittingOut = append(sittingOut, s)
+			continue
+		}
+
 		// Separate QUIC strategies for fast fallback
 		if isUDPBasedStrategy(s) {
 			quicStrategies = append(quicStrategies, s)
@@ -2278,6 +2282,21 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 	}
 	rttProfile := m.rttProfile
 	m.mu.RUnlock()
+
+	if len(strategies) == 0 && len(sittingOut) > 0 {
+		// Every eligible transport is sitting out its turn: the skip list
+		// was meant to let the others go first, and there are no others.
+		// Skipping anyway emptied the cycle, gave no verdict and grew the
+		// backoff, and the run of swallowed cycles never reached its
+		// verdict either.
+		log.Info("Only transports swallowed in a recent cycle are eligible - trying them again")
+		strategies, skippedOthers = sittingOut, skippedOthers-len(sittingOut)
+		for _, s := range sittingOut {
+			if isUDPBasedStrategy(s) {
+				quicStrategies = append(quicStrategies, s)
+			}
+		}
+	}
 
 	if len(strategies) == 0 {
 		// If storm parking emptied the list, unpark everything and retry with
