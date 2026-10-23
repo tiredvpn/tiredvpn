@@ -26,6 +26,15 @@ Versions follow [Semantic Versioning](https://semver.org/).
   and storms park the server with a growing cooldown; a server that accepts
   TCP and answers no handshake gets the same verdict after two or three
   cycles; the first reconnect after a silent session walks the pool.
+- **Client: a failing dual-stack server is left whole.** A verdict on one of
+  its addresses (silence, swallowed handshakes, a dead or stalled session)
+  gets the other address one try; a verdict there too parks the server, for
+  longer each time, and the client goes to the next one. It used to go back
+  and forth between the two addresses of one server.
+- **Client: a transport that dies the same way on two servers in a row is
+  set aside.** The route is blamed, not the servers: the transport is parked
+  for 5 minutes and the client tries another one on the second server,
+  instead of walking the whole pool on a transport that works nowhere.
 - **Client: the tunnel moves back to a better strategy after a fault.** After
   a periodic reprobe finds it working again, the client switches over without
   dropping the tunnel, and keeps the old strategy if the new one fails.
@@ -45,6 +54,9 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- On the wire: when a fault hits every server the same way, the client
+  touches both addresses of one server and one other server, then changes
+  transport instead of dialling the rest of the pool.
 - On the wire: up to two keepalives when a flow stalls, also while a
   download trickles; HTTP Polling leaves a frozen server 32-42 s in; a relay
   sends a keepalive to its exit at most every 30 s while its client is
