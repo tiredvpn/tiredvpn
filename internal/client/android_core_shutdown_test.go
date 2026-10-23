@@ -90,7 +90,18 @@ func command(t *testing.T, sock, cmd string) string {
 // returns where the dial went ("strategy@addr").
 func connectThroughTheSocket(t *testing.T, sock string, dials *[]string, mu *sync.Mutex) string {
 	t.Helper()
-	if resp := command(t, sock, `{"command":"connect"}`); !strings.Contains(resp, "waiting_fd") {
+	return connectOn(t, sock, "", dials, mu)
+}
+
+// connectOn is connectThroughTheSocket with the app naming its network, ""
+// for an app that names none.
+func connectOn(t *testing.T, sock, network string, dials *[]string, mu *sync.Mutex) string {
+	t.Helper()
+	cmd := `{"command":"connect"}`
+	if network != "" {
+		cmd = fmt.Sprintf(`{"command":"connect","network_id":%q}`, network)
+	}
+	if resp := command(t, sock, cmd); !strings.Contains(resp, "waiting_fd") {
 		t.Fatalf("connect answered %s", resp)
 	}
 	mu.Lock()
@@ -285,6 +296,78 @@ func TestAHostThatHangsUpUnreadIsNoPanic(t *testing.T) {
 	}
 }
 
+// TestTheCarryStaysOnTheNetworkItWasMadeOn is the network part of P2-3 of
+// the round-7 review, as Denis decided: the app names its network on
+// "connect" (network_id, the Android Network handle), and a carry made on
+// another network is dropped - parks and route verdicts describe what the
+// old network's path did. An app that names no network keeps today's
+// behaviour, and so does a carry made by one.
+func TestTheCarryStaysOnTheNetworkItWasMadeOn(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		before, after string
+		kept          bool
+	}{
+		{"same network", "100", "100", true},
+		{"another network", "100", "101", false},
+		{"no network named", "", "", true},
+		{"named only before", "100", "", true},
+		{"named only after", "", "101", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := fourExitPool(t)
+			t.Cleanup(clearCarry)
+			var dials []string
+			var mu sync.Mutex
+			runCore(t, coreOn(t, pool, &dials, &mu), pool, os.Interrupt, func(sock string, ctl *tun.ControlConfig) {
+				if got := connectOn(t, sock, tc.before, &dials, &mu); got != "reality@"+pool[0] {
+					t.Fatalf("the first core dialled %s", got)
+				}
+				ctl.SessionEndedFn(degraded)
+			})
+			var got string
+			runCore(t, coreOn(t, pool, &dials, &mu), pool, os.Interrupt, func(sock string, _ *tun.ControlConfig) {
+				got = connectOn(t, sock, tc.after, &dials, &mu)
+			})
+			if kept := got != "reality@"+pool[0]; kept != tc.kept {
+				t.Fatalf("network %q then %q: the next core dialled %s (carry kept: %v, want %v)", tc.before, tc.after, got, kept, tc.kept)
+			}
+		})
+	}
+}
+
+// TestACoreThatNeverDialledLeavesTheCarryAlone: the carry is taken over at
+// a core's first dial, when the app has named its network. A core stopped
+// before it dialled has taken nothing over and learned nothing; the carry it
+// found stays as it was - on its own network, and ageing from its own time -
+// instead of being stamped afresh with no network on it.
+func TestACoreThatNeverDialledLeavesTheCarryAlone(t *testing.T) {
+	pool := fourExitPool(t)
+	t.Cleanup(clearCarry)
+	var dials []string
+	var mu sync.Mutex
+	runCore(t, coreOn(t, pool, &dials, &mu), pool, os.Interrupt, func(sock string, ctl *tun.ControlConfig) {
+		connectOn(t, sock, "100", &dials, &mu)
+		ctl.SessionEndedFn(degraded)
+	})
+	before := snapshotCarry()
+	runCore(t, coreOn(t, pool, &dials, &mu), pool, os.Interrupt, func(sock string, _ *tun.ControlConfig) {
+		command(t, sock, `{"command":"status"}`)
+	})
+	after := snapshotCarry()
+	if after.network != before.network || !after.at.Equal(before.at) {
+		t.Fatalf("a core that never dialled rewrote the carry: network %q -> %q, stamped %v -> %v",
+			before.network, after.network, before.at, after.at)
+	}
+	var got string
+	runCore(t, coreOn(t, pool, &dials, &mu), pool, os.Interrupt, func(sock string, _ *tun.ControlConfig) {
+		got = connectOn(t, sock, "101", &dials, &mu)
+	})
+	if got != "reality@"+pool[0] {
+		t.Fatalf("on another network the next core dialled %s: the carry from network 100 was taken", got)
+	}
+}
+
 // TestAStaleCarryIsNotTaken: P3-5 of the round-5 review and P3-3 of round 6.
 // A carry is for the restart right after a dead connection; one older than
 // androidCarryTTL is not taken. Its stamp is wall-clock time, so a phone
@@ -404,22 +487,23 @@ func TestAndroidRouteVerdictCrossesCoresByAddress(t *testing.T) {
 
 // carrySnapshot lets one carry feed two cores.
 type carrySnapshot struct {
-	health []endpoint.HealthRecord
-	storm  *strategy.StormDetector
-	route  strategy.RouteMemory
-	pool   string
-	at     time.Time
+	health  []endpoint.HealthRecord
+	storm   *strategy.StormDetector
+	route   strategy.RouteMemory
+	pool    string
+	network string
+	at      time.Time
 }
 
 func snapshotCarry() carrySnapshot {
 	androidCarry.mu.Lock()
 	defer androidCarry.mu.Unlock()
-	return carrySnapshot{androidCarry.health, androidCarry.storm, androidCarry.route, androidCarry.pool, androidCarry.at}
+	return carrySnapshot{androidCarry.health, androidCarry.storm, androidCarry.route, androidCarry.pool, androidCarry.network, androidCarry.at}
 }
 
 func restoreCarry(c carrySnapshot) {
 	androidCarry.mu.Lock()
 	defer androidCarry.mu.Unlock()
 	androidCarry.health, androidCarry.storm, androidCarry.route = c.health, c.storm, c.route
-	androidCarry.pool, androidCarry.at = c.pool, c.at
+	androidCarry.pool, androidCarry.network, androidCarry.at = c.pool, c.network, c.at
 }

@@ -89,8 +89,9 @@ Versions follow [Semantic Versioning](https://semver.org/).
   core restart after a dead connection** - parks, the route verdict, the
   swallowed transports, the storm history - so it does not come straight
   back to the server it just left; Android sessions now feed the storm
-  detector. A stop by the user, and a restart more than 2 minutes later,
-  start from nothing.
+  detector. A stop by the user, a restart more than 2 minutes later, and -
+  with an app that names its network on `connect` (`network_id`) - a
+  restart on another network start from nothing.
 - **Server: an idle HTTP Polling session is no longer dropped after ~6
   minutes** while its client keeps polling, directly or through a relay.
 - **Client and relay: an HTTP/2 Stego connection carrying a one-way download
