@@ -204,6 +204,11 @@ type Manager struct {
 	// m.mu.
 	lastDeath deathMark
 
+	// routeParked holds, per server (endpoint index), the transports a
+	// route verdict set aside there and until when (routeDeath). Guarded by
+	// m.mu.
+	routeParked map[int]map[string]time.Time
+
 	// Strategy upgrade (see offerUpgrade). upgradeCallback receives the
 	// candidates a periodic reprobe found working; upgradeFails counts each
 	// strategy's consecutive failed upgrade dials and upgradeSkip how many more
@@ -1559,9 +1564,9 @@ const routeDeathWindow = 10 * time.Minute
 // the client through the whole pool - listing it for an observer and burning
 // every address - on the transport that cannot work anywhere, and a stall
 // verdict never changed the strategy at all (P2-7 of the round-4 review). So
-// the second server is not charged, the transports are parked like a storm,
-// the fast path forgets them, and the next cycle tries another transport on
-// the same server. The pool walk stops at two servers. Deaths on the two
+// the second server is not charged, the transports are set aside on the two
+// servers where they died (routeSkip), and the next cycle tries another
+// transport on the same server. The pool walk stops at two servers. Deaths on the two
 // families of one server are one server's, and are charged as usual.
 //
 // The mark moves on every verdict: kept on the first server, it made every
@@ -1582,17 +1587,58 @@ func (m *Manager) routeDeath(cand endpoint.Candidate, class deathClass, why stri
 		log.Warn("Endpoint %s: %s, as on the previous server - the route, not the server; forced strategy, nothing else to try", cand, why)
 		return true
 	}
-	for _, id := range ids {
-		m.stormDetector.Park(id)
-	}
+	until := now.Add(stormCooldown)
 	m.mu.Lock()
-	if m.lastSuccessfulStrategy != nil && slices.Contains(ids, m.lastSuccessfulStrategy.ID()) {
-		m.lastSuccessfulStrategy = nil
+	if m.routeParked == nil {
+		m.routeParked = make(map[int]map[string]time.Time)
+	}
+	for _, server := range []int{prev.server, cand.EndpointIdx} {
+		if m.routeParked[server] == nil {
+			m.routeParked[server] = make(map[string]time.Time)
+		}
+		for _, id := range ids {
+			m.routeParked[server][id] = until
+		}
 	}
 	m.mu.Unlock()
-	log.Warn("Endpoint %s: %s, as on the previous server - the route, not the server: parking %s for %v and trying other transports here",
+	log.Warn("Endpoint %s: %s, as on the previous server - the route, not the server: setting %s aside on these two servers for %v and trying other transports here",
 		cand, why, strings.Join(ids, ", "), stormCooldown)
 	return true
+}
+
+// routeSkip returns the transports a route verdict set aside on addr's
+// server (routeDeath), for the scan to try last there - as swallowSkip does
+// for a swallowing address. Scoped to the servers where the transport died:
+// a third server is not assumed to share their fate, and pays one death of
+// its own before the rule applies to it (P2-2 of the round-5 review; parked
+// for every server, a false route verdict kept a healthy one on a lesser
+// transport for five minutes). Empty in forced mode, which has nothing else
+// to try. Takes m.mu: not to be called with it held.
+func (m *Manager) routeSkip(addr string) map[string]bool {
+	sel := m.selector()
+	if sel == nil {
+		return nil
+	}
+	cand, ok := sel.CandidateForAddr(addr)
+	if !ok {
+		return nil
+	}
+	now := time.Now()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.forced {
+		return nil
+	}
+	var out map[string]bool
+	for id, until := range m.routeParked[cand.EndpointIdx] {
+		if now.Before(until) {
+			if out == nil {
+				out = make(map[string]bool)
+			}
+			out[id] = true
+		}
+	}
+	return out
 }
 
 // maxEndpointAttempts caps how many endpoint candidates a single Connect may
@@ -2318,6 +2364,16 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 	if len(swallowSkip) > 0 {
 		log.Info("Strategies %s ran out a recent cycle on %s in their handshake - trying the others first this time",
 			strings.Join(slices.Sorted(maps.Keys(swallowSkip)), ", "), scan.addr)
+	}
+	if routeSkip := m.routeSkip(scan.addr); len(routeSkip) > 0 {
+		log.Info("Strategies %s died on this server and the one before it - trying the others first here",
+			strings.Join(slices.Sorted(maps.Keys(routeSkip)), ", "))
+		// Same treatment as a swallowed transport: sitting out, not gone.
+		if swallowSkip == nil {
+			swallowSkip = routeSkip
+		} else {
+			maps.Copy(swallowSkip, routeSkip)
+		}
 	}
 	defer func() { m.noteSwallowed(scan.addr, scan.connectedSilent); scan.connectedSilent = nil }()
 
@@ -4360,6 +4416,7 @@ func (m *Manager) ResetForNetworkChange() {
 	m.stormDetector.Reset()
 	m.lastDeath = deathMark{server: -1}
 	m.swallowed = nil
+	m.routeParked = nil
 
 	// So is the UDP verdict: it gated QUIC for the old network (or for no
 	// network at all, when this runs because the link went down). Void it,
@@ -4426,6 +4483,7 @@ func (m *Manager) AdoptStormHistory(d *StormDetector) {
 type RouteMemory struct {
 	death     deathMark
 	swallowed map[string]*swallowRecord
+	parked    map[int]map[string]time.Time
 }
 
 // RouteHistory returns a copy of the route verdict marker and the swallow
@@ -4436,7 +4494,11 @@ type RouteMemory struct {
 func (m *Manager) RouteHistory() RouteMemory {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	out := RouteMemory{death: m.lastDeath, swallowed: make(map[string]*swallowRecord, len(m.swallowed))}
+	out := RouteMemory{death: m.lastDeath, swallowed: make(map[string]*swallowRecord, len(m.swallowed)),
+		parked: make(map[int]map[string]time.Time, len(m.routeParked))}
+	for server, ids := range m.routeParked {
+		out.parked[server] = maps.Clone(ids)
+	}
 	for k, r := range m.swallowed {
 		c := &swallowRecord{
 			skip:         make(map[string]map[string]bool, len(r.skip)),
@@ -4464,6 +4526,7 @@ func (m *Manager) AdoptRouteHistory(rm RouteMemory) {
 	defer m.mu.Unlock()
 	m.lastDeath = rm.death
 	m.swallowed = rm.swallowed
+	m.routeParked = rm.parked
 }
 
 // ResetStrategyBlocks closes every circuit breaker and puts every strategy's
