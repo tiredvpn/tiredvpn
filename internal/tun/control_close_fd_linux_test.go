@@ -370,7 +370,7 @@ func (h *ctlHarness) sendAsync(cmd string, fd int) <-chan ControlResponse {
 func (h *ctlHarness) withReconnect() *atomic.Int32 {
 	var calls atomic.Int32
 	h.cs.mu.Lock()
-	h.cs.config.ReconnectFn = func(context.Context, net.IP, int) (ReconnectResult, error) {
+	h.cs.config.ReconnectFn = func(context.Context, net.IP, int, bool) (ReconnectResult, error) {
 		calls.Add(1)
 		return ReconnectResult{
 			Conn:       h.newExitConn(),

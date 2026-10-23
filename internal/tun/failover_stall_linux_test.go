@@ -362,8 +362,12 @@ func newRelayStallHarness(t *testing.T, wrap func(net.Conn) net.Conn) *relayStal
 	h := &relayStallHarness{exit: exit, app: app, reasons: make(chan string, 4)}
 	stop := make(chan struct{})
 	h.r = startTUNRelay(dev, conn, net.IPv4(10, 9, 0, 2), net.IPv4(10, 9, 0, 1), stop, &RelayCallbacks{
-		OnError:    func(reason string) { h.reasons <- reason },
-		OnDegraded: func(time.Duration) { h.degraded.Add(1) },
+		OnError: func(reason string) { h.reasons <- reason },
+		OnSessionEnd: func(end RelaySessionEnd) {
+			if end.Degraded {
+				h.degraded.Add(1)
+			}
+		},
 	})
 	t.Cleanup(func() {
 		close(stop)
@@ -409,7 +413,7 @@ func TestRelayGivesUpAFrozenSession(t *testing.T) {
 		t.Fatalf("relay ended with %q, want a degraded session", r)
 	}
 	if h.degraded.Load() != 1 {
-		t.Fatalf("OnDegraded called %d times", h.degraded.Load())
+		t.Fatalf("OnSessionEnd reported %d degraded ends", h.degraded.Load())
 	}
 }
 

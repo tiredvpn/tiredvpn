@@ -483,10 +483,10 @@ type relayStall struct {
 }
 
 // watchStalls is VPNClient.watchStalls for the relay that carries the
-// tunnel on Android: same suspicion, same confirmation. A verdict is
-// reported through OnDegraded, and the relay closes the server connection so
-// that its reader ends and OnError reports a "session_degraded" reason - the
-// app reconnects on it as on any dead connection.
+// tunnel on Android: same suspicion, same confirmation. On a verdict the
+// relay closes the server connection, so its reader ends; OnSessionEnd then
+// carries the verdict and OnError a "session_degraded" reason - the app
+// reconnects on it as on any dead connection.
 func (r *tunRelay) watchStalls() {
 	mon := newStallMonitor(&r.stall.flows)
 	echoes := r.stall.echoes.Load
@@ -528,9 +528,6 @@ func (r *tunRelay) watchStalls() {
 		log.Warn("Session degraded: flow stalled %v, keepalive echo 0/%d (session=%s, last activity %s ago)",
 			stall.Round(time.Millisecond), sent, sinceOrUnknown(r.startedAt), r.idleDuration().Round(time.Millisecond))
 		r.degraded.Store(&sessionDegradedError{stall: stall})
-		if r.callbacks != nil && r.callbacks.OnDegraded != nil {
-			r.callbacks.OnDegraded(stall)
-		}
 		r.serverConn.Close()
 		return
 	}

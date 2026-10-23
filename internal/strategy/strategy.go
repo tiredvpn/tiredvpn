@@ -4070,6 +4070,36 @@ func (m *Manager) ResetForNetworkChange() {
 	m.sortStrategies()
 }
 
+// EndpointHealth returns the selector's per-candidate health, for a manager
+// that takes over from this one (ImportEndpointHealth). Nil without a
+// selector.
+func (m *Manager) EndpointHealth() []endpoint.HealthRecord {
+	if sel := m.selector(); sel != nil {
+		return sel.ExportHealth()
+	}
+	return nil
+}
+
+// ImportEndpointHealth takes over what another manager over the same pool
+// learned about its candidates: failures and parks.
+func (m *Manager) ImportEndpointHealth(recs []endpoint.HealthRecord) {
+	if sel := m.selector(); sel != nil {
+		sel.ImportHealth(recs)
+	}
+}
+
+// StormHistory returns the storm detector, for a manager that takes over
+// from this one (AdoptStormHistory).
+func (m *Manager) StormHistory() *StormDetector { return m.stormDetector }
+
+// AdoptStormHistory makes d this manager's storm detector: the session
+// history another manager collected goes on counting here.
+func (m *Manager) AdoptStormHistory(d *StormDetector) {
+	if d != nil {
+		m.stormDetector = d
+	}
+}
+
 // ResetStrategyBlocks closes every circuit breaker and puts every strategy's
 // confidence back to neutral, and nothing else. It is for a reconnect whose
 // strategies are all blocked on the same network - not a network change, so

@@ -2816,11 +2816,20 @@ type RelayErrorCallback func(reason string)
 type RelayCallbacks struct {
 	OnError     func(reason string) // Called when relay dies (timeout, read error, etc.)
 	OnKeepalive func()              // Called when keepalive received from server
-	// OnDegraded is called when the stall detector gives the session up as
-	// alive but useless, just before the relay closes the connection (OnError
-	// follows with a "session_degraded" reason). stall is how long the
-	// oldest demand waited.
-	OnDegraded func(stall time.Duration)
+	// OnSessionEnd is called once when the relay's session ends on its own,
+	// before OnError: what the session was, for whoever books its end against
+	// the strategy and the endpoint. Not called when the owner stopped it.
+	OnSessionEnd func(RelaySessionEnd)
+}
+
+// RelaySessionEnd describes a relay's session that has just ended.
+type RelaySessionEnd struct {
+	Lifetime time.Duration // from the relay's start
+	Reason   string        // what OnError is about to report
+	// Degraded is the stall detector's verdict: alive but useless. Stall is
+	// how long the oldest demand waited.
+	Degraded bool
+	Stall    time.Duration
 }
 
 // RunTUNRelayWithStop runs packet relay with external stop control
@@ -2967,6 +2976,13 @@ func (r *tunRelay) run() {
 	r.serverConn.Close()
 	log.Info("TUN relay stopped (reason: %s)", errorReason)
 
+	if r.callbacks != nil && r.callbacks.OnSessionEnd != nil {
+		end := RelaySessionEnd{Lifetime: time.Since(r.startedAt), Reason: errorReason}
+		if d := r.degraded.Load(); d != nil {
+			end.Degraded, end.Stall = true, d.stall
+		}
+		r.callbacks.OnSessionEnd(end)
+	}
 	if r.callbacks != nil && r.callbacks.OnError != nil && errorReason != "" {
 		r.callbacks.OnError(errorReason)
 	}

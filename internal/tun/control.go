@@ -113,6 +113,8 @@ type ControlServer struct {
 
 	// Config for connection
 	config *ControlConfig
+	// netCheck replaces checkNetworkConnectivity's probe in tests.
+	netCheck func() bool
 }
 
 // ReconnectResult is the outcome of a reconnect handshake performed by
@@ -162,19 +164,21 @@ type ControlConfig struct {
 	ConnectFn  func(ctx context.Context) (assignedIP, serverIP net.IP, conn net.Conn, err error)
 	StartVPNFn func(tunFd int, localIP, remoteIP net.IP, conn net.Conn) error
 
-	// ReconnectFn is called on network change to re-establish connection.
-	// It receives the current assigned IP to send in handshake and returns a
-	// new server connection with the handshake already done.
-	ReconnectFn func(ctx context.Context, currentIP net.IP, mtu int) (ReconnectResult, error)
+	// ReconnectFn re-establishes the connection. It receives the current
+	// assigned IP to send in handshake and returns a new server connection
+	// with the handshake already done. networkChanged is false when the
+	// relay died on a network that did not change (auto-reconnect): what the
+	// client learned about the servers - a park for a degraded session - must
+	// survive that reconnect, where a network change voids it.
+	ReconnectFn func(ctx context.Context, currentIP net.IP, mtu int, networkChanged bool) (ReconnectResult, error)
 
 	// GetConnectionInfoFn returns metadata about the last connection (for Android UI)
 	GetConnectionInfoFn func() ConnectionMetadata
 
-	// SessionDegradedFn, when set, is told that the relay's stall detector
-	// gave the session up as alive but useless, before the relay reports it
-	// dead. It books the session's end against its endpoint: nothing else on
-	// this path does.
-	SessionDegradedFn func(stall time.Duration)
+	// SessionEndedFn, when set, is told that the relay's session ended on its
+	// own (a death or the stall detector's verdict), before the relay reports
+	// it dead. It books the end against the strategy and the endpoint.
+	SessionEndedFn func(RelaySessionEnd)
 }
 
 // NewControlServer creates a new control server
@@ -583,7 +587,7 @@ func (cs *ControlServer) handleSetFdWithReceivedFd(ctx context.Context, fd int) 
 			OnKeepalive: func() {
 				cs.sendEvent("keepalive", "")
 			},
-			OnDegraded: cs.sessionDegraded,
+			OnSessionEnd: cs.sessionEnded,
 		})
 	}
 
@@ -816,7 +820,7 @@ func (cs *ControlServer) handleReconnect(ctx context.Context, reason string, new
 	opCtx, cancel := cs.opContext(ctx)
 	defer cancel()
 	if cs.config.ReconnectFn != nil {
-		res, err := cs.config.ReconnectFn(opCtx, cs.assignedIP, cs.mtu)
+		res, err := cs.config.ReconnectFn(opCtx, cs.assignedIP, cs.mtu, true)
 		if err != nil {
 			log.Error("Reconnect failed: %v", err)
 			clearReconnecting()
@@ -906,7 +910,7 @@ func (cs *ControlServer) handleReconnect(ctx context.Context, reason string, new
 		OnKeepalive: func() {
 			cs.sendEvent("keepalive", "")
 		},
-		OnDegraded: cs.sessionDegraded,
+		OnSessionEnd: cs.sessionEnded,
 	})
 
 	// Clear reconnecting flag - we're done, future events should be sent
@@ -1168,6 +1172,9 @@ func (cs *ControlServer) doAutoReconnect(reason string) {
 	currentDelay := autoReconnectInitialDelay
 	consecutiveFailures := 0
 	lastNetworkCheck := time.Time{}
+	// networkChanged: the relay died on the network it was on until a wait
+	// for the network says otherwise (see ControlConfig.ReconnectFn).
+	networkChanged := false
 
 	for {
 		consecutiveFailures++
@@ -1187,6 +1194,7 @@ func (cs *ControlServer) doAutoReconnect(reason string) {
 		if consecutiveFailures%5 == 0 || time.Since(lastNetworkCheck) > 30*time.Second {
 			if !cs.checkNetworkConnectivity() {
 				log.Warn("No network connectivity, waiting...")
+				networkChanged = true
 
 				// Wait for network with periodic checks
 				if !cs.waitForNetwork(stopCh) {
@@ -1212,7 +1220,7 @@ func (cs *ControlServer) doAutoReconnect(reason string) {
 
 		// Try to reconnect using ReconnectFn or ConnectFn
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		success := cs.attemptReconnect(ctx)
+		success := cs.attemptReconnect(ctx, networkChanged)
 		cancel()
 
 		if success {
@@ -1247,7 +1255,7 @@ func (cs *ControlServer) doAutoReconnect(reason string) {
 }
 
 // attemptReconnect tries to reconnect using available methods
-func (cs *ControlServer) attemptReconnect(ctx context.Context) bool {
+func (cs *ControlServer) attemptReconnect(ctx context.Context, networkChanged bool) bool {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
@@ -1282,7 +1290,7 @@ func (cs *ControlServer) attemptReconnect(ctx context.Context) bool {
 	// Prefer ReconnectFn (handles circuit breaker reset)
 	if cs.config.ReconnectFn != nil {
 		var res ReconnectResult
-		res, err = cs.config.ReconnectFn(ctx, cs.assignedIP, cs.mtu)
+		res, err = cs.config.ReconnectFn(ctx, cs.assignedIP, cs.mtu, networkChanged)
 		newConn, serverIP, assignedIP = res.Conn, res.ServerIP, res.AssignedIP
 		serverIP6, assignedIP6 = res.ServerIP6, res.AssignedIP6
 	} else if cs.config.ConnectFn != nil {
@@ -1350,7 +1358,7 @@ func (cs *ControlServer) attemptReconnect(ctx context.Context) bool {
 		OnKeepalive: func() {
 			cs.sendEvent("keepalive", "")
 		},
-		OnDegraded: cs.sessionDegraded,
+		OnSessionEnd: cs.sessionEnded,
 	})
 
 	log.Info("Auto-reconnect: TUN relay restarted (server IP: %s)", serverIP)
@@ -1359,6 +1367,9 @@ func (cs *ControlServer) attemptReconnect(ctx context.Context) bool {
 
 // checkNetworkConnectivity performs a quick TCP check
 func (cs *ControlServer) checkNetworkConnectivity() bool {
+	if cs.netCheck != nil {
+		return cs.netCheck()
+	}
 	// Shared with the reconnect loop. The probe must not enter the tunnel:
 	// 8.8.8.8 and 1.1.1.1 are routinely part of the installed TUN routes, so
 	// dials to them black-hole while the tunnel is down and read as "no
@@ -1531,9 +1542,9 @@ func (cs *ControlServer) performTUNHandshake(ctx context.Context) (assignedIP, s
 	return assignedIP, serverIP, nil
 }
 
-// sessionDegraded hands the relay's stall verdict to SessionDegradedFn.
-func (cs *ControlServer) sessionDegraded(stall time.Duration) {
-	if cs.config != nil && cs.config.SessionDegradedFn != nil {
-		cs.config.SessionDegradedFn(stall)
+// sessionEnded hands the end of the relay's session to SessionEndedFn.
+func (cs *ControlServer) sessionEnded(end RelaySessionEnd) {
+	if cs.config != nil && cs.config.SessionEndedFn != nil {
+		cs.config.SessionEndedFn(end)
 	}
 }
