@@ -446,11 +446,13 @@ func init() { stallVerdictsNow.Store(&verdictLimiter{}) }
 func stallVerdicts() *verdictLimiter { return stallVerdictsNow.Load() }
 
 // allow reports whether a verdict at now may be acted on, and books it.
-func (l *verdictLimiter) allow(now time.Time) bool {
+// When it may not, until is when verdicts are acted on again: no session is
+// judged before then.
+func (l *verdictLimiter) allow(now time.Time) (ok bool, until time.Time) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if now.Before(l.quietUntil) {
-		return false
+		return false, l.quietUntil
 	}
 	kept := l.recent[:0]
 	for _, t := range l.recent {
@@ -462,10 +464,10 @@ func (l *verdictLimiter) allow(now time.Time) bool {
 	if len(l.recent) >= stallVerdictMax {
 		l.quietUntil = now.Add(stallVerdictQuiet)
 		l.recent = l.recent[:0]
-		return false
+		return false, l.quietUntil
 	}
 	l.recent = append(l.recent, now)
-	return true
+	return true, time.Time{}
 }
 
 // sessionDegradedError is the reason a session is ended by the stall
@@ -541,16 +543,20 @@ func (v *VPNClient) watchStalls() {
 			log.Info("Session alive: the stalled flow got its answer during the confirmation")
 			continue
 		}
-		judged = conn
 		name := "unknown"
 		if strat != nil {
 			name = strat.Name()
 		}
-		if !stallVerdicts().allow(time.Now()) {
-			log.Warn("Session degraded: flow stalled %v, keepalive echo 0/%d (strategy=%s) - not acting, %d verdicts within %v already",
-				stall.Round(time.Millisecond), sent, name, stallVerdictMax, stallVerdictWindow)
+		if ok, until := stallVerdicts().allow(time.Now()); !ok {
+			// Not acting, and not judging: the session is looked at again
+			// when verdicts are acted on again - it may still be the useless
+			// one then - and no keepalive goes out to confirm in between.
+			log.Warn("Session degraded: flow stalled %v, keepalive echo 0/%d (strategy=%s) - not acting until %s, %d verdicts within %v already",
+				stall.Round(time.Millisecond), sent, name, until.Format(time.TimeOnly), stallVerdictMax, stallVerdictWindow)
+			holdUntil = until
 			continue
 		}
+		judged = conn
 		log.Warn("Session degraded: flow stalled %v, keepalive echo 0/%d (strategy=%s, session=%s, last downlink %s ago)",
 			stall.Round(time.Millisecond), sent, name, sinceOrUnknown(connectedAt), sinceOrUnknown(lastRx))
 		v.connLost(conn, "session degraded", &sessionDegradedError{stall: stall})
@@ -648,10 +654,11 @@ func (r *tunRelay) watchStalls() {
 			log.Info("TUN relay: the stalled flow got its answer during the confirmation")
 			continue
 		}
-		if !stallVerdicts().allow(time.Now()) {
-			log.Warn("Session degraded: flow stalled %v, keepalive echo 0/%d - not acting, %d verdicts within %v already",
-				stall.Round(time.Millisecond), sent, stallVerdictMax, stallVerdictWindow)
-			return
+		if ok, until := stallVerdicts().allow(time.Now()); !ok {
+			log.Warn("Session degraded: flow stalled %v, keepalive echo 0/%d - not acting until %s, %d verdicts within %v already",
+				stall.Round(time.Millisecond), sent, until.Format(time.TimeOnly), stallVerdictMax, stallVerdictWindow)
+			holdUntil = until
+			continue
 		}
 		log.Warn("Session degraded: flow stalled %v, keepalive echo 0/%d (session=%s, last activity %s ago)",
 			stall.Round(time.Millisecond), sent, sinceOrUnknown(r.startedAt), r.idleDuration().Round(time.Millisecond))

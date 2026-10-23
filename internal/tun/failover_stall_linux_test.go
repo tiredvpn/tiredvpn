@@ -272,18 +272,19 @@ func TestMadeUpKeepalivesAreNoEcho(t *testing.T) {
 func TestOneVerdictLimitPerWindow(t *testing.T) {
 	var l verdictLimiter
 	now := time.Now()
+	allowed := func(at time.Time) bool { ok, _ := l.allow(at); return ok }
 	for i := range stallVerdictMax {
-		if !l.allow(now.Add(time.Duration(i) * time.Minute)) {
+		if !allowed(now.Add(time.Duration(i) * time.Minute)) {
 			t.Fatalf("verdict %d refused", i+1)
 		}
 	}
-	if l.allow(now.Add(4 * time.Minute)) {
-		t.Fatal("a fourth verdict within the window was allowed")
+	if ok, until := l.allow(now.Add(4 * time.Minute)); ok || !until.Equal(now.Add(14*time.Minute)) {
+		t.Fatalf("a fourth verdict within the window: allowed=%v, quiet until %v", ok, until)
 	}
-	if l.allow(now.Add(13 * time.Minute)) {
+	if allowed(now.Add(13 * time.Minute)) {
 		t.Fatal("a verdict inside the quiet period was allowed")
 	}
-	if !l.allow(now.Add(15 * time.Minute)) {
+	if !allowed(now.Add(15 * time.Minute)) {
 		t.Fatal("verdicts did not come back after the quiet period")
 	}
 }
@@ -575,5 +576,58 @@ func TestRelayFlowAnsweredDuringTheConfirmationIsNoVerdict(t *testing.T) {
 	}
 	if r := h.reason(1500 * time.Millisecond); r != "" || h.degraded.Load() != 0 {
 		t.Fatalf("a relay whose flow was answered was given up: %q", r)
+	}
+}
+
+// quietLimiter is a limiter in its quiet period for d more.
+func quietLimiter(d time.Duration) *verdictLimiter {
+	return &verdictLimiter{quietUntil: time.Now().Add(d)}
+}
+
+// TestARefusedVerdictIsJudgedAgainAfterTheQuiet is P2-1 of the round-4
+// review: a session whose verdict the limiter refused was never judged again
+// - on the desktop it was marked judged, the Android relay's watcher
+// returned - and a Polling session under a byte cap, which never ends on its
+// own, stayed for good. It is judged again when the quiet period ends, and no
+// keepalive goes out for it in between.
+func TestARefusedVerdictIsJudgedAgainAfterTheQuiet(t *testing.T) {
+	h := newStallHarness(t, nil)
+	stallVerdictsNow.Store(quietLimiter(1500 * time.Millisecond))
+	if !h.wait("not acting until", 2*time.Second) {
+		t.Fatalf("no refused verdict:\n%s", h.out)
+	}
+	sent := h.exit.gotEcho.Load()
+	time.Sleep(300 * time.Millisecond) // inside the quiet period
+	if n := h.exit.gotEcho.Load() - sent; n != 0 {
+		t.Fatalf("%d keepalives went out for a session that may not be judged yet", n)
+	}
+	if !h.wait("VPN disconnected: session degraded", 3*time.Second) {
+		t.Fatalf("the session was not judged again after the quiet period:\n%s", h.out)
+	}
+}
+
+// TestRelayRefusedVerdictIsJudgedAgainAfterTheQuiet: the same on the relay.
+func TestRelayRefusedVerdictIsJudgedAgainAfterTheQuiet(t *testing.T) {
+	out := &stampedLog{}
+	h := newRelayStallHarness(t, nil)
+	setLog(t, out)
+	stallVerdictsNow.Store(quietLimiter(1500 * time.Millisecond))
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, ok := out.first("not acting until"); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no refused verdict:\n%s", out)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	sent := h.exit.gotEcho.Load()
+	time.Sleep(300 * time.Millisecond) // inside the quiet period
+	if n := h.exit.gotEcho.Load() - sent; n != 0 {
+		t.Fatalf("%d keepalives went out for a session that may not be judged yet", n)
+	}
+	if r := h.reason(3 * time.Second); !strings.HasPrefix(r, "session_degraded") {
+		t.Fatalf("relay ended with %q, want a verdict after the quiet period", r)
 	}
 }
