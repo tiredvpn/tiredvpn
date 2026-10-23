@@ -126,6 +126,24 @@ type stallHarness struct {
 // servers, with the session riding the first.
 func newStallHarness(t *testing.T, wrap func(net.Conn) net.Conn) *stallHarness {
 	t.Helper()
+	h := newQuietStallHarness(t, wrap)
+	// The flow is answered once (the stand's SYN-ACK, frame 3), then the
+	// application sends its GET (frame 6) into it.
+	pkts := fixtureFlows(t)
+	if err := h.exit.writeFrame(pkts[2].data); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if _, err := h.app.Write(pkts[5].data); err != nil {
+		t.Fatal(err)
+	}
+	return h
+}
+
+// newQuietStallHarness is newStallHarness before anything has crossed the
+// tunnel.
+func newQuietStallHarness(t *testing.T, wrap func(net.Conn) net.Conn) *stallHarness {
+	t.Helper()
 	shortStallClocks(t)
 	oldLink := probeLocalLink
 	probeLocalLink = func() bool { return true }
@@ -186,15 +204,6 @@ func newStallHarness(t *testing.T, wrap func(net.Conn) net.Conn) *stallHarness {
 			}
 		}
 	}()
-	// The flow is answered once (the stand's SYN-ACK, frame 3), then the
-	// application sends its GET (frame 6) into it.
-	if err := exit.writeFrame(pkts[2].data); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(50 * time.Millisecond)
-	if _, err := app.Write(pkts[5].data); err != nil {
-		t.Fatal(err)
-	}
 	return h
 }
 
@@ -798,11 +807,7 @@ func TestControlRelaysNameTheSessionStrategy(t *testing.T) {
 // its last data packet down (P3-4 of the round-6 review). A keepalive echo
 // moves lastRx and nothing else; a data packet moves lastData.
 func TestDataDownIsStampedAndEchoesAreNot(t *testing.T) {
-	h := newStallHarness(t, nil)
-	h.exit.echo.Store(true)
-	h.v.mu.Lock()
-	h.v.lastData = time.Time{}
-	h.v.mu.Unlock()
+	h := newQuietStallHarness(t, nil)
 	if err := h.exit.writeFrame(nil); err != nil {
 		t.Fatal(err)
 	}
