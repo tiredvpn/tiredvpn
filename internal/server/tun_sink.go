@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/log"
@@ -76,6 +77,10 @@ type relayTUNSink struct {
 	writeMu sync.Mutex
 	done    chan struct{}
 	once    sync.Once
+
+	// keepaliveAt is the UnixNano of the last keepalive sent up for a
+	// downstream client's activity (UpdateActivity).
+	keepaliveAt atomic.Int64
 }
 
 // dualAddrs returns the exit-assigned IPv6 tunnel addresses for the downstream
@@ -109,9 +114,33 @@ func (s *relayTUNSink) WritePacket(pkt []byte) error {
 
 func (s *relayTUNSink) Done() <-chan struct{} { return s.done }
 
-// UpdateActivity is a no-op: the upstream leg's liveness is the read deadline in
-// pump, not a separate idle timer.
-func (s *relayTUNSink) UpdateActivity() {}
+// relayKeepaliveEvery is the least time between two keepalives the relay
+// sends up for its downstream client's activity. A var so tests can shorten
+// it.
+var relayKeepaliveEvery = 30 * time.Second
+
+// UpdateActivity tells the upstream exit that the downstream client is
+// alive: a keepalive frame up, at most one per relayKeepaliveEvery. The
+// exit echoes it, which also keeps pump's read deadline from running out.
+// A downstream client that sends no keepalive of its own - HTTP Polling
+// polls instead, and the relay answers its keepalives itself - left the leg
+// silent, and an idle Polling session through a relay died after
+// relayTUNIdleTimeout.
+func (s *relayTUNSink) UpdateActivity() {
+	now := time.Now().UnixNano()
+	last := s.keepaliveAt.Load()
+	if now-last < int64(relayKeepaliveEvery) || !s.keepaliveAt.CompareAndSwap(last, now) {
+		return
+	}
+	go func() {
+		s.writeMu.Lock()
+		defer s.writeMu.Unlock()
+		s.up.SetWriteDeadline(time.Now().Add(30 * time.Second))
+		if _, err := s.up.Write([]byte{0, 0, 0, 0}); err != nil {
+			s.logger.Debug("Relay TUN: keepalive up failed: %v", err)
+		}
+	}()
+}
 
 func (s *relayTUNSink) Close() {
 	s.once.Do(func() {
