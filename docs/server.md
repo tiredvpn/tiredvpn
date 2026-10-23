@@ -272,10 +272,19 @@ differs from one that replays a real client's hello:
 
 | Exit | Plain probe, pool name | Replayed client hello, pool name |
 |---|---|---|
-| `-reality-b1`, `-reality-sni` lists the name | mirrored to that site | mirrored to that site |
-| `-reality-b1`, name not listed | `-reality-cover-domain` if set, else the server's own `-cert` | the same |
+| `-reality-b1`, `-reality-sni` lists the name | mirrored to that site | mirrored to that site, except a tagged fallback hello replayed to another exit (below) |
+| `-reality-b1`, name not listed | `-reality-cover-domain` if set, else the server's own `-cert` | the same, with the same exception |
 | legacy only, `-reality-cover-domain` set | the server's own `-cert` | mirrored if listed (built-in or `-reality-sni`), else the cover domain |
 | legacy only, no `-reality-cover-domain` | the server's own `-cert` | the server's own `-cert`; `-reality-sni` changes nothing |
+
+The exception: a TLS fallback's hello carries a fallback-transport tag (next
+section). Each exit remembers the tags it has let through, so a replay to
+the same exit is mirrored. The tag is not bound to the hello or to the exit,
+though. A copy, even of the 32-byte `session_id` alone in the prober's own
+ClientHello, is let through once on every other exit with the same secret
+within the clock window, and the prober then sees that exit's own TLS stack.
+This is under review. Per-client registry secrets, rather than one shared
+`-secret`, limit a copy to the exits that know that client.
 
 The legacy transport is on by default (`-reality-legacy`). On an exit that
 runs both, a probe whose ClientHello carries a padding extension of 64 bytes
@@ -317,16 +326,22 @@ own secret and the global `-secret`:
 
 The tag is not a B1 credential and a B1 `session_id` is not a tag. It looks
 like the random value it replaces, differs on every connection, and leaves the
-rest of the ClientHello as crypto/tls builds it.
+rest of the ClientHello as crypto/tls builds it. It carries the client's
+clock: a client more than `-reality-max-time-diff` (300 s by default) off
+has its TLS fallbacks sent to the donor, as its B1 hellos are.
 
-Compatibility:
+**Update B1 exits before handing out SNI pools.** A new client with a pool of
+donor names, dialling an exit that runs `-reality-b1` without the tag check
+(1.11.8 and older), has every TLS fallback proxied to the donor - the failure
+the tag exists to fix.
 
-- Clients built before the tag (1.11.8 and older) on a B1 server: their TLS
-  fallbacks still go to the donor when the SNI is a donor name, and to the
-  cover domain when one is set. REALITY, QUIC and the non-TLS transports are
-  not affected. Update the clients.
-- New clients on a server without the tag check, or without `-reality-b1`:
-  the tag is ignored and everything works as before.
+| Client | Exit | Result |
+|---|---|---|
+| 1.11.8 or older with `sni = [...]` in its config | any | does not start ("cannot decode TOML array") |
+| new, pool of donor names | 1.11.8 with `-reality-b1` | TLS fallbacks go to the donor or the cover domain; REALITY, QUIC and the non-TLS transports work |
+| 1.11.8 or older (no tag) | new, `-reality-b1` | TLS fallbacks mirrored when the SNI is a donor or a cover domain is set, otherwise the ordinary path - as before |
+| any | without `-reality-b1` | the tag is ignored; as before |
+| new relay (`-upstream`) | new, `-reality-b1` | the upstream leg is tagged with its upstream secret and reaches its handler |
 
 Cost: one HMAC per index entry for each ClientHello that B1 turns down and the
 legacy transport does not take: about 0.8 µs and five small allocations per

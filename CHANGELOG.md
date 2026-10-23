@@ -41,8 +41,13 @@ Versions follow [Semantic Versioning](https://semver.org/).
   their secret in the ClientHello `session_id`; the B1 gate hands a fresh tag
   to the ordinary TLS path instead of proxying it to the donor its SNI names,
   or to `-reality-cover-domain`. Replayed, stale and foreign tags still go to
-  the donor. Clients older than this keep the old behaviour on B1 servers;
-  servers older than this ignore the tag.
+  the donor. Clients older than this keep the old behaviour on B1 servers.
+  **Update `-reality-b1` exits before handing out SNI pools:** an older B1
+  exit ignores the tag, and a new client with a pool of donor names has
+  every TLS fallback proxied to the donor there. Exits without `-reality-b1`
+  are not affected. The tag carries the client's clock, as B1 does: a client
+  more than `-reality-max-time-diff` off has its fallbacks sent to the
+  donor.
 - **Client: TLS session tickets are kept per server**, so a ticket from one
   exit is never offered to another that shares a cover name.
 - **Client: failover to another server in the pool works when a server goes
