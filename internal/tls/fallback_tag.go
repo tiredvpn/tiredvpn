@@ -9,10 +9,13 @@ import (
 	"encoding/binary"
 	"hash"
 	"io"
+	"net"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/tiredvpn/tiredvpn/internal/log"
 )
 
 // Fallback-transport tag carried in the TLS session_id.
@@ -157,6 +160,54 @@ func WithFallbackTag(cfg *tls.Config, secret []byte) *tls.Config {
 	if len(secret) == 0 {
 		return cfg
 	}
+	fallbackTagCheck.Do(func() {
+		if !placesFallbackTagFn() {
+			log.Error("Fallback-transport tag: this build's crypto/tls does not take it into the ClientHello " +
+				"session_id; TLS fallbacks will go to the donor on -reality-b1 exits")
+		}
+	})
+	return withFallbackTag(cfg, secret)
+}
+
+// fallbackTagCheck runs placesFallbackTagFn once per process; the var is for
+// tests.
+var (
+	fallbackTagCheck    sync.Once
+	placesFallbackTagFn = placesFallbackTag
+)
+
+// placesFallbackTag reports whether a crypto/tls client handshake built here
+// carries the tag in its session_id. The placement rests on crypto/tls
+// internals - which read draws the session_id - and a Go release that
+// changes them leaves the tag out silently: a B1 exit then sends every TLS
+// fallback to the donor and nothing on the client says why (P3-11 of the
+// round-5 review). One in-memory ClientHello, read off a pipe, says it.
+func placesFallbackTag() bool {
+	secret := []byte("fallback-tag-self-check")
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	cfg := withFallbackTag(&tls.Config{ServerName: "localhost", InsecureSkipVerify: true}, secret) //nolint:gosec // never completes
+	go func() { _ = tls.Client(client, cfg).Handshake() }()
+	_ = server.SetReadDeadline(time.Now().Add(5 * time.Second))
+	hdr := make([]byte, 5)
+	if _, err := io.ReadFull(server, hdr); err != nil || hdr[0] != 0x16 {
+		return false
+	}
+	body := make([]byte, binary.BigEndian.Uint16(hdr[3:]))
+	if _, err := io.ReadFull(server, body); err != nil {
+		return false
+	}
+	sid, err := SessionIDFrom(body)
+	if err != nil {
+		return false
+	}
+	_, ok := DeriveFallbackTagKey(secret).Open(sid)
+	return ok
+}
+
+// withFallbackTag is WithFallbackTag without the self-check.
+func withFallbackTag(cfg *tls.Config, secret []byte) *tls.Config {
 	c := cfg.Clone()
 	c.Rand = NewFallbackTagRand(secret)
 	return c

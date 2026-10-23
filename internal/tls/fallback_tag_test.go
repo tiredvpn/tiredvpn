@@ -8,9 +8,14 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"slices"
+	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/tiredvpn/tiredvpn/internal/log"
 )
 
 // stdlibHello runs a crypto/tls client handshake over a pipe and returns the
@@ -247,5 +252,27 @@ func TestFallbackTagOpenerAgreesWithTheKey(t *testing.T) {
 		if i%3 == 0 && !ok2 {
 			t.Fatal("the opener rejected its own key's tag")
 		}
+	}
+}
+
+// TestTheTagSelfCheck is P3-11 of the round-5 review: the tag's placement
+// rests on crypto/tls internals, and a client that failed to place it got no
+// signal. The self-check finds the tag in this build's ClientHello; and when
+// it does not, the first tagged config says so in the log.
+func TestTheTagSelfCheck(t *testing.T) {
+	if !placesFallbackTag() {
+		t.Fatal("the self-check does not find the tag this build places")
+	}
+
+	var out bytes.Buffer
+	log.SetOutput(&out)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	old := placesFallbackTagFn
+	placesFallbackTagFn = func() bool { return false }
+	fallbackTagCheck = sync.Once{}
+	t.Cleanup(func() { placesFallbackTagFn = old; fallbackTagCheck = sync.Once{} })
+	_ = WithFallbackTag(&tls.Config{}, []byte("x"))
+	if !strings.Contains(out.String(), "does not take it into the ClientHello") {
+		t.Fatalf("a failed self-check left no trace in the log: %q", out.String())
 	}
 }
