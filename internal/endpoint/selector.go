@@ -205,6 +205,14 @@ type serverChain struct {
 	// backoff is the server's own park: Cooldown, doubling with each verdict
 	// on the whole server up to MaxCooldown, cleared by a useful session.
 	backoff time.Duration
+	// until is when the server's last park ends. A server that stays quiet
+	// for as long as that park lasted starts its next one from Cooldown
+	// again: without it the backoff only grew, and a server that misbehaved
+	// once a day was parked for half an hour within a week (P3-4 of the
+	// round-5 review).
+	until time.Time
+	// parked is how long that park lasted, jitter included.
+	parked time.Duration
 }
 
 // NewSelector builds a selector from cfg, or returns the process-scoped one
@@ -763,8 +771,13 @@ func (s *Selector) addrVerdictLocked(idx int, now time.Time) (serverParked bool)
 	}
 
 	sc := &s.servers[ep]
+	if !sc.until.IsZero() && now.Sub(sc.until) >= sc.parked {
+		sc.backoff = 0
+	}
 	sc.backoff = s.nextBackoff(sc.backoff)
-	until := now.Add(s.jitter(sc.backoff))
+	sc.parked = s.jitter(sc.backoff)
+	until := now.Add(sc.parked)
+	sc.until = until
 	for j, c := range s.cands {
 		if c.EndpointIdx == ep && s.health[j].cooldownUntil.Before(until) {
 			s.health[j].cooldownUntil = until

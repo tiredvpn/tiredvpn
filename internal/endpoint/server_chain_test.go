@@ -103,7 +103,7 @@ func TestAServerVerdictGrows(t *testing.T) {
 	serverPark := func() time.Duration {
 		s.ReportSilent(candFor(t, s, aV4), aV6)
 		park := stateOf(t, s, aV6).CooldownUntil.Sub(clk.Now())
-		clk.Advance(time.Hour)
+		clk.Advance(park + time.Second) // back right after the park
 		return park
 	}
 	parks := []time.Duration{serverPark(), serverPark(), serverPark()}
@@ -113,6 +113,27 @@ func TestAServerVerdictGrows(t *testing.T) {
 	s.ReportSessionUseful(candFor(t, s, aV4))
 	if got := serverPark(); got != parks[0] {
 		t.Fatalf("after a useful session the server is parked for %v, want the base %v", got, parks[0])
+	}
+}
+
+// TestAServerBackoffDecays is P3-4 of the round-5 review: the backoff only
+// ever grew. A server that stays quiet after a park for as long as that park
+// lasted starts the next one from the base again.
+func TestAServerBackoffDecays(t *testing.T) {
+	s, clk := twoDualStackServers(t)
+	verdict := func() time.Duration {
+		s.ReportSilent(candFor(t, s, aV4), aV6)
+		return stateOf(t, s, aV6).CooldownUntil.Sub(clk.Now())
+	}
+	base := verdict()
+	clk.Advance(base + time.Second)
+	grown := verdict()
+	if grown <= base {
+		t.Fatalf("a verdict right after the park parked for %v, the first for %v - the test proves nothing", grown, base)
+	}
+	clk.Advance(2*grown + time.Second) // the park, then as long again in quiet
+	if got := verdict(); got != base {
+		t.Fatalf("after a quiet park-length the server is parked for %v, want the base %v", got, base)
 	}
 }
 
@@ -148,7 +169,7 @@ func TestTheServerParkSurvivesACoreRestart(t *testing.T) {
 
 	next, nclk := twoDualStackServers(t)
 	next.ImportHealth(recs)
-	nclk.Advance(time.Hour)
+	nclk.Advance(first + time.Second)
 	next.ReportSilent(candFor(t, next, aV4), aV6)
 	if got := stateOf(t, next, aV6).CooldownUntil.Sub(nclk.Now()); got <= first {
 		t.Fatalf("after the restart the server is parked for %v, no longer than the first %v", got, first)

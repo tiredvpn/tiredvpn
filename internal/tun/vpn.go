@@ -2812,12 +2812,24 @@ func (v *VPNClient) Stop() {
 
 	// Set immediate deadline to unblock any blocking reads before closing.
 	v.mu.Lock()
+	live := v.conn != nil
 	if v.conn != nil {
 		v.conn.SetDeadline(time.Now()) // Force immediate timeout
 		v.conn.Close()
 		v.conn = nil // nothing may be swapped in on top of a stopped client
 	}
+	endedStrategy, sessionCand, hasSessionCand := v.strategy, v.sessionCand, v.hasSessionCand
+	useful := live && sessionWasUseful(v.connectedAt, v.lastRx)
 	v.mu.Unlock()
+
+	// A session the user stopped after it carried traffic is evidence for its
+	// server like any useful one: it ends the server's run of verdicts and its
+	// backoff (P3-4 of the round-5 review). Booked as replaced - the tunnel
+	// did not die - so nothing counts against the strategy.
+	if useful && endedStrategy != nil && v.manager != nil {
+		v.manager.SessionEnded(strategy.SessionEnd{Strategy: endedStrategy.ID(), Endpoint: sessionCand,
+			HasEndpoint: hasSessionCand, Useful: true, Replaced: true})
+	}
 
 	// Unblock TUN read goroutine and close
 	v.tun.SetReadDeadline(time.Now())
@@ -2871,6 +2883,9 @@ type RelayCallbacks struct {
 	// before OnError: what the session was, for whoever books its end against
 	// the strategy and the endpoint. Not called when the owner stopped it.
 	OnSessionEnd func(RelaySessionEnd)
+	// Strategy carries the session, when known: the stall detector looks for
+	// its keepalive counter by it as well as by the conn (echoSourceFor).
+	Strategy strategy.Strategy
 }
 
 // RelaySessionEnd describes a relay's session that has just ended.
