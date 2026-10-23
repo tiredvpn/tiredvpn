@@ -612,10 +612,11 @@ func runControlSocketMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Si
 	// What the previous core of this process learned about the servers -
 	// a park for a degraded session above all - goes on here; what this one
 	// learns goes to the next. See androidCarry.
+	sess := &androidSession{mgr: mgr}
 	carryInto(mgr)
-	defer carryFrom(mgr)
+	defer carryFrom(mgr, sess)
 
-	ctrlCfg := androidControlConfig(cfg, mgr, dualStack, &androidSession{mgr: mgr})
+	ctrlCfg := androidControlConfig(cfg, mgr, dualStack, sess)
 
 	ctrlServer, err := tun.NewControlServer(cfg.ControlSocket, ctrlCfg)
 	if err != nil {

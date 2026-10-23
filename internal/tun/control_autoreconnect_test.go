@@ -55,3 +55,15 @@ func TestRelayDeathOnTheSameNetworkKeepsWhatWasLearned(t *testing.T) {
 		t.Fatal("a reconnect after waiting for the network was not treated as a network change")
 	}
 }
+
+// TestTheHostsDisconnectIsReported: the user's stop reaches DisconnectedFn,
+// so the core does not hand its verdicts to the next start (P3-5 of the
+// round-5 review). A dead connection does not go through here.
+func TestTheHostsDisconnectIsReported(t *testing.T) {
+	called := 0
+	cs := &ControlServer{config: &ControlConfig{DisconnectedFn: func() { called++ }}}
+	cs.handleDisconnect()
+	if called != 1 {
+		t.Fatalf("DisconnectedFn called %d times on disconnect, want 1", called)
+	}
+}

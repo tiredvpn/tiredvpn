@@ -211,3 +211,28 @@ func TestAnIPBlockedServerIsNotTheRoute(t *testing.T) {
 		}
 	}
 }
+
+// TestAnOldDeathIsNotTheRoute: the route marker now outlives an Android core
+// restart, so it carries a time. A death on another server more than
+// routeDeathWindow ago is no evidence about the route now: the second death
+// charges its server.
+func TestAnOldDeathIsNotTheRoute(t *testing.T) {
+	a, b := newHelloListener(t), newHelloListener(t)
+	m := newSilenceManager(t, time.Second, a.addr, b.addr)
+	m.Register(&greetingStrategy{id: "reality", priority: 5})
+	candB, _ := m.selector().CandidateForAddr(b.addr)
+	for _, tc := range []struct {
+		age   time.Duration
+		route bool
+	}{
+		{time.Minute, true},
+		{routeDeathWindow + time.Minute, false},
+	} {
+		m.mu.Lock()
+		m.lastDeath = deathMark{server: 0, class: deathDegraded, at: time.Now().Add(-tc.age)}
+		m.mu.Unlock()
+		if got := m.routeDeath(candB, deathDegraded, "test", []string{"reality"}); got != tc.route {
+			t.Fatalf("a death on a %v ago: route=%v, want %v", tc.age, got, tc.route)
+		}
+	}
+}

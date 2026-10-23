@@ -143,3 +143,30 @@ func TestTheSkipListIsThereOnTheReturnAfterALongPark(t *testing.T) {
 	}
 
 }
+
+// TestTheSwallowRunCrossesACoreRestart: on Android the app restarts the core
+// after a failed connect, and a run of two or three swallowed cycles could
+// never build up across fresh managers (P1-4 of the round-5 review).
+// RouteHistory hands the runs and their skip lists to the next manager, as a
+// copy: the old one cannot change them afterwards.
+func TestTheSwallowRunCrossesACoreRestart(t *testing.T) {
+	addr := slowHelloListener(t, 0)
+	other := newHelloListener(t)
+	m1 := newSilenceManager(t, 2*time.Second, addr, other.addr)
+	m1.Register(&protectedGreeter{id: "reality", priority: 5})
+	m1.Register(&protectedGreeter{id: "polling", priority: 6})
+	m1.noteSwallowed(addr, []string{"reality"})
+
+	m2 := newSilenceManager(t, 2*time.Second, addr, other.addr)
+	m2.Register(&protectedGreeter{id: "reality", priority: 5})
+	m2.Register(&protectedGreeter{id: "polling", priority: 6})
+	m2.Register(&protectedGreeter{id: "ws", priority: 7})
+	m2.AdoptRouteHistory(m1.RouteHistory())
+	if !m2.swallowSkip(addr)["reality"] {
+		t.Fatal("the next manager does not know which transport the server swallows")
+	}
+	m1.noteSwallowed(addr, []string{"polling"})
+	if m2.swallowSkip(addr)["polling"] {
+		t.Fatal("the history is shared with the old manager, not copied")
+	}
+}

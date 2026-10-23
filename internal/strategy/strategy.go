@@ -1533,11 +1533,21 @@ const (
 	deathStorm     deathClass = "storm"
 )
 
-// deathMark is the last verdict given to a server: which one, and of what kind.
+// deathMark is the last verdict given to a server: which one, of what kind,
+// and when.
 type deathMark struct {
 	server int
 	class  deathClass
+	at     time.Time
 }
+
+// routeDeathWindow bounds how far apart two deaths may be and still be "in a
+// row". The chain between them - the other family of the first server, a
+// reconnect, a session dying on the second - takes three or four minutes at
+// most; a mark older than this is about a route that may have changed since,
+// and must not decide a park on its own (P1-4 of the round-5 review, now that
+// the mark survives an Android core restart).
+const routeDeathWindow = 10 * time.Minute
 
 // routeDeath books a verdict of class on cand's server and reports whether it
 // is the route's rather than the server's. Then it parks the transports that
@@ -1559,11 +1569,13 @@ type deathMark struct {
 // spared it forever. A server gets one pass after a switch and is charged on
 // its second death in a row.
 func (m *Manager) routeDeath(cand endpoint.Candidate, class deathClass, why string, ids []string) bool {
+	now := time.Now()
 	m.mu.Lock()
 	prev := m.lastDeath
-	m.lastDeath = deathMark{server: cand.EndpointIdx, class: class}
+	m.lastDeath = deathMark{server: cand.EndpointIdx, class: class, at: now}
 	m.mu.Unlock()
-	if prev.server < 0 || prev.server == cand.EndpointIdx || prev.class != class || len(ids) == 0 {
+	if prev.server < 0 || prev.server == cand.EndpointIdx || prev.class != class || len(ids) == 0 ||
+		now.Sub(prev.at) > routeDeathWindow {
 		return false
 	}
 	if m.IsForced() {
@@ -4385,6 +4397,51 @@ func (m *Manager) AdoptStormHistory(d *StormDetector) {
 	if d != nil {
 		m.stormDetector = d
 	}
+}
+
+// RouteMemory is what a manager knows about the route beyond endpoint health
+// and storm history: the last server verdict (routeDeath) and the runs of
+// swallowed handshakes with their skip lists. Opaque; see RouteHistory.
+type RouteMemory struct {
+	death     deathMark
+	swallowed map[string]*swallowRecord
+}
+
+// RouteHistory returns a copy of the route verdict marker and the swallow
+// runs, for a manager that takes over from this one (AdoptRouteHistory). The
+// Android app replaces the whole core on every dead connection; without these
+// the next core's first verdict was a first verdict again, and the route rule
+// never fired there (P1-4 of the round-5 review).
+func (m *Manager) RouteHistory() RouteMemory {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := RouteMemory{death: m.lastDeath, swallowed: make(map[string]*swallowRecord, len(m.swallowed))}
+	for k, r := range m.swallowed {
+		c := &swallowRecord{
+			skip:         make(map[string]map[string]bool, len(r.skip)),
+			last:         r.last,
+			cycles:       r.cycles,
+			heardNothing: maps.Clone(r.heardNothing),
+			addrs:        maps.Clone(r.addrs),
+		}
+		for a, ids := range r.skip {
+			c.skip[a] = maps.Clone(ids)
+		}
+		out.swallowed[k] = c
+	}
+	return out
+}
+
+// AdoptRouteHistory takes over another manager's RouteHistory over the same
+// pool. The zero RouteMemory changes nothing.
+func (m *Manager) AdoptRouteHistory(rm RouteMemory) {
+	if rm.swallowed == nil && rm.death.at.IsZero() {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lastDeath = rm.death
+	m.swallowed = rm.swallowed
 }
 
 // ResetStrategyBlocks closes every circuit breaker and puts every strategy's
