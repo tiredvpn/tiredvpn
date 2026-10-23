@@ -617,8 +617,9 @@ func runControlSocketMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Si
 	// What the previous core of this process learned about the servers -
 	// a park for a degraded session above all - goes on here; what this one
 	// learns goes to the next. See androidCarry.
+	// The carry is taken over at the core's first dial (takeCarry), when the
+	// app has said which network it is on.
 	sess := &androidSession{mgr: mgr}
-	carryInto(mgr)
 	defer carryFrom(mgr, sess)
 
 	ctrlCfg := androidControlConfig(cfg, mgr, dualStack, sess)

@@ -24,6 +24,10 @@ type ControlCommand struct {
 	TunFd   int    `json:"tun_fd,omitempty"`
 	Pid     int    `json:"pid,omitempty"`    // Parent process PID for /proc/PID/fd/N access
 	Reason  string `json:"reason,omitempty"` // For network_changed: "wifi_to_lte", "lte_to_wifi", "cell_handoff"
+	// NetworkID names the network the command is sent on, opaque to the
+	// core: the Android app sends its Network handle. Optional, on
+	// "connect", "network_changed" and "reconnect". See NetworkFn.
+	NetworkID string `json:"network_id,omitempty"`
 }
 
 // ControlResponse represents response to Android app
@@ -197,6 +201,11 @@ type ControlConfig struct {
 	// host sent the commands, the moment they are read.
 	DisconnectedFn     func()
 	ConnectRequestedFn func()
+
+	// NetworkFn, when set, is told the network_id of every command that
+	// carries one, in the order the host sent them, the moment it is read:
+	// the network the host is on now.
+	NetworkFn func(id string)
 
 	// SessionStrategyFn, when set, names the strategy carrying the current
 	// session, for the relay's stall detector: a conn whose keepalive counter
@@ -388,7 +397,7 @@ func (cs *ControlServer) addReader(conn net.Conn) bool {
 
 // readControl reads conn's commands into batches until the connection ends,
 // and tells DisconnectedFn and ConnectRequestedFn at once of every
-// "disconnect" and "connect" it reads.
+// "disconnect" and "connect" it reads, and NetworkFn of every network_id.
 func (cs *ControlServer) readControl(conn *net.UnixConn, batches chan<- controlBatch) {
 	var drainedOnce sync.Once
 	drained := func() { drainedOnce.Do(cs.readers.Done) }
@@ -430,7 +439,11 @@ func (cs *ControlServer) readControl(conn *net.UnixConn, batches chan<- controlB
 		}
 		msgs, ferr := framer.feed(buf[:n], fd)
 		for _, m := range msgs {
-			switch controlCommandName(m.data) {
+			name, network := controlCommandHead(m.data)
+			if network != "" && cs.config.NetworkFn != nil {
+				cs.config.NetworkFn(network)
+			}
+			switch name {
 			case "disconnect":
 				if cs.config.DisconnectedFn != nil {
 					cs.config.DisconnectedFn()
@@ -455,15 +468,17 @@ func (cs *ControlServer) readControl(conn *net.UnixConn, batches chan<- controlB
 	}
 }
 
-// controlCommandName is the command data names, "" if none.
-func controlCommandName(data []byte) string {
+// controlCommandHead is the command data names and the network it names,
+// "" for either that is missing.
+func controlCommandHead(data []byte) (command, network string) {
 	var cmd struct {
-		Command string `json:"command"`
+		Command   string `json:"command"`
+		NetworkID string `json:"network_id"`
 	}
 	if json.Unmarshal(data, &cmd) != nil {
-		return ""
+		return "", ""
 	}
-	return cmd.Command
+	return cmd.Command, cmd.NetworkID
 }
 
 // closeReadWait is how long Close lets the control readers take in what the

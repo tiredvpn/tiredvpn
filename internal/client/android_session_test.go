@@ -131,7 +131,8 @@ func TestAndroidDegradedVerdictMovesTheClient(t *testing.T) {
 
 // TestAndroidVerdictSurvivesACoreRestart: the app answers a dead connection
 // by restarting the whole core, and every core built a fresh manager that had
-// forgotten the park. carryFrom/carryInto hand it to the next core.
+// forgotten the park. carryFrom, and the next core's first dial
+// (takeCarry), hand it over.
 func TestAndroidVerdictSurvivesACoreRestart(t *testing.T) {
 	m1, _ := androidPoolManager(t)
 	sess := &androidSession{mgr: m1, linkUp: func() bool { return true }}
@@ -146,7 +147,6 @@ func TestAndroidVerdictSurvivesACoreRestart(t *testing.T) {
 	t.Cleanup(clearCarry)
 
 	m2, s2 := androidPoolManager(t)
-	carryInto(m2)
 	ccfg2 := androidControlConfig(&Config{ServerAddr: androidPool[0], TunMTU: 1280}, m2, false, &androidSession{mgr: m2})
 	if _, _, conn, err := ccfg2.ConnectFn(t.Context()); err != nil {
 		t.Fatalf("connect on the new core: %v", err)
@@ -190,8 +190,7 @@ func TestAndroidSessionsFeedTheStormDetector(t *testing.T) {
 func clearCarry() {
 	androidCarry.mu.Lock()
 	defer androidCarry.mu.Unlock()
-	androidCarry.health, androidCarry.storm = nil, nil
-	androidCarry.route, androidCarry.pool, androidCarry.at = strategy.RouteMemory{}, "", time.Time{}
+	clearCarryLocked()
 }
 
 // namedPipeStrategy is targetPipeStrategy under a name of its own, logging
