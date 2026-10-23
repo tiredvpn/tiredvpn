@@ -474,21 +474,40 @@ func (p *IPPool) stickyLookup(clientID string) string {
 // lease is released. It is the carry-over for a client whose lease key changed
 // spelling between releases (see legacyAllocationKeys), and it leaves no lease
 // behind under an old key.
-func (p *IPPool) AdoptAll(oldKeys, oldPrefixes []string, newKey string) {
+//
+// The Redis part of the prefix search runs outside the pool lock and stops
+// with ctx: a SCAN walks the whole keyspace whatever its MATCH, and under the
+// lock a reconnect herd of cold credentials queued every allocation behind
+// it. A search that did not finish - cut short, failed, or past its round
+// limit - does not mark the key folded, so the next handshake looks again.
+func (p *IPPool) AdoptAll(ctx context.Context, oldKeys, oldPrefixes []string, newKey string) {
 	if newKey == "" {
 		return
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	now := time.Now()
-	if at, ok := p.folded[newKey]; ok && now.Sub(at) < adoptFoldTTL {
+	p.mu.Lock()
+	at, ok := p.folded[newKey]
+	p.mu.Unlock()
+	if ok && now.Sub(at) < adoptFoldTTL {
 		return
 	}
-	defer p.markFolded(newKey, now)
+	var stored []string
+	complete := true
+	for _, prefix := range oldPrefixes {
+		keys, done := p.scanClientKeys(ctx, prefix)
+		stored = append(stored, keys...)
+		complete = complete && done
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if complete {
+		defer p.markFolded(newKey, now)
+	}
 	have := p.stickyLookup(newKey)
 	for _, prefix := range oldPrefixes {
-		for _, k := range p.clientKeysWithPrefix(prefix) {
-			if !slices.Contains(oldKeys, k) {
+		for _, k := range append(p.memoryKeysWithPrefix(prefix), stored...) {
+			if strings.HasPrefix(k, prefix) && !slices.Contains(oldKeys, k) {
 				oldKeys = append(oldKeys, k)
 			}
 		}
@@ -539,48 +558,59 @@ func (p *IPPool) markFolded(newKey string, now time.Time) {
 }
 
 // adoptScanBatch and adoptScanRounds bound the Redis SCAN of
-// clientKeysWithPrefix: a few hundred keys per round, and a stop well past any
+// scanClientKeys: a few hundred keys per round, and a stop well past any
 // keyspace an exit holds (leases, client keys, the registry) rather than a walk
 // of whatever else shares the Redis.
 const (
 	adoptScanBatch  = 512
 	adoptScanRounds = 64
+	// adoptScanTimeout bounds the whole search for one handshake.
+	adoptScanTimeout = 2 * time.Second
 )
 
-// clientKeysWithPrefix returns the client keys starting with prefix: the ones
-// this process knows, and the ones in Redis, which a pool outside 10.0.0.0/8
-// does not load at startup (see leaseKeyPattern). Sorted, so the fold is
-// deterministic. Caller must hold p.mu.
-func (p *IPPool) clientKeysWithPrefix(prefix string) []string {
+// memoryKeysWithPrefix returns the client keys this process holds that
+// start with prefix. Caller must hold p.mu.
+func (p *IPPool) memoryKeysWithPrefix(prefix string) []string {
 	if prefix == "" {
 		return nil
 	}
-	found := map[string]bool{}
+	var out []string
 	for k := range p.byClient {
 		if strings.HasPrefix(k, prefix) {
-			found[k] = true
+			out = append(out, k)
 		}
 	}
-	if p.redis != nil {
-		ctx := context.Background()
-		ns := p.redisClientKey("")
-		match := ns + globEscape(prefix) + "*"
-		var cursor uint64
-		for range adoptScanRounds {
-			keys, next, err := p.redis.Scan(ctx, cursor, match, adoptScanBatch).Result()
-			if err != nil {
-				log.Warn("IP pool: scanning for leases under %s*: %v", prefix, err)
-				break
-			}
-			for _, k := range keys {
-				found[strings.TrimPrefix(k, ns)] = true
-			}
-			if cursor = next; cursor == 0 {
-				break
-			}
+	slices.Sort(out)
+	return out
+}
+
+// scanClientKeys returns the client keys in Redis that start with prefix: a
+// pool outside 10.0.0.0/8 does not load them at startup (see
+// leaseKeyPattern). Without p.mu. complete is false when the search stopped
+// early - ctx, an error, or the round limit - and the list may then miss
+// keys.
+func (p *IPPool) scanClientKeys(ctx context.Context, prefix string) (keys []string, complete bool) {
+	if prefix == "" || p.redis == nil {
+		return nil, true
+	}
+	ns := p.redisClientKey("")
+	match := ns + globEscape(prefix) + "*"
+	var cursor uint64
+	for range adoptScanRounds {
+		batch, next, err := p.redis.Scan(ctx, cursor, match, adoptScanBatch).Result()
+		if err != nil {
+			log.Warn("IP pool: scanning for leases under %s*: %v", prefix, err)
+			return keys, false
+		}
+		for _, k := range batch {
+			keys = append(keys, strings.TrimPrefix(k, ns))
+		}
+		if cursor = next; cursor == 0 {
+			return keys, true
 		}
 	}
-	return slices.Sorted(maps.Keys(found))
+	log.Warn("IP pool: scanning for leases under %s* stopped after %d rounds", prefix, adoptScanRounds)
+	return keys, false
 }
 
 // globEscape quotes the characters a Redis MATCH pattern treats as special.

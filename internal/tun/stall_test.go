@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -98,20 +99,21 @@ func cameDown(pkt []byte) bool {
 
 // replay feeds a capture through a flow table on the capture's own clock,
 // checking once a second as the monitor does, and returns the longest stall
-// seen and when it first reached stallThreshold (zero if never).
+// seen and when it first reached the threshold (zero if never).
 func replay(t *testing.T, pkts []capturedPacket) (maxStall time.Duration, crossed time.Time) {
 	t.Helper()
 	ft := newFlowTable()
 	check := func(now time.Time) {
 		s := ft.stalledFor(now)
 		maxStall = max(maxStall, s)
-		if s >= stallThreshold && crossed.IsZero() {
+		if s >= stallClocks().threshold && crossed.IsZero() {
 			crossed = now
 		}
 	}
-	next := pkts[0].at.Truncate(stallCheckEvery).Add(stallCheckEvery)
+	every := stallClocks().checkEvery
+	next := pkts[0].at.Truncate(every).Add(every)
 	for _, p := range pkts {
-		for ; next.Before(p.at); next = next.Add(stallCheckEvery) {
+		for ; next.Before(p.at); next = next.Add(every) {
 			check(next)
 		}
 		if cameDown(p.data) {
@@ -150,7 +152,7 @@ func TestStallOnTheStandCaptures(t *testing.T) {
 			}
 			fault := time.UnixMilli(tc.fault)
 			if crossed.IsZero() {
-				t.Fatalf("never crossed %v, longest stall %v", stallThreshold, maxStall)
+				t.Fatalf("never crossed %v, longest stall %v", stallClocks().threshold, maxStall)
 			}
 			if after := crossed.Sub(fault); after < 29*time.Second || after > 34*time.Second {
 				t.Fatalf("crossed %v after the fault, want about 30 s", after)
@@ -334,5 +336,65 @@ func TestFlowTableReset(t *testing.T) {
 	ft.reset()
 	if s := ft.stalledFor(pkts[5].at.Add(time.Minute)); s != 0 {
 		t.Fatalf("pending demand survived the reset: %v", s)
+	}
+}
+
+// slowEchoes is a keepalive peer whose echo takes rtt.
+type slowEchoes struct {
+	rtt time.Duration
+	n   atomic.Uint64
+}
+
+func (e *slowEchoes) send() error {
+	time.AfterFunc(e.rtt, func() { e.n.Add(1) })
+	return nil
+}
+
+// TestASlowEchoStillCounts is P2-2 of the round-4 review: the baseline was
+// taken anew before the second keepalive, so an echo of the first that came
+// after its window - during the pause - was folded into the baseline and
+// counted as nothing. On a slow channel both echoes came and the session was
+// given up. Window 150 ms, pause 100 ms, echo after 200 ms.
+func TestASlowEchoStillCounts(t *testing.T) {
+	mon := &stallMonitor{flows: newFlowTable(), echoWait: 150 * time.Millisecond, now: time.Now,
+		pause: func() time.Duration { return 100 * time.Millisecond }}
+	peer := &slowEchoes{rtt: 200 * time.Millisecond}
+	if alive, sent, _ := mon.confirm(make(chan struct{}), peer.send, peer.n.Load); !alive {
+		t.Fatalf("both echoes came (%d sent) and the session was given up", sent)
+	}
+}
+
+// TestALateLastEchoStillCounts: an echo of the last keepalive that lands at
+// the very end of its window is still looked for once more.
+func TestALateLastEchoStillCounts(t *testing.T) {
+	mon := &stallMonitor{flows: newFlowTable(), echoWait: 100 * time.Millisecond, now: time.Now,
+		pause: func() time.Duration { return 500 * time.Millisecond }}
+	peer := &slowEchoes{rtt: 700 * time.Millisecond}
+	if alive, _, _ := mon.confirm(make(chan struct{}), peer.send, peer.n.Load); !alive {
+		t.Fatal("an echo landing at the very end of the last window was dropped")
+	}
+}
+
+// TestEvictionIsAmortized is P3-5 of the round-4 review: at the cap every new
+// flow scanned the whole table on the downlink path. Room is now made for an
+// eighth of the table at once.
+func TestEvictionIsAmortized(t *testing.T) {
+	pkts := fixtureFlows(t)
+	down := pkts[2].data
+	ft := newFlowTable()
+	now := pkts[2].at
+	const extra = 4 * stallMaxFlows
+	for i := range stallMaxFlows + extra {
+		p := append([]byte(nil), down...)
+		ihl := int(p[0]&0x0f) * 4
+		binary.BigEndian.PutUint16(p[ihl:], uint16(i%60000+1))
+		binary.BigEndian.PutUint16(p[ihl+2:], uint16(i/60000+1))
+		ft.down(p, now.Add(time.Duration(i)*time.Millisecond))
+	}
+	if max := extra/(stallMaxFlows/8) + 1; ft.evictions > max {
+		t.Fatalf("%d full scans for %d new flows past the cap, want at most %d", ft.evictions, extra, max)
+	}
+	if n := len(ft.flows); n > stallMaxFlows {
+		t.Fatalf("%d flows, cap %d", n, stallMaxFlows)
 	}
 }

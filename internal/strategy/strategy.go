@@ -315,7 +315,14 @@ func (m *Manager) connectThroughRefusal(ctx context.Context, s Strategy, target 
 		case phase.neverDialled():
 			err = fmt.Errorf("%w: %w", errNotDialled, err)
 		}
-		if err != nil && phase.extended() && phase.connected() && heardNothing(err, latency, limit) {
+		// How long the attempt had to hear an answer: since its TCP connect
+		// when that is known, else its whole run.
+		scan.allowance = latency
+		if at := phase.connectedAt.Load(); at != 0 {
+			scan.allowance = time.Since(time.Unix(0, at))
+		}
+		if err != nil && phase.extended() && phase.connected() && heardNothing(err, latency, limit) &&
+			m.swallowEvidence(s, scan.allowance) {
 			scan.connectedSilent = append(scan.connectedSilent, s.ID())
 		}
 		if err == nil || isUDPBasedStrategy(s) || !refusedByAddr(err, target, m.GetServerAddr(ctx)) {
@@ -370,11 +377,12 @@ const (
 
 // connectPhase follows one attempt through its TCP connect.
 type connectPhase struct {
-	ctx     context.Context
-	state   atomic.Int32
-	timer   *time.Timer
-	split   bool
-	tracked bool // the strategy reports its dial, so state is known
+	ctx         context.Context
+	state       atomic.Int32
+	timer       *time.Timer
+	split       bool
+	tracked     bool         // the strategy reports its dial, so state is known
+	connectedAt atomic.Int64 // UnixNano of the TCP connect, 0 before
 }
 
 // watchConnect follows an attempt on ctx, whose cancel is cancel, through its
@@ -396,6 +404,7 @@ func watchConnect(ctx context.Context, cancel context.CancelFunc, limit, dialLim
 			}
 		},
 		func() {
+			p.connectedAt.Store(time.Now().UnixNano())
 			p.state.CompareAndSwap(phaseLocal, phaseConnected)
 			p.state.CompareAndSwap(phaseDialling, phaseConnected)
 		})
@@ -1680,7 +1689,7 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 			// says anything about this endpoint on its own; a run of them in
 			// which its handshakes heard nothing does (swallowCycle).
 			if !m.swallowCycle(cand.Addr, scan) {
-				if !scan.answered && (scan.timeouts > 0 || len(scan.inconclusive) > 0) {
+				if !scan.answered && (scan.timeouts > 0 || scan.unheard > 0) {
 					lastErr = fmt.Errorf("%w: %w", ErrCycleUnanswered, err)
 				}
 				break
@@ -1878,8 +1887,31 @@ type scanState struct {
 	// whose handshake then heard nothing until its attempt ran out.
 	connectedSilent []string
 	// inconclusive lists the transports whose attempt heard nothing and was
-	// still no verdict (attemptInconclusive).
+	// still no verdict (attemptInconclusive), with a real chance to answer
+	// (swallowEvidence).
 	inconclusive []string
+	// allowance is how long the last attempt had to hear an answer, from
+	// its TCP connect when known (connectThroughRefusal).
+	allowance time.Duration
+	// unheard counts the attempts that heard nothing and were no verdict,
+	// evidence or not: what makes a cycle "unanswered" (ErrCycleUnanswered).
+	unheard int
+}
+
+// swallowEvidence reports whether an attempt of s that heard nothing for
+// allowance is evidence that the address swallows handshakes. Not for a UDP
+// transport: a datagram blackhole is the route's, not the server's. And not
+// for an attempt that had less than a third of connectTimeout (10 s on the
+// desktop) to answer: cut by what was left of the cycle - half of it taken
+// by another transport - a healthy Polling handshake needing a couple of
+// seconds looked swallowed, and a working server was parked.
+//
+// A strategy that does not report its TCP connect is held to half of a
+// short cycle as a whole, under the floor: it never counts. A server that
+// swallows every handshake swallows the reporting ones too (REALITY, Polling,
+// Stego, Seqovl), and the first of them in a cycle runs to the cycle's end.
+func (m *Manager) swallowEvidence(s Strategy, allowance time.Duration) bool {
+	return !isUDPBasedStrategy(s) && allowance >= m.connectTimeout/3
 }
 
 // swallowRecord is what one address's last reconnect cycles left behind.
@@ -1910,10 +1942,11 @@ const swallowWindow = 3 * time.Minute
 // Empty in forced mode, which has nothing else to try, and when skipping them
 // would leave no transport at all.
 func (m *Manager) swallowSkip(addr string) map[string]bool {
+	parked := m.addrParked(addr)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r := m.swallowed[addr]
-	if r == nil || len(r.skip) == 0 || m.forced || time.Since(r.last) > swallowWindow {
+	if r == nil || len(r.skip) == 0 || m.forced || swallowStale(r, parked) {
 		return nil
 	}
 	if !slices.ContainsFunc(m.strategies, func(s Strategy) bool { return s.Priority() > 0 && !r.skip[s.ID()] }) {
@@ -1928,19 +1961,21 @@ func (m *Manager) noteSwallowed(addr string, ids []string) {
 	if len(ids) == 0 {
 		return
 	}
+	parked := m.addrParked(addr)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	r := m.swallowRecordLocked(addr)
+	r := m.swallowRecordLocked(addr, parked)
 	for _, id := range ids {
 		r.skip[id] = true
 	}
 }
 
 // swallowRecordLocked returns addr's swallow record, fresh if it had none or
-// its last cycle is older than swallowWindow, and stamps it now. m.mu held.
-func (m *Manager) swallowRecordLocked(addr string) *swallowRecord {
+// it is stale (swallowStale), and stamps it now. m.mu held; parked is
+// addrParked(addr), asked before taking it.
+func (m *Manager) swallowRecordLocked(addr string, parked bool) *swallowRecord {
 	r := m.swallowed[addr]
-	if r == nil || time.Since(r.last) > swallowWindow {
+	if r == nil || swallowStale(r, parked) {
 		r = &swallowRecord{skip: make(map[string]bool), heardNothing: make(map[string]bool)}
 		if m.swallowed == nil {
 			m.swallowed = make(map[string]*swallowRecord)
@@ -1949,6 +1984,25 @@ func (m *Manager) swallowRecordLocked(addr string) *swallowRecord {
 	}
 	r.last = time.Now()
 	return r
+}
+
+// swallowStale reports a record whose last cycle is older than
+// swallowWindow - unless its address is parked: the park can outlast the
+// window (it doubles), and a client coming back to the server after it had
+// forgotten which transports the server swallows.
+func swallowStale(r *swallowRecord, parked bool) bool {
+	return !parked && time.Since(r.last) > swallowWindow
+}
+
+// addrParked reports whether the candidate at addr is parked. Takes m.mu
+// (through selector): not to be called with it held.
+func (m *Manager) addrParked(addr string) bool {
+	sel := m.selector()
+	if sel == nil {
+		return false
+	}
+	cand, ok := sel.CandidateForAddr(addr)
+	return ok && sel.IsParked(cand)
 }
 
 // swallowCycle books a cycle on addr that ended with no verdict and reports
@@ -1963,6 +2017,7 @@ func (m *Manager) swallowRecordLocked(addr string) *swallowRecord {
 // single slow handshake, Polling's included, parks nothing - and a cycle in
 // which any transport got an answer ends the run.
 func (m *Manager) swallowCycle(addr string, scan *scanState) bool {
+	parked := m.addrParked(addr)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if scan.answered {
@@ -1974,7 +2029,7 @@ func (m *Manager) swallowCycle(addr string, scan *scanState) bool {
 	if len(scan.inconclusive) == 0 {
 		return false
 	}
-	r := m.swallowRecordLocked(addr)
+	r := m.swallowRecordLocked(addr, parked)
 	r.cycles++
 	for _, id := range scan.inconclusive {
 		r.heardNothing[id] = true
@@ -2163,7 +2218,10 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 					// scan would only spend the rest of the budget the same way.
 					excludeMap[lastSuccessful.ID()] = true
 				case attemptInconclusive:
-					scan.inconclusive = append(scan.inconclusive, lastSuccessful.ID())
+					scan.unheard++
+					if m.swallowEvidence(lastSuccessful, scan.allowance) {
+						scan.inconclusive = append(scan.inconclusive, lastSuccessful.ID())
+					}
 					excludeMap[lastSuccessful.ID()] = true
 				case attemptNotDialled:
 					// Still queued on this client when its dial limit came:
@@ -2196,6 +2254,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 	var strategies []Strategy
 	var quicStrategies []Strategy // Collect QUIC strategies separately for fast fallback
 	skippedOthers := 0            // held back by a breaker, a storm park or the UDP gate
+	var sittingOut []Strategy     // eligible, but swallowed in a recent cycle here
 
 	for _, s := range m.strategies {
 		if s.Priority() <= 0 {
@@ -2204,13 +2263,6 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 		}
 		if excludeMap[s.ID()] {
 			log.Debug("Skipping excluded strategy: %s", s.Name())
-			continue
-		}
-		if swallowSkip[s.ID()] {
-			// Held back, not gone: the fast path alone being silent is not
-			// "every transport" while this one sits out its turn.
-			log.Debug("Skipping strategy %s (handshake swallowed in a recent cycle)", s.Name())
-			skippedOthers++
 			continue
 		}
 		// Check circuit breaker. This only assembles the candidate list, so use
@@ -2235,6 +2287,16 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			continue
 		}
 
+		if swallowSkip[s.ID()] {
+			// Held back, not gone: the fast path alone being silent is not
+			// "every transport" while this one sits out its turn. Checked
+			// last, so only an otherwise eligible transport sits out.
+			log.Debug("Skipping strategy %s (handshake swallowed in a recent cycle)", s.Name())
+			skippedOthers++
+			sittingOut = append(sittingOut, s)
+			continue
+		}
+
 		// Separate QUIC strategies for fast fallback
 		if isUDPBasedStrategy(s) {
 			quicStrategies = append(quicStrategies, s)
@@ -2243,6 +2305,21 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 	}
 	rttProfile := m.rttProfile
 	m.mu.RUnlock()
+
+	if len(strategies) == 0 && len(sittingOut) > 0 {
+		// Every eligible transport is sitting out its turn: the skip list
+		// was meant to let the others go first, and there are no others.
+		// Skipping anyway emptied the cycle, gave no verdict and grew the
+		// backoff, and the run of swallowed cycles never reached its
+		// verdict either.
+		log.Info("Only transports swallowed in a recent cycle are eligible - trying them again")
+		strategies, skippedOthers = sittingOut, skippedOthers-len(sittingOut)
+		for _, s := range sittingOut {
+			if isUDPBasedStrategy(s) {
+				quicStrategies = append(quicStrategies, s)
+			}
+		}
+	}
 
 	if len(strategies) == 0 {
 		// If storm parking emptied the list, unpark everything and retry with
@@ -2452,7 +2529,10 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 					m.mu.Unlock()
 				}
 			case attemptInconclusive:
-				scan.inconclusive = append(scan.inconclusive, s.ID())
+				scan.unheard++
+				if m.swallowEvidence(s, scan.allowance) {
+					scan.inconclusive = append(scan.inconclusive, s.ID())
+				}
 			case attemptAnswered:
 				// A refusal, a reset, a handshake that got an answer it did not
 				// like: the address is talking. Whatever is wrong here is a
@@ -2573,23 +2653,53 @@ func (sc *StrategyConn) NetConn() net.Conn { return sc.Conn }
 // ServerKeepalives counts only the zero-length frames the server sent, which
 // is what a keepalive echo has to be judged by.
 type ServerKeepaliveCounter interface {
-	ServerKeepalives() uint64
+	// ServerKeepalives returns the count; tracked is false while the conn
+	// can not tell the server's frames apart (before the TUN frame stream,
+	// or after losing its framing), and the count then says nothing.
+	ServerKeepalives() (n uint64, tracked bool)
+}
+
+// KeepaliveMaker is implemented by a strategy whose conns splice keepalive
+// frames of their own into the downlink (HTTP Polling). A caller that judges
+// echoes needs those conns' ServerKeepaliveCounter, and must not judge them
+// without it.
+type KeepaliveMaker interface {
+	MakesUpKeepalives() bool
 }
 
 // ServerKeepaliveCounterOf finds a ServerKeepaliveCounter in conn or under
 // its wrappers (anything with NetConn).
 func ServerKeepaliveCounterOf(conn net.Conn) (ServerKeepaliveCounter, bool) {
+	return findUnder[ServerKeepaliveCounter](conn)
+}
+
+// UplinkQueue is implemented by a tunnel conn whose Write only queues: HTTP
+// Polling, where a write is on its way only when a poll takes it. See
+// HTTPPollingConn.UplinkProgress.
+type UplinkQueue interface {
+	UplinkProgress() (accepted, sent uint64)
+}
+
+// UplinkQueueOf finds an UplinkQueue in conn or under its wrappers.
+func UplinkQueueOf(conn net.Conn) (UplinkQueue, bool) {
+	return findUnder[UplinkQueue](conn)
+}
+
+// findUnder looks for a T in conn and under its wrappers (anything with
+// NetConn), a few levels deep.
+func findUnder[T any](conn net.Conn) (T, bool) {
 	for range 8 {
-		if c, ok := conn.(ServerKeepaliveCounter); ok {
+		if c, ok := conn.(T); ok {
 			return c, true
 		}
 		w, ok := conn.(interface{ NetConn() net.Conn })
 		if !ok {
-			return nil, false
+			break
 		}
 		conn = w.NetConn()
 	}
-	return nil, false
+	var zero T
+	return zero, false
 }
 
 // Strategy returns the strategy used for this connection
@@ -4070,6 +4180,36 @@ func (m *Manager) ResetForNetworkChange() {
 	m.sortStrategies()
 }
 
+// EndpointHealth returns the selector's per-candidate health, for a manager
+// that takes over from this one (ImportEndpointHealth). Nil without a
+// selector.
+func (m *Manager) EndpointHealth() []endpoint.HealthRecord {
+	if sel := m.selector(); sel != nil {
+		return sel.ExportHealth()
+	}
+	return nil
+}
+
+// ImportEndpointHealth takes over what another manager over the same pool
+// learned about its candidates: failures and parks.
+func (m *Manager) ImportEndpointHealth(recs []endpoint.HealthRecord) {
+	if sel := m.selector(); sel != nil {
+		sel.ImportHealth(recs)
+	}
+}
+
+// StormHistory returns the storm detector, for a manager that takes over
+// from this one (AdoptStormHistory).
+func (m *Manager) StormHistory() *StormDetector { return m.stormDetector }
+
+// AdoptStormHistory makes d this manager's storm detector: the session
+// history another manager collected goes on counting here.
+func (m *Manager) AdoptStormHistory(d *StormDetector) {
+	if d != nil {
+		m.stormDetector = d
+	}
+}
+
 // ResetStrategyBlocks closes every circuit breaker and puts every strategy's
 // confidence back to neutral, and nothing else. It is for a reconnect whose
 // strategies are all blocked on the same network - not a network change, so
@@ -4697,6 +4837,26 @@ func (m *Manager) PinAnswering(addr string) bool {
 	}
 	sel.Pin(cand)
 	return true
+}
+
+// PinParkedAnswering pins the candidate at addr whatever its park says, and
+// lifts the park, keeping its history: for a pool poll that has heard only
+// this server, parked for dead sessions, for long enough (see the TUN
+// client's waitForPool). The dead-session park doubles up to MaxCooldown, and
+// a single-server pool would otherwise wait it out in full.
+func (m *Manager) PinParkedAnswering(addr string) {
+	sel := m.selector()
+	if sel == nil {
+		return
+	}
+	cand, ok := sel.CandidateForAddr(addr)
+	if !ok {
+		return
+	}
+	log.Info("Pool poll: %s answers and nothing else does - lifting its park for dead sessions", cand)
+	sel.ReportProbe(cand, true, 0)
+	sel.Unpark(cand)
+	sel.Pin(cand)
 }
 
 // ProbeEndpointFamily runs the one-shot transport-family probe for the pinned

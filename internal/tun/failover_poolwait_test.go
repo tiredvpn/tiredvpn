@@ -459,3 +459,38 @@ func TestPoolPollWaitsOutADeadSessionPark(t *testing.T) {
 		t.Fatalf("only %d polls - the test proves nothing", n)
 	}
 }
+
+// TestPoolPollDoesNotWaitOutAWholeDeadPark is P3-3 of the round-4 review: a
+// server parked for dead sessions was passed over by the pool poll for as
+// long as its park lasted, up to MaxCooldown (30 min), and with nothing else
+// in the pool the client waited all of it. After poolDeadParkWait of hearing
+// only that server, it is pinned and dialled.
+func TestPoolPollDoesNotWaitOutAWholeDeadPark(t *testing.T) {
+	setPoolWaitKnobs(t, true)
+	poolPollInterval = 20 * time.Millisecond
+	old := poolDeadParkWait
+	poolDeadParkWait = 300 * time.Millisecond
+	t.Cleanup(func() { poolDeadParkWait = old })
+	m, addrs, _ := poolManager(t, 1)
+	for _, st := range m.EndpointStates() {
+		if st.Addr == addrs[0] {
+			m.SessionEnded(strategy.SessionEnd{Strategy: "x", Endpoint: st.Candidate, HasEndpoint: true, Dead: true})
+		}
+	}
+	v := &VPNClient{running: 1, stopCh: make(chan struct{}), manager: m}
+	done := make(chan bool, 1)
+	go func() { done <- v.waitForPool(time.Now()) }()
+	select {
+	case ok := <-done:
+		if !ok {
+			t.Fatal("the wait ended without a server")
+		}
+	case <-time.After(3 * time.Second):
+		atomic.StoreInt32(&v.running, 0)
+		close(v.stopCh)
+		t.Fatal("the pool poll waited out the whole dead-session park")
+	}
+	if cooldownLeft(t, m, addrs[0]) > 0 {
+		t.Fatal("pinned but still parked")
+	}
+}

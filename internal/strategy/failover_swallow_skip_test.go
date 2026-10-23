@@ -64,3 +64,28 @@ func TestASwallowedTransportSittingOutIsNotGone(t *testing.T) {
 		t.Fatalf("parked: %+v", st)
 	}
 }
+
+// TestTheSkipListOutlivesAPark is P3-16 of the round-4 review: the skip list
+// lasted three minutes, the park on the address can last longer (it
+// doubles), and a client that came back to the server after the park had
+// forgotten which transports it swallows - and spent its first cycle there
+// on one of them again.
+func TestTheSkipListOutlivesAPark(t *testing.T) {
+	addr := slowHelloListener(t, 0)
+	other := newHelloListener(t)
+	m := newSilenceManager(t, 2*time.Second, addr, other.addr)
+	m.Register(&protectedGreeter{id: "reality", priority: 5})
+	m.Register(&protectedGreeter{id: "polling", priority: 6})
+	m.noteSwallowed(addr, []string{"reality"})
+	m.mu.Lock()
+	m.swallowed[addr].last = time.Now().Add(-2 * swallowWindow)
+	m.mu.Unlock()
+	if len(m.swallowSkip(addr)) != 0 {
+		t.Fatal("a stale record on an address that is not parked still skips - the test proves nothing")
+	}
+	cand, _ := m.selector().CandidateForAddr(addr)
+	m.selector().ReportSilent(cand)
+	if !m.swallowSkip(addr)["reality"] {
+		t.Fatal("the skip list was forgotten while its address is still parked")
+	}
+}

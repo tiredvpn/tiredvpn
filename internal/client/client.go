@@ -614,71 +614,13 @@ func runControlSocketMode(cfg *Config, mgr *strategy.Manager, sigChan chan os.Si
 		return err
 	}
 
-	// Create control server with connect function
-	ctrlCfg := &tun.ControlConfig{
-		ServerAddr: cfg.ServerAddr,
-		Secret:     cfg.Secret,
-		MTU:        cfg.TunMTU,
-		DNS:        "8.8.8.8", // Default DNS
-		Routes:     cfg.TunRoutes,
-		DualStack:  dualStack,
+	// What the previous core of this process learned about the servers -
+	// a park for a degraded session above all - goes on here; what this one
+	// learns goes to the next. See androidCarry.
+	carryInto(mgr)
+	defer carryFrom(mgr)
 
-		// ReconnectFn - called on network change (WiFi→LTE, cell handoff)
-		// Resets circuit breakers and uses optimized fast reconnect
-		// Must send TUN handshake with current IP so server knows this is a TUN session
-		ReconnectFn: func(ctx context.Context, currentIP net.IP, mtu int) (tun.ReconnectResult, error) {
-			return reconnectTUN(ctx, mgr, cfg.ServerAddr, currentIP, mtu, dualStack)
-		},
-
-		// Connect function - connects to server, returns assigned IP
-		ConnectFn: func(ctx context.Context) (assignedIP, serverIP net.IP, conn net.Conn, err error) {
-			// Connect to server via strategy
-			serverConn, strat, err := mgr.Connect(ctx, cfg.ServerAddr)
-			if err != nil {
-				return nil, nil, nil, fmt.Errorf("failed to connect: %w", err)
-			}
-
-			log.Info("Connected via %s, waiting for TUN fd from Android", strat.Name())
-
-			// Return connection WITHOUT TUN handshake
-			// TUN handshake will be done AFTER Android creates VPN interface and sends FD
-			// This fixes the "handshake read failed: EOF" error
-			// Use placeholder IPs (10.9.0.2/10.9.0.1) - real IPs will be set after handshake
-			// NOTE: 0.0.0.0 causes Android to fail VPN interface creation
-			placeholderClient := net.IPv4(10, 9, 0, 2)
-			placeholderServer := net.IPv4(10, 9, 0, 1)
-			return placeholderClient, placeholderServer, serverConn, nil
-		},
-
-		// GetConnectionInfoFn returns connection metadata for Android UI
-		GetConnectionInfoFn: func() tun.ConnectionMetadata {
-			info := mgr.GetLastConnectionInfo()
-			return tun.ConnectionMetadata{
-				Strategy:  info.Strategy,
-				LatencyMs: info.Latency.Milliseconds(),
-				Attempts:  info.Attempts,
-			}
-		},
-
-		// SessionDegradedFn books a stall verdict of the relay against the
-		// endpoint the session rode, as VPNClient's disconnect does on the
-		// desktop, and has the next connect walk the pool through the gate.
-		SessionDegradedFn: func(time.Duration) {
-			mgr.NoteServerSilent()
-			cand, ok := mgr.CurrentCandidate()
-			mgr.SessionEnded(strategy.SessionEnd{
-				Strategy:       mgr.GetLastConnectionInfo().StrategyID,
-				Endpoint:       cand,
-				HasEndpoint:    ok,
-				Degraded:       true,
-				LocalNetworkUp: tun.LocalLinkUp,
-			})
-		},
-
-		// StartVPNFn is NOT set - let control.go use the default path
-		// which includes RunTUNRelayWithCallbacks with keepalive events
-		// and dead connection detection
-	}
+	ctrlCfg := androidControlConfig(cfg, mgr, dualStack, &androidSession{mgr: mgr})
 
 	ctrlServer, err := tun.NewControlServer(cfg.ControlSocket, ctrlCfg)
 	if err != nil {
@@ -717,22 +659,47 @@ func parseTunIPv6Policy(flagValue string) (bool, error) {
 	return policy == tun.IPv6PolicyDual, nil
 }
 
+// reconnectedSession is the strategy and endpoint a reconnect landed on.
+type reconnectedSession struct {
+	strat   strategy.Strategy
+	cand    endpoint.Candidate
+	hasCand bool
+}
+
 // reconnectTUN is the control server's ReconnectFn: it redials through the
-// strategy manager after a network change and re-runs the TUN handshake with
-// the client's current IP so the exit restores the session. The conn it hands
-// back is the one the handshake reader returned, which the relay must read
-// from (it may carry the first byte of the first frame).
-func reconnectTUN(ctx context.Context, mgr *strategy.Manager, serverAddr string, currentIP net.IP, mtu int, dualStack bool) (tun.ReconnectResult, error) {
-	log.Info("Network change reconnect triggered (current IP: %s)", currentIP)
-
-	// Reset all circuit breakers and confidences - old network state is invalid
-	mgr.ResetForNetworkChange()
-
-	// Use optimized reconnect with shorter timeouts
-	conn, strat, err := mgr.ConnectForReconnect(ctx, serverAddr)
-	if err != nil {
-		return tun.ReconnectResult{}, err
+// strategy manager and re-runs the TUN handshake with the client's current IP
+// so the exit restores the session. The conn it hands back is the one the
+// handshake reader returned, which the relay must read from (it may carry the
+// first byte of the first frame).
+//
+// After a network change the old network's verdicts are void: breakers,
+// confidences and endpoint health are reset, and ConnectForReconnect retries
+// the last strategy first. When the relay died on the same network nothing
+// is reset: the ordinary connect runs, with the pre-flight gate and every
+// park. A degraded verdict parks its server just before such a reconnect,
+// and the reset used to undo it - the client came straight back to the same
+// server on the same transport.
+func reconnectTUN(ctx context.Context, mgr *strategy.Manager, serverAddr string, currentIP net.IP, mtu int, dualStack, networkChanged bool) (tun.ReconnectResult, reconnectedSession, error) {
+	var (
+		conn net.Conn
+		sess reconnectedSession
+		err  error
+	)
+	if networkChanged {
+		log.Info("Network change reconnect triggered (current IP: %s)", currentIP)
+		// Reset all circuit breakers and confidences - old network state is invalid
+		mgr.ResetForNetworkChange()
+		// Use optimized reconnect with shorter timeouts
+		conn, sess.strat, err = mgr.ConnectForReconnect(ctx, serverAddr)
+		sess.cand, sess.hasCand = mgr.CurrentCandidate()
+	} else {
+		log.Info("Reconnect after the relay died, same network (current IP: %s)", currentIP)
+		conn, sess.strat, sess.cand, sess.hasCand, err = mgr.ConnectSession(ctx, serverAddr)
 	}
+	if err != nil {
+		return tun.ReconnectResult{}, reconnectedSession{}, err
+	}
+	strat := sess.strat
 
 	log.Info("Network change reconnect successful via %s, sending TUN handshake", strat.Name())
 
@@ -743,7 +710,7 @@ func reconnectTUN(ctx context.Context, mgr *strategy.Manager, serverAddr string,
 	tunnelConn, serverIP, assignedIP, serverIP6, assignedIP6, err := reconnectHandshake(ctx, conn, currentIP, mtu, dualStack)
 	if err != nil {
 		conn.Close()
-		return tun.ReconnectResult{}, err
+		return tun.ReconnectResult{}, reconnectedSession{}, err
 	}
 
 	log.Info("Reconnect handshake complete (server: %s, assigned: %s)", serverIP, assignedIP)
@@ -754,7 +721,7 @@ func reconnectTUN(ctx context.Context, mgr *strategy.Manager, serverAddr string,
 		AssignedIP:  assignedIP,
 		ServerIP6:   serverIP6,
 		AssignedIP6: assignedIP6,
-	}, nil
+	}, sess, nil
 }
 
 // reconnectHandshake runs sendReconnectHandshake so that cancelling ctx ends

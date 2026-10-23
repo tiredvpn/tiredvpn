@@ -7,6 +7,49 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Client: a tunnel that is up but carries nothing is given up.** The client
+  follows the TCP flows it carries. When an application's data in a flow that
+  was being answered waits 30 s for anything back, two keepalives confirm it;
+  if neither is echoed, the session ends, the server is parked and the client
+  moves on. An echo means the tunnel works and the flow's own peer is slow or
+  gone, and nothing happens. Aimed at per-flow byte caps and one-way
+  blackholes that freeze traffic without breaking the connection - HTTP
+  Polling never noticed them. At most three such verdicts in ten minutes.
+  Works on the desktop TUN client and on Android.
+
+### Fixed
+
+- **Client: failover to another server in the pool works when a server goes
+  silent, swallows handshakes, or kills every session young.** Dead sessions
+  and storms park the server with a growing cooldown; a server that accepts
+  TCP and answers no handshake gets the same verdict after two or three
+  cycles; the first reconnect after a silent session walks the pool.
+- **Client: the tunnel moves back to a better strategy after a fault.** After
+  a periodic reprobe finds it working again, the client switches over without
+  dropping the tunnel, and keeps the old strategy if the new one fails.
+- **Client: back within about 30 s after a fault ends**, instead of after a
+  backoff grown to 2 minutes, when the server answered TCP but nothing else.
+- **Client: fewer probes and polls on a fixed period.** Reprobes, pool polls,
+  upgrade offers and emergency reprobes are spaced by drawn pauses, and no
+  reprobe runs while the client is reconnecting.
+- **Android: a stall verdict and the session's endpoint survive the app's
+  core restart**, so the client does not come straight back to the server it
+  just left; Android sessions now feed the storm detector.
+- **Server: an idle HTTP Polling session is no longer dropped after ~6
+  minutes** while its client keeps polling, directly or through a relay.
+- **Server: a client keeps its tunnel address across transports and
+  networks.** Leases are keyed on the credential, and leases an older server
+  wrote under other keys are folded into it.
+
+### Changed
+
+- On the wire: up to two keepalives when a flow stalls, also while a
+  download trickles; HTTP Polling leaves a frozen server 32-42 s in; a relay
+  sends a keepalive to its exit at most every 30 s while its client is
+  active. No change to the protocol.
+
 ## [1.11.8] - 2026-10-20
 
 ### Security

@@ -6,6 +6,7 @@ import (
 	"net"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -41,7 +42,14 @@ func TestAServerThatSwallowsEveryHandshakeIsLeft(t *testing.T) {
 		make func(id string, prio int) Strategy
 	}{
 		{"protected dials", func(id string, prio int) Strategy { return &protectedGreeter{id: id, priority: prio} }},
-		{"plain dials", func(id string, prio int) Strategy { return &greetingStrategy{id: id, priority: prio} }},
+		// A transport that does not report its connect never counts as
+		// swallowed (swallowEvidence); the reporting ones carry the verdict.
+		{"mixed dials", func(id string, prio int) Strategy {
+			if id == "ws" {
+				return &greetingStrategy{id: id, priority: prio}
+			}
+			return &protectedGreeter{id: id, priority: prio}
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			swallower := newBlackholeListener(t)
@@ -49,8 +57,8 @@ func TestAServerThatSwallowsEveryHandshakeIsLeft(t *testing.T) {
 			m := newSilenceManager(t, 2*time.Second, swallower.addr, healthy.addr)
 			reality := tc.make("reality", 5)
 			m.Register(reality)
-			m.Register(tc.make("ws", 6))
-			m.Register(tc.make("polling", 7))
+			m.Register(tc.make("polling", 6))
+			m.Register(tc.make("ws", 7))
 			markConnected(m, reality)
 
 			s, cycles := connectCycles(t, m, 3, time.Second)
@@ -237,5 +245,162 @@ func TestAnUnansweredCycleSaysSo(t *testing.T) {
 	}
 	if !errors.Is(err, ErrCycleUnanswered) {
 		t.Fatalf("err = %v, want it marked as unanswered", err)
+	}
+}
+
+// quicBlackhole is a UDP transport whose datagrams vanish: it reports no
+// dial and waits out its attempt.
+type quicBlackhole struct{ priority int }
+
+func (q *quicBlackhole) Name() string                        { return "quic_blackhole" }
+func (q *quicBlackhole) ID() string                          { return "quic_blackhole" }
+func (q *quicBlackhole) Priority() int                       { return q.priority }
+func (q *quicBlackhole) RequiresServer() bool                { return true }
+func (q *quicBlackhole) Description() string                 { return "UDP into a blackhole" }
+func (q *quicBlackhole) Probe(context.Context, string) error { return nil }
+func (q *quicBlackhole) Connect(ctx context.Context, _ string) (net.Conn, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// TestOnlyRealSwallowsCountTowardTheVerdict is P2-4 of the round-4 review.
+// Server A swallows REALITY and serves Polling, slowly (0.6 s); B is healthy;
+// UDP is blackholed on the route. QUIC took half of cycle 2 and Polling was cut
+// by what was left: both were counted as "heard nothing", A was parked and
+// Polling went on its skip list. A UDP blackhole is the route's, and a
+// handshake cut by the end of the cycle had no real time to answer: neither
+// counts.
+func TestOnlyRealSwallowsCountTowardTheVerdict(t *testing.T) {
+	a := slowHelloListener(t, 600*time.Millisecond)
+	b := newHelloListener(t)
+	m := newSilenceManager(t, 2*time.Second, a, b.addr)
+	reality := &protectedGreeter{id: "reality", priority: 3, swallow: true}
+	m.Register(reality)
+	m.Register(&quicBlackhole{priority: 4})
+	m.Register(&protectedGreeter{id: "polling", priority: 7})
+	markConnected(m, reality)
+
+	for cycle := 1; cycle <= 3; cycle++ {
+		_ = oneCycle(m)
+		if st := endpointState(t, m, a); st.CooldownUntil.After(time.Now()) {
+			t.Fatalf("cycle %d: a server whose Polling works was parked", cycle)
+		}
+	}
+	if m.swallowSkip(a)["polling"] {
+		t.Fatal("Polling, cut by the end of the cycle, went on the skip list")
+	}
+}
+
+// TestAUDPBlackholeIsTheRoutes: QUIC heard nothing for a whole cycle, but a
+// datagram blackhole says the route, not the server. With REALITY swallowed
+// the cycle before, counting it made two transports and parked the server.
+func TestAUDPBlackholeIsTheRoutes(t *testing.T) {
+	a := slowHelloListener(t, 0)
+	b := newHelloListener(t)
+	m := newSilenceManager(t, 2*time.Second, a, b.addr)
+	reality := &protectedGreeter{id: "reality", priority: 3, swallow: true}
+	m.Register(reality)
+	m.Register(&quicBlackhole{priority: 4})
+	markConnected(m, reality)
+	for cycle := 1; cycle <= 2; cycle++ {
+		_ = oneCycle(m)
+	}
+	if st := endpointState(t, m, a); st.CooldownUntil.After(time.Now()) {
+		t.Fatal("a UDP blackhole counted as the server swallowing handshakes")
+	}
+}
+
+// slowConnectSwallower connects only after connectDelay, then hears nothing.
+type slowConnectSwallower struct {
+	id    string
+	delay time.Duration
+}
+
+func (s *slowConnectSwallower) Name() string                        { return s.id }
+func (s *slowConnectSwallower) ID() string                          { return s.id }
+func (s *slowConnectSwallower) Priority() int                       { return 5 }
+func (s *slowConnectSwallower) RequiresServer() bool                { return true }
+func (s *slowConnectSwallower) Description() string                 { return "slow connect, then nothing" }
+func (s *slowConnectSwallower) Probe(context.Context, string) error { return nil }
+func (*slowConnectSwallower) reportsTCPConnect()                    {}
+func (s *slowConnectSwallower) Connect(ctx context.Context, target string) (net.Conn, error) {
+	d := &protect.ProtectDialer{Dialer: &net.Dialer{Control: func(string, string, syscall.RawConn) error {
+		time.Sleep(s.delay)
+		return nil
+	}}}
+	conn, err := d.DialContext(ctx, "tcp", target)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// TestTheAllowanceRunsFromTheConnect: what counts is how long the handshake
+// had after its TCP connect, not the attempt's whole run. A connect that took
+// most of the cycle left a handshake no real time.
+func TestTheAllowanceRunsFromTheConnect(t *testing.T) {
+	a := slowHelloListener(t, 0)
+	m := newSilenceManager(t, 2*time.Second, a)
+	m.Register(&slowConnectSwallower{id: "reality", delay: 500 * time.Millisecond})
+	scan := &scanState{addr: a}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if conn, _, err := m.connectScan(ctx, a, nil, scan); err == nil {
+		conn.Close()
+		t.Fatal("connected - the test proves nothing")
+	}
+	if scan.unheard == 0 {
+		t.Fatal("the attempt was not seen as unanswered - the test proves nothing")
+	}
+	if len(scan.inconclusive) != 0 || len(m.swallowSkip(a)) != 0 {
+		t.Fatalf("a handshake with half a second after its connect counted as swallowed: %v, skip %v", scan.inconclusive, m.swallowSkip(a))
+	}
+}
+
+// TestAHandshakeCutByTheCycleIsNotSkipped: a handshake that had only the end
+// of the cycle after its connect does not go on the address's skip list -
+// the next cycle would leave out a transport that may well work there.
+func TestAHandshakeCutByTheCycleIsNotSkipped(t *testing.T) {
+	silent := newBlackholeListener(t)
+	a := silent.addr
+	m := newSilenceManager(t, 2*time.Second, a)
+	geneva := &closingStrategy{id: "geneva", priority: 3}
+	m.Register(geneva)
+	m.Register(&protectedGreeter{id: "reality", priority: 5, swallow: true})
+	m.Register(&protectedGreeter{id: "polling", priority: 7, swallow: true})
+	markConnected(m, geneva) // the fast path takes half the cycle
+	if err := oneCycle(m); err == nil {
+		t.Fatal("connected - the test proves nothing")
+	}
+	if m.swallowSkip(a)["reality"] {
+		t.Fatal("a handshake with half a cycle went on the skip list")
+	}
+}
+
+// TestTheSkipListCanNotEmptyACycle is P3-1 of the round-4 review: the skip
+// list was checked against registration, not eligibility. With REALITY
+// swallowed and QUIC held back by the UDP gate, the next cycle had nothing
+// to dial: "no available strategies", no verdict, a growing backoff - A was
+// never left and B never dialled.
+func TestTheSkipListCanNotEmptyACycle(t *testing.T) {
+	swallower := newBlackholeListener(t)
+	healthy := newHelloListener(t)
+	m := newSilenceManager(t, 2*time.Second, swallower.addr, healthy.addr)
+	reality := &protectedGreeter{id: "reality", priority: 5}
+	m.Register(reality)
+	m.Register(&quicBlackhole{priority: 4})
+	m.mu.Lock()
+	m.excludeUDPStrategies = true
+	m.mu.Unlock()
+	markConnected(m, reality)
+
+	s, cycles := connectCycles(t, m, swallowCyclesMax+1, time.Second)
+	if s == nil {
+		t.Fatalf("still not connected after %d cycles; A: %+v", cycles, endpointState(t, m, swallower.addr))
+	}
+	if got := m.GetServerAddr(context.Background()); got != healthy.addr {
+		t.Fatalf("connected through %s, want %s", got, healthy.addr)
 	}
 }

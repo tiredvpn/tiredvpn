@@ -248,7 +248,7 @@ func TestControlCloseInterruptsNetworkChanged(t *testing.T) {
 	h := sessionWithTun(t)
 	entered := make(chan struct{})
 	h.cs.mu.Lock()
-	h.cs.config.ReconnectFn = func(ctx context.Context, _ net.IP, _ int) (ReconnectResult, error) {
+	h.cs.config.ReconnectFn = func(ctx context.Context, _ net.IP, _ int, _ bool) (ReconnectResult, error) {
 		close(entered)
 		select {
 		case <-ctx.Done():

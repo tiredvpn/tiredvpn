@@ -17,6 +17,9 @@ func TestPollingCountsOnlyTheServersKeepalives(t *testing.T) {
 	bodies := [][]byte{hs, keepalive, tunFrame(60, 0xb2), keepalive}
 	c := newScriptedPollingConn(t, bodies)
 	fc := useFakeClock(c)
+	if _, tracked := c.ServerKeepalives(); tracked {
+		t.Fatal("a count before the TUN frame stream claims to be tracked")
+	}
 	if _, err := c.Write([]byte{meekTUNMode, 0, 0, 0, 0, 0x05, 0xdc, 0x04}); err != nil {
 		t.Fatal(err)
 	}
@@ -28,7 +31,7 @@ func TestPollingCountsOnlyTheServersKeepalives(t *testing.T) {
 	if !ok {
 		t.Fatal("the polling conn is not found under its wrapper")
 	}
-	if n := counter.ServerKeepalives(); n != 2 {
+	if n, tracked := counter.ServerKeepalives(); n != 2 || !tracked {
 		t.Fatalf("counted %d server keepalives, want 2 (the feeder spliced %d)", n, len(spliced))
 	}
 }
@@ -56,5 +59,28 @@ func TestDegradedSessionChargesItsEndpoint(t *testing.T) {
 	m.SessionEnded(SessionEnd{Strategy: s.ID(), Endpoint: cand, HasEndpoint: true, Useful: true, Degraded: true})
 	if st := endpointState(t, m, frozen.addr); st.DeadStreak == 0 {
 		t.Fatal("a degraded session cleared the endpoint's dead streak")
+	}
+}
+
+// TestPollingReportsItsUplinkProgress: a Write only queues; a poll that took
+// the bytes to the server moves "sent" up to them. The stall detector times
+// a keepalive's echo from there (P2-6 of the round-4 review).
+func TestPollingReportsItsUplinkProgress(t *testing.T) {
+	c := newScriptedPollingConn(t, [][]byte{{}})
+	if _, err := c.Write([]byte{meekTUNMode, 0, 0, 0, 0, 0x05, 0xdc, 0x04}); err != nil {
+		t.Fatal(err)
+	}
+	q, ok := UplinkQueueOf(&StrategyConn{Conn: c})
+	if !ok {
+		t.Fatal("the polling conn's queue is not found under its wrapper")
+	}
+	if accepted, sent := q.UplinkProgress(); accepted != 8 || sent != 0 {
+		t.Fatalf("after a write: accepted %d, sent %d; want 8 and 0", accepted, sent)
+	}
+	if ok, _ := c.poll(); !ok {
+		t.Fatal("poll failed")
+	}
+	if accepted, sent := q.UplinkProgress(); accepted != 8 || sent != 8 {
+		t.Fatalf("after the poll: accepted %d, sent %d; want 8 and 8", accepted, sent)
 	}
 }

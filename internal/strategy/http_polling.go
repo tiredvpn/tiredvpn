@@ -296,6 +296,11 @@ type HTTPPollingConn struct {
 	ackSeq  int64 // Total bytes received (sent to server as ack)
 	ackLock sync.Mutex
 
+	// uplinkAccepted counts the bytes Write has queued, uplinkSent those a
+	// poll has delivered to the server, in order (see UplinkProgress).
+	uplinkAccepted atomic.Uint64
+	uplinkSent     atomic.Uint64
+
 	// lastPollOK is the unix-nano time of the most recent successful poll. It is
 	// meek's true liveness signal: the poll layer round-trips every ~50ms-2s
 	// independent of tunnel payload. runKeepaliveFeeder reads it to decide
@@ -511,6 +516,8 @@ func (c *HTTPPollingConn) poll() (ok bool, moved bool) {
 		c.statsMu.Unlock()
 	}
 
+	c.uplinkSent.Add(uint64(len(sendData)))
+
 	c.statsMu.Lock()
 	c.successfulPolls++
 	c.statsMu.Unlock()
@@ -590,15 +597,31 @@ func (c *HTTPPollingConn) feedKeepalive() bool {
 	return true
 }
 
+// UplinkProgress reports how many bytes Write has accepted and how many of
+// them a poll has delivered so far. A Write returns once its bytes are
+// queued, up to 1 MiB ahead of the polls; the bytes of a given Write are on
+// their way to the server once sent has reached accepted as it stood after
+// that Write.
+func (c *HTTPPollingConn) UplinkProgress() (accepted, sent uint64) {
+	return c.uplinkAccepted.Load(), c.uplinkSent.Load()
+}
+
 // ServerKeepalives counts the zero-length frames the server really sent:
 // keepalive echoes. The feeder splices frames that look the same into what
 // Read returns, so a reader that counts those as echoes hears an answer from a
 // server that may be saying nothing (see strategy.ServerKeepaliveCounter).
-func (c *HTTPPollingConn) ServerKeepalives() uint64 {
+//
+// tracked is false outside the TUN frame stream: on a SOCKS stream, before
+// the handshake is through, or after the tracker lost the framing - then no
+// count can be had, and an echo judged without one would be judged wrong.
+func (c *HTTPPollingConn) ServerKeepalives() (n uint64, tracked bool) {
 	c.recvLock.Lock()
 	defer c.recvLock.Unlock()
-	return c.stream.keepalives
+	return c.stream.keepalives, c.stream.state == meekDownFrames
 }
+
+// MakesUpKeepalives: the feeder splices keepalive frames of its own.
+func (*HTTPPollingStrategy) MakesUpKeepalives() bool { return true }
 
 // doRequest performs one HTTP poll request, reusing the previous request's TLS
 // connection (HTTP/1.1 keep-alive) when one is live and within the reuse bounds,
@@ -890,6 +913,7 @@ func (c *HTTPPollingConn) Write(p []byte) (int, error) {
 		return 0, err
 	}
 	n, err := c.sendBuf.Write(p)
+	c.uplinkAccepted.Add(uint64(n))
 	c.sendLock.Unlock()
 
 	c.lastSend = time.Now()

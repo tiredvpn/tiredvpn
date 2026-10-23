@@ -79,11 +79,20 @@ const silentCycleMaxDelay = 30 * time.Second
 // unreachable from a working network" story as a silent pool, one layer up,
 // and the 2-minute cap slept through up to two minutes of recovered network.
 func nextReconnectDelay(cur time.Duration, err error) time.Duration {
+	return capReconnectDelay(time.Duration(float64(cur)*reconnectMultiplier), err)
+}
+
+// capReconnectDelay caps a backoff for the failure err: silentCycleMaxDelay
+// after a silent or unanswered cycle, reconnectMaxDelay otherwise. Applied to
+// the pause about to be slept as well, not only to the next one: a silent
+// cycle after answered failures slept the old backoff first, up to 2 minutes
+// plus jitter.
+func capReconnectDelay(d time.Duration, err error) time.Duration {
 	maxDelay := reconnectMaxDelay
 	if errors.Is(err, strategy.ErrAddrSilent) || errors.Is(err, strategy.ErrCycleUnanswered) {
 		maxDelay = silentCycleMaxDelay
 	}
-	return min(time.Duration(float64(cur)*reconnectMultiplier), maxDelay)
+	return min(d, maxDelay)
 }
 
 // Port hop reconnect configuration (faster than regular reconnect)
@@ -178,9 +187,10 @@ type VPNClient struct {
 	lastRx      time.Time
 
 	// stall follows the session's TCP flows for the stall detector
-	// (watchStalls); reset with every new tunnel connection.
+	// (watchStalls): one table per tunnel connection, replaced together with
+	// conn under mu, so whatever works on a table works on its own session.
 	// keepaliveEchoes counts the zero-length frames read off the tunnel.
-	stall           flowTable
+	stall           *flowTable
 	keepaliveEchoes atomic.Uint64
 
 	// connCancel cancels the context of an in-flight connect() so Stop() can
@@ -879,7 +889,7 @@ func (v *VPNClient) seamlessPortHop(newPort int) {
 	v.upgradePending = nil
 	v.connectedAt = time.Now()
 	v.lastRx = v.connectedAt
-	v.stall.reset()
+	v.stall = newFlowTable()
 	v.mu.Unlock()
 
 	// The hop replaced the session; book it like the upgrade swap does, and
@@ -1032,7 +1042,7 @@ func (v *VPNClient) connect(parent context.Context) error {
 	v.upgradePending = nil
 	v.connectedAt = time.Now()
 	v.lastRx = v.connectedAt
-	v.stall.reset()
+	v.stall = newFlowTable()
 	if hasCaps {
 		v.serverCaps = caps
 	}
@@ -1670,14 +1680,14 @@ func (v *VPNClient) readFromTun() {
 		binary.BigEndian.PutUint32(buf[:4], uint32(n))
 
 		v.mu.Lock()
-		conn := v.conn
+		conn, flows := v.conn, v.stall
 		v.mu.Unlock()
 
 		if conn == nil {
 			log.Debug("TUN->Server: conn is nil, dropping %d bytes", n)
 			continue
 		}
-		v.stall.up(buf[4:4+n], time.Now())
+		flows.up(buf[4:4+n], time.Now())
 
 		conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 		written, err := conn.Write(buf[:n+4])
@@ -1715,7 +1725,7 @@ func (v *VPNClient) readFromServer() {
 
 	for atomic.LoadInt32(&v.running) == 1 {
 		v.mu.Lock()
-		conn := v.conn
+		conn, flows := v.conn, v.stall
 		v.mu.Unlock()
 
 		if conn == nil {
@@ -1836,7 +1846,7 @@ func (v *VPNClient) readFromServer() {
 			log.Debug("Successfully wrote %d bytes to TUN", n)
 		}
 
-		v.stall.down(actualBuf, time.Now())
+		flows.down(actualBuf, time.Now())
 		v.noteDownlink()
 
 		atomic.AddInt64(&v.packetsDown, 1)
@@ -2097,7 +2107,7 @@ func (v *VPNClient) swapUpgradedConn(oldConn, newConn net.Conn, strat strategy.S
 	v.upgradePending = strat
 	v.connectedAt = time.Now()
 	v.lastRx = v.connectedAt
-	v.stall.reset()
+	v.stall = newFlowTable()
 	if hasCaps {
 		v.serverCaps = caps
 	}
@@ -2297,6 +2307,10 @@ func (v *VPNClient) disconnect(conn net.Conn, reason string, err error) {
 			continue
 		}
 		poolSilentSince = time.Time{}
+
+		// A cycle that heard nothing waits no longer than the silence cap,
+		// whatever the backoff grew to on failures before it.
+		currentDelay = capReconnectDelay(currentDelay, err)
 
 		// Classify error type for better logging
 		errType := classifyError(err)
@@ -2532,22 +2546,42 @@ func (v *VPNClient) waitOutSilentPool(err error, since time.Time) bool {
 // the live one its budget ran out before reaching it, so the client found the
 // live server here and could not get to it there, round after round.
 // Returns false only when the client was stopped.
+//
+// A server parked for dead sessions that answers is passed over (see
+// Manager.PinAnswering), but not for longer than poolDeadParkWait: that park
+// doubles up to MaxCooldown, 30 minutes by default, and with nothing else
+// answering - a single-server pool - the client would wait it out in full.
 func (v *VPNClient) waitForPool(since time.Time) bool {
 	base := poolPollInterval
+	var parkedSince time.Time // when a dead-session-parked server first answered
 	for atomic.LoadInt32(&v.running) == 1 {
 		select {
 		case <-v.stopCh:
 			return false
 		case <-time.After(poolPause(base)):
 		}
-		if addr, ok := v.pollOneServer(); ok && (v.manager == nil || v.manager.PinAnswering(addr)) {
+		addr, ok := v.pollOneServer()
+		if ok && (v.manager == nil || v.manager.PinAnswering(addr)) {
 			log.Info("Server %s answers again after %v of pool silence", addr, time.Since(since).Round(time.Second))
 			return true
+		}
+		if ok {
+			if parkedSince.IsZero() {
+				parkedSince = time.Now()
+			} else if time.Since(parkedSince) >= poolDeadParkWait {
+				v.manager.PinParkedAnswering(addr)
+				return true
+			}
 		}
 		base = nextPoolBase(base, time.Since(since))
 	}
 	return false
 }
+
+// poolDeadParkWait is how long the pool poll passes over a server parked for
+// dead sessions that answers while nothing else does. A var so tests can
+// shorten it.
+var poolDeadParkWait = 2 * time.Minute
 
 // pollOneServer dials the next address of the pool in rotation, TCP only.
 func (v *VPNClient) pollOneServer() (string, bool) {
@@ -2624,14 +2658,31 @@ var gatewayAddrs = physicalGateAddrs
 // behind the tunnel's own routes - a coin toss, and up to 6 s of waiting
 // before every reconnect - which is fine for internetReachable's "should I
 // wait for the network" and not for "may I blame the server".
+//
+// The addresses of each group are dialled at once, not one after another:
+// one silent gateway (an interface-scoped default on macOS, a dead family)
+// cost networkCheckTimeout each, and the answer holds up the end of a
+// session. The fallback probes go out together for the same reason, and so
+// carry no fixed order on the wire.
 func localLinkUp() bool {
-	for _, addr := range gatewayAddrs() {
-		if dialMeansAlive(addr) {
-			return true
-		}
+	if anyDialAlive(gatewayAddrs()) {
+		return true
 	}
-	for _, addr := range linkFallbackProbes {
-		if dialMeansAlive(addr) {
+	return anyDialAlive(linkFallbackProbes)
+}
+
+// anyDialAlive dials every address at once and reports whether one answered
+// (dialMeansAlive), as soon as one does.
+func anyDialAlive(addrs []string) bool {
+	if len(addrs) == 0 {
+		return false
+	}
+	alive := make(chan bool, len(addrs))
+	for _, addr := range addrs {
+		go func() { alive <- dialMeansAlive(addr) }()
+	}
+	for range addrs {
+		if <-alive {
 			return true
 		}
 	}
@@ -2816,11 +2867,20 @@ type RelayErrorCallback func(reason string)
 type RelayCallbacks struct {
 	OnError     func(reason string) // Called when relay dies (timeout, read error, etc.)
 	OnKeepalive func()              // Called when keepalive received from server
-	// OnDegraded is called when the stall detector gives the session up as
-	// alive but useless, just before the relay closes the connection (OnError
-	// follows with a "session_degraded" reason). stall is how long the
-	// oldest demand waited.
-	OnDegraded func(stall time.Duration)
+	// OnSessionEnd is called once when the relay's session ends on its own,
+	// before OnError: what the session was, for whoever books its end against
+	// the strategy and the endpoint. Not called when the owner stopped it.
+	OnSessionEnd func(RelaySessionEnd)
+}
+
+// RelaySessionEnd describes a relay's session that has just ended.
+type RelaySessionEnd struct {
+	Lifetime time.Duration // from the relay's start
+	Reason   string        // what OnError is about to report
+	// Degraded is the stall detector's verdict: alive but useless. Stall is
+	// how long the oldest demand waited.
+	Degraded bool
+	Stall    time.Duration
 }
 
 // RunTUNRelayWithStop runs packet relay with external stop control
@@ -2967,6 +3027,13 @@ func (r *tunRelay) run() {
 	r.serverConn.Close()
 	log.Info("TUN relay stopped (reason: %s)", errorReason)
 
+	if r.callbacks != nil && r.callbacks.OnSessionEnd != nil {
+		end := RelaySessionEnd{Lifetime: time.Since(r.startedAt), Reason: errorReason}
+		if d := r.degraded.Load(); d != nil {
+			end.Degraded, end.Stall = true, d.stall
+		}
+		r.callbacks.OnSessionEnd(end)
+	}
 	if r.callbacks != nil && r.callbacks.OnError != nil && errorReason != "" {
 		r.callbacks.OnError(errorReason)
 	}

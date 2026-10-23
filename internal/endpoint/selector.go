@@ -773,6 +773,48 @@ func (s *Selector) ResetHealth() {
 	s.pinnedAt = s.cfg.Now()
 }
 
+// HealthRecord is one candidate's health, carried from one selector to
+// another over the same pool (ExportHealth, ImportHealth).
+type HealthRecord struct {
+	Addr                string
+	ConsecutiveFailures int
+	LastSuccess         time.Time
+	LastFailure         time.Time
+	CooldownUntil       time.Time
+	Backoff             time.Duration
+	DeadStreak          int
+}
+
+// ExportHealth returns every candidate's failure history and park.
+func (s *Selector) ExportHealth() []HealthRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]HealthRecord, len(s.cands))
+	for i, c := range s.cands {
+		h := s.health[i]
+		out[i] = HealthRecord{Addr: c.Addr, ConsecutiveFailures: h.consecutiveFailures, LastSuccess: h.lastSuccess,
+			LastFailure: h.lastFailure, CooldownUntil: h.cooldownUntil, Backoff: h.backoff, DeadStreak: h.deadStreak}
+	}
+	return out
+}
+
+// ImportHealth takes over the failure history and parks of the candidates in
+// recs whose address this selector also has; others are ignored. It moves
+// the pin off a candidate it parks, as Reconsider would.
+func (s *Selector) ImportHealth(recs []HealthRecord) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range recs {
+		idx, ok := s.byAddr[r.Addr]
+		if !ok {
+			continue
+		}
+		h := &s.health[idx]
+		h.consecutiveFailures, h.lastSuccess, h.lastFailure = r.ConsecutiveFailures, r.LastSuccess, r.LastFailure
+		h.cooldownUntil, h.backoff, h.deadStreak = r.CooldownUntil, r.Backoff, r.DeadStreak
+	}
+}
+
 // Snapshot returns the current state of every candidate, for logging.
 func (s *Selector) Snapshot() []CandidateState {
 	s.mu.Lock()

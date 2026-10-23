@@ -5,10 +5,12 @@ package tun
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -21,14 +23,14 @@ import (
 // shortStallClocks scales the detector down: T 300 ms, echo wait 150 ms.
 func shortStallClocks(t *testing.T) {
 	t.Helper()
-	oldT, oldEcho, oldEvery, oldPause := stallThreshold, stallEchoWait, stallCheckEvery, stallConfirmPause
-	stallThreshold, stallEchoWait, stallCheckEvery = 300*time.Millisecond, 150*time.Millisecond, 20*time.Millisecond
-	stallConfirmPause = func() time.Duration { return 50 * time.Millisecond }
-	oldLimiter := stallVerdicts
-	stallVerdicts = &verdictLimiter{}
+	old := stallClocks()
+	stallClocksNow.Store(&stallClockSet{threshold: 300 * time.Millisecond, echoWait: 150 * time.Millisecond,
+		checkEvery: 20 * time.Millisecond, pause: func() time.Duration { return 50 * time.Millisecond }})
+	oldLimiter := stallVerdicts()
+	stallVerdictsNow.Store(&verdictLimiter{})
 	t.Cleanup(func() {
-		stallThreshold, stallEchoWait, stallCheckEvery, stallConfirmPause = oldT, oldEcho, oldEvery, oldPause
-		stallVerdicts = oldLimiter
+		stallClocksNow.Store(old)
+		stallVerdictsNow.Store(oldLimiter)
 	})
 }
 
@@ -42,8 +44,10 @@ type stallExit struct {
 	answer     []byte
 	answerData atomic.Bool
 	echo       atomic.Bool
+	echoDelay  atomic.Int64 // ns before an echo goes out
 	feeder     atomic.Bool
 	gotData    atomic.Int64
+	gotEcho    atomic.Int64 // keepalives received
 }
 
 func (e *stallExit) writeFrame(p []byte) error {
@@ -73,8 +77,15 @@ func (e *stallExit) serve() {
 			return
 		}
 		switch {
-		case n == 0 && e.echo.Load():
-			_ = e.writeFrame(nil)
+		case n == 0:
+			e.gotEcho.Add(1)
+			if e.echo.Load() {
+				if d := time.Duration(e.echoDelay.Load()); d > 0 {
+					go func() { time.Sleep(d); _ = e.writeFrame(nil) }()
+				} else {
+					_ = e.writeFrame(nil)
+				}
+			}
 		case n > 0:
 			e.gotData.Add(1)
 			if e.answerData.Load() {
@@ -88,7 +99,18 @@ func (e *stallExit) serve() {
 // so: the server itself sent none.
 type pollingLike struct{ net.Conn }
 
-func (pollingLike) ServerKeepalives() uint64 { return 0 }
+func (pollingLike) ServerKeepalives() (uint64, bool) { return 0, true }
+
+// lostTrackConn is a Polling-like conn whose tracker lost the framing.
+type lostTrackConn struct{ net.Conn }
+
+func (lostTrackConn) ServerKeepalives() (uint64, bool) { return 0, false }
+
+// keepaliveMakingStrategy is a strategy that says its conns make up
+// keepalives, as HTTP Polling does.
+type keepaliveMakingStrategy struct{ rankedPipeStrategy }
+
+func (*keepaliveMakingStrategy) MakesUpKeepalives() bool { return true }
 
 type stallHarness struct {
 	v    *VPNClient
@@ -131,7 +153,7 @@ func newStallHarness(t *testing.T, wrap func(net.Conn) net.Conn) *stallHarness {
 	if wrap != nil {
 		conn = wrap(cli)
 	}
-	v := &VPNClient{running: 1, stopCh: make(chan struct{}), manager: m, conn: conn, tun: dev,
+	v := &VPNClient{running: 1, stopCh: make(chan struct{}), manager: m, conn: conn, tun: dev, stall: newFlowTable(),
 		strategy:    &rankedPipeStrategy{pipeStrategy: &pipeStrategy{t: t}, id: "polling", priority: 6},
 		sessionCand: cand, hasSessionCand: true,
 		connectedAt: time.Now().Add(-time.Hour), lastRx: time.Now()}
@@ -139,7 +161,8 @@ func newStallHarness(t *testing.T, wrap func(net.Conn) net.Conn) *stallHarness {
 	setLog(t, out)
 	go v.readFromTun()
 	go v.readFromServer()
-	go v.watchStalls()
+	watched := make(chan struct{})
+	go func() { v.watchStalls(); close(watched) }()
 	t.Cleanup(func() {
 		atomic.StoreInt32(&v.running, 0)
 		select {
@@ -147,6 +170,7 @@ func newStallHarness(t *testing.T, wrap func(net.Conn) net.Conn) *stallHarness {
 		default:
 			close(v.stopCh)
 		}
+		<-watched // the clocks are put back after this, and the watcher reads them
 		cli.Close()
 		srv.Close()
 		app.Close()
@@ -260,18 +284,19 @@ func TestMadeUpKeepalivesAreNoEcho(t *testing.T) {
 func TestOneVerdictLimitPerWindow(t *testing.T) {
 	var l verdictLimiter
 	now := time.Now()
+	allowed := func(at time.Time) bool { ok, _ := l.allow(at); return ok }
 	for i := range stallVerdictMax {
-		if !l.allow(now.Add(time.Duration(i) * time.Minute)) {
+		if !allowed(now.Add(time.Duration(i) * time.Minute)) {
 			t.Fatalf("verdict %d refused", i+1)
 		}
 	}
-	if l.allow(now.Add(4 * time.Minute)) {
-		t.Fatal("a fourth verdict within the window was allowed")
+	if ok, until := l.allow(now.Add(4 * time.Minute)); ok || !until.Equal(now.Add(14*time.Minute)) {
+		t.Fatalf("a fourth verdict within the window: allowed=%v, quiet until %v", ok, until)
 	}
-	if l.allow(now.Add(13 * time.Minute)) {
+	if allowed(now.Add(13 * time.Minute)) {
 		t.Fatal("a verdict inside the quiet period was allowed")
 	}
-	if !l.allow(now.Add(15 * time.Minute)) {
+	if !allowed(now.Add(15 * time.Minute)) {
 		t.Fatal("verdicts did not come back after the quiet period")
 	}
 }
@@ -295,7 +320,8 @@ func pendingFlow(t *testing.T, ft *flowTable) {
 func TestEveryNewConnectionStartsWithNoFlows(t *testing.T) {
 	t.Run("connect", func(t *testing.T) {
 		v := newCallsiteClient(newPipeManager(t))
-		pendingFlow(t, &v.stall)
+		v.stall = newFlowTable()
+		pendingFlow(t, v.stall)
 		if err := v.connect(t.Context()); err != nil {
 			t.Fatalf("connect: %v", err)
 		}
@@ -311,7 +337,7 @@ func TestEveryNewConnectionStartsWithNoFlows(t *testing.T) {
 		if err := v.connect(context.Background()); err != nil {
 			t.Fatalf("connect: %v", err)
 		}
-		pendingFlow(t, &v.stall)
+		pendingFlow(t, v.stall)
 		v.seamlessPortHop(1234)
 		if s := v.stall.stalledFor(time.Now()); s != 0 {
 			t.Fatalf("the port hop kept demand from the old session: %v", s)
@@ -320,7 +346,7 @@ func TestEveryNewConnectionStartsWithNoFlows(t *testing.T) {
 	t.Run("upgrade swap", func(t *testing.T) {
 		v, _, _, better := upgradeOnSelector(t)
 		setLog(t, &stampedLog{})
-		pendingFlow(t, &v.stall)
+		pendingFlow(t, v.stall)
 		v.tryStrategyUpgrade([]strategy.Strategy{better})
 		if v.strategy != better {
 			t.Fatal("no swap - the test proves nothing")
@@ -362,8 +388,12 @@ func newRelayStallHarness(t *testing.T, wrap func(net.Conn) net.Conn) *relayStal
 	h := &relayStallHarness{exit: exit, app: app, reasons: make(chan string, 4)}
 	stop := make(chan struct{})
 	h.r = startTUNRelay(dev, conn, net.IPv4(10, 9, 0, 2), net.IPv4(10, 9, 0, 1), stop, &RelayCallbacks{
-		OnError:    func(reason string) { h.reasons <- reason },
-		OnDegraded: func(time.Duration) { h.degraded.Add(1) },
+		OnError: func(reason string) { h.reasons <- reason },
+		OnSessionEnd: func(end RelaySessionEnd) {
+			if end.Degraded {
+				h.degraded.Add(1)
+			}
+		},
 	})
 	t.Cleanup(func() {
 		close(stop)
@@ -409,7 +439,7 @@ func TestRelayGivesUpAFrozenSession(t *testing.T) {
 		t.Fatalf("relay ended with %q, want a degraded session", r)
 	}
 	if h.degraded.Load() != 1 {
-		t.Fatalf("OnDegraded called %d times", h.degraded.Load())
+		t.Fatalf("OnSessionEnd reported %d degraded ends", h.degraded.Load())
 	}
 }
 
@@ -450,9 +480,254 @@ func TestRelayDeadPeerIsNotDegraded(t *testing.T) {
 // hand the tunnel back wrapped in a replayConn; the Polling count under it
 // must still be what the detector reads, or the feeder's frames count again.
 func TestPollingKeepaliveCountSurvivesTheHandshakeWrapper(t *testing.T) {
-	v := &VPNClient{}
-	v.keepaliveEchoes.Add(7)
-	if got := v.echoCounter(&replayConn{Conn: pollingLike{}})(); got != 0 {
+	generic := func() uint64 { return 7 }
+	if got := echoSourceFor(&replayConn{Conn: pollingLike{}}, nil, generic).count(); got != 0 {
 		t.Fatalf("read %d echoes through the wrapper: the generic count, not the server's", got)
+	}
+}
+
+// TestAConnThatLostCountIsNotJudged is P3-6 of the round-4 review: once the
+// Polling tracker loses the framing it stops counting the server's
+// keepalives, and every later confirmation failed - toward a verdict. Such a
+// session is not judged at all.
+func TestAConnThatLostCountIsNotJudged(t *testing.T) {
+	h := newStallHarness(t, func(c net.Conn) net.Conn { return lostTrackConn{c} })
+	if !h.wait("not judged: the conn has lost track", 2*time.Second) {
+		t.Fatalf("no skip:\n%s", h.out)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if strings.Contains(h.out.String(), "Session degraded") || h.exit.gotEcho.Load() != 0 {
+		t.Fatalf("a session without a usable echo count was judged:\n%s", h.out)
+	}
+}
+
+// TestAMadeUpKeepaliveStrategyWithoutItsCountIsNotJudged is P3-7: a conn of
+// a strategy that makes up keepalives, wrapped in something that hides its
+// count, fell back to the generic count - which includes the made-up frames
+// and passes every confirmation. It is not judged instead.
+func TestAMadeUpKeepaliveStrategyWithoutItsCountIsNotJudged(t *testing.T) {
+	h := newStallHarness(t, nil)
+	h.v.mu.Lock()
+	h.v.strategy = &keepaliveMakingStrategy{rankedPipeStrategy{pipeStrategy: &pipeStrategy{t: t}, id: "polling", priority: 6}}
+	h.v.mu.Unlock()
+	if !h.wait("not judged: the strategy makes up keepalives", 2*time.Second) {
+		t.Fatalf("no skip:\n%s", h.out)
+	}
+	if h.exit.gotEcho.Load() != 0 {
+		t.Fatal("keepalives went out to confirm against a count that includes made-up frames")
+	}
+}
+
+// TestAConfirmationCannotTouchTheNextSession is P2-5 of the round-4 review:
+// the flow table was shared by every session, so a confirmation still running
+// when a swap or hop replaced the session marked the new session's waiting
+// flows as ignored when the old session's echo came in - and a new session
+// that then froze was never judged. The table now belongs to its session.
+func TestAConfirmationCannotTouchTheNextSession(t *testing.T) {
+	h := newStallHarness(t, nil)
+	h.exit.echo.Store(true)
+	h.exit.echoDelay.Store(int64(100 * time.Millisecond))
+	deadline := time.Now().Add(2 * time.Second)
+	for h.exit.gotEcho.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("no confirmation started:\n%s", h.out)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// The swap lands while the old session waits for its echo.
+	other, _ := net.Pipe()
+	t.Cleanup(func() { other.Close() })
+	next := newFlowTable()
+	pendingFlow(t, next)
+	h.v.mu.Lock()
+	h.v.conn, h.v.stall = other, next
+	h.v.mu.Unlock()
+	time.Sleep(300 * time.Millisecond) // the echo arrives, the old confirmation ends
+	if s := next.stalledFor(time.Now()); s == 0 {
+		t.Fatal("the old session's confirmation marked the new session's flows as answered")
+	}
+}
+
+// keepaliveRefusingConn fails every keepalive write and passes the rest.
+type keepaliveRefusingConn struct{ net.Conn }
+
+func (c keepaliveRefusingConn) Write(p []byte) (int, error) {
+	if len(p) == 4 && p[0]|p[1]|p[2]|p[3] == 0 {
+		return 0, errors.New("uplink stuck")
+	}
+	return c.Conn.Write(p)
+}
+
+// TestAKeepaliveThatCannotGoOutIsNoAnswer is P3-8 of the round-4 review: a
+// confirmation whose keepalive could not be sent came back "alive" with 0
+// sent, logged "a keepalive echoed (0 sent)" and was asked again at the next
+// check. It is no answer: no verdict, nothing marked, and the next question
+// after one threshold.
+func TestAKeepaliveThatCannotGoOutIsNoAnswer(t *testing.T) {
+	h := newStallHarness(t, func(c net.Conn) net.Conn { return keepaliveRefusingConn{c} })
+	if !h.wait("could not confirm", 2*time.Second) {
+		t.Fatalf("no failed confirmation:\n%s", h.out)
+	}
+	time.Sleep(200 * time.Millisecond) // under one threshold (300 ms)
+	out := h.out.String()
+	if strings.Contains(out, "Session alive") || strings.Contains(out, "Session degraded") {
+		t.Fatalf("a keepalive that never went out gave an answer:\n%s", out)
+	}
+	if n := strings.Count(out, "Session suspect: a flow"); n != 1 {
+		t.Fatalf("%d suspicions within one threshold of a failed confirmation", n)
+	}
+}
+
+// TestAFlowAnsweredDuringTheConfirmationIsNoVerdict is P2-3 of the round-4
+// review: a stalled flow that got its answer while the keepalives were out -
+// its packet queued behind a downlink burst - still ended the session. The
+// exit stays silent to keepalives and answers the flow once the confirmation
+// has started.
+func TestAFlowAnsweredDuringTheConfirmationIsNoVerdict(t *testing.T) {
+	h := newStallHarness(t, nil)
+	deadline := time.Now().Add(2 * time.Second)
+	for h.exit.gotEcho.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("no confirmation started:\n%s", h.out)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := h.exit.writeFrame(fixtureFlows(t)[8].data); err != nil {
+		t.Fatal(err)
+	}
+	if !h.wait("got its answer during the confirmation", 2*time.Second) {
+		t.Fatalf("no recheck of the flow:\n%s", h.out)
+	}
+	if strings.Contains(h.out.String(), "Session degraded") {
+		t.Fatalf("a session whose flow was answered was given up:\n%s", h.out)
+	}
+}
+
+// TestRelayFlowAnsweredDuringTheConfirmationIsNoVerdict: the same on the
+// Android relay.
+func TestRelayFlowAnsweredDuringTheConfirmationIsNoVerdict(t *testing.T) {
+	h := newRelayStallHarness(t, nil)
+	deadline := time.Now().Add(2 * time.Second)
+	for h.exit.gotEcho.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("no confirmation started")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := h.exit.writeFrame(fixtureFlows(t)[8].data); err != nil {
+		t.Fatal(err)
+	}
+	if r := h.reason(1500 * time.Millisecond); r != "" || h.degraded.Load() != 0 {
+		t.Fatalf("a relay whose flow was answered was given up: %q", r)
+	}
+}
+
+// quietLimiter is a limiter in its quiet period for d more.
+func quietLimiter(d time.Duration) *verdictLimiter {
+	return &verdictLimiter{quietUntil: time.Now().Add(d)}
+}
+
+// TestARefusedVerdictIsJudgedAgainAfterTheQuiet is P2-1 of the round-4
+// review: a session whose verdict the limiter refused was never judged again
+// - on the desktop it was marked judged, the Android relay's watcher
+// returned - and a Polling session under a byte cap, which never ends on its
+// own, stayed for good. It is judged again when the quiet period ends, and no
+// keepalive goes out for it in between.
+func TestARefusedVerdictIsJudgedAgainAfterTheQuiet(t *testing.T) {
+	h := newStallHarness(t, nil)
+	stallVerdictsNow.Store(quietLimiter(1500 * time.Millisecond))
+	if !h.wait("not acting until", 2*time.Second) {
+		t.Fatalf("no refused verdict:\n%s", h.out)
+	}
+	sent := h.exit.gotEcho.Load()
+	time.Sleep(300 * time.Millisecond) // inside the quiet period
+	if n := h.exit.gotEcho.Load() - sent; n != 0 {
+		t.Fatalf("%d keepalives went out for a session that may not be judged yet", n)
+	}
+	if !h.wait("VPN disconnected: session degraded", 3*time.Second) {
+		t.Fatalf("the session was not judged again after the quiet period:\n%s", h.out)
+	}
+}
+
+// TestRelayRefusedVerdictIsJudgedAgainAfterTheQuiet: the same on the relay.
+func TestRelayRefusedVerdictIsJudgedAgainAfterTheQuiet(t *testing.T) {
+	out := &stampedLog{}
+	h := newRelayStallHarness(t, nil)
+	setLog(t, out)
+	stallVerdictsNow.Store(quietLimiter(1500 * time.Millisecond))
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, ok := out.first("not acting until"); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no refused verdict:\n%s", out)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	sent := h.exit.gotEcho.Load()
+	time.Sleep(300 * time.Millisecond) // inside the quiet period
+	if n := h.exit.gotEcho.Load() - sent; n != 0 {
+		t.Fatalf("%d keepalives went out for a session that may not be judged yet", n)
+	}
+	if r := h.reason(3 * time.Second); !strings.HasPrefix(r, "session_degraded") {
+		t.Fatalf("relay ended with %q, want a verdict after the quiet period", r)
+	}
+}
+
+// queueingConn is a tunnel conn whose Write only queues, as HTTP Polling's
+// does: a write reaches the exit lag later, in order, and UplinkProgress
+// says how far the queue has gone.
+type queueingConn struct {
+	net.Conn
+	lag      time.Duration
+	mu       sync.Mutex
+	accepted uint64
+	sent     atomic.Uint64
+	queue    chan []byte
+}
+
+func newQueueingConn(c net.Conn, lag time.Duration) *queueingConn {
+	q := &queueingConn{Conn: c, lag: lag, queue: make(chan []byte, 64)}
+	go func() {
+		for p := range q.queue {
+			time.Sleep(q.lag)
+			if _, err := q.Conn.Write(p); err != nil {
+				return
+			}
+			q.sent.Add(uint64(len(p)))
+		}
+	}()
+	return q
+}
+
+func (q *queueingConn) Write(p []byte) (int, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.accepted += uint64(len(p))
+	q.queue <- append([]byte(nil), p...)
+	return len(p), nil
+}
+
+func (q *queueingConn) UplinkProgress() (uint64, uint64) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.accepted, q.sent.Load()
+}
+
+// TestAQueuedKeepaliveIsTimedFromItsDelivery is P2-6 of the round-4 review:
+// on Polling a keepalive Write only queues, and the echo window ran from the
+// queueing. Behind an upload both keepalives could sit in the queue for the
+// whole confirmation and a live tunnel was given up. Here every write reaches
+// the exit 400 ms late (the windows are 150 ms) and the exit echoes at once;
+// the peer behind the stalled flow is dead.
+func TestAQueuedKeepaliveIsTimedFromItsDelivery(t *testing.T) {
+	h := newStallHarness(t, func(c net.Conn) net.Conn { return newQueueingConn(c, 400*time.Millisecond) })
+	h.exit.echo.Store(true)
+	if !h.wait("Session alive", 3*time.Second) {
+		t.Fatalf("the queued keepalive's echo was not waited for:\n%s", h.out)
+	}
+	if strings.Contains(h.out.String(), "Session degraded") {
+		t.Fatalf("a live tunnel behind a queue was given up:\n%s", h.out)
 	}
 }

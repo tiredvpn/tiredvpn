@@ -1,6 +1,7 @@
 package tun
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -47,5 +48,17 @@ func TestBlockedStrategiesKeepEndpointHealth(t *testing.T) {
 	}
 	if cooldownLeft(t, m, addrs[0]) <= 0 {
 		t.Fatal("resetting blocked strategies lifted an endpoint park")
+	}
+}
+
+// TestAnUnansweredCycleDoesNotSleepTheOldBackoff is P3-2 of the round-4
+// review: after answered failures had grown the backoff to 2 minutes, an
+// unanswered cycle still slept those 2 minutes before the cap applied.
+func TestAnUnansweredCycleDoesNotSleepTheOldBackoff(t *testing.T) {
+	if d := capReconnectDelay(2*time.Minute, strategy.ErrCycleUnanswered); d != silentCycleMaxDelay {
+		t.Fatalf("pause %v after an unanswered cycle, want %v", d, silentCycleMaxDelay)
+	}
+	if d := capReconnectDelay(2*time.Minute, errors.New("reset")); d != 2*time.Minute {
+		t.Fatalf("an answered failure's pause changed to %v", d)
 	}
 }

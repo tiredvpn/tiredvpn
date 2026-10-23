@@ -135,3 +135,49 @@ func (s *nopTUNSink) WritePacket(pkt []byte) error {
 func (s *nopTUNSink) Done() <-chan struct{} { return nil }
 func (s *nopTUNSink) UpdateActivity()       {}
 func (s *nopTUNSink) Close()                {}
+
+// TestRelaySinkKeepsTheUpstreamLegAlive is P3-13 of the round-4 review: an
+// idle HTTP Polling session through a relay sent nothing up - the Polling
+// client sends no keepalive and the relay answers keepalives itself - and the
+// upstream leg died after relayTUNIdleTimeout. The downstream client's
+// activity now sends a keepalive up, at most one per relayKeepaliveEvery.
+func TestRelaySinkKeepsTheUpstreamLegAlive(t *testing.T) {
+	old := relayKeepaliveEvery
+	relayKeepaliveEvery = 200 * time.Millisecond
+	t.Cleanup(func() { relayKeepaliveEvery = old })
+	sink, upstream := newTestRelaySink(t)
+
+	frames := make(chan []byte, 8)
+	go func() {
+		for {
+			buf := make([]byte, 4)
+			if _, err := readFullConn(upstream, buf); err != nil {
+				return
+			}
+			frames <- buf
+		}
+	}()
+	for range 5 { // a burst of polls: one keepalive
+		sink.UpdateActivity()
+	}
+	select {
+	case f := <-frames:
+		if binary.BigEndian.Uint32(f) != 0 {
+			t.Fatalf("frame %x is not a keepalive", f)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no keepalive went up for the downstream client's activity")
+	}
+	select {
+	case <-frames:
+		t.Fatal("a burst of activity sent more than one keepalive")
+	case <-time.After(100 * time.Millisecond):
+	}
+	time.Sleep(200 * time.Millisecond)
+	sink.UpdateActivity()
+	select {
+	case <-frames:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no keepalive after the interval")
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"net"
 	"slices"
 	"testing"
+	"time"
 )
 
 // TestLocalLinkUpAsksTheFallbackProbes is the Android half of P2-4 of the
@@ -67,19 +68,22 @@ func TestBSDDefaultRoute(t *testing.T) {
 	cases := []struct {
 		name          string
 		dst, mask, gw *ribAddr
+		ifscope       bool
 		want          string // dial address, "" for not a default
 	}{
-		{"default, mask absent", v4("0.0.0.0"), nil, v4("192.168.1.1"), "192.168.1.1:53"},
-		{"default, zero mask", v4("0.0.0.0"), v4("0.0.0.0"), v4("192.168.1.1"), "192.168.1.1:53"},
-		{"tunnel 0/1", v4("0.0.0.0"), v4("128.0.0.0"), v4("10.8.0.1"), ""},
-		{"tunnel 128/1", v4("128.0.0.0"), v4("128.0.0.0"), v4("10.8.0.1"), ""},
-		{"lan prefix", v4("192.168.1.0"), v4("255.255.255.0"), v4("192.168.1.1"), ""},
-		{"link-layer gateway", v4("0.0.0.0"), nil, nil, ""},
-		{"v6 default, scoped gateway", v6("::", 0), nil, v6("fe80::1", 4), "[fe80::1%4]:53"},
-		{"v6 tunnel ::/1", v6("::", 0), v6("8000::", 0), v6("fd00::1", 0), ""},
+		{"default, mask absent", v4("0.0.0.0"), nil, v4("192.168.1.1"), false, "192.168.1.1:53"},
+		{"interface-scoped default", v4("0.0.0.0"), nil, v4("192.168.1.1"), true, ""},
+		{"scoped v6 default on the utun", v6("::", 0), nil, v6("fe80::1", 12), true, ""},
+		{"default, zero mask", v4("0.0.0.0"), v4("0.0.0.0"), v4("192.168.1.1"), false, "192.168.1.1:53"},
+		{"tunnel 0/1", v4("0.0.0.0"), v4("128.0.0.0"), v4("10.8.0.1"), false, ""},
+		{"tunnel 128/1", v4("128.0.0.0"), v4("128.0.0.0"), v4("10.8.0.1"), false, ""},
+		{"lan prefix", v4("192.168.1.0"), v4("255.255.255.0"), v4("192.168.1.1"), false, ""},
+		{"link-layer gateway", v4("0.0.0.0"), nil, nil, false, ""},
+		{"v6 default, scoped gateway", v6("::", 0), nil, v6("fe80::1", 4), false, "[fe80::1%4]:53"},
+		{"v6 tunnel ::/1", v6("::", 0), v6("8000::", 0), v6("fd00::1", 0), false, ""},
 	}
 	for _, tc := range cases {
-		r, ok := bsdDefaultRoute(tc.dst, tc.mask, tc.gw, 9)
+		r, ok := bsdDefaultRoute(tc.dst, tc.mask, tc.gw, 9, tc.ifscope)
 		got := ""
 		if ok {
 			if addrs := defaultGatewayAddrs([]ribRoute{r}); len(addrs) == 1 {
@@ -89,5 +93,38 @@ func TestBSDDefaultRoute(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
 		}
+	}
+}
+
+// TestLocalLinkUpDoesNotQueueBehindSilentGateways is P3-10/P3-11 of the
+// round-4 review: gateways and fallback probes were dialled one after
+// another, so each silent one (an interface-scoped default, a dead family)
+// added a full timeout before the answer. Two silent addresses ahead of one
+// that answers: the answer comes in well under one timeout.
+func TestLocalLinkUpDoesNotQueueBehindSilentGateways(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	silentA, silentB := silentTCPAddr(t), silentTCPAddr(t)
+	oldGw := gatewayAddrs
+	t.Cleanup(func() { gatewayAddrs = oldGw })
+	gatewayAddrs = func() []string { return []string{silentA, silentB, ln.Addr().String()} }
+	start := time.Now()
+	if !localLinkUp() {
+		t.Fatal("a gateway answered and the link reads as down")
+	}
+	if took := time.Since(start); took > networkCheckTimeout/2 {
+		t.Fatalf("took %v: the answering gateway waited behind the silent ones", took)
 	}
 }
