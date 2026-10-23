@@ -565,9 +565,14 @@ func (p *IPPool) markFolded(newKey string, now, until time.Time) {
 			// out, not all of them. Clearing the map let every key search
 			// again at once under churn, the very throttle this map is for
 			// (P3-12 of the round-6 review).
-			ends := slices.SortedFunc(maps.Values(p.folded), time.Time.Compare)
-			cut := ends[len(ends)/2]
-			maps.DeleteFunc(p.folded, func(_ string, u time.Time) bool { return u.Before(cut) })
+			// By count, not by a cut time: with records tied on their end, a
+			// cut deleted none (P3-12 of the round-7 review).
+			keys := slices.SortedFunc(maps.Keys(p.folded), func(a, b string) int {
+				return p.folded[a].Compare(p.folded[b])
+			})
+			for _, k := range keys[:len(keys)/2] {
+				delete(p.folded, k)
+			}
 		}
 	}
 	p.folded[newKey] = until

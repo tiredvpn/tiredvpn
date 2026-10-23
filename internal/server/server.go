@@ -1760,13 +1760,6 @@ func cleanupH2Conn(conn net.Conn, srvCtx *serverContext, tunnel **h2TunnelState,
 	}
 }
 
-// runH2FrameLoop reads and dispatches HTTP/2 frames until the connection closes.
-//
-// connPtr / framerPtr are pointers so the loop can swap the connection and
-// framer in place after a kTLS handover (see handover). handover may be nil
-// (legacy non-ALPN path), in which case no kTLS upgrade happens. When set, it
-// is invoked exactly once — immediately after auth succeeds — and returns the
-// connection and framer to use for the subsequent relay phase.
 // h2FrameReadTimeout is the longest gap between two frames the HTTP/2 stego
 // loop allows on its raw conn, for the life of the connection - a relay's
 // upstream leg included, whose keepalive is drawn to land well inside it
@@ -1780,6 +1773,13 @@ var h2FrameReadTimeoutNs = func() *atomic.Int64 {
 
 func h2FrameReadTimeout() time.Duration { return time.Duration(h2FrameReadTimeoutNs.Load()) }
 
+// runH2FrameLoop reads and dispatches HTTP/2 frames until the connection closes.
+//
+// connPtr / framerPtr are pointers so the loop can swap the connection and
+// framer in place after a kTLS handover (see handover). handover may be nil
+// (legacy non-ALPN path), in which case no kTLS upgrade happens. When set, it
+// is invoked exactly once — immediately after auth succeeds — and returns the
+// connection and framer to use for the subsequent relay phase.
 func runH2FrameLoop(connPtr *net.Conn, framerPtr **http2.Framer, hpackDec *hpack.Decoder, srvCtx *serverContext, logger *log.Logger, authenticated *bool, authClientID *clientIdentity, authSecret *[]byte, connTracked *bool, tunnel **h2TunnelState, handover func(net.Conn) (net.Conn, *http2.Framer), ekm []byte) {
 	for {
 		conn := *connPtr

@@ -2266,7 +2266,10 @@ func (m *Manager) swallowRecordLocked(key string, sincePark time.Duration) *swal
 		}
 		m.swallowed[key] = r
 	}
-	r.last = time.Now()
+	// Wall clock: the record crosses an Android core restart, and the
+	// monotonic clock stops while the phone sleeps (P3-6 of the round-7
+	// review).
+	r.last = time.Now().Round(0)
 	return r
 }
 

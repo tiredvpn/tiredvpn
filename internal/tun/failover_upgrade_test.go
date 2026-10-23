@@ -255,7 +255,7 @@ func TestUpgradeIsConfirmedOnlyByAUsefulSession(t *testing.T) {
 	v.mu.Lock()
 	v.connectedAt = time.Now().Add(-sessionUsefulMin - 5*time.Second)
 	v.mu.Unlock()
-	v.noteDownlink()
+	v.noteDownlink(true)
 	if got := v.manager.GetLastConnectionInfo().StrategyID; got == "reality" {
 		t.Fatal("confirmed between the 20 s and 40 s lines, where the same session would still count as dead")
 	}
