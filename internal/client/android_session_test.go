@@ -1,9 +1,9 @@
 package client
 
 import (
-	"io"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"testing"
