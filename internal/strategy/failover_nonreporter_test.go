@@ -41,23 +41,29 @@ func (s *closingStrategy) Connect(ctx context.Context, target string) (net.Conn,
 // that does not report its TCP connect is held to half of a short cycle as a
 // whole, but its attempt was read against the full budget: cut at half, it
 // never "burned nearly its whole budget", and the closed-conn error it came
-// back with counted as the server answering. Every cycle on a server that
-// swallows handshakes then had an answer in it, and the run of swallowed
-// cycles never reached its verdict.
+// back with counted as the server answering - which ended every run of
+// swallowed cycles on that address. Such an attempt is no answer (and, since
+// round 4's P2-4, no evidence of a swallow either: it had only half a cycle).
 func TestACutNonReporterIsNotAnAnswer(t *testing.T) {
 	swallower := newBlackholeListener(t)
-	healthy := newHelloListener(t)
-	m := newSilenceManager(t, 2*time.Second, swallower.addr, healthy.addr)
+	m := newSilenceManager(t, 2*time.Second, swallower.addr)
 	geneva := &closingStrategy{id: "geneva", priority: 5}
 	m.Register(geneva)
 	m.Register(&closingStrategy{id: "ws", priority: 6})
 	m.Register(&closingStrategy{id: "polling", priority: 7})
 	markConnected(m, geneva)
 
-	if s, cycles := connectCycles(t, m, 3, time.Second); s == nil {
-		t.Fatalf("still not connected after %d cycles; A: %+v", cycles, endpointState(t, m, swallower.addr))
+	scan := &scanState{addr: swallower.addr}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if conn, _, err := m.connectScan(ctx, swallower.addr, nil, scan); err == nil {
+		conn.Close()
+		t.Fatal("connected to a server that answers nothing")
 	}
-	if got := m.GetServerAddr(context.Background()); got != healthy.addr {
-		t.Fatalf("connected through %s, want %s", got, healthy.addr)
+	if scan.answered {
+		t.Fatal("a cut attempt that heard nothing was taken for the server's answer")
+	}
+	if scan.unheard == 0 {
+		t.Fatal("the cut attempts were not seen as unanswered")
 	}
 }

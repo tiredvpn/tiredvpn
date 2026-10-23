@@ -315,7 +315,14 @@ func (m *Manager) connectThroughRefusal(ctx context.Context, s Strategy, target 
 		case phase.neverDialled():
 			err = fmt.Errorf("%w: %w", errNotDialled, err)
 		}
-		if err != nil && phase.extended() && phase.connected() && heardNothing(err, latency, limit) {
+		// How long the attempt had to hear an answer: since its TCP connect
+		// when that is known, else its whole run.
+		scan.allowance = latency
+		if at := phase.connectedAt.Load(); at != 0 {
+			scan.allowance = time.Since(time.Unix(0, at))
+		}
+		if err != nil && phase.extended() && phase.connected() && heardNothing(err, latency, limit) &&
+			m.swallowEvidence(s, scan.allowance) {
 			scan.connectedSilent = append(scan.connectedSilent, s.ID())
 		}
 		if err == nil || isUDPBasedStrategy(s) || !refusedByAddr(err, target, m.GetServerAddr(ctx)) {
@@ -370,11 +377,12 @@ const (
 
 // connectPhase follows one attempt through its TCP connect.
 type connectPhase struct {
-	ctx     context.Context
-	state   atomic.Int32
-	timer   *time.Timer
-	split   bool
-	tracked bool // the strategy reports its dial, so state is known
+	ctx         context.Context
+	state       atomic.Int32
+	timer       *time.Timer
+	split       bool
+	tracked     bool         // the strategy reports its dial, so state is known
+	connectedAt atomic.Int64 // UnixNano of the TCP connect, 0 before
 }
 
 // watchConnect follows an attempt on ctx, whose cancel is cancel, through its
@@ -396,6 +404,7 @@ func watchConnect(ctx context.Context, cancel context.CancelFunc, limit, dialLim
 			}
 		},
 		func() {
+			p.connectedAt.Store(time.Now().UnixNano())
 			p.state.CompareAndSwap(phaseLocal, phaseConnected)
 			p.state.CompareAndSwap(phaseDialling, phaseConnected)
 		})
@@ -1680,7 +1689,7 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 			// says anything about this endpoint on its own; a run of them in
 			// which its handshakes heard nothing does (swallowCycle).
 			if !m.swallowCycle(cand.Addr, scan) {
-				if !scan.answered && (scan.timeouts > 0 || len(scan.inconclusive) > 0) {
+				if !scan.answered && (scan.timeouts > 0 || scan.unheard > 0) {
 					lastErr = fmt.Errorf("%w: %w", ErrCycleUnanswered, err)
 				}
 				break
@@ -1878,8 +1887,31 @@ type scanState struct {
 	// whose handshake then heard nothing until its attempt ran out.
 	connectedSilent []string
 	// inconclusive lists the transports whose attempt heard nothing and was
-	// still no verdict (attemptInconclusive).
+	// still no verdict (attemptInconclusive), with a real chance to answer
+	// (swallowEvidence).
 	inconclusive []string
+	// allowance is how long the last attempt had to hear an answer, from
+	// its TCP connect when known (connectThroughRefusal).
+	allowance time.Duration
+	// unheard counts the attempts that heard nothing and were no verdict,
+	// evidence or not: what makes a cycle "unanswered" (ErrCycleUnanswered).
+	unheard int
+}
+
+// swallowEvidence reports whether an attempt of s that heard nothing for
+// allowance is evidence that the address swallows handshakes. Not for a UDP
+// transport: a datagram blackhole is the route's, not the server's. And not
+// for an attempt that had less than a third of connectTimeout (10 s on the
+// desktop) to answer: cut by what was left of the cycle - half of it taken
+// by another transport - a healthy Polling handshake needing a couple of
+// seconds looked swallowed, and a working server was parked.
+//
+// A strategy that does not report its TCP connect is held to half of a
+// short cycle as a whole, under the floor: it never counts. A server that
+// swallows every handshake swallows the reporting ones too (REALITY, Polling,
+// Stego, Seqovl), and the first of them in a cycle runs to the cycle's end.
+func (m *Manager) swallowEvidence(s Strategy, allowance time.Duration) bool {
+	return !isUDPBasedStrategy(s) && allowance >= m.connectTimeout/3
 }
 
 // swallowRecord is what one address's last reconnect cycles left behind.
@@ -2163,7 +2195,10 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 					// scan would only spend the rest of the budget the same way.
 					excludeMap[lastSuccessful.ID()] = true
 				case attemptInconclusive:
-					scan.inconclusive = append(scan.inconclusive, lastSuccessful.ID())
+					scan.unheard++
+					if m.swallowEvidence(lastSuccessful, scan.allowance) {
+						scan.inconclusive = append(scan.inconclusive, lastSuccessful.ID())
+					}
 					excludeMap[lastSuccessful.ID()] = true
 				case attemptNotDialled:
 					// Still queued on this client when its dial limit came:
@@ -2452,7 +2487,10 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 					m.mu.Unlock()
 				}
 			case attemptInconclusive:
-				scan.inconclusive = append(scan.inconclusive, s.ID())
+				scan.unheard++
+				if m.swallowEvidence(s, scan.allowance) {
+					scan.inconclusive = append(scan.inconclusive, s.ID())
+				}
 			case attemptAnswered:
 				// A refusal, a reset, a handshake that got an answer it did not
 				// like: the address is talking. Whatever is wrong here is a
