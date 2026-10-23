@@ -1942,10 +1942,11 @@ const swallowWindow = 3 * time.Minute
 // Empty in forced mode, which has nothing else to try, and when skipping them
 // would leave no transport at all.
 func (m *Manager) swallowSkip(addr string) map[string]bool {
+	parked := m.addrParked(addr)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r := m.swallowed[addr]
-	if r == nil || len(r.skip) == 0 || m.forced || time.Since(r.last) > swallowWindow {
+	if r == nil || len(r.skip) == 0 || m.forced || swallowStale(r, parked) {
 		return nil
 	}
 	if !slices.ContainsFunc(m.strategies, func(s Strategy) bool { return s.Priority() > 0 && !r.skip[s.ID()] }) {
@@ -1960,19 +1961,21 @@ func (m *Manager) noteSwallowed(addr string, ids []string) {
 	if len(ids) == 0 {
 		return
 	}
+	parked := m.addrParked(addr)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	r := m.swallowRecordLocked(addr)
+	r := m.swallowRecordLocked(addr, parked)
 	for _, id := range ids {
 		r.skip[id] = true
 	}
 }
 
 // swallowRecordLocked returns addr's swallow record, fresh if it had none or
-// its last cycle is older than swallowWindow, and stamps it now. m.mu held.
-func (m *Manager) swallowRecordLocked(addr string) *swallowRecord {
+// it is stale (swallowStale), and stamps it now. m.mu held; parked is
+// addrParked(addr), asked before taking it.
+func (m *Manager) swallowRecordLocked(addr string, parked bool) *swallowRecord {
 	r := m.swallowed[addr]
-	if r == nil || time.Since(r.last) > swallowWindow {
+	if r == nil || swallowStale(r, parked) {
 		r = &swallowRecord{skip: make(map[string]bool), heardNothing: make(map[string]bool)}
 		if m.swallowed == nil {
 			m.swallowed = make(map[string]*swallowRecord)
@@ -1981,6 +1984,25 @@ func (m *Manager) swallowRecordLocked(addr string) *swallowRecord {
 	}
 	r.last = time.Now()
 	return r
+}
+
+// swallowStale reports a record whose last cycle is older than
+// swallowWindow - unless its address is parked: the park can outlast the
+// window (it doubles), and a client coming back to the server after it had
+// forgotten which transports the server swallows.
+func swallowStale(r *swallowRecord, parked bool) bool {
+	return !parked && time.Since(r.last) > swallowWindow
+}
+
+// addrParked reports whether the candidate at addr is parked. Takes m.mu
+// (through selector): not to be called with it held.
+func (m *Manager) addrParked(addr string) bool {
+	sel := m.selector()
+	if sel == nil {
+		return false
+	}
+	cand, ok := sel.CandidateForAddr(addr)
+	return ok && sel.IsParked(cand)
 }
 
 // swallowCycle books a cycle on addr that ended with no verdict and reports
@@ -1995,6 +2017,7 @@ func (m *Manager) swallowRecordLocked(addr string) *swallowRecord {
 // single slow handshake, Polling's included, parks nothing - and a cycle in
 // which any transport got an answer ends the run.
 func (m *Manager) swallowCycle(addr string, scan *scanState) bool {
+	parked := m.addrParked(addr)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if scan.answered {
@@ -2006,7 +2029,7 @@ func (m *Manager) swallowCycle(addr string, scan *scanState) bool {
 	if len(scan.inconclusive) == 0 {
 		return false
 	}
-	r := m.swallowRecordLocked(addr)
+	r := m.swallowRecordLocked(addr, parked)
 	r.cycles++
 	for _, id := range scan.inconclusive {
 		r.heardNothing[id] = true
