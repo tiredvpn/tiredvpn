@@ -178,9 +178,10 @@ type VPNClient struct {
 	lastRx      time.Time
 
 	// stall follows the session's TCP flows for the stall detector
-	// (watchStalls); reset with every new tunnel connection.
+	// (watchStalls): one table per tunnel connection, replaced together with
+	// conn under mu, so whatever works on a table works on its own session.
 	// keepaliveEchoes counts the zero-length frames read off the tunnel.
-	stall           flowTable
+	stall           *flowTable
 	keepaliveEchoes atomic.Uint64
 
 	// connCancel cancels the context of an in-flight connect() so Stop() can
@@ -879,7 +880,7 @@ func (v *VPNClient) seamlessPortHop(newPort int) {
 	v.upgradePending = nil
 	v.connectedAt = time.Now()
 	v.lastRx = v.connectedAt
-	v.stall.reset()
+	v.stall = newFlowTable()
 	v.mu.Unlock()
 
 	// The hop replaced the session; book it like the upgrade swap does, and
@@ -1032,7 +1033,7 @@ func (v *VPNClient) connect(parent context.Context) error {
 	v.upgradePending = nil
 	v.connectedAt = time.Now()
 	v.lastRx = v.connectedAt
-	v.stall.reset()
+	v.stall = newFlowTable()
 	if hasCaps {
 		v.serverCaps = caps
 	}
@@ -1670,14 +1671,14 @@ func (v *VPNClient) readFromTun() {
 		binary.BigEndian.PutUint32(buf[:4], uint32(n))
 
 		v.mu.Lock()
-		conn := v.conn
+		conn, flows := v.conn, v.stall
 		v.mu.Unlock()
 
 		if conn == nil {
 			log.Debug("TUN->Server: conn is nil, dropping %d bytes", n)
 			continue
 		}
-		v.stall.up(buf[4:4+n], time.Now())
+		flows.up(buf[4:4+n], time.Now())
 
 		conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 		written, err := conn.Write(buf[:n+4])
@@ -1715,7 +1716,7 @@ func (v *VPNClient) readFromServer() {
 
 	for atomic.LoadInt32(&v.running) == 1 {
 		v.mu.Lock()
-		conn := v.conn
+		conn, flows := v.conn, v.stall
 		v.mu.Unlock()
 
 		if conn == nil {
@@ -1836,7 +1837,7 @@ func (v *VPNClient) readFromServer() {
 			log.Debug("Successfully wrote %d bytes to TUN", n)
 		}
 
-		v.stall.down(actualBuf, time.Now())
+		flows.down(actualBuf, time.Now())
 		v.noteDownlink()
 
 		atomic.AddInt64(&v.packetsDown, 1)
@@ -2097,7 +2098,7 @@ func (v *VPNClient) swapUpgradedConn(oldConn, newConn net.Conn, strat strategy.S
 	v.upgradePending = strat
 	v.connectedAt = time.Now()
 	v.lastRx = v.connectedAt
-	v.stall.reset()
+	v.stall = newFlowTable()
 	if hasCaps {
 		v.serverCaps = caps
 	}

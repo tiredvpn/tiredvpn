@@ -21,14 +21,14 @@ import (
 // shortStallClocks scales the detector down: T 300 ms, echo wait 150 ms.
 func shortStallClocks(t *testing.T) {
 	t.Helper()
-	oldT, oldEcho, oldEvery, oldPause := stallThreshold, stallEchoWait, stallCheckEvery, stallConfirmPause
-	stallThreshold, stallEchoWait, stallCheckEvery = 300*time.Millisecond, 150*time.Millisecond, 20*time.Millisecond
-	stallConfirmPause = func() time.Duration { return 50 * time.Millisecond }
-	oldLimiter := stallVerdicts
-	stallVerdicts = &verdictLimiter{}
+	old := stallClocks()
+	stallClocksNow.Store(&stallClockSet{threshold: 300 * time.Millisecond, echoWait: 150 * time.Millisecond,
+		checkEvery: 20 * time.Millisecond, pause: func() time.Duration { return 50 * time.Millisecond }})
+	oldLimiter := stallVerdicts()
+	stallVerdictsNow.Store(&verdictLimiter{})
 	t.Cleanup(func() {
-		stallThreshold, stallEchoWait, stallCheckEvery, stallConfirmPause = oldT, oldEcho, oldEvery, oldPause
-		stallVerdicts = oldLimiter
+		stallClocksNow.Store(old)
+		stallVerdictsNow.Store(oldLimiter)
 	})
 }
 
@@ -42,8 +42,10 @@ type stallExit struct {
 	answer     []byte
 	answerData atomic.Bool
 	echo       atomic.Bool
+	echoDelay  atomic.Int64 // ns before an echo goes out
 	feeder     atomic.Bool
 	gotData    atomic.Int64
+	gotEcho    atomic.Int64 // keepalives received
 }
 
 func (e *stallExit) writeFrame(p []byte) error {
@@ -73,8 +75,15 @@ func (e *stallExit) serve() {
 			return
 		}
 		switch {
-		case n == 0 && e.echo.Load():
-			_ = e.writeFrame(nil)
+		case n == 0:
+			e.gotEcho.Add(1)
+			if e.echo.Load() {
+				if d := time.Duration(e.echoDelay.Load()); d > 0 {
+					go func() { time.Sleep(d); _ = e.writeFrame(nil) }()
+				} else {
+					_ = e.writeFrame(nil)
+				}
+			}
 		case n > 0:
 			e.gotData.Add(1)
 			if e.answerData.Load() {
@@ -131,7 +140,7 @@ func newStallHarness(t *testing.T, wrap func(net.Conn) net.Conn) *stallHarness {
 	if wrap != nil {
 		conn = wrap(cli)
 	}
-	v := &VPNClient{running: 1, stopCh: make(chan struct{}), manager: m, conn: conn, tun: dev,
+	v := &VPNClient{running: 1, stopCh: make(chan struct{}), manager: m, conn: conn, tun: dev, stall: newFlowTable(),
 		strategy:    &rankedPipeStrategy{pipeStrategy: &pipeStrategy{t: t}, id: "polling", priority: 6},
 		sessionCand: cand, hasSessionCand: true,
 		connectedAt: time.Now().Add(-time.Hour), lastRx: time.Now()}
@@ -139,7 +148,8 @@ func newStallHarness(t *testing.T, wrap func(net.Conn) net.Conn) *stallHarness {
 	setLog(t, out)
 	go v.readFromTun()
 	go v.readFromServer()
-	go v.watchStalls()
+	watched := make(chan struct{})
+	go func() { v.watchStalls(); close(watched) }()
 	t.Cleanup(func() {
 		atomic.StoreInt32(&v.running, 0)
 		select {
@@ -147,6 +157,7 @@ func newStallHarness(t *testing.T, wrap func(net.Conn) net.Conn) *stallHarness {
 		default:
 			close(v.stopCh)
 		}
+		<-watched // the clocks are put back after this, and the watcher reads them
 		cli.Close()
 		srv.Close()
 		app.Close()
@@ -295,7 +306,8 @@ func pendingFlow(t *testing.T, ft *flowTable) {
 func TestEveryNewConnectionStartsWithNoFlows(t *testing.T) {
 	t.Run("connect", func(t *testing.T) {
 		v := newCallsiteClient(newPipeManager(t))
-		pendingFlow(t, &v.stall)
+		v.stall = newFlowTable()
+		pendingFlow(t, v.stall)
 		if err := v.connect(t.Context()); err != nil {
 			t.Fatalf("connect: %v", err)
 		}
@@ -311,7 +323,7 @@ func TestEveryNewConnectionStartsWithNoFlows(t *testing.T) {
 		if err := v.connect(context.Background()); err != nil {
 			t.Fatalf("connect: %v", err)
 		}
-		pendingFlow(t, &v.stall)
+		pendingFlow(t, v.stall)
 		v.seamlessPortHop(1234)
 		if s := v.stall.stalledFor(time.Now()); s != 0 {
 			t.Fatalf("the port hop kept demand from the old session: %v", s)
@@ -320,7 +332,7 @@ func TestEveryNewConnectionStartsWithNoFlows(t *testing.T) {
 	t.Run("upgrade swap", func(t *testing.T) {
 		v, _, _, better := upgradeOnSelector(t)
 		setLog(t, &stampedLog{})
-		pendingFlow(t, &v.stall)
+		pendingFlow(t, v.stall)
 		v.tryStrategyUpgrade([]strategy.Strategy{better})
 		if v.strategy != better {
 			t.Fatal("no swap - the test proves nothing")
@@ -458,5 +470,35 @@ func TestPollingKeepaliveCountSurvivesTheHandshakeWrapper(t *testing.T) {
 	v.keepaliveEchoes.Add(7)
 	if got := v.echoCounter(&replayConn{Conn: pollingLike{}})(); got != 0 {
 		t.Fatalf("read %d echoes through the wrapper: the generic count, not the server's", got)
+	}
+}
+
+// TestAConfirmationCannotTouchTheNextSession is P2-5 of the round-4 review:
+// the flow table was shared by every session, so a confirmation still running
+// when a swap or hop replaced the session marked the new session's waiting
+// flows as ignored when the old session's echo came in - and a new session
+// that then froze was never judged. The table now belongs to its session.
+func TestAConfirmationCannotTouchTheNextSession(t *testing.T) {
+	h := newStallHarness(t, nil)
+	h.exit.echo.Store(true)
+	h.exit.echoDelay.Store(int64(100 * time.Millisecond))
+	deadline := time.Now().Add(2 * time.Second)
+	for h.exit.gotEcho.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("no confirmation started:\n%s", h.out)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// The swap lands while the old session waits for its echo.
+	other, _ := net.Pipe()
+	t.Cleanup(func() { other.Close() })
+	next := newFlowTable()
+	pendingFlow(t, next)
+	h.v.mu.Lock()
+	h.v.conn, h.v.stall = other, next
+	h.v.mu.Unlock()
+	time.Sleep(300 * time.Millisecond) // the echo arrives, the old confirmation ends
+	if s := next.stalledFor(time.Now()); s == 0 {
+		t.Fatal("the old session's confirmation marked the new session's flows as answered")
 	}
 }

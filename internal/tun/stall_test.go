@@ -98,20 +98,21 @@ func cameDown(pkt []byte) bool {
 
 // replay feeds a capture through a flow table on the capture's own clock,
 // checking once a second as the monitor does, and returns the longest stall
-// seen and when it first reached stallThreshold (zero if never).
+// seen and when it first reached the threshold (zero if never).
 func replay(t *testing.T, pkts []capturedPacket) (maxStall time.Duration, crossed time.Time) {
 	t.Helper()
 	ft := newFlowTable()
 	check := func(now time.Time) {
 		s := ft.stalledFor(now)
 		maxStall = max(maxStall, s)
-		if s >= stallThreshold && crossed.IsZero() {
+		if s >= stallClocks().threshold && crossed.IsZero() {
 			crossed = now
 		}
 	}
-	next := pkts[0].at.Truncate(stallCheckEvery).Add(stallCheckEvery)
+	every := stallClocks().checkEvery
+	next := pkts[0].at.Truncate(every).Add(every)
 	for _, p := range pkts {
-		for ; next.Before(p.at); next = next.Add(stallCheckEvery) {
+		for ; next.Before(p.at); next = next.Add(every) {
 			check(next)
 		}
 		if cameDown(p.data) {
@@ -150,7 +151,7 @@ func TestStallOnTheStandCaptures(t *testing.T) {
 			}
 			fault := time.UnixMilli(tc.fault)
 			if crossed.IsZero() {
-				t.Fatalf("never crossed %v, longest stall %v", stallThreshold, maxStall)
+				t.Fatalf("never crossed %v, longest stall %v", stallClocks().threshold, maxStall)
 			}
 			if after := crossed.Sub(fault); after < 29*time.Second || after > 34*time.Second {
 				t.Fatalf("crossed %v after the fault, want about 30 s", after)

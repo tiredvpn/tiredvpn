@@ -23,7 +23,7 @@ import (
 // The signal measured on the stand (test-logs/degraded-2026-10-22) is the
 // stalled flow: the application sent data (a TCP segment with payload, or a
 // FIN) into a flow that recently got answers, and nothing came back down in
-// that flow for stallThreshold. It is read entirely inside the client, off
+// that flow for the threshold. It is read entirely inside the client, off
 // the packets it moves between the TUN and the tunnel.
 //
 // On the stand no healthy load crossed 0.58 s and an honestly slow 256 kbit/s
@@ -31,20 +31,35 @@ import (
 // crossed 30 s within 29.4-32.6 s. A dead application peer behind a healthy
 // tunnel crosses too, which is why a crossing is only a suspicion: it is
 // confirmed by keepalive echoes (stallMonitor.confirm).
-// The detector's clocks. Vars so tests can shorten them.
-var (
-	// stallThreshold is T: how long the oldest demand may wait for an answer
-	// in its flow before the session is suspected.
-	stallThreshold = 30 * time.Second
-	// stallEchoWait is how long one confirming keepalive waits for its echo.
-	stallEchoWait = 3 * time.Second
-	// stallCheckEvery is how often a session is checked; local only.
-	stallCheckEvery = time.Second
-	// stallConfirmPause is the wait between the two confirming keepalives:
-	// uniform 1-3 s. No measured distribution to match; it only keeps the
-	// pair from a fixed spacing.
-	stallConfirmPause = func() time.Duration { return time.Second + rand.N(2*time.Second) }
-)
+// stallClockSet is the detector's clocks.
+type stallClockSet struct {
+	// threshold is T: how long the oldest demand may wait for an answer in
+	// its flow before the session is suspected.
+	threshold time.Duration
+	// echoWait is how long one confirming keepalive waits for its echo.
+	echoWait time.Duration
+	// checkEvery is how often a session is checked; local only.
+	checkEvery time.Duration
+	// pause is the wait between the two confirming keepalives: uniform
+	// 1-3 s. No measured distribution to match; it only keeps the pair from
+	// a fixed spacing.
+	pause func() time.Duration
+}
+
+// stallClocksNow holds the clocks in force. Tests swap in shorter ones;
+// atomic, because relays of other tests may still be reading.
+var stallClocksNow atomic.Pointer[stallClockSet]
+
+func init() {
+	stallClocksNow.Store(&stallClockSet{
+		threshold:  30 * time.Second,
+		echoWait:   3 * time.Second,
+		checkEvery: time.Second,
+		pause:      func() time.Duration { return time.Second + rand.N(2*time.Second) },
+	})
+}
+
+func stallClocks() *stallClockSet { return stallClocksNow.Load() }
 
 const (
 	// stallFlowFresh is how recent a flow's last answer must be for new
@@ -146,6 +161,9 @@ func newFlowTable() *flowTable {
 // down books a packet the tunnel delivered into the TUN. Only here is a flow
 // created: a flow is worth watching once it has been answered.
 func (t *flowTable) down(pkt []byte, now time.Time) {
+	if t == nil {
+		return
+	}
 	seg, ok := parseTCPSegment(pkt)
 	if !ok {
 		return
@@ -174,6 +192,9 @@ func (t *flowTable) down(pkt []byte, now time.Time) {
 // or a FIN in a flow answered within stallFlowFresh. A bare ACK, a SYN, a RST
 // and a window probe into a closed window ask nothing of the peer.
 func (t *flowTable) up(pkt []byte, now time.Time) {
+	if t == nil {
+		return
+	}
 	seg, ok := parseTCPSegment(pkt)
 	if !ok || seg.syn || seg.rst || (seg.payload == 0 && !seg.fin) {
 		return
@@ -269,12 +290,13 @@ type stallMonitor struct {
 }
 
 func newStallMonitor(flows *flowTable) *stallMonitor {
+	c := stallClocks()
 	return &stallMonitor{
 		flows:     flows,
-		threshold: stallThreshold,
-		echoWait:  stallEchoWait,
+		threshold: c.threshold,
+		echoWait:  c.echoWait,
 		now:       time.Now,
-		pause:     stallConfirmPause,
+		pause:     c.pause,
 	}
 }
 
@@ -346,8 +368,13 @@ type verdictLimiter struct {
 	quietUntil time.Time
 }
 
-// stallVerdicts is the process-wide limiter: one process carries one tunnel.
-var stallVerdicts = &verdictLimiter{}
+// stallVerdictsNow is the process-wide limiter: one process carries one
+// tunnel. Atomic so a test can put in a fresh one under running relays.
+var stallVerdictsNow atomic.Pointer[verdictLimiter]
+
+func init() { stallVerdictsNow.Store(&verdictLimiter{}) }
+
+func stallVerdicts() *verdictLimiter { return stallVerdictsNow.Load() }
 
 // allow reports whether a verdict at now may be acted on, and books it.
 func (l *verdictLimiter) allow(now time.Time) bool {
@@ -386,15 +413,14 @@ func (e *sessionDegradedError) Error() string {
 func (e *sessionDegradedError) Is(target error) bool { return target == strategy.ErrServerSilent }
 
 // watchStalls is the stall detector on the desktop tunnel: once a second it
-// asks the session's flow table whether demand has waited stallThreshold, and
+// asks the session's flow table whether demand has waited the threshold, and
 // if so confirms with keepalives (stallMonitor). An unanswered confirmation
 // ends the session as degraded - at most once per session, and within the
 // process-wide verdict limit. Sessions on Android run through the control
 // socket's relay, which carries its own (tunRelay.watchStalls).
 func (v *VPNClient) watchStalls() {
-	mon := newStallMonitor(&v.stall)
 	var judged net.Conn // the session that has had its verdict
-	ticker := time.NewTicker(stallCheckEvery)
+	ticker := time.NewTicker(stallClocks().checkEvery)
 	defer ticker.Stop()
 	for {
 		select {
@@ -406,11 +432,15 @@ func (v *VPNClient) watchStalls() {
 			return
 		}
 		v.mu.Lock()
-		conn, connectedAt, lastRx, strat := v.conn, v.connectedAt, v.lastRx, v.strategy
+		conn, flows, connectedAt, lastRx, strat := v.conn, v.stall, v.connectedAt, v.lastRx, v.strategy
 		v.mu.Unlock()
-		if conn == nil || conn == judged {
+		if conn == nil || flows == nil || conn == judged {
 			continue
 		}
+		// The table of this conn's session, read with it: a confirmation
+		// still running when a swap or a hop replaces the session works on
+		// the old table and can not mark the new session's flows.
+		mon := newStallMonitor(flows)
 		stall, ok := mon.suspect(time.Since(connectedAt))
 		if !ok {
 			continue
@@ -432,7 +462,7 @@ func (v *VPNClient) watchStalls() {
 		if strat != nil {
 			name = strat.Name()
 		}
-		if !stallVerdicts.allow(time.Now()) {
+		if !stallVerdicts().allow(time.Now()) {
 			log.Warn("Session degraded: flow stalled %v, keepalive echo 0/%d (strategy=%s) - not acting, %d verdicts within %v already",
 				stall.Round(time.Millisecond), sent, name, stallVerdictMax, stallVerdictWindow)
 			continue
@@ -493,7 +523,7 @@ func (r *tunRelay) watchStalls() {
 	if count, ok := serverKeepaliveCount(r.serverConn); ok {
 		echoes = count
 	}
-	ticker := time.NewTicker(stallCheckEvery)
+	ticker := time.NewTicker(stallClocks().checkEvery)
 	defer ticker.Stop()
 	for {
 		select {
@@ -520,7 +550,7 @@ func (r *tunRelay) watchStalls() {
 			}
 			continue
 		}
-		if !stallVerdicts.allow(time.Now()) {
+		if !stallVerdicts().allow(time.Now()) {
 			log.Warn("Session degraded: flow stalled %v, keepalive echo 0/%d - not acting, %d verdicts within %v already",
 				stall.Round(time.Millisecond), sent, stallVerdictMax, stallVerdictWindow)
 			return
