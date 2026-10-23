@@ -561,7 +561,13 @@ func (p *IPPool) markFolded(newKey string, now, until time.Time) {
 	if len(p.folded) >= adoptFoldMax {
 		maps.DeleteFunc(p.folded, func(_ string, u time.Time) bool { return !now.Before(u) })
 		if len(p.folded) >= adoptFoldMax {
-			clear(p.folded)
+			// Still full of live records: drop the half closest to running
+			// out, not all of them. Clearing the map let every key search
+			// again at once under churn, the very throttle this map is for
+			// (P3-12 of the round-6 review).
+			ends := slices.SortedFunc(maps.Values(p.folded), time.Time.Compare)
+			cut := ends[len(ends)/2]
+			maps.DeleteFunc(p.folded, func(_ string, u time.Time) bool { return u.Before(cut) })
 		}
 	}
 	p.folded[newKey] = until
