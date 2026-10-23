@@ -335,8 +335,12 @@ func (s *TrafficMorphStrategy) Connect(ctx context.Context, target string) (net.
 		serverAddr := s.manager.GetServerAddr(ctx)
 		log.Debug("Traffic Morph: Using server address: %s", serverAddr)
 
-		// Use TLS connection with standard ALPN (no fingerprint in ClientHello)
+		// Use TLS connection with standard ALPN (no fingerprint in ClientHello).
+		// The SNI is drawn from the endpoint's pool, like every other
+		// strategy's; without a pool there is none, as before (P3-7 of the
+		// round-7 review).
 		tlsConfig := &tls.Config{
+			ServerName:         coverNameFor(ctx, ""),
 			InsecureSkipVerify: true,
 			NextProtos:         []string{"http/1.1"},
 			ClientSessionCache: s.manager.TLSSessionCache(serverAddr), // resume across reconnects

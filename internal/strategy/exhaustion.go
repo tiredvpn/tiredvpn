@@ -134,8 +134,12 @@ func (s *StateExhaustionStrategy) Connect(ctx context.Context, target string) (n
 		return s.baseStrat.Connect(ctx, target)
 	}
 
-	// Use TLS connection with Confusion wrapper (server requires protocol magic)
+	// Use TLS connection with Confusion wrapper (server requires protocol magic).
+	// The SNI is drawn from the endpoint's pool, like every other strategy's;
+	// without a pool it is the target's host name, or none for an address,
+	// as before (P3-7 of the round-7 review).
 	tlsConfig := &tls.Config{
+		ServerName:         coverNameFor(ctx, ""),
 		InsecureSkipVerify: true,
 		NextProtos:         []string{"http/1.1"},
 		ClientSessionCache: s.manager.TLSSessionCache(target), // resume across reconnects

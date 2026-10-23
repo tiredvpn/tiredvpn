@@ -611,7 +611,9 @@ Notes worth reading once:
   QUIC take their SNI from it for that endpoint, each connection drawing a name
   uniformly; it wins over `-reality-sni` and `-cover`. HTTP Polling,
   WebSocket padded, Geneva and anti-probe take their SNI and Host header from
-  it too. Those TLS fallbacks (and HTTP/2 Stego, Traffic Morph, State
+  it too, and Traffic Morph and State Exhaustion their SNI (without a pool,
+  Morph sends none and State Exhaustion the server's host name, if it has
+  one). Those TLS fallbacks (and HTTP/2 Stego, Traffic Morph, State
   Exhaustion) put a tag derived from the endpoint's secret in the ClientHello
   `session_id`. An exit running `-reality-b1` with `-reality-fallback-tag`
   hands them to their handlers rather than to the donor the name belongs to;

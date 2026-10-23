@@ -21,8 +21,9 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 - **Client: an SNI pool per server.** `[[servers]] sni = ["name", ...]` or
   `-reality-sni name,name` gives an endpoint its own cover names; REALITY,
-  Seqovl, HTTP/2 Stego, QUIC, HTTP Polling, WebSocket, Geneva and anti-probe
-  draw from it, one uniformly chosen name per connection. Names must be DNS
+  Seqovl, HTTP/2 Stego, QUIC, HTTP Polling, WebSocket, Geneva, anti-probe,
+  Traffic Morph and State Exhaustion draw from it, one uniformly chosen name
+  per connection. Names must be DNS
   host names. Set the same names on the exit with its own `-reality-sni`, so
   that a probe replaying one is mirrored to that site.
   **Clients 1.11.8 and older do not start with a config that has

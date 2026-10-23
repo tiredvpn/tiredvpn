@@ -283,6 +283,33 @@ func TestFixedHostStrategiesSendTheEndpointsSNI(t *testing.T) {
 	}
 }
 
+// TestMorphAndExhaustionSendTheEndpointsSNI is P3-7 of the round-7 review:
+// one SNI pool for every strategy, Denis's decision. Traffic Morph sent no
+// SNI at all and State Exhaustion the target's host, to an exit configured
+// with Google names. With a pool they draw from it; without one they keep
+// what they sent (none, for an address).
+func TestMorphAndExhaustionSendTheEndpointsSNI(t *testing.T) {
+	own := []string{"www.gstatic.com", "storage.googleapis.com"}
+	secret := []byte("fixed-host-secret")
+	for _, tc := range []struct {
+		name string
+		make func(m *Manager) Strategy
+	}{
+		{"Traffic Morph", func(m *Manager) Strategy { return NewTrafficMorphStrategy(m, nil, nil, secret) }},
+		{"State Exhaustion", func(m *Manager) Strategy { return NewStateExhaustionStrategy(m, secret) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, a, b := sniTestManager(t, own)
+			dialEach(t, m, tc.make(m), 12)
+			assertNamesFrom(t, "endpoint with sni", a.names(), own)
+			if got := a.names(); !slices.Contains(got, own[0]) || !slices.Contains(got, own[1]) {
+				t.Fatalf("endpoint with sni: %v in 12 dials, not drawn from the whole pool", got)
+			}
+			assertNamesFrom(t, "endpoint without sni", b.names(), []string{""})
+		})
+	}
+}
+
 // TestFixedHostStrategiesKeepSNIAndHostTogether: the strategies that send an
 // HTTP request inside their TLS name the same host in both places, whichever
 // one the pool gave the connection.
