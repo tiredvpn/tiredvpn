@@ -1,0 +1,382 @@
+package server
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/binary"
+	"io"
+	"net"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/tiredvpn/tiredvpn/internal/endpoint"
+	"github.com/tiredvpn/tiredvpn/internal/strategy"
+	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
+)
+
+// P1-1 of the rejudge r4 of PR #127: with an SNI pool of donor names, the TLS
+// fallback transports never reached their handlers on a B1 server - the gate
+// proxied them to the donor. These run the real client strategies against the
+// real dispatcher (handleConnection -> tryREALITYB1 -> handleTLSConnection),
+// with a loopback stand-in for the donor.
+
+const tagTestSecret = "fallback-tag-dispatch-secret"
+
+// donorPool is an endpoint SNI pool of built-in donor names: the
+// configuration docs/server.md recommends, and the one that broke.
+var donorPool = []string{"www.google.com", "yandex.ru"}
+
+// tagFallbackStrategies are the TLS fallbacks, as the client builds them.
+var tagFallbackStrategies = []struct {
+	name string
+	make func(m *strategy.Manager, secret []byte) strategy.Strategy
+}{
+	{"HTTP Polling", func(m *strategy.Manager, s []byte) strategy.Strategy { return strategy.NewHTTPPollingStrategy(m, s) }},
+	{"WebSocket padded", func(m *strategy.Manager, s []byte) strategy.Strategy {
+		return strategy.NewWebSocketPaddedStrategy(m, s)
+	}},
+	{"Geneva", func(m *strategy.Manager, s []byte) strategy.Strategy { return strategy.NewGenevaStrategy(m, s, "ru") }},
+	{"anti-probe", func(m *strategy.Manager, s []byte) strategy.Strategy { return strategy.NewAntiProbeStrategy(m, s) }},
+	{"HTTP/2 Stego", func(m *strategy.Manager, s []byte) strategy.Strategy {
+		return strategy.NewHTTP2StegoStrategy(m, s, "")
+	}},
+}
+
+// tagServer is a B1 server on loopback with the global secret and a stand-in
+// donor, every connection dispatched by handleConnection.
+type tagServer struct {
+	addr   string
+	donor  *countingDonor
+	srvCtx *serverContext
+}
+
+func newTagServer(t *testing.T, cover string) *tagServer {
+	t.Helper()
+	privB64, _, err := GenerateREALITYKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &Config{
+		Secret:             []byte(tagTestSecret),
+		REALITYB1Enabled:   true,
+		REALITYPrivateKey:  privB64,
+		REALITYMaxTimeDiff: 300,
+		REALITYCoverDomain: cover,
+	}
+	if err := InitREALITYKeys(cfg); err != nil {
+		t.Fatal(err)
+	}
+	gate := newREALITYB1Gate(cfg.REALITYMaxTimeDiff)
+	gate.index.Rebuild(nil, cfg.Secret)
+
+	donor := newCountingDonor(t)
+	srvCtx := &serverContext{
+		cfg:         cfg,
+		tlsConfig:   buildTLSProfile(cfg, selfSignedCertForTest(t)),
+		donorDialer: donor.dial,
+		b1Gate:      gate,
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	var id atomic.Uint64
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				handleConnection(conn, srvCtx, id.Add(1))
+			}()
+		}
+	}()
+	t.Cleanup(func() { ln.Close() })
+	return &tagServer{addr: ln.Addr().String(), donor: donor, srvCtx: srvCtx}
+}
+
+// countingDonor stands in for every donor site: it counts the connections
+// handed to it and keeps the first bytes of each.
+type countingDonor struct {
+	addr  string
+	conns atomic.Int64
+	got   chan []byte
+}
+
+func newCountingDonor(t *testing.T) *countingDonor {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	d := &countingDonor{addr: ln.Addr().String(), got: make(chan []byte, 64)}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+				first, _ := readRecord(c)
+				if len(first) > 0 {
+					d.conns.Add(1)
+					d.got <- first
+				}
+			}()
+		}
+	}()
+	return d
+}
+
+func (d *countingDonor) dial(string) (net.Conn, error) {
+	return net.DialTimeout("tcp", d.addr, time.Second)
+}
+
+// readRecord reads one TLS record, header included.
+func readRecord(r io.Reader) ([]byte, error) {
+	hdr := make([]byte, 5)
+	if _, err := io.ReadFull(r, hdr); err != nil {
+		return nil, err
+	}
+	rec := make([]byte, 5+int(binary.BigEndian.Uint16(hdr[3:])))
+	copy(rec, hdr)
+	_, err := io.ReadFull(r, rec[5:])
+	return rec, err
+}
+
+// tagClient is a manager over one endpoint at addr with the pool and secret.
+func tagClient(t *testing.T, addr, secret string, pool []string) (*strategy.Manager, endpoint.Candidate) {
+	t.Helper()
+	m := strategy.NewManager()
+	fam := endpoint.V4Only
+	if err := m.SetEndpointsTuned([]endpoint.Endpoint{
+		{Name: "b1", V4: addr, Secret: secret, SNI: pool},
+	}, endpoint.Tuning{Family: &fam}); err != nil {
+		t.Fatal(err)
+	}
+	cand, ok := m.CurrentCandidate()
+	if !ok {
+		t.Fatal("no candidate pinned")
+	}
+	return m, cand
+}
+
+// dialFallback runs one Connect of the strategy against the server.
+func dialFallback(t *testing.T, m *strategy.Manager, cand endpoint.Candidate, s strategy.Strategy) error {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	conn, err := m.ConnectStrategy(ctx, s, cand)
+	if err == nil {
+		conn.Close()
+	}
+	return err
+}
+
+// TestTaggedFallbacksReachTheirHandlersOnAB1Server is P1-1 itself: each TLS
+// fallback, its SNI drawn from a pool of donor names, completes its own
+// handshake through the dispatcher, and the donor sees none of them. With
+// the cover domain set too - it used to take every TLS hello B1 turned down.
+func TestTaggedFallbacksReachTheirHandlersOnAB1Server(t *testing.T) {
+	for _, cover := range []string{"", "www.microsoft.com"} {
+		for _, tc := range tagFallbackStrategies {
+			t.Run(tc.name+" cover="+cover, func(t *testing.T) {
+				srv := newTagServer(t, cover)
+				m, cand := tagClient(t, srv.addr, tagTestSecret, donorPool)
+				if err := dialFallback(t, m, cand, tc.make(m, []byte("not-the-endpoint-secret"))); err != nil {
+					t.Fatalf("Connect: %v (donor took %d connections)", err, srv.donor.conns.Load())
+				}
+				if n := srv.donor.conns.Load(); n != 0 {
+					t.Fatalf("the donor took %d connections of a tagged client", n)
+				}
+			})
+		}
+	}
+}
+
+// TestUntaggedAndForeignFallbacksStillGoToTheDonor is the other half, and the
+// control that the test above can see a donor at all: the same transport's
+// real ClientHello with its tag replaced by random bytes (a client older than
+// the tag), and one tagged with a key the server does not hold, both go to the
+// donor byte for byte.
+func TestUntaggedAndForeignFallbacksStillGoToTheDonor(t *testing.T) {
+	for _, cover := range []string{"", "www.microsoft.com"} {
+		for _, tc := range tagFallbackStrategies {
+			t.Run(tc.name+" cover="+cover, func(t *testing.T) {
+				srv := newTagServer(t, cover)
+
+				untagged := captureFallbackHello(t, tc.make, tagTestSecret)
+				setSessionID(t, untagged, randomSessionID(t))
+				expectDonor(t, srv, untagged)
+
+				foreign := captureFallbackHello(t, tc.make, "a-secret-this-server-does-not-know")
+				expectDonor(t, srv, foreign)
+			})
+		}
+	}
+}
+
+// TestReplayedFallbackHelloGoesToTheDonor: a captured tagged hello is let
+// through once; the same bytes again are a prober's and go to the donor. So
+// does a tag made outside the clock-skew window.
+func TestReplayedFallbackHelloGoesToTheDonor(t *testing.T) {
+	for _, tc := range tagFallbackStrategies {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newTagServer(t, "")
+			hello := captureFallbackHello(t, tc.make, tagTestSecret)
+
+			expectTLSPath(t, srv, hello)
+			expectDonor(t, srv, hello)
+
+			stale, err := customtls.FallbackTag(customtls.DeriveFallbackTagKey([]byte(tagTestSecret)),
+				time.Now().Add(-time.Duration(srv.srvCtx.cfg.REALITYMaxTimeDiff+60)*time.Second))
+			if err != nil {
+				t.Fatal(err)
+			}
+			setSessionID(t, hello, stale)
+			expectDonor(t, srv, hello)
+		})
+	}
+}
+
+// TestFallbackTagMatchesRegistryClients: the tag is checked against every
+// client's own secret, not just the global one - and an index built without
+// keys (the zero key is public) accepts nothing.
+func TestFallbackTagMatchesRegistryClients(t *testing.T) {
+	srv := newTagServer(t, "")
+	gate := srv.srvCtx.b1Gate
+	gate.index.Rebuild([]*ClientConfig{
+		{ID: "alice", Secret: "alice-own-secret", Enabled: true},
+		{ID: "bob", Secret: "bob-own-secret", Enabled: true},
+	}, nil)
+
+	hello := captureFallbackHello(t, tagFallbackStrategies[0].make, "bob-own-secret")
+	entry, ok := gate.fallbackTag(srv.srvCtx, hello[5:], time.Now())
+	if !ok || entry.clientID != registryIdentity("bob") {
+		t.Fatalf("bob's tag: ok=%v client=%v, want bob", ok, entry.clientID)
+	}
+	expectDonor(t, srv, captureFallbackHello(t, tagFallbackStrategies[0].make, tagTestSecret))
+
+	gate.index.mu.Lock()
+	for id, e := range gate.index.entries {
+		e.tagKey = customtls.FallbackTagKey{}
+		gate.index.entries[id] = e
+	}
+	gate.index.mu.Unlock()
+	zero, err := customtls.FallbackTag(customtls.FallbackTagKey{}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	setSessionID(t, hello, zero)
+	if _, ok := gate.fallbackTag(srv.srvCtx, hello[5:], time.Now()); ok {
+		t.Fatal("a tag under the zero key was accepted")
+	}
+}
+
+// captureFallbackHello records the first TLS record the strategy sends when
+// it dials an endpoint with secret and the donor pool.
+func captureFallbackHello(t *testing.T, build func(*strategy.Manager, []byte) strategy.Strategy, secret string) []byte {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	got := make(chan []byte, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+		rec, _ := readRecord(c)
+		got <- rec
+	}()
+	m, cand := tagClient(t, ln.Addr().String(), secret, donorPool)
+	go func() { _ = dialFallback(t, m, cand, build(m, nil)) }()
+	select {
+	case rec := <-got:
+		if len(rec) < 6 || rec[0] != 0x16 {
+			t.Fatalf("captured %d bytes, not a ClientHello", len(rec))
+		}
+		return rec
+	case <-time.After(5 * time.Second):
+		t.Fatal("the strategy sent no ClientHello")
+		return nil
+	}
+}
+
+func randomSessionID(t *testing.T) [customtls.AuthSessionIDLen]byte {
+	t.Helper()
+	var b [customtls.AuthSessionIDLen]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func setSessionID(t *testing.T, record []byte, sid [customtls.AuthSessionIDLen]byte) {
+	t.Helper()
+	off, err := customtls.SessionIDOffset(record[5:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy(record[5+off:], sid[:])
+}
+
+// expectDonor sends record to the server and requires the donor to receive it
+// byte for byte.
+func expectDonor(t *testing.T, srv *tagServer, record []byte) {
+	t.Helper()
+	conn, err := net.Dial("tcp", srv.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write(record); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-srv.donor.got:
+		if string(got) != string(record) {
+			t.Fatal("the donor received something other than the ClientHello")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the hello did not reach the donor")
+	}
+}
+
+// expectTLSPath sends record to the server and requires a ServerHello from
+// our own TLS stack, with the donor untouched.
+func expectTLSPath(t *testing.T, srv *tagServer, record []byte) {
+	t.Helper()
+	before := srv.donor.conns.Load()
+	conn, err := net.Dial("tcp", srv.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write(record); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	rec, err := readRecord(conn)
+	if err != nil || rec[0] != 0x16 || rec[5] != 0x02 {
+		t.Fatalf("no ServerHello from our TLS stack (err %v)", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if n := srv.donor.conns.Load() - before; n != 0 {
+		t.Fatalf("the donor took %d connections", n)
+	}
+}

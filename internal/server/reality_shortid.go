@@ -15,6 +15,11 @@ import (
 type shortIDEntry struct {
 	clientID clientIdentity
 	secret   []byte
+
+	// tagKey checks the fallback-transport tag a client's TLS fallbacks put
+	// in their session_id (customtls.FallbackTag). Derived here, once per
+	// rebuild, so the connection path pays HMACs and no HKDF.
+	tagKey customtls.FallbackTagKey
 }
 
 // shortIDIndex maps the 8-byte identifier carried in session_id to a client.
@@ -68,7 +73,11 @@ func (i *shortIDIndex) Rebuild(clients []*ClientConfig, globalSecret []byte) {
 			continue
 		}
 		secret := []byte(c.Secret)
-		next[customtls.ShortIDFor(secret)] = shortIDEntry{clientID: registryIdentity(c.ID), secret: secret}
+		next[customtls.ShortIDFor(secret)] = shortIDEntry{
+			clientID: registryIdentity(c.ID),
+			secret:   secret,
+			tagKey:   customtls.DeriveFallbackTagKey(secret),
+		}
 	}
 
 	if len(globalSecret) > 0 {
@@ -77,7 +86,11 @@ func (i *shortIDIndex) Rebuild(clients []*ClientConfig, globalSecret []byte) {
 		// being silently merged into "global".
 		id := customtls.ShortIDFor(globalSecret)
 		if _, taken := next[id]; !taken {
-			next[id] = shortIDEntry{clientID: sharedIdentity(globalClientID), secret: globalSecret}
+			next[id] = shortIDEntry{
+				clientID: sharedIdentity(globalClientID),
+				secret:   globalSecret,
+				tagKey:   customtls.DeriveFallbackTagKey(globalSecret),
+			}
 		}
 	}
 
@@ -93,6 +106,28 @@ func (i *shortIDIndex) Lookup(id [customtls.AuthShortIDLen]byte) (shortIDEntry, 
 	defer i.mu.RUnlock()
 	e, ok := i.entries[id]
 	return e, ok
+}
+
+// MatchFallbackTag returns the client whose key opens sid as a fallback tag,
+// with the time the tag was made at.
+//
+// One HMAC per client: unlike a short ID, the tag carries nothing that can be
+// looked up without the key - anything that could would be a static field an
+// observer links connections by. It runs only for a ClientHello B1 already
+// turned down, which costs a donor dial or a TLS handshake, both dearer than a
+// few hundred HMACs.
+func (i *shortIDIndex) MatchFallbackTag(sid [customtls.AuthSessionIDLen]byte) (shortIDEntry, uint32, bool) {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	for _, e := range i.entries {
+		if e.tagKey == (customtls.FallbackTagKey{}) {
+			continue // an entry built without a key; the zero key is public
+		}
+		if at, ok := e.tagKey.Open(sid); ok {
+			return e, at, true
+		}
+	}
+	return shortIDEntry{}, 0, false
 }
 
 // stale reports whether the index is old enough to want a refresh.

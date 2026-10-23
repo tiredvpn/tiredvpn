@@ -488,6 +488,11 @@ type serverContext struct {
 	// Nil means net.DialTimeout, which is what production uses; tests set it
 	// so the donor fallback can be exercised without reaching the internet.
 	donorDialer func(addr string) (net.Conn, error)
+
+	// b1Gate, when set, is the REALITY B1 gate this context uses instead of
+	// the process-wide one. Only tests set it: the process-wide gate is built
+	// once, from whichever context reaches it first.
+	b1Gate *realityB1Gate
 }
 
 // knockReplayGuard remembers the per-connection knock nonces seen inside the
