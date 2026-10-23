@@ -701,7 +701,7 @@ func reconnectTUN(ctx context.Context, mgr *strategy.Manager, serverAddr string,
 	}
 	strat := sess.strat
 
-	log.Info("Network change reconnect successful via %s, sending TUN handshake", strat.Name())
+	log.Info("Reconnect successful via %s, sending TUN handshake", strat.Name())
 
 	// Send TUN mode handshake with our current IP
 	// Server will recognize us and restore the session

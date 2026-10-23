@@ -46,10 +46,31 @@ func (s *targetPipeStrategy) last() string {
 	return s.targets[len(s.targets)-1]
 }
 
-var androidPool = []string{"203.0.113.10:995", "203.0.113.20:995"}
+// androidPool is two loopback servers that accept and hang up: the family
+// probe the endpoint walk makes must get an answer, or it moves the pin on
+// its own after its timeout (the scripted exit itself is a pipe).
+var androidPool []string
 
 func androidPoolManager(t *testing.T) (*strategy.Manager, *targetPipeStrategy) {
 	t.Helper()
+	if androidPool == nil {
+		for range 2 {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			go func() {
+				for {
+					c, err := ln.Accept()
+					if err != nil {
+						return
+					}
+					c.Close()
+				}
+			}()
+			androidPool = append(androidPool, ln.Addr().String())
+		}
+	}
 	m := strategy.NewManager()
 	var eps []endpoint.Endpoint
 	for i, a := range androidPool {
