@@ -174,10 +174,10 @@ func TestRouteRuleDoesNotLatch(t *testing.T) {
 	m.SessionEnded(SessionEnd{Strategy: "reality", Endpoint: endpoint.Candidate{Addr: a.addr, EndpointIdx: 0}, HasEndpoint: true, Dead: true})
 	m.ResetForNetworkChange()
 	m.mu.RLock()
-	marker := m.lastDeadEndpoint
+	marker := m.lastDeath
 	m.mu.RUnlock()
-	if marker != -1 {
-		t.Fatalf("ResetForNetworkChange kept the route marker at %d", marker)
+	if marker.server != -1 {
+		t.Fatalf("ResetForNetworkChange kept the route marker at %+v", marker)
 	}
 }
 

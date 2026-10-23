@@ -443,9 +443,9 @@ func TestEndpointHealthSurvivesClientRecreation(t *testing.T) {
 
 	silentA.settle(t)
 	silentB.settle(t)
-	dialsBefore := silentA.accepts.Load() + silentB.accepts.Load()
-	if dialsBefore == 0 {
-		t.Fatal("cycle one dialled neither silent server - the test proves nothing")
+	dialsBefore := silentA.accepts.Load()
+	if dialsBefore == 0 || silentB.accepts.Load() == 0 {
+		t.Fatal("cycle one did not dial both silent servers - the test proves nothing")
 	}
 
 	// The service throws the client away and builds a new one. Same process,
@@ -462,8 +462,23 @@ func TestEndpointHealthSurvivesClientRecreation(t *testing.T) {
 	}
 	silentA.settle(t)
 	silentB.settle(t)
-	if after := silentA.accepts.Load() + silentB.accepts.Load(); after != dialsBefore {
-		t.Fatalf("cycle two dialled the silent servers %d more times; a fresh client "+
+	if after := silentA.accepts.Load(); after != dialsBefore {
+		t.Fatalf("cycle two dialled the first silent server %d more times; a fresh client "+
 			"must inherit the verdict, not rediscover it", after-dialsBefore)
 	}
+	// The same silence on a second server in a row reads as the route
+	// (Manager.routeDeath): B is not charged in cycle one, and cycle two
+	// gives it one more cycle before it is. One cycle, no more.
+	if got := seen.since(0); countOf(got, silentB.addr) > 2*strategies {
+		t.Fatalf("the second silent server was dialled %d times over two cycles", countOf(got, silentB.addr))
+	}
+}
+
+func countOf(list []string, s string) (n int) {
+	for _, v := range list {
+		if v == s {
+			n++
+		}
+	}
+	return n
 }

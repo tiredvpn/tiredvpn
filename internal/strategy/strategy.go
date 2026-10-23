@@ -198,10 +198,10 @@ type Manager struct {
 	// silence; cleared by the gate run it causes. Guarded by m.mu.
 	preflightArmed bool
 
-	// lastDeadEndpoint is the endpoint index of the last session that died
-	// young (see SessionEnded), -1 when a useful session has ended since.
-	// Guarded by m.mu.
-	lastDeadEndpoint int
+	// lastDeath is the last verdict a session or a cycle gave a server (see
+	// routeDeath); server -1 when a useful session has ended since. Guarded by
+	// m.mu.
+	lastDeath deathMark
 
 	// Strategy upgrade (see offerUpgrade). upgradeCallback receives the
 	// candidates a periodic reprobe found working; upgradeFails counts each
@@ -856,7 +856,7 @@ func NewManager() *Manager {
 		stopReprobe:           make(chan struct{}),
 		tcpFailuresBeforeQUIC: 3, // Switch to QUIC after 3 TCP timeouts
 		tlsSessionCache:       tls.NewLRUClientSessionCache(64),
-		lastDeadEndpoint:      -1,
+		lastDeath:             deathMark{server: -1},
 	}
 	m.lifeCtx, m.lifeCancel = context.WithCancel(context.Background())
 	log.Debug("Strategy Manager created (probeTimeout=%v, connectTimeout=%v, maxRetries=%d)",
@@ -1469,7 +1469,7 @@ func (m *Manager) SessionEnded(end SessionEnd) (storming bool) {
 		if m.lastSuccessfulStrategy != nil && m.lastSuccessfulStrategy.ID() == end.Strategy {
 			m.lastSuccessfulTime = time.Now()
 		}
-		m.lastDeadEndpoint = -1
+		m.lastDeath = deathMark{server: -1}
 		m.mu.Unlock()
 		if sel != nil && end.HasEndpoint {
 			sel.ReportSessionUseful(end.Endpoint)
@@ -1479,9 +1479,9 @@ func (m *Manager) SessionEnded(end SessionEnd) (storming bool) {
 
 	switch {
 	case end.Dead:
-		m.chargeSessionEndpoint(sel, end, "session went silent right after connecting")
+		m.chargeSessionEndpoint(sel, end, deathDead, "session went silent right after connecting")
 	case end.Degraded:
-		m.chargeSessionEndpoint(sel, end, "session degraded: a flow stalled and keepalives went unanswered")
+		m.chargeSessionEndpoint(sel, end, deathDegraded, "session degraded: a flow stalled and keepalives went unanswered")
 	case storming && !end.UpgradeFailed:
 		// A strategy whose sessions keep dying on this endpoint is evidence
 		// against the endpoint too: a freeze keyed to the address kills every
@@ -1494,20 +1494,15 @@ func (m *Manager) SessionEnded(end SessionEnd) (storming bool) {
 		// detector keys on the strategy, so short sessions from before the
 		// switch to the fallback are still in its history, and the server the
 		// fallback carries traffic on is not what failed.
-		m.chargeSessionEndpoint(sel, end, "storm")
+		m.chargeSessionEndpoint(sel, end, deathStorm, "storm")
 	}
 	return storming
 }
 
 // chargeSessionEndpoint parks the endpoint a dead session or a storm happened
-// on, growing the park with each one in a row (Selector.ReportDeadSession).
-//
-// Unless the previous one happened on a different server with nothing useful
-// in between: the same death on two servers in a row says the route, not the
-// servers, and parking every server it touches would walk the client through
-// the whole pool - listing it for an observer and burning every address. That
-// case is left to the storm detector, which works on the strategies.
-func (m *Manager) chargeSessionEndpoint(sel *endpoint.Selector, end SessionEnd, why string) {
+// on, growing the park with each one in a row (Selector.ReportDeadSession) -
+// unless it is the route's death (routeDeath).
+func (m *Manager) chargeSessionEndpoint(sel *endpoint.Selector, end SessionEnd, class deathClass, why string) {
 	if sel == nil || !end.HasEndpoint {
 		return
 	}
@@ -1515,17 +1510,7 @@ func (m *Manager) chargeSessionEndpoint(sel *endpoint.Selector, end SessionEnd, 
 		log.Info("Endpoint %s: %s, but the local network cannot be confirmed up - not charging it", end.Endpoint, why)
 		return
 	}
-	m.mu.Lock()
-	prev := m.lastDeadEndpoint
-	// Moved on every decision, not only the first: kept on the first server,
-	// the marker made every later death on the second one look like "the same
-	// death on another server" and spared it forever, so a clean third server
-	// was never reached. Now a server gets one pass after a switch and is
-	// charged on its second death in a row.
-	m.lastDeadEndpoint = end.Endpoint.EndpointIdx
-	m.mu.Unlock()
-	if prev >= 0 && prev != end.Endpoint.EndpointIdx {
-		log.Info("Endpoint %s: %s, as on the previous server - the route, not the server; not parking it", end.Endpoint, why)
+	if m.routeDeath(end.Endpoint, class, why, []string{end.Strategy}) {
 		return
 	}
 	if sel.ReportDeadSession(end.Endpoint) {
@@ -1534,6 +1519,67 @@ func (m *Manager) chargeSessionEndpoint(sel *endpoint.Selector, end SessionEnd, 
 		log.Info("Endpoint %s charged for its session (%s)", end.Endpoint, why)
 	}
 	m.logEndpointHealth(sel, end.Endpoint)
+}
+
+// deathClass names the kind of verdict a server got, for routeDeath.
+type deathClass string
+
+const (
+	deathSilent    deathClass = "silence"
+	deathSwallowed deathClass = "swallowed handshakes"
+	deathDead      deathClass = "dead session"
+	deathDegraded  deathClass = "stalled session"
+	deathStorm     deathClass = "storm"
+)
+
+// deathMark is the last verdict given to a server: which one, and of what kind.
+type deathMark struct {
+	server int
+	class  deathClass
+}
+
+// routeDeath books a verdict of class on cand's server and reports whether it
+// is the route's rather than the server's. Then it parks the transports that
+// died - ids - instead of the server, and the caller charges nothing.
+//
+// The same death on two different servers in a row, with nothing useful in
+// between, says the route: a censor killing one transport on every exit, the
+// way the stand's Polling throttle did. Parking every server it touches walked
+// the client through the whole pool - listing it for an observer and burning
+// every address - on the transport that cannot work anywhere, and a stall
+// verdict never changed the strategy at all (P2-7 of the round-4 review). So
+// the second server is not charged, the transports are parked like a storm,
+// the fast path forgets them, and the next cycle tries another transport on
+// the same server. The pool walk stops at two servers. Deaths on the two
+// families of one server are one server's, and are charged as usual.
+//
+// The mark moves on every verdict: kept on the first server, it made every
+// later death on the second look like "the same death on another server" and
+// spared it forever. A server gets one pass after a switch and is charged on
+// its second death in a row.
+func (m *Manager) routeDeath(cand endpoint.Candidate, class deathClass, why string, ids []string) bool {
+	m.mu.Lock()
+	prev := m.lastDeath
+	m.lastDeath = deathMark{server: cand.EndpointIdx, class: class}
+	m.mu.Unlock()
+	if prev.server < 0 || prev.server == cand.EndpointIdx || prev.class != class || len(ids) == 0 {
+		return false
+	}
+	if m.IsForced() {
+		log.Warn("Endpoint %s: %s, as on the previous server - the route, not the server; forced strategy, nothing else to try", cand, why)
+		return true
+	}
+	for _, id := range ids {
+		m.stormDetector.Park(id)
+	}
+	m.mu.Lock()
+	if m.lastSuccessfulStrategy != nil && slices.Contains(ids, m.lastSuccessfulStrategy.ID()) {
+		m.lastSuccessfulStrategy = nil
+	}
+	m.mu.Unlock()
+	log.Warn("Endpoint %s: %s, as on the previous server - the route, not the server: parking %s for %v and trying other transports here",
+		cand, why, strings.Join(ids, ", "), stormCooldown)
+	return true
 }
 
 // maxEndpointAttempts caps how many endpoint candidates a single Connect may
@@ -1679,7 +1725,7 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 
 		start := time.Now()
 		scan := &scanState{addr: cand.Addr}
-		var swallowedOn []string
+		var swallowedOn, swallowedTransports []string
 		conn, strategy, err := m.connectScan(dialCtx, m.withHoppedPort(cand.Addr), nil, scan)
 		if err == nil {
 			m.clearSwallowed(cand.Addr)
@@ -1692,7 +1738,7 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 			// Context cancelled, or no strategy was even eligible. Neither
 			// says anything about this endpoint on its own; a run of them in
 			// which its handshakes heard nothing does (swallowCycle).
-			verdict, covered, _ := m.swallowCycle(cand.Addr, scan)
+			verdict, covered, heard := m.swallowCycle(cand.Addr, scan)
 			if !verdict {
 				if !scan.answered && (scan.timeouts > 0 || scan.unheard > 0) {
 					lastErr = fmt.Errorf("%w: %w", ErrCycleUnanswered, err)
@@ -1711,11 +1757,20 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 			}
 			err = fmt.Errorf("%w: %w, handshakes swallowed cycle after cycle: %w", errAddrSilent, errStrategyScanFailed, err)
 			lastErr = err
-			swallowedOn = covered
+			swallowedOn, swallowedTransports = covered, heard
 		} else {
 			m.endSwallowRun(cand.Addr)
 		}
 		if errors.Is(err, errAddrSilent) {
+			class, died := deathSilent, scan.silent
+			if swallowedOn != nil {
+				class, died = deathSwallowed, swallowedTransports
+			}
+			if m.routeDeath(cand, class, "it answered nothing", died) {
+				// Not the server's: stay, and let the next cycle try the
+				// transports still standing here.
+				break
+			}
 			if sel.ReportSilent(cand, swallowedOn...) {
 				log.Warn("Endpoint %s: every address of the server has a verdict - parking the server", cand)
 			}
@@ -1914,6 +1969,9 @@ type scanState struct {
 	// unheard counts the attempts that heard nothing and were no verdict,
 	// evidence or not: what makes a cycle "unanswered" (ErrCycleUnanswered).
 	unheard int
+	// silent lists the non-UDP transports whose attempt was silence
+	// (attemptSilent): what a silence verdict says died.
+	silent []string
 }
 
 // swallowEvidence reports whether an attempt of s that heard nothing for
@@ -2285,6 +2343,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 				switch m.classifyAttempt(err, latency, attemptLimit(lastSuccessful, budget, dialBudget)) {
 				case attemptSilent:
 					scan.timeouts++
+					scan.silent = append(scan.silent, lastSuccessful.ID())
 					fastSilent = true
 					// It had its turn this cycle; dialling it again in the
 					// scan would only spend the rest of the budget the same way.
@@ -2590,6 +2649,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			case attemptSilent:
 				if !isUDPBasedStrategy(s) {
 					scan.timeouts++
+					scan.silent = append(scan.silent, s.ID())
 					log.Debug("TCP silence count: %d/%d", scan.timeouts, tcpFailuresThreshold)
 				}
 				// Track TCP timeouts for Android fast fallback
@@ -4220,7 +4280,7 @@ func (m *Manager) ResetForNetworkChange() {
 
 	// Storm state is tied to the old network - clear it after a network change.
 	m.stormDetector.Reset()
-	m.lastDeadEndpoint = -1
+	m.lastDeath = deathMark{server: -1}
 	m.swallowed = nil
 
 	// So is the UDP verdict: it gated QUIC for the old network (or for no
