@@ -27,9 +27,19 @@ Versions follow [Semantic Versioning](https://semver.org/).
   that a probe replaying one is mirrored to that site.
 - **Server: `-reality-sni`** adds operator-chosen donor names to the built-in
   list, on the B1 and the legacy unauthenticated paths.
+- **Server: `reality_fallback_tag_total`** counts the TLS fallback connections
+  the B1 gate let through on a fallback-transport tag.
 
 ### Fixed
 
+- **TLS fallback transports reach their handlers on a `-reality-b1` server.**
+  HTTP Polling, WebSocket padded, Geneva, anti-probe, HTTP/2 Stego, Traffic
+  Morph, State Exhaustion and a relay's upstream leg put a tag derived from
+  their secret in the ClientHello `session_id`; the B1 gate hands a fresh tag
+  to the ordinary TLS path instead of proxying it to the donor its SNI names,
+  or to `-reality-cover-domain`. Replayed, stale and foreign tags still go to
+  the donor. Clients older than this keep the old behaviour on B1 servers;
+  servers older than this ignore the tag.
 - **Client: TLS session tickets are kept per server**, so a ticket from one
   exit is never offered to another that shares a cover name.
 - **Client: failover to another server in the pool works when a server goes
@@ -60,6 +70,9 @@ Versions follow [Semantic Versioning](https://semver.org/).
   download trickles; HTTP Polling leaves a frozen server 32-42 s in; a relay
   sends a keepalive to its exit at most every 30 s while its client is
   active. No change to the protocol.
+- On the wire: the TLS fallback transports' `session_id` is a keyed tag
+  instead of random bytes. Same 32 bytes, different on every connection; the
+  rest of the ClientHello is unchanged.
 
 ## [1.11.8] - 2026-10-20
 
