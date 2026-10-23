@@ -85,9 +85,9 @@ type IPPool struct {
 	leases   map[string]*IPLease // In-memory: IP -> Lease
 	byClient map[string]string   // In-memory: ClientID -> IP
 
-	// folded records when AdoptAll last folded the old keys of a lease key, so
-	// the next handshakes of that client skip the fold - see adoptFoldTTL.
-	// Guarded by mu.
+	// folded records until when AdoptAll leaves a lease key alone: its old
+	// keys folded (adoptFoldTTL), or a search for them that did not finish
+	// (adoptRetryAfter). Guarded by mu.
 	folded map[string]time.Time
 }
 
@@ -98,6 +98,13 @@ type IPPool struct {
 // sharing the same Redis can still write an old key, and this bounds how long
 // that lease waits for its fold.
 const adoptFoldTTL = 10 * time.Minute
+
+// adoptRetryAfter is how long a lease key waits after a search for its old
+// keys that did not finish. Not marking it at all made every TUN handshake of
+// the client pay the search again - up to 64 SCAN rounds on a Redis with more
+// than about 32k keys, where the search never finishes (P3-8 of the round-5
+// review). A minute bounds that to one search per minute per credential.
+const adoptRetryAfter = time.Minute
 
 // adoptFoldMax caps folded. Shared keys carry the client's origin, so the map
 // grows with every address a global-secret client comes from.
@@ -479,16 +486,17 @@ func (p *IPPool) stickyLookup(clientID string) string {
 // with ctx: a SCAN walks the whole keyspace whatever its MATCH, and under the
 // lock a reconnect herd of cold credentials queued every allocation behind
 // it. A search that did not finish - cut short, failed, or past its round
-// limit - does not mark the key folded, so the next handshake looks again.
+// limit - does not mark the key folded: the next look comes after
+// adoptRetryAfter, not on the next handshake.
 func (p *IPPool) AdoptAll(ctx context.Context, oldKeys, oldPrefixes []string, newKey string) {
 	if newKey == "" {
 		return
 	}
 	now := time.Now()
 	p.mu.Lock()
-	at, ok := p.folded[newKey]
+	until, ok := p.folded[newKey]
 	p.mu.Unlock()
-	if ok && now.Sub(at) < adoptFoldTTL {
+	if ok && now.Before(until) {
 		return
 	}
 	var stored []string
@@ -502,7 +510,9 @@ func (p *IPPool) AdoptAll(ctx context.Context, oldKeys, oldPrefixes []string, ne
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if complete {
-		defer p.markFolded(newKey, now)
+		defer p.markFolded(newKey, now, now.Add(adoptFoldTTL))
+	} else {
+		defer p.markFolded(newKey, now, now.Add(adoptRetryAfter))
 	}
 	have := p.stickyLookup(newKey)
 	for _, prefix := range oldPrefixes {
@@ -543,18 +553,18 @@ func (p *IPPool) AdoptAll(ctx context.Context, oldKeys, oldPrefixes []string, ne
 	}
 }
 
-// markFolded records newKey as folded at now. Caller must hold p.mu.
-func (p *IPPool) markFolded(newKey string, now time.Time) {
+// markFolded leaves newKey alone until until. Caller must hold p.mu.
+func (p *IPPool) markFolded(newKey string, now, until time.Time) {
 	if p.folded == nil {
 		p.folded = make(map[string]time.Time)
 	}
 	if len(p.folded) >= adoptFoldMax {
-		maps.DeleteFunc(p.folded, func(_ string, at time.Time) bool { return now.Sub(at) >= adoptFoldTTL })
+		maps.DeleteFunc(p.folded, func(_ string, u time.Time) bool { return !now.Before(u) })
 		if len(p.folded) >= adoptFoldMax {
 			clear(p.folded)
 		}
 	}
-	p.folded[newKey] = now
+	p.folded[newKey] = until
 }
 
 // adoptScanBatch and adoptScanRounds bound the Redis SCAN of
