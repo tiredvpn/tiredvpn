@@ -620,10 +620,11 @@ func TestARelayLegWithoutAClientGetsNoKeepalive(t *testing.T) {
 
 // TestABusyRelayLegGetsNoKeepalive: traffic both ways is all the two read
 // deadlines need, and a keepalive on a busy leg would only add a frame. A
-// real leg carries a packet each way every 40 ms against a 200 ms quiet
-// period.
+// real leg carries a packet each way every 40 ms against a 500 ms quiet
+// period - long enough that a scheduling stall under -race load is not
+// taken for a quiet leg.
 func TestABusyRelayLegGetsNoKeepalive(t *testing.T) {
-	setKeepaliveDraw(t, func(time.Duration) time.Duration { return 200 * time.Millisecond })
+	setKeepaliveDraw(t, func(time.Duration) time.Duration { return 500 * time.Millisecond })
 	sent := keepaliveLog(t)
 	exit, sink, clientIP, down := dialLeg(t)
 	w := exitWriterFor(t, exit, clientIP)
@@ -643,7 +644,7 @@ func TestABusyRelayLegGetsNoKeepalive(t *testing.T) {
 	}
 
 	// Control: the same leg gone quiet one way gets its keepalive.
-	for range 10 {
+	for range 25 {
 		sink.UpdateActivity()
 		_ = sink.WritePacket(up)
 		time.Sleep(40 * time.Millisecond)
