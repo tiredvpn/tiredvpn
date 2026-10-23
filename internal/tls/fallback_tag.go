@@ -43,12 +43,14 @@ import (
 // by. The key comes from the client's secret through HKDF with its own info
 // string, so a tag is never a B1 credential and a B1 session_id is never a tag.
 //
-// What the tag does not do is bind the rest of the hello. crypto/tls draws the
-// session_id before it builds the key shares, and offers no hook in between.
-// A captured hello replayed byte for byte is caught by the server's replay
-// cache; a censor that drops the original and sends it first instead reaches
-// our TLS stack with a key share it holds no private key for - B1 accepts the
-// same exposure.
+// What the tag does not do is bind the rest of the hello, or the exit.
+// crypto/tls draws the session_id before it builds the key shares, and offers
+// no hook in between. A captured hello replayed byte for byte to the same
+// exit is caught by its replay cache; but a copy of the session_id alone, in
+// a prober's own ClientHello, is let through once by every other exit that
+// holds the secret and has not seen it. B1 has no such exposure: its seal
+// binds the hello and the exit's key. That is why the server admits tags only
+// with -reality-fallback-tag. Binding the tag is planned as its version 2.
 const (
 	// FallbackTagInfo is the HKDF info string of the tag key. Distinct from
 	// AuthHKDFInfo and ShortIDInfo on purpose: one secret, three keys that

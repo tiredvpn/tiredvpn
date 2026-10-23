@@ -108,8 +108,11 @@ func (d *UpstreamDialer) connectStego(ctx context.Context) (net.Conn, *tls.Conn,
 	}
 
 	// TLS handshake on the optimized TCP connection. The session_id carries
-	// the fallback-transport tag, so an exit running -reality-b1 takes the
-	// relay for one of its own clients rather than a stranger for the donor.
+	// the fallback-transport tag, so an exit running -reality-b1 with
+	// -reality-fallback-tag takes the relay for one of its own clients rather
+	// than a stranger. Without the flag it is a stranger's hello, as in
+	// 1.11.8: an exit with a cover domain sends it there, and one without
+	// sends it on to the ordinary path, its SNI being no donor.
 	tlsConn := tls.Client(tcpConn, customtls.WithFallbackTag(d.tlsConfig, d.upstreamSecret))
 
 	// Set deadline for handshake

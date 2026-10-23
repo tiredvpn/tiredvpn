@@ -363,6 +363,7 @@ the donor, as its B1 hellos are.
 | 1.11.8 or older (no tag) | new, `-reality-b1` | TLS fallbacks mirrored when the SNI is a donor or a cover domain is set, otherwise the ordinary path - as before |
 | any | without `-reality-b1` | the tag is ignored; as before |
 | new relay (`-upstream`) | new, `-reality-b1 -reality-fallback-tag` | the upstream leg is tagged with its upstream secret and reaches its handler |
+| new relay (`-upstream`) | `-reality-b1` without the flag, with `-reality-cover-domain` | the upstream leg goes to the cover domain, as in 1.11.8 |
 
 **Update B1 exits and turn on `-reality-fallback-tag` before handing out SNI
 pools** of donor names to clients that need their TLS fallbacks.

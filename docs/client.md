@@ -618,9 +618,14 @@ Notes worth reading once:
   any other exit ignores the tag, and on a B1 exit without the flag those
   transports reach the donor. The tag lets anyone who captures one test
   guesses at the secret offline: use a random secret of 32 bytes or more
-  (the client warns at startup about a weak one). IMAP keeps doing what a mail client does: the dialled hostname, or
-  no SNI for an IP. `sni = ""` means no pool. Give the exit the same names with its `-reality-sni`: an exit without
-  them answers a probe that replays one of these names with its cover domain's
+  (the client warns at startup about a weak one; a secret it lets pass is
+  not therefore safe - any secret a person chose can be guessed).
+
+  IMAP keeps doing what a mail client does: the dialled hostname, or no SNI
+  for an IP. `sni = ""` means no pool.
+
+  Give the exit the same names with its `-reality-sni`: an exit without them
+  answers a probe that replays one of these names with its cover domain's
   certificate instead of the named site's.
 - **`policy` other than `priority`, and `health_check = "active"`, are not
   applied yet.** The value is validated (a misspelling is a startup error) and
