@@ -19,19 +19,20 @@ import (
 // loop closes a raw conn after 60 s without a frame. Every idle leg through a
 // relay died after a minute, on the client's 10 s grid. These run the real
 // legs - dialRelayTUN on the relay, handleConnection and runH2FrameLoop on
-// the exit - with every clock scaled down 50 times, the draw included.
+// the exit - with every clock scaled down 25 times, the draw included.
 
-const legScale = 50
+const legScale = 25
 
 // scaleLegClocks divides the leg's three clocks by legScale for the test.
 func scaleLegClocks(t *testing.T) {
 	t.Helper()
-	oldRead, oldIdle, oldDraw := h2FrameReadTimeout, relayTUNIdleTimeout, relayKeepaliveAfter
-	h2FrameReadTimeout /= legScale
-	relayTUNIdleTimeout /= legScale
-	relayKeepaliveAfter = func() time.Duration { return oldDraw() / legScale }
+	oldRead, oldIdle := h2FrameReadTimeoutNs.Load(), relayTUNIdleTimeoutNs.Load()
+	h2FrameReadTimeoutNs.Store(oldRead / legScale)
+	relayTUNIdleTimeoutNs.Store(oldIdle / legScale)
+	setKeepaliveDraw(t, func(d time.Duration) time.Duration { return d / legScale })
 	t.Cleanup(func() {
-		h2FrameReadTimeout, relayTUNIdleTimeout, relayKeepaliveAfter = oldRead, oldIdle, oldDraw
+		h2FrameReadTimeoutNs.Store(oldRead)
+		relayTUNIdleTimeoutNs.Store(oldIdle)
 	})
 }
 
@@ -123,7 +124,7 @@ const (
 )
 
 // TestARelayLegOutlivesTheExitsReadDeadline: an idle leg, one that only
-// uploads and one that only downloads each stay up for more than three of
+// uploads and one that only downloads each stay up for three of
 // the exit's read deadlines, while the downstream client shows a sign of life
 // every 10 s (scaled) as its keepalive would.
 func TestARelayLegOutlivesTheExitsReadDeadline(t *testing.T) {
@@ -146,16 +147,16 @@ func TestARelayLegOutlivesTheExitsReadDeadline(t *testing.T) {
 
 			pkt := ipv4Packet(net.IPv4(10, 8, 7, 9), clientIP)
 			up := ipv4Packet(clientIP, net.IPv4(10, 8, 7, 9))
-			deadline := time.Now().Add(4 * h2FrameReadTimeout)
+			deadline := time.Now().Add(3 * h2FrameReadTimeout())
 			clientTick := time.NewTicker(10 * time.Second / legScale)
 			defer clientTick.Stop()
-			trafficTick := time.NewTicker(h2FrameReadTimeout / 5)
+			trafficTick := time.NewTicker(h2FrameReadTimeout() / 5)
 			defer trafficTick.Stop()
 			for time.Now().Before(deadline) {
 				select {
 				case <-sink.Done():
 					t.Fatalf("the leg closed after %v (exit read deadline %v)",
-						4*h2FrameReadTimeout-time.Until(deadline), h2FrameReadTimeout)
+						3*h2FrameReadTimeout()-time.Until(deadline), h2FrameReadTimeout())
 				case <-clientTick.C:
 					sink.UpdateActivity()
 				case <-trafficTick.C:
@@ -205,9 +206,7 @@ func ipv4Packet(src, dst net.IP) []byte {
 // multiples of the client's 10 s keepalive. With the downstream client on a
 // 100 ms grid here, the gaps between keepalives must not sit on it.
 func TestTheRelayKeepaliveIsOffTheClientsGrid(t *testing.T) {
-	old := relayKeepaliveAfter
-	relayKeepaliveAfter = func() time.Duration { return old() / 100 } // 200-450 ms
-	t.Cleanup(func() { relayKeepaliveAfter = old })
+	setKeepaliveDraw(t, func(d time.Duration) time.Duration { return d / 100 }) // 200-450 ms
 	sink, upstream := newTestRelaySink(t)
 	sink.startKeepalive()
 
@@ -265,7 +264,7 @@ func TestRelayKeepalivePauseShape(t *testing.T) {
 	low, mid := 0, 0
 	for range n {
 		d := relayKeepaliveAfter()
-		if d < 20*time.Second || d >= 45*time.Second || d >= h2FrameReadTimeout-10*time.Second {
+		if d < 20*time.Second || d >= 45*time.Second || d >= h2FrameReadTimeout()-10*time.Second {
 			t.Fatalf("drew %v, outside [20 s, 45 s)", d)
 		}
 		seen[d.Round(50*time.Millisecond)] = true
@@ -295,9 +294,7 @@ func TestRelayKeepalivePauseShape(t *testing.T) {
 // alive for its downstream client. Once that client has shown nothing for
 // relayClientActiveWindow, the relay stops, and the leg may close.
 func TestARelayLegWithoutAClientGetsNoKeepalive(t *testing.T) {
-	old := relayKeepaliveAfter
-	relayKeepaliveAfter = func() time.Duration { return 100 * time.Millisecond }
-	t.Cleanup(func() { relayKeepaliveAfter = old })
+	setKeepaliveDraw(t, func(time.Duration) time.Duration { return 100 * time.Millisecond })
 	sink, upstream := newTestRelaySink(t)
 	sink.startKeepalive()
 	sink.lastActivity.Store(time.Now().Add(-relayClientActiveWindow - time.Second).UnixNano())
@@ -325,9 +322,7 @@ func TestARelayLegWithoutAClientGetsNoKeepalive(t *testing.T) {
 // TestABusyRelayLegGetsNoKeepalive: traffic both ways is all the two read
 // deadlines need, and a keepalive on a busy leg would only add a frame.
 func TestABusyRelayLegGetsNoKeepalive(t *testing.T) {
-	old := relayKeepaliveAfter
-	relayKeepaliveAfter = func() time.Duration { return 200 * time.Millisecond }
-	t.Cleanup(func() { relayKeepaliveAfter = old })
+	setKeepaliveDraw(t, func(time.Duration) time.Duration { return 200 * time.Millisecond })
 	sink, upstream := newTestRelaySink(t)
 	go sink.pump(func([]byte) error { return nil })
 	sink.startKeepalive()
@@ -360,4 +355,14 @@ func TestABusyRelayLegGetsNoKeepalive(t *testing.T) {
 	if n := keepalives.Load(); n != 0 {
 		t.Fatalf("%d keepalives on a leg busy both ways", n)
 	}
+}
+
+// setKeepaliveDraw replaces the keepalive draw for the test with f applied
+// to the real one.
+func setKeepaliveDraw(t *testing.T, f func(time.Duration) time.Duration) {
+	t.Helper()
+	old := relayKeepaliveDraw.Load()
+	draw := func() time.Duration { return f((*old)()) }
+	relayKeepaliveDraw.Store(&draw)
+	t.Cleanup(func() { relayKeepaliveDraw.Store(old) })
 }

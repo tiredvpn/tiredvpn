@@ -1770,14 +1770,21 @@ func cleanupH2Conn(conn net.Conn, srvCtx *serverContext, tunnel **h2TunnelState,
 // h2FrameReadTimeout is the longest gap between two frames the HTTP/2 stego
 // loop allows on its raw conn, for the life of the connection - a relay's
 // upstream leg included, whose keepalive is drawn to land well inside it
-// (relayKeepaliveAfter). A var so tests can scale it.
-var h2FrameReadTimeout = 60 * time.Second
+// (relayKeepaliveAfter). Atomic so tests can scale it while other tests'
+// connections still read it.
+var h2FrameReadTimeoutNs = func() *atomic.Int64 {
+	var v atomic.Int64
+	v.Store(int64(60 * time.Second))
+	return &v
+}()
+
+func h2FrameReadTimeout() time.Duration { return time.Duration(h2FrameReadTimeoutNs.Load()) }
 
 func runH2FrameLoop(connPtr *net.Conn, framerPtr **http2.Framer, hpackDec *hpack.Decoder, srvCtx *serverContext, logger *log.Logger, authenticated *bool, authClientID *clientIdentity, authSecret *[]byte, connTracked *bool, tunnel **h2TunnelState, handover func(net.Conn) (net.Conn, *http2.Framer), ekm []byte) {
 	for {
 		conn := *connPtr
 		framer := *framerPtr
-		conn.SetReadDeadline(time.Now().Add(h2FrameReadTimeout))
+		conn.SetReadDeadline(time.Now().Add(h2FrameReadTimeout()))
 		frame, err := framer.ReadFrame()
 		if err != nil {
 			if err != io.EOF {

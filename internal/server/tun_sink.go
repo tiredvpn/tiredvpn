@@ -102,9 +102,15 @@ func (s *relayTUNSink) dualAddrs() *dualStackAddrs {
 
 // relayTUNIdleTimeout bounds how long the relay waits for anything from the
 // exit. The exit echoes the relay's keepalives (startKeepalive), so a leg
-// with nothing on it for this long is dead rather than idle. A var so tests
+// with nothing on it for this long is dead rather than idle. Atomic so tests
 // can shorten it.
-var relayTUNIdleTimeout = 3 * time.Minute
+var relayTUNIdleTimeoutNs = func() *atomic.Int64 {
+	var v atomic.Int64
+	v.Store(int64(3 * time.Minute))
+	return &v
+}()
+
+func relayTUNIdleTimeout() time.Duration { return time.Duration(relayTUNIdleTimeoutNs.Load()) }
 
 func (s *relayTUNSink) WritePacket(pkt []byte) error {
 	if len(pkt) > 65535 {
@@ -125,8 +131,8 @@ func (s *relayTUNSink) WritePacket(pkt []byte) error {
 func (s *relayTUNSink) Done() <-chan struct{} { return s.done }
 
 // relayKeepaliveAfter draws how long either direction of the upstream leg
-// may stay silent before the relay sends a keepalive up. A var so tests can
-// scale it.
+// may stay silent before the relay sends a keepalive up. The draw lives in
+// relayKeepaliveDraw, atomic so tests can scale it.
 //
 // The exit reads the leg under h2FrameReadTimeout (60 s): a relay-to-exit
 // gap longer than that closes it. The relay reads it under
@@ -143,9 +149,14 @@ func (s *relayTUNSink) Done() <-chan struct{} { return s.done }
 // measured reference distribution for an idle server-to-server TLS leg
 // (verification rule 3); the shape is chosen to have no grid, no spike, and
 // no flat plateau, and the hard floor at 20 s is the one regularity left.
-var relayKeepaliveAfter = func() time.Duration {
-	return strategy.HumpDelay(20*time.Second, 30*time.Second, 45*time.Second)
+var relayKeepaliveDraw atomic.Pointer[func() time.Duration]
+
+func init() {
+	draw := func() time.Duration { return strategy.HumpDelay(20*time.Second, 30*time.Second, 45*time.Second) }
+	relayKeepaliveDraw.Store(&draw)
 }
+
+func relayKeepaliveAfter() time.Duration { return (*relayKeepaliveDraw.Load())() }
 
 // relayClientActiveWindow is how long after its downstream client's last
 // sign of life the relay keeps its upstream leg alive with keepalives. A
@@ -214,7 +225,13 @@ func (s *relayTUNSink) Close() {
 		if t := s.keepalive.Load(); t != nil {
 			t.Stop()
 		}
+		// Closing writes too (HTTP/2 stego sends GOAWAY), so it takes the
+		// write lock like WritePacket and the keepalive; a write stuck on a
+		// dead leg is cut first.
+		_ = s.up.SetWriteDeadline(time.Now())
+		s.writeMu.Lock()
 		s.up.Close()
+		s.writeMu.Unlock()
 		close(s.done)
 	})
 }
@@ -228,7 +245,7 @@ func (s *relayTUNSink) pump(deliver func(pkt []byte) error) {
 
 	header := make([]byte, 4)
 	for {
-		s.up.SetReadDeadline(time.Now().Add(relayTUNIdleTimeout))
+		s.up.SetReadDeadline(time.Now().Add(relayTUNIdleTimeout()))
 		if _, err := io.ReadFull(s.up, header); err != nil {
 			if !errors.Is(err, io.EOF) {
 				s.logger.Debug("Relay TUN: upstream read ended: %v", err)
