@@ -213,7 +213,10 @@ REALITY OPTIONS:
         Without -reality-b1 or -reality-cover-domain a probe gets this server's own -cert for any name
   -reality-b1
         Accept the B1 transport: real TLS 1.3 with auth in session_id. Needs -reality-private-key.
-        TLS fallback transports get past the gate on a session_id tag from the client's secret
+        TLS fallback transports get past the gate only with -reality-fallback-tag
+  -reality-fallback-tag
+        With -reality-b1: let hellos with a valid fallback-transport tag reach their handlers
+        instead of the donor (off: mirrored, as in 1.11.8). Use per-client registry secrets
   -reality-private-key string
         Server's static X25519 key, base64 (or TIREDVPN_REALITY_PRIVATE_KEY). Generate with: tiredvpn reality-keygen
   -reality-legacy
@@ -535,7 +538,8 @@ func registerServerFlags(fs *flag.FlagSet, cfg *server.Config) *serverFlagOpts {
 	// code path that does nothing yet. Flip the default in the release that
 	// ships the handler (task 005).
 	fs.StringVar(&cfg.REALITYPrivateKey, "reality-private-key", "", "Server's static X25519 key for REALITY B1, base64 (falls back to TIREDVPN_REALITY_PRIVATE_KEY). Generate with `tiredvpn reality-keygen`. Required with -reality-b1.")
-	fs.BoolVar(&cfg.REALITYB1Enabled, "reality-b1", false, "Accept the REALITY B1 transport (real TLS 1.3, auth in session_id). Requires -reality-private-key. The TLS fallback transports get past the B1 gate on a session_id tag derived from the client's secret.")
+	fs.BoolVar(&cfg.REALITYB1Enabled, "reality-b1", false, "Accept the REALITY B1 transport (real TLS 1.3, auth in session_id). Requires -reality-private-key. TLS fallback transports get past the gate only with -reality-fallback-tag.")
+	fs.BoolVar(&cfg.REALITYFallbackTag, "reality-fallback-tag", false, "With -reality-b1: let a ClientHello carrying a valid fallback-transport tag (HTTP Polling, WebSocket, Geneva, anti-probe, Stego, Morph, a relay's upstream) through to its handler instead of the donor. Off: tagged hellos are mirrored as in 1.11.8. A copied tag opens every exit sharing the secret once; use per-client registry secrets.")
 	fs.BoolVar(&cfg.REALITYLegacyEnabled, "reality-legacy", true, "Accept the legacy REALITY transport (credentials in padding extension 0x0015). Turn off once no client uses it.")
 	fs.IntVar(&cfg.REALITYMaxTimeDiff, "reality-max-time-diff", 300, "Client clock skew tolerated by B1 auth and the fallback-transport tag, seconds (0 = do not check)")
 	fs.StringVar(&cfg.REALITYMinClientVer, "reality-min-client-ver", "", "Lowest client version B1 accepts, X.Y.Z (empty = do not check)")

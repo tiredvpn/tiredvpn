@@ -429,6 +429,14 @@ type Config struct {
 	// authentication carried in session_id.
 	REALITYB1Enabled bool
 
+	// REALITYFallbackTag lets the B1 gate hand a ClientHello with a valid
+	// fallback-transport tag to the ordinary TLS path instead of the donor.
+	// Off by default: the tag binds neither the hello nor the exit, so a
+	// copied one opens every exit with the same secret once within the clock
+	// window (P1-1 of the round-5 review). Off, tagged hellos are mirrored
+	// like any other, as in 1.11.8.
+	REALITYFallbackTag bool
+
 	// REALITYLegacyEnabled accepts the old transport, the one that hides
 	// credentials in padding extension 0x0015. Switch it off once
 	// reality_auth_legacy_total stops growing.
@@ -550,6 +558,7 @@ func Run(cfg *Config) error {
 	if err := validateREALITYConfig(cfg); err != nil {
 		return fmt.Errorf("reality configuration: %w", err)
 	}
+	warnREALITYSecrets(cfg)
 
 	if err := InitREALITYKeys(cfg); err != nil {
 		return fmt.Errorf("reality initialization failed: %w", err)

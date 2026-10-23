@@ -157,13 +157,17 @@ func tryREALITYB1(conn net.Conn, peekBuf []byte, srvCtx *serverContext, logger *
 		// cover domain too, which used to take every one of them. After the
 		// legacy check: crypto/tls never sends a padding extension, so a legacy
 		// hello is never a tagged one, and it no longer pays an HMAC per
-		// client for nothing (P3-1 of the round-5 review).
-		if entry, ok := gate.fallbackTag(srvCtx, helloRaw, now); ok {
-			releaseDonor(donor)
-			reputation.remember(conn.RemoteAddr(), now)
-			realityFallbackTagTotal.Add(1)
-			logger.Debug("REALITY B1: fallback-transport tag accepted (client: %s), continuing as ordinary TLS", entry.clientID)
-			return false
+		// client for nothing (P3-1 of the round-5 review). Only with
+		// -reality-fallback-tag: off, a tagged hello is a stranger's like any
+		// other, and no HMAC is paid at all.
+		if srvCtx.cfg.REALITYFallbackTag {
+			if entry, ok := gate.fallbackTag(srvCtx, helloRaw, now); ok {
+				releaseDonor(donor)
+				reputation.remember(conn.RemoteAddr(), now)
+				realityFallbackTagTotal.Add(1)
+				logger.Debug("REALITY B1: fallback-transport tag accepted (client: %s), continuing as ordinary TLS", entry.clientID)
+				return false
+			}
 		}
 
 		// Every other rejection lands here, and they must be indistinguishable.

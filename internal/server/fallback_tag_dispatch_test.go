@@ -1,12 +1,16 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdh"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/binary"
 	"io"
 	"net"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -66,6 +70,7 @@ func newTagServer(t *testing.T, cover string) *tagServer {
 		REALITYPrivateKey:  privB64,
 		REALITYMaxTimeDiff: 300,
 		REALITYCoverDomain: cover,
+		REALITYFallbackTag: true,
 	}
 	if err := InitREALITYKeys(cfg); err != nil {
 		t.Fatal(err)
@@ -487,5 +492,109 @@ func TestALegacyHelloIsNotCheckedForATag(t *testing.T) {
 	}
 	if realityFallbackTagTotal.Load() != before {
 		t.Fatal("the tag was checked - and accepted - on a legacy hello")
+	}
+}
+
+// TestWithTheTagOffTaggedFallbacksAreMirrored is P1-1 of the round-5 review,
+// as Denis decided: -reality-fallback-tag is off by default, and then a B1
+// exit admits no tagged hello and mirrors it like 1.11.8 did - and pays no
+// HMAC for it. Clients keep sending the tag; nothing on the wire changes.
+func TestWithTheTagOffTaggedFallbacksAreMirrored(t *testing.T) {
+	for _, tc := range tagFallbackStrategies {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newTagServer(t, "")
+			srv.srvCtx.cfg.REALITYFallbackTag = false
+			hello := captureFallbackHello(t, tc.make, tagTestSecret)
+			before := srv.srvCtx.b1Gate.index.tagLookups.Load()
+			expectDonor(t, srv, hello)
+			if n := srv.srvCtx.b1Gate.index.tagLookups.Load() - before; n != 0 {
+				t.Fatalf("the tag was looked up %d times with the flag off", n)
+			}
+		})
+	}
+}
+
+// TestACopiedTagOpensAnotherExit documents the known exposure that keeps
+// -reality-fallback-tag off by default (P1-1 of the round-5 review): the tag
+// binds neither the hello nor the exit. A prober copies the 32-byte
+// session_id of a client's tagged hello into its own crypto/tls ClientHello -
+// its own random and key share - and sends it to another exit with the same
+// secret, which has not seen the tag. With the flag on, that exit's own TLS
+// stack answers, not the donor; with it off, the donor does. Binding the tag
+// to hello.random and the key share is planned for 1.11.10. If the first
+// half of this test starts failing, the exposure is closed: update
+// docs/server.md and this test.
+func TestACopiedTagOpensAnotherExit(t *testing.T) {
+	exitA := newTagServer(t, "")
+	exitB := newTagServer(t, "")
+	tagged := captureFallbackHello(t, tagFallbackStrategies[0].make, tagTestSecret)
+	expectTLSPath(t, exitA, tagged)
+	sid, err := customtls.SessionIDFrom(tagged[5:])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	probe := proberHello(t, "www.google.com")
+	setSessionID(t, probe, sid)
+	expectTLSPath(t, exitB, probe) // the known exposure
+
+	exitC := newTagServer(t, "")
+	exitC.srvCtx.cfg.REALITYFallbackTag = false
+	probe2 := proberHello(t, "www.google.com")
+	setSessionID(t, probe2, sid)
+	expectDonor(t, exitC, probe2)
+}
+
+// proberHello is a plain crypto/tls ClientHello record for sni, as any
+// prober would send it.
+func proberHello(t *testing.T, sni string) []byte {
+	t.Helper()
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	go func() {
+		_ = tls.Client(client, &tls.Config{ServerName: sni, InsecureSkipVerify: true}).Handshake() //nolint:gosec // a probe
+	}()
+	_ = server.SetReadDeadline(time.Now().Add(5 * time.Second))
+	rec, err := readRecord(server)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rec
+}
+
+// TestStartupWarnsAboutSecrets: P2-1 of the round-5 review - a weak global
+// secret, and a global secret at all once the tag is admitted, are said at
+// startup; a flag that does nothing without B1 is too.
+func TestStartupWarnsAboutSecrets(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  Config
+		want []string
+		not  []string
+	}{
+		{"weak global secret", Config{Secret: []byte("pass-424242")}, []string{"global -secret is weak"}, []string{"Prefer per-client"}},
+		{"tag on, global secret", Config{Secret: []byte("9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"),
+			REALITYB1Enabled: true, REALITYFallbackTag: true}, []string{"Prefer per-client registry secrets"}, []string{"is weak"}},
+		{"tag without b1", Config{REALITYFallbackTag: true}, []string{"no effect without -reality-b1"}, nil},
+		{"strong secret, tag off", Config{Secret: []byte("9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"),
+			REALITYB1Enabled: true}, nil, []string{"weak", "Prefer", "no effect"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out bytes.Buffer
+			log.SetOutput(&out)
+			t.Cleanup(func() { log.SetOutput(os.Stderr) })
+			warnREALITYSecrets(&tc.cfg)
+			for _, w := range tc.want {
+				if !strings.Contains(out.String(), w) {
+					t.Errorf("no %q in %q", w, out.String())
+				}
+			}
+			for _, w := range tc.not {
+				if strings.Contains(out.String(), w) {
+					t.Errorf("unexpected %q in %q", w, out.String())
+				}
+			}
+		})
 	}
 }

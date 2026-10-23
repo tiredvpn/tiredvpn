@@ -276,3 +276,24 @@ func TestTheTagSelfCheck(t *testing.T) {
 		t.Fatalf("a failed self-check left no trace in the log: %q", out.String())
 	}
 }
+
+// TestWeakSecret: P2-1 of the round-5 review recovered "pass-424242" from one
+// tag in about a second. What an operator types by hand is flagged; a random
+// secret is not.
+func TestWeakSecret(t *testing.T) {
+	for _, tc := range []struct {
+		secret string
+		weak   bool
+	}{
+		{"pass-424242", true},
+		{"Xq7#mP2$vL9@kR4", true}, // 15 bytes: rich, but short
+		{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", true},
+		{"correcthorsebattery", true}, // 19 lowercase: about 89 bits
+		{"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", false},
+		{"Xq7#mP2$vL9@kR4!wN6&zT3*", false},
+	} {
+		if why, weak := WeakSecret([]byte(tc.secret)); weak != tc.weak {
+			t.Errorf("%q: weak=%v (%s), want %v", tc.secret, weak, why, tc.weak)
+		}
+	}
+}

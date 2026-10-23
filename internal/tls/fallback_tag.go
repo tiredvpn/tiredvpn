@@ -7,8 +7,10 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/binary"
+	"fmt"
 	"hash"
 	"io"
+	"math"
 	"net"
 	"runtime"
 	"strings"
@@ -271,4 +273,50 @@ func readFrom(fn string) bool {
 			return false
 		}
 	}
+}
+
+// WeakSecret reports whether a client secret is too weak to stand an offline
+// guessing run, and why. A captured fallback-transport tag is checked with
+// the secret alone, so its strength is all that stands between one tag and
+// the secret (P2-1 of the round-5 review). The estimate is generous - length
+// times the bits of the character classes it uses - and still flags what an
+// operator types by hand: under 16 bytes, under 96 estimated bits, or fewer
+// than 8 distinct characters. A random 32-byte secret in hex has about 330.
+func WeakSecret(secret []byte) (why string, weak bool) {
+	if len(secret) < 16 {
+		return fmt.Sprintf("%d bytes, under 16", len(secret)), true
+	}
+	var lower, upper, digit, other, high bool
+	distinct := map[byte]bool{}
+	for _, c := range secret {
+		distinct[c] = true
+		switch {
+		case c >= 'a' && c <= 'z':
+			lower = true
+		case c >= 'A' && c <= 'Z':
+			upper = true
+		case c >= '0' && c <= '9':
+			digit = true
+		case c < 0x80:
+			other = true
+		default:
+			high = true
+		}
+	}
+	if len(distinct) < 8 {
+		return fmt.Sprintf("%d distinct characters", len(distinct)), true
+	}
+	alphabet := 0
+	for _, c := range []struct {
+		on bool
+		n  int
+	}{{lower, 26}, {upper, 26}, {digit, 10}, {other, 33}, {high, 128}} {
+		if c.on {
+			alphabet += c.n
+		}
+	}
+	if bits := float64(len(secret)) * math.Log2(float64(alphabet)); bits < 96 {
+		return fmt.Sprintf("about %.0f bits", bits), true
+	}
+	return "", false
 }

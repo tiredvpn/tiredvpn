@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
@@ -39,6 +40,10 @@ type shortIDIndex struct {
 	built   time.Time
 	// gen is the registry generation the entries were built from.
 	gen uint64
+
+	// tagLookups counts MatchFallbackTag calls: the HMAC loop a tag check
+	// costs, for /metrics-free tests of when it runs.
+	tagLookups atomic.Uint64
 
 	// refreshing serialises rebuilds and, with lastRefresh, rate-limits the
 	// ones triggered by a lookup miss. Without that limit an attacker who
@@ -119,6 +124,7 @@ func (i *shortIDIndex) Lookup(id [customtls.AuthShortIDLen]byte) (shortIDEntry, 
 // turned down, which costs a donor dial or a TLS handshake, both dearer than a
 // few hundred HMACs.
 func (i *shortIDIndex) MatchFallbackTag(sid [customtls.AuthSessionIDLen]byte) (shortIDEntry, uint32, bool) {
+	i.tagLookups.Add(1)
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 	for _, e := range i.entries {

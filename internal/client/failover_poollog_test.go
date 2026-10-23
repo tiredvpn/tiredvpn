@@ -65,3 +65,36 @@ func TestEndpointPoolLineShowsTheConfiguredFamily(t *testing.T) {
 		t.Fatalf("pool line names another family than the one in force:\n%s", pool)
 	}
 }
+
+// TestWeakSecretsAreSaidAtStartup is P2-1 of the round-5 review on the
+// client: every TLS fallback puts a tag made from its secret on the wire,
+// and one captured tag lets anyone check guesses offline. A weak default
+// secret and a weak per-server one are each said once; a strong one is not.
+func TestWeakSecretsAreSaidAtStartup(t *testing.T) {
+	out := &lockedBuffer{}
+	log.SetOutput(out)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	strong := "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+	cfg := &Config{
+		Secret: "hunter2",
+		Servers: []ServerSpec{
+			{Name: "a", Addr: "192.0.2.1:995"},
+			{Name: "b", Addr: "192.0.2.2:995", Secret: "pass-424242"},
+			{Name: "c", Addr: "192.0.2.3:995", Secret: strong},
+		},
+	}
+	if _, err := buildManager(cfg, "hunter2"); err != nil {
+		t.Fatalf("buildManager: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "client secret is weak") {
+		t.Fatalf("the weak default secret was not said:\n%s", got)
+	}
+	if !strings.Contains(got, "secret of server b is weak") {
+		t.Fatalf("server b's weak secret was not said:\n%s", got)
+	}
+	if strings.Contains(got, "server c") {
+		t.Fatalf("server c's strong secret was called weak:\n%s", got)
+	}
+}

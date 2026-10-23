@@ -613,9 +613,12 @@ Notes worth reading once:
   WebSocket padded, Geneva and anti-probe take their SNI and Host header from
   it too. Those TLS fallbacks (and HTTP/2 Stego, Traffic Morph, State
   Exhaustion) put a tag derived from the endpoint's secret in the ClientHello
-  `session_id`, so an exit running `-reality-b1` hands them to their handlers
-  rather than to the donor the name belongs to; an exit without the check
-  ignores it. IMAP keeps doing what a mail client does: the dialled hostname, or
+  `session_id`. An exit running `-reality-b1` with `-reality-fallback-tag`
+  hands them to their handlers rather than to the donor the name belongs to;
+  any other exit ignores the tag, and on a B1 exit without the flag those
+  transports reach the donor. The tag lets anyone who captures one test
+  guesses at the secret offline: use a random secret of 32 bytes or more
+  (the client warns at startup about a weak one). IMAP keeps doing what a mail client does: the dialled hostname, or
   no SNI for an IP. `sni = ""` means no pool. Give the exit the same names with its `-reality-sni`: an exit without
   them answers a probe that replays one of these names with its cover domain's
   certificate instead of the named site's.

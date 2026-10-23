@@ -313,6 +313,26 @@ func applyAdaptiveDefaults(cfg *Config) {
 	}
 }
 
+// warnWeakSecrets logs each weak secret this client authenticates with: the
+// default and the endpoints' own. Every TLS fallback puts a tag made from its
+// secret on the wire, and one captured tag lets anyone check guesses at the
+// secret offline (P2-1 of the round-5 review).
+func warnWeakSecrets(secret string, eps []endpoint.Endpoint) {
+	if why, weak := customtls.WeakSecret([]byte(secret)); secret != "" && weak {
+		log.Warn("The client secret is weak (%s): a captured fallback-transport tag lets anyone check guesses "+
+			"against it offline. Use a random secret of 32 bytes or more", why)
+	}
+	for i, ep := range eps {
+		if ep.Secret == "" || ep.Secret == secret {
+			continue
+		}
+		if why, weak := customtls.WeakSecret([]byte(ep.Secret)); weak {
+			log.Warn("The secret of server %s is weak (%s): a captured fallback-transport tag lets anyone check "+
+				"guesses against it offline", ep.Label(i), why)
+		}
+	}
+}
+
 // buildManager constructs and configures the strategy manager.
 func buildManager(cfg *Config, secret string) (*strategy.Manager, error) {
 	// Resolved here rather than passed in: RunWithContext (Android/macOS) and
@@ -326,6 +346,7 @@ func buildManager(cfg *Config, secret string) (*strategy.Manager, error) {
 	if err != nil {
 		return nil, err
 	}
+	warnWeakSecrets(secret, eps)
 
 	rttProfile := resolveRTTProfile(cfg)
 	echConfigList := decodeECHConfig(cfg)
