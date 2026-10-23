@@ -79,12 +79,16 @@ type relayTUNSink struct {
 	done    chan struct{}
 	once    sync.Once
 
-	// lastTraffic is the UnixNano of the last frame on the upstream leg in
-	// either direction, a keepalive included; quietFor is how long the leg
-	// must stay silent before UpdateActivity sends a keepalive, drawn anew
-	// after each one (relayKeepaliveAfter). Zero means not drawn yet.
-	lastTraffic atomic.Int64
-	quietFor    atomic.Int64
+	// lastUp and lastDown are the UnixNano of the last frame the relay sent
+	// to the exit and read from it, keepalives and their echoes included;
+	// lastActivity that of the downstream client's last sign of life
+	// (UpdateActivity). quietFor is the silence the keepalive timer waits
+	// for, drawn anew after each keepalive (relayKeepaliveAfter).
+	lastUp       atomic.Int64
+	lastDown     atomic.Int64
+	lastActivity atomic.Int64
+	quietFor     atomic.Int64
+	keepalive    atomic.Pointer[time.Timer]
 }
 
 // dualAddrs returns the exit-assigned IPv6 tunnel addresses for the downstream
@@ -96,10 +100,11 @@ func (s *relayTUNSink) dualAddrs() *dualStackAddrs {
 	return &dualStackAddrs{ServerIP6: s.serverIP6, ClientIP6: s.clientIP6}
 }
 
-// relayTUNIdleTimeout bounds a silent upstream leg. Clients keepalive every 30s
-// and those frames are forwarded, so a leg with nothing on it for this long is
-// dead rather than idle.
-const relayTUNIdleTimeout = 3 * time.Minute
+// relayTUNIdleTimeout bounds how long the relay waits for anything from the
+// exit. The exit echoes the relay's keepalives (startKeepalive), so a leg
+// with nothing on it for this long is dead rather than idle. A var so tests
+// can shorten it.
+var relayTUNIdleTimeout = 3 * time.Minute
 
 func (s *relayTUNSink) WritePacket(pkt []byte) error {
 	if len(pkt) > 65535 {
@@ -113,62 +118,102 @@ func (s *relayTUNSink) WritePacket(pkt []byte) error {
 	defer s.writeMu.Unlock()
 	s.up.SetWriteDeadline(time.Now().Add(30 * time.Second))
 	_, err := s.up.Write(frame)
-	s.lastTraffic.Store(time.Now().UnixNano())
+	s.lastUp.Store(time.Now().UnixNano())
 	return err
 }
 
 func (s *relayTUNSink) Done() <-chan struct{} { return s.done }
 
-// relayKeepaliveAfter draws how long the upstream leg may stay silent before
-// the relay sends a keepalive up for its downstream client's activity. A var
-// so tests can shorten it.
+// relayKeepaliveAfter draws how long either direction of the upstream leg
+// may stay silent before the relay sends a keepalive up. A var so tests can
+// scale it.
 //
-// The keepalive exists so an idle leg outlives relayTUNIdleTimeout (3 min)
-// here and the exit's inactivity cleanup there, nothing more. It used to go
-// out every 30 s while the downstream client was active, whatever the leg
-// carried: a fixed 30 s cadence on a leg that may cross the border (P2-5 of
-// the round-5 review). Now it only fills silence, and rarely: a hump drawn
-// between 60 and 150 s, mean 90 s - no grid, no hard minimum spike, no flat
-// plateau (verification rule 3), and under the 3 min the leg dies at. There
-// is no measured reference distribution for an idle server-to-server TLS leg
-// to compare it with; the aim is fewer frames on a pattern-free schedule.
+// The exit reads the leg under h2FrameReadTimeout (60 s): a relay-to-exit
+// gap longer than that closes it. The relay reads it under
+// relayTUNIdleTimeout (3 min), fed by the exit's echo of the keepalive. The
+// round-5 draw (60-150 s) started at the exit's deadline, and the keepalive
+// rode the downstream client's 10 s keepalive grid on top of it: every idle
+// leg through a relay died after exactly a minute (P1-A of the round-6
+// review), and the gaps the leg showed were whole multiples of 10 s (P2-A).
+//
+// Now a timer of its own sends the keepalive, so nothing ties it to the
+// client's grid, after a quiet period drawn as a hump between 20 and 45 s
+// (HumpDelay: 20 s plus a gamma of shape 3, mean 30 s, redrawn above 45 s).
+// The ceiling leaves 15 s of the exit's 60 s for the network. There is no
+// measured reference distribution for an idle server-to-server TLS leg
+// (verification rule 3); the shape is chosen to have no grid, no spike, and
+// no flat plateau, and the hard floor at 20 s is the one regularity left.
 var relayKeepaliveAfter = func() time.Duration {
-	return strategy.HumpDelay(60*time.Second, 90*time.Second, 150*time.Second)
+	return strategy.HumpDelay(20*time.Second, 30*time.Second, 45*time.Second)
 }
 
-// UpdateActivity tells the upstream exit that the downstream client is
-// alive, when the leg has been silent for its drawn quiet period: a
-// keepalive frame up, which the exit echoes, which also keeps pump's read
-// deadline from running out. A downstream client that sends no keepalive of
-// its own - HTTP Polling polls instead, and the relay answers keepalives
-// itself - left the leg silent, and an idle Polling session through a relay
-// died after relayTUNIdleTimeout. Traffic on the leg in either direction
-// resets the silence: no keepalive while the leg is busy.
+// relayClientActiveWindow is how long after its downstream client's last
+// sign of life the relay keeps its upstream leg alive with keepalives. A
+// downstream client sends something at least every 10 s (its keepalive, or a
+// Polling poll); one silent for this long is gone, and its leg may go too.
+const relayClientActiveWindow = time.Minute
+
+// UpdateActivity records that the downstream client is alive, which keeps
+// the keepalive timer sending (startKeepalive).
 func (s *relayTUNSink) UpdateActivity() {
+	s.lastActivity.Store(time.Now().UnixNano())
+}
+
+// startKeepalive arms the timer that keeps the upstream leg alive while the
+// downstream client is: when either direction of the leg has been silent for
+// the drawn quiet period, a keepalive goes up. The exit's read deadline sees
+// the keepalive, and the relay's own sees the exit's echo - an upload-only
+// leg died of the second, a download-only one of the first, while one
+// keepalive per silence covered neither (P1-A of the round-6 review).
+func (s *relayTUNSink) startKeepalive() {
 	now := time.Now().UnixNano()
-	quiet := s.quietFor.Load()
-	if quiet == 0 {
-		quiet = int64(relayKeepaliveAfter())
-		s.quietFor.CompareAndSwap(0, quiet)
-		quiet = s.quietFor.Load()
-	}
-	last := s.lastTraffic.Load()
-	if now-last < quiet || !s.lastTraffic.CompareAndSwap(last, now) {
+	s.lastUp.CompareAndSwap(0, now)
+	s.lastDown.CompareAndSwap(0, now)
+	s.lastActivity.CompareAndSwap(0, now)
+	quiet := relayKeepaliveAfter()
+	s.quietFor.Store(int64(quiet))
+	t := time.AfterFunc(time.Hour, s.keepaliveTick)
+	s.keepalive.Store(t)
+	t.Reset(quiet)
+}
+
+func (s *relayTUNSink) keepaliveTick() {
+	select {
+	case <-s.done:
 		return
+	default:
 	}
-	s.quietFor.Store(int64(relayKeepaliveAfter()))
-	go func() {
+	now := time.Now()
+	quiet := time.Duration(s.quietFor.Load())
+	oldest := time.Unix(0, min(s.lastUp.Load(), s.lastDown.Load()))
+	active := now.Sub(time.Unix(0, s.lastActivity.Load())) < relayClientActiveWindow
+	if active && now.Sub(oldest) >= quiet {
 		s.writeMu.Lock()
-		defer s.writeMu.Unlock()
-		s.up.SetWriteDeadline(time.Now().Add(30 * time.Second))
-		if _, err := s.up.Write([]byte{0, 0, 0, 0}); err != nil {
+		s.up.SetWriteDeadline(now.Add(30 * time.Second))
+		_, err := s.up.Write([]byte{0, 0, 0, 0})
+		s.writeMu.Unlock()
+		if err != nil {
 			s.logger.Debug("Relay TUN: keepalive up failed: %v", err)
 		}
-	}()
+		s.lastUp.Store(now.UnixNano())
+		quiet = relayKeepaliveAfter()
+		s.quietFor.Store(int64(quiet))
+		oldest = time.Unix(0, min(s.lastUp.Load(), s.lastDown.Load()))
+	}
+	next := oldest.Add(quiet).Sub(now)
+	if next < 100*time.Millisecond {
+		next = quiet // the echo has not come back yet, or the client is gone
+	}
+	if t := s.keepalive.Load(); t != nil {
+		t.Reset(next)
+	}
 }
 
 func (s *relayTUNSink) Close() {
 	s.once.Do(func() {
+		if t := s.keepalive.Load(); t != nil {
+			t.Stop()
+		}
 		s.up.Close()
 		close(s.done)
 	})
@@ -190,7 +235,7 @@ func (s *relayTUNSink) pump(deliver func(pkt []byte) error) {
 			}
 			return
 		}
-		s.lastTraffic.Store(time.Now().UnixNano())
+		s.lastDown.Store(time.Now().UnixNano())
 		n := binary.BigEndian.Uint32(header)
 		if n == 0 {
 			continue
@@ -243,7 +288,6 @@ func dialRelayTUN(srvCtx *serverContext, logger *log.Logger, handshake []byte, o
 	}
 
 	sink := &relayTUNSink{up: upConn, logger: logger, done: make(chan struct{})}
-	sink.lastTraffic.Store(time.Now().UnixNano())
 	serverIP := append(net.IP(nil), resp[1:5]...)
 	clientIP := append(net.IP(nil), resp[5:9]...)
 
@@ -259,6 +303,7 @@ func dialRelayTUN(srvCtx *serverContext, logger *log.Logger, handshake []byte, o
 	}
 
 	go sink.pump(deliver)
+	sink.startKeepalive()
 
 	logger.Info("Relay TUN bridge established (origin=%s, upstream-assigned=%s)", origin, clientIP)
 	return sink, serverIP, clientIP, nil

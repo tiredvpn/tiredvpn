@@ -61,9 +61,10 @@ Versions follow [Semantic Versioning](https://semver.org/).
   transport instead of dialling the rest of the pool.
 - On the wire: up to two keepalives when a flow stalls, also while a
   download trickles; HTTP Polling leaves a frozen server 32-42 s in; a relay
-  whose client is active sends a keepalive to its exit only after the leg
-  has been silent for 60-150 s (drawn anew each time), never while it
-  carries traffic. No change to the protocol.
+  whose client is active sends a keepalive to its exit, on a timer of its
+  own, when either direction of the leg has been silent for 20-45 s (drawn
+  anew each time); a leg busy both ways gets none. No change to the
+  protocol.
 
 ## [1.11.8] - 2026-10-20
 
