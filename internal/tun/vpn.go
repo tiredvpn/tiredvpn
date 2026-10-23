@@ -185,6 +185,9 @@ type VPNClient struct {
 	// or readTimeout fires on a live tunnel.
 	connectedAt time.Time
 	lastRx      time.Time
+	// lastData is when the session last carried a data packet down -
+	// keepalive echoes move lastRx, not this. Zero until the first one.
+	lastData time.Time
 
 	// stall follows the session's TCP flows for the stall detector
 	// (watchStalls): one table per tunnel connection, replaced together with
@@ -889,6 +892,7 @@ func (v *VPNClient) seamlessPortHop(newPort int) {
 	v.upgradePending = nil
 	v.connectedAt = time.Now()
 	v.lastRx = v.connectedAt
+	v.lastData = time.Time{}
 	v.stall = newFlowTable()
 	v.mu.Unlock()
 
@@ -1042,6 +1046,7 @@ func (v *VPNClient) connect(parent context.Context) error {
 	v.upgradePending = nil
 	v.connectedAt = time.Now()
 	v.lastRx = v.connectedAt
+	v.lastData = time.Time{}
 	v.stall = newFlowTable()
 	if hasCaps {
 		v.serverCaps = caps
@@ -1848,6 +1853,9 @@ func (v *VPNClient) readFromServer() {
 
 		flows.down(actualBuf, time.Now())
 		v.noteDownlink()
+		v.mu.Lock()
+		v.lastData = time.Now()
+		v.mu.Unlock()
 
 		atomic.AddInt64(&v.packetsDown, 1)
 		atomic.AddInt64(&v.bytesDown, int64(pktLen))
@@ -2107,6 +2115,7 @@ func (v *VPNClient) swapUpgradedConn(oldConn, newConn net.Conn, strat strategy.S
 	v.upgradePending = strat
 	v.connectedAt = time.Now()
 	v.lastRx = v.connectedAt
+	v.lastData = time.Time{}
 	v.stall = newFlowTable()
 	if hasCaps {
 		v.serverCaps = caps
@@ -2819,7 +2828,10 @@ func (v *VPNClient) Stop() {
 		v.conn = nil // nothing may be swapped in on top of a stopped client
 	}
 	endedStrategy, sessionCand, hasSessionCand := v.strategy, v.sessionCand, v.hasSessionCand
-	useful := live && sessionWasUseful(v.connectedAt, v.lastRx)
+	// Data down, not keepalive echoes: a tunnel alive but useless echoes
+	// keepalives to the end, and stopping it must not clear its server's
+	// backoff (P3-4 of the round-6 review).
+	useful := live && sessionWasUseful(v.connectedAt, v.lastData)
 	v.mu.Unlock()
 
 	// A session the user stopped after it carried traffic is evidence for its
