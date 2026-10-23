@@ -263,6 +263,37 @@ key pair at boot, so B1 clients pinning a public key must not rely on it. With
 throwaway that would drop every client on the next restart. The public half is
 printed in the startup log.
 
+#### What a probe sees for a pool name
+
+A client's SNI pool hides the exit only if a probe that sends one of those
+names gets that site back. What decides it is the exit's flags, and a plain
+probe (`openssl s_client`, any ClientHello without REALITY credentials)
+differs from one that replays a real client's hello:
+
+| Exit | Plain probe, pool name | Replayed client hello, pool name |
+|---|---|---|
+| `-reality-b1`, `-reality-sni` lists the name | mirrored to that site | mirrored to that site |
+| `-reality-b1`, name not listed | `-reality-cover-domain` if set, else the server's own `-cert` | the same |
+| legacy only, `-reality-cover-domain` set | the server's own `-cert` | mirrored if listed (built-in or `-reality-sni`), else the cover domain |
+| legacy only, no `-reality-cover-domain` | the server's own `-cert` | the server's own `-cert`; `-reality-sni` changes nothing |
+
+The legacy transport is on by default (`-reality-legacy`). On an exit that
+runs both, a probe whose ClientHello carries a padding extension of 64 bytes
+or more (OpenSSL adds one to hellos of 256-511 bytes) is handed to the legacy
+path and gets the legacy row.
+
+On a legacy-only exit the pool is not protected without
+`-reality-cover-domain`, and even with it a plain probe gets the server's
+own certificate. The stand showed `CN=www.example.com` coming back for
+`www.google.com` (final acceptance, N12). Recommended exit setup for clients
+with an SNI pool:
+
+```
+-reality-b1 -reality-private-key <key> \
+-reality-sni <the clients' pool names> \
+-reality-cover-domain <a real site for every other name>
+```
+
 #### TLS fallback transports on a B1 server
 
 With `-reality-b1` the gate reads every TLS ClientHello on the port, not only

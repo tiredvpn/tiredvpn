@@ -209,7 +209,8 @@ REALITY OPTIONS:
         A ClientHello with a valid fallback-transport tag is never taken
   -reality-sni string
         Comma-separated cover names this exit's clients use beyond the built-in donors; unauthenticated
-        connections naming one are mirrored to it (legacy transport: only with -reality-cover-domain)
+        connections naming one are mirrored to it (legacy transport: only with -reality-cover-domain).
+        Without -reality-b1 or -reality-cover-domain a probe gets this server's own -cert for any name
   -reality-b1
         Accept the B1 transport: real TLS 1.3 with auth in session_id. Needs -reality-private-key.
         TLS fallback transports get past the gate on a session_id tag from the client's secret
@@ -512,7 +513,7 @@ func registerServerFlags(fs *flag.FlagSet, cfg *server.Config) *serverFlagOpts {
 	// of this exit are configured with (-reality-sni / [[servers]] sni). A
 	// probe that replays one of them is mirrored to that site, as it is for a
 	// built-in donor, instead of to the cover domain.
-	fs.Var((*sniListFlag)(&cfg.REALITYSNIs), "reality-sni", "Comma-separated cover names (SNI) this exit's clients use beyond the built-in donor list; unauthenticated REALITY connections naming one are mirrored to that site (B1 always, legacy only with -reality-cover-domain). Operator-set, like -reality-cover-domain.")
+	fs.Var((*sniListFlag)(&cfg.REALITYSNIs), "reality-sni", "Comma-separated cover names (SNI) this exit's clients use beyond the built-in donor list; unauthenticated REALITY connections naming one are mirrored to that site (B1 always, legacy only with -reality-cover-domain). Operator-set, like -reality-cover-domain. Without -reality-b1 or -reality-cover-domain a probe gets this server's own -cert for any name; see docs/server.md.")
 	// Transition switch for the data-layer rewrite: leave off while old clients
 	// are still around, turn on afterwards to remove the v1 downgrade path.
 	// Node ceilings. Both default to off: a non-zero default would start
