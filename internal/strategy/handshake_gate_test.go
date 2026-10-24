@@ -135,6 +135,46 @@ func TestSNILaneReserveSpacesNeighbours(t *testing.T) {
 	}
 }
 
+// TestHandshakeGateWaitsWhatItReserved closes the gap between the two tests
+// above: the lane's reservations are exact, and acquire waits at least the
+// spacing on the wall clock, but a wait that pairs or jitters the starts
+// meets that lower bound. With the clock held still and the waits recorded,
+// acquire must ask for exactly what the lane reserved: nothing for the
+// first start, then one more spacing for each next one.
+func TestHandshakeGateWaitsWhatItReserved(t *testing.T) {
+	const (
+		spacing = 30 * time.Millisecond
+		starts  = 5
+	)
+	now := time.Unix(1_700_000_000, 0)
+	var waits []time.Duration
+	oldNow, oldTimer := gateNow, gateTimer
+	gateNow = func() time.Time { return now }
+	gateTimer = func(d time.Duration) *time.Timer {
+		waits = append(waits, d)
+		return time.NewTimer(0)
+	}
+	t.Cleanup(func() { gateNow, gateTimer = oldNow, oldTimer })
+
+	g := newHandshakeGateWith(2, spacing, 0)
+	for k := range starts {
+		release, err := g.acquire(context.Background(), "api.github.com")
+		if err != nil {
+			t.Fatalf("acquire %d: %v", k, err)
+		}
+		release()
+	}
+
+	if len(waits) != starts-1 {
+		t.Fatalf("acquire waited %d times for %d starts, want %d: %v", len(waits), starts, starts-1, waits)
+	}
+	for i, d := range waits {
+		if want := time.Duration(i+1) * spacing; d != want {
+			t.Fatalf("start %d waited %v, want the reserved %v (all waits %v)", i+1, d, want, waits)
+		}
+	}
+}
+
 // TestHandshakeGatePerSNIIndependence verifies the throttle is per donor, not
 // global: dialing a different donor must not queue behind an occupied one.
 func TestHandshakeGatePerSNIIndependence(t *testing.T) {
