@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand/v2"
+	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -209,8 +210,11 @@ func TestMorphedConnCloseReportsUndelivered(t *testing.T) {
 // while close is running must still be written. The old drain stopped at
 // the first empty look at the queue, and a producer racing it could put a
 // frame in after that: Write returned nil and the frame was never written.
+// This is the race as it happens, red on the old code within the 200
+// rounds; TestPacerCloseWaitsForProducerMidSend pins it down
+// deterministically.
 func TestPacerCloseKeepsFramesAcceptedDuringClose(t *testing.T) {
-	for range 2000 {
+	for range 200 {
 		c := &countingConn{}
 		p := newWritePacer(c, &constShaper{delay: 0})
 
@@ -272,5 +276,42 @@ func TestPacerCloseCountsFramesQueuedAfterWriteError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "3 bytes of queued frames not written") {
 		t.Fatalf("close = %q, want the failed frame and the late one counted (3 bytes)", err)
+	}
+}
+
+// TestPacerCloseWaitsForProducerMidSend holds a producer inside enqueue,
+// past its closed check, while close runs: the drain must not give up on
+// the empty queue, and the frame the producer then sends must be written.
+// After close, enqueue must refuse: on the old code its select could pick
+// the free queue over done, and Write returned nil for a frame no one
+// would ever write.
+func TestPacerCloseWaitsForProducerMidSend(t *testing.T) {
+	c := &countingConn{}
+	p := newWritePacer(c, &constShaper{delay: 0})
+
+	p.sendMu.RLock()
+	closed := make(chan error, 1)
+	go func() { closed <- p.close() }()
+	<-p.done
+	// Long enough for a drain that stops at an empty queue to have stopped.
+	time.Sleep(50 * time.Millisecond)
+	p.queue <- pacedFrame{packet: []byte{7}, bucket: -1}
+	p.sendMu.RUnlock()
+
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("close = %v, want nil: the frame was sent before the queue closed", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("close did not return")
+	}
+	if got := c.Writes(); got != 1 {
+		t.Fatalf("%d writes, want the producer's frame written", got)
+	}
+	for i := range 100 {
+		if err := p.enqueue(pacedFrame{packet: []byte{0}, bucket: -1}); !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("enqueue %d after close = %v, want net.ErrClosed", i, err)
+		}
 	}
 }
