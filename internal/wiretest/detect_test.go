@@ -122,12 +122,16 @@ func TestSameGapsHonoursTolerance(t *testing.T) {
 	a := timed(20*time.Millisecond, 40*time.Millisecond)
 	b := timed(25*time.Millisecond, 65*time.Millisecond) // within 30 ms of a, gap by gap
 	c := timed(20*time.Millisecond, 200*time.Millisecond)
+	d := timed(20*time.Millisecond, 71*time.Millisecond) // 31 ms off a on the second gap
 
 	if _, ok := wiretest.SameGaps(a, b, wiretest.C2S, 0, 30*time.Millisecond); !ok {
 		t.Error("the same nominal delays were not recognised as repeating")
 	}
 	if _, ok := wiretest.SameGaps(a, c, wiretest.C2S, 0, 30*time.Millisecond); ok {
 		t.Error("a 160ms difference passed a 30ms tolerance")
+	}
+	if _, ok := wiretest.SameGaps(a, d, wiretest.C2S, 0, 30*time.Millisecond); ok {
+		t.Error("a 31ms difference passed a 30ms tolerance")
 	}
 }
 
