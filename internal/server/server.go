@@ -1805,6 +1805,17 @@ var h2FrameReadTimeoutNs = func() *atomic.Int64 {
 
 func h2FrameReadTimeout() time.Duration { return time.Duration(h2FrameReadTimeoutNs.Load()) }
 
+// tunClientReadTimeoutNs is how long the raw TUN loop (handleTUNModeWithHandshake:
+// REALITY, anti-probe, SSH, IMAP, QUIC) waits for a frame from its client
+// before it ends the session: 120 s. Atomic so tests can scale it.
+var tunClientReadTimeoutNs = func() *atomic.Int64 {
+	var v atomic.Int64
+	v.Store(int64(120 * time.Second))
+	return &v
+}()
+
+func tunClientReadTimeout() time.Duration { return time.Duration(tunClientReadTimeoutNs.Load()) }
+
 // runH2FrameLoop reads and dispatches HTTP/2 frames until the connection closes.
 //
 // connPtr / framerPtr are pointers so the loop can swap the connection and
@@ -3658,7 +3669,7 @@ func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger
 		default:
 		}
 
-		conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+		conn.SetReadDeadline(time.Now().Add(tunClientReadTimeout()))
 		if _, err := io.ReadFull(conn, lenBuf); err != nil {
 			logger.Debug("TUN read length error: %v", err)
 			break
