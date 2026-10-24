@@ -73,13 +73,26 @@ func TestShaperE2E_ChromePreset_RoundTrip(t *testing.T) {
 		wg       sync.WaitGroup
 	)
 	wg.Add(1)
+	readTimeout := 30 * time.Second
+	read := make(chan struct{})
 	go func() {
 		defer wg.Done()
 		_, writeErr = client.Write(want)
+		// Close only once the reader has everything: Close drains what is
+		// still queued for at most pacerDrainTimeout (100 ms) and drops the
+		// rest, and on a loaded machine the tail of the payload was still
+		// queued when the writer closed right after Write returned. The
+		// timer only bounds a broken run, where the reader never gets it
+		// all and waits for the close to end its read.
+		select {
+		case <-read:
+		case <-time.After(readTimeout):
+		}
 		_ = client.Close()
 	}()
 
-	got, readErr := readAll(server, N, 30*time.Second)
+	got, readErr := readAll(server, N, readTimeout)
+	close(read)
 	wg.Wait()
 	if writeErr != nil {
 		t.Fatalf("client write: %v", writeErr)
@@ -123,13 +136,26 @@ func TestShaperE2E_DifferentPresetsCantTalk_DocumentBehavior(t *testing.T) {
 		wg       sync.WaitGroup
 	)
 	wg.Add(1)
+	readTimeout := 10 * time.Second
+	read := make(chan struct{})
 	go func() {
 		defer wg.Done()
 		_, writeErr = client.Write(want)
+		// Close only once the reader has everything: Close drains what is
+		// still queued for at most pacerDrainTimeout (100 ms) and drops the
+		// rest, and on a loaded machine the tail of the payload was still
+		// queued when the writer closed right after Write returned. The
+		// timer only bounds a broken run, where the reader never gets it
+		// all and waits for the close to end its read.
+		select {
+		case <-read:
+		case <-time.After(readTimeout):
+		}
 		_ = client.Close()
 	}()
 
-	got, readErr := readAll(server, N, 10*time.Second)
+	got, readErr := readAll(server, N, readTimeout)
+	close(read)
 	wg.Wait()
 	if writeErr != nil {
 		t.Fatalf("client write: %v", writeErr)
@@ -166,13 +192,26 @@ func TestShaperE2E_LargePayload_Async(t *testing.T) {
 		wg       sync.WaitGroup
 	)
 	wg.Add(1)
+	readTimeout := 60 * time.Second
+	read := make(chan struct{})
 	go func() {
 		defer wg.Done()
 		_, writeErr = client.Write(want)
+		// Close only once the reader has everything: Close drains what is
+		// still queued for at most pacerDrainTimeout (100 ms) and drops the
+		// rest, and on a loaded machine the tail of the payload was still
+		// queued when the writer closed right after Write returned. The
+		// timer only bounds a broken run, where the reader never gets it
+		// all and waits for the close to end its read.
+		select {
+		case <-read:
+		case <-time.After(readTimeout):
+		}
 		_ = client.Close()
 	}()
 
-	got, readErr := readAll(server, N, 60*time.Second)
+	got, readErr := readAll(server, N, readTimeout)
+	close(read)
 	wg.Wait()
 	if writeErr != nil {
 		t.Fatalf("client write: %v", writeErr)
