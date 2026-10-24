@@ -51,21 +51,67 @@ func dialSecret(ctx context.Context, fallback []byte) []byte {
 	return fallback
 }
 
-// ensureDialSecret fills in the pinned endpoint's secret when the caller has not
+// The address travels the same way. Most strategies resolve the server they
+// dial through Manager.GetServerAddr rather than the target they are handed,
+// and that used to read the pin at the moment of the call - so a pin that
+// moved mid-dial (a concurrent Connect, the pre-flight gate, a health report)
+// sent the handshake to one server keyed for another. The address the dial
+// was decided for now rides the context next to its key, and GetServerAddr
+// answers with it.
+type dialAddrKey struct{}
+
+// withDialCandidate returns ctx carrying cand's address and secret, decided
+// together for this dial.
+func (m *Manager) withDialCandidate(ctx context.Context, cand endpoint.Candidate) context.Context {
+	ctx = withDialSecret(ctx, m.secretForCandidate(cand))
+	return context.WithValue(ctx, dialAddrKey{}, cand.Addr)
+}
+
+// dialAddr returns the server address this dial was decided for, if a caller
 // named one.
+func dialAddr(ctx context.Context) (string, bool) {
+	if ctx == nil {
+		return "", false
+	}
+	a, ok := ctx.Value(dialAddrKey{}).(string)
+	return a, ok && a != ""
+}
+
+// ensureDialSecret fills in the pinned endpoint's secret and address when the
+// caller has not named them.
 //
-// dialEndpoints names it per candidate, which is the precise answer. Every other
-// way into the strategy scan - reconnect after a network change, budget
+// dialEndpoints names them per candidate, which is the precise answer. Every
+// other way into the strategy scan - reconnect after a network change, budget
 // recycling, port-hop make-before-break, the periodic reprobe - dials whatever
-// is pinned right now, so the pinned endpoint's secret is the right answer for
-// them, and this is the one place that has to say so.
+// is pinned right now, so the pinned endpoint is the right answer for them, and
+// this is the one place that has to say so. Both come from one read of the pin.
 func (m *Manager) ensureDialSecret(ctx context.Context) context.Context {
+	hasSecret := false
 	if ctx != nil {
-		if s, ok := ctx.Value(dialSecretKey{}).([]byte); ok && len(s) > 0 {
-			return ctx
+		s, ok := ctx.Value(dialSecretKey{}).([]byte)
+		hasSecret = ok && len(s) > 0
+	}
+	_, hasAddr := dialAddr(ctx)
+	if hasSecret && hasAddr {
+		return ctx
+	}
+	sel := m.selector()
+	var cand endpoint.Candidate
+	pinned := false
+	if sel != nil {
+		cand, pinned = sel.Current()
+	}
+	if !hasSecret {
+		if pinned {
+			ctx = withDialSecret(ctx, m.secretForCandidate(cand))
+		} else {
+			ctx = withDialSecret(ctx, m.defaultSecret())
 		}
 	}
-	return withDialSecret(ctx, m.CurrentSecret())
+	if !hasAddr && pinned {
+		ctx = context.WithValue(ctx, dialAddrKey{}, cand.Addr)
+	}
+	return ctx
 }
 
 // CurrentSecret returns the secret of the endpoint pinned right now, or the

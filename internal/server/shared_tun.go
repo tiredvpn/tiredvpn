@@ -84,9 +84,13 @@ func (st *SharedTUN) releasePacket(pkt *tunPacket) {
 
 // ClientWriter represents a connected client that receives packets from shared TUN
 type ClientWriter struct {
-	conn       net.Conn
-	clientIP   net.IP
-	clientID   string
+	conn     net.Conn
+	clientIP net.IP
+	clientID string
+	// origin is the peer host the client's lease was keyed with (see
+	// allocateTunnelIP). Taken from the handler, not from conn.RemoteAddr():
+	// the Polling and H2 adapters have no peer of their own.
+	origin     string
 	lastActive int64 // Unix timestamp, updated atomically
 	created    int64 // Unix timestamp of creation
 	done       chan struct{}
@@ -236,7 +240,7 @@ func (st *SharedTUN) TUNDevice() *tun.TUNDevice {
 // RegisterClient adds a client to the shared TUN
 // If client with same IP exists, old connection is gracefully drained before replacement
 func (st *SharedTUN) RegisterClient(clientIP net.IP, clientID string, conn net.Conn, frameFunc func([]byte) []byte) *ClientWriter {
-	return st.registerClient(clientIP, clientID, conn, frameFunc, nil)
+	return st.registerClient(clientIP, clientID, originOf(conn.RemoteAddr()), conn, frameFunc, nil)
 }
 
 // RegisterClientGated registers a client whose tunnel is owned by a frame gate.
@@ -244,11 +248,14 @@ func (st *SharedTUN) RegisterClient(clientIP net.IP, clientID string, conn net.C
 // is the whole point: a packet dispatched in the window between registration and
 // the handshake response is refused by the closed gate instead of being framed
 // into the stream ahead of the response.
-func (st *SharedTUN) RegisterClientGated(clientIP net.IP, clientID string, conn net.Conn, frameFunc func([]byte) []byte, gate *tunFrameGate) *ClientWriter {
-	return st.registerClient(clientIP, clientID, conn, frameFunc, gate)
+//
+// origin is the peer host the handler keyed the lease with: a takeover from the
+// same origin is the client moving its own tunnel, from another one a collision.
+func (st *SharedTUN) RegisterClientGated(clientIP net.IP, clientID, origin string, conn net.Conn, frameFunc func([]byte) []byte, gate *tunFrameGate) *ClientWriter {
+	return st.registerClient(clientIP, clientID, origin, conn, frameFunc, gate)
 }
 
-func (st *SharedTUN) registerClient(clientIP net.IP, clientID string, conn net.Conn, frameFunc func([]byte) []byte, gate *tunFrameGate) *ClientWriter {
+func (st *SharedTUN) registerClient(clientIP net.IP, clientID, origin string, conn net.Conn, frameFunc func([]byte) []byte, gate *tunFrameGate) *ClientWriter {
 	ipStr := clientIP.String()
 	now := time.Now().Unix()
 
@@ -256,6 +263,7 @@ func (st *SharedTUN) registerClient(clientIP net.IP, clientID string, conn net.C
 		conn:        conn,
 		clientIP:    clientIP,
 		clientID:    clientID,
+		origin:      origin,
 		lastActive:  now,
 		created:     now,
 		done:        make(chan struct{}),
@@ -278,14 +286,24 @@ func (st *SharedTUN) registerClient(clientIP net.IP, clientID string, conn net.C
 	if hadOld {
 		oldAge := now - atomic.LoadInt64(&old.created)
 		lastSeen := now - atomic.LoadInt64(&old.lastActive)
-		if lastSeen <= sharedTUNLiveEvictionWindow {
+		// An unknown origin matches nothing, not another unknown one.
+		sameOrigin := origin != "" && old.origin == origin
+		switch {
+		case lastSeen <= sharedTUNLiveEvictionWindow && sameOrigin:
+			// A live session taken over from the same address: a client moving
+			// its own tunnel to another transport (strategy upgrade) or port.
+			// Two boxes behind one NAT on the global secret look the same and
+			// cannot be told apart here.
+			log.Info("SharedTUN: live connection for %s taken over from the same address (clientID=%s, old_age=%ds, reconnect_count=%d)",
+				ipStr, clientID, oldAge, count)
+		case lastSeen <= sharedTUNLiveEvictionWindow:
 			// The connection being replaced was carrying traffic seconds ago, so
 			// this is not a client recovering a dead session: two clients are
 			// sharing one tunnel IP and evicting each other. Usually means two
 			// boxes on the same global secret (they all authenticate as "global").
 			log.Warn("SharedTUN: replacing LIVE connection for %s (clientID=%s, old_age=%ds, last_seen=%ds ago, reconnect_count=%d) - two clients may be sharing one tunnel IP",
 				ipStr, clientID, oldAge, lastSeen, count)
-		} else {
+		default:
 			log.Info("SharedTUN: replacing connection for %s (clientID=%s, old_age=%ds, reconnect_count=%d)",
 				ipStr, clientID, oldAge, count)
 		}

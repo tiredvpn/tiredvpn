@@ -698,7 +698,7 @@ func runClient(args []string) {
 	reprobeInterval := fs.Duration("reprobe-interval", 5*time.Minute, "How often to re-probe strategies")
 	fs.IntVar(&cfg.CircuitThreshold, "circuit-threshold", 3, "Failures before circuit opens")
 	circuitResetTime := fs.Duration("circuit-reset", 5*time.Minute, "Time before circuit tries half-open")
-	fs.BoolVar(&cfg.EnableFallback, "fallback", true, "Enable mid-session fallback to other strategies")
+	fs.BoolVar(&cfg.EnableFallback, "fallback", true, "Move a live TUN tunnel back to a better strategy, make-before-break, once a periodic reprobe finds it working")
 
 	// QUIC transport flags
 	fs.BoolVar(&cfg.QUICEnabled, "quic", false, "Enable QUIC transport (highest priority, hardest to block)")

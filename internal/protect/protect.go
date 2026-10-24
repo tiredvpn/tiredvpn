@@ -263,17 +263,22 @@ func (d *ProtectDialer) DialContext(ctx context.Context, network, address string
 	if dialer == nil {
 		dialer = &net.Dialer{}
 	}
+	tcpDialStarted(ctx, network)
 
 	conn, err := dialer.DialContext(ctx, network, address)
 	if err != nil {
 		return nil, err
 	}
+	// Before protect, not after: the connect is up the moment DialContext
+	// returns, and a slow protect round trip on Android (up to protectTimeout)
+	// could otherwise let the caller's dial-limit cut land on a connected
+	// socket and read it as a SYN nobody answered.
+	tcpConnected(ctx, network)
 
 	if err := ProtectConn(conn); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("protect failed: %w", err)
 	}
-
 	return conn, nil
 }
 

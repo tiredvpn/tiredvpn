@@ -132,14 +132,20 @@ type StormDetector struct {
 	startedAt time.Time            // start of the current grace window (start / last Reset)
 }
 
+// wallNow is the wall clock without the monotonic reading. The storm history
+// crosses an Android core restart in the carry, and a phone may sleep in
+// between; the monotonic clock stops while it does, and a storm from before
+// a long doze could still count after waking (P3-6 of the round-7 review).
+func wallNow() time.Time { return time.Now().Round(0) }
+
 // NewStormDetector creates a detector with the given config (defaults applied).
 func NewStormDetector(cfg StormConfig) *StormDetector {
 	return &StormDetector{
 		cfg:       cfg.withDefaults(),
-		now:       time.Now,
+		now:       wallNow,
 		byID:      make(map[string]*strategyStorm),
 		openedAt:  make(map[string]time.Time),
-		startedAt: time.Now(),
+		startedAt: wallNow(),
 	}
 }
 
@@ -150,6 +156,23 @@ func (d *StormDetector) SessionOpened(strategyID string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.openedAt[strategyID] = d.now()
+}
+
+// SessionOpenedAt reports when the open session of strategyID started, as
+// SessionOpened recorded it.
+func (d *StormDetector) SessionOpenedAt(strategyID string) (time.Time, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	t, ok := d.openedAt[strategyID]
+	return t, ok
+}
+
+// SessionAbandoned forgets the session opened via SessionOpened without
+// recording a lifetime: it did not end on its own, the client replaced it.
+func (d *StormDetector) SessionAbandoned(strategyID string) {
+	d.mu.Lock()
+	delete(d.openedAt, strategyID)
+	d.mu.Unlock()
 }
 
 // SessionClosed records that the session opened via SessionOpened has ended.

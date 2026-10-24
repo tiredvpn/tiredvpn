@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"net"
 )
 
@@ -91,6 +92,26 @@ type clientIdentity struct {
 	// second lease after it changes address; the opposite default hands two
 	// clients one tunnel IP and they evict each other until one gives up.
 	perClient bool
+
+	// lease is the credential behind id, without the transport's label: the
+	// registry client's ID, or "global" for the shared secret. One client
+	// presents one credential over every transport, so this is what keys its
+	// tunnel address. Empty means id itself.
+	//
+	// It used to be id, and id differs by transport: REALITY says
+	// "reality:<hmac-of-secret>", HTTP polling "polling:global", the rest
+	// "global". A client that moved from Geneva to REALITY in the middle of a
+	// session - the strategy upgrade - arrived as somebody else and was handed
+	// another address, so the move could never be committed.
+	lease string
+}
+
+// leaseID is the identity a lease is keyed on - see lease.
+func (c clientIdentity) leaseID() string {
+	if c.lease != "" {
+		return c.lease
+	}
+	return c.id
 }
 
 // sharedIdentity marks an identity derived from a credential every client
@@ -117,7 +138,7 @@ func (c clientIdentity) prefixed(transport string) clientIdentity {
 	if c.id == "" {
 		return c
 	}
-	return clientIdentity{id: transport + ":" + c.id, perClient: c.perClient}
+	return clientIdentity{id: transport + ":" + c.id, perClient: c.perClient, lease: c.leaseID()}
 }
 
 // allocationKey qualifies the IP-pool lease key with the client's origin when
@@ -139,7 +160,84 @@ func allocationKey(id clientIdentity, origin string) string {
 	// before they get here; this keeps the function honest for the ones that do
 	// not, which is what it did before it learned about provenance.
 	if id.id == "" || id.perClient || origin == "" {
-		return id.id
+		return id.leaseID()
 	}
-	return id.id + "@" + origin
+	return id.leaseID() + "@" + origin
+}
+
+// allocateTunnelIP is the one way a TUN session gets its address: the lease
+// keyed by allocationKey, after folding in every lease the client still holds
+// under a key an older server spelled for it (legacyAllocationKeys).
+func allocateTunnelIP(srvCtx *serverContext, id clientIdentity, origin string, requested net.IP) (net.IP, error) {
+	key := allocationKey(id, origin)
+	keys, prefixes := legacyAllocationKeys(srvCtx, id, origin)
+	// Bounded: the Redis search for old leases must not hold a handshake up
+	// for long (adoptScanTimeout); one that runs out is retried next time.
+	ctx, cancel := context.WithTimeout(context.Background(), adoptScanTimeout)
+	defer cancel()
+	srvCtx.ipPool.AdoptAll(ctx, keys, prefixes, key)
+	return srvCtx.ipPool.Allocate(key, requested, "")
+}
+
+// legacyAllocationKeys lists the keys a server before the credential lease
+// could have spelled for this client, over any transport: the plain one,
+// HTTP polling's "polling:" one, and REALITY's "reality:<hmac>@origin" (always
+// origin-qualified - it used to be classified as shared even for a registry
+// client). The REALITY key needs the credential's secret, looked up here.
+//
+// All of them, not just the incoming transport's: a client whose lease was
+// taken over REALITY and who comes back over Geneva would otherwise get a new
+// address and leave the REALITY lease behind. Requested leases are permanent
+// in Redis, so an orphan never goes away on its own. Drop this once every exit
+// has run a release with the credential lease.
+//
+// prefixes names keys by their start instead: a registry client's REALITY
+// lease under ANY origin, "reality:<hmac>@". Its key no longer has an origin,
+// so the lease it took from another network is its own, and looking only under
+// the current origin left that one behind and handed out a new address. On the
+// global secret the origin is what tells boxes apart, and another origin's
+// REALITY lease is somebody else's: there only the current origin's key is
+// listed.
+func legacyAllocationKeys(srvCtx *serverContext, id clientIdentity, origin string) (keys, prefixes []string) {
+	lease := id.leaseID()
+	if lease == "" {
+		return nil, nil
+	}
+	qualify := func(k string, shared bool) string {
+		if !shared || origin == "" {
+			return k
+		}
+		return k + "@" + origin
+	}
+	keys = []string{
+		qualify(lease, !id.perClient),
+		qualify("polling:"+lease, !id.perClient),
+	}
+	if secret := credentialSecret(srvCtx, lease, id.perClient); len(secret) > 0 {
+		realityKey := realityClientIdentity(secret, clientIdentity{}).id
+		if id.perClient {
+			prefixes = append(prefixes, realityKey+"@")
+		} else {
+			keys = append(keys, qualify(realityKey, true))
+		}
+	}
+	return keys, prefixes
+}
+
+// credentialSecret is the secret behind a lease identity: the global secret,
+// or the registry client's own.
+func credentialSecret(srvCtx *serverContext, lease string, perClient bool) []byte {
+	if !perClient {
+		if lease == globalClientID && srvCtx.cfg != nil {
+			return srvCtx.cfg.Secret
+		}
+		return nil
+	}
+	if srvCtx.registry == nil {
+		return nil
+	}
+	if c := srvCtx.registry.GetByID(lease); c != nil {
+		return []byte(c.Secret)
+	}
+	return nil
 }

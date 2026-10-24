@@ -226,15 +226,20 @@ func (c *replayCache) sweepLocked(now time.Time) {
 }
 
 // realityClientIdentity derives the identity a REALITY client is known by from
-// the secret it authenticated with.
+// the secret it authenticated with, and carries over cred - what that secret
+// names on every other transport - as its lease identity and its provenance.
 //
-// The value depends on the secret and on nothing else, which is the point: one
-// user reconnecting is recognised across sessions. The consequence is that it
-// says nothing about WHICH client is holding that secret - on the global secret
-// every client in the world produces this same string. It is therefore shared,
-// and a lease keyed on it alone collides. See clientIdentity.
-func realityClientIdentity(secret []byte) clientIdentity {
+// The id depends on the secret and on nothing else, which is the point: one
+// user reconnecting is recognised across sessions, and logs keep the
+// "reality:<hmac>" spelling. Whether it tells clients apart is cred's call: on
+// the global secret every client in the world produces this same string, so it
+// is shared, and a lease keyed on it alone collides. See clientIdentity.
+func realityClientIdentity(secret []byte, cred clientIdentity) clientIdentity {
 	mac := hmac.New(sha256.New, secret)
 	mac.Write([]byte("tiredvpn-client-id-v1"))
-	return sharedIdentity(fmt.Sprintf("reality:%x", mac.Sum(nil)[:8]))
+	return clientIdentity{
+		id:        fmt.Sprintf("reality:%x", mac.Sum(nil)[:8]),
+		perClient: cred.perClient,
+		lease:     cred.leaseID(),
+	}
 }

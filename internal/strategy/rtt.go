@@ -471,3 +471,6 @@ func WrapWithRTTMasking(conn net.Conn, profile *RTTProfile) net.Conn {
 
 // Ensure interface compliance
 var _ net.Conn = (*RTTMaskingConn)(nil)
+
+// NetConn returns the wrapped connection.
+func (c *RTTMaskingConn) NetConn() net.Conn { return c.Conn }

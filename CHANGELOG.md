@@ -7,6 +7,108 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Client: a tunnel that is up but carries nothing is given up.** The client
+  follows the TCP flows it carries. When an application's data in a flow that
+  was being answered waits 30 s for anything back, two keepalives confirm it;
+  if neither is echoed, the session ends, the server is parked and the client
+  moves on. An echo means the tunnel works and the flow's own peer is slow or
+  gone, and nothing happens. Aimed at per-flow byte caps and one-way
+  blackholes that freeze traffic without breaking the connection - HTTP
+  Polling never noticed them. At most three such verdicts in ten minutes.
+  Works on the desktop TUN client and on Android.
+
+### Fixed
+
+- **Client: failover to another server in the pool works when a server goes
+  silent, swallows handshakes, or kills every session young.** Dead sessions
+  and storms park the server with a growing cooldown; a server that accepts
+  TCP and answers no handshake gets the same verdict after two or three
+  cycles; the first reconnect after a silent session walks the pool.
+- **Client: a failing dual-stack server is left whole.** A verdict on one of
+  its addresses (silence, swallowed handshakes, a dead or stalled session)
+  gets the other address one try; a verdict there too parks the server, for
+  longer each time, and the client goes to the next one. It used to go back
+  and forth between the two addresses of one server.
+- **Client: a transport that dies the same way on two servers in a row is
+  set aside.** The route is blamed, not the servers: the transport is set
+  aside for 5 minutes on those two servers, and the client tries another one
+  on the second server instead of walking the whole pool on a transport that
+  works nowhere. A third server is not assumed to share their fate: it pays
+  one death of its own before the rule applies there.
+- **Client: the tunnel moves back to a better strategy after a fault.** After
+  a periodic reprobe finds it working again, the client switches over without
+  dropping the tunnel, and keeps the old strategy if the new one fails.
+- **Client: back within about 30 s after a fault ends**, instead of after a
+  backoff grown to 2 minutes, when the server answered TCP but nothing else.
+- **Client: fewer probes and polls on a fixed period.** Reprobes, pool polls,
+  upgrade offers and emergency reprobes are spaced by drawn pauses, and no
+  reprobe runs while the client is reconnecting.
+- **Android: what the client learned about the servers survives the app's
+  core restart after a dead connection** - parks, the route verdict, the
+  swallowed transports, the storm history - so it does not come straight
+  back to the server it just left; Android sessions now feed the storm
+  detector. A stop by the user, a restart more than 2 minutes later, and -
+  with an app that names its network on `connect` (`network_id`) - a
+  restart on another network start from nothing. `network_id` may be a
+  string or a number; the carry is stamped with the network its state was
+  learned on.
+- **Server: an idle HTTP Polling session is no longer dropped after ~6
+  minutes** while its client keeps polling, directly or through a relay.
+- **Client and relay: an HTTP/2 Stego connection carrying a one-way download
+  no longer breaks.** Every 256 KB down the connection returns flow-control
+  credit from its read path; that write ran into the deadline the last
+  ordinary write had left, failed, and a failed write breaks a TLS
+  connection for good. Through a relay, a leg with a steady download and
+  nothing going up died within two minutes.
+- **Client: a one-way download with nothing going up no longer drops after
+  about a minute.** The client sent a keepalive only when the server had been
+  silent; a server streaming down never is, and the exit closed the session
+  on its read deadline (about 68 s for HTTP/2 Stego, 120 s for Morph and
+  Confusion). The desktop client now also sends one when nothing has gone up
+  for a while.
+- **Relay: the `-upstream` TUN bridge and proxy relays close cleanly and say
+  why.** A write that failed on the upstream TLS connection used to be
+  followed by close_notify, which the exit read as "bad record MAC". The
+  bridge, the raw-tunnel, QUIC and mux relays now log what ended them first
+  (the client, the upstream or the target closing, an error, an idle
+  timeout).
+- **Relay: a sparse download no longer loses its leg every minute.** A
+  client sending nothing up - a push every few seconds, no keepalive of its
+  own before 1.11.9 - left the relay's TUN bridge and its proxy relays
+  silent toward the exit, which closed the leg after 60 s. The relay now
+  keeps the leg fed while its client is alive, which also counts a client
+  whose TCP acknowledges what comes down, a QUIC client whose connection is
+  open and an HTTP Polling client that keeps polling: on QUIC and Polling a
+  proxied stream through a relay still died after two minutes. Exits of any
+  version accept it.
+- **Relay: anti-probe sessions through a relay no longer end 2 s after
+  connecting.**
+- **Server: a proxied site that hangs up is passed on at once.** The client,
+  directly or through a relay, used to wait up to a minute for the rest of
+  an answer that had ended.
+- **Server: a client keeps its tunnel address across transports and
+  networks.** Leases are keyed on the credential, and leases an older server
+  wrote under other keys are folded into it.
+
+### Changed
+
+- On the wire: when a fault hits every server the same way, the client
+  touches both addresses of one server and one other server, then changes
+  transport instead of dialling the rest of the pool.
+- On the wire: up to two keepalives when a flow stalls, also while a
+  download trickles; HTTP Polling leaves a frozen server 32-42 s in; a relay
+  whose client is active sends a keepalive to its exit, on a timer of its
+  own, once either direction of the leg has been silent for a period drawn
+  anew each time between 20 and 45 s; a leg busy both ways gets none; the
+  desktop client does the same for its own uplink, on top of its keepalive
+  when the server is silent, except on HTTP Polling, whose polls already
+  reach the exit. No change to the protocol.
+- On the wire: a relay sends its exit a small frame when nothing else has
+  gone up for a period drawn anew each time between 20 and 45 s, while its
+  client is alive. No change to the protocol.
+
 ## [1.11.8] - 2026-10-20
 
 ### Security

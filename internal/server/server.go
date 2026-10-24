@@ -206,6 +206,32 @@ func optimizedRelay(dst, src net.Conn) (int64, error) {
 	return io.CopyBuffer(dst, src, buf)
 }
 
+// relayEnd records what ended a two-way relay: the first end is the cause,
+// and the ends after it are the close it caused. A relay that logged only
+// its byte counts left a dead upstream and a client hanging up looking the
+// same (the round-8 stand never saw why a relay bridge closed).
+type relayEnd struct{ why atomic.Pointer[string] }
+
+// note records the end of the copy from src to dst, err nil for src closing
+// it, unless an earlier end is recorded.
+func (e *relayEnd) note(src, dst string, err error) {
+	why := src + " closed it"
+	if err != nil {
+		why = src + " to " + dst + ": " + err.Error()
+	}
+	e.set(why)
+}
+
+// set records why, unless an earlier end is recorded.
+func (e *relayEnd) set(why string) { e.why.CompareAndSwap(nil, &why) }
+
+func (e *relayEnd) String() string {
+	if w := e.why.Load(); w != nil {
+		return *w
+	}
+	return "no end recorded"
+}
+
 // isTimeout checks if error is a timeout error
 func isTimeout(err error) bool {
 	if err == nil {
@@ -1092,7 +1118,7 @@ func handleQUICConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 	var err error
 	if srvCtx.upstreamDialer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr)
+		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr, conn)
 		cancel()
 	} else {
 		targetConn, err = optimizedDial("tcp", targetAddr, 10*time.Second)
@@ -1119,22 +1145,26 @@ func handleQUICConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 
 	wg.Add(2)
 
+	var end relayEnd
+
 	// Client -> Target
 	go func() {
 		defer wg.Done()
-		n, _ := optimizedRelay(targetConn, conn)
+		n, err := optimizedRelay(targetConn, conn)
 		atomic.AddInt64(&bytesUp, n)
+		end.note("the client", "the target", err)
 	}()
 
 	// Target -> Client
 	go func() {
 		defer wg.Done()
-		n, _ := optimizedRelay(conn, targetConn)
+		n, err := optimizedRelay(conn, targetConn)
 		atomic.AddInt64(&bytesDown, n)
+		end.note("the target", "the client", err)
 	}()
 
 	wg.Wait()
-	logger.Info("QUIC relay closed: up=%d down=%d", bytesUp, bytesDown)
+	logger.Info("QUIC relay closed: up=%d down=%d: %s", bytesUp, bytesDown, &end)
 
 	// Update metrics
 	if srvCtx.metrics != nil {
@@ -1672,7 +1702,9 @@ func handleMorphConnectionWithALPN(conn net.Conn, srvCtx *serverContext, logger 
 
 // h2TunnelState holds state for HTTP/2 stego tunnel
 type h2TunnelState struct {
-	targetConn      net.Conn
+	targetConn net.Conn
+	// downstream is the client's conn, for a relay's clientLiveness.
+	downstream      net.Conn
 	streamID        uint32
 	clientID        clientIdentity // Client identity for IP pool allocation
 	secret          []byte         // Authenticated client secret, keys the stego markers
@@ -1760,6 +1792,30 @@ func cleanupH2Conn(conn net.Conn, srvCtx *serverContext, tunnel **h2TunnelState,
 	}
 }
 
+// h2FrameReadTimeout is the longest gap between two frames the HTTP/2 stego
+// loop allows on its raw conn, for the life of the connection - a relay's
+// upstream leg included, whose keepalive is drawn to land well inside it
+// (relayKeepaliveAfter). Atomic so tests can scale it while other tests'
+// connections still read it.
+var h2FrameReadTimeoutNs = func() *atomic.Int64 {
+	var v atomic.Int64
+	v.Store(int64(60 * time.Second))
+	return &v
+}()
+
+func h2FrameReadTimeout() time.Duration { return time.Duration(h2FrameReadTimeoutNs.Load()) }
+
+// tunClientReadTimeoutNs is how long the raw TUN loop (handleTUNModeWithHandshake:
+// REALITY, anti-probe, SSH, IMAP, QUIC) waits for a frame from its client
+// before it ends the session: 120 s. Atomic so tests can scale it.
+var tunClientReadTimeoutNs = func() *atomic.Int64 {
+	var v atomic.Int64
+	v.Store(int64(120 * time.Second))
+	return &v
+}()
+
+func tunClientReadTimeout() time.Duration { return time.Duration(tunClientReadTimeoutNs.Load()) }
+
 // runH2FrameLoop reads and dispatches HTTP/2 frames until the connection closes.
 //
 // connPtr / framerPtr are pointers so the loop can swap the connection and
@@ -1771,11 +1827,16 @@ func runH2FrameLoop(connPtr *net.Conn, framerPtr **http2.Framer, hpackDec *hpack
 	for {
 		conn := *connPtr
 		framer := *framerPtr
-		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		deadline := h2FrameReadTimeout()
+		conn.SetReadDeadline(time.Now().Add(deadline))
 		frame, err := framer.ReadFrame()
 		if err != nil {
-			if err != io.EOF {
-				logger.Debug("Frame read error: %v", err)
+			if t := *tunnel; t != nil && t.tunGate != nil {
+				// A TUN session's end, and what ended it: the read deadline,
+				// the client, or an error.
+				logger.Info("H2 TUN session ended: %s", legReadEnd(err, deadline))
+			} else {
+				logger.Debug("H2 session ended: %s", legReadEnd(err, deadline))
 			}
 			return
 		}
@@ -1900,7 +1961,7 @@ func handleH2DataFrame(conn net.Conn, f *http2.DataFrame, framer *http2.Framer, 
 
 	tunnel := *tunnelPtr
 	if tunnel == nil {
-		t := &h2TunnelState{streamID: f.StreamID, clientID: authClientID, secret: authSecret, remoteAddr: originOf(conn.RemoteAddr())}
+		t := &h2TunnelState{streamID: f.StreamID, clientID: authClientID, secret: authSecret, remoteAddr: originOf(conn.RemoteAddr()), downstream: conn}
 		setupH2Tunnel(t, framer, payload, srvCtx, logger)
 		*tunnelPtr = t
 		return
@@ -1928,7 +1989,10 @@ func handleH2DataFrame(conn net.Conn, f *http2.DataFrame, framer *http2.Framer, 
 // not fit (int(pktLen) > len(payload)-4), black-holing every inner packet above
 // ~996 bytes on relay chains. We now buffer across payloads like the morph path.
 func forwardH2TUNPacket(tunnel *h2TunnelState, streamID uint32, payload []byte, logger *log.Logger) {
+	// Every write down reads streamID under tunnel.mu; so must this.
+	tunnel.mu.Lock()
 	tunnel.streamID = streamID
+	tunnel.mu.Unlock()
 	if tunnel.sink == nil {
 		return
 	}
@@ -2323,7 +2387,7 @@ func handleMorphConnection(conn net.Conn, srvCtx *serverContext, logger *log.Log
 	var err error
 	if srvCtx.upstreamDialer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr)
+		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr, conn)
 		cancel()
 	} else {
 		targetConn, err = optimizedDial("tcp", targetAddr, 10*time.Second)
@@ -2566,7 +2630,7 @@ func handleMorphTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverConte
 		// Relay: hand this client to the upstream exit instead of terminating it
 		// here, so a client that fell back to morph still exits where it asked.
 		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, remainingData,
-			originOf(conn.RemoteAddr()), func(pkt []byte) error {
+			originOf(conn.RemoteAddr()), conn, func(pkt []byte) error {
 				return writeMorphFrame(morphFramePacket(pkt))
 			})
 		if err != nil {
@@ -2583,7 +2647,7 @@ func handleMorphTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverConte
 	} else {
 		// Allocate IP from pool (if available) or use requested IP as fallback
 		if srvCtx.ipPool != nil {
-			allocatedIP, err := srvCtx.ipPool.Allocate(allocationKey(clientID, originOf(conn.RemoteAddr())), requestedIP, "")
+			allocatedIP, err := allocateTunnelIP(srvCtx, clientID, originOf(conn.RemoteAddr()), requestedIP)
 			if err != nil {
 				logger.Error("Failed to allocate IP from pool: %v", err)
 				failPacket := []byte{0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01}
@@ -2599,7 +2663,7 @@ func handleMorphTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverConte
 		serverIP = cfg.TunIP
 
 		// Register client with shared TUN using Morph framing
-		writer := srvCtx.sharedTUN.RegisterClientGated(clientIP, clientID.id, conn, morphFramePacket, gate)
+		writer := srvCtx.sharedTUN.RegisterClientGated(clientIP, clientID.id, originOf(conn.RemoteAddr()), conn, morphFramePacket, gate)
 		localSink := newLocalTUNSink(srvCtx.sharedTUN, writer, clientIP)
 		sink = localSink
 		defer func() {
@@ -2977,7 +3041,7 @@ func handleProtocolConfusion(sess *confusionSession, srvCtx *serverContext, logg
 	var targetConn net.Conn
 	if srvCtx.upstreamDialer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr)
+		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr, sess.raw)
 		cancel()
 	} else {
 		targetConn, err = optimizedDial("tcp", targetAddr, 10*time.Second)
@@ -3119,7 +3183,7 @@ func handleConfusionTUNMode(sess *confusionSession, remainingData []byte, srvCtx
 	if srvCtx.upstreamDialer != nil {
 		// Relay: forward to the upstream exit rather than terminating here.
 		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, remainingData,
-			originOf(conn.RemoteAddr()), func(pkt []byte) error {
+			originOf(conn.RemoteAddr()), sess.raw, func(pkt []byte) error {
 				frame := make([]byte, 4+len(pkt))
 				binary.BigEndian.PutUint32(frame[:4], uint32(len(pkt)))
 				copy(frame[4:], pkt)
@@ -3138,7 +3202,7 @@ func handleConfusionTUNMode(sess *confusionSession, remainingData []byte, srvCtx
 	} else {
 		// Allocate IP from pool
 		if srvCtx.ipPool != nil {
-			allocatedIP, err := srvCtx.ipPool.Allocate(allocationKey(clientID, originOf(conn.RemoteAddr())), requestedIP, "")
+			allocatedIP, err := allocateTunnelIP(srvCtx, clientID, originOf(conn.RemoteAddr()), requestedIP)
 			if err != nil {
 				logger.Error("Failed to allocate IP from pool: %v", err)
 				conn.Write([]byte{0x01})
@@ -3153,7 +3217,7 @@ func handleConfusionTUNMode(sess *confusionSession, remainingData []byte, srvCtx
 		serverIP = cfg.TunIP
 
 		// Register client with shared TUN (default framing: [length:4][packet:N])
-		writer := srvCtx.sharedTUN.RegisterClientGated(clientIP, clientID.id, conn, nil, gate)
+		writer := srvCtx.sharedTUN.RegisterClientGated(clientIP, clientID.id, originOf(conn.RemoteAddr()), conn, nil, gate)
 		localSink := newLocalTUNSink(srvCtx.sharedTUN, writer, clientIP)
 		sink = localSink
 		defer func() {
@@ -3339,7 +3403,7 @@ func handleRawTunnel(conn net.Conn, srvCtx *serverContext, logger *log.Logger, c
 	var err error
 	if srvCtx.upstreamDialer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr)
+		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr, conn)
 		cancel()
 	} else {
 		targetConn, err = optimizedDial("tcp", targetAddr, 10*time.Second)
@@ -3376,10 +3440,13 @@ func handleRawTunnel(conn net.Conn, srvCtx *serverContext, logger *log.Logger, c
 
 	wg.Add(2)
 
+	var end relayEnd
+
 	go func() {
 		defer wg.Done()
-		n, _ := optimizedRelay(targetConn, conn)
+		n, err := optimizedRelay(targetConn, conn)
 		atomic.AddInt64(&bytesUp, n)
+		end.note("the client", "the target", err)
 		if tc, ok := targetConn.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
@@ -3387,13 +3454,22 @@ func handleRawTunnel(conn net.Conn, srvCtx *serverContext, logger *log.Logger, c
 
 	go func() {
 		defer wg.Done()
-		n, _ := optimizedRelay(conn, targetConn)
+		n, err := optimizedRelay(conn, targetConn)
 		atomic.AddInt64(&bytesDown, n)
+		end.note("the target", "the client", err)
+		// Pass the target's end on, as the other direction does with
+		// CloseWrite: a client that is told nothing waits for the rest
+		// of an answer that has ended.
+		if cw, ok := conn.(interface{ CloseWrite() error }); ok {
+			_ = cw.CloseWrite()
+		} else {
+			conn.Close()
+		}
 	}()
 
 	wg.Wait()
 
-	logger.Info("Tunnel closed (up=%d, down=%d)", bytesUp, bytesDown)
+	logger.Info("Tunnel closed (up=%d, down=%d): %s", bytesUp, bytesDown, &end)
 
 	// Update metrics
 	if srvCtx.metrics != nil {
@@ -3500,7 +3576,7 @@ func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger
 	if srvCtx.ipPool != nil {
 		// Use IP Pool - it returns same IP for same lease key (from Redis leases)
 		var err error
-		clientIP, err = srvCtx.ipPool.Allocate(allocationKey(clientID, originOf(conn.RemoteAddr())), requestedIP, "")
+		clientIP, err = allocateTunnelIP(srvCtx, clientID, originOf(conn.RemoteAddr()), requestedIP)
 		if err != nil {
 			logger.Warn("IP allocation failed: %v", err)
 			resp := make([]byte, 9)
@@ -3570,7 +3646,7 @@ func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger
 
 	// Register client with shared TUN
 	// Default framing: [length:4][packet:N]
-	writer := srvCtx.sharedTUN.RegisterClientGated(clientIP, clientID.id, conn, nil, gate)
+	writer := srvCtx.sharedTUN.RegisterClientGated(clientIP, clientID.id, originOf(conn.RemoteAddr()), conn, nil, gate)
 	defer func() {
 		srvCtx.sharedTUN.UnregisterClient(clientIP, writer)
 		// Don't release IP - it stays allocated for reconnects
@@ -3593,7 +3669,7 @@ func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger
 		default:
 		}
 
-		conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+		conn.SetReadDeadline(time.Now().Add(tunClientReadTimeout()))
 		if _, err := io.ReadFull(conn, lenBuf); err != nil {
 			logger.Debug("TUN read length error: %v", err)
 			break
@@ -3687,7 +3763,7 @@ func relayTUNToUpstream(conn net.Conn, srvCtx *serverContext, logger *log.Logger
 	}
 
 	dialCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	upstreamConn, resp, err := srvCtx.upstreamDialer.DialTUN(dialCtx, handshake, origin)
+	upstreamConn, upstreamStego, resp, err := srvCtx.upstreamDialer.dialTUN(dialCtx, handshake, origin)
 	cancel()
 	if err != nil {
 		logger.Warn("Relay: upstream TUN dial failed: %v", err)
@@ -3716,21 +3792,27 @@ func relayTUNToUpstream(conn net.Conn, srvCtx *serverContext, logger *log.Logger
 	logger.Info("Relay TUN bridge established (client=%s, upstream-assigned=%s)",
 		conn.RemoteAddr(), net.IP(resp[5:9]))
 
+	// The bridge copies the client's bytes up as they come, and a client on
+	// a sparse download may send none for minutes: the leg died every 60 s
+	// on the exit's read deadline (fix12-slow). The upstream conn keeps it
+	// fed while the client is alive.
+	keepUpstreamAlive(upstreamStego, clientLiveness{conn: conn}, logger)
+
 	// Bidirectional transparent copy with an idle watchdog. Both ends speak the
 	// identical TUN wire format, so no reframing is needed.
 	idleTimeout := srvCtx.cfg.RelayIdleTimeout
 	if idleTimeout <= 0 {
 		idleTimeout = defaultRelayIdleTimeout
 	}
-	runIdleWatchedBridge(conn, upstreamConn, idleTimeout, logger)
+	why := runIdleWatchedBridge(conn, upstreamConn, idleTimeout, logger)
 
-	logger.Info("Relay TUN bridge closed (client=%s)", conn.RemoteAddr())
+	logger.Info("Relay TUN bridge closed (client=%s): %s", conn.RemoteAddr(), why)
 }
 
 // runIdleWatchedBridge byte-copies traffic in both directions between a and b
 // and force-closes BOTH once no bytes flow in either direction for idleTimeout.
 // It returns when both copy directions have finished (peer close, error, or the
-// idle force-close).
+// idle force-close), with what ended the bridge first.
 //
 // The idle watchdog exists because SetReadDeadline cannot reap a stuck relay
 // bridge: the downstream may be an h2TunConn whose SetReadDeadline is a no-op,
@@ -3739,7 +3821,7 @@ func relayTUNToUpstream(conn net.Conn, srvCtx *serverContext, logger *log.Logger
 // copy goroutines stamp lastActivity on every read; the watchdog closes both
 // sides once the stamp ages past idleTimeout. Real traffic - including 10s TUN
 // keepalive frames - keeps the stamp fresh, so a live session is never reaped.
-func runIdleWatchedBridge(a, b net.Conn, idleTimeout time.Duration, logger *log.Logger) {
+func runIdleWatchedBridge(a, b net.Conn, idleTimeout time.Duration, logger *log.Logger) string {
 	var once sync.Once
 	closeBoth := func() {
 		once.Do(func() {
@@ -3748,8 +3830,9 @@ func runIdleWatchedBridge(a, b net.Conn, idleTimeout time.Duration, logger *log.
 		})
 	}
 
+	var end relayEnd
 	var lastActivity atomic.Int64
-	lastActivity.Store(time.Now().UnixNano())
+	lastActivity.Store(monoNow())
 	watchdogDone := make(chan struct{})
 	go func() {
 		// Poll at a quarter of the timeout so the bridge is reaped within
@@ -3765,11 +3848,12 @@ func runIdleWatchedBridge(a, b net.Conn, idleTimeout time.Duration, logger *log.
 			case <-watchdogDone:
 				return
 			case <-ticker.C:
-				idle := time.Since(time.Unix(0, lastActivity.Load()))
+				idle := monoSince(lastActivity.Load())
 				if idle >= idleTimeout {
 					if logger != nil {
 						logger.Info("Relay TUN bridge idle for %s, force-closing", idle.Round(time.Second))
 					}
+					end.set(fmt.Sprintf("idle for %s", idle.Round(time.Second)))
 					closeBoth()
 					return
 				}
@@ -3782,19 +3866,22 @@ func runIdleWatchedBridge(a, b net.Conn, idleTimeout time.Duration, logger *log.
 	go func() {
 		defer wg.Done()
 		defer closeBoth()
-		copyWithActivity(b, a, &lastActivity) // a -> b
+		_, err := copyWithActivity(b, a, &lastActivity) // a -> b
+		end.note("the client", "the upstream", err)
 	}()
 	go func() {
 		defer wg.Done()
 		defer closeBoth()
-		copyWithActivity(a, b, &lastActivity) // b -> a
+		_, err := copyWithActivity(a, b, &lastActivity) // b -> a
+		end.note("the upstream", "the client", err)
 	}()
 	wg.Wait()
 	close(watchdogDone)
+	return end.String()
 }
 
-// copyWithActivity is io.Copy with an activity stamp: it records time.Now (as
-// UnixNano) into lastActivity on every successful read from src. The relay
+// copyWithActivity is io.Copy with an activity stamp: it records a monotonic
+// stamp (monoNow) into lastActivity on every successful read from src. The relay
 // idle-watchdog reads this stamp to detect a silent bridge and force-close it.
 // Buffer size matches io.Copy's internal 32KB.
 func copyWithActivity(dst io.Writer, src io.Reader, lastActivity *atomic.Int64) (int64, error) {
@@ -3803,7 +3890,7 @@ func copyWithActivity(dst io.Writer, src io.Reader, lastActivity *atomic.Int64) 
 	for {
 		nr, rerr := src.Read(buf)
 		if nr > 0 {
-			lastActivity.Store(time.Now().UnixNano())
+			lastActivity.Store(monoNow())
 			nw, werr := dst.Write(buf[:nr])
 			written += int64(nw)
 			if werr != nil {
@@ -3853,7 +3940,7 @@ func setupH2Tunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, srv
 	var err error
 	if srvCtx.upstreamDialer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr)
+		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr, tunnel.downstream)
 		cancel()
 	} else {
 		targetConn, err = optimizedDial("tcp", targetAddr, 10*time.Second)
@@ -3879,6 +3966,17 @@ func setupH2Tunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, srv
 			n, err := targetConn.Read(buf)
 			if err != nil {
 				logger.Debug("Target read error: %v", err)
+				// The target is done, and the connection carries nothing
+				// else: close it, after the last response (tunnel.mu), so
+				// the client reads the end. It used to stay open until
+				// the read deadline, 60 s on, and the client - or a
+				// relay's client - waited that long for an answer that
+				// had ended.
+				tunnel.mu.Lock()
+				if tunnel.downstream != nil {
+					tunnel.downstream.Close()
+				}
+				tunnel.mu.Unlock()
 				return
 			}
 			tunnel.mu.Lock()
@@ -4007,7 +4105,7 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 
 	if srvCtx.upstreamDialer != nil {
 		// Relay: forward to the upstream exit rather than terminating here.
-		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, data, origin, sendPacketDown)
+		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, data, origin, tunnel.downstream, sendPacketDown)
 		if err != nil {
 			logger.Warn("H2 TUN relay: upstream dial failed: %v", err)
 			sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, tunnel.secret)
@@ -4018,8 +4116,7 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 	} else {
 		// Allocate IP from pool
 		if srvCtx.ipPool != nil {
-			leaseKey := allocationKey(tunnel.clientID, origin)
-			allocatedIP, err := srvCtx.ipPool.Allocate(leaseKey, requestedIP, "")
+			allocatedIP, err := allocateTunnelIP(srvCtx, tunnel.clientID, origin, requestedIP)
 			if err != nil {
 				logger.Error("Failed to allocate IP from pool: %v", err)
 				sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, tunnel.secret)
@@ -4037,7 +4134,7 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 		// Register client with shared TUN. The default [len:4][packet:N] framing
 		// is what the gate's writer wraps in a stego response, so there is no
 		// longer a frameFunc that sends on its own and returns nil.
-		writer := srvCtx.sharedTUN.RegisterClientGated(clientIP, tunnel.clientID.id, h2Conn, nil, gate)
+		writer := srvCtx.sharedTUN.RegisterClientGated(clientIP, tunnel.clientID.id, origin, h2Conn, nil, gate)
 		tunnel.sharedTUNWriter = writer
 		tunnel.sharedTUN = srvCtx.sharedTUN
 		tunnel.sink = newLocalTUNSink(srvCtx.sharedTUN, writer, clientIP)
@@ -4211,6 +4308,10 @@ func verifyFullKnockSequence(conn net.Conn, secret []byte, srvCtx *serverContext
 		logger.Debug("Knock packet %d: OK (%d bytes)", i, seq.Sizes[i])
 	}
 
+	// The tunnel that follows reads without a deadline of its own. Left at
+	// 2 s, it ended the session 2 s after the knock - on an exit the TUN
+	// loop sets its own, but the relay's bridge and proxy copy do not.
+	conn.SetReadDeadline(time.Time{})
 	return true
 }
 
@@ -4617,6 +4718,15 @@ type HTTPPollingSession struct {
 
 // touch records a request on the session at t.
 func (s *HTTPPollingSession) touch(t time.Time) { s.lastActive.Store(t.UnixNano()) }
+
+// sinceRequest is how long ago the session's last request came, false
+// before the first.
+func (s *HTTPPollingSession) sinceRequest() (time.Duration, bool) {
+	if s.lastActive.Load() == 0 {
+		return 0, false
+	}
+	return s.idleFor(time.Now()), true
+}
 
 // idleFor is how long the session has gone without a request as of now.
 func (s *HTTPPollingSession) idleFor(now time.Time) time.Duration {
@@ -5071,18 +5181,27 @@ func (s *HTTPPollingSession) ReadToClient(ackSeq int64) []byte {
 	// Check if we need to re-send unacked data (with grace period to allow parallel polls to ack)
 	// Only re-send if: we have unacked data, client is behind, AND enough time has passed
 	const resendGracePeriod = 500 * time.Millisecond // Wait before triggering re-send
-	if len(s.unackedBuf) > 0 && ackSeq < s.sentOffset && time.Since(s.lastSendTime) > resendGracePeriod {
+	if ackSeq < s.sentOffset {
+		// The client is behind what was sent. Nothing past ackSeq may go out
+		// now: the client appends whatever it gets at ackSeq, so new bytes
+		// here land where the missing ones belong and every frame boundary
+		// after them is off - "bad frame: length 916517968" on the client
+		// after one poll timed out. Its retry comes within ~0.2 s, inside
+		// the grace, which is exactly when the old code sent new data.
+		if time.Since(s.lastSendTime) <= resendGracePeriod {
+			return nil
+		}
 		// Client hasn't received all data after grace period - re-send from where client is
 		resendOffset := ackSeq - (s.sentOffset - int64(len(s.unackedBuf)))
-		if resendOffset >= 0 && resendOffset < int64(len(s.unackedBuf)) {
-			// Re-send from resendOffset
-			toResend := s.unackedBuf[resendOffset:]
-			if len(toResend) > maxChunk {
-				toResend = toResend[:maxChunk]
-			}
-			s.lastSendTime = time.Now() // Update send time for re-send
-			return toResend
+		if resendOffset < 0 || resendOffset >= int64(len(s.unackedBuf)) {
+			return nil
 		}
+		toResend := s.unackedBuf[resendOffset:]
+		if len(toResend) > maxChunk {
+			toResend = toResend[:maxChunk]
+		}
+		s.lastSendTime = time.Now() // Update send time for re-send
+		return toResend
 	}
 
 	// Flow control: don't send more data if unacked buffer is full. The client
@@ -5640,7 +5759,9 @@ func runPollingSessionRelay(sess *HTTPPollingSession, srvCtx *serverContext, log
 	var err error
 	if srvCtx.upstreamDialer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr)
+		// The session has no conn; its requests - every 4 s at most while
+		// idle - say the client is there.
+		targetConn, err = srvCtx.upstreamDialer.dialLive(ctx, targetAddr, clientLiveness{seen: sess.sinceRequest})
 		cancel()
 	} else {
 		targetConn, err = optimizedDial("tcp", targetAddr, 10*time.Second)
@@ -5830,7 +5951,7 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 		// Relay: forward to the upstream exit rather than terminating here. This
 		// is the path a client lands on after falling back to meek-style polling,
 		// which used to strand it on the relay's own exit and address pool.
-		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, remainingData, sess.Origin,
+		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, remainingData, sess.Origin, nil,
 			func(pkt []byte) error {
 				_, err := pollConn.Write(pkt)
 				return err
@@ -5850,7 +5971,7 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 	} else {
 		// Allocate IP from pool
 		if srvCtx.ipPool != nil {
-			allocatedIP, err := srvCtx.ipPool.Allocate(allocationKey(clientID, sess.Origin), requestedIP, "")
+			allocatedIP, err := allocateTunnelIP(srvCtx, clientID, sess.Origin, requestedIP)
 			if err != nil {
 				logger.Error("HTTP Polling TUN: Failed to allocate IP from pool: %v", err)
 				sess.WriteToClient([]byte{0x01}) // Failure
@@ -5867,7 +5988,7 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 
 		// Register client with shared TUN using custom framer for polling
 		// Polling uses [length:4][packet:N] framing
-		writer := srvCtx.sharedTUN.RegisterClientGated(clientIP, clientID.id, pollConn, nil, gate)
+		writer := srvCtx.sharedTUN.RegisterClientGated(clientIP, clientID.id, sess.Origin, pollConn, nil, gate)
 		localSink := newLocalTUNSink(srvCtx.sharedTUN, writer, clientIP)
 		sink = localSink
 		defer func() {
@@ -5895,6 +6016,12 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 	lenBuf := make([]byte, 4)
 	var packetsUp int64
 	var pending []byte // a frame's head whose tail has not arrived yet
+	// polledAt is the last poll this loop has passed on to the shared TUN as
+	// activity. A Polling client proves it is alive by polling, idle or not;
+	// before polls counted, an idle session was cleaned as inactive after
+	// ~340 s on the 2026-10-22 stand, and the client saw a session reset on a
+	// healthy idle tunnel. Works for every client version.
+	var polledAt int64
 
 	for {
 		select {
@@ -5911,6 +6038,11 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 		if sess.closed.Load() {
 			logger.Debug("HTTP Polling TUN: session closed")
 			return
+		}
+
+		if at := sess.lastActive.Load(); at != polledAt {
+			polledAt = at
+			sink.UpdateActivity()
 		}
 
 		// Read packet from client via polling buffer. pending is the tail of a

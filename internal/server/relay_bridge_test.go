@@ -125,7 +125,7 @@ func TestCopyWithActivity_StampsAndCopies(t *testing.T) {
 	defer dst.Close()
 
 	var stamp atomic.Int64
-	stamp.Store(time.Now().Add(-time.Hour).UnixNano())
+	stamp.Store(monoNow() - int64(time.Hour))
 	before := stamp.Load()
 
 	copyDone := make(chan struct{})
