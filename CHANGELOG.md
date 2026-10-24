@@ -114,6 +114,17 @@ Versions follow [Semantic Versioning](https://semver.org/).
   bridge, the raw-tunnel, QUIC and mux relays now log what ended them first
   (the client, the upstream or the target closing, an error, an idle
   timeout).
+- **Relay: a sparse download no longer loses its leg every minute.** A
+  client sending nothing up - a push every few seconds, no keepalive of its
+  own before 1.11.9 - left the relay's TUN bridge and its proxy relays
+  silent toward the exit, which closed the leg after 60 s. The relay now
+  keeps the leg fed while its client is alive, which also counts a client
+  whose TCP acknowledges what comes down. Exits of any version accept it.
+- **Relay: anti-probe sessions through a relay no longer end 2 s after
+  connecting.**
+- **Server: a proxied site that hangs up is passed on at once.** The client,
+  directly or through a relay, used to wait up to a minute for the rest of
+  an answer that had ended.
 - **Server: a client keeps its tunnel address across transports and
   networks.** Leases are keyed on the credential, and leases an older server
   wrote under other keys are folded into it.
@@ -134,6 +145,9 @@ Versions follow [Semantic Versioning](https://semver.org/).
 - On the wire: the TLS fallback transports' `session_id` is a keyed tag
   instead of random bytes. Same 32 bytes, different on every connection; the
   rest of the ClientHello is unchanged.
+- On the wire: a relay sends its exit a small frame when nothing else has
+  gone up for a period drawn anew each time between 20 and 45 s, while its
+  client is alive. No change to the protocol.
 
 ## [1.11.8] - 2026-10-20
 
