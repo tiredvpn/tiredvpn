@@ -291,7 +291,7 @@ For flag-backed variables the precedence is flag > env > default.
 - `-seqovl-packet-drop`: warned and forced off.
 - NAT or NAT66 bootstrap failure: the server comes up proxy-degraded.
 - No `-ip-pool` on an exit node: native full-tunnel clients will be rejected.
-- QUIC enabled with UDP buffers below 7.5 MB.
+- A kernel or process limit below what the config needs (see [Host tuning](#host-tuning)).
 - API bound to a non-loopback address without `-api-token`.
 - A forward-hook chain that is not ours has policy `drop` (see below).
 - `-node-max-clients` set on a relay.
@@ -336,6 +336,47 @@ If you would rather manage NAT yourself, that is fine: the automatic setup only
 ever touches the `-ip-pool` CIDR, so your own rules coexist with it. See
 [Server firewall and forwarding](../README.md#server-firewall-and-forwarding-required-for-tun-mode)
 in the README for manual commands.
+
+## Host tuning
+
+At startup the server reads the kernel and process settings below and compares
+each with what **its own configuration** asks of the host. Every setting that
+falls short gets one `INFO` line with the current value, the recommended one, a
+reason, the command that fixes it now and the `sysctl.d` line that keeps it.
+A summary line follows; on a well-tuned host it is the only line:
+
+```
+Host tuning: net.core.rmem_max is 212992, recommended 524288 - the upstream dialer requests 524288-byte socket buffers and the kernel silently clamps them to this ceiling. Fix: sysctl -w net.core.rmem_max=524288; persist: add 'net.core.rmem_max = 524288' to /etc/sysctl.d/90-tiredvpn.conf
+Host tuning: 7 settings checked for this config, 1 to adjust; the server changes none of them itself
+```
+
+The server never writes these settings itself (the `ip_forward` and NAT66
+bootstrap described above is the one exception, and it predates the advisor:
+the forwarding rules only report when that bootstrap failed). Rules that do not
+apply to the config are not checked: a relay gets no forwarding or conntrack
+advice, an exit without `-ip-pool` no forwarding advice. A value that cannot be
+read (for example `nf_conntrack_max` before the module is loaded) is skipped
+and counted as unreadable, never guessed. Outside Linux the advisor is silent.
+
+<!-- host-tuning-table:begin (generated from internal/server/host_tuning.go; go test ./internal/server -run TestHostTuningDocsInSync -update-host-tuning-docs) -->
+| Setting | Checked when | Recommended | Why | Evidence |
+|---|---|---|---|---|
+| `net.core.rmem_max` | always | >= the largest socket buffer the config requests: 4 MiB on an exit (target dials), `-relay-upstream-buf` or 512 KiB on a relay, 7.5 MB with QUIC | `SO_RCVBUF` above this is clamped without an error, so the receive window of every such socket is capped | Relay on stock Ubuntu 24.04, 146 ms upstream leg (2026-10-24): 212992 held the leg at `rcv_ssthresh` 210439 and TUN downloads at 6.3-8.7 Mbit/s; 1 MiB gave 19.8-20.1 Mbit/s. Same class as the hard-coded 64 KB buffers that held 1.3.x at ~3.5 Mbit/s on 150 ms. Two of our exits still run 212992 (read 2026-10-24), which clamps their 4 MiB target-dial buffers; the effect on that leg has not been measured |
+| `net.core.wmem_max` | always | same as `net.core.rmem_max` | `SO_SNDBUF` is clamped the same way, capping how much one socket keeps in flight | Raised together with `rmem_max` in the relay measurement above; of the seven nodes read on 2026-10-24 one runs 16 MiB for both, two 4 MiB, one 1 MiB, two exits the stock 212992 |
+| `net.ipv4.tcp_rmem` | always | last field >= 4 MiB | accepted client sockets set no buffer and autotune up to the last field | Not seen as a bottleneck: stock Ubuntu 24.04 has 6291456, our tuned exit 16777216. The rule only catches a host tuned below that |
+| `net.ipv4.tcp_wmem` | always | last field >= 4 MiB | same as `tcp_rmem`, for the send side of client sockets | Not seen as a bottleneck: stock Ubuntu 24.04 has 4194304, our tuned exit 16777216 |
+| `net.ipv4.tcp_congestion_control` | always | `bbr` | loss-based cubic backs off on random loss over long-RTT paths | One of the seven nodes read on 2026-10-24 runs bbr, six run cubic. No A/B throughput measurement has been made, so treat it as a default, not a measured gain |
+| `net.ipv4.ip_forward` | `-ip-pool` on an exit (no `-upstream`) | 1 | TUN clients' packets are forwarded out of this host; the server sets it at startup, so 0 here means its own attempt failed | Set by the NAT bootstrap (internal/tun/nat_linux.go); the advisor runs after it and only reports |
+| `net.ipv6.conf.all.forwarding` | `-ip-pool` with `-ip-pool-v6` on an exit | 1 | same as `ip_forward`, for the dual-stack pool | Set by the NAT66 bootstrap; without it v6 inside the tunnel is blackholed |
+| `net.netfilter.nf_conntrack_max` | `-ip-pool` on an exit (skipped while nf_conntrack is not loaded) | >= min(pool size, admission limit) x 256, at most 262144 | every masqueraded flow takes an entry and a full table drops new flows | The kernel default scales with RAM: 8192 on a 960 MB exit, 65536 on 2 GB ones; no `table full` in their kernel logs (2026-10-24). 256 flows per client is an assumption, not a measurement |
+| `net.core.somaxconn` | always | >= min(admission limit, 4096) | Go uses it as the listen backlog; a reconnect storm overflows a short accept queue before admission control sees it | 4096 on every node we run (kernel >= 5.4 default; read 2026-10-24); older kernels default to 128. No overflow has been observed, the rule only catches an old kernel or a host tuned below the default |
+| `RLIMIT_NOFILE` | always | >= admission limit x 4 + 1024 | each admitted connection holds a client socket and a target or upstream leg; below this accept fails with EMFILE | Our nodes run 524287 (Go raises the soft limit to the hard one) or the 65536 the packaged unit sets (read 2026-10-24). Derived from admission control, not from an incident |
+<!-- host-tuning-table:end -->
+
+Considered and left out, for lack of evidence that they matter here: MTU and
+MSS need no host setting (the server clamps MSS on the TUN device and sizes the
+TUN MTU itself), and `net.core.default_qdisc=fq` next to `bbr` was estimated as
+a small effect and never measured.
 
 ## Configuration via TOML
 
