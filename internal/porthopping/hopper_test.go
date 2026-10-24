@@ -223,12 +223,18 @@ func TestPortHopperJitter(t *testing.T) {
 
 	intervals := make([]time.Duration, 100)
 
+	// The drawn interval itself, not TimeUntilNextHop: that is the interval
+	// less the time since the hopper was built, and under -race with the
+	// machine loaded the gap between the two calls ate tens of ms (minimum
+	// 11 ms against the 70 ms floor in CI-like runs).
 	for i := range 100 {
 		hopper, err := NewPortHopper(config)
 		if err != nil {
 			t.Fatalf("failed to create hopper: %v", err)
 		}
-		intervals[i] = hopper.TimeUntilNextHop()
+		hopper.mu.RLock()
+		intervals[i] = hopper.jitteredInterval
+		hopper.mu.RUnlock()
 	}
 
 	// Check jitter range (70% to 130% of base interval)
@@ -245,12 +251,11 @@ func TestPortHopperJitter(t *testing.T) {
 		}
 	}
 
-	// Allow some tolerance
-	tolerance := 10 * time.Millisecond
-	if min < minExpected-tolerance {
+	// Exact bounds: the value no longer depends on the clock.
+	if min < minExpected {
 		t.Errorf("minimum interval %v below expected %v", min, minExpected)
 	}
-	if max > maxExpected+tolerance {
+	if max > maxExpected {
 		t.Errorf("maximum interval %v above expected %v", max, maxExpected)
 	}
 
