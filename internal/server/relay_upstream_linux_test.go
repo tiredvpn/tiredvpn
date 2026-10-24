@@ -122,7 +122,9 @@ func (b *relayBridge) alive(t *testing.T, out *lockedLog, when string) {
 }
 
 // download streams 1200-byte packets from the exit to the client, one every
-// every for span, and waits for them to come down.
+// every, span/every of them, and waits for them to come down. Counted, not
+// timed: under load a ticker drops ticks, and the stand's 3 minutes at 10 ms
+// are 720 packets whatever the machine does.
 func (b *relayBridge) download(t *testing.T, out *lockedLog, span, every time.Duration) {
 	t.Helper()
 	w := exitWriterFor(t, b.exit, b.clientIP)
@@ -132,7 +134,7 @@ func (b *relayBridge) download(t *testing.T, out *lockedLog, span, every time.Du
 	var sent int64
 	tick := time.NewTicker(every)
 	defer tick.Stop()
-	for end := time.Now().Add(span); time.Now().Before(end); {
+	for range span / every {
 		<-tick.C
 		if w.SendPacket(pkt) == nil {
 			sent++
