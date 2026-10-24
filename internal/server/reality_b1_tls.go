@@ -256,7 +256,7 @@ func handleREALITYB1(conn net.Conn, peekBuf []byte, clientID clientIdentity, sec
 			logger.Debug("REALITY B1: smux session closed: %v", err)
 			return
 		}
-		go handleRawTunnel(stream, srvCtx, logger, clientID)
+		go handleRawTunnel(overTransport{stream, conn}, srvCtx, logger, clientID)
 	}
 }
 

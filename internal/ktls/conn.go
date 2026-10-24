@@ -32,6 +32,9 @@ type Conn struct {
 	rx recvState
 }
 
+// NetConn returns the TCP connection under the kTLS one.
+func (c *Conn) NetConn() net.Conn { return c.tcpConn }
+
 // NewConn creates a new kTLS connection wrapper.
 // It extracts the underlying TCP connection.
 func NewConn(tlsConn *tls.Conn) (*Conn, error) {

@@ -132,7 +132,7 @@ func handleSSHCamouflage(conn net.Conn, srvCtx *serverContext, logger *log.Logge
 	// stripped, so handleRawTunnel (which already supports both SOCKS proxy and
 	// TUN mode) can run over it unchanged.
 	sshConn := strategy.NewSSHCamouflageConn(transport)
-	handleRawTunnel(sshConn, srvCtx, logger, clientID)
+	handleRawTunnel(overTransport{sshConn, conn}, srvCtx, logger, clientID)
 }
 
 // sshServerHandshake performs the SSH transport handshake and then verifies the

@@ -194,6 +194,9 @@ func newCCSGuardWithPolicy(conn net.Conn, policy ccsPolicy) *ccsGuard {
 // handshakeDone stops the guard. Call it once tls.Handshake returns, whatever
 // the outcome. After this the connection is pure ApplicationData, where a 0x14
 // is a byte of ciphertext and filtering it would corrupt the stream.
+// Unwrap returns the conn under the guard, for clientLiveness.
+func (g *ccsGuard) Unwrap() net.Conn { return g.Conn }
+
 func (g *ccsGuard) handshakeDone() {
 	g.mu.Lock()
 	g.done = true

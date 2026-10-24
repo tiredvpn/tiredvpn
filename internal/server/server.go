@@ -1702,7 +1702,9 @@ func handleMorphConnectionWithALPN(conn net.Conn, srvCtx *serverContext, logger 
 
 // h2TunnelState holds state for HTTP/2 stego tunnel
 type h2TunnelState struct {
-	targetConn      net.Conn
+	targetConn net.Conn
+	// downstream is the client's conn, for a relay's clientLiveness.
+	downstream      net.Conn
 	streamID        uint32
 	clientID        clientIdentity // Client identity for IP pool allocation
 	secret          []byte         // Authenticated client secret, keys the stego markers
@@ -1948,7 +1950,7 @@ func handleH2DataFrame(conn net.Conn, f *http2.DataFrame, framer *http2.Framer, 
 
 	tunnel := *tunnelPtr
 	if tunnel == nil {
-		t := &h2TunnelState{streamID: f.StreamID, clientID: authClientID, secret: authSecret, remoteAddr: originOf(conn.RemoteAddr())}
+		t := &h2TunnelState{streamID: f.StreamID, clientID: authClientID, secret: authSecret, remoteAddr: originOf(conn.RemoteAddr()), downstream: conn}
 		setupH2Tunnel(t, framer, payload, srvCtx, logger)
 		*tunnelPtr = t
 		return
@@ -2617,7 +2619,7 @@ func handleMorphTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverConte
 		// Relay: hand this client to the upstream exit instead of terminating it
 		// here, so a client that fell back to morph still exits where it asked.
 		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, remainingData,
-			originOf(conn.RemoteAddr()), func(pkt []byte) error {
+			originOf(conn.RemoteAddr()), conn, func(pkt []byte) error {
 				return writeMorphFrame(morphFramePacket(pkt))
 			})
 		if err != nil {
@@ -3170,7 +3172,7 @@ func handleConfusionTUNMode(sess *confusionSession, remainingData []byte, srvCtx
 	if srvCtx.upstreamDialer != nil {
 		// Relay: forward to the upstream exit rather than terminating here.
 		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, remainingData,
-			originOf(conn.RemoteAddr()), func(pkt []byte) error {
+			originOf(conn.RemoteAddr()), sess.raw, func(pkt []byte) error {
 				frame := make([]byte, 4+len(pkt))
 				binary.BigEndian.PutUint32(frame[:4], uint32(len(pkt)))
 				copy(frame[4:], pkt)
@@ -4067,7 +4069,7 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 
 	if srvCtx.upstreamDialer != nil {
 		// Relay: forward to the upstream exit rather than terminating here.
-		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, data, origin, sendPacketDown)
+		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, data, origin, tunnel.downstream, sendPacketDown)
 		if err != nil {
 			logger.Warn("H2 TUN relay: upstream dial failed: %v", err)
 			sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, tunnel.secret)
@@ -5902,7 +5904,7 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 		// Relay: forward to the upstream exit rather than terminating here. This
 		// is the path a client lands on after falling back to meek-style polling,
 		// which used to strand it on the relay's own exit and address pool.
-		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, remainingData, sess.Origin,
+		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, remainingData, sess.Origin, nil,
 			func(pkt []byte) error {
 				_, err := pollConn.Write(pkt)
 				return err
