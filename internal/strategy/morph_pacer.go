@@ -18,18 +18,22 @@ import (
 var ErrShaperOverflow = errors.New("shaper queue overflow")
 
 // ErrShaperCloseIncomplete is returned by Close when frames that Write had
-// already accepted into the pacer queue did not all reach the peer: the
-// peer did not take them within pacerCloseTimeout, or the connection broke
-// with frames still queued. The error wraps the write error that stopped
-// the pacer, if any.
-var ErrShaperCloseIncomplete = errors.New("shaper close did not deliver every accepted frame")
+// already accepted into the pacer queue were not all handed to the
+// connection: it did not take them by the close deadline, or it failed with
+// frames still queued. Handed over is all Close can know. Bytes the kernel
+// or the TLS layer accepted count as delivered, though a later reset can
+// still lose them. The count in the message is of framed bytes (header and
+// padding included), not of the payload bytes the caller wrote. The error
+// wraps the write error that stopped the pacer, if any.
+var ErrShaperCloseIncomplete = errors.New("shaper close: queued frames not handed to the conn")
 
-// pacerCloseTimeout bounds how long close() waits for the queue to reach
-// the wire. It is applied as a write deadline on the connection, so it also
-// cuts short a write that is already blocked on a peer that does not read.
-// The queue is bounded (pacerQueueCap frames), so a peer that reads keeps
-// up with it well inside this; one that does not costs Close this long and
-// an ErrShaperCloseIncomplete. A var so tests can shorten it.
+// pacerCloseTimeout bounds how long MorphedConn.Close spends writing out
+// the queue. Close puts it on the connection as the write deadline, unless
+// the caller's own write deadline is earlier, so it also cuts short a write
+// that is already blocked on a peer that does not read. The queue is
+// bounded (pacerQueueCap frames), so a peer that reads keeps up with it
+// well inside this; one that does not costs Close this long and an
+// ErrShaperCloseIncomplete. A var so tests can shorten it.
 var pacerCloseTimeout = 5 * time.Second
 
 // pacer tuning constants — see ADR §7. Exposed as package-private so tests
@@ -80,7 +84,7 @@ type writePacer struct {
 	closed bool
 
 	// lost counts the bytes of accepted frames released without reaching
-	// the wire. close() reports them as ErrShaperCloseIncomplete.
+	// the wire. shutdown reports them as ErrShaperCloseIncomplete.
 	lost atomic.Int64
 
 	// errSeen holds the last non-nil Conn.Write error observed by the
@@ -97,8 +101,8 @@ type writePacer struct {
 }
 
 // newWritePacer constructs and starts a pacer goroutine bound to conn.
-// Caller owns conn and must invoke close() before closing the underlying
-// connection so the drain timeout has a chance to flush queued frames.
+// Caller owns conn and must invoke shutdown before closing the underlying
+// connection so the queued frames have a chance to reach it.
 func newWritePacer(conn net.Conn, sh shaper.Shaper) *writePacer {
 	return newWritePacerWithWritev(conn, sh, nil)
 }
@@ -213,7 +217,7 @@ func (p *writePacer) run() {
 			return
 		case f, ok := <-p.queue:
 			if !ok {
-				// close() closed the queue and this select picked it over
+				// shutdown closed the queue and this select picked it over
 				// done. Nothing is pending: an iteration that leaves the
 				// queue empty flushes, and a closed queue is empty.
 				return
@@ -274,8 +278,8 @@ func (p *writePacer) run() {
 }
 
 // drain empties the queue after stop. With send set (close path) it writes
-// the frames out in writev batches until close() closes the queue; the
-// write deadline close() put on the connection bounds every batch. Without
+// the frames out in writev batches until shutdown closes the queue; the
+// write deadline the owner put on the connection bounds every batch. Without
 // send (Conn.Write failure path) the connection is dead: it only releases
 // what is queued now, without waiting for close. Every frame released
 // without being written is counted in lost.
@@ -373,16 +377,16 @@ func (p *writePacer) enqueue(frame pacedFrame) error {
 	}
 }
 
-// close stops the pacer and returns once every frame accepted by enqueue
-// has been written or given up on. Queued frames go out unpaced; the whole
-// drain is bounded by pacerCloseTimeout, set as the connection's write
-// deadline. If any accepted frame did not reach the wire, close returns
+// shutdown stops the pacer and returns once every frame accepted by
+// enqueue has been written or given up on. Queued frames go out unpaced.
+// The owner bounds the drain: it puts a write deadline on the connection
+// first, and closes the socket if a write outlives it. If any accepted
+// frame was not handed to the connection, shutdown returns
 // ErrShaperCloseIncomplete with the byte count; it never drops one
 // silently. Safe to call multiple times; later calls return the first
 // result.
-func (p *writePacer) close() error {
+func (p *writePacer) shutdown() error {
 	p.closeOnce.Do(func() {
-		_ = p.conn.SetWriteDeadline(time.Now().Add(pacerCloseTimeout))
 		close(p.done)
 		// Producers parked in enqueue see done and leave; after that none
 		// can send, and closing the queue tells the drain it has the last
@@ -399,7 +403,7 @@ func (p *writePacer) close() error {
 			releasePacketBuf(f.packet, f.bucket)
 		}
 		if lost := p.lost.Load(); lost > 0 {
-			p.closeErr = fmt.Errorf("%w: %d bytes of queued frames not written", ErrShaperCloseIncomplete, lost)
+			p.closeErr = fmt.Errorf("%w: %d framed bytes", ErrShaperCloseIncomplete, lost)
 			if errp := p.errSeen.Load(); errp != nil {
 				p.closeErr = fmt.Errorf("%w: %w", p.closeErr, *errp)
 			}

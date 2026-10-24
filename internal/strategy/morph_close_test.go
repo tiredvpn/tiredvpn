@@ -199,7 +199,7 @@ func TestMorphedConnCloseReportsUndelivered(t *testing.T) {
 			if !errors.Is(err, ErrShaperCloseIncomplete) {
 				t.Fatalf("Close = %v, want ErrShaperCloseIncomplete", err)
 			}
-			if want := fmt.Sprintf("%d bytes of queued frames not written", sent-int64(read)); !strings.Contains(err.Error(), want) {
+			if want := fmt.Sprintf(": %d framed bytes", sent-int64(read)); !strings.Contains(err.Error(), want) {
 				t.Fatalf("Close = %q, want it to report %q (%d queued, %d read)", err, want, sent, read)
 			}
 		})
@@ -274,7 +274,7 @@ func TestPacerCloseCountsFramesQueuedAfterWriteError(t *testing.T) {
 	if !errors.Is(err, ErrShaperCloseIncomplete) || !errors.Is(err, errFakeWrite) {
 		t.Fatalf("close = %v, want ErrShaperCloseIncomplete wrapping the write error", err)
 	}
-	if !strings.Contains(err.Error(), "3 bytes of queued frames not written") {
+	if !strings.Contains(err.Error(), ": 3 framed bytes") {
 		t.Fatalf("close = %q, want the failed frame and the late one counted (3 bytes)", err)
 	}
 }

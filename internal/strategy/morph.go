@@ -10,6 +10,7 @@ import (
 	mathrand "math/rand/v2"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/evasion"
@@ -485,9 +486,13 @@ type MorphedConn struct {
 	// pacer drains shaped frames asynchronously so the producer Write
 	// never blocks on per-frame time.Sleep. Lazy-initialised via pacerOnce
 	// on the first shaped Write; nil while the connection only sees
-	// NoopShaper traffic.
+	// NoopShaper traffic, and for good if Close came first.
 	pacer     *writePacer
 	pacerOnce sync.Once
+
+	// wdl keeps the caller's write deadline, so that Close bounds the drain
+	// by it instead of replacing it.
+	wdl closeDeadline
 }
 
 // NetConn returns the underlying net.Conn for TCP optimization
@@ -775,18 +780,59 @@ func (mc *MorphedConn) Read(p []byte) (int, error) {
 	return copied, nil
 }
 
+// SetDeadline sets the read and write deadlines. Once Close has started,
+// the write deadline can only move closer.
+func (mc *MorphedConn) SetDeadline(t time.Time) error {
+	return mc.wdl.setDeadline(mc.Conn, t)
+}
+
+// SetWriteDeadline sets the write deadline. Once Close has started, it can
+// only move closer.
+func (mc *MorphedConn) SetWriteDeadline(t time.Time) error {
+	return mc.wdl.setWriteDeadline(mc.Conn, t)
+}
+
 // Close closes the underlying connection. If the async shaped-write pacer
 // has been started, it is stopped first and writes out every frame Write
-// already accepted before the socket goes away. A peer that does not take
-// them within pacerCloseTimeout makes Close return ErrShaperCloseIncomplete
-// (joined with the socket's own Close error, if any) instead of losing the
-// tail silently.
+// already accepted before the socket goes away, under the earlier of the
+// caller's write deadline and pacerCloseTimeout. A connection that does not
+// take them by then makes Close return ErrShaperCloseIncomplete instead of
+// losing the tail silently. The socket is then closed below any TLS layer,
+// without close_notify, which tls.Conn would otherwise spend another 5 s
+// trying to send. Whatever is still writing closeAbortGrace past the
+// deadline - a write on a connection that ignores write deadlines, or the
+// close_notify after a complete drain into a window that has just shut -
+// is cut off by closing the socket, so Close never takes longer than
+// that. The socket's own Close error, if any, is joined in.
 func (mc *MorphedConn) Close() error {
-	var drainErr error
-	if mc.pacer != nil {
-		drainErr = mc.pacer.close()
+	// Use up pacerOnce: a shaped Write that has not started the pacer yet
+	// can no longer start one on a closed conn, and the read of mc.pacer
+	// below is ordered after the write in ensurePacer.
+	mc.pacerOnce.Do(func() {})
+	if mc.pacer == nil {
+		return mc.Conn.Close()
 	}
-	return errors.Join(drainErr, mc.Conn.Close())
+
+	closeBy := mc.wdl.begin(mc.Conn, pacerCloseTimeout)
+	var aborted atomic.Bool
+	closeSock := sync.OnceValue(func() error { return closeSocket(mc.Conn) })
+	abort := time.AfterFunc(time.Until(closeBy)+closeAbortGrace, func() {
+		aborted.Store(true)
+		_ = closeSock()
+	})
+	defer abort.Stop()
+	drainErr := mc.pacer.shutdown()
+	if drainErr == nil && !aborted.Load() {
+		return mc.Conn.Close()
+	}
+	if drainErr != nil {
+		log.Warn("Morph: close lost the queued tail: %v", drainErr)
+	}
+	sockErr := closeSock()
+	// Release the wrapper too. Its error only reports the socket closed
+	// just above.
+	_ = mc.Conn.Close()
+	return errors.Join(drainErr, sockErr)
 }
 
 // Stats returns traffic statistics

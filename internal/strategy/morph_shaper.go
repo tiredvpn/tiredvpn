@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"io"
+	"net"
 
 	"github.com/tiredvpn/tiredvpn/internal/config/toml"
 	"github.com/tiredvpn/tiredvpn/internal/shaper"
@@ -36,6 +37,10 @@ func (mc *MorphedConn) ensurePacer() {
 // blocks on time.Sleep at sub-tick granularity (see adr-shaper-perf.md).
 func (mc *MorphedConn) writeShaped(p []byte) (int, error) {
 	mc.ensurePacer()
+	if mc.pacer == nil {
+		// Close used up pacerOnce before any shaped Write started the pacer.
+		return 0, net.ErrClosed
+	}
 
 	frames := mc.shaper.Wrap(p)
 	if len(frames) == 0 {
