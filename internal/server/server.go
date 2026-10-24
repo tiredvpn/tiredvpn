@@ -599,7 +599,7 @@ func Run(cfg *Config) error {
 
 	// After NAT bootstrap and listener setup, so forwarding and conntrack are
 	// read as the server leaves them. Reports only; changes nothing.
-	logHostTuning(cfg, srvCtx.ipPool != nil && srvCtx.ipPool.DualStack())
+	logHostTuning(cfg, srvCtx)
 
 	for {
 		conn, err := listener.Accept()

@@ -1,11 +1,11 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"runtime"
-	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -17,63 +17,66 @@ import (
 //
 // At startup the server reads the kernel and process settings that decide how
 // well it can run, compares each against what this server's own configuration
-// asks of the host, and logs one INFO line per setting that falls short, with
-// the exact command to fix it. It never writes a setting itself: changing a
-// host's kernel is the operator's call.
+// asks of the host, and logs one line per setting that falls short, with the
+// exact command to fix it. It never writes a setting itself: changing a host's
+// kernel is the operator's call.
 //
 // Every rule is derived from the configuration rather than from a fixed list
-// of "good values": the socket-buffer ceiling is checked against the buffer
-// this process will actually request, forwarding only when the TUN pool's
-// traffic leaves through this host, and so on. The rule table below also
-// generates the "Host tuning" section of docs/server.md (see
-// TestHostTuningDocsInSync), so the two cannot drift apart.
+// of "good values", and every rule says what it rests on: a measurement on our
+// nodes, a hard requirement of the config, or an estimate. Measured and
+// required shortfalls are logged at INFO; estimates only at DEBUG, marked
+// "(unmeasured)", so they cannot drown out the measured ones. A buffer
+// recommendation is only made while the buffers it allows fit in half of the
+// service's memory limit (see socketBufferBudget).
+//
+// The rule table below also generates the "Host tuning" section of
+// docs/server.md (see TestHostTuningDocsInSync), so the two cannot drift.
 
 const (
-	// targetDialSockBuf is the SO_RCVBUF/SO_SNDBUF that setTCPOptions requests
-	// on every direct target dial of an exit node.
-	targetDialSockBuf = 4 * 1024 * 1024
-
-	// quicUDPSockBuf is the UDP buffer quic-go asks for; below it the QUIC
-	// listener runs with a clamped receive buffer.
-	quicUDPSockBuf = 7500000
-
-	// tcpAutotuneMax is the floor for the third field of tcp_rmem/tcp_wmem, the
-	// autotuning ceiling for the client-facing sockets the server accepts
-	// without setting a buffer. 4 MiB covers ~64 Mbit/s at 500 ms RTT, the
-	// longest relay leg we have measured.
-	tcpAutotuneMax = 4 * 1024 * 1024
-
-	// fdsPerConn budgets descriptors per admitted connection: the client
-	// socket, its target or upstream leg, and slack for mux sessions that open
-	// several targets over one connection. An assumption, not a measurement.
+	// fdsPerConn is the estimated descriptor cost of one admitted connection:
+	// the client socket, its target or upstream leg, and slack for a few mux
+	// streams. An estimate, not a measurement.
 	fdsPerConn = 4
 
 	// fdHeadroom covers listeners, TUN, Redis, log files and the runtime.
 	fdHeadroom = 1024
 
 	// conntrackPerClient is the conntrack budget per TUN client behind this
-	// host's MASQUERADE. An assumption, not a measurement: no per-client flow
-	// count has been taken on our exits.
+	// host's MASQUERADE. An assumption: no per-client flow count has been
+	// taken on our exits.
 	conntrackPerClient = 256
 
-	// conntrackCeiling caps the recommendation for very large pools, where the
-	// admission limit and memory bind long before the conntrack table does.
+	// conntrackCeiling caps the recommendation for very large pools.
 	conntrackCeiling = 262144
+
+	// conntrackEntryBytes is the slab size of one conntrack entry on our
+	// kernels (256 on 6.8, 320 on 5.15; the larger is used).
+	conntrackEntryBytes = 320
+
+	// conntrackRAMShare is the fraction of host RAM (1/16) the conntrack
+	// table may take at the recommended size.
+	conntrackRAMShare = 16
 
 	// hostTuningSysctlFile is the drop-in the persist hints point at.
 	hostTuningSysctlFile = "/etc/sysctl.d/90-tiredvpn.conf"
+)
+
+// Basis of a rule: what the recommendation rests on. It decides the level.
+const (
+	basisMeasured = "measured" // measured on our nodes; INFO
+	basisRequired = "required" // the config cannot work without it; INFO
+	basisEstimate = "estimate" // reasoned, never measured; DEBUG
 )
 
 // hostTuningInput is what this server's configuration asks of the host.
 type hostTuningInput struct {
 	upstream    bool // -upstream: target and TUN traffic goes to the upstream exit
 	upstreamBuf int  // socket buffer the upstream dialer requests
-	quic        bool
 	// natV4 / natV6: a TUN pool whose traffic is forwarded and masqueraded out
 	// of this host (an exit with -ip-pool, not a relay bridging to upstream).
 	natV4, natV6   bool
 	poolClients    int // usable addresses in the v4 pool
-	admissionLimit int
+	admissionLimit int // TCP admission limit; QUIC and mux streams are not bounded by it
 }
 
 // hostTuningInputFor derives the input from the effective configuration.
@@ -81,7 +84,6 @@ type hostTuningInput struct {
 func hostTuningInputFor(cfg *Config, dualStack bool) hostTuningInput {
 	in := hostTuningInput{
 		upstream:       cfg.UpstreamAddr != "",
-		quic:           cfg.QUICEnabled,
 		admissionLimit: admissionLimitFor(cfg),
 	}
 	if in.upstream {
@@ -96,6 +98,11 @@ func hostTuningInputFor(cfg *Config, dualStack bool) hostTuningInput {
 		in.poolClients = poolHostCount(cfg.IPPoolNetwork)
 	}
 	return in
+}
+
+// poolDualStack is whether the server's IP pool came up dual-stack.
+func poolDualStack(srvCtx *serverContext) bool {
+	return srvCtx != nil && srvCtx.ipPool != nil && srvCtx.ipPool.DualStack()
 }
 
 // poolHostCount is the number of client addresses in a v4 CIDR: everything
@@ -115,12 +122,17 @@ func poolHostCount(cidr string) int {
 }
 
 // hostReader is the host as the advisor sees it. The production reader is
-// /proc/sys plus getrlimit; tests substitute a map.
+// /proc, /sys/fs/cgroup and getrlimit; tests substitute a map.
 type hostReader interface {
 	// sysctl returns the value of a dotted sysctl name, e.g. net.core.rmem_max.
 	sysctl(name string) (string, error)
 	// nofileSoft returns the soft RLIMIT_NOFILE the process runs with.
 	nofileSoft() (uint64, error)
+	// memLimit returns the memory limit of this process's cgroup (the unit's
+	// MemoryMax); limited is false when there is none.
+	memLimit() (limit uint64, limited bool, err error)
+	// memTotal returns the host RAM in bytes.
+	memTotal() (uint64, error)
 }
 
 type procHost struct{}
@@ -141,18 +153,102 @@ func (procHost) nofileSoft() (uint64, error) {
 	return uint64(rl.Cur), nil
 }
 
+func (procHost) memLimit() (uint64, bool, error) {
+	self, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		return 0, false, err
+	}
+	return cgroupMemLimit(string(self), os.ReadFile)
+}
+
+func (procHost) memTotal() (uint64, error) {
+	b, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0, err
+	}
+	return parseMemTotal(string(b))
+}
+
+// cgroupMemLimit returns the tightest memory limit on the path from this
+// process's cgroup up to the root. cgroup v2 (memory.max, "max" = none) and
+// the v1 memory controller (memory.limit_in_bytes, a huge value = none) are
+// understood. A level without the file is skipped: the root has none.
+func cgroupMemLimit(selfCgroup string, readFile func(string) ([]byte, error)) (uint64, bool, error) {
+	var dir, file string
+	for line := range strings.SplitSeq(strings.TrimSpace(selfCgroup), "\n") {
+		parts := strings.SplitN(line, ":", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		switch {
+		case parts[0] == "0" && parts[1] == "":
+			if dir == "" {
+				dir, file = "/sys/fs/cgroup"+parts[2], "memory.max"
+			}
+		case strings.Contains(","+parts[1]+",", ",memory,"):
+			dir, file = "/sys/fs/cgroup/memory"+parts[2], "memory.limit_in_bytes"
+		}
+	}
+	if dir == "" {
+		return 0, false, errors.New("no memory cgroup in /proc/self/cgroup")
+	}
+	const v1Unlimited = 1 << 62
+	var best uint64
+	limited := false
+	for p := strings.TrimSuffix(dir, "/"); ; {
+		b, err := readFile(p + "/" + file)
+		if err == nil {
+			v := strings.TrimSpace(string(b))
+			if n, err := strconv.ParseUint(v, 10, 64); err == nil && n < v1Unlimited && (!limited || n < best) {
+				best, limited = n, true
+			} else if err != nil && v != "max" {
+				return 0, false, fmt.Errorf("%s/%s: %q", p, file, v)
+			}
+		}
+		i := strings.LastIndexByte(p, '/')
+		if i <= len("/sys/fs/cgroup") || !strings.HasPrefix(p, "/sys/fs/cgroup") {
+			break
+		}
+		p = p[:i]
+	}
+	return best, limited, nil
+}
+
+func parseMemTotal(meminfo string) (uint64, error) {
+	for line := range strings.SplitSeq(meminfo, "\n") {
+		rest, ok := strings.CutPrefix(line, "MemTotal:")
+		if !ok {
+			continue
+		}
+		f := strings.Fields(rest)
+		if len(f) != 2 || f[1] != "kB" {
+			return 0, fmt.Errorf("MemTotal: %q", line)
+		}
+		kb, err := strconv.ParseUint(f[0], 10, 64)
+		if err != nil {
+			return 0, err
+		}
+		return kb * 1024, nil
+	}
+	return 0, errors.New("no MemTotal in /proc/meminfo")
+}
+
 // tuningAdvice is one setting that falls short of what the config needs.
 type tuningAdvice struct {
 	setting string
 	current string
 	want    string
 	reason  string
-	fix     string // command that applies it now
+	fix     string // what to do now
 	persist string // how to keep it across reboots
 }
 
-func (a tuningAdvice) line() string {
-	s := fmt.Sprintf("Host tuning: %s is %s, recommended %s - %s. Fix: %s", a.setting, a.current, a.want, a.reason, a.fix)
+func (a tuningAdvice) line(basis string) string {
+	tag := ""
+	if basis == basisEstimate {
+		tag = " (unmeasured)"
+	}
+	s := fmt.Sprintf("Host tuning%s: %s is %s, recommended %s - %s. Fix: %s", tag, a.setting, a.current, a.want, a.reason, a.fix)
 	if a.persist != "" {
 		s += "; persist: " + a.persist
 	}
@@ -164,34 +260,25 @@ type hostTuningRule struct {
 	setting  string
 	when     string // when the rule applies
 	want     string // recommended value, as documented
+	basis    string // basisMeasured, basisRequired or basisEstimate
 	why      string
 	evidence string
 	// check returns applies=false when the config does not need the setting,
-	// a non-nil advice when the host falls short, and an error when the value
-	// could not be read (the rule is then skipped, never guessed).
-	check func(in hostTuningInput, h hostReader) (adv *tuningAdvice, applies bool, err error)
-}
-
-// sockBufNeed is the largest socket buffer this config will request, and why.
-func sockBufNeed(in hostTuningInput) (int, string) {
-	need, why := targetDialSockBuf, "direct target dials request 4 MiB socket buffers and the kernel silently clamps them to this ceiling"
-	if in.upstream {
-		need, why = in.upstreamBuf, fmt.Sprintf("the upstream dialer requests %d-byte socket buffers and the kernel silently clamps them to this ceiling", in.upstreamBuf)
-	}
-	if in.quic && quicUDPSockBuf > need {
-		need, why = quicUDPSockBuf, "the QUIC listener asks for 7.5 MB UDP buffers"
-	}
-	return need, why
+	// a non-nil advice when the host falls short, and an error when a value
+	// could not be read (the rule is then skipped, never guessed). current is
+	// the value read, for the debug "ok" line.
+	check func(in hostTuningInput, h hostReader) (adv *tuningAdvice, current string, applies bool, err error)
 }
 
 // sysctlFix renders the runtime command and the sysctl.d line for one value.
-// Multi-field values (tcp_rmem) are quoted for the shell.
+// Multi-field values are quoted for the shell. These sysctls are host-wide:
+// inside a container they are read-only, hence "on the host".
 func sysctlFix(name, value string) (fix, persist string) {
 	arg := value
 	if strings.ContainsAny(value, " \t") {
 		arg = strconv.Quote(value)
 	}
-	return fmt.Sprintf("sysctl -w %s=%s", name, arg), fmt.Sprintf("add '%s = %s' to %s", name, value, hostTuningSysctlFile)
+	return fmt.Sprintf("on the host, sysctl -w %s=%s", name, arg), fmt.Sprintf("add '%s = %s' to %s", name, value, hostTuningSysctlFile)
 }
 
 func readInt(h hostReader, name string) (int64, error) {
@@ -199,181 +286,232 @@ func readInt(h hostReader, name string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	return strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+	return strconv.ParseInt(v, 10, 64)
 }
 
-// minIntRule fires when an integer sysctl is below need(in). need returns 0
-// when the config does not use the setting.
-func minIntRule(name string, need func(hostTuningInput) (int64, string)) func(hostTuningInput, hostReader) (*tuningAdvice, bool, error) {
-	return func(in hostTuningInput, h hostReader) (*tuningAdvice, bool, error) {
-		want, reason := need(in)
-		if want <= 0 {
-			return nil, false, nil
+const mib = 1 << 20
+
+// socketBufferBudget decides whether raising the per-socket buffer ceiling to
+// perSocket bytes (receive plus send, as requested) is safe for this service.
+//
+// Worst case: every admitted connection fills both buffers, which the kernel
+// sizes at twice the request. The host-wide TCP limit (tcp_mem, third field)
+// bounds that sum whatever the connection count, so the worst case is the
+// smaller of the two. It must fit in half of the service's memory budget -
+// the unit's MemoryMax, or host RAM without one - leaving the other half to
+// the process. The admission limit is a floor on the connection count, not a
+// bound (mux streams dial their own sockets), which is why tcp_mem matters.
+//
+// It returns ok, and otherwise the worst case and the budget for the line.
+func socketBufferBudget(in hostTuningInput, h hostReader, perSocket int64) (ok bool, worst, budget uint64, budgetName string, err error) {
+	total, err := h.memTotal()
+	if err != nil {
+		return false, 0, 0, "", err
+	}
+	limit, limited, err := h.memLimit()
+	if err != nil {
+		return false, 0, 0, "", err
+	}
+	budget, budgetName = total, "host RAM"
+	if limited && limit < total {
+		budget, budgetName = limit, "this unit's memory limit (MemoryMax)"
+	}
+	worst = uint64(in.admissionLimit) * 2 * uint64(perSocket)
+	if v, err := h.sysctl("net.ipv4.tcp_mem"); err == nil {
+		if f := strings.Fields(v); len(f) == 3 {
+			if pages, err := strconv.ParseUint(f[2], 10, 64); err == nil {
+				worst = min(worst, pages*uint64(os.Getpagesize()))
+			}
+		}
+	}
+	return worst <= budget/2, worst, budget, budgetName, nil
+}
+
+// relayBufRule checks rmem_max / wmem_max against the relay's upstream buffer.
+// Exits are not checked: their target dials request 4 MiB, and lifting that
+// clamp has a memory cost that has not been measured.
+func relayBufRule(name string) func(hostTuningInput, hostReader) (*tuningAdvice, string, bool, error) {
+	return func(in hostTuningInput, h hostReader) (*tuningAdvice, string, bool, error) {
+		if !in.upstream {
+			return nil, "", false, nil
 		}
 		cur, err := readInt(h, name)
 		if err != nil {
-			return nil, true, err
+			return nil, "", true, err
 		}
+		curS := strconv.FormatInt(cur, 10)
+		want := int64(in.upstreamBuf)
 		if cur >= want {
-			return nil, true, nil
+			return nil, curS, true, nil
 		}
 		w := strconv.FormatInt(want, 10)
+		reason := fmt.Sprintf("the upstream dialer requests %d-byte socket buffers and the kernel silently clamps them to this ceiling", want)
 		fix, persist := sysctlFix(name, w)
-		return &tuningAdvice{setting: name, current: strconv.FormatInt(cur, 10), want: w, reason: reason, fix: fix, persist: persist}, true, nil
-	}
-}
-
-// autotuneMaxRule checks the third field of tcp_rmem / tcp_wmem.
-func autotuneMaxRule(name string) func(hostTuningInput, hostReader) (*tuningAdvice, bool, error) {
-	return func(_ hostTuningInput, h hostReader) (*tuningAdvice, bool, error) {
-		v, err := h.sysctl(name)
+		fix += ", then restart the server (open sockets keep the clamped size)"
+		// Both ceilings are raised together, so budget receive plus send.
+		ok, worst, budget, budgetName, err := socketBufferBudget(in, h, 2*want)
 		if err != nil {
-			return nil, true, err
+			return nil, curS, true, err
 		}
-		f := strings.Fields(v)
-		if len(f) != 3 {
-			return nil, true, fmt.Errorf("%s: want 3 fields, got %q", name, v)
+		if !ok {
+			return &tuningAdvice{
+				setting: name, current: curS, want: w + " only after the memory budget allows it",
+				reason: reason + fmt.Sprintf(", but at that size the socket buffers could take %d MiB, more than half of %s (%d MiB)", worst/mib, budgetName, budget/mib),
+				fix:    fmt.Sprintf("raise the memory limit to at least %d MiB or lower -relay-upstream-buf first; until then leave %s as it is", 2*worst/mib, name),
+			}, curS, true, nil
 		}
-		cur, err := strconv.ParseInt(f[2], 10, 64)
-		if err != nil {
-			return nil, true, err
-		}
-		if cur >= tcpAutotuneMax {
-			return nil, true, nil
-		}
-		want := fmt.Sprintf("%s %s %d", f[0], f[1], tcpAutotuneMax)
-		fix, persist := sysctlFix(name, want)
-		return &tuningAdvice{
-			setting: name, current: strings.Join(f, " "), want: want,
-			reason: "client sockets autotune up to the last field, and a smaller window caps one client's throughput on a long-RTT leg",
-			fix:    fix, persist: persist,
-		}, true, nil
+		return &tuningAdvice{setting: name, current: curS, want: w, reason: reason, fix: fix, persist: persist}, curS, true, nil
 	}
 }
 
 // equalsOneRule fires when a boolean sysctl is not 1 while the config needs it.
-func equalsOneRule(name string, needed func(hostTuningInput) bool, reason string) func(hostTuningInput, hostReader) (*tuningAdvice, bool, error) {
-	return func(in hostTuningInput, h hostReader) (*tuningAdvice, bool, error) {
+func equalsOneRule(name string, needed func(hostTuningInput) bool, reason string) func(hostTuningInput, hostReader) (*tuningAdvice, string, bool, error) {
+	return func(in hostTuningInput, h hostReader) (*tuningAdvice, string, bool, error) {
 		if !needed(in) {
-			return nil, false, nil
+			return nil, "", false, nil
 		}
 		v, err := h.sysctl(name)
 		if err != nil {
-			return nil, true, err
+			return nil, "", true, err
 		}
 		if v == "1" {
-			return nil, true, nil
+			return nil, v, true, nil
 		}
 		fix, persist := sysctlFix(name, "1")
-		return &tuningAdvice{setting: name, current: v, want: "1", reason: reason, fix: fix, persist: persist}, true, nil
+		return &tuningAdvice{setting: name, current: v, want: "1", reason: reason, fix: fix, persist: persist}, v, true, nil
 	}
 }
 
-func congestionRule(_ hostTuningInput, h hostReader) (*tuningAdvice, bool, error) {
+func congestionRule(_ hostTuningInput, h hostReader) (*tuningAdvice, string, bool, error) {
 	const name = "net.ipv4.tcp_congestion_control"
 	cur, err := h.sysctl(name)
 	if err != nil {
-		return nil, true, err
+		return nil, "", true, err
 	}
-	if cur == "bbr" {
-		return nil, true, nil
+	// bbr, bbr2, bbr3: any BBR is what the rule asks for.
+	if strings.HasPrefix(cur, "bbr") {
+		return nil, cur, true, nil
 	}
 	fix, persist := sysctlFix(name, "bbr")
-	if avail, err := h.sysctl("net.ipv4.tcp_available_congestion_control"); err != nil || !slices.Contains(strings.Fields(avail), "bbr") {
-		fix = "modprobe tcp_bbr && " + fix
+	if avail, err := h.sysctl("net.ipv4.tcp_available_congestion_control"); err != nil || !strings.Contains(" "+avail+" ", " bbr ") {
+		fix = "on the host, modprobe tcp_bbr && sysctl -w " + name + "=bbr"
 		persist = "add 'tcp_bbr' to /etc/modules-load.d/tiredvpn.conf and '" + name + " = bbr' to " + hostTuningSysctlFile
 	}
+	fix += ", then restart the server (the listener keeps the algorithm it was created with)"
 	return &tuningAdvice{
 		setting: name, current: cur, want: "bbr",
-		reason: "loss-based congestion control backs off on random loss over long-RTT paths",
+		reason: "loss-based congestion control backs off on random loss over long-RTT paths; the setting is host-wide and changes every TCP flow on the host",
 		fix:    fix, persist: persist,
-	}, true, nil
+	}, cur, true, nil
 }
 
+func conntrackNeed(in hostTuningInput, h hostReader) (int64, error) {
+	total, err := h.memTotal()
+	if err != nil {
+		return 0, err
+	}
+	// QUIC serves TUN clients without TCP admission, so the whole pool counts.
+	need := min(int64(in.poolClients)*conntrackPerClient, conntrackCeiling)
+	return min(need, int64(total/conntrackRAMShare/conntrackEntryBytes)), nil
+}
+
+func conntrackRule(in hostTuningInput, h hostReader) (*tuningAdvice, string, bool, error) {
+	const name = "net.netfilter.nf_conntrack_max"
+	if !in.natV4 {
+		return nil, "", false, nil
+	}
+	want, err := conntrackNeed(in, h)
+	if err != nil {
+		return nil, "", true, err
+	}
+	if want <= 0 {
+		return nil, "", false, nil
+	}
+	cur, err := readInt(h, name)
+	if err != nil {
+		return nil, "", true, err
+	}
+	curS := strconv.FormatInt(cur, 10)
+	if cur >= want {
+		return nil, curS, true, nil
+	}
+	w := strconv.FormatInt(want, 10)
+	return &tuningAdvice{
+		setting: name, current: curS, want: w,
+		reason: fmt.Sprintf("every flow of up to %d TUN clients is masqueraded here at an assumed %d flows each, and a full table drops new flows", in.poolClients, conntrackPerClient),
+		fix:    fmt.Sprintf("on the host, sysctl -w %s=%s net.netfilter.nf_conntrack_buckets=%s (buckets track the maximum, or hash chains grow)", name, w, w),
+		persist: fmt.Sprintf("add 'nf_conntrack' to /etc/modules-load.d/tiredvpn.conf (sysctl.d runs before the module loads otherwise), 'options nf_conntrack hashsize=%s' to /etc/modprobe.d/tiredvpn.conf and '%s = %s' to %s",
+			w, name, w, hostTuningSysctlFile),
+	}, curS, true, nil
+}
+
+func somaxconnRule(in hostTuningInput, h hostReader) (*tuningAdvice, string, bool, error) {
+	const name = "net.core.somaxconn"
+	cur, err := readInt(h, name)
+	if err != nil {
+		return nil, "", true, err
+	}
+	curS := strconv.FormatInt(cur, 10)
+	want := int64(min(in.admissionLimit, 4096))
+	if cur >= want {
+		return nil, curS, true, nil
+	}
+	w := strconv.FormatInt(want, 10)
+	fix, persist := sysctlFix(name, w)
+	return &tuningAdvice{
+		setting: name, current: curS, want: w,
+		reason: fmt.Sprintf("Go takes the listen backlog from it, and a reconnect storm can arrive faster than admission (%d) drains the queue", in.admissionLimit),
+		fix:    fix + ", then restart the server (the backlog is fixed when the listener is created)", persist: persist,
+	}, curS, true, nil
+}
+
+// nofileNeed saturates instead of overflowing on an absurd -max-conns.
 func nofileNeed(in hostTuningInput) uint64 {
-	return uint64(in.admissionLimit*fdsPerConn + fdHeadroom)
+	return min(uint64(max(in.admissionLimit, 0)), 1<<40)*fdsPerConn + fdHeadroom
 }
 
-func nofileRule(in hostTuningInput, h hostReader) (*tuningAdvice, bool, error) {
+func nofileRule(in hostTuningInput, h hostReader) (*tuningAdvice, string, bool, error) {
 	cur, err := h.nofileSoft()
 	if err != nil {
-		return nil, true, err
+		return nil, "", true, err
 	}
+	curS := strconv.FormatUint(cur, 10)
 	want := nofileNeed(in)
 	if cur >= want {
-		return nil, true, nil
+		return nil, curS, true, nil
 	}
+	w := strconv.FormatUint(want, 10)
 	return &tuningAdvice{
-		setting: "RLIMIT_NOFILE", current: strconv.FormatUint(cur, 10), want: strconv.FormatUint(want, 10),
-		reason: fmt.Sprintf("admission control lets in %d connections and each holds at least two descriptors, so accept fails with EMFILE first", in.admissionLimit),
-		fix:    fmt.Sprintf("set LimitNOFILE=%d in the [Service] section of the unit (docker: --ulimit nofile=%d:%d) and restart", want, want, want),
-	}, true, nil
-}
-
-func conntrackNeed(in hostTuningInput) (int64, string) {
-	if !in.natV4 {
-		return 0, ""
-	}
-	clients := min(in.poolClients, in.admissionLimit)
-	need := min(clients*conntrackPerClient, conntrackCeiling)
-	return int64(need), fmt.Sprintf("every flow of %d TUN clients is masqueraded here at about %d flows each, and a full table drops new flows", clients, conntrackPerClient)
-}
-
-func somaxconnNeed(in hostTuningInput) (int64, string) {
-	return int64(min(in.admissionLimit, 4096)), fmt.Sprintf("the listen backlog is this value and a reconnect storm arrives faster than admission (%d) can drain it", in.admissionLimit)
+		setting: "RLIMIT_NOFILE", current: curS, want: w,
+		reason: fmt.Sprintf("at an estimated %d descriptors per connection, %d admitted connections need more, and mux streams and QUIC add descriptors admission does not bound", fdsPerConn, in.admissionLimit),
+		fix:    fmt.Sprintf("set LimitNOFILE=%s in the [Service] section of the unit (docker: --ulimit nofile=%s:%s) and restart", w, w, w),
+	}, curS, true, nil
 }
 
 var hostTuningRules = []hostTuningRule{
 	{
 		setting:  "net.core.rmem_max",
-		when:     "always",
-		want:     ">= the largest socket buffer the config requests: 4 MiB on an exit (target dials), `-relay-upstream-buf` or 512 KiB on a relay, 7.5 MB with QUIC",
-		why:      "`SO_RCVBUF` above this is clamped without an error, so the receive window of every such socket is capped",
-		evidence: "Relay on stock Ubuntu 24.04, 146 ms upstream leg (2026-10-24): 212992 held the leg at `rcv_ssthresh` 210439 and TUN downloads at 6.3-8.7 Mbit/s; 1 MiB gave 19.8-20.1 Mbit/s. Same class as the hard-coded 64 KB buffers that held 1.3.x at ~3.5 Mbit/s on 150 ms. Two of our exits still run 212992 (read 2026-10-24), which clamps their 4 MiB target-dial buffers; the effect on that leg has not been measured",
-		check: minIntRule("net.core.rmem_max", func(in hostTuningInput) (int64, string) {
-			n, why := sockBufNeed(in)
-			return int64(n), why
-		}),
+		when:     "`-upstream` (relay)",
+		want:     ">= the relay's upstream buffer (`-relay-upstream-buf`, default 512 KiB), only while buffers of that size fit in half of the memory budget",
+		basis:    basisMeasured,
+		why:      "`SO_RCVBUF` above this is clamped without an error, so the receive window of the upstream leg is capped",
+		evidence: "Relay on stock Ubuntu 24.04, 146 ms upstream leg (2026-10-24): 212992 held the leg at `rcv_ssthresh` 210439 and TUN downloads at 6.3-8.7 Mbit/s; 1 MiB gave 19.8-20.1 Mbit/s. Exits are not checked: their target dials request 4 MiB, and lifting that clamp can cost 8 MiB of kernel memory per slow download, which has not been measured",
+		check:    relayBufRule("net.core.rmem_max"),
 	},
 	{
 		setting:  "net.core.wmem_max",
-		when:     "always",
+		when:     "`-upstream` (relay)",
 		want:     "same as `net.core.rmem_max`",
-		why:      "`SO_SNDBUF` is clamped the same way, capping how much one socket keeps in flight",
-		evidence: "Raised together with `rmem_max` in the relay measurement above; of the seven nodes read on 2026-10-24 one runs 16 MiB for both, two 4 MiB, one 1 MiB, two exits the stock 212992",
-		check: minIntRule("net.core.wmem_max", func(in hostTuningInput) (int64, string) {
-			n, why := sockBufNeed(in)
-			return int64(n), why
-		}),
-	},
-	{
-		setting:  "net.ipv4.tcp_rmem",
-		when:     "always",
-		want:     "last field >= 4 MiB",
-		why:      "accepted client sockets set no buffer and autotune up to the last field",
-		evidence: "Not seen as a bottleneck: stock Ubuntu 24.04 has 6291456, our tuned exit 16777216. The rule only catches a host tuned below that",
-		check:    autotuneMaxRule("net.ipv4.tcp_rmem"),
-	},
-	{
-		setting:  "net.ipv4.tcp_wmem",
-		when:     "always",
-		want:     "last field >= 4 MiB",
-		why:      "same as `tcp_rmem`, for the send side of client sockets",
-		evidence: "Not seen as a bottleneck: stock Ubuntu 24.04 has 4194304, our tuned exit 16777216",
-		check:    autotuneMaxRule("net.ipv4.tcp_wmem"),
-	},
-	{
-		setting:  "net.ipv4.tcp_congestion_control",
-		when:     "always",
-		want:     "`bbr`",
-		why:      "loss-based cubic backs off on random loss over long-RTT paths",
-		evidence: "One of the seven nodes read on 2026-10-24 runs bbr, six run cubic. No A/B throughput measurement has been made, so treat it as a default, not a measured gain",
-		check:    congestionRule,
+		basis:    basisMeasured,
+		why:      "`SO_SNDBUF` is clamped the same way, capping how much the upstream leg keeps in flight",
+		evidence: "Raised together with `rmem_max` in the relay measurement above, not measured on its own",
+		check:    relayBufRule("net.core.wmem_max"),
 	},
 	{
 		setting:  "net.ipv4.ip_forward",
 		when:     "`-ip-pool` on an exit (no `-upstream`)",
 		want:     "1",
+		basis:    basisRequired,
 		why:      "TUN clients' packets are forwarded out of this host; the server sets it at startup, so 0 here means its own attempt failed",
 		evidence: "Set by the NAT bootstrap (internal/tun/nat_linux.go); the advisor runs after it and only reports",
 		check: equalsOneRule("net.ipv4.ip_forward", func(in hostTuningInput) bool { return in.natV4 },
@@ -383,79 +521,126 @@ var hostTuningRules = []hostTuningRule{
 		setting:  "net.ipv6.conf.all.forwarding",
 		when:     "`-ip-pool` with `-ip-pool-v6` on an exit",
 		want:     "1",
+		basis:    basisRequired,
 		why:      "same as `ip_forward`, for the dual-stack pool",
 		evidence: "Set by the NAT66 bootstrap; without it v6 inside the tunnel is blackholed",
 		check: equalsOneRule("net.ipv6.conf.all.forwarding", func(in hostTuningInput) bool { return in.natV6 },
 			"dual-stack TUN clients' IPv6 is forwarded out of this host and the server's own attempt to enable it failed"),
 	},
 	{
+		setting:  "net.ipv4.tcp_congestion_control",
+		when:     "always; the setting is host-wide and changes every TCP flow on the host",
+		want:     "`bbr` (any version)",
+		basis:    basisEstimate,
+		why:      "loss-based cubic backs off on random loss over long-RTT paths",
+		evidence: "One of the seven nodes read on 2026-10-24 runs bbr, six run cubic. No A/B throughput measurement has been made",
+		check:    congestionRule,
+	},
+	{
 		setting:  "net.netfilter.nf_conntrack_max",
 		when:     "`-ip-pool` on an exit (skipped while nf_conntrack is not loaded)",
-		want:     ">= min(pool size, admission limit) x 256, at most 262144",
+		want:     ">= pool size x 256, at most 262144 and at most 1/16 of host RAM at 320 bytes per entry; `nf_conntrack_buckets` raised to match",
+		basis:    basisEstimate,
 		why:      "every masqueraded flow takes an entry and a full table drops new flows",
-		evidence: "The kernel default scales with RAM: 8192 on a 960 MB exit, 65536 on 2 GB ones; no `table full` in their kernel logs (2026-10-24). 256 flows per client is an assumption, not a measurement",
-		check:    minIntRule("net.netfilter.nf_conntrack_max", conntrackNeed),
+		evidence: "The kernel default scales with RAM and sets buckets equal to the maximum: 8192 on a 960 MB exit, 65536 on 2 GB ones; no `table full` in their kernel logs (2026-10-24). 256 flows per client is an assumption. The whole pool counts because QUIC serves TUN clients outside TCP admission",
+		check:    conntrackRule,
 	},
 	{
 		setting:  "net.core.somaxconn",
 		when:     "always",
 		want:     ">= min(admission limit, 4096)",
+		basis:    basisEstimate,
 		why:      "Go uses it as the listen backlog; a reconnect storm overflows a short accept queue before admission control sees it",
 		evidence: "4096 on every node we run (kernel >= 5.4 default; read 2026-10-24); older kernels default to 128. No overflow has been observed, the rule only catches an old kernel or a host tuned below the default",
-		check:    minIntRule("net.core.somaxconn", somaxconnNeed),
+		check:    somaxconnRule,
 	},
 	{
 		setting:  "RLIMIT_NOFILE",
 		when:     "always",
-		want:     ">= admission limit x 4 + 1024",
-		why:      "each admitted connection holds a client socket and a target or upstream leg; below this accept fails with EMFILE",
-		evidence: "Our nodes run 524287 (Go raises the soft limit to the hard one) or the 65536 the packaged unit sets (read 2026-10-24). Derived from admission control, not from an incident",
+		want:     ">= admission limit x 4 + 1024 (a floor: mux streams and QUIC are not bounded by admission)",
+		basis:    basisEstimate,
+		why:      "each admitted connection holds a client socket and a target or upstream leg, more with mux streams",
+		evidence: "Our nodes run 524287 (Go raises the soft limit to the hard one) or the 65536 the packaged unit sets (read 2026-10-24). 4 descriptors per connection is an estimate, not a measurement",
 		check:    nofileRule,
 	},
 }
 
-// adviseHostTuning runs every rule and returns the lines to log: one per
-// setting that falls short, then a summary. skipped collects rules whose value
-// could not be read, for a debug line.
-func adviseHostTuning(in hostTuningInput, h hostReader) (lines []string, skipped []string) {
-	checked, short := 0, 0
+// hostTuningReport is the advisor's verdict for one config on one host.
+type hostTuningReport struct {
+	info    []string // measured or required shortfalls, then the summary
+	debug   []string // unmeasured shortfalls and settings that are fine
+	skipped []string // settings that could not be read
+}
+
+// adviseHostTuning runs every rule. The summary is the last info line.
+func adviseHostTuning(in hostTuningInput, h hostReader) hostTuningReport {
+	var rep hostTuningReport
+	checked, short, estimates := 0, 0, 0
 	for _, r := range hostTuningRules {
-		adv, applies, err := r.check(in, h)
+		adv, cur, applies, err := r.check(in, h)
 		if !applies {
 			continue
 		}
 		if err != nil {
-			skipped = append(skipped, fmt.Sprintf("%s: %v", r.setting, err))
+			rep.skipped = append(rep.skipped, fmt.Sprintf("%s: %v", r.setting, err))
 			continue
 		}
 		checked++
-		if adv != nil {
+		switch {
+		case adv == nil:
+			rep.debug = append(rep.debug, fmt.Sprintf("Host tuning: %s ok (%s)", r.setting, cur))
+		case r.basis == basisEstimate:
+			estimates++
+			rep.debug = append(rep.debug, adv.line(r.basis))
+		default:
 			short++
-			lines = append(lines, adv.line())
+			rep.info = append(rep.info, adv.line(r.basis))
 		}
 	}
-	summary := fmt.Sprintf("Host tuning: %d settings checked for this config, %d to adjust", checked, short)
-	if short == 0 {
-		summary = fmt.Sprintf("Host tuning: %d settings checked for this config, all fine", checked)
+	return rep.withSummary(in, checked, short, estimates)
+}
+
+func (rep hostTuningReport) withSummary(in hostTuningInput, checked, short, estimates int) hostTuningReport {
+	unreadable := len(rep.skipped)
+	changes := "the server changes none of them itself"
+	if in.natV4 {
+		changes = "the server changes none of them itself apart from enabling forwarding in the NAT bootstrap"
 	}
-	if len(skipped) > 0 {
-		summary += fmt.Sprintf(", %d unreadable", len(skipped))
+	var s string
+	switch {
+	case unreadable > 0 && unreadable >= checked:
+		s = fmt.Sprintf("Host tuning: inconclusive, %d of %d settings for this config could not be read (see -debug)", unreadable, checked+unreadable)
+	case short == 0 && estimates == 0:
+		s = fmt.Sprintf("Host tuning: %d settings checked for this config, all fine", checked)
+	default:
+		s = fmt.Sprintf("Host tuning: %d settings checked for this config, %d to adjust", checked, short)
+		if estimates > 0 {
+			s += fmt.Sprintf(", %d more unmeasured at debug level", estimates)
+		}
 	}
-	return append(lines, summary+"; the server changes none of them itself"), skipped
+	if unreadable > 0 && unreadable < checked {
+		s += fmt.Sprintf(", %d unreadable", unreadable)
+	}
+	rep.info = append(rep.info, s+"; "+changes)
+	return rep
 }
 
 // logHostTuning is the startup entry point. Linux only: elsewhere the
-// settings do not exist and the advisor stays silent.
-func logHostTuning(cfg *Config, dualStack bool) {
+// settings do not exist and the advisor stays silent. It must run after the
+// IP pool and NAT bootstrap, so forwarding is read as the server leaves it.
+func logHostTuning(cfg *Config, srvCtx *serverContext) {
 	if runtime.GOOS != "linux" {
 		log.Debug("Host tuning: skipped on %s", runtime.GOOS)
 		return
 	}
-	lines, skipped := adviseHostTuning(hostTuningInputFor(cfg, dualStack), procHost{})
-	for _, s := range skipped {
+	rep := adviseHostTuning(hostTuningInputFor(cfg, poolDualStack(srvCtx)), procHost{})
+	for _, s := range rep.skipped {
 		log.Debug("Host tuning: cannot read %s", s)
 	}
-	for _, l := range lines {
+	for _, l := range rep.debug {
+		log.Debug("%s", l)
+	}
+	for _, l := range rep.info {
 		log.Info("%s", l)
 	}
 }
@@ -463,10 +648,10 @@ func logHostTuning(cfg *Config, dualStack bool) {
 // hostTuningDocTable renders the rule table for docs/server.md.
 func hostTuningDocTable() string {
 	var b strings.Builder
-	b.WriteString("| Setting | Checked when | Recommended | Why | Evidence |\n")
-	b.WriteString("|---|---|---|---|---|\n")
+	b.WriteString("| Setting | Checked when | Recommended | Basis | Why | Evidence |\n")
+	b.WriteString("|---|---|---|---|---|---|\n")
 	for _, r := range hostTuningRules {
-		fmt.Fprintf(&b, "| `%s` | %s | %s | %s | %s |\n", r.setting, r.when, r.want, r.why, r.evidence)
+		fmt.Fprintf(&b, "| `%s` | %s | %s | %s | %s | %s |\n", r.setting, r.when, r.want, r.basis, r.why, r.evidence)
 	}
 	return b.String()
 }
