@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -60,6 +61,19 @@ func (c *sniCatcher) names() []string {
 
 // sniTestManager is a manager over two endpoints on catchers: the first with
 // its own SNI pool, the second without.
+// cycleSNIDraws makes pickSNI's draws go round the pool in order for the
+// test. "Drawn from the whole pool" was asserted on 12 random draws from two
+// names, which all land on one name about once in 2048 (P3-8 of the round-8
+// review); in order, a pick that ignores the draw - or the pool - shows at
+// the second dial.
+func cycleSNIDraws(t *testing.T) {
+	t.Helper()
+	var next atomic.Int64
+	old := sniIndex
+	sniIndex = func(n int) int { return int(next.Add(1)-1) % n }
+	t.Cleanup(func() { sniIndex = old })
+}
+
 func sniTestManager(t *testing.T, own []string) (*Manager, *sniCatcher, *sniCatcher) {
 	t.Helper()
 	a, b := newSNICatcher(t), newSNICatcher(t)
@@ -272,6 +286,7 @@ func TestFixedHostStrategiesSendTheEndpointsSNI(t *testing.T) {
 		{"anti-probe", func(m *Manager) Strategy { return NewAntiProbeStrategy(m, secret) }, "www.google.com"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			cycleSNIDraws(t)
 			m, a, b := sniTestManager(t, own)
 			dialEach(t, m, tc.make(m), 12)
 			assertNamesFrom(t, "endpoint with sni", a.names(), own)
@@ -299,6 +314,7 @@ func TestMorphAndExhaustionSendTheEndpointsSNI(t *testing.T) {
 		{"State Exhaustion", func(m *Manager) Strategy { return NewStateExhaustionStrategy(m, secret) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			cycleSNIDraws(t)
 			m, a, b := sniTestManager(t, own)
 			dialEach(t, m, tc.make(m), 12)
 			assertNamesFrom(t, "endpoint with sni", a.names(), own)

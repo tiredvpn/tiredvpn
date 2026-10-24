@@ -546,8 +546,12 @@ func (s *QUICStrategy) selectSNI(ctx context.Context) string {
 // for stego and QUIC use, so a configured pool does not change the shape of
 // the choice, only its members.
 func pickSNI(pool []string) string {
-	return pool[mathrand.IntN(len(pool))]
+	return pool[sniIndex(len(pool))]
 }
+
+// sniIndex is pickSNI's draw, mathrand.IntN. A var so a test can make the
+// draws its own instead of asserting on what random ones happened to be.
+var sniIndex = mathrand.IntN
 
 // extractHost extracts hostname from target address
 func (s *QUICStrategy) extractHost(target string) string {

@@ -49,6 +49,15 @@ var tagFallbackStrategies = []struct {
 	{"HTTP/2 Stego", func(m *strategy.Manager, s []byte) strategy.Strategy {
 		return strategy.NewHTTP2StegoStrategy(m, s, "")
 	}},
+	// Morph and State Exhaustion send the endpoint's SNI since the pool
+	// became every strategy's (P3-7 of the round-7 review), and with it
+	// the tag; they had no test here (P3-7 of the round-8 review).
+	{"Traffic Morph", func(m *strategy.Manager, s []byte) strategy.Strategy {
+		return strategy.NewTrafficMorphStrategy(m, nil, nil, s)
+	}},
+	{"State Exhaustion", func(m *strategy.Manager, s []byte) strategy.Strategy {
+		return strategy.NewStateExhaustionStrategy(m, s)
+	}},
 }
 
 // tagServer is a B1 server on loopback with the global secret and a stand-in
