@@ -37,16 +37,21 @@ func isTemporaryError(err error) bool {
 		strings.Contains(errStr, "would block")
 }
 
-// Keepalive packet marker (zero-length packet signals keepalive). A var so
-// tests can shorten the ticker.
-var keepaliveInterval = 10 * time.Second
+// keepaliveIntervalNs is the keepalive ticker's period (a zero-length frame
+// signals keepalive): 10 s. Atomic so a test can shorten it while another
+// test's relay is still winding down.
+var keepaliveIntervalNs = func() *atomic.Int64 {
+	var v atomic.Int64
+	v.Store(int64(10 * time.Second))
+	return &v
+}()
 
-// SetKeepaliveInterval replaces keepaliveInterval for a test in another
-// package and returns the old value. Not for concurrent tests.
+func keepaliveInterval() time.Duration { return time.Duration(keepaliveIntervalNs.Load()) }
+
+// SetKeepaliveInterval replaces the keepalive period for a test in another
+// package and returns the old value.
 func SetKeepaliveInterval(d time.Duration) time.Duration {
-	old := keepaliveInterval
-	keepaliveInterval = d
-	return old
+	return time.Duration(keepaliveIntervalNs.Swap(int64(d)))
 }
 
 var readTimeout = 30 * time.Second    // Must be > keepaliveInterval, detect dead connection faster. A var so tests can shorten it.
@@ -1702,7 +1707,7 @@ func (v *VPNClient) sendKeepalive() {
 		}
 	}()
 
-	ticker := time.NewTicker(keepaliveInterval)
+	ticker := time.NewTicker(keepaliveInterval())
 	defer ticker.Stop()
 
 	for {
@@ -1724,7 +1729,7 @@ func (v *VPNClient) sendKeepalive() {
 			// Send unless the server spoke within the last interval. Outgoing
 			// packets do not count: they may draw no reply at all, and then the
 			// echo is the only thing keeping readFromServer under readTimeout.
-			if time.Since(lastRx) >= keepaliveInterval*9/10 {
+			if time.Since(lastRx) >= keepaliveInterval()*9/10 {
 				// Send zero-length packet as keepalive: [length:4=0]
 				keepalivePkt := make([]byte, 4)
 				binary.BigEndian.PutUint32(keepalivePkt, 0)
@@ -3352,7 +3357,7 @@ func runDeadConnectionMonitor(stopCh chan struct{}, relayDone <-chan struct{}, s
 
 // runKeepaliveSender periodically writes zero-length keepalive frames to serverConn.
 func runKeepaliveSender(stopCh chan struct{}, relayDone <-chan struct{}, serverConn net.Conn, connFailed func()) {
-	ticker := time.NewTicker(keepaliveInterval)
+	ticker := time.NewTicker(keepaliveInterval())
 	defer ticker.Stop()
 	for {
 		select {

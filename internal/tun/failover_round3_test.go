@@ -494,9 +494,9 @@ func TestStalledKeepaliveWriteIsNotServerSilence(t *testing.T) {
 			name = "smux"
 		}
 		t.Run(name, func(t *testing.T) {
-			oldKA, oldW := keepaliveInterval, keepaliveWriteTimeout
-			keepaliveInterval, keepaliveWriteTimeout = 20*time.Millisecond, 50*time.Millisecond
-			t.Cleanup(func() { keepaliveInterval, keepaliveWriteTimeout = oldKA, oldW })
+			oldKA, oldW := SetKeepaliveInterval(20*time.Millisecond), keepaliveWriteTimeout
+			keepaliveWriteTimeout = 50 * time.Millisecond
+			t.Cleanup(func() { SetKeepaliveInterval(oldKA); keepaliveWriteTimeout = oldW })
 
 			m := strategy.NewManager()
 			m.SetConnectivityChecker(strategy.NewConnectivityChecker("127.0.0.1:1", time.Second, true))
