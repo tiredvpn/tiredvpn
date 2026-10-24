@@ -524,6 +524,10 @@ func (sc *SalamanderConn) Close() error {
 	return sc.conn.Close()
 }
 
+// NetConn returns the conn under the WebSocket framing, so a relay can read
+// its client's TCP state (the server's clientLiveness).
+func (sc *SalamanderConn) NetConn() net.Conn { return sc.conn }
+
 // LocalAddr returns local address
 func (sc *SalamanderConn) LocalAddr() net.Addr {
 	return sc.conn.LocalAddr()

@@ -306,6 +306,9 @@ func TestEveryRelayPathKeepsASparseProxiedStream(t *testing.T) {
 		{name: "Confusion", dial: strategyStream(func(m *strategy.Manager, r *pathRelay) strategy.Strategy {
 			return strategy.NewProtocolConfusionStrategy(m, strategy.ConfusionHTTPoverTLS, r.srvCtx.cfg.Secret)
 		})},
+		{name: "WebSocket Padded", dial: strategyStream(func(m *strategy.Manager, r *pathRelay) strategy.Strategy {
+			return strategy.NewWebSocketPaddedStrategy(m, r.srvCtx.cfg.Secret)
+		})},
 		{name: "HTTP Polling", dial: strategyStream(func(m *strategy.Manager, r *pathRelay) strategy.Strategy {
 			return strategy.NewHTTPPollingStrategy(m, r.srvCtx.cfg.Secret)
 		})},
