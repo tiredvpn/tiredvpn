@@ -4270,6 +4270,10 @@ func verifyFullKnockSequence(conn net.Conn, secret []byte, srvCtx *serverContext
 		logger.Debug("Knock packet %d: OK (%d bytes)", i, seq.Sizes[i])
 	}
 
+	// The tunnel that follows reads without a deadline of its own. Left at
+	// 2 s, it ended the session 2 s after the knock - on an exit the TUN
+	// loop sets its own, but the relay's bridge and proxy copy do not.
+	conn.SetReadDeadline(time.Time{})
 	return true
 }
 
