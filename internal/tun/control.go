@@ -653,8 +653,13 @@ func (cs *ControlServer) handleConnect(ctx context.Context) ControlResponse {
 	if err != nil {
 		conn.Close()
 		cs.serverConn = nil
-		if cs.config.HandshakeOutcomeFn != nil && IsHandshakeUnanswered(err) {
-			err = cs.config.HandshakeOutcomeFn(false, err)
+		if cs.config.HandshakeOutcomeFn != nil {
+			switch {
+			case IsHandshakeUnanswered(err):
+				err = cs.config.HandshakeOutcomeFn(false, err)
+			case IsHandshakeAnswered(err):
+				_ = cs.config.HandshakeOutcomeFn(true, nil)
+			}
 		}
 		return ControlResponse{Status: "error", Error: fmt.Sprintf("TUN handshake failed: %v", err)}
 	}
@@ -1671,7 +1676,7 @@ func (cs *ControlServer) performTUNHandshake(ctx context.Context) (assignedIP, s
 	// nothing past it, so the relay that follows starts frame-aligned; the conn
 	// it returns replaces cs.serverConn because it may carry the first byte of
 	// the first frame back to the relay.
-	resp, n, next, err := readHandshakeResponse(cs.serverConn, version, time.Now().Add(handshakeReadTimeout))
+	resp, n, next, err := readHandshakeResponse(cs.serverConn, version, time.Time{})
 	if !stop() {
 		return nil, nil, fmt.Errorf("handshake interrupted: %w", context.Cause(ctx))
 	}
@@ -1694,11 +1699,11 @@ func (cs *ControlServer) performTUNHandshake(ctx context.Context) (assignedIP, s
 	if resp[0] != 0x00 {
 		switch resp[0] {
 		case 0x01:
-			return nil, nil, fmt.Errorf("IP pool exhausted")
+			return nil, nil, fmt.Errorf("%w: IP pool exhausted", errHandshakeRefused)
 		case 0x02:
-			return nil, nil, fmt.Errorf("no IP pool configured")
+			return nil, nil, fmt.Errorf("%w: no IP pool configured", errHandshakeRefused)
 		default:
-			return nil, nil, fmt.Errorf("server error: %d", resp[0])
+			return nil, nil, HandshakeRefused(resp[0])
 		}
 	}
 

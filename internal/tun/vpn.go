@@ -1025,6 +1025,9 @@ func (v *VPNClient) connect(parent context.Context) error {
 			// heard nothing (R1 of the fix9 stand run).
 			return fmt.Errorf("%w: %w", v.manager.HandshakeUnanswered(strat, cand, hasCand), err)
 		}
+		if IsHandshakeAnswered(err) {
+			v.manager.HandshakeAnswered(cand, hasCand)
+		}
 		return err
 	}
 	v.manager.HandshakeAnswered(cand, hasCand)
@@ -1155,7 +1158,7 @@ func (v *VPNClient) doHandshake(conn net.Conn, localIP net.IP) ([]byte, int, net
 	// Extended v1 (14 bytes): [status:1][serverIP:4][clientIP:4][flags:1][portStart:2][portEnd:2]
 	// Extended v2 (20+ bytes): [status:1][serverIP:4][clientIP:4][flags:1][portStart:2][portEnd:2][hopInterval:4][strategy:1][seedLen:1][seed:0-32]
 	// Dual-stack (v4): the version-dependent layout followed by [serverIP6:16][clientIP6:16]
-	resp, n, conn, err := readHandshakeResponse(conn, v.handshakeVersion(), time.Now().Add(handshakeReadTimeout))
+	resp, n, conn, err := readHandshakeResponse(conn, v.handshakeVersion(), time.Time{})
 	if err != nil {
 		return nil, 0, nil, err
 	}
@@ -1176,16 +1179,42 @@ func (v *VPNClient) doHandshake(conn net.Conn, localIP net.IP) ([]byte, int, net
 }
 
 // IsHandshakeUnanswered reports whether a session handshake failed because
-// the request went out and no answer came before the read deadline.
+// the request went out and no byte of an answer came in the full
+// handshakeReadTimeout. A wait the caller's budget cut short says nothing
+// about the server - on a reconnect a late connect leaves the handshake what
+// is left of the cycle, and booking that as the server's silence parked
+// healthy servers (P2-2 of the round-8 review) - and neither does a request
+// that never left or an answer that came in part.
 func IsHandshakeUnanswered(err error) bool {
-	if errors.Is(err, errHandshakeNotSent) || errors.Is(err, errHandshakeRefused) {
+	switch {
+	case errors.Is(err, errHandshakeNotSent), errors.Is(err, errHandshakeRefused),
+		errors.Is(err, errHandshakeCutShort), errors.Is(err, errHandshakePartlyAnswered),
+		errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 		return false
-	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		return true // the cycle ran out while the handshake waited
 	}
 	var ne net.Error
 	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// IsHandshakeAnswered reports whether a failed session handshake was
+// answered all the same: refused with an error status, or answered in part.
+// Either ends the server's run of unanswered handshakes (P3-4 of the
+// round-8 review).
+func IsHandshakeAnswered(err error) bool {
+	return errors.Is(err, errHandshakeRefused) || errors.Is(err, errHandshakePartlyAnswered)
+}
+
+// HandshakeRefused is the error for a handshake the server refused with
+// status, for a caller in another package (the client's reconnect).
+func HandshakeRefused(status byte) error {
+	return fmt.Errorf("%w: status=%d", errHandshakeRefused, status)
+}
+
+// HandshakeNotSent marks err, a failed write of the session handshake
+// request, as a request that never left: for a caller in another package
+// (the client's reconnect).
+func HandshakeNotSent(err error) error {
+	return fmt.Errorf("%w: %w", errHandshakeNotSent, err)
 }
 
 // errHandshakeNotSent and errHandshakeRefused are the two handshake failures
@@ -1196,6 +1225,15 @@ func IsHandshakeUnanswered(err error) bool {
 var (
 	errHandshakeNotSent = errors.New("TUN handshake request not sent")
 	errHandshakeRefused = errors.New("server error")
+)
+
+// errHandshakeCutShort and errHandshakePartlyAnswered are the handshake
+// failures that say nothing of whether the server answers (see
+// IsHandshakeUnanswered): the read ran out of the caller's budget before
+// its full wait, or part of the answer came.
+var (
+	errHandshakeCutShort       = errors.New("TUN handshake read cut short by the caller's budget")
+	errHandshakePartlyAnswered = errors.New("TUN handshake answered in part")
 )
 
 // handshakeRespBufSize fits the largest handshake response: the v2 layout
@@ -1236,6 +1274,10 @@ func ParseTUNHandshakeCapabilities(resp []byte) (ServerCapabilities, bool) {
 // response, used when the caller has no deadline of its own. A var so tests
 // can shorten it.
 var handshakeReadTimeout = 10 * time.Second
+
+// HandshakeReadTimeout is the full wait for a handshake response, the one
+// after which no answer is the server's (IsHandshakeUnanswered).
+func HandshakeReadTimeout() time.Duration { return handshakeReadTimeout }
 
 // SetHandshakeReadTimeout replaces handshakeReadTimeout for a test in
 // another package and returns the old value. Not for concurrent tests.
@@ -1291,14 +1333,24 @@ const handshakeFlagsGrace = 300 * time.Millisecond
 // deadlines of their own (the relay's bridge and pump), and a deadline left
 // behind would cut them off once it passed, however busy the tunnel was.
 func readHandshakeResponse(conn net.Conn, clientVersion byte, deadline time.Time) ([]byte, int, net.Conn, error) {
+	full := time.Now().Add(handshakeReadTimeout)
 	if deadline.IsZero() {
-		deadline = time.Now().Add(handshakeReadTimeout)
+		deadline = full
 	}
 	_ = conn.SetReadDeadline(deadline)
 	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
 
 	resp := make([]byte, handshakeRespBufSize)
-	if _, err := io.ReadFull(conn, resp[:9]); err != nil {
+	if got, err := io.ReadFull(conn, resp[:9]); err != nil {
+		switch {
+		case got > 0:
+			err = fmt.Errorf("%w: %w", errHandshakePartlyAnswered, err)
+		case deadline.Before(full):
+			// The caller's budget ran out before the full wait: the
+			// server may simply not have had the time (P2-2 of the
+			// round-8 review).
+			err = fmt.Errorf("%w: %w", errHandshakeCutShort, err)
+		}
 		return nil, 0, conn, err
 	}
 	if resp[0] != 0x00 {
@@ -1309,11 +1361,11 @@ func readHandshakeResponse(conn net.Conn, clientVersion byte, deadline time.Time
 	}
 	n, next, err := readHandshakeFlags(conn, resp, clientVersion)
 	if err != nil {
-		return nil, 0, conn, err
+		return nil, 0, conn, fmt.Errorf("%w: %w", errHandshakePartlyAnswered, err)
 	}
 	n, err = readResponseTail(next, resp, n, clientVersion)
 	if err != nil {
-		return nil, 0, conn, err
+		return nil, 0, conn, fmt.Errorf("%w: %w", errHandshakePartlyAnswered, err)
 	}
 	return resp, n, next, nil
 }
