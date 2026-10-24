@@ -182,7 +182,10 @@ clamps the request to `net.core.rmem_max` / `wmem_max`. The host tuning advisor
 does not recommend raising them for QUIC: on an exit the same ceilings lift the
 clamp on the 4 MiB target-dial buffers, whose memory cost has not been measured
 (see [Host tuning](#host-tuning)). With `-port-range` set, QUIC listens on the
-same multi-port set, one socket and one such buffer per port.
+same multi-port set, one socket per port. Each socket can hold up to
+2 x min(7 MiB, ceiling) per direction: 14 MiB each way on a host with 16 MiB
+ceilings, 416 KiB each way on stock Ubuntu. This UDP memory is not part of the
+advisor's TCP memory budget.
 
 ### Multi-hop / relay
 
@@ -349,24 +352,31 @@ reason, the command that fixes it and the line that keeps it across reboots. A
 summary line at `INFO` follows; on a well-tuned host it is the only line. On a
 stock Ubuntu relay:
 
+<!-- host-tuning-example:begin (generated from internal/server/host_tuning.go; go test ./internal/server -run TestHostTuningDocsInSync -update-host-tuning-docs) -->
 ```
 Host tuning: net.core.rmem_max is 212992, recommended 524288 - the upstream dialer requests 524288-byte socket buffers and the kernel silently clamps them to this ceiling. Fix: on the host, sysctl -w net.core.rmem_max=524288, then restart the server (open sockets keep the clamped size); persist: add 'net.core.rmem_max = 524288' to /etc/sysctl.d/90-tiredvpn.conf
 Host tuning: net.core.wmem_max is 212992, recommended 524288 - the upstream dialer requests 524288-byte socket buffers and the kernel silently clamps them to this ceiling. Fix: on the host, sysctl -w net.core.wmem_max=524288, then restart the server (open sockets keep the clamped size); persist: add 'net.core.wmem_max = 524288' to /etc/sysctl.d/90-tiredvpn.conf
 Host tuning: 5 settings checked for this config, 2 to adjust, 1 more unmeasured at debug level; the server changes none of them itself
 ```
+<!-- host-tuning-example:end -->
 
 The level follows the rule's basis. A shortfall that was measured on our nodes,
 or that the config cannot work without, is logged at `INFO`. An estimate is
 logged only at `DEBUG` (`-debug`), tagged `(unmeasured)`, and the summary
 counts it. With `-debug` every setting that is fine gets an `ok` line too.
 
-A buffer ceiling is recommended only while the buffers it allows fit in half of
-the service's memory budget: the cgroup memory limit of the process (the unit's
-`MemoryMax`), or host RAM without one. The worst case is every admitted
-connection filling both buffers at twice the request, bounded by the host-wide
-`net.ipv4.tcp_mem` limit. When that does not fit, the line says so and asks for
-a larger memory limit or a smaller `-relay-upstream-buf` instead of the
-`sysctl`. Exits get no buffer advice at all for now (see the table).
+A buffer ceiling is recommended only while the worst case fits in half of the
+service's memory budget. The budget is the tightest cgroup memory limit from
+the process's own cgroup up to its namespace root (the unit's `MemoryMax`, or a
+container's limit), or host RAM without one; a limit that cannot be read
+suppresses the advice. The worst case is the host-wide TCP memory limit, the
+third field of `net.ipv4.tcp_mem`: nothing in the server bounds how many
+sockets fill their buffers (one admitted connection can carry many mux
+streams, each with its own upstream socket, and QUIC opens sockets outside TCP
+admission), so the kernel's limit is the only real bound. When it does not
+fit, the line says so and asks for a larger memory limit, or a lower
+`tcp_mem`, instead of the `sysctl`. Exits get no buffer advice at all for now
+(see the table).
 
 The server never writes these settings itself. The one exception predates the
 advisor: the NAT bootstrap described above enables `ip_forward` and IPv6
@@ -375,19 +385,23 @@ not apply to the config are not checked: a relay gets no forwarding or
 conntrack advice, an exit no buffer advice. A value that cannot be read (for
 example `nf_conntrack_max` before the module is loaded) is skipped and counted,
 never guessed; when as many settings are unreadable as were checked, the
-summary says "inconclusive" instead of "all fine". The `sysctl` fixes are
-host-wide and must run on the host, not inside a container. Outside Linux the
-advisor is silent.
+summary says "inconclusive" instead of "all fine". Where a fix has to run
+depends on the setting: `somaxconn`, `ip_forward`, IPv6 forwarding and
+`tcp_congestion_control` are kept per network namespace, so a server in a
+container needs them in its own namespace (`docker --sysctl`, or the pod's
+`securityContext.sysctls`) and a `sysctl -w` on the host does not reach it; the
+buffer ceilings, `tcp_mem` and conntrack are host-wide and can only be set on
+the host. The hints say which. Outside Linux the advisor is silent.
 
 <!-- host-tuning-table:begin (generated from internal/server/host_tuning.go; go test ./internal/server -run TestHostTuningDocsInSync -update-host-tuning-docs) -->
 | Setting | Checked when | Recommended | Basis | Why | Evidence |
 |---|---|---|---|---|---|
-| `net.core.rmem_max` | `-upstream` (relay) | >= the relay's upstream buffer (`-relay-upstream-buf`, default 512 KiB), only while buffers of that size fit in half of the memory budget | measured | `SO_RCVBUF` above this is clamped without an error, so the receive window of the upstream leg is capped | Relay on stock Ubuntu 24.04, 146 ms upstream leg (2026-10-24): 212992 held the leg at `rcv_ssthresh` 210439 and TUN downloads at 6.3-8.7 Mbit/s; 1 MiB gave 19.8-20.1 Mbit/s. Exits are not checked: their target dials request 4 MiB, and lifting that clamp can cost 8 MiB of kernel memory per slow download, which has not been measured |
+| `net.core.rmem_max` | `-upstream` (relay) | >= the relay's upstream buffer (`-relay-upstream-buf`, default 512 KiB), only while the host's TCP memory limit (`tcp_mem`) fits in half of the memory budget | measured | `SO_RCVBUF` above this is clamped without an error, so the receive window of the upstream leg is capped | Relay on stock Ubuntu 24.04, 146 ms upstream leg (2026-10-24): 212992 held the leg at `rcv_ssthresh` 210439 and TUN downloads at 6.3-8.7 Mbit/s; 1 MiB gave 19.8-20.1 Mbit/s. Exits are not checked: their target dials request 4 MiB, and lifting that clamp can cost 8 MiB of kernel memory per slow download, which has not been measured |
 | `net.core.wmem_max` | `-upstream` (relay) | same as `net.core.rmem_max` | measured | `SO_SNDBUF` is clamped the same way, capping how much the upstream leg keeps in flight | Raised together with `rmem_max` in the relay measurement above, not measured on its own |
 | `net.ipv4.ip_forward` | `-ip-pool` on an exit (no `-upstream`) | 1 | required | TUN clients' packets are forwarded out of this host; the server sets it at startup, so 0 here means its own attempt failed | Set by the NAT bootstrap (internal/tun/nat_linux.go); the advisor runs after it and only reports |
 | `net.ipv6.conf.all.forwarding` | `-ip-pool` with `-ip-pool-v6` on an exit | 1 | required | same as `ip_forward`, for the dual-stack pool | Set by the NAT66 bootstrap; without it v6 inside the tunnel is blackholed |
 | `net.ipv4.tcp_congestion_control` | always; the setting is host-wide and changes every TCP flow on the host | `bbr` (any version) | estimate | loss-based cubic backs off on random loss over long-RTT paths | One of the seven nodes read on 2026-10-24 runs bbr, six run cubic. No A/B throughput measurement has been made |
-| `net.netfilter.nf_conntrack_max` | `-ip-pool` on an exit (skipped while nf_conntrack is not loaded) | >= pool size x 256, at most 262144 and at most 1/16 of host RAM at 320 bytes per entry; `nf_conntrack_buckets` raised to match | estimate | every masqueraded flow takes an entry and a full table drops new flows | The kernel default scales with RAM and sets buckets equal to the maximum: 8192 on a 960 MB exit, 65536 on 2 GB ones; no `table full` in their kernel logs (2026-10-24). 256 flows per client is an assumption. The whole pool counts because QUIC serves TUN clients outside TCP admission |
+| `net.netfilter.nf_conntrack_max` | `-ip-pool` on an exit (skipped while nf_conntrack is not loaded) | >= pool size x 256, at most 262144 and at most 1/16 of host RAM at 320 bytes per entry; `nf_conntrack_buckets` at least a quarter of that (raised to match when advised) | estimate | every masqueraded flow takes an entry and a full table drops new flows | The kernel default scales with RAM and sets buckets equal to the maximum: 8192 on a 960 MB exit, 65536 on 2 GB ones; no `table full` in their kernel logs (2026-10-24). 256 flows per client is an assumption. The whole pool counts because QUIC serves TUN clients outside TCP admission |
 | `net.core.somaxconn` | always | >= min(admission limit, 4096) | estimate | Go uses it as the listen backlog; a reconnect storm overflows a short accept queue before admission control sees it | 4096 on every node we run (kernel >= 5.4 default; read 2026-10-24); older kernels default to 128. No overflow has been observed, the rule only catches an old kernel or a host tuned below the default |
 | `RLIMIT_NOFILE` | always | >= admission limit x 4 + 1024 (a floor: mux streams and QUIC are not bounded by admission) | estimate | each admitted connection holds a client socket and a target or upstream leg, more with mux streams | Our nodes run 524287 (Go raises the soft limit to the hard one) or the 65536 the packaged unit sets (read 2026-10-24). 4 descriptors per connection is an estimate, not a measurement |
 <!-- host-tuning-table:end -->
