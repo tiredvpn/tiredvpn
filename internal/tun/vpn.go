@@ -41,6 +41,14 @@ func isTemporaryError(err error) bool {
 // tests can shorten the ticker.
 var keepaliveInterval = 10 * time.Second
 
+// SetKeepaliveInterval replaces keepaliveInterval for a test in another
+// package and returns the old value. Not for concurrent tests.
+func SetKeepaliveInterval(d time.Duration) time.Duration {
+	old := keepaliveInterval
+	keepaliveInterval = d
+	return old
+}
+
 var readTimeout = 30 * time.Second    // Must be > keepaliveInterval, detect dead connection faster. A var so tests can shorten it.
 const writeTimeout = 30 * time.Second // Write timeout (was 5s, caused i/o timeouts with bufferbloat)
 
