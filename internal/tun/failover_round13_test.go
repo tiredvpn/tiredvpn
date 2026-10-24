@@ -155,3 +155,107 @@ func partAnswer(t *testing.T, play exitPlay, v6 IPv6Policy) {
 		}
 	}
 }
+
+// listenAt is a listener on addr that takes every connection, for the
+// selector's addresses.
+func listenAt(t *testing.T, addr string) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Skipf("listen %s: %v", addr, err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// TestAMuteTransportOnBothFamiliesDoesNotCondemnTheServer is P2-3 of the round-8
+// review, through the client's connect: Confusion is mute on a, morph works
+// there. Confusion went unanswered on v6, was tried again on v4 - set aside
+// on the one address only - and its second miss was a's verdict: a parked,
+// the client sent to b, morph never tried on a.
+func TestAMuteTransportOnBothFamiliesDoesNotCondemnTheServer(t *testing.T) {
+	old := handshakeReadTimeout
+	handshakeReadTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { handshakeReadTimeout = old })
+
+	a6, a4 := listenAt(t, "[::1]:0"), listenAt(t, "127.0.0.1:0")
+	b6, b4 := listenAt(t, "[::1]:0"), listenAt(t, "127.0.0.1:0")
+	m := strategy.NewManager()
+	eps := []endpoint.Endpoint{{Name: "a", V6: a6, V4: a4}, {Name: "b", V6: b6, V4: b4, Order: 1}}
+	if err := m.SetEndpoints(eps, endpoint.PreferV6); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(endpoint.ResetSharedSelectors)
+	m.Register(&mutePipeStrategy{t: t, id: "confusion", priority: 5, answers: map[string]bool{b6: true, b4: true}})
+	m.Register(&mutePipeStrategy{t: t, id: "morph", priority: 6, answers: map[string]bool{a6: true, a4: true, b6: true, b4: true}})
+
+	v := newCallsiteClient(m)
+	var rode []string
+	for cycle := 1; cycle <= 3; cycle++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		err := v.connect(ctx)
+		cancel()
+		addr := m.GetServerAddr(context.Background())
+		rode = append(rode, addr)
+		if errors.Is(err, strategy.ErrAddrSilent) {
+			t.Fatalf("cycle %d: a's silence verdict over one mute transport (%v): %v", cycle, rode, err)
+		}
+		if err == nil {
+			if addr != a6 && addr != a4 || v.strategy == nil || v.strategy.ID() != "morph" {
+				t.Fatalf("connected via %v on %s, want morph on a (%v)", v.strategy, addr, rode)
+			}
+			if cycle != 2 {
+				t.Fatalf("connected in cycle %d, want the second (%v)", cycle, rode)
+			}
+			return
+		}
+	}
+	t.Fatalf("no connection in 3 cycles: %v", rode)
+}
+
+// TestAOneTransportClientStillLeavesAMuteServer is why P2-3 sets the
+// transport aside on every address rather than asking for two transports
+// before a verdict: with one transport, mute on a, the client still has to
+// reach b.
+func TestAOneTransportClientStillLeavesAMuteServer(t *testing.T) {
+	old := handshakeReadTimeout
+	handshakeReadTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { handshakeReadTimeout = old })
+
+	a6, a4 := listenAt(t, "[::1]:0"), listenAt(t, "127.0.0.1:0")
+	b6, b4 := listenAt(t, "[::1]:0"), listenAt(t, "127.0.0.1:0")
+	m := strategy.NewManager()
+	eps := []endpoint.Endpoint{{Name: "a", V6: a6, V4: a4}, {Name: "b", V6: b6, V4: b4, Order: 1}}
+	if err := m.SetEndpoints(eps, endpoint.PreferV6); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(endpoint.ResetSharedSelectors)
+	m.Register(&mutePipeStrategy{t: t, id: "confusion", priority: 5, answers: map[string]bool{b6: true, b4: true}})
+
+	v := newCallsiteClient(m)
+	var rode []string
+	for cycle := 1; cycle <= 6; cycle++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		err := v.connect(ctx)
+		cancel()
+		addr := m.GetServerAddr(context.Background())
+		rode = append(rode, addr)
+		if err == nil {
+			if addr != b6 && addr != b4 {
+				t.Fatalf("connected on %s, want b (%v)", addr, rode)
+			}
+			t.Logf("on b after %d cycles: %v", cycle, rode)
+			return
+		}
+	}
+	t.Fatalf("not on b after 6 cycles: %v", rode)
+}

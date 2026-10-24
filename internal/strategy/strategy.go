@@ -2399,10 +2399,16 @@ const handshakeRunVerdict = 2
 // servers kept the client from the healthy third for over seven minutes,
 // the backoff growing to 2 minutes (R1 of the fix9 stand run).
 //
-// The transport is set aside on that address like a swallowed one and loses
-// the fast path; the server's other family gets the next try; a second
-// unanswered handshake on the server is its silence verdict, or the route's
-// when the same transport died that way on the server before (routeDeath).
+// The transport is set aside like a swallowed one, on every address of the
+// server, and loses the fast path; the server's other family gets the next
+// try, with another transport; a second unanswered handshake on the server is
+// its silence verdict, or the route's when the same transport died that way
+// on the server before (routeDeath). Set aside on the one address only, the
+// mute transport was tried again on the other family, and its second miss
+// condemned a server another transport worked on (P2-3 of the round-8
+// review). The other cure, a verdict only from two distinct transports, was
+// not taken: a client with one transport would never reach one, and it costs
+// the healthy transport a cycle.
 // The error to wrap the handshake failure in is returned: ErrAddrSilent on
 // a verdict, ErrCycleUnanswered otherwise - both cap the reconnect backoff
 // at the silence cap.
@@ -2423,7 +2429,9 @@ func (m *Manager) HandshakeUnanswered(s Strategy, cand endpoint.Candidate, hasCa
 	if sel == nil || !hasCand {
 		return ErrCycleUnanswered
 	}
-	m.noteSwallowed(cand.Addr, []string{id})
+	for _, addr := range append([]string{cand.Addr}, sel.Siblings(cand)...) {
+		m.noteSwallowed(addr, []string{id})
+	}
 	key := m.swallowKey(cand.Addr)
 	now := time.Now().Round(0)
 	m.mu.Lock()
