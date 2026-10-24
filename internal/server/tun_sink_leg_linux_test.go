@@ -566,16 +566,24 @@ func keepaliveRecord(t *testing.T) (func() []time.Time, func() []sentKeepalive) 
 }
 
 // exitWriterFor returns the exit's writer for the relay's tunnel address.
+//
+// The raw TUN loop answers the handshake before it registers the client, so
+// a client may be up before the exit has it: under load that took longer
+// than the test's next line. It waits up to 5 s.
 func exitWriterFor(t *testing.T, e *legExit, clientIP net.IP) *ClientWriter {
 	t.Helper()
 	st := e.srvCtx.sharedTUN
-	st.clientsMu.RLock()
-	defer st.clientsMu.RUnlock()
-	w := st.clients[clientIP.String()]
-	if w == nil {
-		t.Fatalf("no client %s registered on the exit", clientIP)
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		st.clientsMu.RLock()
+		w := st.clients[clientIP.String()]
+		st.clientsMu.RUnlock()
+		if w != nil {
+			return w
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no client %s registered on the exit", clientIP)
+		}
 	}
-	return w
 }
 
 // ipv4Packet is a minimal IPv4/UDP packet from src to dst.
