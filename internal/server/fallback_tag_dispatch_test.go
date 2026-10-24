@@ -70,6 +70,10 @@ type tagServer struct {
 
 func newTagServer(t *testing.T, cover string) *tagServer {
 	t.Helper()
+	// A Polling fallback that gets through opens a real session on the
+	// process-wide pollingManager, which outlived the test and filled the
+	// ceiling the session-cap tests count on.
+	forgetNewPollingSessions(t)
 	privB64, _, err := GenerateREALITYKeyPair()
 	if err != nil {
 		t.Fatal(err)
