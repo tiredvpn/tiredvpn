@@ -384,6 +384,22 @@ func expectDonor(t *testing.T, srv *tagServer, record []byte) {
 	}
 }
 
+// settleDonor waits until the donor's connection count has stopped moving,
+// so a connection from earlier in the test cannot be counted against what
+// comes next.
+func settleDonor(t *testing.T, srv *tagServer) {
+	t.Helper()
+	last := srv.donor.conns.Load()
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		time.Sleep(150 * time.Millisecond)
+		if n := srv.donor.conns.Load(); n == last {
+			return
+		}
+		last = srv.donor.conns.Load()
+	}
+	t.Fatal("the donor kept taking connections for three seconds")
+}
+
 // expectTLSPath sends record to the server and requires a ServerHello from
 // our own TLS stack, with the donor untouched.
 func expectTLSPath(t *testing.T, srv *tagServer, record []byte) {
@@ -479,7 +495,13 @@ func TestANewRegistryClientsTagIsSeenSoon(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	// And carol's next fallback is hers.
+	// And carol's next fallback is hers. The first hello may have gone to
+	// the donor, and its accept there lands whenever the machine gets round
+	// to it: counted after expectTLSPath read its baseline, it looked like
+	// the second hello's (P3-9 of the round-9 review). So that hello is
+	// finished with, and the donor's count left to settle, first.
+	conn.Close()
+	settleDonor(t, srv)
 	expectTLSPath(t, srv, captureFallbackHello(t, tagFallbackStrategies[0].make, carol.Secret))
 }
 
