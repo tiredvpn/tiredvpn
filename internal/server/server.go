@@ -86,19 +86,23 @@ var admissionSem chan struct{}
 // initAdmissionControl sizes the global admission semaphore from cfg. Safe to
 // call once at startup before any accept-loop runs.
 func initAdmissionControl(cfg *Config) {
-	limit := cfg.MaxConcurrentConns
-	if limit <= 0 {
-		// A relay (-upstream) holds a heavy per-client upstream bridge, so it gets
-		// a much smaller default than an exit node. An explicit -max-conns always
-		// wins for both roles.
-		if cfg.UpstreamAddr != "" {
-			limit = defaultRelayMaxConcurrentConns
-		} else {
-			limit = defaultMaxConcurrentConns
-		}
-	}
+	limit := admissionLimitFor(cfg)
 	admissionSem = make(chan struct{}, limit)
 	log.Info("Admission control: max %d concurrent incoming connections", limit)
+}
+
+// admissionLimitFor is the admission-control limit cfg resolves to.
+func admissionLimitFor(cfg *Config) int {
+	if cfg.MaxConcurrentConns > 0 {
+		return cfg.MaxConcurrentConns
+	}
+	// A relay (-upstream) holds a heavy per-client upstream bridge, so it gets
+	// a much smaller default than an exit node. An explicit -max-conns always
+	// wins for both roles.
+	if cfg.UpstreamAddr != "" {
+		return defaultRelayMaxConcurrentConns
+	}
+	return defaultMaxConcurrentConns
 }
 
 // onHandlerDone, when non-nil, is invoked after a spawned handler goroutine
@@ -142,40 +146,6 @@ func acceptConnection(conn net.Conn, srvCtx *serverContext, connID uint64) bool 
 		conn.Close()
 		return false
 	}
-}
-
-// checkUDPBufferSizes checks if system UDP buffer sizes are adequate for QUIC
-// Returns true if buffers are properly configured
-func checkUDPBufferSizes() bool {
-	const minBuffer = 7500000 // 7.5MB recommended for QUIC
-
-	rmemMax, err := os.ReadFile("/proc/sys/net/core/rmem_max")
-	if err != nil {
-		log.Warn("Cannot read rmem_max: %v", err)
-		return false
-	}
-
-	wmemMax, err := os.ReadFile("/proc/sys/net/core/wmem_max")
-	if err != nil {
-		log.Warn("Cannot read wmem_max: %v", err)
-		return false
-	}
-
-	var rmem, wmem int
-	fmt.Sscanf(string(bytes.TrimSpace(rmemMax)), "%d", &rmem)
-	fmt.Sscanf(string(bytes.TrimSpace(wmemMax)), "%d", &wmem)
-
-	if rmem < minBuffer || wmem < minBuffer {
-		log.Warn("UDP buffer sizes too small for optimal QUIC performance!")
-		log.Warn("  Current: rmem_max=%d, wmem_max=%d", rmem, wmem)
-		log.Warn("  Recommended: %d (7.5MB)", minBuffer)
-		log.Warn("  Fix with: sysctl -w net.core.rmem_max=%d net.core.wmem_max=%d", minBuffer, minBuffer)
-		log.Warn("  Persist: add to /etc/sysctl.conf")
-		return false
-	}
-
-	log.Debug("UDP buffer sizes OK: rmem_max=%d, wmem_max=%d", rmem, wmem)
-	return true
 }
 
 // setTCPOptions applies performance optimizations to TCP connections
@@ -627,6 +597,10 @@ func Run(cfg *Config) error {
 		log.Warn("TUN mode unavailable: %s", reason)
 	}
 
+	// After NAT bootstrap and listener setup, so forwarding and conntrack are
+	// read as the server leaves them. Reports only; changes nothing.
+	logHostTuning(cfg, srvCtx.ipPool != nil && srvCtx.ipPool.DualStack())
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -884,8 +858,7 @@ func startQUICServer(cfg *Config, srvCtx *serverContext) *strategy.QUICServer {
 	if !cfg.QUICEnabled {
 		return nil
 	}
-	checkUDPBufferSizes()
-
+	// UDP buffer sizing for QUIC is reported by the host tuning advisor.
 	quicAddr := cfg.QUICListenAddr
 	if quicAddr == "" {
 		quicAddr = cfg.ListenAddr
