@@ -213,8 +213,9 @@ func TestAGoneClientLetsTheBridgeLegGo(t *testing.T) {
 }
 
 // TestClientLiveness: heard within the window is alive; so is a TCP that
-// acknowledged data within it; a TCP that has acknowledged nothing for the
-// window, or no conn at all, is not.
+// acknowledged data within it, a Polling session with a request within it
+// and an open QUIC conn; a TCP that has acknowledged nothing for the
+// window, a closed QUIC conn, or no conn at all, is not.
 func TestClientLiveness(t *testing.T) {
 	old := relayClientActiveWindowNs.Load()
 	relayClientActiveWindowNs.Store(int64(300 * time.Millisecond))
@@ -225,6 +226,18 @@ func TestClientLiveness(t *testing.T) {
 	}
 	if (clientLiveness{heard: never}).alive() {
 		t.Fatal("a client never heard, with no conn, is alive")
+	}
+	if !(clientLiveness{heard: never, seen: func() (time.Duration, bool) { return 10 * time.Millisecond, true }}).alive() {
+		t.Fatal("a Polling client seen 10 ms ago is not alive")
+	}
+	if (clientLiveness{heard: never, seen: func() (time.Duration, bool) { return time.Second, true }}).alive() {
+		t.Fatal("a Polling client not seen for the window is alive")
+	}
+	if !(clientLiveness{conn: openPeer{alive: true}, heard: never}).alive() {
+		t.Fatal("a client whose QUIC conn is open is not alive")
+	}
+	if (clientLiveness{conn: openPeer{}, heard: never}).alive() {
+		t.Fatal("a client whose QUIC conn has closed is alive")
 	}
 	relaySide, client := tcpPair(t)
 	t.Cleanup(func() { relaySide.Close(); client.Close() })
@@ -241,3 +254,11 @@ func TestClientLiveness(t *testing.T) {
 		t.Fatal("a TCP that acknowledged data 50 ms ago is not alive")
 	}
 }
+
+// openPeer is a conn that says whether its peer is there, as a QUIC conn does.
+type openPeer struct {
+	net.Conn
+	alive bool
+}
+
+func (p openPeer) PeerAlive() bool { return p.alive }

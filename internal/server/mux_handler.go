@@ -121,7 +121,9 @@ func (h *MuxHandler) Handle(ctx context.Context, conn net.Conn) error {
 			defer atomic.AddInt64(&h.activeStreams, -1)
 			defer stream.Close()
 
-			h.handleStream(ctx, stream)
+			// The stream names the conn under the session, for the
+			// relay's clientLiveness (TCP_INFO).
+			h.handleStream(ctx, overTransport{stream, conn})
 		}(stream)
 	}
 

@@ -21,22 +21,39 @@ import (
 // 60 s on the exit's read deadline, while the client was there all along
 // (the fix12-slow stand run). So where the transport is TCP and the kernel
 // can say, a client whose TCP acknowledged what the relay sent it within
-// the window is alive too: a phone that left stops acknowledging. Without
-// TCP_INFO the first rule alone decides.
+// the window is alive too: a phone that left stops acknowledging. A
+// transport that is not TCP says so itself: a QUIC conn is open while its
+// client's packets keep coming (peerAlive), an HTTP Polling session is heard
+// by its requests (seen). Without any of these the first rule alone decides.
 type clientLiveness struct {
 	// conn is the downstream conn, nil for a transport without one (HTTP
 	// Polling's requests).
 	conn net.Conn
 	// heard is how long ago the client was last heard, false if never.
 	heard func() (time.Duration, bool)
+	// seen is how long ago the client last showed itself where the relay
+	// has no conn of it - an HTTP Polling session's last request - false if
+	// never. Nil for none.
+	seen func() (time.Duration, bool)
 }
+
+// peerAlive is a conn that knows whether its peer is still there: a QUIC
+// conn, which quic-go closes once the client has sent nothing for its idle
+// timeout.
+type peerAlive interface{ PeerAlive() bool }
 
 func (l clientLiveness) alive() bool {
 	window := relayClientActiveWindow()
-	if l.heard != nil {
-		if d, ok := l.heard(); ok && d < window {
+	for _, f := range []func() (time.Duration, bool){l.heard, l.seen} {
+		if f == nil {
+			continue
+		}
+		if d, ok := f(); ok && d < window {
 			return true
 		}
+	}
+	if p, ok := l.conn.(peerAlive); ok && p.PeerAlive() {
+		return true
 	}
 	if d, ok := sinceAckReceived(l.conn); ok && d < window {
 		return true
@@ -112,13 +129,13 @@ var upstreamKeepaliveSent atomic.Pointer[func()]
 // the exit, of any version, reads a frame and delivers nothing. A conn that
 // is not an upstream stego conn is left alone.
 //
-// client is the downstream conn, nil without one. The client counts as
-// heard whenever its bytes go up the leg.
-func keepUpstreamAlive(up *strategy.HTTP2StegoConn, client net.Conn, logger *log.Logger) {
+// live says what the relay can read of its downstream client; the client
+// also counts as heard whenever its bytes go up the leg.
+func keepUpstreamAlive(up *strategy.HTTP2StegoConn, live clientLiveness, logger *log.Logger) {
 	if up == nil {
 		return
 	}
-	live := clientLiveness{conn: client, heard: up.SinceOwnerWrite}
+	live.heard = up.SinceOwnerWrite
 	go up.KeepAlive(relayKeepaliveAfter, live.alive, func() {
 		if logger != nil {
 			logger.Debug("Relay: keepalive up the upstream leg")

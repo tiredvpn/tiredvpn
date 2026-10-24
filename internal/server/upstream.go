@@ -179,6 +179,12 @@ func (d *UpstreamDialer) connectStego(ctx context.Context) (*strategy.HTTP2Stego
 // downstream conn, nil without one - is alive (keepUpstreamAlive): a relay
 // copies bytes up only as its client sends them.
 func (d *UpstreamDialer) Dial(ctx context.Context, targetAddr string, client net.Conn) (net.Conn, error) {
+	return d.dialLive(ctx, targetAddr, clientLiveness{conn: client})
+}
+
+// dialLive is Dial with what the relay can read of its client spelled out,
+// for a client that has no conn of its own (HTTP Polling).
+func (d *UpstreamDialer) dialLive(ctx context.Context, targetAddr string, live clientLiveness) (net.Conn, error) {
 	log.Debug("Upstream dial to %s via %s", targetAddr, d.upstreamAddr)
 
 	stegoConn, tlsConn, err := d.connectStego(ctx)
@@ -211,7 +217,7 @@ func (d *UpstreamDialer) Dial(ctx context.Context, targetAddr string, client net
 	}
 
 	log.Debug("Upstream connection established to %s", targetAddr)
-	keepUpstreamAlive(stegoConn, client, nil)
+	keepUpstreamAlive(stegoConn, live, nil)
 
 	// Return the stego connection - it implements net.Conn
 	// Read/Write will automatically handle HTTP/2 stego framing
