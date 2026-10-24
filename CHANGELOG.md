@@ -91,7 +91,9 @@ Versions follow [Semantic Versioning](https://semver.org/).
   back to the server it just left; Android sessions now feed the storm
   detector. A stop by the user, a restart more than 2 minutes later, and -
   with an app that names its network on `connect` (`network_id`) - a
-  restart on another network start from nothing.
+  restart on another network start from nothing. `network_id` may be a
+  string or a number; the carry is stamped with the network its state was
+  learned on.
 - **Server: an idle HTTP Polling session is no longer dropped after ~6
   minutes** while its client keeps polling, directly or through a relay.
 - **Client and relay: an HTTP/2 Stego connection carrying a one-way download
@@ -106,6 +108,12 @@ Versions follow [Semantic Versioning](https://semver.org/).
   on its read deadline (about 68 s for HTTP/2 Stego, 120 s for Morph and
   Confusion). The desktop client now also sends one when nothing has gone up
   for a while.
+- **Relay: the `-upstream` TUN bridge and proxy relays close cleanly and say
+  why.** A write that failed on the upstream TLS connection used to be
+  followed by close_notify, which the exit read as "bad record MAC". The
+  bridge, the raw-tunnel, QUIC and mux relays now log what ended them first
+  (the client, the upstream or the target closing, an error, an idle
+  timeout).
 - **Server: a client keeps its tunnel address across transports and
   networks.** Leases are keyed on the credential, and leases an older server
   wrote under other keys are folded into it.
@@ -121,7 +129,8 @@ Versions follow [Semantic Versioning](https://semver.org/).
   own, once either direction of the leg has been silent for a period drawn
   anew each time between 20 and 45 s; a leg busy both ways gets none; the
   desktop client does the same for its own uplink, on top of its keepalive
-  when the server is silent. No change to the protocol.
+  when the server is silent, except on HTTP Polling, whose polls already
+  reach the exit. No change to the protocol.
 - On the wire: the TLS fallback transports' `session_id` is a keyed tag
   instead of random bytes. Same 32 bytes, different on every connection; the
   rest of the ClientHello is unchanged.
