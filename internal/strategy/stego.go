@@ -287,6 +287,9 @@ type HTTP2StegoConn struct {
 	// closed is closed by Close; KeepAlive ends with it.
 	closed    chan struct{}
 	closeOnce sync.Once
+	// ownerDone is closed by OwnerDone: the owner writes no more.
+	ownerDone     chan struct{}
+	ownerDoneOnce sync.Once
 
 	secret      []byte
 	isClient    bool
@@ -345,6 +348,7 @@ func NewHTTP2StegoConn(conn net.Conn, secret []byte, isClient bool, paddingMode 
 		paddingMode: paddingMode,
 		ekm:         ekm,
 		closed:      make(chan struct{}),
+		ownerDone:   make(chan struct{}),
 	}
 
 	// Initialize HTTP/2 framer
@@ -785,7 +789,8 @@ func (sc *HTTP2StegoConn) SinceOwnerWrite() (time.Duration, bool) {
 // the owner's client is gone, none goes, and the exit's deadline ends the
 // leg as before. sent, when set, is told of each keepalive written.
 //
-// It returns when the conn is closed or a keepalive cannot be written.
+// It returns when the conn is closed, when its owner is done writing
+// (OwnerDone), or when a keepalive cannot be written.
 func (sc *HTTP2StegoConn) KeepAlive(quiet func() time.Duration, alive func() bool, sent func()) {
 	q := quiet()
 	timer := time.NewTimer(q)
@@ -793,6 +798,8 @@ func (sc *HTTP2StegoConn) KeepAlive(quiet func() time.Duration, alive func() boo
 	for {
 		select {
 		case <-sc.closed:
+			return
+		case <-sc.ownerDone:
 			return
 		case <-timer.C:
 		}
@@ -811,6 +818,14 @@ func (sc *HTTP2StegoConn) KeepAlive(quiet func() time.Duration, alive func() boo
 		}
 		timer.Reset(max(q-silent, 10*time.Millisecond))
 	}
+}
+
+// OwnerDone tells the conn its owner will write no more on it: a relay
+// whose client has sent its last byte. The keepalive stops, so the peer's
+// read deadline ends the conn unless the peer answers first. Nothing goes on
+// the wire: the stego stream has no half-close. The conn can still be read.
+func (sc *HTTP2StegoConn) OwnerDone() {
+	sc.ownerDoneOnce.Do(func() { close(sc.ownerDone) })
 }
 
 // writeKeepalive writes an empty stego DATA frame, under a write deadline

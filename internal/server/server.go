@@ -1153,6 +1153,7 @@ func handleQUICConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 		n, err := optimizedRelay(targetConn, conn)
 		atomic.AddInt64(&bytesUp, n)
 		end.note("the client", "the target", err)
+		endTargetWrites(targetConn)
 	}()
 
 	// Target -> Client
@@ -2415,6 +2416,7 @@ func handleMorphConnection(conn net.Conn, srvCtx *serverContext, logger *log.Log
 	// Client -> Target (need to unwrap morph packets)
 	go func() {
 		defer wg.Done()
+		defer endTargetWrites(targetConn)
 		for {
 			// Read morph packet header: [dataLen:4][paddingLen:2]
 			hdr := make([]byte, 6)
@@ -3071,6 +3073,7 @@ func handleProtocolConfusion(sess *confusionSession, srvCtx *serverContext, logg
 
 	go func() {
 		defer wg.Done()
+		defer endTargetWrites(targetConn)
 		for {
 			data, err := conn.ReadFrame()
 			if err != nil {
@@ -3447,9 +3450,7 @@ func handleRawTunnel(conn net.Conn, srvCtx *serverContext, logger *log.Logger, c
 		n, err := optimizedRelay(targetConn, conn)
 		atomic.AddInt64(&bytesUp, n)
 		end.note("the client", "the target", err)
-		if tc, ok := targetConn.(*net.TCPConn); ok {
-			tc.CloseWrite()
-		}
+		endTargetWrites(targetConn)
 	}()
 
 	go func() {
@@ -5774,9 +5775,18 @@ func runPollingSessionRelay(sess *HTTPPollingSession, srvCtx *serverContext, log
 		return
 	}
 
+	// A session closed during the dial - up to 10 s - never saw this conn,
+	// and nothing else would close it: an upstream conn's keepalive held it
+	// and its socket for good (P3-4 of the round-9 review). Close sets
+	// closed before it looks at targetConn under targetLock, so one of the
+	// two closes it.
 	sess.targetLock.Lock()
 	sess.targetConn = targetConn
 	sess.targetLock.Unlock()
+	if sess.closed.Load() {
+		targetConn.Close()
+		return
+	}
 
 	// Send success
 	sess.WriteToClient([]byte{0x00})

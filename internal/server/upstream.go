@@ -182,6 +182,23 @@ func (d *UpstreamDialer) Dial(ctx context.Context, targetAddr string, client net
 	return d.dialLive(ctx, targetAddr, clientLiveness{conn: client})
 }
 
+// endTargetWrites passes on that a relay's client has sent its last byte.
+// A TCP target gets a FIN and may still answer. A relay's upstream conn
+// stops its keepalive (OwnerDone): the stego stream has no half-close, so
+// the exit's read deadline ends the leg unless the target answers first,
+// at most a minute after the last write up, as before round 13b. A leg kept
+// fed after its client left lingered up to about 2 3/4 minutes (P3-3 of the
+// round-9 review). Checked before CloseWrite on purpose: the stego conn
+// embeds a tls.Conn, whose CloseWrite would end the TLS stream.
+func endTargetWrites(target net.Conn) {
+	switch c := target.(type) {
+	case interface{ OwnerDone() }:
+		c.OwnerDone()
+	case *net.TCPConn:
+		_ = c.CloseWrite()
+	}
+}
+
 // dialLive is Dial with what the relay can read of its client spelled out,
 // for a client that has no conn of its own (HTTP Polling).
 func (d *UpstreamDialer) dialLive(ctx context.Context, targetAddr string, live clientLiveness) (net.Conn, error) {
