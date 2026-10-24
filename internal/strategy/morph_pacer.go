@@ -71,6 +71,10 @@ type writePacer struct {
 // newWritePacer constructs and starts a pacer goroutine bound to conn.
 // Caller owns conn and must invoke close() before closing the underlying
 // connection so the drain timeout has a chance to flush queued frames.
+// pacerSleep is the writer loop's sleep. A var so a test can count the
+// sleeps it asks for instead of timing them.
+var pacerSleep = time.Sleep
+
 func newWritePacer(conn net.Conn, sh shaper.Shaper) *writePacer {
 	return newWritePacerWithWritev(conn, sh, nil)
 }
@@ -199,7 +203,7 @@ func (p *writePacer) run() {
 					if flush() {
 						return
 					}
-					time.Sleep(pendingDelay)
+					pacerSleep(pendingDelay)
 					pendingDelay = 0
 					continue
 				}
@@ -222,7 +226,7 @@ func (p *writePacer) run() {
 					scaled += pendingDelay
 					pendingDelay = 0
 				}
-				time.Sleep(scaled)
+				pacerSleep(scaled)
 			}
 		}
 	}

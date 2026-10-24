@@ -116,29 +116,58 @@ func TestPacer_BasicFlow(t *testing.T) {
 
 // TestPacer_SleepCoalescing: with a 50µs delay (below the 100µs skip
 // threshold), the pacer should coalesce N×50µs into far fewer real sleeps.
-// Total wall time should be much less than the naive N×50µs when N is large.
+//
+// It used to time the burst and require it under N×60µs, which a loaded
+// machine under -race overran (12.8 ms against 6 ms). The sleeps the pacer
+// asks for are counted instead: each coalesced one is at least the 200µs
+// flush budget, so N frames can need no more than N×50µs/200µs of them -
+// against N, one per frame, without coalescing.
 func TestPacer_SleepCoalescing(t *testing.T) {
+	var mu sync.Mutex
+	var sleeps []time.Duration
+	old := pacerSleep
+	pacerSleep = func(d time.Duration) {
+		mu.Lock()
+		sleeps = append(sleeps, d)
+		mu.Unlock()
+	}
+	t.Cleanup(func() { pacerSleep = old })
+
 	c := &countingConn{}
 	p := newWritePacer(c, &constShaper{delay: 50 * time.Microsecond})
 	const N = 100
-	start := time.Now()
 	for range N {
 		if err := p.enqueue(pacedFrame{packet: []byte{0}, bucket: -1}); err != nil {
 			t.Fatalf("enqueue: %v", err)
 		}
 	}
+	// Close only once every frame went out through the pacer's own loop.
+	// Closed at once, the loop could see the close before the frames and
+	// drain them without pacing: no sleeps at all, and nothing tested.
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
+		c.mu.Lock()
+		done := c.bytes >= N
+		c.mu.Unlock()
+		if done {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the pacer did not write the frames")
+		}
+	}
 	p.close()
-	elapsed := time.Since(start)
-	naive := time.Duration(N) * 50 * time.Microsecond
-	// With coalescing we sleep once every ~4 frames (200µs / 50µs), so
-	// real sleep count is ~N/4 each delivering scheduler-floor latency.
-	// On Linux even the floor exceeds 50µs, so we relax the bound: we
-	// only assert that we are well below the *uncoalesced* cost, where
-	// every single sub-tick sleep would be rounded up to >=50µs anyway.
-	// Allow up to 60% of the worst-case floored sum (N * 60µs).
-	worstCase := time.Duration(N) * 60 * time.Microsecond
-	if elapsed > worstCase {
-		t.Fatalf("elapsed %v > worstCase %v (naive %v); coalescing not effective", elapsed, worstCase, naive)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(sleeps) == 0 {
+		t.Fatal("the pacer slept not once over 100 frames of 50µs - the test proves nothing")
+	}
+	if max := N * 50 / 200; len(sleeps) > max {
+		t.Fatalf("%d sleeps for %d frames of 50µs, want at most %d; coalescing not effective", len(sleeps), N, max)
+	}
+	for i, d := range sleeps {
+		if d < pacerCoalesceFlushAt {
+			t.Fatalf("sleep %d was %v, under the %v flush budget: a sub-tick delay slept on its own", i+1, d, pacerCoalesceFlushAt)
+		}
 	}
 }
 
