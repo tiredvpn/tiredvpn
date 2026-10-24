@@ -105,18 +105,22 @@ func TestSameStreamAndSizesSeparateTwoConnections(t *testing.T) {
 }
 
 func TestSameGapsHonoursTolerance(t *testing.T) {
+	// Exact gaps: the test used to sleep them, and a sleep under -race on a
+	// loaded machine overshot past the 30 ms tolerance, so two dumps of the
+	// same nominal delays failed to match.
 	timed := func(gaps ...time.Duration) *wiretest.Dump {
 		d := wiretest.NewDump("synthetic", wiretest.LayerTCP)
-		d.Record(wiretest.C2S, []byte{0})
+		at := time.Unix(1_700_000_000, 0)
+		d.RecordAt(wiretest.C2S, at, []byte{0})
 		for _, g := range gaps {
-			time.Sleep(g)
-			d.Record(wiretest.C2S, []byte{0})
+			at = at.Add(g)
+			d.RecordAt(wiretest.C2S, at, []byte{0})
 		}
 		return d
 	}
 
 	a := timed(20*time.Millisecond, 40*time.Millisecond)
-	b := timed(20*time.Millisecond, 40*time.Millisecond)
+	b := timed(25*time.Millisecond, 65*time.Millisecond) // within 30 ms of a, gap by gap
 	c := timed(20*time.Millisecond, 200*time.Millisecond)
 
 	if _, ok := wiretest.SameGaps(a, b, wiretest.C2S, 0, 30*time.Millisecond); !ok {
