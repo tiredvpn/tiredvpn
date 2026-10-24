@@ -414,16 +414,28 @@ func TestV1HoldLimit(t *testing.T) {
 		}
 		client.Close()
 	}
-	if got := app.accepted.Load(); got != 64 {
-		t.Fatalf("app received %d requests with 64 held, want one per held number", got)
+	// The app counts a request in its own per-connection goroutine, which
+	// can run later than the client's 30 ms deadline that made it held.
+	for deadline := time.Now().Add(5 * time.Second); app.accepted.Load() < 64; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("app received %d requests with 64 held, want one per held number", app.accepted.Load())
+		}
 	}
 	// The 65th fails on the backlog check, before it dials: that is what
-	// "without waiting" means, and the error says so. Its duration is not
-	// checked - a loaded machine can stall any call for 30 ms.
+	// "without waiting" means, and the error says so. A 30 ms timeout cannot
+	// tell waiting from a loaded machine, so the timeout goes to a minute
+	// here: a 65th that waited for it would take a minute, while a stall
+	// from load stays far under the bound. Nothing in the background reads
+	// protectTimeout, the held requests copied their limits when held.
+	protectTimeout = time.Minute
 	client, _ := tcpPair(t)
+	start := time.Now()
 	err := ProtectConn(client)
 	if err == nil || !strings.Contains(err.Error(), "backlog") {
 		t.Fatalf("65th request: err = %v, want a backlog error", err)
+	}
+	if d := time.Since(start); d > 10*time.Second {
+		t.Errorf("65th request took %v, it must fail without waiting", d)
 	}
 	time.Sleep(50 * time.Millisecond)
 	if got := app.accepted.Load(); got != 64 {
