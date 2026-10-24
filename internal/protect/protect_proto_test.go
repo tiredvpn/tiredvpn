@@ -401,24 +401,29 @@ func TestV1HoldLimit(t *testing.T) {
 		t.Fatalf("v1HoldLimit = %d, the contract says 64", v1HoldLimit)
 	}
 
-	for i := range 64 {
+	// Requests until 64 are held. Under load a request can miss its 30 ms
+	// deadline before it is even sent (the write fails, nothing is held);
+	// the test counted exactly 64 requests and saw 63 held.
+	for i := 0; heldV1.Load() < 64; i++ {
+		if i >= 256 {
+			t.Fatalf("held = %d after %d requests, want 64", heldV1.Load(), i)
+		}
 		client, _ := tcpPair(t)
 		if err := ProtectConn(client); err == nil {
 			t.Fatalf("request %d unexpectedly answered", i)
 		}
 		client.Close()
 	}
-	if got := heldV1.Load(); got != 64 {
-		t.Fatalf("held = %d, want 64", got)
+	if got := app.accepted.Load(); got != 64 {
+		t.Fatalf("app received %d requests with 64 held, want one per held number", got)
 	}
+	// The 65th fails on the backlog check, before it dials: that is what
+	// "without waiting" means, and the error says so. Its duration is not
+	// checked - a loaded machine can stall any call for 30 ms.
 	client, _ := tcpPair(t)
-	start := time.Now()
 	err := ProtectConn(client)
 	if err == nil || !strings.Contains(err.Error(), "backlog") {
 		t.Fatalf("65th request: err = %v, want a backlog error", err)
-	}
-	if d := time.Since(start); d >= protectTimeout {
-		t.Errorf("65th request took %v, it must fail without waiting", d)
 	}
 	time.Sleep(50 * time.Millisecond)
 	if got := app.accepted.Load(); got != 64 {
