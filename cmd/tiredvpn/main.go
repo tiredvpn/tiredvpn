@@ -17,6 +17,7 @@ import (
 
 	"github.com/skip2/go-qrcode"
 	"github.com/tiredvpn/tiredvpn/internal/client"
+	"github.com/tiredvpn/tiredvpn/internal/evasion"
 	"github.com/tiredvpn/tiredvpn/internal/server"
 	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 	"github.com/tiredvpn/tiredvpn/internal/tun"
@@ -204,15 +205,24 @@ ICMP TUNNEL:
 
 REALITY OPTIONS:
   -reality-cover-domain string
-        Operator-set hostname to transparently proxy unauthorized REALITY probes to (empty = drop)
+        Operator-set hostname to proxy unauthorized REALITY connections to when their SNI is no donor.
+        A ClientHello with a valid fallback-transport tag is never taken
+  -reality-sni string
+        Comma-separated cover names this exit's clients use beyond the built-in donors; unauthenticated
+        connections naming one are mirrored to it (legacy transport: only with -reality-cover-domain).
+        Without -reality-b1 or -reality-cover-domain a probe gets this server's own -cert for any name
   -reality-b1
         Accept the B1 transport: real TLS 1.3 with auth in session_id. Needs -reality-private-key.
+        TLS fallback transports get past the gate only with -reality-fallback-tag
+  -reality-fallback-tag
+        With -reality-b1: let hellos with a valid fallback-transport tag reach their handlers
+        instead of the donor (off: mirrored, as in 1.11.8). Use per-client registry secrets
   -reality-private-key string
         Server's static X25519 key, base64 (or TIREDVPN_REALITY_PRIVATE_KEY). Generate with: tiredvpn reality-keygen
   -reality-legacy
         Accept the legacy transport, credentials in padding extension 0x0015 (default true)
   -reality-max-time-diff int
-        Client clock skew tolerated by B1 auth, seconds; 0 = do not check (default 300)
+        Client clock skew tolerated by B1 auth and the fallback tag, seconds; 0 = do not check (default 300)
   -reality-min-client-ver string
         Lowest client version B1 accepts, X.Y.Z (empty = do not check)
   -reality-mirror string
@@ -394,11 +404,13 @@ ADVANCED EVASION:
   -rtt-profile string
         RTT profile: moscow-yandex, moscow-vk, regional-russia, siberia, cdn, beijing-baidu, tehran-aparat (default "moscow-yandex")
   -cover string
-        Cover host for traffic mimicry (default "api.googleapis.com")
+        HTTP/2 Stego cover host (SNI and :authority); an endpoint SNI pool (-reality-sni, [[servers]] sni) wins; empty = rotate (default "api.googleapis.com")
   -reality-require-data-v2
         Refuse REALITY servers still on the v1 data layer instead of silently falling back (default true; =false only for pre-1.11 servers)
   -reality-server-pubkey string
         Server's static REALITY public key, base64. Set it to speak the B1 transport; empty uses the legacy one.
+  -reality-sni string
+        Comma-separated cover names (SNI) instead of the built-in donor pool, for REALITY, HTTP/2 stego and QUIC; a [[servers]] entry's own sni wins
 
 ICMP TUNNEL (backup transport):
   -icmp-tunnel
@@ -464,6 +476,21 @@ type serverFlagOpts struct {
 // without editing runClient, which everyone shares.
 func registerClientREALITYFlags(fs *flag.FlagSet, cfg *client.Config) {
 	fs.StringVar(&cfg.REALITYServerPubKey, "reality-server-pubkey", "", "Server's static REALITY public key, base64. Set it to speak the B1 transport; empty uses the legacy one. No probing, no downgrade on error.")
+	fs.Var((*sniListFlag)(&cfg.REALITYSNIs), "reality-sni", "Comma-separated cover names (SNI) to use instead of the built-in donor pool for REALITY, HTTP/2 stego and QUIC, e.g. 'www.google.com,www.gstatic.com'. A [[servers]] entry's own sni wins. Empty = built-in pool.")
+}
+
+// sniListFlag is a comma-separated hostname list flag (-reality-sni).
+type sniListFlag []string
+
+func (f *sniListFlag) String() string { return strings.Join(*f, ",") }
+
+func (f *sniListFlag) Set(s string) error {
+	list, err := evasion.ParseSNIList(s)
+	if err != nil {
+		return err
+	}
+	*f = list
+	return nil
 }
 
 // registerServerFlags binds every server flag onto fs and cfg. It is split out
@@ -479,11 +506,17 @@ func registerServerFlags(fs *flag.FlagSet, cfg *server.Config) *serverFlagOpts {
 	fs.StringVar(&cfg.KeyFile, "key", "server.key", "TLS key file")
 	opts.secret = fs.String("secret", "", "Shared secret for authentication (single-client mode)")
 	fs.StringVar(&cfg.FakeWebRoot, "fake-root", "./www", "Fake website root directory")
-	// Operator-set hostname that unauthorized REALITY probes are transparently
-	// proxied to (see reality.go handleREALITYUnauthorized). Empty = silently
-	// drop. Never sourced from the client's SNI, so there is no SSRF via a
-	// client-controlled hostname.
-	fs.StringVar(&cfg.REALITYCoverDomain, "reality-cover-domain", "", "Hostname to transparently proxy unauthorized REALITY probes to (operator-set, e.g. 'www.microsoft.com'); empty = silently drop. Never derived from client SNI.")
+	// Operator-set hostname that unauthorized REALITY connections are
+	// transparently proxied to when their SNI is not a donor (see reality.go
+	// handleREALITYUnauthorized and donorDestination). A client SNI is dialled
+	// only when it is on the built-in list or -reality-sni, so there is no SSRF
+	// via a client-controlled hostname.
+	fs.StringVar(&cfg.REALITYCoverDomain, "reality-cover-domain", "", "Hostname to transparently proxy unauthorized REALITY connections to when their SNI is not a donor (built-in list or -reality-sni), operator-set, e.g. 'www.microsoft.com'. A donor SNI is mirrored to that donor. Empty = no cover: such connections get the fake website. An unlisted SNI is never dialled. A ClientHello carrying a valid fallback-transport tag is never taken.")
+	// Operator-set donors on top of the built-in allowlist: the names clients
+	// of this exit are configured with (-reality-sni / [[servers]] sni). A
+	// probe that replays one of them is mirrored to that site, as it is for a
+	// built-in donor, instead of to the cover domain.
+	fs.Var((*sniListFlag)(&cfg.REALITYSNIs), "reality-sni", "Comma-separated cover names (SNI) this exit's clients use beyond the built-in donor list; unauthenticated REALITY connections naming one are mirrored to that site (B1 always, legacy only with -reality-cover-domain). Operator-set, like -reality-cover-domain. Without -reality-b1 or -reality-cover-domain a probe gets this server's own -cert for any name; see docs/server.md.")
 	// Transition switch for the data-layer rewrite: leave off while old clients
 	// are still around, turn on afterwards to remove the v1 downgrade path.
 	// Node ceilings. Both default to off: a non-zero default would start
@@ -505,9 +538,10 @@ func registerServerFlags(fs *flag.FlagSet, cfg *server.Config) *serverFlagOpts {
 	// code path that does nothing yet. Flip the default in the release that
 	// ships the handler (task 005).
 	fs.StringVar(&cfg.REALITYPrivateKey, "reality-private-key", "", "Server's static X25519 key for REALITY B1, base64 (falls back to TIREDVPN_REALITY_PRIVATE_KEY). Generate with `tiredvpn reality-keygen`. Required with -reality-b1.")
-	fs.BoolVar(&cfg.REALITYB1Enabled, "reality-b1", false, "Accept the REALITY B1 transport (real TLS 1.3, auth in session_id). Requires -reality-private-key.")
+	fs.BoolVar(&cfg.REALITYB1Enabled, "reality-b1", false, "Accept the REALITY B1 transport (real TLS 1.3, auth in session_id). Requires -reality-private-key. TLS fallback transports get past the gate only with -reality-fallback-tag.")
+	fs.BoolVar(&cfg.REALITYFallbackTag, "reality-fallback-tag", false, "With -reality-b1: let a ClientHello carrying a valid fallback-transport tag (HTTP Polling, WebSocket, Geneva, anti-probe, Stego, Morph, a relay's upstream) through to its handler instead of the donor. Off: tagged hellos are mirrored as in 1.11.8. A copied tag opens every exit sharing the secret once; use per-client registry secrets.")
 	fs.BoolVar(&cfg.REALITYLegacyEnabled, "reality-legacy", true, "Accept the legacy REALITY transport (credentials in padding extension 0x0015). Turn off once no client uses it.")
-	fs.IntVar(&cfg.REALITYMaxTimeDiff, "reality-max-time-diff", 300, "Client clock skew tolerated by B1 auth, seconds (0 = do not check)")
+	fs.IntVar(&cfg.REALITYMaxTimeDiff, "reality-max-time-diff", 300, "Client clock skew tolerated by B1 auth and the fallback-transport tag, seconds (0 = do not check)")
 	fs.StringVar(&cfg.REALITYMinClientVer, "reality-min-client-ver", "", "Lowest client version B1 accepts, X.Y.Z (empty = do not check)")
 	fs.StringVar(&cfg.REALITYMirrorMode, "reality-mirror", "adaptive", "Mirror the handshake to the real donor for unauthenticated sources: off, adaptive (default), always. 'always' dials a donor for every connection including users - measurement only.")
 	fs.StringVar(&cfg.BurstReshape, "burst-reshape", "off", "Split the inner TLS handshake with a nudge/ack exchange so the nDPI burst heuristic stops matching: off, on. MUST match the client setting - a one-sided 'on' corrupts streams.")
@@ -655,7 +689,7 @@ func runClient(args []string) {
 	fs.StringVar(&cfg.HTTPListenAddr, "http-listen", "", "Separate HTTP proxy address (optional)")
 	fs.StringVar(&cfg.ServerAddr, "server", "", "Remote server address (host:port)")
 	fs.StringVar(&cfg.Secret, "secret", "", "Shared secret for authentication")
-	fs.StringVar(&cfg.CoverHost, "cover", "api.googleapis.com", "Cover host for traffic mimicry")
+	fs.StringVar(&cfg.CoverHost, "cover", "api.googleapis.com", "HTTP/2 Stego cover host (SNI and :authority). An endpoint SNI pool (-reality-sni, [[servers]] sni) wins over it; empty = rotate built-in hosts.")
 	fs.StringVar(&cfg.StrategyName, "strategy", "", "Force specific strategy (http2_stego, morph, confusion, antiprobe, quic, http_polling)")
 	fs.BoolVar(&cfg.ListStrategies, "list", false, "List available strategies and exit")
 	fs.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
@@ -895,23 +929,27 @@ type adminConnFlags struct {
 	quicPort *int
 	strategy *string
 	cover    *string
+	sni      *sniListFlag
 }
 
 func registerAdminConnFlags(fs *flag.FlagSet) adminConnFlags {
+	sni := new(sniListFlag)
+	fs.Var(sni, "reality-sni", "Comma-separated SNI pool for the connection string (sni=); empty leaves it out")
 	return adminConnFlags{
 		quic:     fs.Bool("quic", true, "Enable QUIC"),
 		quicPort: fs.Int("quic-port", 0, "QUIC port for the connection string; 0 leaves it out (clients dial the server port)"),
 		strategy: fs.String("strategy", "auto", "Strategy"),
 		cover:    fs.String("cover", "api.googleapis.com", "Cover host"),
+		sni:      sni,
 	}
 }
 
 func (f adminConnFlags) connectionString(serverAddr, secret string) string {
-	return buildConnectionString(serverAddr, secret, *f.quic, *f.quicPort, *f.strategy, *f.cover)
+	return buildConnectionString(serverAddr, secret, *f.quic, *f.quicPort, *f.strategy, *f.cover, *f.sni)
 }
 
 // buildConnectionString builds a tired:// connection string
-func buildConnectionString(serverAddr, secret string, quic bool, quicPort int, strategy, cover string) string {
+func buildConnectionString(serverAddr, secret string, quic bool, quicPort int, strategy, cover string, sni []string) string {
 	params := url.Values{}
 	params.Set("secret", secret)
 	params.Set("strategy", strategy)
@@ -922,6 +960,11 @@ func buildConnectionString(serverAddr, secret string, quic bool, quicPort int, s
 		params.Set("quicPort", fmt.Sprintf("%d", quicPort))
 	}
 	params.Set("cover", cover)
+	// The endpoint's SNI pool, comma-separated like -reality-sni. Left out
+	// when empty, so strings for clients without a pool are unchanged.
+	if len(sni) > 0 {
+		params.Set("sni", strings.Join(sni, ","))
+	}
 	params.Set("rtt", "false")
 	params.Set("rttProfile", "moscow-yandex")
 	params.Set("fallback", "true")

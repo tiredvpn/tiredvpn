@@ -284,7 +284,7 @@ func mergeClient(dst, src *ClientConfig) {
 	if src.Server.Secret != "" {
 		dst.Server.Secret = src.Server.Secret
 	}
-	if src.Server.SNI != "" {
+	if src.Server.SNI != nil {
 		dst.Server.SNI = src.Server.SNI
 	}
 	// The list is atomic: a partial merge of two server lists has no meaning a

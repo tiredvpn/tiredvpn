@@ -16,6 +16,7 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/geneva"
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/padding"
+	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 )
 
 // GenevaStrategy applies Geneva-style packet manipulation to evade DPI
@@ -155,14 +156,16 @@ func (g *GenevaStrategy) Connect(ctx context.Context, target string) (net.Conn, 
 
 	// Step 4: Do TLS handshake THROUGH Geneva connection
 	// The Geneva wrapper will fragment the ClientHello automatically
+	// SNI and Host agree: the endpoint's own name when it has a pool.
+	host := coverNameFor(ctx, g.wsHost)
 	tlsConfig := &tls.Config{
-		ServerName:         g.wsHost,
+		ServerName:         host,
 		InsecureSkipVerify: true, // Server uses self-signed cert
 		MinVersion:         tls.VersionTLS12,
-		ClientSessionCache: g.manager.TLSSessionCache(), // resume across reconnects
+		ClientSessionCache: g.manager.TLSSessionCache(serverAddr), // resume across reconnects
 	}
 
-	tlsConn := tls.Client(genevaConn, tlsConfig)
+	tlsConn := tls.Client(genevaConn, customtls.WithFallbackTag(tlsConfig, secret))
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		genevaConn.Close()
 		return nil, fmt.Errorf("geneva tls handshake: %w", err)
@@ -190,7 +193,7 @@ func (g *GenevaStrategy) Connect(ctx context.Context, target string) (net.Conn, 
 			"X-Auth-Token: %s\r\n"+
 			"User-Agent: "+browserUserAgent+"\r\n"+
 			"\r\n",
-		g.wsPath, g.wsHost, wsKey, hex.EncodeToString(authToken))
+		g.wsPath, host, wsKey, hex.EncodeToString(authToken))
 
 	if _, err := tlsConn.Write([]byte(upgradeReq)); err != nil {
 		tlsConn.Close()

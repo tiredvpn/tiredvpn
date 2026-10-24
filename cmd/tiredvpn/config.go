@@ -94,18 +94,21 @@ func applyServerList(cfg *client.Config, tcfg *tomlcfg.ClientConfig) error {
 	list := tcfg.ServerList()
 	specs := make([]client.ServerSpec, 0, len(list))
 	for _, s := range list {
+		snis, err := s.SNIs()
+		if err != nil {
+			return fmt.Errorf("server %q: %w", s.Name, err)
+		}
 		spec := client.ServerSpec{
 			Name:   s.Name,
 			Weight: s.Weight,
 			Secret: s.Secret,
-			SNI:    s.SNI,
+			SNI:    snis,
 		}
 		// endpoint.NormalizeAddr is the same code the -server/-server-v6
 		// path goes through in client.ResolveEndpoints. Joining the fields
 		// directly turned address_v6 = "[2001:db8::2]" into "[[2001:db8::2]]:995".
 		// The schema stores the address bare and the port apart, but a port
 		// written into the address wins, as it does on the command line.
-		var err error
 		if spec.Addr, err = endpoint.NormalizeAddr(s.Address, s.Port); err != nil {
 			return fmt.Errorf("server %q: address: %w", s.Name, err)
 		}

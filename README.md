@@ -346,6 +346,7 @@ Run `tiredvpn server -help` or `tiredvpn client -help` for the full flag list.
 | `-enable-icmp` | `false` | Enable ICMP tunnel listener (requires CAP_NET_RAW) |
 | `-reality-b1` | `false` | Accept the REALITY B1 transport; needs `-reality-private-key` |
 | `-reality-private-key` | | Static X25519 key, base64 (`TIREDVPN_REALITY_PRIVATE_KEY`) |
+| `-reality-fallback-tag` | `false` | With `-reality-b1`: let the TLS fallback transports' tagged hellos reach their handlers instead of the donor. Use per-client registry secrets with it; see `docs/server.md` |
 | `-max-conns` | `0` | Cap on in-flight incoming connections (0 = 4096) |
 | `-pprof` | | Serve pprof on this address (e.g. `:6060`) |
 | `-debug` | `false` | Verbose logging |

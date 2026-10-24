@@ -63,9 +63,10 @@ type Endpoint struct {
 
 	// Secret and SNI are per-endpoint overrides. They are carried here so the
 	// selector can hand a complete description to the caller, but nothing in
-	// this package interprets them.
+	// this package interprets them. SNI is the endpoint's cover-name pool;
+	// empty means the built-in one.
 	Secret string
-	SNI    string
+	SNI    []string
 }
 
 // Addr returns the endpoint's address on family f, or "" when it has none.

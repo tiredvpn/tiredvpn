@@ -248,11 +248,13 @@ Two limitations, both logged at startup:
 |------|---------|-------------|
 | `-reality-legacy` | `true` | Accept the legacy transport (credentials in padding extension `0x0015`). |
 | `-reality-b1` | `false` | Accept the B1 transport: real TLS 1.3, authentication in `session_id`. Requires `-reality-private-key`. |
+| `-reality-fallback-tag` | `false` | With `-reality-b1`: let a ClientHello carrying a valid fallback-transport tag reach its handler instead of the donor (see below). Off, tagged hellos are mirrored as in 1.11.8. Use per-client registry secrets when it is on. |
 | `-reality-private-key` | | Server's static X25519 key, base64. Falls back to `TIREDVPN_REALITY_PRIVATE_KEY`. Generate with `tiredvpn reality-keygen`. |
-| `-reality-max-time-diff` | `300` | Client clock skew tolerated by B1 auth, in seconds. `0` disables the check; negative aborts startup. |
+| `-reality-max-time-diff` | `300` | Client clock skew tolerated by B1 auth and by the fallback-transport tag, in seconds. `0` disables the check; negative aborts startup. |
 | `-reality-min-client-ver` | | Lowest client version B1 accepts, `X.Y.Z`. Empty disables the check. An unparsable value aborts startup. |
 | `-reality-mirror` | `adaptive` | Donor mirroring for sources that have not authenticated: `off`, `adaptive`, `always`. `always` dials a donor for every connection including real users - measurement only. |
-| `-reality-cover-domain` | | Hostname that unauthorised REALITY probes are transparently proxied to (port 443). Empty drops them silently. Operator-set, never derived from the client's SNI. |
+| `-reality-cover-domain` | | Hostname that unauthorised REALITY connections are transparently proxied to (port 443) when their SNI is not a donor (the built-in list or `-reality-sni`). A donor SNI is mirrored to that donor instead. Empty: a connection naming no donor is handed to the ordinary TLS path and gets the fake website. An SNI on neither list is never dialled. A ClientHello with a valid fallback-transport tag is never taken (see below). |
+| `-reality-sni` | | Comma-separated cover names this exit's clients are configured with (client `-reality-sni` or `[[servers]] sni`), on top of the built-in donor list. An unauthenticated REALITY connection naming one is mirrored to that site: on B1 always, on the legacy transport when `-reality-cover-domain` is set. Names match case-insensitively. Without it, a probe replaying such a name gets the cover domain's certificate for it. |
 | `-reality-require-data-v2` | `false` | Reject clients that do not negotiate the v2 data layer (per-connection keys + AEAD). Turn on only after every client is upgraded. |
 
 Turning both `-reality-b1` and `-reality-legacy` off aborts startup - no REALITY
@@ -261,6 +263,137 @@ key pair at boot, so B1 clients pinning a public key must not rely on it. With
 `-reality-b1` and no key, startup fails rather than silently generating a
 throwaway that would drop every client on the next restart. The public half is
 printed in the startup log.
+
+#### What a probe sees for a pool name
+
+A client's SNI pool hides the exit only if a probe that sends one of those
+names gets that site back. What decides it is the exit's flags, and a plain
+probe (`openssl s_client`, any ClientHello without REALITY credentials)
+differs from one that replays a real client's hello:
+
+| Exit | Plain probe, pool name | Replayed client hello, pool name |
+|---|---|---|
+| `-reality-b1`, `-reality-sni` lists the name | mirrored to that site | mirrored to that site; with `-reality-fallback-tag`, see below |
+| `-reality-b1`, name not listed | `-reality-cover-domain` if set, else the server's own `-cert` | the same; with `-reality-fallback-tag`, see below |
+| legacy only, `-reality-cover-domain` set | the server's own `-cert` | mirrored if listed (built-in or `-reality-sni`), else the cover domain |
+| legacy only, no `-reality-cover-domain` | the server's own `-cert` | the server's own `-cert`; `-reality-sni` changes nothing |
+
+With `-reality-fallback-tag` on, a replayed hello of a TLS fallback is the
+exception. Its `session_id` carries a fallback-transport tag (next section).
+Each exit remembers the tags it has let through, so a replay to the same exit
+is still mirrored. But the tag is bound neither to the hello nor to the exit.
+A copy - even of the 32-byte `session_id` alone, in the prober's own
+ClientHello with its own random and key share - is let through once on every
+other exit with the same secret within the clock window. The prober then
+completes TLS with that exit's own stack. That is why the flag is off by
+default. Per-client registry secrets, rather than one shared `-secret`, limit
+a copy to the exits that know that one client.
+
+The legacy transport is on by default (`-reality-legacy`). On an exit that
+runs both, a probe whose ClientHello carries a padding extension of 64 bytes
+or more (OpenSSL adds one to hellos of 256-511 bytes) is handed to the legacy
+path and gets the legacy row.
+
+On a legacy-only exit the pool is not protected without
+`-reality-cover-domain`, and even with it a plain probe gets the server's
+own certificate. The stand showed `CN=www.example.com` coming back for
+`www.google.com` (final acceptance, N12). Recommended exit setup for clients
+with an SNI pool:
+
+```
+-reality-b1 -reality-private-key <key> \
+-reality-sni <the clients' pool names> \
+-reality-cover-domain <a real site for every other name>
+```
+
+Add `-reality-fallback-tag` if the clients' TLS fallbacks must work on that
+exit, and then give the clients per-client registry secrets (next section).
+
+#### TLS fallback transports on a B1 server
+
+With `-reality-b1` the gate reads every TLS ClientHello on the port, not only
+REALITY's. HTTP Polling, WebSocket padded, Geneva, anti-probe, HTTP/2 Stego,
+Traffic Morph, State Exhaustion and a relay's `-upstream` leg all open with a
+plain crypto/tls ClientHello, and their SNI comes from the endpoint's pool -
+donor names by design. The gate proxies them to the donor, and they never
+reach their handlers.
+
+Clients put a fallback-transport tag in their `session_id` instead of 32
+random bytes. The tag is a nonce, the time masked by a keyed pad, and a MAC,
+with the key derived (HKDF, its own info string) from the secret the client
+dials with. With `-reality-fallback-tag` the gate checks it against every
+client in its index - each registry client's own secret and the global
+`-secret`:
+
+- a fresh tag (inside `-reality-max-time-diff`, not seen before) hands the
+  connection to the ordinary TLS path and its dispatch byte, ahead of the
+  donor and `-reality-cover-domain`;
+- a replayed or stale tag, an unknown key, and no tag at all go to the donor
+  or the cover domain, exactly as an unauthenticated stranger does.
+
+Without the flag - the default - the tag is not looked at, costs nothing, and
+a tagged hello is treated like any other, as in 1.11.8. So on a B1 exit the
+TLS fallbacks of clients with a donor-name pool work only with the flag on.
+
+"Treated like any other" is not "mirrored": the flag only decides tag
+admission. These hellos reach the exit's own TLS stack whatever it says,
+each a way for a probe to tell the exit from the site it imitates:
+
+- a valid ClientHello with no X25519 key share (P-256 only, say), which the
+  B1 gate cannot read;
+- any ClientHello when no donor can be dialled;
+- a hello with a padding extension of 64 bytes or more, with
+  `-reality-legacy` on (it goes to the legacy path, see the probe table);
+- IMAP STARTTLS on the IMAP camouflage port, which runs its own TLS server.
+
+Before turning the flag on, know what it opens. The tag binds neither the
+hello nor the exit, so a copy works once on every exit that shares the secret
+(previous section). Binding it to the hello's random and key share is planned
+for 1.11.10, as tag version 2 under its own key (HKDF info
+`tiredvpn-fallback-tag-v2`). The plan is that a 1.11.10 exit with the flag on
+admits v2 tags only: TLS fallbacks of 1.11.9 clients go to the donor there,
+as with the flag off, so upgrade the clients before you turn the flag on.
+Admitting v1 next to v2 would keep the exposure and would take an opt-in of
+its own. Until then:
+
+- use per-client registry secrets, not one global `-secret`, on any exit
+  with the flag on (the server warns at startup otherwise);
+- use random secrets of 32 bytes or more. One captured tag lets anyone test
+  guesses at the secret offline; a secret like `pass-424242` falls to a
+  dictionary in about a second. The client warns at startup about each weak
+  secret it uses, and the server about its global `-secret` and, with the
+  flag on, about each weak registry secret (once per client). Weak means
+  under 16 bytes, fewer than 8 distinct characters, a string that repeats
+  itself, a common word in it, or under about 90 bits by its character
+  classes. Passing the check is not "safe": any secret a person chose can be
+  guessed by a dictionary that knows how people choose. Generate secrets.
+
+The tag is not a B1 credential and a B1 `session_id` is not a tag. It looks
+like the random value it replaces to anyone without the secret, differs on
+every connection, and leaves the rest of the ClientHello as crypto/tls builds
+it. It carries the client's clock: with the flag on, a client more than
+`-reality-max-time-diff` (300 s by default) off has its TLS fallbacks sent to
+the donor, as its B1 hellos are.
+
+| Client | Exit | Result |
+|---|---|---|
+| 1.11.8 or older with `sni = [...]` in its config | any | does not start ("cannot decode TOML array") |
+| new, pool of donor names | `-reality-b1` without `-reality-fallback-tag` (any version) | TLS fallbacks go to the donor or the cover domain; REALITY, QUIC and the non-TLS transports work |
+| new, pool of donor names | new, `-reality-b1 -reality-fallback-tag` | TLS fallbacks reach their handlers |
+| 1.11.8 or older (no tag) | new, `-reality-b1` | TLS fallbacks mirrored when the SNI is a donor or a cover domain is set, otherwise the ordinary path - as before |
+| any | without `-reality-b1` | the tag is ignored; as before |
+| new relay (`-upstream`) | new, `-reality-b1 -reality-fallback-tag` | the upstream leg is tagged with its upstream secret and reaches its handler |
+| new relay (`-upstream`) | `-reality-b1` without the flag, with `-reality-cover-domain` | the upstream leg goes to the cover domain, as in 1.11.8 |
+
+**Update B1 exits and turn on `-reality-fallback-tag` before handing out SNI
+pools** of donor names to clients that need their TLS fallbacks.
+
+Cost, with the flag on: one HMAC per index entry for each ClientHello that B1
+turns down and the legacy transport does not take: about 0.8 µs and five small allocations per
+client, measured (0.8 ms at 1000 clients), on the order of the TLS handshake
+the connection costs anyway. A legacy-REALITY hello skips it.
+`reality_fallback_tag_total` on `/metrics` counts the connections let through
+on a tag.
 
 ### Burst reshaping
 

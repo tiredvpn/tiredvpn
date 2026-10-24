@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -83,7 +84,7 @@ func sharedKey(cfg Config) string {
 		cfg.Family, cfg.Selection, cfg.FailureThreshold,
 		cfg.Cooldown, cfg.MaxCooldown, cfg.MinDwell, cfg.JitterFrac, cfg.ProbeTimeout)
 	for _, e := range cfg.Endpoints {
-		fmt.Fprintf(h, "ep(%q,%q,%q,%d,%d,%q,%q);", e.Name, e.V4, e.V6, e.Weight, e.Order, e.Secret, e.SNI)
+		fmt.Fprintf(h, "ep(%q,%q,%q,%d,%d,%q,%q);", e.Name, e.V4, e.V6, e.Weight, e.Order, e.Secret, strings.Join(e.SNI, ","))
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }

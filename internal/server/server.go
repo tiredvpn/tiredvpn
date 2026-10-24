@@ -401,6 +401,11 @@ type Config struct {
 	// If empty, unauthorized REALITY connections are silently dropped.
 	REALITYCoverDomain string
 
+	// REALITYSNIs (-reality-sni) are operator-set donors on top of the
+	// built-in allowlist: the cover names this exit's clients are configured
+	// with. An unauthenticated connection naming one is mirrored to that site.
+	REALITYSNIs []string
+
 	// NodeMaxClients caps distinct authenticated clients on this node. 0 = off.
 	//
 	// The vector is address reputation, and it is the only confirmed one that
@@ -449,6 +454,14 @@ type Config struct {
 	// REALITYB1Enabled accepts the B1 transport: a real TLS 1.3 handshake with
 	// authentication carried in session_id.
 	REALITYB1Enabled bool
+
+	// REALITYFallbackTag lets the B1 gate hand a ClientHello with a valid
+	// fallback-transport tag to the ordinary TLS path instead of the donor.
+	// Off by default: the tag binds neither the hello nor the exit, so a
+	// copied one opens every exit with the same secret once within the clock
+	// window (P1-1 of the round-5 review). Off, tagged hellos are mirrored
+	// like any other, as in 1.11.8.
+	REALITYFallbackTag bool
 
 	// REALITYLegacyEnabled accepts the old transport, the one that hides
 	// credentials in padding extension 0x0015. Switch it off once
@@ -509,6 +522,11 @@ type serverContext struct {
 	// Nil means net.DialTimeout, which is what production uses; tests set it
 	// so the donor fallback can be exercised without reaching the internet.
 	donorDialer func(addr string) (net.Conn, error)
+
+	// b1Gate, when set, is the REALITY B1 gate this context uses instead of
+	// the process-wide one. Only tests set it: the process-wide gate is built
+	// once, from whichever context reaches it first.
+	b1Gate *realityB1Gate
 }
 
 // knockReplayGuard remembers the per-connection knock nonces seen inside the
@@ -566,6 +584,7 @@ func Run(cfg *Config) error {
 	if err := validateREALITYConfig(cfg); err != nil {
 		return fmt.Errorf("reality configuration: %w", err)
 	}
+	warnREALITYSecrets(cfg)
 
 	if err := InitREALITYKeys(cfg); err != nil {
 		return fmt.Errorf("reality initialization failed: %w", err)

@@ -60,11 +60,46 @@ func dialSecret(ctx context.Context, fallback []byte) []byte {
 // answers with it.
 type dialAddrKey struct{}
 
-// withDialCandidate returns ctx carrying cand's address and secret, decided
-// together for this dial.
+// The endpoint's cover-name pool ([[servers]] sni / -reality-sni) rides the
+// same way: decided with the address and the key, so a dial cannot send one
+// endpoint's ClientHello with another endpoint's names.
+type dialSNIKey struct{}
+
+// sniPool is the context value for dialSNIKey. A struct, not a bare slice, so
+// "this dial has no pool of its own" (nil list, present) is told apart from
+// "nobody decided" (absent).
+type sniPool struct{ list []string }
+
+// dialSNIs returns the cover-name pool this dial was decided with; nil means
+// the built-in one.
+func dialSNIs(ctx context.Context) []string {
+	if ctx == nil {
+		return nil
+	}
+	p, _ := ctx.Value(dialSNIKey{}).(sniPool)
+	return p.list
+}
+
+// withDialCandidate returns ctx carrying cand's address, secret and SNI pool,
+// decided together for this dial.
 func (m *Manager) withDialCandidate(ctx context.Context, cand endpoint.Candidate) context.Context {
 	ctx = withDialSecret(ctx, m.secretForCandidate(cand))
+	ctx = context.WithValue(ctx, dialSNIKey{}, sniPool{m.sniForCandidate(cand)})
 	return context.WithValue(ctx, dialAddrKey{}, cand.Addr)
+}
+
+// sniForCandidate returns the cover-name pool configured on cand's endpoint,
+// nil for the built-in pool.
+func (m *Manager) sniForCandidate(cand endpoint.Candidate) []string {
+	sel := m.selector()
+	if sel == nil {
+		return nil
+	}
+	ep, ok := sel.Endpoint(cand)
+	if !ok {
+		return nil
+	}
+	return ep.SNI
 }
 
 // dialAddr returns the server address this dial was decided for, if a caller
@@ -92,7 +127,11 @@ func (m *Manager) ensureDialSecret(ctx context.Context) context.Context {
 		hasSecret = ok && len(s) > 0
 	}
 	_, hasAddr := dialAddr(ctx)
-	if hasSecret && hasAddr {
+	hasSNI := false
+	if ctx != nil {
+		_, hasSNI = ctx.Value(dialSNIKey{}).(sniPool)
+	}
+	if hasSecret && hasAddr && hasSNI {
 		return ctx
 	}
 	sel := m.selector()
@@ -110,6 +149,9 @@ func (m *Manager) ensureDialSecret(ctx context.Context) context.Context {
 	}
 	if !hasAddr && pinned {
 		ctx = context.WithValue(ctx, dialAddrKey{}, cand.Addr)
+	}
+	if !hasSNI && pinned {
+		ctx = context.WithValue(ctx, dialSNIKey{}, sniPool{m.sniForCandidate(cand)})
 	}
 	return ctx
 }
@@ -156,4 +198,17 @@ func (m *Manager) setDefaultSecret(secret []byte) {
 	m.mu.Lock()
 	m.secret = secret
 	m.mu.Unlock()
+}
+
+// coverNameFor is the cover name a connection to the dial's endpoint carries,
+// for the strategies with a host of their own (HTTP Polling, WebSocket padded,
+// Geneva, anti-probe): a uniform draw from the endpoint's SNI pool when it has
+// one, else fallback, the strategy's own host. Without it an exit configured
+// with its cloud's names still saw a CDN's or OpenAI's name from the same
+// client on every fallback transport.
+func coverNameFor(ctx context.Context, fallback string) string {
+	if pool := dialSNIs(ctx); len(pool) > 0 {
+		return pickSNI(pool)
+	}
+	return fallback
 }

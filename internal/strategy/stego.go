@@ -154,9 +154,13 @@ func (s *HTTP2StegoStrategy) Connect(ctx context.Context, target string) (net.Co
 	// an hour-of-day index that moves every client at once) keeps the SNI a
 	// donor TSPU does not IP-range-check against us, and keeps the two views of
 	// the same name - the cleartext SNI and the encrypted :authority - agreeing.
-	// A caller that pinned a cover host in config keeps it.
+	// A caller that pinned a cover host in config keeps it - unless the endpoint
+	// has its own SNI pool ([[servers]] sni / -reality-sni), which is the more
+	// specific setting and wins.
 	coverHost := s.coverHost
-	if coverHost == "" {
+	if pool := dialSNIs(ctx); len(pool) > 0 {
+		coverHost = pickSNI(pool)
+	} else if coverHost == "" {
 		coverHost = stegoCoverRotator.Next()
 	}
 	log.Debug("HTTP/2 Stego: Using server address: %s (cover %s)", serverAddr, coverHost)
@@ -168,7 +172,7 @@ func (s *HTTP2StegoStrategy) Connect(ctx context.Context, target string) (net.Co
 		InsecureSkipVerify: true,
 		ServerName:         coverHost,
 		NextProtos:         []string{"h2", "http/1.1"},
-		ClientSessionCache: s.manager.TLSSessionCache(), // resume across reconnects
+		ClientSessionCache: s.manager.TLSSessionCache(serverAddr), // resume across reconnects
 	}
 
 	var conn *tls.Conn
@@ -189,7 +193,7 @@ func (s *HTTP2StegoStrategy) Connect(ctx context.Context, target string) (net.Co
 			return nil, dialErr
 		}
 
-		conn = tls.Client(tcpConn, tlsConfig)
+		conn = tls.Client(tcpConn, customtls.WithFallbackTag(tlsConfig, secret))
 		if err = conn.HandshakeContext(ctx); err != nil {
 			tcpConn.Close()
 			// Fallback to non-ECH on failure
@@ -198,7 +202,7 @@ func (s *HTTP2StegoStrategy) Connect(ctx context.Context, target string) (net.Co
 			if dialErr != nil {
 				return nil, dialErr
 			}
-			conn = tls.Client(tcpConn2, tlsConfig)
+			conn = tls.Client(tcpConn2, customtls.WithFallbackTag(tlsConfig, secret))
 			if err = conn.HandshakeContext(ctx); err != nil {
 				tcpConn2.Close()
 				return nil, err
@@ -209,7 +213,7 @@ func (s *HTTP2StegoStrategy) Connect(ctx context.Context, target string) (net.Co
 		if dialErr != nil {
 			return nil, dialErr
 		}
-		conn = tls.Client(tcpConn, tlsConfig)
+		conn = tls.Client(tcpConn, customtls.WithFallbackTag(tlsConfig, secret))
 		if err = conn.HandshakeContext(ctx); err != nil {
 			tcpConn.Close()
 			return nil, err

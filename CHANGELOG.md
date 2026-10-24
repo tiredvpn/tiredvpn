@@ -19,8 +19,48 @@ Versions follow [Semantic Versioning](https://semver.org/).
   Polling never noticed them. At most three such verdicts in ten minutes.
   Works on the desktop TUN client and on Android.
 
+- **Client: an SNI pool per server.** `[[servers]] sni = ["name", ...]` or
+  `-reality-sni name,name` gives an endpoint its own cover names; REALITY,
+  Seqovl, HTTP/2 Stego, QUIC, HTTP Polling, WebSocket, Geneva, anti-probe,
+  Traffic Morph and State Exhaustion draw from it, one uniformly chosen name
+  per connection. Names must be DNS
+  host names. Set the same names on the exit with its own `-reality-sni`, so
+  that a probe replaying one is mirrored to that site.
+  **Clients 1.11.8 and older do not start with a config that has
+  `sni = [...]`** ("cannot decode TOML array into ... SNI of type string").
+  Hand such configs out only after the clients are updated.
+- **Server: `-reality-sni`** adds operator-chosen donor names to the built-in
+  list, on the B1 and the legacy unauthenticated paths.
+- **Server: `reality_fallback_tag_total`** counts the TLS fallback connections
+  the B1 gate let through on a fallback-transport tag.
+
 ### Fixed
 
+- **TLS fallback transports can reach their handlers on a `-reality-b1`
+  server, with the new `-reality-fallback-tag` (off by default).** HTTP
+  Polling, WebSocket padded, Geneva, anti-probe, HTTP/2 Stego, Traffic Morph,
+  State Exhaustion and a relay's upstream leg put a tag derived from their
+  secret in the ClientHello `session_id`. With the flag on, the B1 gate hands
+  a fresh tag to the ordinary TLS path instead of proxying it to the donor
+  its SNI names, or to `-reality-cover-domain`; replayed, stale and foreign
+  tags still go to the donor. With the flag off, tagged hellos are mirrored
+  as in 1.11.8. The flag is off by default because the tag binds neither the
+  hello nor the exit: a copied tag opens every exit that shares the secret
+  once. Turn it on only with per-client registry secrets. Binding the tag to
+  the hello is planned for 1.11.10.
+  **Update `-reality-b1` exits and turn the flag on before handing out SNI
+  pools** of donor names: otherwise every TLS fallback of those clients is
+  proxied to the donor there. Exits without `-reality-b1` are not affected.
+  With the flag on, the tag carries the client's clock, as B1 does: a client
+  more than `-reality-max-time-diff` off has its fallbacks sent to the donor.
+- **Server and client: a weak secret is warned about** (under 16 bytes,
+  fewer than 8 distinct characters, a repeating string, a common word, or
+  under about 90 bits): the client's own at startup, the server's global
+  `-secret` at startup, and with `-reality-fallback-tag` each weak registry
+  secret once. One captured fallback-transport tag lets anyone test guesses
+  at the secret offline; a secret that passes is not therefore safe.
+- **Client: TLS session tickets are kept per server**, so a ticket from one
+  exit is never offered to another that shares a cover name.
 - **Client: failover to another server in the pool works when a server goes
   silent, swallows handshakes, or kills every session young.** Dead sessions
   and storms park the server with a growing cooldown; a server that accepts
@@ -102,6 +142,9 @@ Versions follow [Semantic Versioning](https://semver.org/).
   desktop client does the same for its own uplink, on top of its keepalive
   when the server is silent, except on HTTP Polling, whose polls already
   reach the exit. No change to the protocol.
+- On the wire: the TLS fallback transports' `session_id` is a keyed tag
+  instead of random bytes. Same 32 bytes, different on every connection; the
+  rest of the ClientHello is unchanged.
 - On the wire: a relay sends its exit a small frame when nothing else has
   gone up for a period drawn anew each time between 20 and 45 s, while its
   client is alive. No change to the protocol.

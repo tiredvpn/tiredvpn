@@ -529,7 +529,7 @@ func TestDonorDestinationPolicy(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := donorDestination(tt.hello, tt.cover); got != tt.want {
+			if got := donorDestination(tt.hello, &Config{REALITYCoverDomain: tt.cover}); got != tt.want {
 				t.Fatalf("destination = %q, want %q", got, tt.want)
 			}
 		})
@@ -871,3 +871,19 @@ type spyConn struct {
 
 func (c *spyConn) Write(p []byte) (int, error) { c.written += len(p); return len(p), nil }
 func (c *spyConn) Close() error                { c.closed = true; return nil }
+
+// TestOperatorDonorsAreMirrored: an exit whose clients are configured with
+// their own cover names (-reality-sni on the client, e.g. Google names on a
+// GCP address) must mirror a probe that replays one of them to that site, like
+// a built-in donor - not to the cover domain, which would answer a ClientHello
+// for www.gstatic.com with another site's certificate. Names the operator did
+// not list still go to the cover domain: the SNI is unauthenticated input.
+func TestOperatorDonorsAreMirrored(t *testing.T) {
+	cfg := &Config{REALITYCoverDomain: "www.microsoft.com", REALITYSNIs: []string{"www.gstatic.com"}}
+	if got := donorDestination(buildRecordWithSNI(t, "www.gstatic.com"), cfg); got != "www.gstatic.com" {
+		t.Fatalf("operator donor went to %q, want it mirrored to itself", got)
+	}
+	if got := donorDestination(buildRecordWithSNI(t, "attacker-controlled.example"), cfg); got != "www.microsoft.com" {
+		t.Fatalf("an unlisted name went to %q, want the cover domain", got)
+	}
+}

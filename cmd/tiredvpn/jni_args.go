@@ -5,6 +5,7 @@ import (
 	"strconv"
 
 	"github.com/tiredvpn/tiredvpn/internal/client"
+	"github.com/tiredvpn/tiredvpn/internal/evasion"
 	"github.com/tiredvpn/tiredvpn/internal/log"
 )
 
@@ -152,6 +153,29 @@ func parseClientArgs(args []string) (_ *client.Config, err error) {
 				cfg.CoverHost = args[i+1]
 				i++
 			}
+		// The endpoint SNI pool, same as the CLI flag. -cover above stays
+		// HTTP/2 Stego's own host and yields to a pool when there is one.
+		//
+		// A bad list fails the connect, as it fails the CLI at startup. It
+		// is not dropped with a warning like other bad values: falling back
+		// to the built-in pool would put names in the ClientHello that the
+		// operator chose this list to avoid, on an exit whose own cloud they
+		// do not belong to.
+		case "-reality-sni":
+			if i+1 >= len(args) {
+				// A bare trailing flag is a malformed list too: the CLI
+				// refuses it, and taking the built-in pool here would put
+				// the names it avoids in the ClientHello.
+				return nil, fmt.Errorf("-reality-sni needs a value")
+			}
+			v, perr := evasion.ParseSNIList(args[i+1])
+			if perr != nil {
+				// The parse error quotes the bad name, which is raw argv;
+				// the redacted value says the same.
+				return nil, fmt.Errorf("invalid -reality-sni value %q", logArgs[i+1])
+			}
+			cfg.REALITYSNIs = v
+			i++
 		case "-debug":
 			cfg.Debug = true
 		case "-tun":

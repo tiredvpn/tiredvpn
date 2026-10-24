@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/tiredvpn/tiredvpn/internal/log"
 	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 )
 
@@ -15,6 +17,11 @@ import (
 type shortIDEntry struct {
 	clientID clientIdentity
 	secret   []byte
+
+	// tag checks the fallback-transport tag a client's TLS fallbacks put in
+	// their session_id (customtls.FallbackTag). Derived and keyed here, once
+	// per rebuild, so the connection path pays one cloned HMAC and no HKDF.
+	tag *customtls.FallbackTagOpener
 }
 
 // shortIDIndex maps the 8-byte identifier carried in session_id to a client.
@@ -32,6 +39,16 @@ type shortIDIndex struct {
 	mu      sync.RWMutex
 	entries map[[customtls.AuthShortIDLen]byte]shortIDEntry
 	built   time.Time
+	// gen is the registry generation the entries were built from.
+	gen uint64
+
+	// tagLookups counts MatchFallbackTag calls: the HMAC loop a tag check
+	// costs, for /metrics-free tests of when it runs.
+	tagLookups atomic.Uint64
+
+	// weakWarned holds the registry clients already warned about for a weak
+	// secret, so a rebuild every 30 s does not repeat it. Guarded by mu.
+	weakWarned map[string]bool
 
 	// refreshing serialises rebuilds and, with lastRefresh, rate-limits the
 	// ones triggered by a lookup miss. Without that limit an attacker who
@@ -68,7 +85,11 @@ func (i *shortIDIndex) Rebuild(clients []*ClientConfig, globalSecret []byte) {
 			continue
 		}
 		secret := []byte(c.Secret)
-		next[customtls.ShortIDFor(secret)] = shortIDEntry{clientID: registryIdentity(c.ID), secret: secret}
+		next[customtls.ShortIDFor(secret)] = shortIDEntry{
+			clientID: registryIdentity(c.ID),
+			secret:   secret,
+			tag:      customtls.NewFallbackTagOpener(customtls.DeriveFallbackTagKey(secret)),
+		}
 	}
 
 	if len(globalSecret) > 0 {
@@ -77,7 +98,11 @@ func (i *shortIDIndex) Rebuild(clients []*ClientConfig, globalSecret []byte) {
 		// being silently merged into "global".
 		id := customtls.ShortIDFor(globalSecret)
 		if _, taken := next[id]; !taken {
-			next[id] = shortIDEntry{clientID: sharedIdentity(globalClientID), secret: globalSecret}
+			next[id] = shortIDEntry{
+				clientID: sharedIdentity(globalClientID),
+				secret:   globalSecret,
+				tag:      customtls.NewFallbackTagOpener(customtls.DeriveFallbackTagKey(globalSecret)),
+			}
 		}
 	}
 
@@ -93,6 +118,29 @@ func (i *shortIDIndex) Lookup(id [customtls.AuthShortIDLen]byte) (shortIDEntry, 
 	defer i.mu.RUnlock()
 	e, ok := i.entries[id]
 	return e, ok
+}
+
+// MatchFallbackTag returns the client whose key opens sid as a fallback tag,
+// with the time the tag was made at.
+//
+// One HMAC per client: unlike a short ID, the tag carries nothing that can be
+// looked up without the key - anything that could would be a static field an
+// observer links connections by. It runs only for a ClientHello B1 already
+// turned down, which costs a donor dial or a TLS handshake, both dearer than a
+// few hundred HMACs.
+func (i *shortIDIndex) MatchFallbackTag(sid [customtls.AuthSessionIDLen]byte) (shortIDEntry, uint32, bool) {
+	i.tagLookups.Add(1)
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	for _, e := range i.entries {
+		if e.tag == nil {
+			continue // an entry built without a key
+		}
+		if at, ok := e.tag.Open(sid); ok {
+			return e, at, true
+		}
+	}
+	return shortIDEntry{}, 0, false
 }
 
 // stale reports whether the index is old enough to want a refresh.
@@ -125,12 +173,56 @@ func (i *shortIDIndex) refreshAsync(srvCtx *serverContext, minInterval time.Dura
 
 	go func() {
 		defer i.refreshing.Unlock()
-		var clients []*ClientConfig
-		if srvCtx.registry != nil {
-			clients = srvCtx.registry.ListClients()
-		}
-		i.Rebuild(clients, srvCtx.cfg.Secret)
+		i.rebuildFrom(srvCtx)
 	}()
+}
+
+// rebuildFrom rebuilds the index from srvCtx's registry and global secret,
+// and notes the registry generation it was built from.
+func (i *shortIDIndex) rebuildFrom(srvCtx *serverContext) {
+	var clients []*ClientConfig
+	var gen uint64
+	if srvCtx.registry != nil {
+		gen = srvCtx.registry.Generation()
+		clients = srvCtx.registry.ListClients()
+	}
+	i.Rebuild(clients, srvCtx.cfg.Secret)
+	i.mu.Lock()
+	i.gen = gen
+	if srvCtx.cfg.REALITYFallbackTag && srvCtx.cfg.REALITYB1Enabled {
+		i.warnWeakLocked(clients)
+	}
+	i.mu.Unlock()
+}
+
+// warnWeakLocked warns, once per client, about registry clients whose secret
+// is weak while the fallback tag is admitted: each of their tags lets anyone
+// test guesses at it offline (P3-9 of the round-6 review - only the global
+// -secret was checked). i.mu held.
+func (i *shortIDIndex) warnWeakLocked(clients []*ClientConfig) {
+	if i.weakWarned == nil {
+		i.weakWarned = make(map[string]bool)
+	}
+	for _, c := range clients {
+		if c == nil || c.Secret == "" || i.weakWarned[c.ID] {
+			continue
+		}
+		if why, weak := customtls.WeakSecret([]byte(c.Secret)); weak {
+			i.weakWarned[c.ID] = true
+			log.Warn("Registry client %s has a weak secret (%s): with -reality-fallback-tag, one captured tag "+
+				"lets anyone check guesses against it offline", c.ID, why)
+		}
+	}
+}
+
+// behind reports whether the registry has changed since the index was built.
+func (i *shortIDIndex) behind(srvCtx *serverContext) bool {
+	if srvCtx.registry == nil {
+		return false
+	}
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.gen != srvCtx.registry.Generation()
 }
 
 // replayCache remembers the session_id values already accepted, so the same

@@ -20,6 +20,7 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/padding"
 	"github.com/tiredvpn/tiredvpn/internal/protocol"
+	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 )
 
 // browserUserAgent is a plausible desktop-browser User-Agent for the WebSocket
@@ -112,12 +113,14 @@ func (s *WebSocketPaddedStrategy) Connect(ctx context.Context, target string) (n
 		KeepAlive: 30 * time.Second,
 	}
 
+	// SNI and Host agree: the endpoint's own name when it has a pool.
+	host := coverNameFor(ctx, s.wsHost)
 	tlsConfig := &tls.Config{
-		ServerName:         s.wsHost,
+		ServerName:         host,
 		InsecureSkipVerify: true,
 		MinVersion:         tls.VersionTLS12,
 		NextProtos:         []string{"h2", "http/1.1"},
-		ClientSessionCache: s.manager.TLSSessionCache(), // resume across reconnects
+		ClientSessionCache: s.manager.TLSSessionCache(serverAddr), // resume across reconnects
 	}
 
 	tcpConn, err := dialer.DialContext(ctx, "tcp", serverAddr)
@@ -125,7 +128,7 @@ func (s *WebSocketPaddedStrategy) Connect(ctx context.Context, target string) (n
 		return nil, fmt.Errorf("websocket_padded: tcp dial failed: %w", err)
 	}
 
-	tlsConn := tls.Client(tcpConn, tlsConfig)
+	tlsConn := tls.Client(tcpConn, customtls.WithFallbackTag(tlsConfig, secret))
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		tcpConn.Close()
 		return nil, fmt.Errorf("websocket_padded: tls handshake failed: %w", err)
@@ -164,7 +167,7 @@ func (s *WebSocketPaddedStrategy) Connect(ctx context.Context, target string) (n
 			"X-Auth-Token: %s\r\n"+
 			"User-Agent: "+browserUserAgent+"\r\n"+
 			"\r\n",
-		s.wsPath, s.wsHost, wsKey, hex.EncodeToString(authToken))
+		s.wsPath, host, wsKey, hex.EncodeToString(authToken))
 
 	if _, err := tlsConn.Write([]byte(upgradeReq)); err != nil {
 		tlsConn.Close()

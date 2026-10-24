@@ -3274,7 +3274,7 @@ type DefaultManagerConfig struct {
 	ServerAddr string       // Server address for server-based strategies
 	Secret     []byte       // Shared secret for authentication
 	RelayNodes []*RelayNode // Mesh relay nodes (optional)
-	CoverHost  string       // Host to impersonate for HTTP/2 stego
+	CoverHost  string       // HTTP/2 stego cover host; an endpoint SNI pool wins over it
 
 	// IPv6 Transport Layer
 	ServerAddrV6 string // IPv6 server address (e.g., "[2001:db8::100]:995")
@@ -5440,11 +5440,33 @@ func (m *Manager) IsPortHoppingEnabled() bool {
 	return m.portHopper != nil
 }
 
-// TLSSessionCache returns the shared client session cache used by stdlib-TLS
-// strategies for resumption across reconnects. Safe for concurrent use; the
-// returned value is fixed at construction and never replaced.
-func (m *Manager) TLSSessionCache() tls.ClientSessionCache {
-	return m.tlsSessionCache
+// TLSSessionCache returns the client session cache stdlib-TLS strategies use
+// for resumption across reconnects, scoped to serverAddr, the server the
+// connection dials. Safe for concurrent use.
+//
+// crypto/tls keys a session by ServerName, and the cover names are shared:
+// two exits in one SNI pool, or the fixed hosts of WS, Geneva and anti-probe,
+// put the same name on connections to different servers. A ticket server A
+// issued was then offered to server B in the ClientHello - the same opaque
+// ticket bytes sent to two addresses, which links them on the wire for anyone
+// who sees both.
+func (m *Manager) TLSSessionCache(serverAddr string) tls.ClientSessionCache {
+	return scopedSessionCache{inner: m.tlsSessionCache, scope: serverAddr}
+}
+
+// scopedSessionCache keeps one server's tickets apart from every other's in a
+// shared cache.
+type scopedSessionCache struct {
+	inner tls.ClientSessionCache
+	scope string
+}
+
+func (c scopedSessionCache) Get(key string) (*tls.ClientSessionState, bool) {
+	return c.inner.Get(c.scope + "\x00" + key)
+}
+
+func (c scopedSessionCache) Put(key string, cs *tls.ClientSessionState) {
+	c.inner.Put(c.scope+"\x00"+key, cs)
 }
 
 // GetServerAddr returns the address of the currently pinned endpoint candidate.

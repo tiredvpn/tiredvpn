@@ -59,7 +59,7 @@ Since 1.5.0 TUN mode also takes IPv6 out of the host's hands by default - see
 | `-config` | | Path to a TOML config file (see [Configuration via TOML](#configuration-via-toml)) |
 | `-listen` | `127.0.0.1:1080` | Local proxy address (SOCKS5/HTTP auto-detect) |
 | `-http-listen` | | Separate HTTP proxy address (optional) |
-| `-cover` | `api.googleapis.com` | Cover host for traffic mimicry (SNI / Host header). Process-wide |
+| `-cover` | `api.googleapis.com` | HTTP/2 Stego cover host (SNI and `:authority`). An endpoint SNI pool (`-reality-sni`, `[[servers]] sni`) wins over it for that endpoint |
 | `-strategy` | | Force a specific strategy; skips auto-selection |
 | `-list` | `false` | Print available strategies and exit |
 | `-debug` | `false` | Enable verbose debug logging |
@@ -332,6 +332,7 @@ tiredvpn client \
 | `-rtt-masking` | `false` | Enable RTT masking (hides proxy timing signature) |
 | `-rtt-profile` | `moscow-yandex` | RTT profile to emulate (see table below) |
 | `-reality-server-pubkey` | | Server's static REALITY public key, base64. Non-empty selects the B1 transport |
+| `-reality-sni` | | Comma-separated cover names (SNI) for every endpoint without its own `sni`: REALITY, Seqovl, HTTP/2 Stego and QUIC draw from it, uniformly per connection, instead of the built-in donor pool. Host names only (no IPs, wildcards or trailing dots); a bad list is a startup error |
 | `-reality-require-data-v2` | `false` | Refuse REALITY servers still on the v1 data layer instead of falling back |
 | `-burst-reshape` | `off` | Split the inner TLS handshake with a nudge/ack exchange: `off`, `on`. Must match the server |
 | `-burst-reshape-pad-flight` | `0` | Extra bytes the server adds to its flight (0 = off). Must match the server |
@@ -605,8 +606,29 @@ Notes worth reading once:
   is a missed line. If every entry agrees on one `secret` and nothing else
   named a default, that value becomes the client's, which is what lets the
   config file be the only place a secret appears.
-- **`sni` is recorded but not applied yet**: the cover host is still
-  process-wide (`-cover`). The client says so in the log rather than pretending.
+- **`sni` is the endpoint's own cover-name pool**: `sni = ["www.google.com",
+  "www.gstatic.com"]`, or a single string. REALITY, Seqovl, HTTP/2 Stego and
+  QUIC take their SNI from it for that endpoint, each connection drawing a name
+  uniformly; it wins over `-reality-sni` and `-cover`. HTTP Polling,
+  WebSocket padded, Geneva and anti-probe take their SNI and Host header from
+  it too, and Traffic Morph and State Exhaustion their SNI (without a pool,
+  Morph sends none and State Exhaustion the server's host name, if it has
+  one). Those TLS fallbacks (and HTTP/2 Stego, Traffic Morph, State
+  Exhaustion) put a tag derived from the endpoint's secret in the ClientHello
+  `session_id`. An exit running `-reality-b1` with `-reality-fallback-tag`
+  hands them to their handlers rather than to the donor the name belongs to;
+  any other exit ignores the tag, and on a B1 exit without the flag those
+  transports reach the donor. The tag lets anyone who captures one test
+  guesses at the secret offline: use a random secret of 32 bytes or more
+  (the client warns at startup about a weak one; a secret it lets pass is
+  not therefore safe - any secret a person chose can be guessed).
+
+  IMAP keeps doing what a mail client does: the dialled hostname, or no SNI
+  for an IP. `sni = ""` means no pool.
+
+  Give the exit the same names with its `-reality-sni`: an exit without them
+  answers a probe that replays one of these names with its cover domain's
+  certificate instead of the named site's.
 - **`policy` other than `priority`, and `health_check = "active"`, are not
   applied yet.** The value is validated (a misspelling is a startup error) and
   then warned about on startup; candidates stay in configuration order, and the

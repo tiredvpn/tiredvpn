@@ -28,10 +28,10 @@ func TestConnectionStringQUICPort(t *testing.T) {
 		return v
 	}
 
-	if q := query(buildConnectionString("vpn.example.com:995", "s", true, 0, "auto", "c")); q.Has("quicPort") {
+	if q := query(buildConnectionString("vpn.example.com:995", "s", true, 0, "auto", "c", nil)); q.Has("quicPort") {
 		t.Errorf("unset -quic-port wrote quicPort=%s", q.Get("quicPort"))
 	}
-	if got := query(buildConnectionString("vpn.example.com:995", "s", true, 995, "auto", "c")).Get("quicPort"); got != "995" {
+	if got := query(buildConnectionString("vpn.example.com:995", "s", true, 995, "auto", "c", nil)).Get("quicPort"); got != "995" {
 		t.Errorf("explicit -quic-port 995 wrote quicPort=%q", got)
 	}
 }
