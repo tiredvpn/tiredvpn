@@ -25,6 +25,9 @@ func (c *recordingConn) Write(p []byte) (int, error) {
 
 func (c *recordingConn) Close() error { return nil }
 
+// SetWriteDeadline is a no-op: the recording never blocks.
+func (c *recordingConn) SetWriteDeadline(time.Time) error { return nil }
+
 func (c *recordingConn) snapshot() [][]byte {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -122,8 +125,9 @@ func TestWriteWithBurst_FlushesPartialBurst(t *testing.T) {
 // failingConn refuses every Write, like a socket the peer has reset.
 type failingConn struct{ net.Conn }
 
-func (failingConn) Write([]byte) (int, error) { return 0, errFakeWrite }
-func (failingConn) Close() error              { return nil }
+func (failingConn) Write([]byte) (int, error)        { return 0, errFakeWrite }
+func (failingConn) Close() error                     { return nil }
+func (failingConn) SetWriteDeadline(time.Time) error { return nil }
 
 // TestRTTMaskingCloseReportsUnsentBurst: a packet held for the next burst
 // was accepted by Write, so a Close whose final flush cannot send it must

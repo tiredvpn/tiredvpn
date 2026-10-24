@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"errors"
+	"fmt"
 	"math"
 	mrand "math/rand"
 	"net"
@@ -196,7 +197,19 @@ type RTTMaskingConn struct {
 	mu            sync.Mutex
 	burstBuffer   [][]byte
 	lastBurstTime time.Time
-	done          chan struct{}
+	// flushErr is the first failed burst write, guarded by mu. Write
+	// refuses to buffer after it and Close reports it: the packets it lost
+	// had already been reported written.
+	flushErr error
+
+	// done is closed by Close; a burst-mode Write after it fails instead of
+	// buffering a packet nothing would flush.
+	done      chan struct{}
+	closeOnce sync.Once
+
+	// wdl keeps the caller's write deadline, so that Close bounds its
+	// final flush by it instead of replacing it.
+	wdl closeDeadline
 
 	// writeMu serialises every write to c.Conn - the burst flush from Write, the
 	// ticker Flush, and the simple-delay path. Both the burst flush and the simple
@@ -219,22 +232,31 @@ func NewRTTMaskingConn(conn net.Conn, config RTTMaskingConfig) *RTTMaskingConn {
 		burstBuffer:   make([][]byte, 0, config.BurstSize),
 		lastBurstTime: time.Now(),
 		observedRTTs:  make([]time.Duration, 0, 100),
+		done:          make(chan struct{}),
 	}
 	if config.BurstMode && config.BurstInterval > 0 {
-		c.done = make(chan struct{})
 		go c.flushLoop()
 	}
 	return c
 }
 
+// rttCloseTimeout bounds how long Close spends flushing the pending burst:
+// Close puts it on the connection as the write deadline, unless the
+// caller's own is earlier. A var so tests can shorten it.
+var rttCloseTimeout = 5 * time.Second
+
 // flushLoop fires Flush every BurstInterval so buffered packets don't stall.
+// It stops at the first failed flush; Flush has recorded the error for
+// Write and Close to report.
 func (c *RTTMaskingConn) flushLoop() {
 	ticker := time.NewTicker(c.config.BurstInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			c.Flush()
+			if c.Flush() != nil {
+				return
+			}
 		case <-c.done:
 			return
 		}
@@ -274,7 +296,18 @@ func (c *RTTMaskingConn) writeWithBurst(p []byte, delay time.Duration) (int, err
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 
+	// Checked under writeMu: Close closes done before its final Flush takes
+	// writeMu, so a packet buffered past this check is still flushed.
+	select {
+	case <-c.done:
+		return 0, net.ErrClosed
+	default:
+	}
 	c.mu.Lock()
+	if err := c.flushErr; err != nil {
+		c.mu.Unlock()
+		return 0, err
+	}
 	shouldFlush := len(c.burstBuffer)+1 >= c.config.BurstSize ||
 		time.Since(c.lastBurstTime) >= c.config.BurstInterval
 
@@ -307,20 +340,44 @@ func (c *RTTMaskingConn) writeWithBurst(p []byte, delay time.Duration) (int, err
 	// itself, return only its partial count. Either way n <= len(p), so the
 	// io.Writer contract holds (the old code summed the whole burst and could
 	// return more than len(p)).
-	for i, data := range buffer {
-		n, err := c.Conn.Write(data)
-		if err != nil {
-			if i == len(buffer)-1 {
-				return n, err
-			}
-			return 0, err
+	if i, n, err := c.sendBurst(buffer, true); err != nil {
+		if i == len(buffer)-1 {
+			return n, err
 		}
-		// Tiny delay between packets in burst (0.5-2ms)
-		inBurstDelay := c.randomDuration(500*time.Microsecond, 2*time.Millisecond)
-		time.Sleep(inBurstDelay)
+		return 0, err
 	}
 
 	return len(p), nil
+}
+
+// sendBurst writes buffer to c.Conn in order, with a 0.5-2 ms pause after
+// each packet when pace is set. On a failed write it returns the index of
+// the packet that failed and how much of it went out, and an error that
+// counts what did not: every packet before the last one was reported
+// written by an earlier Write. The error is also kept in flushErr. The
+// caller holds writeMu.
+func (c *RTTMaskingConn) sendBurst(buffer [][]byte, pace bool) (int, int, error) {
+	for i, data := range buffer {
+		n, err := c.Conn.Write(data)
+		if err != nil {
+			left := -n
+			for _, d := range buffer[i:] {
+				left += len(d)
+			}
+			err = fmt.Errorf("rtt burst: %d of %d packets (%d bytes) not written: %w", len(buffer)-i, len(buffer), left, err)
+			c.mu.Lock()
+			if c.flushErr == nil {
+				c.flushErr = err
+			}
+			c.mu.Unlock()
+			return i, n, err
+		}
+		if pace {
+			// Tiny delay between packets in burst (0.5-2ms)
+			time.Sleep(c.randomDuration(500*time.Microsecond, 2*time.Millisecond))
+		}
+	}
+	return len(buffer), 0, nil
 }
 
 // calculateDelay computes the delay based on config and profile
@@ -381,7 +438,8 @@ func (c *RTTMaskingConn) Read(p []byte) (int, error) {
 	return c.Conn.Read(p)
 }
 
-// Flush sends any buffered data immediately without waiting for burst
+// Flush sends any buffered data immediately without waiting for burst. A
+// failed write loses the rest of the buffer; the error says how much.
 func (c *RTTMaskingConn) Flush() error {
 	// Same lock order as writeWithBurst (writeMu before mu): serialise the writes
 	// to c.Conn against a concurrent burst flush so records are not interleaved.
@@ -394,27 +452,41 @@ func (c *RTTMaskingConn) Flush() error {
 	c.lastBurstTime = time.Now()
 	c.mu.Unlock()
 
-	for _, data := range buffer {
-		if _, err := c.Conn.Write(data); err != nil {
-			return err
-		}
-	}
-	return nil
+	_, _, err := c.sendBurst(buffer, false)
+	return err
+}
+
+// SetDeadline sets the read and write deadlines. Once Close has started,
+// the write deadline can only move closer.
+func (c *RTTMaskingConn) SetDeadline(t time.Time) error {
+	return c.wdl.setDeadline(c.Conn, t)
+}
+
+// SetWriteDeadline sets the write deadline. Once Close has started, it can
+// only move closer.
+func (c *RTTMaskingConn) SetWriteDeadline(t time.Time) error {
+	return c.wdl.setWriteDeadline(c.Conn, t)
 }
 
 // Close stops the flush goroutine, flushes any pending burst, and closes
-// connection. A burst that fails to go out is reported, joined with the
+// connection. The flush runs under the earlier of the caller's write
+// deadline and rttCloseTimeout; the deadline goes down to the wrapped conn,
+// so a MorphedConn under this one drains within the same bound. If the
+// flush is still blocked closeAbortGrace past it, as on a conn that ignores
+// write deadlines, the conn is closed to break it loose. A burst that did
+// not go out, now or in an earlier flush, is reported, joined with the
 // socket's own Close error: Write already returned success for it.
 func (c *RTTMaskingConn) Close() error {
-	if c.done != nil {
-		select {
-		case <-c.done:
-		default:
-			close(c.done)
-		}
-	}
-	flushErr := c.Flush()
-	return errors.Join(flushErr, c.Conn.Close())
+	c.closeOnce.Do(func() { close(c.done) })
+	closeBy := c.wdl.begin(c.Conn, rttCloseTimeout)
+	closeConn := sync.OnceValue(c.Conn.Close)
+	abort := time.AfterFunc(time.Until(closeBy)+closeAbortGrace, func() { _ = closeConn() })
+	_ = c.Flush()
+	abort.Stop()
+	c.mu.Lock()
+	flushErr := c.flushErr
+	c.mu.Unlock()
+	return errors.Join(flushErr, closeConn())
 }
 
 // UpdateConfig allows runtime config updates
