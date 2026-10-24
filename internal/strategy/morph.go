@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	mathrand "math/rand/v2"
@@ -775,13 +776,17 @@ func (mc *MorphedConn) Read(p []byte) (int, error) {
 }
 
 // Close closes the underlying connection. If the async shaped-write pacer
-// has been started, it is stopped first so its drain timeout has a chance
-// to flush queued frames before the socket goes away.
+// has been started, it is stopped first and writes out every frame Write
+// already accepted before the socket goes away. A peer that does not take
+// them within pacerCloseTimeout makes Close return ErrShaperCloseIncomplete
+// (joined with the socket's own Close error, if any) instead of losing the
+// tail silently.
 func (mc *MorphedConn) Close() error {
+	var drainErr error
 	if mc.pacer != nil {
-		mc.pacer.close()
+		drainErr = mc.pacer.close()
 	}
-	return mc.Conn.Close()
+	return errors.Join(drainErr, mc.Conn.Close())
 }
 
 // Stats returns traffic statistics

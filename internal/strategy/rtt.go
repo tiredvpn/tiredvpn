@@ -1,6 +1,7 @@
 package strategy
 
 import (
+	"errors"
 	"math"
 	mrand "math/rand"
 	"net"
@@ -401,7 +402,9 @@ func (c *RTTMaskingConn) Flush() error {
 	return nil
 }
 
-// Close stops the flush goroutine, flushes any pending burst, and closes connection
+// Close stops the flush goroutine, flushes any pending burst, and closes
+// connection. A burst that fails to go out is reported, joined with the
+// socket's own Close error: Write already returned success for it.
 func (c *RTTMaskingConn) Close() error {
 	if c.done != nil {
 		select {
@@ -410,8 +413,8 @@ func (c *RTTMaskingConn) Close() error {
 			close(c.done)
 		}
 	}
-	c.Flush()
-	return c.Conn.Close()
+	flushErr := c.Flush()
+	return errors.Join(flushErr, c.Conn.Close())
 }
 
 // UpdateConfig allows runtime config updates
