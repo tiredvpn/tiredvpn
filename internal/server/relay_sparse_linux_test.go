@@ -2,7 +2,10 @@ package server
 
 import (
 	"encoding/binary"
+	"io"
 	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -48,6 +51,21 @@ func sparseDownload(t *testing.T, exit *legExit, clientIP net.IP) int64 {
 	return sent
 }
 
+// TestAnOldClientOnASparseDownloadKeepsItsBridgeLeg is the stand run
+// itself, on its own path: a 1.11.8-like client over anti-probe, which the
+// relay terminates in handleRawTunnel and bridges (relayTUNToUpstream).
+func TestAnOldClientOnASparseDownloadKeepsItsBridgeLeg(t *testing.T) {
+	scaleLegClocks(t)
+	secret := []byte("relay-leg-secret-0123456789abcdef")
+	exit := newLegExit(t, secret)
+	relay := legRelay(t, secret, exit)
+	client := clientVia(t, relay, false, func(m *strategy.Manager) strategy.Strategy {
+		return strategy.NewAntiProbeStrategy(m, secret)
+	})
+	sent := sparseDownload(t, exit, client.LocalIP())
+	waitDown(t, client, sent)
+}
+
 // TestAnOldClientOnASparseDownloadKeepsItsSinkLeg: the same client over
 // Traffic Morph, which the relay terminates itself and forwards through a
 // relayTUNSink. Its keepalive was there, but stopped once the client had
@@ -81,5 +99,99 @@ func waitDown(t *testing.T, client *tun.VPNClient, sent int64) {
 			t.Fatalf("%d of %d datagrams came down", down, sent)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestASparseDownloadThroughAProxyRelayKeepsItsLeg: a proxy relay -
+// handleRawTunnel over UpstreamDialer.Dial, copying with optimizedRelay -
+// with the target sending 28 B every 5 s and the client nothing, scaled.
+// The client's TCP acknowledges what comes down; at the end "hello" up has
+// to reach the target, which must have got nothing else.
+func TestASparseDownloadThroughAProxyRelayKeepsItsLeg(t *testing.T) {
+	scaleLegClocks(t)
+	secret := []byte("relay-leg-secret-0123456789abcdef")
+	exit := newLegExit(t, secret)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	stop := make(chan struct{})
+	stopTarget := sync.OnceFunc(func() { close(stop) })
+	t.Cleanup(stopTarget)
+	got := make(chan []byte, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		go func() {
+			b, _ := io.ReadAll(c)
+			got <- b
+		}()
+		tick := time.NewTicker(sparseEvery)
+		defer tick.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-tick.C:
+				if _, err := c.Write(make([]byte, 28)); err != nil {
+					return
+				}
+			}
+		}
+	}()
+
+	relayCtx := &serverContext{cfg: &Config{}, upstreamDialer: NewUpstreamDialer(exit.addr, secret)}
+	client, relaySide := tcpPair(t)
+	t.Cleanup(func() { client.Close() })
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handleRawTunnel(relaySide, relayCtx, testLogger(t), clientIdentity{})
+	}()
+	addr := []byte(ln.Addr().String())
+	if _, err := client.Write(append([]byte{byte(len(addr) >> 8), byte(len(addr))}, addr...)); err != nil {
+		t.Fatal(err)
+	}
+	ack := make([]byte, 1)
+	_ = client.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if _, err := io.ReadFull(client, ack); err != nil || ack[0] != 0 {
+		t.Fatalf("relay ack %x: %v", ack, err)
+	}
+	_ = client.SetReadDeadline(time.Time{})
+	var down atomic.Int64
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := client.Read(buf)
+			down.Add(int64(n))
+			if err != nil {
+				return
+			}
+		}
+	}()
+	for end := time.Now().Add(legDeadlines * h2FrameReadTimeout()); time.Now().Before(end); time.Sleep(50 * time.Millisecond) {
+		select {
+		case <-done:
+			t.Fatalf("the relay closed the tunnel after %d bytes down", down.Load())
+		default:
+		}
+	}
+	if _, err := client.Write([]byte("hello")); err != nil {
+		t.Fatalf("client write: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	client.Close()
+	stopTarget()
+	select {
+	case b := <-got:
+		if string(b) != "hello" {
+			t.Fatalf("the target got %q, want the client's hello and nothing else", b)
+		}
+	case <-time.After(3 * h2FrameReadTimeout()):
+		t.Fatal("the target never saw the end of the client's stream")
 	}
 }

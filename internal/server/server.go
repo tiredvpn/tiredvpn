@@ -1118,7 +1118,7 @@ func handleQUICConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 	var err error
 	if srvCtx.upstreamDialer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr)
+		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr, conn)
 		cancel()
 	} else {
 		targetConn, err = optimizedDial("tcp", targetAddr, 10*time.Second)
@@ -2376,7 +2376,7 @@ func handleMorphConnection(conn net.Conn, srvCtx *serverContext, logger *log.Log
 	var err error
 	if srvCtx.upstreamDialer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr)
+		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr, conn)
 		cancel()
 	} else {
 		targetConn, err = optimizedDial("tcp", targetAddr, 10*time.Second)
@@ -3030,7 +3030,7 @@ func handleProtocolConfusion(sess *confusionSession, srvCtx *serverContext, logg
 	var targetConn net.Conn
 	if srvCtx.upstreamDialer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr)
+		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr, sess.raw)
 		cancel()
 	} else {
 		targetConn, err = optimizedDial("tcp", targetAddr, 10*time.Second)
@@ -3392,7 +3392,7 @@ func handleRawTunnel(conn net.Conn, srvCtx *serverContext, logger *log.Logger, c
 	var err error
 	if srvCtx.upstreamDialer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr)
+		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr, conn)
 		cancel()
 	} else {
 		targetConn, err = optimizedDial("tcp", targetAddr, 10*time.Second)
@@ -3744,7 +3744,7 @@ func relayTUNToUpstream(conn net.Conn, srvCtx *serverContext, logger *log.Logger
 	}
 
 	dialCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	upstreamConn, resp, err := srvCtx.upstreamDialer.DialTUN(dialCtx, handshake, origin)
+	upstreamConn, upstreamStego, resp, err := srvCtx.upstreamDialer.dialTUN(dialCtx, handshake, origin)
 	cancel()
 	if err != nil {
 		logger.Warn("Relay: upstream TUN dial failed: %v", err)
@@ -3772,6 +3772,12 @@ func relayTUNToUpstream(conn net.Conn, srvCtx *serverContext, logger *log.Logger
 
 	logger.Info("Relay TUN bridge established (client=%s, upstream-assigned=%s)",
 		conn.RemoteAddr(), net.IP(resp[5:9]))
+
+	// The bridge copies the client's bytes up as they come, and a client on
+	// a sparse download may send none for minutes: the leg died every 60 s
+	// on the exit's read deadline (fix12-slow). The upstream conn keeps it
+	// fed while the client is alive.
+	keepUpstreamAlive(upstreamStego, conn, logger)
 
 	// Bidirectional transparent copy with an idle watchdog. Both ends speak the
 	// identical TUN wire format, so no reframing is needed.
@@ -3915,7 +3921,7 @@ func setupH2Tunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, srv
 	var err error
 	if srvCtx.upstreamDialer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr)
+		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr, tunnel.downstream)
 		cancel()
 	} else {
 		targetConn, err = optimizedDial("tcp", targetAddr, 10*time.Second)
@@ -5714,7 +5720,7 @@ func runPollingSessionRelay(sess *HTTPPollingSession, srvCtx *serverContext, log
 	var err error
 	if srvCtx.upstreamDialer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr)
+		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr, nil)
 		cancel()
 	} else {
 		targetConn, err = optimizedDial("tcp", targetAddr, 10*time.Second)

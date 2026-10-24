@@ -275,6 +275,16 @@ type HTTP2StegoConn struct {
 	// writeFailed is set once a write on the conn failed (stegoWriter).
 	writeFailed atomic.Bool
 
+	// lastWrite is a stegoMono stamp of the last frame the conn put on the
+	// wire, whoever wrote it; lastOwnerWrite of the last data its owner
+	// wrote (Write). Zero before the first.
+	lastWrite      atomic.Int64
+	lastOwnerWrite atomic.Int64
+
+	// closed is closed by Close; KeepAlive ends with it.
+	closed    chan struct{}
+	closeOnce sync.Once
+
 	secret      []byte
 	isClient    bool
 	paddingMode NaivePaddingMode
@@ -331,6 +341,7 @@ func NewHTTP2StegoConn(conn net.Conn, secret []byte, isClient bool, paddingMode 
 		isClient:    isClient,
 		paddingMode: paddingMode,
 		ekm:         ekm,
+		closed:      make(chan struct{}),
 	}
 
 	// Initialize HTTP/2 framer
@@ -714,8 +725,86 @@ func (w stegoWriter) Write(p []byte) (int, error) {
 	n, err := w.sc.Conn.Write(p)
 	if err != nil {
 		w.sc.writeFailed.Store(true)
+	} else {
+		w.sc.lastWrite.Store(stegoMono())
 	}
 	return n, err
+}
+
+// stegoMonoBase anchors stegoMono to the monotonic clock.
+var stegoMonoBase = time.Now()
+
+// stegoMono is a monotonic stamp, in nanoseconds since stegoMonoBase; never 0.
+func stegoMono() int64 { return int64(time.Since(stegoMonoBase)) + 1 }
+
+// SinceOwnerWrite is how long ago the conn's owner last wrote data on it,
+// and false before the first time. The conn's own frames - flow-control
+// credit, a keepalive - do not count.
+func (sc *HTTP2StegoConn) SinceOwnerWrite() (time.Duration, bool) {
+	at := sc.lastOwnerWrite.Load()
+	if at == 0 {
+		return 0, false
+	}
+	return time.Duration(stegoMono() - at), true
+}
+
+// KeepAlive feeds the peer's read deadline on a conn whose owner may write
+// nothing for minutes: a relay's upstream leg carrying a sparse download,
+// whose exit closes a connection after 60 s without a frame. Whenever
+// nothing has gone out on the conn for quiet() - redrawn after each one - it
+// writes an empty stego DATA frame: no payload, cover as on any frame. The
+// frame does not touch the byte stream the owner writes, so it needs no
+// frame boundary of the owner's; an exit of any version reads it, which
+// feeds its deadline, and finds nothing to deliver.
+//
+// Not before the owner's first write: the exit takes the first payload on a
+// connection as the tunnel's setup, and an empty one would be a broken
+// setup. alive, when set, is asked before each keepalive: while it says
+// the owner's client is gone, none goes, and the exit's deadline ends the
+// leg as before. sent, when set, is told of each keepalive written.
+//
+// It returns when the conn is closed or a keepalive cannot be written.
+func (sc *HTTP2StegoConn) KeepAlive(quiet func() time.Duration, alive func() bool, sent func()) {
+	q := quiet()
+	timer := time.NewTimer(q)
+	defer timer.Stop()
+	for {
+		select {
+		case <-sc.closed:
+			return
+		case <-timer.C:
+		}
+		silent := time.Duration(stegoMono() - sc.lastWrite.Load())
+		if silent >= q {
+			if sc.lastOwnerWrite.Load() != 0 && (alive == nil || alive()) {
+				if err := sc.writeKeepalive(); err != nil {
+					return
+				}
+				if sent != nil {
+					sent()
+				}
+			}
+			q = quiet()
+			silent = 0
+		}
+		timer.Reset(max(q-silent, 10*time.Millisecond))
+	}
+}
+
+// writeKeepalive writes an empty stego DATA frame, under a write deadline
+// of its own like the read path's writes (readPathWrite).
+func (sc *HTTP2StegoConn) writeKeepalive() error {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	var err error
+	sc.readPathWrite(func() {
+		if sc.tunMode {
+			_, err = sc.writeViaDataFast(nil)
+		} else {
+			_, err = sc.writeViaData(nil)
+		}
+	})
+	return err
 }
 
 // readPathWrite runs write, a write the read path makes on its own, under a
@@ -779,6 +868,9 @@ func (sc *HTTP2StegoConn) Write(p []byte) (int, error) {
 		}
 		written += n
 	}
+	if written > 0 {
+		sc.lastOwnerWrite.Store(stegoMono())
+	}
 
 	return written, nil
 }
@@ -789,7 +881,11 @@ func (sc *HTTP2StegoConn) writeFast(p []byte) (int, error) {
 	defer sc.mu.Unlock()
 
 	sc.flushWindowUpdate()
-	return sc.writeViaDataFast(p)
+	n, err := sc.writeViaDataFast(p)
+	if n > 0 {
+		sc.lastOwnerWrite.Store(stegoMono())
+	}
+	return n, err
 }
 
 type covertMethod int
@@ -1312,6 +1408,7 @@ func (sc *HTTP2StegoConn) Close() error {
 	// The owner's deadline is put back after it, as after every write of
 	// the conn's own (readPathWrite).
 	_ = sc.Conn.SetWriteDeadline(time.Now().Add(time.Second))
+	sc.closeOnce.Do(func() { close(sc.closed) })
 	sc.mu.Lock()
 	sc.framer.WriteGoAway(sc.nextStreamID, http2.ErrCodeNo, nil)
 	sc.restoreOwnerWD()

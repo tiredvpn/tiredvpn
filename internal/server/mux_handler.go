@@ -174,7 +174,7 @@ func (h *MuxHandler) handleStream(ctx context.Context, stream net.Conn) {
 	if h.srvCtx.upstreamDialer != nil {
 		// Multi-hop mode: dial through upstream
 		dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		targetConn, err = h.srvCtx.upstreamDialer.Dial(dialCtx, targetAddr)
+		targetConn, err = h.srvCtx.upstreamDialer.Dial(dialCtx, targetAddr, stream)
 		cancel()
 	} else {
 		// Direct mode: dial target directly

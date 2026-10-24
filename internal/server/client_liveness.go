@@ -2,12 +2,17 @@ package server
 
 import (
 	"net"
+	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/tiredvpn/tiredvpn/internal/log"
+	"github.com/tiredvpn/tiredvpn/internal/strategy"
 )
 
 // clientLiveness says whether a relay's downstream client is still there,
-// which is what keeps its upstream leg alive (relayTUNSink's keepalive).
+// which is what keeps its upstream leg alive (relayTUNSink's keepalive, the
+// upstream conn's KeepAlive).
 //
 // Heard from within relayClientActiveWindow is alive, as since round 11. A
 // client may also send nothing for minutes: a desktop client older than
@@ -92,3 +97,34 @@ type overTransport struct {
 }
 
 func (c overTransport) TransportConn() net.Conn { return c.transport }
+
+// upstreamKeepaliveSent, when a test sets it, is called for each keepalive
+// a relay's upstream conn sends (keepUpstreamAlive). Nil in production.
+var upstreamKeepaliveSent atomic.Pointer[func()]
+
+// keepUpstreamAlive keeps the exit's 60 s read deadline fed on a relay's
+// upstream conn while its downstream client is alive, for the relay paths
+// that copy bytes up as they come - the TUN bridge and every relay over
+// UpstreamDialer.Dial. They wrote nothing up while the client wrote
+// nothing, and a sparse download - a push every 5 s, nothing up - lost its
+// leg every minute (fix12-slow). The keepalive is an empty stego DATA frame
+// after a quiet period drawn like the TUN leg's (relayKeepaliveAfter), so
+// the exit, of any version, reads a frame and delivers nothing. A conn that
+// is not an upstream stego conn is left alone.
+//
+// client is the downstream conn, nil without one. The client counts as
+// heard whenever its bytes go up the leg.
+func keepUpstreamAlive(up *strategy.HTTP2StegoConn, client net.Conn, logger *log.Logger) {
+	if up == nil {
+		return
+	}
+	live := clientLiveness{conn: client, heard: up.SinceOwnerWrite}
+	go up.KeepAlive(relayKeepaliveAfter, live.alive, func() {
+		if logger != nil {
+			logger.Debug("Relay: keepalive up the upstream leg")
+		}
+		if f := upstreamKeepaliveSent.Load(); f != nil {
+			(*f)()
+		}
+	})
+}
