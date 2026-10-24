@@ -535,7 +535,7 @@ needed. It just needs `/dev/net/tun`, `NET_ADMIN`, and a writable
 ### Requirements
 
 - Go 1.26 or later
-- Linux, macOS, or Windows (TUN mode requires Linux)
+- Linux or macOS (Windows is not supported: the core does not build for it)
 
 ### Build
 
