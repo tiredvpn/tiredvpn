@@ -36,6 +36,8 @@ func scaleLegClocks(t *testing.T) {
 	t.Helper()
 	oldRead, oldIdle, oldWindow := h2FrameReadTimeoutNs.Load(), relayTUNIdleTimeoutNs.Load(), relayClientActiveWindowNs.Load()
 	oldWrite := relayWriteTimeoutNs.Load()
+	oldTUN := tunClientReadTimeoutNs.Load()
+	tunClientReadTimeoutNs.Store(oldTUN / legScale)
 	h2FrameReadTimeoutNs.Store(oldRead / legScale)
 	relayTUNIdleTimeoutNs.Store(oldIdle / legScale)
 	relayClientActiveWindowNs.Store(oldWindow / legScale)
@@ -46,6 +48,7 @@ func scaleLegClocks(t *testing.T) {
 		relayTUNIdleTimeoutNs.Store(oldIdle)
 		relayClientActiveWindowNs.Store(oldWindow)
 		relayWriteTimeoutNs.Store(oldWrite)
+		tunClientReadTimeoutNs.Store(oldTUN)
 	})
 }
 
@@ -59,6 +62,12 @@ type legExit struct {
 }
 
 func newLegExit(t *testing.T, secret []byte) *legExit {
+	t.Helper()
+	return newLegExitWith(t, secret, nil)
+}
+
+// newLegExitWith is newLegExit with tweak applied to its config.
+func newLegExitWith(t *testing.T, secret []byte, tweak func(*Config)) *legExit {
 	t.Helper()
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET, 0)
 	if err != nil {
@@ -77,6 +86,9 @@ func newLegExit(t *testing.T, secret []byte) *legExit {
 	shared.tunDev = dev
 	shared.mtu = 1500
 	cfg := &Config{Secret: secret}
+	if tweak != nil {
+		tweak(cfg)
+	}
 	srvCtx := &serverContext{cfg: cfg, tlsConfig: buildTLSProfile(cfg, selfSignedCertForTest(t)), ipPool: pool, sharedTUN: shared}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

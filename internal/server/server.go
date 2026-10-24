@@ -1824,6 +1824,17 @@ var h2FrameReadTimeoutNs = func() *atomic.Int64 {
 
 func h2FrameReadTimeout() time.Duration { return time.Duration(h2FrameReadTimeoutNs.Load()) }
 
+// tunClientReadTimeoutNs is how long the raw TUN loop (handleTUNModeWithHandshake:
+// REALITY, anti-probe, SSH, IMAP, QUIC) waits for a frame from its client
+// before it ends the session: 120 s. Atomic so tests can scale it.
+var tunClientReadTimeoutNs = func() *atomic.Int64 {
+	var v atomic.Int64
+	v.Store(int64(120 * time.Second))
+	return &v
+}()
+
+func tunClientReadTimeout() time.Duration { return time.Duration(tunClientReadTimeoutNs.Load()) }
+
 // runH2FrameLoop reads and dispatches HTTP/2 frames until the connection closes.
 //
 // connPtr / framerPtr are pointers so the loop can swap the connection and
@@ -3677,7 +3688,7 @@ func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger
 		default:
 		}
 
-		conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+		conn.SetReadDeadline(time.Now().Add(tunClientReadTimeout()))
 		if _, err := io.ReadFull(conn, lenBuf); err != nil {
 			logger.Debug("TUN read length error: %v", err)
 			break
@@ -3804,7 +3815,7 @@ func relayTUNToUpstream(conn net.Conn, srvCtx *serverContext, logger *log.Logger
 	// a sparse download may send none for minutes: the leg died every 60 s
 	// on the exit's read deadline (fix12-slow). The upstream conn keeps it
 	// fed while the client is alive.
-	keepUpstreamAlive(upstreamStego, conn, logger)
+	keepUpstreamAlive(upstreamStego, clientLiveness{conn: conn}, logger)
 
 	// Bidirectional transparent copy with an idle watchdog. Both ends speak the
 	// identical TUN wire format, so no reframing is needed.
@@ -4726,6 +4737,15 @@ type HTTPPollingSession struct {
 
 // touch records a request on the session at t.
 func (s *HTTPPollingSession) touch(t time.Time) { s.lastActive.Store(t.UnixNano()) }
+
+// sinceRequest is how long ago the session's last request came, false
+// before the first.
+func (s *HTTPPollingSession) sinceRequest() (time.Duration, bool) {
+	if s.lastActive.Load() == 0 {
+		return 0, false
+	}
+	return s.idleFor(time.Now()), true
+}
 
 // idleFor is how long the session has gone without a request as of now.
 func (s *HTTPPollingSession) idleFor(now time.Time) time.Duration {
@@ -5758,7 +5778,9 @@ func runPollingSessionRelay(sess *HTTPPollingSession, srvCtx *serverContext, log
 	var err error
 	if srvCtx.upstreamDialer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr, nil)
+		// The session has no conn; its requests - every 4 s at most while
+		// idle - say the client is there.
+		targetConn, err = srvCtx.upstreamDialer.dialLive(ctx, targetAddr, clientLiveness{seen: sess.sinceRequest})
 		cancel()
 	} else {
 		targetConn, err = optimizedDial("tcp", targetAddr, 10*time.Second)

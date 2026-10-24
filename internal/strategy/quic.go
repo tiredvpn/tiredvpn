@@ -1180,6 +1180,13 @@ func (c *QUICServerConn) Close() error {
 	return c.CloseWithError(0, "server closed")
 }
 
+// PeerAlive reports whether the QUIC connection is still open. quic-go closes
+// it once nothing has come from the client for MaxIdleTimeout (30 s), and the
+// client's keepalive goes every 10 s, so an open connection is a client that
+// was heard from within 30 s, whatever its stream carries. A relay asks it of
+// a client that writes nothing up (the server's clientLiveness).
+func (c *QUICServerConn) PeerAlive() bool { return c.Conn.Context().Err() == nil }
+
 // LocalAddr implements net.Conn
 func (c *QUICServerConn) LocalAddr() net.Addr {
 	return c.Conn.LocalAddr()

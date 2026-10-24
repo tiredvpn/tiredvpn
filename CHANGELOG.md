@@ -119,7 +119,10 @@ Versions follow [Semantic Versioning](https://semver.org/).
   own before 1.11.9 - left the relay's TUN bridge and its proxy relays
   silent toward the exit, which closed the leg after 60 s. The relay now
   keeps the leg fed while its client is alive, which also counts a client
-  whose TCP acknowledges what comes down. Exits of any version accept it.
+  whose TCP acknowledges what comes down, a QUIC client whose connection is
+  open and an HTTP Polling client that keeps polling: on QUIC and Polling a
+  proxied stream through a relay still died after two minutes. Exits of any
+  version accept it.
 - **Relay: anti-probe sessions through a relay no longer end 2 s after
   connecting.**
 - **Server: a proxied site that hangs up is passed on at once.** The client,
