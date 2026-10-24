@@ -3,6 +3,7 @@ package server
 import (
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,10 +21,25 @@ import (
 // deadlines, the uplink keepalive drawn as in production and scaled.
 func TestADirectREALITYClientKeepsItsSessionOnASparseDownload(t *testing.T) {
 	scaleLegClocks(t)
+	// The draws and the keepalives sent are recorded, so a run says how
+	// late a keepalive came against the period drawn for it and how long
+	// the uplink was silent against the exit's deadline.
+	var mu sync.Mutex
+	var draws []time.Duration
+	var sends []time.Time
 	restore := tun.SetUplinkKeepaliveDraw(func() time.Duration {
-		return strategy.HumpDelay(20*time.Second, 30*time.Second, 45*time.Second) / legScale
+		d := strategy.HumpDelay(20*time.Second, 30*time.Second, 45*time.Second) / legScale
+		mu.Lock()
+		draws = append(draws, d)
+		mu.Unlock()
+		return d
 	})
-	t.Cleanup(func() { tun.SetUplinkKeepaliveDraw(restore) })
+	tun.SetUplinkKeepaliveSent(func() {
+		mu.Lock()
+		sends = append(sends, time.Now())
+		mu.Unlock()
+	})
+	t.Cleanup(func() { tun.SetUplinkKeepaliveDraw(restore); tun.SetUplinkKeepaliveSent(nil) })
 	out := captureLog(t)
 	if err := InitREALITYKeys(&Config{}); err != nil {
 		t.Fatal(err)
@@ -52,6 +68,18 @@ func TestADirectREALITYClientKeepsItsSessionOnASparseDownload(t *testing.T) {
 		}
 	}
 	waitDown(t, client, sent)
+	mu.Lock()
+	var silent, late time.Duration
+	for i := 1; i < len(sends); i++ {
+		gap := sends[i].Sub(sends[i-1])
+		silent = max(silent, gap)
+		if i < len(draws) {
+			late = max(late, gap-draws[i])
+		}
+	}
+	t.Logf("%d keepalives; longest uplink silence between two %v of the exit's %v, latest %v past its draw",
+		len(sends), silent.Round(time.Millisecond), tunClientReadTimeout(), late.Round(time.Millisecond))
+	mu.Unlock()
 	if n := strings.Count(out.String(), "REALITY: Tunnel established"); n != 1 || strings.Contains(out.String(), "VPN disconnected") {
 		t.Fatalf("the session dropped on a sparse download (%d REALITY tunnels):\n%s", n, out.String())
 	}
