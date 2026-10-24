@@ -251,16 +251,10 @@ func TestARelayBridgeCarriesKeepalivesAfterADownload(t *testing.T) {
 // TestARelayProxyWritesUpAfterAQuietDownload is P1-1 on the proxy path:
 // handleRawTunnel dials the target through UpstreamDialer.Dial and relays
 // with optimizedRelay. 1 MiB comes down, the client is quiet past the read
-// path's deadline, then sends "hello", which has to reach the target.
-//
-// The exit does not pass the target's hang-up on to its peer (a finding of
-// its own, outside this fix): the relay learns the session is over when the
-// exit's read deadline ends it, scaled here.
+// path's deadline, then sends "hello", which has to reach the target. The
+// target hangs up after it, and the relay ends the tunnel on that.
 func TestARelayProxyWritesUpAfterAQuietDownload(t *testing.T) {
 	quiet := 2 * scaleReadPathWrite(t)
-	oldRead := h2FrameReadTimeoutNs.Load()
-	h2FrameReadTimeoutNs.Store(oldRead / legScale)
-	t.Cleanup(func() { h2FrameReadTimeoutNs.Store(oldRead) })
 	out := captureLog(t)
 	secret := []byte("relay-leg-secret-0123456789abcdef")
 	exit := newLegExit(t, secret)
@@ -322,15 +316,21 @@ func TestARelayProxyWritesUpAfterAQuietDownload(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatalf("the write up after the quiet never reached the target:\n%s", out.String())
 	}
+	// The target's hang-up reaches the client as the end of its stream,
+	// and the client closes on it, as a real one does.
+	_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.ReadAll(client); err != nil {
+		t.Fatalf("the target's hang-up did not reach the client: %v", err)
+	}
 	client.Close()
 	select {
 	case <-done:
-	case <-time.After(3 * h2FrameReadTimeout()):
-		t.Fatal("the relay kept the tunnel past the exit's read deadline")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the relay kept the tunnel after both ends hung up")
 	}
 	logs := out.String()
-	if !strings.Contains(logs, "Tunnel closed (up=5, down=1048576): the client closed it") {
-		t.Fatalf("the relay did not say the client closed the tunnel:\n%s", logs)
+	if !strings.Contains(logs, "Tunnel closed (up=5, down=1048576): the target closed it") {
+		t.Fatalf("the relay did not say the target closed the tunnel:\n%s", logs)
 	}
 	if strings.Contains(logs, "bad record MAC") {
 		t.Fatalf("a TLS record broke at the close:\n%s", logs)

@@ -3446,6 +3446,14 @@ func handleRawTunnel(conn net.Conn, srvCtx *serverContext, logger *log.Logger, c
 		n, err := optimizedRelay(conn, targetConn)
 		atomic.AddInt64(&bytesDown, n)
 		end.note("the target", "the client", err)
+		// Pass the target's end on, as the other direction does with
+		// CloseWrite: a client that is told nothing waits for the rest
+		// of an answer that has ended.
+		if cw, ok := conn.(interface{ CloseWrite() error }); ok {
+			_ = cw.CloseWrite()
+		} else {
+			conn.Close()
+		}
 	}()
 
 	wg.Wait()
@@ -3947,6 +3955,17 @@ func setupH2Tunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, srv
 			n, err := targetConn.Read(buf)
 			if err != nil {
 				logger.Debug("Target read error: %v", err)
+				// The target is done, and the connection carries nothing
+				// else: close it, after the last response (tunnel.mu), so
+				// the client reads the end. It used to stay open until
+				// the read deadline, 60 s on, and the client - or a
+				// relay's client - waited that long for an answer that
+				// had ended.
+				tunnel.mu.Lock()
+				if tunnel.downstream != nil {
+					tunnel.downstream.Close()
+				}
+				tunnel.mu.Unlock()
 				return
 			}
 			tunnel.mu.Lock()
