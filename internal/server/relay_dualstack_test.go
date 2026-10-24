@@ -245,7 +245,7 @@ func TestDialRelayTUNCarriesDualStackAddrs(t *testing.T) {
 		srvCtx := newTestServerContext(t)
 		srvCtx.upstreamDialer = NewUpstreamDialer(exit.ln.Addr().String(), secret)
 
-		sink, serverIP, clientIP, err := dialRelayTUN(srvCtx, testLogger(t), dialTUNHandshake(), "origin", "", nil, func([]byte) error { return nil })
+		sink, serverIP, clientIP, err := dialRelayTUN(srvCtx, testLogger(t), dialTUNHandshake(), "origin", "", nil, nil, func([]byte) error { return nil })
 		if err != nil {
 			t.Fatalf("dialRelayTUN: %v", err)
 		}
@@ -270,7 +270,7 @@ func TestDialRelayTUNCarriesDualStackAddrs(t *testing.T) {
 		srvCtx := newTestServerContext(t)
 		srvCtx.upstreamDialer = NewUpstreamDialer(exit.ln.Addr().String(), secret)
 
-		sink, _, _, err := dialRelayTUN(srvCtx, testLogger(t), dialTUNHandshake(), "origin", "", nil, func([]byte) error { return nil })
+		sink, _, _, err := dialRelayTUN(srvCtx, testLogger(t), dialTUNHandshake(), "origin", "", nil, nil, func([]byte) error { return nil })
 		if err != nil {
 			t.Fatalf("dialRelayTUN: %v", err)
 		}

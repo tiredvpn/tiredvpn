@@ -7,6 +7,21 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Server: per-client traffic stats count bytes.** `bytes_up` and `bytes_down`
+  in Redis, `/stats`, `/clients/{id}` and the per-client `/metrics` series
+  showed the client's connection count: the three counters of a client shared
+  one integer, and no TUN transport counted traffic at all. Every data path now
+  accounts the client's payload (IP packet bytes in TUN mode, stream bytes in
+  proxy mode) on exits and relays alike, with one atomic add per packet and no
+  Redis call on the data path. The totals are lifetime totals: a restart
+  continues them, a record written by the old counters keeps its connection
+  count and starts its byte count from zero, and the server flushes on
+  shutdown. `last_seen` is the last time the client was seen and is omitted
+  for a client never seen, instead of the time of the request. Proxy streams
+  relayed with `io.Copy` (raw tunnel, QUIC) are counted when the stream ends.
+
 ### Removed
 
 - **Client: the inert `-pq` / `-pq-server-key` flags.** They built ML-KEM-768

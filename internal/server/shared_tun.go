@@ -105,6 +105,10 @@ type ClientWriter struct {
 	// what keeps the handshake first in the stream and one frame from landing
 	// inside another. See tun_frame_gate.go.
 	gate *tunFrameGate
+
+	// traffic accounts the packets this client sends (localTUNSink) and
+	// receives (SendPacket); nil when the session has no registry client.
+	traffic *clientTraffic
 }
 
 // reconnectTracker tracks per-client reconnect frequency to prevent flapping
@@ -184,14 +188,26 @@ func NewSharedTUN(name string, serverIP net.IP, network *net.IPNet, mtu, workers
 		return nil, err
 	}
 
-	st := &SharedTUN{
+	st := newSharedTUNOn(tunDev, serverIP, network, mtu, workers)
+	st.v6prefix = v6prefix
+	st.v6m = v6m
+	st.start()
+
+	log.Info("SharedTUN started: %s (server=%s, network=%s, workers=%d)",
+		st.name, serverIP, network, workers)
+
+	return st, nil
+}
+
+// newSharedTUNOn builds a SharedTUN around an already configured device. It
+// does not start the dispatcher; start does.
+func newSharedTUNOn(tunDev *tun.TUNDevice, serverIP net.IP, network *net.IPNet, mtu, workers int) *SharedTUN {
+	return &SharedTUN{
 		tunDev:        tunDev,
 		name:          tunDev.Name(),
 		serverIP:      serverIP,
 		network:       network,
 		mtu:           mtu,
-		v6prefix:      v6prefix,
-		v6m:           v6m,
 		clients:       make(map[string]*ClientWriter),
 		reconnTracker: newReconnectTracker(10), // warn if >10 reconnects/min
 		workers:       workers,
@@ -199,19 +215,22 @@ func NewSharedTUN(name string, serverIP net.IP, network *net.IPNet, mtu, workers
 		bufferSize:    1024, // Buffer up to 1024 packets per worker
 		stopCh:        make(chan struct{}),
 	}
+}
 
-	bufLen := mtu + 100
+// start launches the packet workers and the dispatcher that reads the device.
+func (st *SharedTUN) start() {
+	bufLen := st.mtu + 100
 	st.pktPool.New = func() any {
 		return &tunPacket{buf: make([]byte, bufLen)}
 	}
 
 	// Initialize worker channels
-	for i := 0; i < workers; i++ {
+	for i := 0; i < st.workers; i++ {
 		st.workerChans[i] = make(chan *tunPacket, st.bufferSize)
 	}
 
 	// Start workers
-	for i := 0; i < workers; i++ {
+	for i := 0; i < st.workers; i++ {
 		st.wg.Add(1)
 		go st.packetWorker(i, st.workerChans[i])
 	}
@@ -221,10 +240,6 @@ func NewSharedTUN(name string, serverIP net.IP, network *net.IPNet, mtu, workers
 	go st.packetDispatcher()
 
 	atomic.StoreInt32(&st.running, 1)
-	log.Info("SharedTUN started: %s (server=%s, network=%s, workers=%d)",
-		st.name, serverIP, network, workers)
-
-	return st, nil
 }
 
 // Name returns the TUN device name
@@ -240,7 +255,7 @@ func (st *SharedTUN) TUNDevice() *tun.TUNDevice {
 // RegisterClient adds a client to the shared TUN
 // If client with same IP exists, old connection is gracefully drained before replacement
 func (st *SharedTUN) RegisterClient(clientIP net.IP, clientID string, conn net.Conn, frameFunc func([]byte) []byte) *ClientWriter {
-	return st.registerClient(clientIP, clientID, originOf(conn.RemoteAddr()), conn, frameFunc, nil)
+	return st.registerClient(clientIP, clientID, originOf(conn.RemoteAddr()), conn, frameFunc, nil, nil)
 }
 
 // RegisterClientGated registers a client whose tunnel is owned by a frame gate.
@@ -251,11 +266,13 @@ func (st *SharedTUN) RegisterClient(clientIP net.IP, clientID string, conn net.C
 //
 // origin is the peer host the handler keyed the lease with: a takeover from the
 // same origin is the client moving its own tunnel, from another one a collision.
-func (st *SharedTUN) RegisterClientGated(clientIP net.IP, clientID, origin string, conn net.Conn, frameFunc func([]byte) []byte, gate *tunFrameGate) *ClientWriter {
-	return st.registerClient(clientIP, clientID, origin, conn, frameFunc, gate)
+// traffic is where the client's packets are accounted in both directions; nil
+// counts nothing.
+func (st *SharedTUN) RegisterClientGated(clientIP net.IP, clientID, origin string, conn net.Conn, frameFunc func([]byte) []byte, gate *tunFrameGate, traffic *clientTraffic) *ClientWriter {
+	return st.registerClient(clientIP, clientID, origin, conn, frameFunc, gate, traffic)
 }
 
-func (st *SharedTUN) registerClient(clientIP net.IP, clientID, origin string, conn net.Conn, frameFunc func([]byte) []byte, gate *tunFrameGate) *ClientWriter {
+func (st *SharedTUN) registerClient(clientIP net.IP, clientID, origin string, conn net.Conn, frameFunc func([]byte) []byte, gate *tunFrameGate, traffic *clientTraffic) *ClientWriter {
 	ipStr := clientIP.String()
 	now := time.Now().Unix()
 
@@ -269,6 +286,7 @@ func (st *SharedTUN) registerClient(clientIP net.IP, clientID, origin string, co
 		done:        make(chan struct{}),
 		framePacket: frameFunc,
 		gate:        gate,
+		traffic:     traffic,
 	}
 
 	// Track reconnect frequency
@@ -551,21 +569,23 @@ func (w *ClientWriter) SendPacket(pkt []byte) error {
 			}
 			return err
 		}
-		atomic.StoreInt64(&w.lastActive, time.Now().Unix())
-		return nil
+	} else if err := w.writeDirect(framedPkt); err != nil {
+		return err
 	}
 
+	w.traffic.addDown(len(pkt))
+	atomic.StoreInt64(&w.lastActive, time.Now().Unix())
+	return nil
+}
+
+// writeDirect writes a frame for a client registered without a gate.
+func (w *ClientWriter) writeDirect(frame []byte) error {
 	w.writeMu.Lock()
 	defer w.writeMu.Unlock()
 
 	w.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	_, err := w.conn.Write(framedPkt)
-	if err != nil {
-		return err
-	}
-
-	atomic.StoreInt64(&w.lastActive, time.Now().Unix())
-	return nil
+	_, err := w.conn.Write(frame)
+	return err
 }
 
 // UpdateActivity updates the last activity timestamp

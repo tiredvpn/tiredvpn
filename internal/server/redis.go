@@ -44,7 +44,7 @@ type ClientStats struct {
 	TotalConns  int64     `json:"total_conns"`
 	BytesUp     int64     `json:"bytes_up"`
 	BytesDown   int64     `json:"bytes_down"`
-	LastSeen    time.Time `json:"last_seen"`
+	LastSeen    time.Time `json:"last_seen,omitzero"` // zero (omitted) = never seen
 }
 
 // DefaultRedisPrefix is the key namespace used when none is configured.
