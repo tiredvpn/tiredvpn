@@ -22,6 +22,7 @@ import (
 // s, and each one woke the idle poll loop out of its backoff. Polling's
 // polls reach the exit on their own: it gets none.
 func TestAnIdlePollingSessionGetsNoUplinkKeepalive(t *testing.T) {
+	forgetNewPollingSessions(t)
 	scaleLegClocks(t)
 	restore := tun.SetUplinkKeepaliveDraw(func() time.Duration {
 		return strategy.HumpDelay(20*time.Second, 30*time.Second, 45*time.Second) / legScale
@@ -68,4 +69,31 @@ func TestAnIdlePollingSessionGetsNoUplinkKeepalive(t *testing.T) {
 	if n := sent.Load(); n != 0 {
 		t.Fatalf("%d uplink keepalives on an idle Polling session", n)
 	}
+}
+
+// forgetNewPollingSessions removes, once the test is over, the polling
+// sessions the test opened on the process-wide pollingManager: the client is
+// gone, but its session would wait out its idle timeout and fill the
+// ceiling the session-cap tests count on.
+func forgetNewPollingSessions(t *testing.T) {
+	t.Helper()
+	pollingManager.mu.Lock()
+	before := make(map[string]bool, len(pollingManager.sessions))
+	for id := range pollingManager.sessions {
+		before[id] = true
+	}
+	pollingManager.mu.Unlock()
+	t.Cleanup(func() {
+		pollingManager.mu.Lock()
+		var ours []*HTTPPollingSession
+		for id, sess := range pollingManager.sessions {
+			if !before[id] {
+				ours = append(ours, sess)
+			}
+		}
+		pollingManager.mu.Unlock()
+		for _, sess := range ours {
+			pollingManager.removeSession(sess)
+		}
+	})
 }
