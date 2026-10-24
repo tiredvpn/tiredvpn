@@ -9,7 +9,6 @@ import (
 	"errors"
 	"io"
 	"math/rand/v2"
-	"sync"
 	"testing"
 	"time"
 
@@ -68,21 +67,14 @@ func TestShaperE2E_ChromePreset_RoundTrip(t *testing.T) {
 		want[i] = byte(rng.UintN(256))
 	}
 
-	var (
-		writeErr error
-		wg       sync.WaitGroup
-	)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		_, writeErr = client.Write(want)
-		_ = client.Close()
-	}()
+	readTimeout := 30 * time.Second
+	read := make(chan struct{})
+	writeErr := writeThenCloseAfterRead(client, want, read, readTimeout)
 
-	got, readErr := readAll(server, N, 30*time.Second)
-	wg.Wait()
-	if writeErr != nil {
-		t.Fatalf("client write: %v", writeErr)
+	got, readErr := readAll(server, N, readTimeout)
+	close(read)
+	if err := <-writeErr; err != nil {
+		t.Fatalf("client write: %v", err)
 	}
 	if readErr != nil && readErr != io.EOF {
 		t.Fatalf("server read: %v", readErr)
@@ -118,21 +110,14 @@ func TestShaperE2E_DifferentPresetsCantTalk_DocumentBehavior(t *testing.T) {
 		want[i] = byte(rng.UintN(256))
 	}
 
-	var (
-		writeErr error
-		wg       sync.WaitGroup
-	)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		_, writeErr = client.Write(want)
-		_ = client.Close()
-	}()
+	readTimeout := 10 * time.Second
+	read := make(chan struct{})
+	writeErr := writeThenCloseAfterRead(client, want, read, readTimeout)
 
-	got, readErr := readAll(server, N, 10*time.Second)
-	wg.Wait()
-	if writeErr != nil {
-		t.Fatalf("client write: %v", writeErr)
+	got, readErr := readAll(server, N, readTimeout)
+	close(read)
+	if err := <-writeErr; err != nil {
+		t.Fatalf("client write: %v", err)
 	}
 	if readErr != nil && readErr != io.EOF {
 		t.Fatalf("server read: %v", readErr)
@@ -161,21 +146,14 @@ func TestShaperE2E_LargePayload_Async(t *testing.T) {
 		want[i] = byte(rng.UintN(256))
 	}
 
-	var (
-		writeErr error
-		wg       sync.WaitGroup
-	)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		_, writeErr = client.Write(want)
-		_ = client.Close()
-	}()
+	readTimeout := 60 * time.Second
+	read := make(chan struct{})
+	writeErr := writeThenCloseAfterRead(client, want, read, readTimeout)
 
-	got, readErr := readAll(server, N, 60*time.Second)
-	wg.Wait()
-	if writeErr != nil {
-		t.Fatalf("client write: %v", writeErr)
+	got, readErr := readAll(server, N, readTimeout)
+	close(read)
+	if err := <-writeErr; err != nil {
+		t.Fatalf("client write: %v", err)
 	}
 	if readErr != nil && readErr != io.EOF {
 		t.Fatalf("server read: %v", readErr)
@@ -217,6 +195,33 @@ func TestShaperE2E_OverflowGraceful(t *testing.T) {
 	if elapsed > 5*time.Second {
 		t.Fatalf("Write took %v to return overflow; expected ~1s", elapsed)
 	}
+}
+
+// writeThenCloseAfterRead writes payload on w in the background and closes
+// w once read is closed, that is once the reader has everything. It returns
+// the Write error.
+//
+// The close waits for the reader because MorphedConn.Close drains what is
+// still queued for at most pacerDrainTimeout (100 ms) and drops the rest
+// without an error, and on a loaded machine the tail of the payload was
+// still queued when the writer closed right after Write returned. These
+// tests check that the round trip does not corrupt bytes; Write followed at
+// once by Close gets its own regression tests with the Close fix in PR
+// #129, after which these can close right after Write again. The timer only
+// bounds a broken run, where the reader never gets it all and waits for the
+// close to end its read.
+func writeThenCloseAfterRead(w io.WriteCloser, payload []byte, read <-chan struct{}, timeout time.Duration) <-chan error {
+	errc := make(chan error, 1)
+	go func() {
+		_, err := w.Write(payload)
+		select {
+		case <-read:
+		case <-time.After(timeout):
+		}
+		_ = w.Close()
+		errc <- err
+	}()
+	return errc
 }
 
 func readAll(r io.Reader, n int, timeout time.Duration) ([]byte, error) {

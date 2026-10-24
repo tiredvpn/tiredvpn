@@ -64,6 +64,7 @@ func TestHandshakeGateEnforcesSpacing(t *testing.T) {
 	var mu sync.Mutex
 	var at []time.Time
 
+	t0 := time.Now()
 	var wg sync.WaitGroup
 	for range starts {
 		wg.Add(1)
@@ -92,13 +93,45 @@ func TestHandshakeGateEnforcesSpacing(t *testing.T) {
 			}
 		}
 	}
-	// Timer granularity makes the observed gap slightly noisy; allow 20% slack
-	// so this does not flake on a loaded CI box.
-	minGap := spacing - spacing/5
-	for i := 1; i < len(at); i++ {
-		if gap := at[i].Sub(at[i-1]); gap < minGap {
-			t.Fatalf("handshake starts %d and %d only %v apart, want >= %v", i-1, i, gap, minGap)
+	// The gate reserves start k at least k spacings after the first, which
+	// is no earlier than t0, and a timer never fires early: start k comes no
+	// sooner than t0 + k*spacing, however the machine is loaded. The gap
+	// between two neighbours is not bounded that way on the wall clock - one
+	// start recorded late and the next on time look close, and it fell under
+	// a 24 ms slack on a loaded box (23.3 ms). The neighbour gaps are checked
+	// on the lane's own timeline in TestSNILaneReserveSpacesNeighbours; this
+	// one checks that acquire actually waits out what the lane reserved.
+	for k := range at {
+		if early := t0.Add(time.Duration(k) * spacing).Sub(at[k]); early > 0 {
+			t.Fatalf("handshake start %d came %v before t0 + %d spacings", k, early, k)
 		}
+	}
+}
+
+// TestSNILaneReserveSpacesNeighbours checks the reservations the gate's
+// waits come from, with the clock held still so load cannot blur them:
+// callers queued at the same instant get starts exactly one spacing apart,
+// so no two neighbours land closer than that, and none is pushed later
+// than the queue requires.
+func TestSNILaneReserveSpacesNeighbours(t *testing.T) {
+	const spacing = 30 * time.Millisecond
+	now := time.Unix(1_700_000_000, 0)
+
+	var l sniLane
+	for k := range 8 {
+		if got, want := l.reserve(now, spacing), time.Duration(k)*spacing; got != want {
+			t.Fatalf("reservation %d at a fixed now waits %v, want %v", k, got, want)
+		}
+	}
+
+	// A caller arriving once the queue has passed starts at once, and the
+	// next one is a full spacing behind it, not behind the old queue.
+	later := now.Add(time.Hour)
+	if got := l.reserve(later, spacing); got != 0 {
+		t.Fatalf("reservation after the queue drained waits %v, want 0", got)
+	}
+	if got := l.reserve(later.Add(spacing/3), spacing); got != spacing-spacing/3 {
+		t.Fatalf("reservation %v after the last start waits %v, want %v", spacing/3, got, spacing-spacing/3)
 	}
 }
 
