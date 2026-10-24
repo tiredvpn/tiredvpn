@@ -806,10 +806,11 @@ func (sc *HTTP2StegoConn) KeepAlive(quiet func() time.Duration, alive func() boo
 		silent := time.Duration(stegoMono() - sc.lastWrite.Load())
 		if silent >= q {
 			if sc.lastOwnerWrite.Load() != 0 && (alive == nil || alive()) {
-				if err := sc.writeKeepalive(); err != nil {
+				wrote, err := sc.writeKeepalive(q)
+				if err != nil {
 					return
 				}
-				if sent != nil {
+				if wrote && sent != nil {
 					sent()
 				}
 			}
@@ -828,11 +829,24 @@ func (sc *HTTP2StegoConn) OwnerDone() {
 	sc.ownerDoneOnce.Do(func() { close(sc.ownerDone) })
 }
 
+// stegoKeepaliveLocked, when a test sets it, runs once writeKeepalive holds
+// sc.mu, before it looks at the conn's last write again. Nil in production.
+var stegoKeepaliveLocked atomic.Pointer[func()]
+
 // writeKeepalive writes an empty stego DATA frame, under a write deadline
-// of its own like the read path's writes (readPathWrite).
-func (sc *HTTP2StegoConn) writeKeepalive() error {
+// of its own like the read path's writes (readPathWrite), unless something
+// went out within quiet after all: KeepAlive decided before it held sc.mu,
+// and a frame written while it waited was followed by an empty one at
+// once, a pair (P3-5 of the round-9 review). It says whether it wrote.
+func (sc *HTTP2StegoConn) writeKeepalive(quiet time.Duration) (bool, error) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
+	if f := stegoKeepaliveLocked.Load(); f != nil {
+		(*f)()
+	}
+	if time.Duration(stegoMono()-sc.lastWrite.Load()) < quiet {
+		return false, nil
+	}
 	var err error
 	sc.readPathWrite(func() {
 		if sc.tunMode {
@@ -841,7 +855,7 @@ func (sc *HTTP2StegoConn) writeKeepalive() error {
 			_, err = sc.writeViaData(nil)
 		}
 	})
-	return err
+	return err == nil, err
 }
 
 // readPathWrite runs write, a write the read path makes on its own, under a

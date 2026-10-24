@@ -144,3 +144,52 @@ func TestARestoreLeavesClosesBoundAlone(t *testing.T) {
 		t.Fatal("the restore put the owner's zero deadline back over Close's bound")
 	}
 }
+
+// writeCountConn counts the writes on it.
+type writeCountConn struct {
+	net.Conn
+	mu     sync.Mutex
+	writes int
+}
+
+func (c *writeCountConn) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	c.writes++
+	c.mu.Unlock()
+	return c.Conn.Write(p)
+}
+
+func (c *writeCountConn) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.writes
+}
+
+// TestAKeepaliveLooksAgainWithTheWriterLockHeld is the relay half of P3-5
+// of the round-9 review: KeepAlive saw the conn quiet, then waited for
+// sc.mu and wrote without looking again, so a frame that went out while it
+// waited was followed by an empty one at once. Here a frame is stamped just
+// as the keepalive gets the lock: nothing may be written.
+func TestAKeepaliveLooksAgainWithTheWriterLockHeld(t *testing.T) {
+	a, b := net.Pipe()
+	t.Cleanup(func() { a.Close(); b.Close() })
+	go func() { _, _ = io.Copy(io.Discard, b) }()
+	cc := &writeCountConn{Conn: a}
+	sc := NewHTTP2StegoConn(cc, []byte("stego-interleave-secret"), true, NaivePaddingMinimal, nil)
+	hook := func() { sc.lastWrite.Store(stegoMono()) }
+	stegoKeepaliveLocked.Store(&hook)
+	t.Cleanup(func() { stegoKeepaliveLocked.Store(nil) })
+	before := cc.count()
+	wrote, err := sc.writeKeepalive(time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wrote || cc.count() != before {
+		t.Fatalf("a keepalive went right behind a frame (wrote=%v, %d writes)", wrote, cc.count()-before)
+	}
+	stegoKeepaliveLocked.Store(nil)
+	sc.lastWrite.Store(stegoMono() - int64(2*time.Hour))
+	if wrote, err := sc.writeKeepalive(time.Hour); err != nil || !wrote {
+		t.Fatalf("a keepalive on a quiet conn did not go (wrote=%v): %v - the test proves nothing", wrote, err)
+	}
+}
