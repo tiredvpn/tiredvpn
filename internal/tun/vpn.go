@@ -1751,6 +1751,20 @@ func init() {
 // uplink had been silent. Nil in production.
 var uplinkTimerReset atomic.Pointer[func(next, quiet, silent time.Duration)]
 
+// uplinkKeepaliveSent, when a test sets it, is called for each uplink
+// keepalive written. Nil in production.
+var uplinkKeepaliveSent atomic.Pointer[func()]
+
+// SetUplinkKeepaliveSent sets the hook for a test in another package, nil
+// to clear it.
+func SetUplinkKeepaliveSent(f func()) {
+	if f == nil {
+		uplinkKeepaliveSent.Store(nil)
+		return
+	}
+	uplinkKeepaliveSent.Store(&f)
+}
+
 // uplinkConnTaken, when a test sets it, runs once the uplink keepalive has
 // taken the conn and before it looks at the uplink's stamp again. Nil in
 // production.
@@ -1826,6 +1840,9 @@ func (v *VPNClient) keepUplinkAlive() {
 					} else {
 						v.lastTx.Store(monoNow())
 						log.Debug("Sent keepalive packet (uplink silent %v)", silent.Round(time.Millisecond))
+						if f := uplinkKeepaliveSent.Load(); f != nil {
+							(*f)()
+						}
 					}
 				}
 				quiet = (*uplinkKeepaliveDraw.Load())()

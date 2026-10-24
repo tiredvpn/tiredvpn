@@ -121,7 +121,10 @@ func newTunApp(fd int) *tunApp {
 	go func() {
 		buf := make([]byte, 2048)
 		for {
-			if _, err := unix.Read(fd, buf); err != nil {
+			// The end of the stream is a 0-byte read, not an error. Read
+			// on past it, the loop took the next test's socket, which got
+			// the same descriptor number, and stole its packets.
+			if n, err := unix.Read(fd, buf); err != nil || n == 0 {
 				return
 			}
 			a.got.Add(1)

@@ -4,13 +4,13 @@ import (
 	"context"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/unix"
 
 	"github.com/tiredvpn/tiredvpn/internal/endpoint"
-	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
 	"github.com/tiredvpn/tiredvpn/internal/tun"
 )
@@ -28,8 +28,9 @@ func TestAnIdlePollingSessionGetsNoUplinkKeepalive(t *testing.T) {
 	})
 	t.Cleanup(func() { tun.SetUplinkKeepaliveDraw(restore) })
 	out := captureLog(t)
-	log.SetLevel(log.LevelDebug)
-	t.Cleanup(func() { log.SetLevel(log.LevelInfo) })
+	var sent atomic.Int64
+	tun.SetUplinkKeepaliveSent(func() { sent.Add(1) })
+	t.Cleanup(func() { tun.SetUplinkKeepaliveSent(nil) })
 
 	secret := []byte("relay-leg-secret-0123456789abcdef")
 	exit := newLegExit(t, secret)
@@ -64,7 +65,7 @@ func TestAnIdlePollingSessionGetsNoUplinkKeepalive(t *testing.T) {
 
 	// Five of the longest draws: the old client sent at least four.
 	time.Sleep(5 * 45 * time.Second / legScale)
-	if n := strings.Count(out.String(), "Sent keepalive packet (uplink silent"); n != 0 {
+	if n := sent.Load(); n != 0 {
 		t.Fatalf("%d uplink keepalives on an idle Polling session", n)
 	}
 }
