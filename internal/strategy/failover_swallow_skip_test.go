@@ -231,17 +231,20 @@ func TestASuccessOnOneFamilyKeepsTheOthersSkipList(t *testing.T) {
 // and a phone may sleep between two cores. Stamped on the monotonic clock,
 // which stops during the sleep, a run or a storm from before a long doze
 // still counted after waking. Both are stamped here through the real paths
-// - a swallowed cycle, a session started as the tunnel starts one - and must
-// carry no monotonic reading.
+// - an unanswered session handshake, a session started as the tunnel starts
+// one - and must carry no monotonic reading.
 func TestStampsThatCrossACoreRestartAreWallClock(t *testing.T) {
 	a, b := newHelloListener(t), newHelloListener(t)
 	m := newSilenceManager(t, 300*time.Millisecond, a.addr, b.addr)
-	dead := map[string]bool{a.addr: true}
-	reality := &swallowAtGreeter{protectedGreeter{id: "reality", priority: 5}, dead}
+	reality := &protectedGreeter{id: "reality", priority: 5}
 	m.Register(reality)
-	m.Register(&swallowAtGreeter{protectedGreeter{id: "polling", priority: 6}, dead})
-	markConnected(m, reality)
-	connectCycles(t, m, 1, 500*time.Millisecond)
+	m.Register(&protectedGreeter{id: "polling", priority: 6})
+	// The swallow record is stamped where every booking stamps it
+	// (swallowRecordLocked). Booked here by an unanswered session handshake,
+	// not by a 500 ms cycle racing its swallowed attempts under load (P3-10
+	// of the round-8 review).
+	ca, _ := m.selector().CandidateForAddr(a.addr)
+	m.HandshakeUnanswered(reality, ca, true)
 	m.mu.RLock()
 	var stamps []time.Time
 	for _, r := range m.swallowed {

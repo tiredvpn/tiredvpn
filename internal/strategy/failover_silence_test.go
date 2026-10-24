@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -254,6 +255,52 @@ func TestNetUnreachableIsNotSilence(t *testing.T) {
 type swallowingStrategy struct {
 	id       string
 	priority int
+	// deadlines, when set, records the deadline of every attempt.
+	deadlines *deadlineLog
+}
+
+// deadlineLog records attempt deadlines.
+type deadlineLog struct {
+	mu sync.Mutex
+	at []time.Time
+}
+
+func (l *deadlineLog) add(ctx context.Context) {
+	if d, ok := ctx.Deadline(); ok {
+		l.mu.Lock()
+		l.at = append(l.at, d)
+		l.mu.Unlock()
+	}
+}
+
+// latest is the latest deadline recorded, zero if none.
+func (l *deadlineLog) latest() time.Time {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out time.Time
+	for _, d := range l.at {
+		if d.After(out) {
+			out = d
+		}
+	}
+	return out
+}
+
+// roomStrategy connects at once: a transport whose need the test judges by
+// the deadline it was given rather than by spending it.
+type roomStrategy struct {
+	id       string
+	priority int
+}
+
+func (s *roomStrategy) Name() string                        { return s.id }
+func (s *roomStrategy) ID() string                          { return s.id }
+func (s *roomStrategy) Priority() int                       { return s.priority }
+func (s *roomStrategy) RequiresServer() bool                { return true }
+func (s *roomStrategy) Description() string                 { return "connects at once" }
+func (s *roomStrategy) Probe(context.Context, string) error { return nil }
+func (s *roomStrategy) Connect(ctx context.Context, target string) (net.Conn, error) {
+	return (&greetingStrategy{id: s.id}).Connect(ctx, target)
 }
 
 func (s *swallowingStrategy) Name() string                        { return s.id }
@@ -263,6 +310,9 @@ func (s *swallowingStrategy) RequiresServer() bool                { return true 
 func (s *swallowingStrategy) Description() string                 { return "handshake swallowed" }
 func (s *swallowingStrategy) Probe(context.Context, string) error { return nil }
 func (s *swallowingStrategy) Connect(ctx context.Context, target string) (net.Conn, error) {
+	if s.deadlines != nil {
+		s.deadlines.add(ctx)
+	}
 	<-ctx.Done()
 	return nil, fmt.Errorf("reality: serverhello read failed: %w", ctx.Err())
 }
@@ -347,28 +397,45 @@ func (s *slowStrategy) Connect(ctx context.Context, target string) (net.Conn, er
 // little for a Polling handshake of a couple of seconds - so a live server was
 // parked without Polling ever getting through. Scaled 1:10: a 3 s connect
 // timeout, a 1.5 s cycle, Polling needing 0.25 s.
+//
+// The room is judged by the deadlines the scan handed out, not by a Polling
+// that sleeps its 0.25 s against the cycle: under load the swallowed attempts
+// wake late and the sleep lost the race (P3-10 of the round-8 review). The
+// last swallowed attempt's deadline has to leave Polling's need before the
+// cycle's end; Polling, given that room, connects at once.
 func TestDesktopRetriesAreNotTwoSilentTransports(t *testing.T) {
+	const need = 250 * time.Millisecond
 	for _, tc := range []struct {
 		name  string
-		extra Strategy // a second swallowed transport ahead of Polling, or nil
+		extra bool // a second swallowed transport ahead of Polling
 	}{
-		{"REALITY swallowed", nil},
-		{"REALITY and WS swallowed", &swallowingStrategy{id: "ws", priority: 5}},
+		{"REALITY swallowed", false},
+		{"REALITY and WS swallowed", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			live := newHelloListener(t)
 			other := newHelloListener(t)
 			m := newSilenceManager(t, 3*time.Second, live.addr, other.addr)
 			m.maxRetries = 2 // the desktop default
-			m.Register(&swallowingStrategy{id: "reality", priority: 4})
-			if tc.extra != nil {
-				m.Register(tc.extra)
+			var swallowedUntil deadlineLog
+			m.Register(&swallowingStrategy{id: "reality", priority: 4, deadlines: &swallowedUntil})
+			if tc.extra {
+				m.Register(&swallowingStrategy{id: "ws", priority: 5, deadlines: &swallowedUntil})
 			}
-			m.Register(&slowStrategy{id: "polling", priority: 6, delay: 250 * time.Millisecond})
+			polling := &roomStrategy{id: "polling", priority: 6}
+			m.Register(polling)
 
 			ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
 			defer cancel()
+			cycleEnd, _ := ctx.Deadline()
 			conn, s, err := m.Connect(ctx, "")
+			last := swallowedUntil.latest()
+			if last.IsZero() {
+				t.Fatal("no swallowed attempt - the test proves nothing")
+			}
+			if room := cycleEnd.Sub(last); room < need {
+				t.Fatalf("the swallowed attempts were given until %v before the cycle's end, Polling needs %v", room, need)
+			}
 			if err != nil {
 				t.Fatalf("Polling never got through: %v", err)
 			}
