@@ -195,3 +195,49 @@ func TestASparseDownloadThroughAProxyRelayKeepsItsLeg(t *testing.T) {
 		t.Fatal("the target never saw the end of the client's stream")
 	}
 }
+
+// TestAGoneClientLetsTheBridgeLegGo is the other side of the rule: a client
+// neither heard from nor acknowledging anything for the window is gone, and
+// the relay stops feeding its leg, which the exit's deadline then ends. Here
+// nothing flows either way after the setup.
+func TestAGoneClientLetsTheBridgeLegGo(t *testing.T) {
+	scaleLegClocks(t)
+	b := startRelayBridge(t)
+	deadline := time.Now().Add(relayClientActiveWindow() + 3*h2FrameReadTimeout())
+	for b.exit.ended.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if b.exit.ended.Load() == 0 {
+		t.Fatalf("the relay kept a silent client's leg for %v", relayClientActiveWindow()+3*h2FrameReadTimeout())
+	}
+}
+
+// TestClientLiveness: heard within the window is alive; so is a TCP that
+// acknowledged data within it; a TCP that has acknowledged nothing for the
+// window, or no conn at all, is not.
+func TestClientLiveness(t *testing.T) {
+	old := relayClientActiveWindowNs.Load()
+	relayClientActiveWindowNs.Store(int64(300 * time.Millisecond))
+	t.Cleanup(func() { relayClientActiveWindowNs.Store(old) })
+	never := func() (time.Duration, bool) { return 0, false }
+	if (clientLiveness{heard: func() (time.Duration, bool) { return 10 * time.Millisecond, true }}).alive() == false {
+		t.Fatal("a client heard 10 ms ago is not alive")
+	}
+	if (clientLiveness{heard: never}).alive() {
+		t.Fatal("a client never heard, with no conn, is alive")
+	}
+	relaySide, client := tcpPair(t)
+	t.Cleanup(func() { relaySide.Close(); client.Close() })
+	go func() { _, _ = io.Copy(io.Discard, client) }()
+	time.Sleep(400 * time.Millisecond)
+	if (clientLiveness{conn: relaySide, heard: never}).alive() {
+		t.Fatal("a TCP that acknowledged nothing for the window is alive")
+	}
+	if _, err := relaySide.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if !(clientLiveness{conn: relaySide, heard: never}).alive() {
+		t.Fatal("a TCP that acknowledged data 50 ms ago is not alive")
+	}
+}
