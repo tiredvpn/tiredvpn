@@ -121,3 +121,44 @@ func TestTheUplinkKeepaliveLooksAgainWithTheConnInHand(t *testing.T) {
 		t.Fatal("a keepalive went right behind a frame that went up as the conn was taken")
 	}
 }
+
+// TestANumericNetworkIDKeepsTheCommand is P3-2 of the round-8 review:
+// Kotlin's put("network_id", network.networkHandle) writes a JSON number,
+// and the number made the whole command undecodable - dropped, unanswered.
+func TestANumericNetworkIDKeepsTheCommand(t *testing.T) {
+	var mu sync.Mutex
+	var named []string
+	h := newCtlHarnessWith(t, &ControlConfig{MTU: 1280, NetworkFn: func(id string) {
+		mu.Lock()
+		named = append(named, id)
+		mu.Unlock()
+	}})
+	for _, tc := range []struct{ cmd, want string }{
+		{`{"command":"status","network_id":432902426637}`, "432902426637"},
+		{`{"command":"status","network_id":"101"}`, "101"},
+		{`{"command":"status","network_id":true}`, ""},
+	} {
+		select {
+		case resp := <-h.sendAsync(tc.cmd+"\n", -1):
+			if resp.Status == "" || resp.Status == "error" || resp.Status == "read-failed" {
+				t.Fatalf("%s answered %+v", tc.cmd, resp)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("%s was not answered", tc.cmd)
+		}
+		mu.Lock()
+		last := ""
+		if len(named) > 0 {
+			last = named[len(named)-1]
+		}
+		if tc.want != "" && last != tc.want {
+			t.Fatalf("%s: the network named is %q, want %q", tc.cmd, last, tc.want)
+		}
+		mu.Unlock()
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(named) != 2 {
+		t.Fatalf("networks named %q, want the two valid ones only", named)
+	}
+}
