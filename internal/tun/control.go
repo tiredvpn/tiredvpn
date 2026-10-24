@@ -27,7 +27,29 @@ type ControlCommand struct {
 	// NetworkID names the network the command is sent on, opaque to the
 	// core: the Android app sends its Network handle. Optional, on
 	// "connect", "network_changed" and "reconnect". See NetworkFn.
-	NetworkID string `json:"network_id,omitempty"`
+	NetworkID NetworkID `json:"network_id,omitempty"`
+}
+
+// NetworkID is a command's network_id: a string, or the JSON number
+// Kotlin's put("network_id", network.networkHandle) writes. A number made
+// the whole command undecodable, and it was dropped unanswered (P3-2 of the
+// round-8 review). Any other value is ignored, not the command with it.
+type NetworkID string
+
+func (n *NetworkID) UnmarshalJSON(b []byte) error {
+	var s string
+	if json.Unmarshal(b, &s) == nil {
+		*n = NetworkID(s)
+		return nil
+	}
+	var num json.Number
+	if json.Unmarshal(b, &num) == nil {
+		*n = NetworkID(num.String())
+		return nil
+	}
+	log.Warn("Control: ignoring a network_id that is neither a string nor a number (%q)", clip(b))
+	*n = ""
+	return nil
 }
 
 // ControlResponse represents response to Android app
@@ -477,13 +499,13 @@ func (cs *ControlServer) readControl(conn *net.UnixConn, batches chan<- controlB
 // "" for either that is missing.
 func controlCommandHead(data []byte) (command, network string) {
 	var cmd struct {
-		Command   string `json:"command"`
-		NetworkID string `json:"network_id"`
+		Command   string    `json:"command"`
+		NetworkID NetworkID `json:"network_id"`
 	}
 	if json.Unmarshal(data, &cmd) != nil {
 		return "", ""
 	}
-	return cmd.Command, cmd.NetworkID
+	return cmd.Command, string(cmd.NetworkID)
 }
 
 // closeReadWait is how long Close lets the control readers take in what the
@@ -653,8 +675,13 @@ func (cs *ControlServer) handleConnect(ctx context.Context) ControlResponse {
 	if err != nil {
 		conn.Close()
 		cs.serverConn = nil
-		if cs.config.HandshakeOutcomeFn != nil && IsHandshakeUnanswered(err) {
-			err = cs.config.HandshakeOutcomeFn(false, err)
+		if cs.config.HandshakeOutcomeFn != nil {
+			switch {
+			case IsHandshakeUnanswered(err):
+				err = cs.config.HandshakeOutcomeFn(false, err)
+			case IsHandshakeAnswered(err):
+				_ = cs.config.HandshakeOutcomeFn(true, nil)
+			}
 		}
 		return ControlResponse{Status: "error", Error: fmt.Sprintf("TUN handshake failed: %v", err)}
 	}
@@ -1671,7 +1698,7 @@ func (cs *ControlServer) performTUNHandshake(ctx context.Context) (assignedIP, s
 	// nothing past it, so the relay that follows starts frame-aligned; the conn
 	// it returns replaces cs.serverConn because it may carry the first byte of
 	// the first frame back to the relay.
-	resp, n, next, err := readHandshakeResponse(cs.serverConn, version, time.Now().Add(handshakeReadTimeout))
+	resp, n, next, err := readHandshakeResponse(cs.serverConn, version, time.Time{})
 	if !stop() {
 		return nil, nil, fmt.Errorf("handshake interrupted: %w", context.Cause(ctx))
 	}
@@ -1694,11 +1721,11 @@ func (cs *ControlServer) performTUNHandshake(ctx context.Context) (assignedIP, s
 	if resp[0] != 0x00 {
 		switch resp[0] {
 		case 0x01:
-			return nil, nil, fmt.Errorf("IP pool exhausted")
+			return nil, nil, fmt.Errorf("%w: IP pool exhausted", errHandshakeRefused)
 		case 0x02:
-			return nil, nil, fmt.Errorf("no IP pool configured")
+			return nil, nil, fmt.Errorf("%w: no IP pool configured", errHandshakeRefused)
 		default:
-			return nil, nil, fmt.Errorf("server error: %d", resp[0])
+			return nil, nil, HandshakeRefused(resp[0])
 		}
 	}
 

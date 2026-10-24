@@ -745,10 +745,12 @@ func reconnectTUN(ctx context.Context, mgr *strategy.Manager, serverAddr string,
 			// Booked on the server like the desktop's (R1 of the fix9 stand
 			// run): the transport connected, the server said nothing.
 			err = fmt.Errorf("%w: %w", mgr.HandshakeUnanswered(sess.strat, sess.cand, sess.hasCand), err)
+		} else if tun.IsHandshakeAnswered(err) {
+			mgr.HandshakeAnswered(sess.strat, sess.cand, sess.hasCand)
 		}
 		return tun.ReconnectResult{}, reconnectedSession{}, err
 	}
-	mgr.HandshakeAnswered(sess.cand, sess.hasCand)
+	mgr.HandshakeAnswered(sess.strat, sess.cand, sess.hasCand)
 
 	log.Info("Reconnect handshake complete (server: %s, assigned: %s)", serverIP, assignedIP)
 
@@ -762,12 +764,20 @@ func reconnectTUN(ctx context.Context, mgr *strategy.Manager, serverAddr string,
 }
 
 // reconnectHandshake runs sendReconnectHandshake so that cancelling ctx ends
-// it. The response read is bounded by ctx's deadline (none: the reader's
-// default), not by ctx itself, so a cancelled ctx - the control server
-// closing - closes conn to cut the read short. On error the caller closes
-// conn.
+// it. The response read is bounded by ctx's deadline when that comes before
+// the reader's default, not by ctx itself, so a cancelled ctx - the control
+// server closing - closes conn to cut the read short. On error the caller
+// closes conn.
 func reconnectHandshake(ctx context.Context, conn net.Conn, currentIP net.IP, mtu int, dualStack bool) (tunnelConn net.Conn, serverIP, assignedIP, serverIP6, assignedIP6 net.IP, err error) {
+	// The read waits the full handshake wait at most (zero: the reader's
+	// own): one that runs out with ctx still live is the server's silence,
+	// one that ctx cuts short says nothing (tun.IsHandshakeUnanswered).
+	// Bounded by ctx's deadline alone, the read and ctx ran out at the same
+	// moment and raced.
 	deadline, _ := ctx.Deadline()
+	if deadline.After(time.Now().Add(tun.HandshakeReadTimeout())) {
+		deadline = time.Time{}
+	}
 	stop := context.AfterFunc(ctx, func() { conn.Close() })
 	tunnelConn, serverIP, assignedIP, serverIP6, assignedIP6, err = sendReconnectHandshake(conn, currentIP, mtu, dualStack, deadline)
 	if !stop() {
@@ -803,7 +813,7 @@ func sendReconnectHandshake(conn net.Conn, currentIP net.IP, mtu int, dualStack 
 	handshake[7] = version
 
 	if _, err := conn.Write(handshake); err != nil {
-		return nil, nil, nil, nil, nil, fmt.Errorf("handshake write failed: %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("handshake write failed: %w", tun.HandshakeNotSent(err))
 	}
 
 	// Read the response for the version just sent: exactly the response
@@ -822,7 +832,7 @@ func sendReconnectHandshake(conn net.Conn, currentIP net.IP, mtu int, dualStack 
 	}
 
 	if resp[0] != 0x00 {
-		return nil, nil, nil, nil, nil, fmt.Errorf("server rejected reconnect: status=%d", resp[0])
+		return nil, nil, nil, nil, nil, fmt.Errorf("server rejected reconnect: %w", tun.HandshakeRefused(resp[0]))
 	}
 
 	serverIP = net.IP(resp[1:5])

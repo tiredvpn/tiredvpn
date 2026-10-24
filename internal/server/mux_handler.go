@@ -198,7 +198,7 @@ func (h *MuxHandler) handleStream(ctx context.Context, stream net.Conn) {
 	streamLogger.Debug("Connected to %s, starting relay", targetAddr)
 
 	// Bidirectional relay
-	bytesUp, bytesDown := h.relay(stream, targetConn)
+	bytesUp, bytesDown, why := h.relay(stream, targetConn)
 
 	// Update stats
 	atomic.AddInt64(&h.bytesUp, bytesUp)
@@ -214,7 +214,7 @@ func (h *MuxHandler) handleStream(ctx context.Context, stream net.Conn) {
 		h.srvCtx.registry.AddBytes(h.clientID, bytesUp, bytesDown)
 	}
 
-	streamLogger.Debug("Relay closed: up=%d down=%d", bytesUp, bytesDown)
+	streamLogger.Debug("Relay closed: up=%d down=%d: %s", bytesUp, bytesDown, why)
 }
 
 // relay copies data bidirectionally between stream and target.
@@ -228,9 +228,10 @@ func (h *MuxHandler) handleStream(ctx context.Context, stream net.Conn) {
 // framer's ReadFrame - leaking the whole upstream conn, its goroutines and
 // buffers. Under a storm that leak balloons to gigabytes and OOM-kills the
 // relay. Closing both ends on first completion bounds every stream's lifetime.
-func (h *MuxHandler) relay(stream, target net.Conn) (bytesUp, bytesDown int64) {
+func (h *MuxHandler) relay(stream, target net.Conn) (bytesUp, bytesDown int64, why string) {
 	var wg sync.WaitGroup
 	var up, down int64
+	var end relayEnd
 
 	var closeOnce sync.Once
 	closeBoth := func() {
@@ -245,21 +246,23 @@ func (h *MuxHandler) relay(stream, target net.Conn) (bytesUp, bytesDown int64) {
 	// Stream -> Target (upload)
 	go func() {
 		defer wg.Done()
-		n, _ := optimizedRelay(target, stream)
+		n, err := optimizedRelay(target, stream)
 		atomic.StoreInt64(&up, n)
+		end.note("the stream", "the target", err)
 		closeBoth()
 	}()
 
 	// Target -> Stream (download)
 	go func() {
 		defer wg.Done()
-		n, _ := optimizedRelay(stream, target)
+		n, err := optimizedRelay(stream, target)
 		atomic.StoreInt64(&down, n)
+		end.note("the target", "the stream", err)
 		closeBoth()
 	}()
 
 	wg.Wait()
-	return atomic.LoadInt64(&up), atomic.LoadInt64(&down)
+	return atomic.LoadInt64(&up), atomic.LoadInt64(&down), end.String()
 }
 
 // Stats returns current handler statistics

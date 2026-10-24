@@ -141,6 +141,13 @@ type health struct {
 	// only a useful session does (ReportSessionUseful).
 	deadStreak int
 
+	// deadParkUntil is when this candidate's park for dead sessions ends:
+	// the reason for the park, kept apart from deadStreak, which grows the
+	// next one. A useful session on the server's other address clears the
+	// streak, and the pool poll read the cleared streak as "not parked for
+	// dead sessions" and lifted a park in force (P2-1 of the round-8 review).
+	deadParkUntil time.Time
+
 	// probed records that the family probe has run for this candidate since the
 	// last ResetHealth. It is the replacement for the old ipv6CheckedOnce flag:
 	// the probe costs a dial, so it must not repeat on the hot reconnect path.
@@ -555,6 +562,7 @@ func (s *Selector) Next(now time.Time) (Candidate, bool) {
 		return Candidate{}, false
 	}
 	s.health[best].cooldownUntil = time.Time{}
+	s.health[best].deadParkUntil = time.Time{}
 	return s.cands[best], true
 }
 
@@ -604,6 +612,7 @@ func (s *Selector) Report(c Candidate, ok bool, latency time.Duration) {
 		h.consecutiveFailures = 0
 		h.backoff = 0
 		h.cooldownUntil = time.Time{}
+		h.deadParkUntil = time.Time{}
 		h.lastSuccess = now
 		h.probed = true
 		h.latencyEWMA = blendLatency(h.latencyEWMA, latency)
@@ -723,7 +732,9 @@ func (s *Selector) ReportDeadSession(c Candidate) (serverParked bool) {
 	park = min(park, s.cfg.MaxCooldown)
 	h.backoff = park
 	h.cooldownUntil = now.Add(s.jitter(park))
-	return s.addrVerdictLocked(idx, now)
+	serverParked = s.addrVerdictLocked(idx, now)
+	h.deadParkUntil = h.cooldownUntil
+	return serverParked
 }
 
 // chainLocked returns the verdict map of the server candidate idx belongs to.
@@ -781,15 +792,18 @@ func (s *Selector) addrVerdictLocked(idx int, now time.Time) (serverParked bool)
 	for j, c := range s.cands {
 		if c.EndpointIdx == ep && s.health[j].cooldownUntil.Before(until) {
 			s.health[j].cooldownUntil = until
+			if s.health[j].deadParkUntil.After(now) {
+				s.health[j].deadParkUntil = until
+			}
 		}
 	}
 	clear(verdicts)
 	return true
 }
 
-// ParkedForDeadSessions reports whether c is in cooldown with a dead-session
-// streak: parked because sessions there connect and then die, which a
-// completed TCP connect cannot speak against.
+// ParkedForDeadSessions reports whether c is in a park for dead sessions:
+// parked because sessions there connect and then die, which a completed TCP
+// connect cannot speak against.
 func (s *Selector) ParkedForDeadSessions(c Candidate) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -797,7 +811,8 @@ func (s *Selector) ParkedForDeadSessions(c Candidate) bool {
 	if !found {
 		return false
 	}
-	return s.health[idx].deadStreak > 0 && s.inCooldownLocked(idx, s.cfg.Now())
+	now := s.cfg.Now()
+	return s.health[idx].deadParkUntil.After(now) && s.inCooldownLocked(idx, now)
 }
 
 // Unpark clears c's cooldown, keeping its failure history. For a caller with
@@ -807,6 +822,7 @@ func (s *Selector) Unpark(c Candidate) {
 	defer s.mu.Unlock()
 	if idx, found := s.byAddr[c.Addr]; found {
 		s.health[idx].cooldownUntil = time.Time{}
+		s.health[idx].deadParkUntil = time.Time{}
 	}
 }
 
@@ -818,8 +834,8 @@ func (s *Selector) Unpark(c Candidate) {
 // c's own dead streak, while a verdict's park is the larger of the server's
 // and the address's, so a useful session on v6 left v4's park growing: 1m7s,
 // then 2m4s after 70 s of traffic (N14 of the fix9 stand run). A park in
-// force on another address stays: that family's failure is its own evidence,
-// and it runs out on its own.
+// force on another address stays, and so does its reason (deadParkUntil):
+// that family's failure is its own evidence, and it runs out on its own.
 func (s *Selector) ReportSessionUseful(c Candidate) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -921,6 +937,7 @@ type HealthRecord struct {
 	CooldownUntil       time.Time
 	Backoff             time.Duration
 	DeadStreak          int
+	DeadParkUntil       time.Time
 
 	// ServerBackoff is the server's own park (serverChain.backoff), the same
 	// on every address of one server. The chain's verdicts need no carrying:
@@ -945,7 +962,7 @@ func (s *Selector) ExportHealth() []HealthRecord {
 		sc := s.servers[c.EndpointIdx]
 		out[i] = HealthRecord{Addr: c.Addr, ConsecutiveFailures: h.consecutiveFailures, LastSuccess: h.lastSuccess,
 			LastFailure: h.lastFailure, CooldownUntil: h.cooldownUntil, Backoff: h.backoff, DeadStreak: h.deadStreak,
-			ServerBackoff: sc.backoff, ServerParkEnd: sc.until, ServerParked: sc.parked}
+			DeadParkUntil: h.deadParkUntil, ServerBackoff: sc.backoff, ServerParkEnd: sc.until, ServerParked: sc.parked}
 	}
 	return out
 }
@@ -964,6 +981,7 @@ func (s *Selector) ImportHealth(recs []HealthRecord) {
 		h := &s.health[idx]
 		h.consecutiveFailures, h.lastSuccess, h.lastFailure = r.ConsecutiveFailures, r.LastSuccess, r.LastFailure
 		h.cooldownUntil, h.backoff, h.deadStreak = r.CooldownUntil, r.Backoff, r.DeadStreak
+		h.deadParkUntil = r.DeadParkUntil
 		sc := &s.servers[s.cands[idx].EndpointIdx]
 		if r.ServerBackoff > sc.backoff {
 			sc.backoff, sc.until, sc.parked = r.ServerBackoff, r.ServerParkEnd, r.ServerParked

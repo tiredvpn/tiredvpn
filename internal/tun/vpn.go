@@ -189,15 +189,15 @@ type VPNClient struct {
 	// keepalive echoes move lastRx, not this. Zero until the first one.
 	lastData time.Time
 
-	// stall follows the session's TCP flows for the stall detector
-	// (watchStalls): one table per tunnel connection, replaced together with
-	// conn under mu, so whatever works on a table works on its own session.
 	// lastTx is a monoNow stamp of the last frame written up the tunnel,
 	// keepalives included (keepUplinkAlive).
 	lastTx atomic.Int64
 
+	// stall follows the session's TCP flows for the stall detector
+	// (watchStalls): one table per tunnel connection, replaced together with
+	// conn under mu, so whatever works on a table works on its own session.
+	stall *flowTable
 	// keepaliveEchoes counts the zero-length frames read off the tunnel.
-	stall           *flowTable
 	keepaliveEchoes atomic.Uint64
 
 	// connCancel cancels the context of an in-flight connect() so Stop() can
@@ -747,6 +747,9 @@ func (v *VPNClient) sendProbeFrame(payload []byte) error {
 	}
 	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	_, err := conn.Write(frame)
+	if err == nil {
+		v.lastTx.Store(monoNow())
+	}
 	return err
 }
 
@@ -1025,9 +1028,12 @@ func (v *VPNClient) connect(parent context.Context) error {
 			// heard nothing (R1 of the fix9 stand run).
 			return fmt.Errorf("%w: %w", v.manager.HandshakeUnanswered(strat, cand, hasCand), err)
 		}
+		if IsHandshakeAnswered(err) {
+			v.manager.HandshakeAnswered(strat, cand, hasCand)
+		}
 		return err
 	}
-	v.manager.HandshakeAnswered(cand, hasCand)
+	v.manager.HandshakeAnswered(strat, cand, hasCand)
 	// From here on the tunnel is read through tunnelConn: the handshake reader
 	// may have had to look at the first byte of the first frame.
 	conn = tunnelConn
@@ -1155,7 +1161,7 @@ func (v *VPNClient) doHandshake(conn net.Conn, localIP net.IP) ([]byte, int, net
 	// Extended v1 (14 bytes): [status:1][serverIP:4][clientIP:4][flags:1][portStart:2][portEnd:2]
 	// Extended v2 (20+ bytes): [status:1][serverIP:4][clientIP:4][flags:1][portStart:2][portEnd:2][hopInterval:4][strategy:1][seedLen:1][seed:0-32]
 	// Dual-stack (v4): the version-dependent layout followed by [serverIP6:16][clientIP6:16]
-	resp, n, conn, err := readHandshakeResponse(conn, v.handshakeVersion(), time.Now().Add(handshakeReadTimeout))
+	resp, n, conn, err := readHandshakeResponse(conn, v.handshakeVersion(), time.Time{})
 	if err != nil {
 		return nil, 0, nil, err
 	}
@@ -1176,16 +1182,42 @@ func (v *VPNClient) doHandshake(conn net.Conn, localIP net.IP) ([]byte, int, net
 }
 
 // IsHandshakeUnanswered reports whether a session handshake failed because
-// the request went out and no answer came before the read deadline.
+// the request went out and no byte of an answer came in the full
+// handshakeReadTimeout. A wait the caller's budget cut short says nothing
+// about the server - on a reconnect a late connect leaves the handshake what
+// is left of the cycle, and booking that as the server's silence parked
+// healthy servers (P2-2 of the round-8 review) - and neither does a request
+// that never left or an answer that came in part.
 func IsHandshakeUnanswered(err error) bool {
-	if errors.Is(err, errHandshakeNotSent) || errors.Is(err, errHandshakeRefused) {
+	switch {
+	case errors.Is(err, errHandshakeNotSent), errors.Is(err, errHandshakeRefused),
+		errors.Is(err, errHandshakeCutShort), errors.Is(err, errHandshakePartlyAnswered),
+		errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 		return false
-	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		return true // the cycle ran out while the handshake waited
 	}
 	var ne net.Error
 	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// IsHandshakeAnswered reports whether a failed session handshake was
+// answered all the same: refused with an error status, or answered in part.
+// Either ends the server's run of unanswered handshakes (P3-4 of the
+// round-8 review).
+func IsHandshakeAnswered(err error) bool {
+	return errors.Is(err, errHandshakeRefused) || errors.Is(err, errHandshakePartlyAnswered)
+}
+
+// HandshakeRefused is the error for a handshake the server refused with
+// status, for a caller in another package (the client's reconnect).
+func HandshakeRefused(status byte) error {
+	return fmt.Errorf("%w: status=%d", errHandshakeRefused, status)
+}
+
+// HandshakeNotSent marks err, a failed write of the session handshake
+// request, as a request that never left: for a caller in another package
+// (the client's reconnect).
+func HandshakeNotSent(err error) error {
+	return fmt.Errorf("%w: %w", errHandshakeNotSent, err)
 }
 
 // errHandshakeNotSent and errHandshakeRefused are the two handshake failures
@@ -1196,6 +1228,15 @@ func IsHandshakeUnanswered(err error) bool {
 var (
 	errHandshakeNotSent = errors.New("TUN handshake request not sent")
 	errHandshakeRefused = errors.New("server error")
+)
+
+// errHandshakeCutShort and errHandshakePartlyAnswered are the handshake
+// failures that say nothing of whether the server answers (see
+// IsHandshakeUnanswered): the read ran out of the caller's budget before
+// its full wait, or part of the answer came.
+var (
+	errHandshakeCutShort       = errors.New("TUN handshake read cut short by the caller's budget")
+	errHandshakePartlyAnswered = errors.New("TUN handshake answered in part")
 )
 
 // handshakeRespBufSize fits the largest handshake response: the v2 layout
@@ -1236,6 +1277,10 @@ func ParseTUNHandshakeCapabilities(resp []byte) (ServerCapabilities, bool) {
 // response, used when the caller has no deadline of its own. A var so tests
 // can shorten it.
 var handshakeReadTimeout = 10 * time.Second
+
+// HandshakeReadTimeout is the full wait for a handshake response, the one
+// after which no answer is the server's (IsHandshakeUnanswered).
+func HandshakeReadTimeout() time.Duration { return handshakeReadTimeout }
 
 // SetHandshakeReadTimeout replaces handshakeReadTimeout for a test in
 // another package and returns the old value. Not for concurrent tests.
@@ -1291,14 +1336,24 @@ const handshakeFlagsGrace = 300 * time.Millisecond
 // deadlines of their own (the relay's bridge and pump), and a deadline left
 // behind would cut them off once it passed, however busy the tunnel was.
 func readHandshakeResponse(conn net.Conn, clientVersion byte, deadline time.Time) ([]byte, int, net.Conn, error) {
+	full := time.Now().Add(handshakeReadTimeout)
 	if deadline.IsZero() {
-		deadline = time.Now().Add(handshakeReadTimeout)
+		deadline = full
 	}
 	_ = conn.SetReadDeadline(deadline)
 	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
 
 	resp := make([]byte, handshakeRespBufSize)
-	if _, err := io.ReadFull(conn, resp[:9]); err != nil {
+	if got, err := io.ReadFull(conn, resp[:9]); err != nil {
+		switch {
+		case got > 0:
+			err = fmt.Errorf("%w: %w", errHandshakePartlyAnswered, err)
+		case deadline.Before(full):
+			// The caller's budget ran out before the full wait: the
+			// server may simply not have had the time (P2-2 of the
+			// round-8 review).
+			err = fmt.Errorf("%w: %w", errHandshakeCutShort, err)
+		}
 		return nil, 0, conn, err
 	}
 	if resp[0] != 0x00 {
@@ -1309,11 +1364,11 @@ func readHandshakeResponse(conn net.Conn, clientVersion byte, deadline time.Time
 	}
 	n, next, err := readHandshakeFlags(conn, resp, clientVersion)
 	if err != nil {
-		return nil, 0, conn, err
+		return nil, 0, conn, fmt.Errorf("%w: %w", errHandshakePartlyAnswered, err)
 	}
 	n, err = readResponseTail(next, resp, n, clientVersion)
 	if err != nil {
-		return nil, 0, conn, err
+		return nil, 0, conn, fmt.Errorf("%w: %w", errHandshakePartlyAnswered, err)
 	}
 	return resp, n, next, nil
 }
@@ -1696,6 +1751,11 @@ func init() {
 // uplink had been silent. Nil in production.
 var uplinkTimerReset atomic.Pointer[func(next, quiet, silent time.Duration)]
 
+// uplinkConnTaken, when a test sets it, runs once the uplink keepalive has
+// taken the conn and before it looks at the uplink's stamp again. Nil in
+// production.
+var uplinkConnTaken atomic.Pointer[func()]
+
 // SetUplinkKeepaliveDraw replaces the draw for a test and returns the one it
 // replaced.
 func SetUplinkKeepaliveDraw(draw func() time.Duration) func() time.Duration {
@@ -1719,6 +1779,12 @@ func monoNow() int64 { return int64(time.Since(monoBase)) }
 // reference distribution for it. A busy uplink, or the server-silence
 // keepalive every 10 s, keeps it from ever firing. A tick that comes before
 // the period is up waits out the rest of it, never a whole period.
+//
+// A transport that makes its own keepalives (strategy.KeepaliveMaker, HTTP
+// Polling) gets none: its polls already reach the exit, and a keepalive
+// written into it woke the idle poll loop out of its backoff - a 4-byte poll
+// and a run of fast ones every 20-45 s on a session that had sent only
+// backed-off empty polls (P2-4 of the round-8 review).
 func (v *VPNClient) keepUplinkAlive() {
 	defer func() {
 		if r := recover(); r != nil {
@@ -1741,19 +1807,30 @@ func (v *VPNClient) keepUplinkAlive() {
 		silent := time.Duration(monoNow() - v.lastTx.Load())
 		if silent >= quiet {
 			v.mu.Lock()
-			conn := v.conn
+			conn, strat := v.conn, v.strategy
 			v.mu.Unlock()
-			if conn != nil {
-				_ = conn.SetWriteDeadline(time.Now().Add(keepaliveWriteTimeout))
-				if _, err := conn.Write([]byte{0, 0, 0, 0}); err != nil {
-					v.connLost(conn, "keepalive write", uplinkFailed(err))
-				} else {
-					v.lastTx.Store(monoNow())
-					log.Debug("Sent keepalive packet (uplink silent %v)", silent.Round(time.Millisecond))
-				}
+			if f := uplinkConnTaken.Load(); f != nil {
+				(*f)()
 			}
-			quiet = (*uplinkKeepaliveDraw.Load())()
-			silent = 0
+			km, own := strat.(strategy.KeepaliveMaker)
+			own = own && km.MakesUpKeepalives()
+			// Looked at again with the conn in hand: a write may have gone
+			// up while the lock was waited for, and two keepalives back to
+			// back are a pair no client sends (P3-9 of the round-8 review).
+			silent = time.Duration(monoNow() - v.lastTx.Load())
+			if silent >= quiet {
+				if conn != nil && !own {
+					_ = conn.SetWriteDeadline(time.Now().Add(keepaliveWriteTimeout))
+					if _, err := conn.Write([]byte{0, 0, 0, 0}); err != nil {
+						v.connLost(conn, "keepalive write", uplinkFailed(err))
+					} else {
+						v.lastTx.Store(monoNow())
+						log.Debug("Sent keepalive packet (uplink silent %v)", silent.Round(time.Millisecond))
+					}
+				}
+				quiet = (*uplinkKeepaliveDraw.Load())()
+				silent = 0
+			}
 		}
 		next := max(quiet-silent, 10*time.Millisecond)
 		if f := uplinkTimerReset.Load(); f != nil {

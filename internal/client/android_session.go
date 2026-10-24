@@ -47,6 +47,28 @@ type androidSession struct {
 	network atomic.Pointer[string]
 	took    sync.Once
 	taken   atomic.Bool
+
+	// learnedOn is the network what mgr knows was learned on, which the
+	// carry is stamped with: the network at the takeover, then the one at
+	// each network-change reset. Not the last network_id read - the host
+	// names the new network before the reset, and a reconnect that ends
+	// before it left the old network's state stamped with the new one
+	// (P3-1 of the round-8 review).
+	learnedOn atomic.Pointer[string]
+}
+
+// learnedOnID is the network mgr's state was learned on, "" if none named.
+func (a *androidSession) learnedOnID() string {
+	if p := a.learnedOn.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
+
+// relearn records that mgr's state starts over on the network named now.
+func (a *androidSession) relearn() {
+	id := a.networkID()
+	a.learnedOn.Store(&id)
 }
 
 // networkID is the network the host last named, "" if none.
@@ -61,7 +83,8 @@ func (a *androidSession) networkID() string {
 // host named with its first command.
 func (a *androidSession) takeCarry() {
 	a.took.Do(func() {
-		carryInto(a.mgr, a.networkID())
+		a.relearn()
+		carryInto(a.mgr, a.learnedOnID())
 		a.taken.Store(true)
 	})
 }
@@ -140,6 +163,11 @@ func androidControlConfig(cfg *Config, mgr *strategy.Manager, dualStack bool, se
 		// so server knows this is a TUN session.
 		ReconnectFn: func(ctx context.Context, currentIP net.IP, mtu int, networkChanged bool) (tun.ReconnectResult, error) {
 			sess.takeCarry()
+			if networkChanged {
+				// reconnectTUN resets mgr for the new network before
+				// anything else.
+				sess.relearn()
+			}
 			res, r, err := reconnectTUN(ctx, mgr, cfg.ServerAddr, currentIP, mtu, dualStack, networkChanged)
 			if err == nil {
 				sess.started(r.strat, r.cand, r.hasCand)
@@ -198,7 +226,7 @@ func androidControlConfig(cfg *Config, mgr *strategy.Manager, dualStack bool, se
 			strat, cand, hasCand := sess.stratObj, sess.cand, sess.hasCand
 			sess.mu.Unlock()
 			if answered {
-				mgr.HandshakeAnswered(cand, hasCand)
+				mgr.HandshakeAnswered(strat, cand, hasCand)
 				return nil
 			}
 			return fmt.Errorf("%w: %w", mgr.HandshakeUnanswered(strat, cand, hasCand), err)
@@ -329,7 +357,7 @@ func carryFrom(mgr *strategy.Manager, sess *androidSession) {
 	androidCarry.route = mgr.RouteHistory()
 	androidCarry.pool = poolOf(mgr)
 	if sess != nil {
-		androidCarry.network = sess.networkID()
+		androidCarry.network = sess.learnedOnID()
 	}
 	// Wall clock (Round(0) drops the monotonic reading): a phone that sleeps
 	// between two cores must see the sleep in the carry's age (P3-3 of the
