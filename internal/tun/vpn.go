@@ -189,15 +189,15 @@ type VPNClient struct {
 	// keepalive echoes move lastRx, not this. Zero until the first one.
 	lastData time.Time
 
-	// stall follows the session's TCP flows for the stall detector
-	// (watchStalls): one table per tunnel connection, replaced together with
-	// conn under mu, so whatever works on a table works on its own session.
 	// lastTx is a monoNow stamp of the last frame written up the tunnel,
 	// keepalives included (keepUplinkAlive).
 	lastTx atomic.Int64
 
+	// stall follows the session's TCP flows for the stall detector
+	// (watchStalls): one table per tunnel connection, replaced together with
+	// conn under mu, so whatever works on a table works on its own session.
+	stall *flowTable
 	// keepaliveEchoes counts the zero-length frames read off the tunnel.
-	stall           *flowTable
 	keepaliveEchoes atomic.Uint64
 
 	// connCancel cancels the context of an in-flight connect() so Stop() can
@@ -747,6 +747,9 @@ func (v *VPNClient) sendProbeFrame(payload []byte) error {
 	}
 	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	_, err := conn.Write(frame)
+	if err == nil {
+		v.lastTx.Store(monoNow())
+	}
 	return err
 }
 
@@ -1748,6 +1751,11 @@ func init() {
 // uplink had been silent. Nil in production.
 var uplinkTimerReset atomic.Pointer[func(next, quiet, silent time.Duration)]
 
+// uplinkConnTaken, when a test sets it, runs once the uplink keepalive has
+// taken the conn and before it looks at the uplink's stamp again. Nil in
+// production.
+var uplinkConnTaken atomic.Pointer[func()]
+
 // SetUplinkKeepaliveDraw replaces the draw for a test and returns the one it
 // replaced.
 func SetUplinkKeepaliveDraw(draw func() time.Duration) func() time.Duration {
@@ -1771,6 +1779,12 @@ func monoNow() int64 { return int64(time.Since(monoBase)) }
 // reference distribution for it. A busy uplink, or the server-silence
 // keepalive every 10 s, keeps it from ever firing. A tick that comes before
 // the period is up waits out the rest of it, never a whole period.
+//
+// A transport that makes its own keepalives (strategy.KeepaliveMaker, HTTP
+// Polling) gets none: its polls already reach the exit, and a keepalive
+// written into it woke the idle poll loop out of its backoff - a 4-byte poll
+// and a run of fast ones every 20-45 s on a session that had sent only
+// backed-off empty polls (P2-4 of the round-8 review).
 func (v *VPNClient) keepUplinkAlive() {
 	defer func() {
 		if r := recover(); r != nil {
@@ -1793,19 +1807,30 @@ func (v *VPNClient) keepUplinkAlive() {
 		silent := time.Duration(monoNow() - v.lastTx.Load())
 		if silent >= quiet {
 			v.mu.Lock()
-			conn := v.conn
+			conn, strat := v.conn, v.strategy
 			v.mu.Unlock()
-			if conn != nil {
-				_ = conn.SetWriteDeadline(time.Now().Add(keepaliveWriteTimeout))
-				if _, err := conn.Write([]byte{0, 0, 0, 0}); err != nil {
-					v.connLost(conn, "keepalive write", uplinkFailed(err))
-				} else {
-					v.lastTx.Store(monoNow())
-					log.Debug("Sent keepalive packet (uplink silent %v)", silent.Round(time.Millisecond))
-				}
+			if f := uplinkConnTaken.Load(); f != nil {
+				(*f)()
 			}
-			quiet = (*uplinkKeepaliveDraw.Load())()
-			silent = 0
+			km, own := strat.(strategy.KeepaliveMaker)
+			own = own && km.MakesUpKeepalives()
+			// Looked at again with the conn in hand: a write may have gone
+			// up while the lock was waited for, and two keepalives back to
+			// back are a pair no client sends (P3-9 of the round-8 review).
+			silent = time.Duration(monoNow() - v.lastTx.Load())
+			if silent >= quiet {
+				if conn != nil && !own {
+					_ = conn.SetWriteDeadline(time.Now().Add(keepaliveWriteTimeout))
+					if _, err := conn.Write([]byte{0, 0, 0, 0}); err != nil {
+						v.connLost(conn, "keepalive write", uplinkFailed(err))
+					} else {
+						v.lastTx.Store(monoNow())
+						log.Debug("Sent keepalive packet (uplink silent %v)", silent.Round(time.Millisecond))
+					}
+				}
+				quiet = (*uplinkKeepaliveDraw.Load())()
+				silent = 0
+			}
 		}
 		next := max(quiet-silent, 10*time.Millisecond)
 		if f := uplinkTimerReset.Load(); f != nil {

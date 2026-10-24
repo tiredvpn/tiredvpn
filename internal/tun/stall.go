@@ -536,7 +536,14 @@ func (v *VPNClient) watchStalls() {
 		}
 		stall := suspect.stall
 		log.Info("Session suspect: a flow has waited %v for an answer - confirming with keepalives", stall.Round(time.Millisecond))
-		alive, sent, err := mon.confirm(v.stopCh, keepaliveSender(conn, v.stopCh), echoes.count)
+		send := keepaliveSender(conn, v.stopCh)
+		alive, sent, err := mon.confirm(v.stopCh, func() error {
+			err := send()
+			if err == nil {
+				v.lastTx.Store(monoNow()) // what went up, for keepUplinkAlive
+			}
+			return err
+		}, echoes.count)
 		v.mu.Lock()
 		current := v.conn == conn
 		v.mu.Unlock()
