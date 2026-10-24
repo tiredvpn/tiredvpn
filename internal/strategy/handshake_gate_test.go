@@ -64,6 +64,7 @@ func TestHandshakeGateEnforcesSpacing(t *testing.T) {
 	var mu sync.Mutex
 	var at []time.Time
 
+	t0 := time.Now()
 	var wg sync.WaitGroup
 	for range starts {
 		wg.Add(1)
@@ -92,12 +93,15 @@ func TestHandshakeGateEnforcesSpacing(t *testing.T) {
 			}
 		}
 	}
-	// Timer granularity makes the observed gap slightly noisy; allow 20% slack
-	// so this does not flake on a loaded CI box.
-	minGap := spacing - spacing/5
-	for i := 1; i < len(at); i++ {
-		if gap := at[i].Sub(at[i-1]); gap < minGap {
-			t.Fatalf("handshake starts %d and %d only %v apart, want >= %v", i-1, i, gap, minGap)
+	// The gate reserves start k at least k spacings after the first, which
+	// is no earlier than t0, and a timer never fires early: start k comes no
+	// sooner than t0 + k*spacing, however the machine is loaded. The gap
+	// between two neighbours, which this compared before, is not bounded
+	// that way - one start recorded late and the next on time look close -
+	// and it fell under the 24 ms slack on a loaded box (23.3 ms).
+	for k := range at {
+		if early := t0.Add(time.Duration(k) * spacing).Sub(at[k]); early > 0 {
+			t.Fatalf("handshake start %d came %v before t0 + %d spacings", k, early, k)
 		}
 	}
 }
