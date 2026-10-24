@@ -266,6 +266,15 @@ func (s *HTTP2StegoStrategy) Connect(ctx context.Context, target string) (net.Co
 // HTTP2StegoConn implements net.Conn with HTTP/2 steganography
 type HTTP2StegoConn struct {
 	net.Conn
+
+	// ownerWD is the write deadline the conn's owner last set; wdMu guards
+	// it apart from mu, which a blocked write holds.
+	wdMu    sync.Mutex
+	ownerWD time.Time
+
+	// writeFailed is set once a write on the conn failed (stegoWriter).
+	writeFailed atomic.Bool
+
 	secret      []byte
 	isClient    bool
 	paddingMode NaivePaddingMode
@@ -325,7 +334,7 @@ func NewHTTP2StegoConn(conn net.Conn, secret []byte, isClient bool, paddingMode 
 	}
 
 	// Initialize HTTP/2 framer
-	sc.framer = http2.NewFramer(conn, conn)
+	sc.framer = http2.NewFramer(stegoWriter{sc}, conn)
 	sc.framer.AllowIllegalWrites = true
 	sc.framer.AllowIllegalReads = true
 
@@ -654,19 +663,77 @@ func (sc *HTTP2StegoConn) proactiveFlushWindowUpdate() {
 }
 
 // stegoReadPathWriteTimeout bounds a write the read path makes on its own:
-// WINDOW_UPDATE credit, a SETTINGS ack.
-const stegoReadPathWriteTimeout = 10 * time.Second
+// WINDOW_UPDATE credit, a SETTINGS ack. Atomic so tests in other packages
+// can scale it (SetStegoReadPathWriteTimeout).
+var stegoReadPathWriteTimeoutNs atomic.Int64
+
+func init() { stegoReadPathWriteTimeoutNs.Store(int64(10 * time.Second)) }
+
+func stegoReadPathWriteTimeout() time.Duration {
+	return time.Duration(stegoReadPathWriteTimeoutNs.Load())
+}
+
+// SetStegoReadPathWriteTimeout replaces the read path's write deadline for
+// a test and returns the old one.
+func SetStegoReadPathWriteTimeout(d time.Duration) time.Duration {
+	return time.Duration(stegoReadPathWriteTimeoutNs.Swap(int64(d)))
+}
+
+// SetWriteDeadline records the owner's write deadline and sets it: the
+// conn's own writes (readPathWrite, Close) put it back when they are done.
+func (sc *HTTP2StegoConn) SetWriteDeadline(t time.Time) error {
+	sc.wdMu.Lock()
+	sc.ownerWD = t
+	sc.wdMu.Unlock()
+	return sc.Conn.SetWriteDeadline(t)
+}
+
+// SetDeadline is SetWriteDeadline and SetReadDeadline together, recorded the
+// same way.
+func (sc *HTTP2StegoConn) SetDeadline(t time.Time) error {
+	sc.wdMu.Lock()
+	sc.ownerWD = t
+	sc.wdMu.Unlock()
+	return sc.Conn.SetDeadline(t)
+}
+
+// restoreOwnerWD puts back the write deadline the conn's owner last set,
+// zero for an owner that sets none.
+func (sc *HTTP2StegoConn) restoreOwnerWD() {
+	sc.wdMu.Lock()
+	t := sc.ownerWD
+	sc.wdMu.Unlock()
+	_ = sc.Conn.SetWriteDeadline(t)
+}
+
+// stegoWriter is the framer's writer: the conn's writes, with a failed one
+// recorded for Close.
+type stegoWriter struct{ sc *HTTP2StegoConn }
+
+func (w stegoWriter) Write(p []byte) (int, error) {
+	n, err := w.sc.Conn.Write(p)
+	if err != nil {
+		w.sc.writeFailed.Store(true)
+	}
+	return n, err
+}
 
 // readPathWrite runs write, a write the read path makes on its own, under a
 // deadline of its own. The caller's last deadline belongs to the caller's
 // last write and may long have passed: a one-way download writes nothing
 // else, and a WINDOW_UPDATE flush that hit a stale deadline failed, which
 // tls.Conn makes permanent - every later write on the conn failed and the
-// tunnel died (P2-1 of the round-7 review). The deadline is left set: every
-// writer sets its own before it writes. Must be called with sc.mu held.
+// tunnel died (P2-1 of the round-7 review).
+//
+// The owner's deadline is put back afterwards. Left at now+10s it broke the
+// owners that set none - the relay's TUN bridge and its proxy relays write
+// upstream without a deadline - and the first write up more than 10 s after
+// a download failed for good (P1-1 of the round-8 review). Must be called
+// with sc.mu held.
 func (sc *HTTP2StegoConn) readPathWrite(write func()) {
-	_ = sc.SetWriteDeadline(time.Now().Add(stegoReadPathWriteTimeout))
+	_ = sc.Conn.SetWriteDeadline(time.Now().Add(stegoReadPathWriteTimeout()))
 	write()
+	sc.restoreOwnerWD()
 }
 
 // Write sends data using various steganographic channels
@@ -1242,10 +1309,22 @@ func (sc *HTTP2StegoConn) Close() error {
 	// review). A deadline of its own: whatever deadline the last write left
 	// may have passed, and a GOAWAY failing on it would spend a TLS record
 	// number before close_notify.
-	_ = sc.SetWriteDeadline(time.Now().Add(time.Second))
+	// The owner's deadline is put back after it, as after every write of
+	// the conn's own (readPathWrite).
+	_ = sc.Conn.SetWriteDeadline(time.Now().Add(time.Second))
 	sc.mu.Lock()
 	sc.framer.WriteGoAway(sc.nextStreamID, http2.ErrCodeNo, nil)
+	sc.restoreOwnerWD()
 	sc.mu.Unlock()
+	// A TLS write that failed spent a record number and may have left half
+	// a record on the wire; a close_notify after it reads as "bad record
+	// MAC" at the peer, which then logs a broken session for a close. Shut
+	// the socket under TLS instead: the peer reads the end of the stream.
+	if sc.writeFailed.Load() {
+		if tc, ok := sc.Conn.(interface{ NetConn() net.Conn }); ok {
+			return tc.NetConn().Close()
+		}
+	}
 	return sc.Conn.Close()
 }
 

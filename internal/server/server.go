@@ -206,6 +206,32 @@ func optimizedRelay(dst, src net.Conn) (int64, error) {
 	return io.CopyBuffer(dst, src, buf)
 }
 
+// relayEnd records what ended a two-way relay: the first end is the cause,
+// and the ends after it are the close it caused. A relay that logged only
+// its byte counts left a dead upstream and a client hanging up looking the
+// same (the round-8 stand never saw why a relay bridge closed).
+type relayEnd struct{ why atomic.Pointer[string] }
+
+// note records the end of the copy from src to dst, err nil for src closing
+// it, unless an earlier end is recorded.
+func (e *relayEnd) note(src, dst string, err error) {
+	why := src + " closed it"
+	if err != nil {
+		why = src + " to " + dst + ": " + err.Error()
+	}
+	e.set(why)
+}
+
+// set records why, unless an earlier end is recorded.
+func (e *relayEnd) set(why string) { e.why.CompareAndSwap(nil, &why) }
+
+func (e *relayEnd) String() string {
+	if w := e.why.Load(); w != nil {
+		return *w
+	}
+	return "no end recorded"
+}
+
 // isTimeout checks if error is a timeout error
 func isTimeout(err error) bool {
 	if err == nil {
@@ -1119,22 +1145,26 @@ func handleQUICConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 
 	wg.Add(2)
 
+	var end relayEnd
+
 	// Client -> Target
 	go func() {
 		defer wg.Done()
-		n, _ := optimizedRelay(targetConn, conn)
+		n, err := optimizedRelay(targetConn, conn)
 		atomic.AddInt64(&bytesUp, n)
+		end.note("the client", "the target", err)
 	}()
 
 	// Target -> Client
 	go func() {
 		defer wg.Done()
-		n, _ := optimizedRelay(conn, targetConn)
+		n, err := optimizedRelay(conn, targetConn)
 		atomic.AddInt64(&bytesDown, n)
+		end.note("the target", "the client", err)
 	}()
 
 	wg.Wait()
-	logger.Info("QUIC relay closed: up=%d down=%d", bytesUp, bytesDown)
+	logger.Info("QUIC relay closed: up=%d down=%d: %s", bytesUp, bytesDown, &end)
 
 	// Update metrics
 	if srvCtx.metrics != nil {
@@ -1792,8 +1822,8 @@ func runH2FrameLoop(connPtr *net.Conn, framerPtr **http2.Framer, hpackDec *hpack
 				// A TUN session's end, and what ended it: the read deadline,
 				// the client, or an error.
 				logger.Info("H2 TUN session ended: %s", legReadEnd(err, deadline))
-			} else if err != io.EOF {
-				logger.Debug("Frame read error: %v", err)
+			} else {
+				logger.Debug("H2 session ended: %s", legReadEnd(err, deadline))
 			}
 			return
 		}
@@ -3397,10 +3427,13 @@ func handleRawTunnel(conn net.Conn, srvCtx *serverContext, logger *log.Logger, c
 
 	wg.Add(2)
 
+	var end relayEnd
+
 	go func() {
 		defer wg.Done()
-		n, _ := optimizedRelay(targetConn, conn)
+		n, err := optimizedRelay(targetConn, conn)
 		atomic.AddInt64(&bytesUp, n)
+		end.note("the client", "the target", err)
 		if tc, ok := targetConn.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
@@ -3408,13 +3441,14 @@ func handleRawTunnel(conn net.Conn, srvCtx *serverContext, logger *log.Logger, c
 
 	go func() {
 		defer wg.Done()
-		n, _ := optimizedRelay(conn, targetConn)
+		n, err := optimizedRelay(conn, targetConn)
 		atomic.AddInt64(&bytesDown, n)
+		end.note("the target", "the client", err)
 	}()
 
 	wg.Wait()
 
-	logger.Info("Tunnel closed (up=%d, down=%d)", bytesUp, bytesDown)
+	logger.Info("Tunnel closed (up=%d, down=%d): %s", bytesUp, bytesDown, &end)
 
 	// Update metrics
 	if srvCtx.metrics != nil {
@@ -3743,15 +3777,15 @@ func relayTUNToUpstream(conn net.Conn, srvCtx *serverContext, logger *log.Logger
 	if idleTimeout <= 0 {
 		idleTimeout = defaultRelayIdleTimeout
 	}
-	runIdleWatchedBridge(conn, upstreamConn, idleTimeout, logger)
+	why := runIdleWatchedBridge(conn, upstreamConn, idleTimeout, logger)
 
-	logger.Info("Relay TUN bridge closed (client=%s)", conn.RemoteAddr())
+	logger.Info("Relay TUN bridge closed (client=%s): %s", conn.RemoteAddr(), why)
 }
 
 // runIdleWatchedBridge byte-copies traffic in both directions between a and b
 // and force-closes BOTH once no bytes flow in either direction for idleTimeout.
 // It returns when both copy directions have finished (peer close, error, or the
-// idle force-close).
+// idle force-close), with what ended the bridge first.
 //
 // The idle watchdog exists because SetReadDeadline cannot reap a stuck relay
 // bridge: the downstream may be an h2TunConn whose SetReadDeadline is a no-op,
@@ -3760,7 +3794,7 @@ func relayTUNToUpstream(conn net.Conn, srvCtx *serverContext, logger *log.Logger
 // copy goroutines stamp lastActivity on every read; the watchdog closes both
 // sides once the stamp ages past idleTimeout. Real traffic - including 10s TUN
 // keepalive frames - keeps the stamp fresh, so a live session is never reaped.
-func runIdleWatchedBridge(a, b net.Conn, idleTimeout time.Duration, logger *log.Logger) {
+func runIdleWatchedBridge(a, b net.Conn, idleTimeout time.Duration, logger *log.Logger) string {
 	var once sync.Once
 	closeBoth := func() {
 		once.Do(func() {
@@ -3769,6 +3803,7 @@ func runIdleWatchedBridge(a, b net.Conn, idleTimeout time.Duration, logger *log.
 		})
 	}
 
+	var end relayEnd
 	var lastActivity atomic.Int64
 	lastActivity.Store(monoNow())
 	watchdogDone := make(chan struct{})
@@ -3791,6 +3826,7 @@ func runIdleWatchedBridge(a, b net.Conn, idleTimeout time.Duration, logger *log.
 					if logger != nil {
 						logger.Info("Relay TUN bridge idle for %s, force-closing", idle.Round(time.Second))
 					}
+					end.set(fmt.Sprintf("idle for %s", idle.Round(time.Second)))
 					closeBoth()
 					return
 				}
@@ -3803,15 +3839,18 @@ func runIdleWatchedBridge(a, b net.Conn, idleTimeout time.Duration, logger *log.
 	go func() {
 		defer wg.Done()
 		defer closeBoth()
-		copyWithActivity(b, a, &lastActivity) // a -> b
+		_, err := copyWithActivity(b, a, &lastActivity) // a -> b
+		end.note("the client", "the upstream", err)
 	}()
 	go func() {
 		defer wg.Done()
 		defer closeBoth()
-		copyWithActivity(a, b, &lastActivity) // b -> a
+		_, err := copyWithActivity(a, b, &lastActivity) // b -> a
+		end.note("the upstream", "the client", err)
 	}()
 	wg.Wait()
 	close(watchdogDone)
+	return end.String()
 }
 
 // copyWithActivity is io.Copy with an activity stamp: it records a monotonic

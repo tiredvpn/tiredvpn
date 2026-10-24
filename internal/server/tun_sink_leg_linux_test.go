@@ -109,8 +109,12 @@ func newLegExit(t *testing.T, secret []byte) *legExit {
 	return e
 }
 
-// tunApp drains the exit's TUN so packets written to it never block.
-type tunApp struct{ fd int }
+// tunApp drains the exit's TUN so packets written to it never block; got
+// counts the packets that came out of it.
+type tunApp struct {
+	fd  int
+	got atomic.Int64
+}
 
 func newTunApp(fd int) *tunApp {
 	a := &tunApp{fd: fd}
@@ -120,6 +124,7 @@ func newTunApp(fd int) *tunApp {
 			if _, err := unix.Read(fd, buf); err != nil {
 				return
 			}
+			a.got.Add(1)
 		}
 	}()
 	return a
@@ -276,6 +281,45 @@ func TestARelayLegClosesCleanly(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "H2 TUN session ended: the peer closed it") {
 		t.Fatalf("the exit did not see a clean close:\n%s", out.String())
+	}
+}
+
+// TestARelayLegClosesCleanlyDuringAnUpload is P3-3 of the round-8 review:
+// Close cut the deadline whenever the write lock was taken, and on a busy
+// upload it is taken by a healthy write nearly always. The write was torn
+// and the exit read a broken stream. Close has to wait for it.
+func TestARelayLegClosesCleanlyDuringAnUpload(t *testing.T) {
+	out := &lockedLog{}
+	log.SetOutput(out)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	for i := range 5 {
+		exit, sink, clientIP, _ := dialLeg(t)
+		up := ipv4Packet(clientIP, net.IPv4(10, 8, 7, 9))
+		up = append(up, make([]byte, 1372)...)
+		binary.BigEndian.PutUint16(up[2:], uint16(len(up)))
+		var wg sync.WaitGroup
+		for range 3 {
+			wg.Go(func() {
+				for sink.WritePacket(up) == nil {
+				}
+			})
+		}
+		for exit.app.got.Load() < 200 {
+			time.Sleep(time.Millisecond)
+		}
+		sink.Close()
+		wg.Wait()
+		deadline := time.Now().Add(5 * time.Second)
+		for exit.ended.Load() == 0 && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		logs := out.String()
+		if strings.Contains(logs, "bad record MAC") || strings.Contains(logs, "mid-frame") {
+			t.Fatalf("close %d: the exit read a broken stream:\n%s", i, logs)
+		}
+		if n := strings.Count(logs, "H2 TUN session ended: the peer closed it"); n != i+1 {
+			t.Fatalf("close %d: the exit saw %d clean closes:\n%s", i, n, logs)
+		}
 	}
 }
 

@@ -306,18 +306,27 @@ func (s *relayTUNSink) Close() {
 		// on a dead leg is cut: cutting the deadline with nothing stuck made
 		// GOAWAY fail, which spent a TLS record number, and the exit read
 		// "bad record MAC" instead of a clean close (P3-1 of the round-7
-		// review).
+		// review). A write in flight on a live leg is waited for, briefly:
+		// cut, it tore the packet it carried and the TLS stream behind it
+		// (P3-3 of the round-8 review).
 		s.closing.Store(true)
-		if s.writeMu.TryLock() {
+		locked := make(chan struct{})
+		go func() {
+			s.writeMu.Lock()
+			close(locked)
+		}()
+		wait := time.NewTimer(relayCloseWriteGrace)
+		select {
+		case <-locked:
+			wait.Stop()
 			s.up.Close()
 			s.writeMu.Unlock()
-		} else {
+		case <-wait.C:
 			// A write is stuck on a dead leg: cut it, and let the TLS
-			// close finish in the background - its close_notify waits up
-			// to 5 s on a peer that reads nothing.
+			// close finish in the background.
 			_ = s.up.SetWriteDeadline(time.Now())
-			s.writeMu.Lock()
 			go func() {
+				<-locked
 				s.up.Close()
 				s.writeMu.Unlock()
 			}()
@@ -326,6 +335,11 @@ func (s *relayTUNSink) Close() {
 	})
 }
 
+// relayCloseWriteGrace is how long Close waits for a write in flight on the
+// leg before it cuts it: a packet's write on a live leg takes far less, one
+// stuck on a dead leg never ends.
+const relayCloseWriteGrace = 200 * time.Millisecond
+
 // legReadEnd names what ended a read on a TUN leg: the read deadline, which
 // is given, the peer closing it, or the error.
 func legReadEnd(err error, deadline time.Duration) string {
@@ -333,8 +347,12 @@ func legReadEnd(err error, deadline time.Duration) string {
 	switch {
 	case errors.As(err, &ne) && ne.Timeout():
 		return fmt.Sprintf("no frame for %s (read deadline)", deadline)
-	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+	case errors.Is(err, io.EOF):
 		return "the peer closed it"
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		// The stream ended inside a frame or a TLS record: a write torn
+		// on the other side, not a close.
+		return "the stream broke off mid-frame"
 	default:
 		return err.Error()
 	}
