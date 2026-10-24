@@ -1225,6 +1225,22 @@ func IsHandshakeAnswered(err error) bool {
 	return errors.Is(err, errHandshakeRefused) || errors.Is(err, errHandshakePartlyAnswered)
 }
 
+// KeepHandshakeMark returns outer with what the handshake learned from
+// inner kept on it: a refusal or an answer that came in part, either of
+// which ends the server's run of unanswered handshakes (IsHandshakeAnswered),
+// and a request that never left. A cancellation that replaced the handshake's
+// error dropped the mark, so a run of unanswered handshakes with a partial
+// answer cut short in the middle still read as the server's silence (P3-7 of
+// the round-9 review). Without a mark, outer is returned as it is.
+func KeepHandshakeMark(outer, inner error) error {
+	for _, mark := range []error{errHandshakePartlyAnswered, errHandshakeRefused, errHandshakeNotSent} {
+		if errors.Is(inner, mark) {
+			return fmt.Errorf("%w: %w", mark, outer)
+		}
+	}
+	return outer
+}
+
 // HandshakeRefused is the error for a handshake the server refused with
 // status, for a caller in another package (the client's reconnect).
 func HandshakeRefused(status byte) error {

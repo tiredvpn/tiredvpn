@@ -250,3 +250,83 @@ func TestAFullyUnansweredReconnectIsStillTheServersSilence(t *testing.T) {
 		t.Fatalf("reconnect 2: %v, want a's silence verdict", errs[1])
 	}
 }
+
+// partialThenSlowStrategy answers the handshake in part - the status byte
+// and two bytes of the server IP - and then says nothing, so the caller's
+// budget cuts the rest of the read short.
+type partialThenSlowStrategy struct {
+	t    *testing.T
+	id   string
+	prio int
+	// partial is true for the connection that answers in part; the others
+	// say nothing at all.
+	partial atomic.Bool
+}
+
+func (s *partialThenSlowStrategy) Name() string                        { return s.id }
+func (s *partialThenSlowStrategy) ID() string                          { return s.id }
+func (s *partialThenSlowStrategy) Priority() int                       { return s.prio }
+func (s *partialThenSlowStrategy) Probe(context.Context, string) error { return nil }
+func (s *partialThenSlowStrategy) RequiresServer() bool                { return true }
+func (s *partialThenSlowStrategy) Description() string                 { return "answers in part" }
+func (s *partialThenSlowStrategy) Connect(context.Context, string) (net.Conn, error) {
+	partial := s.partial.Load()
+	cli, srv := net.Pipe()
+	s.t.Cleanup(func() { cli.Close(); srv.Close() })
+	go func() {
+		req := make([]byte, 8)
+		if _, err := io.ReadFull(srv, req); err != nil {
+			return
+		}
+		if partial {
+			_, _ = srv.Write([]byte{0x00, 10, 8})
+		}
+		_, _ = io.Copy(io.Discard, srv)
+	}()
+	return cli, nil
+}
+
+// TestAPartialAnswerCutShortStillEndsTheUnansweredRun is P3-7 of the
+// round-9 review, through reconnectTUN: the reconnect's cancellation
+// replaced the handshake's error with "reconnect handshake interrupted", and
+// the mark that said the server had answered in part went with it. So
+// unanswered, partial-answer-cut-short, unanswered still ended in the
+// server's silence verdict, though the server had spoken in between.
+func TestAPartialAnswerCutShortStillEndsTheUnansweredRun(t *testing.T) {
+	old := tun.SetHandshakeReadTimeout(300 * time.Millisecond)
+	t.Cleanup(func() { tun.SetHandshakeReadTimeout(old) })
+	a, b := acceptAll(t), acceptAll(t)
+	m := strategy.NewManager()
+	if err := m.SetEndpoints([]endpoint.Endpoint{{Name: "a", V4: a}, {Name: "b", V4: b, Order: 1}}, endpoint.V4Only); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(endpoint.ResetSharedSelectors)
+	partial := &partialThenSlowStrategy{t: t, id: "morph", prio: 6}
+	m.Register(&refusingStrategy{t: t, id: "confusion", prio: 5})
+	m.Register(partial)
+
+	var errs []error
+	for i := range 3 {
+		// The middle reconnect answers in part and is cut short by the
+		// budget: shorter than the handshake wait, so the read cannot
+		// finish on its own.
+		partial.partial.Store(i == 1)
+		budget := 2 * time.Second
+		if i == 1 {
+			budget = 150 * time.Millisecond
+		}
+		ctx, cancel := context.WithTimeout(t.Context(), budget)
+		_, _, err := reconnectTUN(ctx, m, a, reconnClientIP, 1280, false, false)
+		cancel()
+		if err == nil {
+			t.Fatalf("reconnect %d connected - the test proves nothing", i+1)
+		}
+		errs = append(errs, err)
+	}
+	if !strings.Contains(errs[1].Error(), "interrupted") {
+		t.Fatalf("reconnect 2: %v, want the budget to have cut it short - the test proves nothing", errs[1])
+	}
+	if errors.Is(errs[2], strategy.ErrAddrSilent) {
+		t.Fatalf("reconnect 3: a's silence verdict, though a answered in part in between: %v", errs[2])
+	}
+}

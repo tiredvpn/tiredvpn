@@ -755,7 +755,12 @@ func reconnectHandshake(ctx context.Context, conn net.Conn, currentIP net.IP, mt
 	stop := context.AfterFunc(ctx, func() { conn.Close() })
 	tunnelConn, serverIP, assignedIP, serverIP6, assignedIP6, err = sendReconnectHandshake(conn, currentIP, mtu, dualStack, deadline)
 	if !stop() {
-		return nil, nil, nil, nil, nil, fmt.Errorf("reconnect handshake interrupted: %w", context.Cause(ctx))
+		// What the handshake learned goes with the cancellation: an answer
+		// that came in part ends the server's run of silence, and losing
+		// that let unanswered, partial-cut-short, unanswered read as the
+		// server's verdict (P3-7 of the round-9 review).
+		return nil, nil, nil, nil, nil, tun.KeepHandshakeMark(
+			fmt.Errorf("reconnect handshake interrupted: %w", context.Cause(ctx)), err)
 	}
 	return tunnelConn, serverIP, assignedIP, serverIP6, assignedIP6, err
 }
