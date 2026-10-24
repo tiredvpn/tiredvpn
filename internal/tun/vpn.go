@@ -1029,11 +1029,11 @@ func (v *VPNClient) connect(parent context.Context) error {
 			return fmt.Errorf("%w: %w", v.manager.HandshakeUnanswered(strat, cand, hasCand), err)
 		}
 		if IsHandshakeAnswered(err) {
-			v.manager.HandshakeAnswered(cand, hasCand)
+			v.manager.HandshakeAnswered(strat, cand, hasCand)
 		}
 		return err
 	}
-	v.manager.HandshakeAnswered(cand, hasCand)
+	v.manager.HandshakeAnswered(strat, cand, hasCand)
 	// From here on the tunnel is read through tunnelConn: the handshake reader
 	// may have had to look at the first byte of the first frame.
 	conn = tunnelConn

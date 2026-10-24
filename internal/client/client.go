@@ -720,11 +720,11 @@ func reconnectTUN(ctx context.Context, mgr *strategy.Manager, serverAddr string,
 			// run): the transport connected, the server said nothing.
 			err = fmt.Errorf("%w: %w", mgr.HandshakeUnanswered(sess.strat, sess.cand, sess.hasCand), err)
 		} else if tun.IsHandshakeAnswered(err) {
-			mgr.HandshakeAnswered(sess.cand, sess.hasCand)
+			mgr.HandshakeAnswered(sess.strat, sess.cand, sess.hasCand)
 		}
 		return tun.ReconnectResult{}, reconnectedSession{}, err
 	}
-	mgr.HandshakeAnswered(sess.cand, sess.hasCand)
+	mgr.HandshakeAnswered(sess.strat, sess.cand, sess.hasCand)
 
 	log.Info("Reconnect handshake complete (server: %s, assigned: %s)", serverIP, assignedIP)
 

@@ -2160,6 +2160,14 @@ type swallowRecord struct {
 	// skip holds, per address, the transports whose connected handshake heard
 	// nothing there; the next cycle on that address starts without them.
 	skip map[string]map[string]bool
+	// mute holds, per address, the transports whose session handshake went
+	// unanswered there (HandshakeUnanswered). Unlike skip, another
+	// transport's connect does not clear it - Protocol Confusion connects
+	// without hearing the server, and its connect cleared the list that
+	// held it, so the next scan and the next upgrade offer went straight
+	// back to it (P3-5 of the round-8 review). A handshake of that
+	// transport answered on the address clears it (HandshakeAnswered).
+	mute map[string]map[string]bool
 	last time.Time
 	// cycles counts the cycles in a row that ended with no verdict while a
 	// transport heard nothing there, and heardNothing names those
@@ -2171,6 +2179,16 @@ type swallowRecord struct {
 	// unanswered counts the cycles in a row that ended with no verdict and
 	// no answer at all, evidence or not (see swallowUnansweredMax).
 	unanswered int
+}
+
+// muteEmpty reports whether no transport is mute on any address.
+func (r *swallowRecord) muteEmpty() bool {
+	for _, ids := range r.mute {
+		if len(ids) > 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // endRun ends the run of no-verdict cycles; the skip lists stay.
@@ -2234,14 +2252,34 @@ func (m *Manager) swallowSkip(addr string) map[string]bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r := m.swallowed[key]
-	if r == nil || len(r.skip[addr]) == 0 || m.forced || swallowStale(r, sincePark) {
+	if r == nil || len(r.skip[addr])+len(r.mute[addr]) == 0 || m.forced || swallowStale(r, sincePark) {
 		return nil
 	}
-	skip := r.skip[addr]
+	skip := maps.Clone(r.skip[addr])
+	if skip == nil {
+		skip = make(map[string]bool)
+	}
+	maps.Copy(skip, r.mute[addr])
 	if !slices.ContainsFunc(m.strategies, func(s Strategy) bool { return s.Priority() > 0 && !skip[s.ID()] }) {
 		return nil
 	}
-	return maps.Clone(skip)
+	return skip
+}
+
+// noteMute books s's session handshake, unanswered, against addr.
+func (m *Manager) noteMute(addr, id string) {
+	sincePark := m.serverSincePark(addr)
+	key := m.swallowKey(addr)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r := m.swallowRecordLocked(key, sincePark)
+	if r.mute == nil {
+		r.mute = make(map[string]map[string]bool)
+	}
+	if r.mute[addr] == nil {
+		r.mute[addr] = make(map[string]bool)
+	}
+	r.mute[addr][id] = true
 }
 
 // noteSwallowed books the transports whose connected handshake heard nothing
@@ -2430,7 +2468,7 @@ func (m *Manager) HandshakeUnanswered(s Strategy, cand endpoint.Candidate, hasCa
 		return ErrCycleUnanswered
 	}
 	for _, addr := range append([]string{cand.Addr}, sel.Siblings(cand)...) {
-		m.noteSwallowed(addr, []string{id})
+		m.noteMute(addr, id)
 	}
 	key := m.swallowKey(cand.Addr)
 	now := time.Now().Round(0)
@@ -2477,15 +2515,19 @@ func (m *Manager) HandshakeUnanswered(s Strategy, cand endpoint.Candidate, hasCa
 }
 
 // HandshakeAnswered ends cand's server's run of unanswered session
-// handshakes: the server answered one.
-func (m *Manager) HandshakeAnswered(cand endpoint.Candidate, hasCand bool) {
+// handshakes: the server answered one, on s, which is no longer mute on
+// cand's address.
+func (m *Manager) HandshakeAnswered(s Strategy, cand endpoint.Candidate, hasCand bool) {
 	if !hasCand {
 		return
 	}
 	key := m.swallowKey(cand.Addr)
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	delete(m.unansweredHS, key)
-	m.mu.Unlock()
+	if r := m.swallowed[key]; r != nil && s != nil {
+		delete(r.mute[cand.Addr], s.ID())
+	}
 }
 
 // endSwallowRun ends addr's run of no-verdict cycles: a cycle reached a
@@ -2515,7 +2557,7 @@ func (m *Manager) clearSwallowed(addr string) {
 	}
 	r.endRun()
 	delete(r.skip, addr)
-	if len(r.skip) == 0 {
+	if len(r.skip) == 0 && r.muteEmpty() {
 		delete(m.swallowed, key)
 	}
 }
@@ -4058,15 +4100,17 @@ func (m *Manager) ScanScore(s Strategy) float64 {
 }
 
 // UpgradeEligible reports whether a scan on addr would admit s right now: not
-// a UDP strategy while UDP is excluded, not storm-parked, breaker closed, and
-// not set aside on addr's server by a route verdict (routeSkip). The offer
+// a UDP strategy while UDP is excluded, not storm-parked, breaker closed, not
+// set aside on addr's server by a route verdict (routeSkip), and not set
+// aside on addr as swallowed or mute (swallowSkip, P3-5 of the round-8
+// review). The offer
 // checks it when it is built; the dial comes up to minutes later and checks it
 // again. Without the last check an upgrade moved the tunnel straight back
 // onto the transport the route had just killed there, and its next death
 // charged the server - the false charge the route rule exists to prevent
 // (P2-B of the round-6 review).
 func (m *Manager) UpgradeEligible(s Strategy, addr string) bool {
-	if m.routeSkip(addr)[s.ID()] {
+	if m.routeSkip(addr)[s.ID()] || m.swallowSkip(addr)[s.ID()] {
 		return false
 	}
 	m.mu.RLock()
@@ -4097,10 +4141,11 @@ func (m *Manager) offerUpgrade(results []Result) {
 	m.muxMu.Unlock()
 
 	// The reprobe ran against the pinned server, and the tunnel rides it.
-	var routeSkip map[string]bool
+	var routeSkip, swallowSkip map[string]bool
 	if sel := m.selector(); sel != nil {
 		if cand, ok := sel.Current(); ok {
 			routeSkip = m.routeSkip(cand.Addr)
+			swallowSkip = m.swallowSkip(cand.Addr)
 		}
 	}
 
@@ -4128,7 +4173,7 @@ func (m *Manager) offerUpgrade(results []Result) {
 			continue
 		}
 		if (excludeUDP && isUDPBasedStrategy(s)) || m.stormDetector.IsParked(id) || !m.circuitBreakers.CanTry(id) ||
-			routeSkip[id] {
+			routeSkip[id] || swallowSkip[id] {
 			continue
 		}
 		cands = append(cands, s)
@@ -4821,6 +4866,12 @@ func (m *Manager) RouteHistory() RouteMemory {
 		}
 		for a, ids := range r.skip {
 			c.skip[a] = maps.Clone(ids)
+		}
+		for a, ids := range r.mute {
+			if c.mute == nil {
+				c.mute = make(map[string]map[string]bool, len(r.mute))
+			}
+			c.mute[a] = maps.Clone(ids)
 		}
 		var idx int
 		if _, err := fmt.Sscanf(k, "server %d", &idx); err == nil {

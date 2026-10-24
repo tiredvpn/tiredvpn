@@ -226,7 +226,7 @@ func androidControlConfig(cfg *Config, mgr *strategy.Manager, dualStack bool, se
 			strat, cand, hasCand := sess.stratObj, sess.cand, sess.hasCand
 			sess.mu.Unlock()
 			if answered {
-				mgr.HandshakeAnswered(cand, hasCand)
+				mgr.HandshakeAnswered(strat, cand, hasCand)
 				return nil
 			}
 			return fmt.Errorf("%w: %w", mgr.HandshakeUnanswered(strat, cand, hasCand), err)

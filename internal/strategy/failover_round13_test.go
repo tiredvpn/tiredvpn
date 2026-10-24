@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
@@ -123,5 +124,71 @@ func TestALiftedDeadSessionParkLeavesNoReasonBehind(t *testing.T) {
 				t.Fatal("a park for failed connects was taken for one for dead sessions")
 			}
 		})
+	}
+}
+
+// TestAMuteTransportIsNoUpgradeOnItsServer is P3-5 of the round-8 review:
+// Confusion's session handshake went unanswered on a, Polling connected
+// there - and its connect cleared the list that held Confusion, so the
+// upgrade offer (and the next scan) went straight back to it. Its next miss
+// tears the tunnel down: the request went out.
+func TestAMuteTransportIsNoUpgradeOnItsServer(t *testing.T) {
+	noUpgradeDelay(t)
+	a, b := newHelloListener(t), newHelloListener(t)
+	m := newSilenceManager(t, time.Second, a.addr, b.addr)
+	confusion := &greetingStrategy{id: "confusion", priority: 5}
+	m.Register(confusion)
+	m.Register(&greetingStrategy{id: "polling", priority: 6})
+	ca, _ := m.selector().CandidateForAddr(a.addr)
+	m.HandshakeUnanswered(confusion, ca, true)
+
+	conn, s, cand, _, err := m.ConnectSession(context.Background(), "")
+	if err != nil {
+		t.Fatalf("ConnectSession: %v", err)
+	}
+	conn.Close()
+	if s.ID() != "polling" || cand.Addr != a.addr {
+		t.Fatalf("the session rode %s@%s, want polling on a", s.ID(), cand.Addr)
+	}
+	m.HandshakeAnswered(s, cand, true)
+	if m.UpgradeEligible(confusion, a.addr) {
+		t.Fatal("Confusion eligible for an upgrade on a, where its session handshake went unanswered")
+	}
+	offers := newUpgradeOffers()
+	m.SetStrategyUpgradeCallback(offers.take)
+	m.doPeriodicReprobe(context.Background())
+	if got := offers.next(t); slices.Contains(got, "confusion") {
+		t.Fatalf("the reprobe on a offered %v, Confusion included", got)
+	}
+
+	// Control: Confusion answered on a is a candidate again.
+	m.HandshakeAnswered(confusion, ca, true)
+	if !m.UpgradeEligible(confusion, a.addr) {
+		t.Fatal("Confusion still set aside on a after it was answered there - the test proves nothing")
+	}
+}
+
+// TestAMuteTransportCrossesACoreRestart: what is mute on a server goes
+// with the route history to the next core.
+func TestAMuteTransportCrossesACoreRestart(t *testing.T) {
+	a, b := newHelloListener(t), newHelloListener(t)
+	m := newSilenceManager(t, time.Second, a.addr, b.addr)
+	confusion := &greetingStrategy{id: "confusion", priority: 5}
+	m.Register(confusion)
+	m.Register(&greetingStrategy{id: "polling", priority: 6})
+	ca, _ := m.selector().CandidateForAddr(a.addr)
+	m.HandshakeUnanswered(confusion, ca, true)
+	conn, _, _, _, err := m.ConnectSession(context.Background(), "")
+	if err != nil {
+		t.Fatalf("ConnectSession: %v", err)
+	}
+	conn.Close()
+
+	next := newSilenceManager(t, time.Second, a.addr, b.addr)
+	next.Register(confusion)
+	next.Register(&greetingStrategy{id: "polling", priority: 6})
+	next.AdoptRouteHistory(m.RouteHistory())
+	if next.UpgradeEligible(confusion, a.addr) {
+		t.Fatal("the next core forgot that Confusion is mute on a")
 	}
 }
