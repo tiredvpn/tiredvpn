@@ -3,6 +3,7 @@ package server
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
 	"runtime"
@@ -26,8 +27,8 @@ import (
 // nodes, a hard requirement of the config, or an estimate. Measured and
 // required shortfalls are logged at INFO; estimates only at DEBUG, marked
 // "(unmeasured)", so they cannot drown out the measured ones. A buffer
-// recommendation is only made while the buffers it allows fit in half of the
-// service's memory limit (see socketBufferBudget).
+// recommendation is only made while the host's TCP memory limit fits in half
+// of the service's memory limit (see socketBufferBudget).
 //
 // The rule table below also generates the "Host tuning" section of
 // docs/server.md (see TestHostTuningDocsInSync), so the two cannot drift.
@@ -170,11 +171,13 @@ func (procHost) memTotal() (uint64, error) {
 }
 
 // cgroupMemLimit returns the tightest memory limit on the path from this
-// process's cgroup up to the root. cgroup v2 (memory.max, "max" = none) and
+// process's cgroup up to and including the root of its cgroup namespace (a
+// container's own limit sits there). cgroup v2 (memory.max, "max" = none) and
 // the v1 memory controller (memory.limit_in_bytes, a huge value = none) are
-// understood. A level without the file is skipped: the root has none.
+// understood. A level without the file is skipped (the global root has
+// none); any other read error makes the limit unknown, never "none".
 func cgroupMemLimit(selfCgroup string, readFile func(string) ([]byte, error)) (uint64, bool, error) {
-	var dir, file string
+	var root, dir, file string
 	for line := range strings.SplitSeq(strings.TrimSpace(selfCgroup), "\n") {
 		parts := strings.SplitN(line, ":", 3)
 		if len(parts) != 3 {
@@ -183,10 +186,12 @@ func cgroupMemLimit(selfCgroup string, readFile func(string) ([]byte, error)) (u
 		switch {
 		case parts[0] == "0" && parts[1] == "":
 			if dir == "" {
-				dir, file = "/sys/fs/cgroup"+parts[2], "memory.max"
+				root, file = "/sys/fs/cgroup", "memory.max"
+				dir = root + parts[2]
 			}
 		case strings.Contains(","+parts[1]+",", ",memory,"):
-			dir, file = "/sys/fs/cgroup/memory"+parts[2], "memory.limit_in_bytes"
+			root, file = "/sys/fs/cgroup/memory", "memory.limit_in_bytes"
+			dir = root + parts[2]
 		}
 	}
 	if dir == "" {
@@ -197,19 +202,24 @@ func cgroupMemLimit(selfCgroup string, readFile func(string) ([]byte, error)) (u
 	limited := false
 	for p := strings.TrimSuffix(dir, "/"); ; {
 		b, err := readFile(p + "/" + file)
-		if err == nil {
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+		case err != nil:
+			return 0, false, err
+		default:
 			v := strings.TrimSpace(string(b))
-			if n, err := strconv.ParseUint(v, 10, 64); err == nil && n < v1Unlimited && (!limited || n < best) {
-				best, limited = n, true
-			} else if err != nil && v != "max" {
+			if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+				if n < v1Unlimited && (!limited || n < best) {
+					best, limited = n, true
+				}
+			} else if v != "max" {
 				return 0, false, fmt.Errorf("%s/%s: %q", p, file, v)
 			}
 		}
-		i := strings.LastIndexByte(p, '/')
-		if i <= len("/sys/fs/cgroup") || !strings.HasPrefix(p, "/sys/fs/cgroup") {
+		if p == root || !strings.HasPrefix(p, root+"/") {
 			break
 		}
-		p = p[:i]
+		p = p[:strings.LastIndexByte(p, '/')]
 	}
 	return best, limited, nil
 }
@@ -270,15 +280,27 @@ type hostTuningRule struct {
 	check func(in hostTuningInput, h hostReader) (adv *tuningAdvice, current string, applies bool, err error)
 }
 
-// sysctlFix renders the runtime command and the sysctl.d line for one value.
-// Multi-field values are quoted for the shell. These sysctls are host-wide:
-// inside a container they are read-only, hence "on the host".
+// netnsSysctls are kept per network namespace: a server in its own namespace
+// (a container, a pod) reads and needs its namespace's value, and a sysctl -w
+// on the host would not touch it. Every other sysctl the advisor reads is
+// host-wide and can only be set on the host.
+var netnsSysctls = map[string]bool{
+	"net.core.somaxconn":              true,
+	"net.ipv4.ip_forward":             true,
+	"net.ipv6.conf.all.forwarding":    true,
+	"net.ipv4.tcp_congestion_control": true,
+}
+
+// sysctlFix renders the runtime command and the sysctl.d line for one value,
+// saying where it has to run.
 func sysctlFix(name, value string) (fix, persist string) {
-	arg := value
-	if strings.ContainsAny(value, " \t") {
-		arg = strconv.Quote(value)
+	cmd := fmt.Sprintf("sysctl -w %s=%s", name, value)
+	persist = fmt.Sprintf("add '%s = %s' to %s", name, value, hostTuningSysctlFile)
+	if netnsSysctls[name] {
+		return fmt.Sprintf("%s in the server's network namespace (in a container: docker --sysctl %s=%s, or the pod's securityContext.sysctls)", cmd, name, value),
+			persist + " (host namespace only)"
 	}
-	return fmt.Sprintf("on the host, sysctl -w %s=%s", name, arg), fmt.Sprintf("add '%s = %s' to %s", name, value, hostTuningSysctlFile)
+	return "on the host, " + cmd, persist
 }
 
 func readInt(h hostReader, name string) (int64, error) {
@@ -291,19 +313,19 @@ func readInt(h hostReader, name string) (int64, error) {
 
 const mib = 1 << 20
 
-// socketBufferBudget decides whether raising the per-socket buffer ceiling to
-// perSocket bytes (receive plus send, as requested) is safe for this service.
+// socketBufferBudget decides whether raising a per-socket buffer ceiling is
+// safe for this service.
 //
-// Worst case: every admitted connection fills both buffers, which the kernel
-// sizes at twice the request. The host-wide TCP limit (tcp_mem, third field)
-// bounds that sum whatever the connection count, so the worst case is the
-// smaller of the two. It must fit in half of the service's memory budget -
-// the unit's MemoryMax, or host RAM without one - leaving the other half to
-// the process. The admission limit is a floor on the connection count, not a
-// bound (mux streams dial their own sockets), which is why tcp_mem matters.
+// Nothing in the server bounds how many TCP sockets fill their buffers: one
+// admitted connection can carry many mux streams, each with its own upstream
+// socket, and QUIC opens sockets outside TCP admission. The only bound is the
+// one the kernel enforces, the host-wide TCP memory limit (tcp_mem, third
+// field), so that is the worst case. It must fit in half of the service's
+// memory budget - its cgroup memory limit (MemoryMax), or host RAM without one
+// - leaving the other half to the process.
 //
 // It returns ok, and otherwise the worst case and the budget for the line.
-func socketBufferBudget(in hostTuningInput, h hostReader, perSocket int64) (ok bool, worst, budget uint64, budgetName string, err error) {
+func socketBufferBudget(h hostReader) (ok bool, worst, budget uint64, budgetName string, err error) {
 	total, err := h.memTotal()
 	if err != nil {
 		return false, 0, 0, "", err
@@ -316,14 +338,19 @@ func socketBufferBudget(in hostTuningInput, h hostReader, perSocket int64) (ok b
 	if limited && limit < total {
 		budget, budgetName = limit, "this unit's memory limit (MemoryMax)"
 	}
-	worst = uint64(in.admissionLimit) * 2 * uint64(perSocket)
-	if v, err := h.sysctl("net.ipv4.tcp_mem"); err == nil {
-		if f := strings.Fields(v); len(f) == 3 {
-			if pages, err := strconv.ParseUint(f[2], 10, 64); err == nil {
-				worst = min(worst, pages*uint64(os.Getpagesize()))
-			}
-		}
+	v, err := h.sysctl("net.ipv4.tcp_mem")
+	if err != nil {
+		return false, 0, 0, "", err
 	}
+	f := strings.Fields(v)
+	if len(f) != 3 {
+		return false, 0, 0, "", fmt.Errorf("net.ipv4.tcp_mem: want 3 fields, got %q", v)
+	}
+	pages, err := strconv.ParseUint(f[2], 10, 64)
+	if err != nil {
+		return false, 0, 0, "", fmt.Errorf("net.ipv4.tcp_mem: %w", err)
+	}
+	worst = pages * uint64(os.Getpagesize())
 	return worst <= budget/2, worst, budget, budgetName, nil
 }
 
@@ -348,16 +375,18 @@ func relayBufRule(name string) func(hostTuningInput, hostReader) (*tuningAdvice,
 		reason := fmt.Sprintf("the upstream dialer requests %d-byte socket buffers and the kernel silently clamps them to this ceiling", want)
 		fix, persist := sysctlFix(name, w)
 		fix += ", then restart the server (open sockets keep the clamped size)"
-		// Both ceilings are raised together, so budget receive plus send.
-		ok, worst, budget, budgetName, err := socketBufferBudget(in, h, 2*want)
+		ok, worst, budget, budgetName, err := socketBufferBudget(h)
 		if err != nil {
 			return nil, curS, true, err
 		}
 		if !ok {
+			// Rounded so that applying either number clears the check.
+			needMiB := (2*worst + mib - 1) / mib
+			capPages := budget / 2 / uint64(os.Getpagesize())
 			return &tuningAdvice{
 				setting: name, current: curS, want: w + " only after the memory budget allows it",
-				reason: reason + fmt.Sprintf(", but at that size the socket buffers could take %d MiB, more than half of %s (%d MiB)", worst/mib, budgetName, budget/mib),
-				fix:    fmt.Sprintf("raise the memory limit to at least %d MiB or lower -relay-upstream-buf first; until then leave %s as it is", 2*worst/mib, name),
+				reason: reason + fmt.Sprintf(", but TCP socket memory may grow to %d MiB (net.ipv4.tcp_mem), more than half of %s (%d MiB)", (worst+mib-1)/mib, budgetName, budget/mib),
+				fix:    fmt.Sprintf("raise the memory limit to at least %d MiB, or cap the third field of net.ipv4.tcp_mem at %d pages, first; until then leave %s as it is", needMiB, capPages, name),
 			}, curS, true, nil
 		}
 		return &tuningAdvice{setting: name, current: curS, want: w, reason: reason, fix: fix, persist: persist}, curS, true, nil
@@ -394,7 +423,7 @@ func congestionRule(_ hostTuningInput, h hostReader) (*tuningAdvice, string, boo
 	}
 	fix, persist := sysctlFix(name, "bbr")
 	if avail, err := h.sysctl("net.ipv4.tcp_available_congestion_control"); err != nil || !strings.Contains(" "+avail+" ", " bbr ") {
-		fix = "on the host, modprobe tcp_bbr && sysctl -w " + name + "=bbr"
+		fix = "on the host, modprobe tcp_bbr; then " + fix
 		persist = "add 'tcp_bbr' to /etc/modules-load.d/tiredvpn.conf and '" + name + " = bbr' to " + hostTuningSysctlFile
 	}
 	fix += ", then restart the server (the listener keeps the algorithm it was created with)"
@@ -432,10 +461,23 @@ func conntrackRule(in hostTuningInput, h hostReader) (*tuningAdvice, string, boo
 		return nil, "", true, err
 	}
 	curS := strconv.FormatInt(cur, 10)
+	w := strconv.FormatInt(want, 10)
 	if cur >= want {
+		// A big table on few buckets only lengthens the hash chains. Older
+		// kernels default to 4 entries per bucket; fewer buckets than that is
+		// advised. Unreadable buckets are not guessed at.
+		const buckets = "net.netfilter.nf_conntrack_buckets"
+		if b, err := readInt(h, buckets); err == nil && b < want/4 {
+			bS := strconv.FormatInt(b, 10)
+			return &tuningAdvice{
+				setting: buckets, current: bS, want: w,
+				reason:  fmt.Sprintf("the table holds %s entries on %s hash buckets, so lookups walk long chains", curS, bS),
+				fix:     fmt.Sprintf("on the host, sysctl -w %s=%s", buckets, w),
+				persist: fmt.Sprintf("add 'options nf_conntrack hashsize=%s' to /etc/modprobe.d/tiredvpn.conf", w),
+			}, curS, true, nil
+		}
 		return nil, curS, true, nil
 	}
-	w := strconv.FormatInt(want, 10)
 	return &tuningAdvice{
 		setting: name, current: curS, want: w,
 		reason: fmt.Sprintf("every flow of up to %d TUN clients is masqueraded here at an assumed %d flows each, and a full table drops new flows", in.poolClients, conntrackPerClient),
@@ -492,7 +534,7 @@ var hostTuningRules = []hostTuningRule{
 	{
 		setting:  "net.core.rmem_max",
 		when:     "`-upstream` (relay)",
-		want:     ">= the relay's upstream buffer (`-relay-upstream-buf`, default 512 KiB), only while buffers of that size fit in half of the memory budget",
+		want:     ">= the relay's upstream buffer (`-relay-upstream-buf`, default 512 KiB), only while the host's TCP memory limit (`tcp_mem`) fits in half of the memory budget",
 		basis:    basisMeasured,
 		why:      "`SO_RCVBUF` above this is clamped without an error, so the receive window of the upstream leg is capped",
 		evidence: "Relay on stock Ubuntu 24.04, 146 ms upstream leg (2026-10-24): 212992 held the leg at `rcv_ssthresh` 210439 and TUN downloads at 6.3-8.7 Mbit/s; 1 MiB gave 19.8-20.1 Mbit/s. Exits are not checked: their target dials request 4 MiB, and lifting that clamp can cost 8 MiB of kernel memory per slow download, which has not been measured",
@@ -539,7 +581,7 @@ var hostTuningRules = []hostTuningRule{
 	{
 		setting:  "net.netfilter.nf_conntrack_max",
 		when:     "`-ip-pool` on an exit (skipped while nf_conntrack is not loaded)",
-		want:     ">= pool size x 256, at most 262144 and at most 1/16 of host RAM at 320 bytes per entry; `nf_conntrack_buckets` raised to match",
+		want:     ">= pool size x 256, at most 262144 and at most 1/16 of host RAM at 320 bytes per entry; `nf_conntrack_buckets` at least a quarter of that (raised to match when advised)",
 		basis:    basisEstimate,
 		why:      "every masqueraded flow takes an entry and a full table drops new flows",
 		evidence: "The kernel default scales with RAM and sets buckets equal to the maximum: 8192 on a 960 MB exit, 65536 on 2 GB ones; no `table full` in their kernel logs (2026-10-24). 256 flows per client is an assumption. The whole pool counts because QUIC serves TUN clients outside TCP admission",

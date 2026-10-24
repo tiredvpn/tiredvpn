@@ -154,7 +154,13 @@ func NewIPPool(cfg IPPoolConfig, redisClient *redis.Client) (*IPPool, error) {
 		log.Warn("Failed to load IP leases: %v", err)
 	}
 
-	poolSize := int(endIP-startIP+1) - len(reserved)
+	// Reserved addresses outside start..end (network, broadcast) take no slot.
+	poolSize := int(endIP - startIP + 1)
+	for ip := range reserved {
+		if ip >= startIP && ip <= endIP {
+			poolSize--
+		}
+	}
 	if networkV6 != nil {
 		log.Info("IP Pool initialized: %s (size=%d, server=%s) + dual-stack %s (server=%s)",
 			cfg.Network, poolSize, cfg.ServerIP, networkV6, pool.ServerIP6())
