@@ -457,7 +457,9 @@ func handleREALITYSession(conn net.Conn, srvCtx *serverContext, logger *log.Logg
 			logger.Debug("REALITY: smux session closed: %v", err)
 			return
 		}
-		go handleRawTunnel(stream, srvCtx, logger, clientID)
+		// The stream names the TCP conn under it, for the relay's
+		// clientLiveness (TCP_INFO).
+		go handleRawTunnel(overTransport{stream, conn}, srvCtx, logger, clientID)
 	}
 }
 

@@ -87,8 +87,10 @@ type relayTUNSink struct {
 	lastUp       atomic.Int64
 	lastDown     atomic.Int64
 	lastActivity atomic.Int64
-	quietFor     atomic.Int64
-	keepalive    atomic.Pointer[time.Timer]
+	// client is the downstream conn, nil without one, for clientLiveness.
+	client    net.Conn
+	quietFor  atomic.Int64
+	keepalive atomic.Pointer[time.Timer]
 
 	// why is what ended the leg, set by the pump when the exit's side ended
 	// it; logged once, at Info, when the leg closes.
@@ -257,7 +259,9 @@ func (s *relayTUNSink) keepaliveTick() {
 	}
 	quiet := time.Duration(s.quietFor.Load())
 	sinceOldest := max(monoSince(s.lastUp.Load()), monoSince(s.lastDown.Load()))
-	active := monoSince(s.lastActivity.Load()) < relayClientActiveWindow()
+	active := clientLiveness{conn: s.client, heard: func() (time.Duration, bool) {
+		return monoSince(s.lastActivity.Load()), true
+	}}.alive()
 	if active && sinceOldest >= quiet {
 		sinceUp, sinceDown := monoSince(s.lastUp.Load()), monoSince(s.lastDown.Load())
 		s.writeMu.Lock()
@@ -408,7 +412,7 @@ func (s *relayTUNSink) pump(deliver func(pkt []byte) error) {
 // When the exit negotiated dual-stack, its IPv6 tunnel addresses ride on the
 // sink (see relayTUNSink.dualAddrs).
 func dialRelayTUN(srvCtx *serverContext, logger *log.Logger, handshake []byte, origin string,
-	deliver func(pkt []byte) error) (*relayTUNSink, net.IP, net.IP, error) {
+	client net.Conn, deliver func(pkt []byte) error) (*relayTUNSink, net.IP, net.IP, error) {
 
 	handshake, forwarded := splitTUNOrigin(handshake)
 	if forwarded != "" {
@@ -426,7 +430,7 @@ func dialRelayTUN(srvCtx *serverContext, logger *log.Logger, handshake []byte, o
 		return nil, nil, nil, fmt.Errorf("short upstream handshake response: %d bytes", len(resp))
 	}
 
-	sink := &relayTUNSink{up: upConn, logger: logger, done: make(chan struct{})}
+	sink := &relayTUNSink{up: upConn, logger: logger, done: make(chan struct{}), client: client}
 	serverIP := append(net.IP(nil), resp[1:5]...)
 	clientIP := append(net.IP(nil), resp[5:9]...)
 

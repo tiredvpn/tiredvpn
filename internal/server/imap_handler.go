@@ -68,7 +68,7 @@ func handleIMAPCamouflage(conn net.Conn, srvCtx *serverContext, logger *log.Logg
 	// so handleRawTunnel (which already supports SOCKS proxy and TUN mode) runs
 	// over it unchanged.
 	imapConn := strategy.NewIMAPCamouflageConn(tlsConn, br, true)
-	handleRawTunnel(imapConn, srvCtx, logger, clientID)
+	handleRawTunnel(overTransport{imapConn, tlsConn}, srvCtx, logger, clientID)
 }
 
 // imapServerHandshake reads the client greeting, answers CAPABILITY, upgrades

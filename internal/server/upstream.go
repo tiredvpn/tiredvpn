@@ -71,7 +71,7 @@ func NewUpstreamDialer(addr string, secret []byte) *UpstreamDialer {
 // completes the stego handshake. It is shared by Dial (address-proxy mode) and
 // DialTUN (multi-hop TUN bridge). Returns the live stego conn and the underlying
 // tls.Conn (caller closes the latter on any post-handshake failure).
-func (d *UpstreamDialer) connectStego(ctx context.Context) (net.Conn, *tls.Conn, error) {
+func (d *UpstreamDialer) connectStego(ctx context.Context) (*strategy.HTTP2StegoConn, *tls.Conn, error) {
 	// Get timeout from context or use default
 	deadline, hasDeadline := ctx.Deadline()
 	timeout := 30 * time.Second
@@ -179,8 +179,12 @@ func (d *UpstreamDialer) connectStego(ctx context.Context) (net.Conn, *tls.Conn,
 }
 
 // Dial connects to the target address through the upstream TiredVPN server
-// Returns a net.Conn that transparently tunnels through the upstream
-func (d *UpstreamDialer) Dial(ctx context.Context, targetAddr string) (net.Conn, error) {
+// Returns a net.Conn that transparently tunnels through the upstream.
+//
+// The conn keeps the exit's read deadline fed while client - the relay's
+// downstream conn, nil without one - is alive (keepUpstreamAlive): a relay
+// copies bytes up only as its client sends them.
+func (d *UpstreamDialer) Dial(ctx context.Context, targetAddr string, client net.Conn) (net.Conn, error) {
 	log.Debug("Upstream dial to %s via %s", targetAddr, d.upstreamAddr)
 
 	stegoConn, tlsConn, err := d.connectStego(ctx)
@@ -213,6 +217,7 @@ func (d *UpstreamDialer) Dial(ctx context.Context, targetAddr string) (net.Conn,
 	}
 
 	log.Debug("Upstream connection established to %s", targetAddr)
+	keepUpstreamAlive(stegoConn, client, nil)
 
 	// Return the stego connection - it implements net.Conn
 	// Read/Write will automatically handle HTTP/2 stego framing
@@ -237,11 +242,18 @@ func (d *UpstreamDialer) Dial(ctx context.Context, targetAddr string) (net.Conn,
 // [status:1][serverIP:4][clientIP:4][flags:1]... plus the trailing 32-byte
 // dual-stack block [serverIP6:16][clientIP6:16] when the exit negotiated it.
 func (d *UpstreamDialer) DialTUN(ctx context.Context, tunHandshake []byte, origin string) (net.Conn, []byte, error) {
+	conn, _, resp, err := d.dialTUN(ctx, tunHandshake, origin)
+	return conn, resp, err
+}
+
+// dialTUN is DialTUN with the stego conn under the tunnel conn, for a
+// caller that keeps it alive (keepUpstreamAlive).
+func (d *UpstreamDialer) dialTUN(ctx context.Context, tunHandshake []byte, origin string) (net.Conn, *strategy.HTTP2StegoConn, []byte, error) {
 	log.Debug("Upstream TUN dial via %s", d.upstreamAddr)
 
 	stegoConn, tlsConn, err := d.connectStego(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	// Send the TUN-mode setup over the stego stream. The upstream's setupH2Tunnel
@@ -253,7 +265,7 @@ func (d *UpstreamDialer) DialTUN(ctx context.Context, tunHandshake []byte, origi
 	setup = appendTUNOrigin(setup, origin)
 	if _, err := stegoConn.Write(setup); err != nil {
 		tlsConn.Close()
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	// Read the handshake response: the version-dependent base layout and, when
@@ -305,27 +317,27 @@ func (d *UpstreamDialer) DialTUN(ctx context.Context, tunHandshake []byte, origi
 	resp, tunnelConn, err := tun.ReadTUNHandshakeResponse(stegoConn, clientVersion, deadline)
 	if err != nil {
 		tlsConn.Close()
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if len(resp) < 9 {
 		tlsConn.Close()
-		return nil, nil, fmt.Errorf("short upstream TUN handshake response: %d bytes", len(resp))
+		return nil, nil, nil, fmt.Errorf("short upstream TUN handshake response: %d bytes", len(resp))
 	}
 
 	if resp[0] != 0x00 {
 		tlsConn.Close()
-		return nil, nil, errors.New("upstream rejected TUN handshake")
+		return nil, nil, nil, errors.New("upstream rejected TUN handshake")
 	}
 
 	log.Debug("Upstream TUN tunnel established (assigned IP=%s)", net.IP(resp[5:9]))
-	return tunnelConn, resp, nil
+	return tunnelConn, stegoConn, resp, nil
 }
 
 // DialTimeout is a convenience wrapper with explicit timeout
 func (d *UpstreamDialer) DialTimeout(targetAddr string, timeout time.Duration) (net.Conn, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	return d.Dial(ctx, targetAddr)
+	return d.Dial(ctx, targetAddr, nil)
 }
 
 // Close releases resources

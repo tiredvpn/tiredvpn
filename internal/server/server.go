@@ -1137,7 +1137,7 @@ func handleQUICConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 	var err error
 	if srvCtx.upstreamDialer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr)
+		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr, conn)
 		cancel()
 	} else {
 		targetConn, err = optimizedDial("tcp", targetAddr, 10*time.Second)
@@ -1721,7 +1721,9 @@ func handleMorphConnectionWithALPN(conn net.Conn, srvCtx *serverContext, logger 
 
 // h2TunnelState holds state for HTTP/2 stego tunnel
 type h2TunnelState struct {
-	targetConn      net.Conn
+	targetConn net.Conn
+	// downstream is the client's conn, for a relay's clientLiveness.
+	downstream      net.Conn
 	streamID        uint32
 	clientID        clientIdentity // Client identity for IP pool allocation
 	secret          []byte         // Authenticated client secret, keys the stego markers
@@ -1967,7 +1969,7 @@ func handleH2DataFrame(conn net.Conn, f *http2.DataFrame, framer *http2.Framer, 
 
 	tunnel := *tunnelPtr
 	if tunnel == nil {
-		t := &h2TunnelState{streamID: f.StreamID, clientID: authClientID, secret: authSecret, remoteAddr: originOf(conn.RemoteAddr())}
+		t := &h2TunnelState{streamID: f.StreamID, clientID: authClientID, secret: authSecret, remoteAddr: originOf(conn.RemoteAddr()), downstream: conn}
 		setupH2Tunnel(t, framer, payload, srvCtx, logger)
 		*tunnelPtr = t
 		return
@@ -2393,7 +2395,7 @@ func handleMorphConnection(conn net.Conn, srvCtx *serverContext, logger *log.Log
 	var err error
 	if srvCtx.upstreamDialer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr)
+		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr, conn)
 		cancel()
 	} else {
 		targetConn, err = optimizedDial("tcp", targetAddr, 10*time.Second)
@@ -2636,7 +2638,7 @@ func handleMorphTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverConte
 		// Relay: hand this client to the upstream exit instead of terminating it
 		// here, so a client that fell back to morph still exits where it asked.
 		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, remainingData,
-			originOf(conn.RemoteAddr()), func(pkt []byte) error {
+			originOf(conn.RemoteAddr()), conn, func(pkt []byte) error {
 				return writeMorphFrame(morphFramePacket(pkt))
 			})
 		if err != nil {
@@ -3047,7 +3049,7 @@ func handleProtocolConfusion(sess *confusionSession, srvCtx *serverContext, logg
 	var targetConn net.Conn
 	if srvCtx.upstreamDialer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr)
+		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr, sess.raw)
 		cancel()
 	} else {
 		targetConn, err = optimizedDial("tcp", targetAddr, 10*time.Second)
@@ -3189,7 +3191,7 @@ func handleConfusionTUNMode(sess *confusionSession, remainingData []byte, srvCtx
 	if srvCtx.upstreamDialer != nil {
 		// Relay: forward to the upstream exit rather than terminating here.
 		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, remainingData,
-			originOf(conn.RemoteAddr()), func(pkt []byte) error {
+			originOf(conn.RemoteAddr()), sess.raw, func(pkt []byte) error {
 				frame := make([]byte, 4+len(pkt))
 				binary.BigEndian.PutUint32(frame[:4], uint32(len(pkt)))
 				copy(frame[4:], pkt)
@@ -3409,7 +3411,7 @@ func handleRawTunnel(conn net.Conn, srvCtx *serverContext, logger *log.Logger, c
 	var err error
 	if srvCtx.upstreamDialer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr)
+		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr, conn)
 		cancel()
 	} else {
 		targetConn, err = optimizedDial("tcp", targetAddr, 10*time.Second)
@@ -3463,6 +3465,14 @@ func handleRawTunnel(conn net.Conn, srvCtx *serverContext, logger *log.Logger, c
 		n, err := optimizedRelay(conn, targetConn)
 		atomic.AddInt64(&bytesDown, n)
 		end.note("the target", "the client", err)
+		// Pass the target's end on, as the other direction does with
+		// CloseWrite: a client that is told nothing waits for the rest
+		// of an answer that has ended.
+		if cw, ok := conn.(interface{ CloseWrite() error }); ok {
+			_ = cw.CloseWrite()
+		} else {
+			conn.Close()
+		}
 	}()
 
 	wg.Wait()
@@ -3761,7 +3771,7 @@ func relayTUNToUpstream(conn net.Conn, srvCtx *serverContext, logger *log.Logger
 	}
 
 	dialCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	upstreamConn, resp, err := srvCtx.upstreamDialer.DialTUN(dialCtx, handshake, origin)
+	upstreamConn, upstreamStego, resp, err := srvCtx.upstreamDialer.dialTUN(dialCtx, handshake, origin)
 	cancel()
 	if err != nil {
 		logger.Warn("Relay: upstream TUN dial failed: %v", err)
@@ -3789,6 +3799,12 @@ func relayTUNToUpstream(conn net.Conn, srvCtx *serverContext, logger *log.Logger
 
 	logger.Info("Relay TUN bridge established (client=%s, upstream-assigned=%s)",
 		conn.RemoteAddr(), net.IP(resp[5:9]))
+
+	// The bridge copies the client's bytes up as they come, and a client on
+	// a sparse download may send none for minutes: the leg died every 60 s
+	// on the exit's read deadline (fix12-slow). The upstream conn keeps it
+	// fed while the client is alive.
+	keepUpstreamAlive(upstreamStego, conn, logger)
 
 	// Bidirectional transparent copy with an idle watchdog. Both ends speak the
 	// identical TUN wire format, so no reframing is needed.
@@ -3932,7 +3948,7 @@ func setupH2Tunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, srv
 	var err error
 	if srvCtx.upstreamDialer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr)
+		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr, tunnel.downstream)
 		cancel()
 	} else {
 		targetConn, err = optimizedDial("tcp", targetAddr, 10*time.Second)
@@ -3958,6 +3974,17 @@ func setupH2Tunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, srv
 			n, err := targetConn.Read(buf)
 			if err != nil {
 				logger.Debug("Target read error: %v", err)
+				// The target is done, and the connection carries nothing
+				// else: close it, after the last response (tunnel.mu), so
+				// the client reads the end. It used to stay open until
+				// the read deadline, 60 s on, and the client - or a
+				// relay's client - waited that long for an answer that
+				// had ended.
+				tunnel.mu.Lock()
+				if tunnel.downstream != nil {
+					tunnel.downstream.Close()
+				}
+				tunnel.mu.Unlock()
 				return
 			}
 			tunnel.mu.Lock()
@@ -4086,7 +4113,7 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 
 	if srvCtx.upstreamDialer != nil {
 		// Relay: forward to the upstream exit rather than terminating here.
-		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, data, origin, sendPacketDown)
+		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, data, origin, tunnel.downstream, sendPacketDown)
 		if err != nil {
 			logger.Warn("H2 TUN relay: upstream dial failed: %v", err)
 			sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, tunnel.secret)
@@ -4289,6 +4316,10 @@ func verifyFullKnockSequence(conn net.Conn, secret []byte, srvCtx *serverContext
 		logger.Debug("Knock packet %d: OK (%d bytes)", i, seq.Sizes[i])
 	}
 
+	// The tunnel that follows reads without a deadline of its own. Left at
+	// 2 s, it ended the session 2 s after the knock - on an exit the TUN
+	// loop sets its own, but the relay's bridge and proxy copy do not.
+	conn.SetReadDeadline(time.Time{})
 	return true
 }
 
@@ -5727,7 +5758,7 @@ func runPollingSessionRelay(sess *HTTPPollingSession, srvCtx *serverContext, log
 	var err error
 	if srvCtx.upstreamDialer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr)
+		targetConn, err = srvCtx.upstreamDialer.Dial(ctx, targetAddr, nil)
 		cancel()
 	} else {
 		targetConn, err = optimizedDial("tcp", targetAddr, 10*time.Second)
@@ -5917,7 +5948,7 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 		// Relay: forward to the upstream exit rather than terminating here. This
 		// is the path a client lands on after falling back to meek-style polling,
 		// which used to strand it on the relay's own exit and address pool.
-		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, remainingData, sess.Origin,
+		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, remainingData, sess.Origin, nil,
 			func(pkt []byte) error {
 				_, err := pollConn.Write(pkt)
 				return err
