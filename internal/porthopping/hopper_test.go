@@ -265,6 +265,34 @@ func TestPortHopperJitter(t *testing.T) {
 	}
 }
 
+// TestTimeUntilNextHop checks that the time left counts down from the drawn
+// interval, not the base one, with intervals far apart from both the base
+// and any stall a loaded machine can add between the two clock reads.
+func TestTimeUntilNextHop(t *testing.T) {
+	config := DefaultConfig()
+	config.HopInterval = 100 * time.Millisecond
+
+	hopper, err := NewPortHopper(config)
+	if err != nil {
+		t.Fatalf("failed to create hopper: %v", err)
+	}
+	hopper.mu.Lock()
+	hopper.jitteredInterval = time.Hour
+	hopper.lastHop = time.Now().Add(-10 * time.Minute)
+	hopper.mu.Unlock()
+
+	if left := hopper.TimeUntilNextHop(); left > 50*time.Minute || left < 49*time.Minute {
+		t.Errorf("TimeUntilNextHop = %v 10 min into a 1h interval, want just under 50 min", left)
+	}
+
+	hopper.mu.Lock()
+	hopper.lastHop = time.Now().Add(-2 * time.Hour)
+	hopper.mu.Unlock()
+	if left := hopper.TimeUntilNextHop(); left != 0 {
+		t.Errorf("TimeUntilNextHop = %v past the interval, want 0", left)
+	}
+}
+
 func TestPortHopperCallback(t *testing.T) {
 	config := DefaultConfig()
 	config.Strategy = StrategySequential
