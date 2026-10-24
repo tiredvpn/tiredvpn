@@ -5,6 +5,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
@@ -24,10 +25,10 @@ const (
 	hostTuningSkipMarker = "HOST-TUNING-CHILD-SKIP: "
 )
 
-// hostTuningChildMaxConns is far above any RLIMIT_NOFILE a kernel allows
-// (fs.nr_open tops out just under 2^30), so the RLIMIT_NOFILE rule fires on
-// every host and its line proves the config reached the advisor through Run.
-const hostTuningChildMaxConns = 1 << 28
+// hostTuningChildBuf is a -relay-upstream-buf no host's rmem_max reaches, so
+// the relay rmem_max rule fires at INFO on every host (as advice or as a
+// held-back line) and proves the config reached the advisor through Run.
+const hostTuningChildBuf = 1 << 30
 
 // runHostTuningChild starts Run in a child process (via wrap, e.g. unshare)
 // and returns its log up to and including the host tuning summary.
@@ -104,36 +105,48 @@ func hasLine(lines []string, sub string) bool {
 }
 
 // TestHostTuningRunCallsAdvisor starts the real Run in a child process and
-// waits for the advisor's lines. Testing logHostTuning directly would pass
-// with the call in Run deleted.
+// waits for the advisor's INFO lines. Testing logHostTuning directly would
+// pass with the call in Run deleted.
 func TestHostTuningRunCallsAdvisor(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("the advisor only reads Linux settings")
 	}
 	lines := runHostTuningChild(t, "plain")
-	want := strconv.Itoa(hostTuningChildMaxConns*fdsPerConn + fdHeadroom)
-	if !hasLine(lines, "Host tuning (unmeasured): RLIMIT_NOFILE is ") || !hasLine(lines, "recommended "+want+" - ") {
-		t.Fatalf("no RLIMIT_NOFILE line for -max-conns %d; output:\n%s", hostTuningChildMaxConns, strings.Join(lines, "\n"))
+	want := "requests " + strconv.Itoa(hostTuningChildBuf) + "-byte socket buffers"
+	if !hasLine(lines, "Host tuning: net.core.rmem_max is ") || !hasLine(lines, want) {
+		t.Fatalf("no INFO rmem_max line for -relay-upstream-buf %d; output:\n%s", hostTuningChildBuf, strings.Join(lines, "\n"))
 	}
 }
 
-// TestHostTuningRunReadsForwardingAfterNAT runs Run with a dual-stack pool in
-// a private user and network namespace, where the child may create TUN and
-// write forwarding. The child zeroes both forwarding switches first; the NAT
+// TestRootHostTuningReadsForwardingAfterNAT runs Run with a dual-stack pool in
+// a network namespace of its own, where the child may create TUN and write
+// forwarding. The child zeroes both forwarding switches first; the NAT
 // bootstrap turns them on, so an advisor running after it reads 1 for both.
-// Called before initIPPool it would read 0 and miss the dual-stack pool.
-func TestHostTuningRunReadsForwardingAfterNAT(t *testing.T) {
+// Called before initIPPool, or without the dual-stack flag, it would not.
+//
+// CI runs it as root in the netns_tests job (TIREDVPN_NETNS_TESTS=1, already
+// inside "sudo unshare -n"), where a skip fails the job. Elsewhere it uses an
+// unprivileged user namespace when the host allows one.
+func TestRootHostTuningReadsForwardingAfterNAT(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("Linux only")
 	}
-	unshare, err := exec.LookPath("unshare")
-	if err != nil {
-		t.Skip("unshare not installed")
+	var wrap []string
+	if os.Getenv("TIREDVPN_NETNS_TESTS") == "1" {
+		if os.Geteuid() != 0 {
+			t.Skip("needs root: creates a TUN device and writes forwarding")
+		}
+	} else {
+		unshare, err := exec.LookPath("unshare")
+		if err != nil {
+			t.Skip("unshare not installed")
+		}
+		if err := exec.Command(unshare, "-Urn", "true").Run(); err != nil {
+			t.Skipf("unprivileged user namespaces unavailable: %v", err)
+		}
+		wrap = []string{unshare, "-Urn"}
 	}
-	if err := exec.Command(unshare, "-Urn", "true").Run(); err != nil {
-		t.Skipf("unprivileged user namespaces unavailable: %v", err)
-	}
-	lines := runHostTuningChild(t, "nat", unshare, "-Urn")
+	lines := runHostTuningChild(t, "nat", wrap...)
 	for _, want := range []string{"Host tuning: net.ipv4.ip_forward ok (1)", "Host tuning: net.ipv6.conf.all.forwarding ok (1)"} {
 		if !hasLine(lines, want) {
 			t.Errorf("no %q; output:\n%s", want, strings.Join(lines, "\n"))
@@ -146,7 +159,10 @@ func TestHostTuningRunReadsForwardingAfterNAT(t *testing.T) {
 func TestHostTuningRunChild(t *testing.T) {
 	mode := os.Getenv(hostTuningChildEnv)
 	if mode == "" {
-		t.Skip("child process of TestHostTuningRun*")
+		t.Skip("child process of the host tuning Run tests")
+	}
+	skip := func(why string) {
+		os.Stderr.WriteString(hostTuningSkipMarker + why + "\n")
 	}
 	cfg := &Config{
 		ListenAddr:           "127.0.0.1:0",
@@ -154,16 +170,25 @@ func TestHostTuningRunChild(t *testing.T) {
 		CertFile:             os.Getenv("TIREDVPN_TEST_CERT"),
 		KeyFile:              os.Getenv("TIREDVPN_TEST_KEY"),
 		REALITYLegacyEnabled: true,
-		MaxConcurrentConns:   hostTuningChildMaxConns,
-		Debug:                true,
 	}
-	if mode == "nat" {
+	switch mode {
+	case "plain":
+		cfg.UpstreamAddr, cfg.UpstreamSecret = "exit.invalid:443", "host-tuning-child"
+		cfg.RelayUpstreamBufBytes = hostTuningChildBuf
+	case "nat":
+		f, err := os.OpenFile("/dev/net/tun", os.O_RDWR, 0)
+		if err != nil {
+			skip("no usable /dev/net/tun: " + err.Error())
+			return
+		}
+		f.Close()
 		for _, p := range []string{"/proc/sys/net/ipv4/ip_forward", "/proc/sys/net/ipv6/conf/all/forwarding"} {
 			if err := os.WriteFile(p, []byte("0\n"), 0o644); err != nil {
-				os.Stderr.WriteString(hostTuningSkipMarker + "cannot write " + p + ": " + err.Error() + "\n")
+				skip("cannot write " + p + ": " + err.Error())
 				return
 			}
 		}
+		cfg.Debug = true // the "ok" lines are debug
 		cfg.IPPoolNetwork, cfg.IPPoolV6 = "10.77.0.0/24", "fd00:77::/64"
 		cfg.TunIP, cfg.TunName = net.IPv4(10, 77, 0, 1).To4(), "tvht0"
 		// Loopback is down in a fresh network namespace; the wildcard binds
@@ -172,7 +197,6 @@ func TestHostTuningRunChild(t *testing.T) {
 	}
 	t.Fatal(Run(cfg))
 }
-
 func writePEM(t *testing.T, path, typ string, der []byte) {
 	t.Helper()
 	if err := os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: typ, Bytes: der}), 0o600); err != nil {
@@ -204,8 +228,12 @@ func TestProcHostReadsTheRealHost(t *testing.T) {
 	if err != nil || total < 64<<20 {
 		t.Errorf("memTotal = %d, %v", total, err)
 	}
-	if limit, limited, err := h.memLimit(); err != nil || (limited && limit == 0) {
+	limit, limited, err := h.memLimit()
+	if err != nil || (limited && limit == 0) {
 		t.Errorf("memLimit = %d %v, %v", limit, limited, err)
+	}
+	if direct, dLimited, ok := ownCgroupV2MemLimit(t); ok && (direct != limit || dLimited != limited) {
+		t.Errorf("memLimit = %d %v, direct read of memory.max along /proc/self/cgroup = %d %v", limit, limited, direct, dLimited)
 	}
 }
 
@@ -235,37 +263,123 @@ func TestProcHostNofileIsTheSoftLimit(t *testing.T) {
 	}
 }
 
+// ownCgroupV2MemLimit reads memory.max at every level of this process's
+// cgroup v2 path, namespace root included, independently of cgroupMemLimit.
+// ok is false on a v1 or hybrid memory hierarchy.
+func ownCgroupV2MemLimit(t *testing.T) (limit uint64, limited, ok bool) {
+	t.Helper()
+	self, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var path string
+	for _, line := range strings.Split(strings.TrimSpace(string(self)), "\n") {
+		f := strings.SplitN(line, ":", 3)
+		if len(f) == 3 && strings.Contains(","+f[1]+",", ",memory,") {
+			return 0, false, false
+		}
+		if len(f) == 3 && f[0] == "0" && f[1] == "" {
+			path, ok = f[2], true
+		}
+	}
+	if !ok {
+		return 0, false, false
+	}
+	levels := []string{"/sys/fs/cgroup"}
+	for _, part := range strings.Split(strings.Trim(path, "/"), "/") {
+		if part != "" {
+			levels = append(levels, levels[len(levels)-1]+"/"+part)
+		}
+	}
+	for _, dir := range levels {
+		b, err := os.ReadFile(dir + "/memory.max")
+		if err != nil {
+			continue
+		}
+		if n, err := strconv.ParseUint(strings.TrimSpace(string(b)), 10, 64); err == nil && (!limited || n < limit) {
+			limit, limited = n, true
+		}
+	}
+	return limit, limited, true
+}
+
 const memLimitChildEnv = "TIREDVPN_TEST_MEMLIMIT_CHILD"
 
-// TestProcHostReadsTheUnitMemoryLimit runs the production reader inside a
-// transient systemd scope with a known MemoryMax: an unlimited test host
-// could not tell a working reader from one that always says "no limit".
-func TestProcHostReadsTheUnitMemoryLimit(t *testing.T) {
+// TestRootProcHostReadsMemoryMax runs the production reader in a child placed
+// in a cgroup with a known memory.max: on an unlimited test host a reader that
+// always says "no limit" would pass every other test. As root (the
+// netns_tests job) the test makes the cgroup itself; otherwise it asks the
+// user's systemd for a transient scope.
+func TestRootProcHostReadsMemoryMax(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("Linux only")
 	}
-	run, err := exec.LookPath("systemd-run")
-	if err != nil {
-		t.Skip("systemd-run not installed")
-	}
 	const limit = 314572800
-	cmd := exec.Command(run, "--user", "--scope", "-q", "-p", "MemoryMax="+strconv.Itoa(limit),
-		os.Args[0], "-test.run=^TestProcHostMemLimitChild$", "-test.v")
+	child := []string{os.Args[0], "-test.run=^TestProcHostMemLimitChild$", "-test.v"}
+	var cmd *exec.Cmd
+	var cgroupDir string
+	if os.Geteuid() == 0 && os.Getenv("TIREDVPN_NETNS_TESTS") == "1" {
+		cgroupDir = fmt.Sprintf("/sys/fs/cgroup/tiredvpn-test-%d", os.Getpid())
+		if err := os.Mkdir(cgroupDir, 0o755); err != nil {
+			t.Skipf("cannot create a cgroup: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Remove(cgroupDir) })
+		if err := os.WriteFile(cgroupDir+"/memory.max", []byte(strconv.Itoa(limit)), 0o644); err != nil {
+			t.Skipf("cannot set memory.max (memory controller not delegated?): %v", err)
+		}
+		cmd = exec.Command(child[0], child[1:]...)
+	} else {
+		run, err := exec.LookPath("systemd-run")
+		if err != nil {
+			t.Skip("not root and no systemd-run")
+		}
+		args := append([]string{"--user", "--scope", "-q", "-p", "MemoryMax=" + strconv.Itoa(limit)}, child...)
+		cmd = exec.Command(run, args...)
+	}
 	cmd.Env = append(os.Environ(), memLimitChildEnv+"="+strconv.Itoa(limit))
-	out, err := cmd.CombinedOutput()
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out strings.Builder
+	cmd.Stdout, cmd.Stderr = &out, &out
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start the child: %v", err)
+	}
+	if cgroupDir != "" {
+		if err := os.WriteFile(cgroupDir+"/cgroup.procs", []byte(strconv.Itoa(cmd.Process.Pid)), 0o644); err != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			t.Fatalf("cannot move the child into %s: %v", cgroupDir, err)
+		}
+	}
+	// The child reads its limit only after it has been placed.
+	_, _ = stdin.Write([]byte("go\n"))
+	_ = stdin.Close()
+	err = cmd.Wait()
+	o := out.String()
 	switch {
-	case strings.Contains(string(out), "--- PASS: TestProcHostMemLimitChild"):
-	case err != nil && !strings.Contains(string(out), "--- FAIL"):
-		t.Skipf("no systemd user scope here: %v: %s", err, out)
+	case strings.Contains(o, "--- PASS: TestProcHostMemLimitChild"):
+	case strings.Contains(o, hostTuningSkipMarker):
+		t.Skipf("limit not applied to the child: %s", o)
+	case cgroupDir == "" && !strings.Contains(o, "--- FAIL"):
+		t.Skipf("no systemd user scope here: %v: %s", err, o)
 	default:
-		t.Fatalf("child: %v\n%s", err, out)
+		t.Fatalf("child: %v\n%s", err, o)
 	}
 }
 
 func TestProcHostMemLimitChild(t *testing.T) {
 	want := os.Getenv(memLimitChildEnv)
 	if want == "" {
-		t.Skip("child process of TestProcHostReadsTheUnitMemoryLimit")
+		t.Skip("child process of TestRootProcHostReadsMemoryMax")
+	}
+	_, _ = bufio.NewReader(os.Stdin).ReadString('\n')
+	// A scope that was created but not limited is the host's doing, not the
+	// reader's: report it as a skip.
+	if direct, limited, ok := ownCgroupV2MemLimit(t); ok && (!limited || strconv.FormatUint(direct, 10) != want) {
+		os.Stdout.WriteString(hostTuningSkipMarker + "cgroup memory.max is not " + want + "\n")
+		return
 	}
 	limit, limited, err := procHost{}.memLimit()
 	if err != nil || !limited || strconv.FormatUint(limit, 10) != want {

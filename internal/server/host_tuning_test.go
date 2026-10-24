@@ -53,6 +53,7 @@ func tunedHost(override map[string]string) fakeHost {
 		"net.ipv4.ip_forward":                       "1",
 		"net.ipv6.conf.all.forwarding":              "1",
 		"net.netfilter.nf_conntrack_max":            "262144",
+		"net.netfilter.nf_conntrack_buckets":        "262144",
 		"net.core.somaxconn":                        "4096",
 	}}
 	for k, v := range override {
@@ -94,6 +95,9 @@ func adviceFor(rep hostTuningReport, setting string) (line string, info bool) {
 }
 
 func ruleBasis(setting string) string {
+	if setting == "net.netfilter.nf_conntrack_buckets" {
+		setting = "net.netfilter.nf_conntrack_max"
+	}
 	for _, r := range hostTuningRules {
 		if r.setting == setting {
 			return r.basis
@@ -132,14 +136,18 @@ var hostTuningCases = []hostTuningCase{
 	{name: "exit, stock rmem: exits are not advised", cfg: cfgExit, override: map[string]string{"net.core.rmem_max": "212992"}, setting: "net.core.rmem_max"},
 	{name: "exit with QUIC, stock rmem: exits are not advised", cfg: cfgExitQUIC, override: map[string]string{"net.core.rmem_max": "212992"}, setting: "net.core.rmem_max"},
 	{name: "relay under MemoryMax 800M: fits, fires", cfg: cfgRelay, limit: 800 << 20, override: map[string]string{"net.core.rmem_max": "212992"}, setting: "net.core.rmem_max", want: "524288"},
+	// tcp_mem max 43164 pages = 168.6 MiB, so the limit must be >= 337.2 MiB.
 	{name: "relay under MemoryMax 100M: held back", cfg: cfgRelay, limit: 100 << 20, override: map[string]string{"net.core.rmem_max": "212992"}, setting: "net.core.rmem_max",
-		want:    "524288 only after the memory budget allows it",
-		wantIn:  []string{"more than half of this unit's memory limit (MemoryMax) (100 MiB)", "Fix: raise the memory limit to at least", "leave net.core.rmem_max as it is"},
+		want: "524288 only after the memory budget allows it",
+		wantIn: []string{"TCP socket memory may grow to 169 MiB (net.ipv4.tcp_mem), more than half of this unit's memory limit (MemoryMax) (100 MiB)",
+			"Fix: raise the memory limit to at least 338 MiB, or cap the third field of net.ipv4.tcp_mem at 12800 pages, first", "leave net.core.rmem_max as it is"},
 		wantOut: []string{"sysctl -w", "persist"}},
+	{name: "relay under MemoryMax 337M: still held back", cfg: cfgRelay, limit: 337 << 20, override: map[string]string{"net.core.rmem_max": "212992"}, setting: "net.core.rmem_max", want: "524288 only after the memory budget allows it"},
+	{name: "relay under the suggested 338M: fires", cfg: cfgRelay, limit: 338 << 20, override: map[string]string{"net.core.rmem_max": "212992"}, setting: "net.core.rmem_max", want: "524288"},
+	{name: "relay, MemoryMax 100M with tcp_mem capped at the suggested 12800 pages: fires", cfg: cfgRelay, limit: 100 << 20, override: map[string]string{"net.core.rmem_max": "212992", "net.ipv4.tcp_mem": "6000 9000 12800"}, setting: "net.core.rmem_max", want: "524288"},
 	{name: "relay, MemoryMax above host RAM: host RAM is the budget", cfg: cfgRelay, limit: 64 * gib, override: map[string]string{"net.core.rmem_max": "212992"}, setting: "net.core.rmem_max", want: "524288"},
-	{name: "relay, tcp_mem unreadable, MemoryMax 800M: 256 x 2 MiB does not fit", cfg: cfgRelay, limit: 800 << 20, override: map[string]string{"net.core.rmem_max": "212992", "net.ipv4.tcp_mem": "<missing>"}, setting: "net.core.rmem_max",
-		want: "524288 only after the memory budget allows it", wantIn: []string{"could take 512 MiB"}},
-	{name: "relay, tcp_mem bounds the estimate, MemoryMax 800M: fits", cfg: &Config{UpstreamAddr: "exit.invalid:443", MaxConcurrentConns: 100000}, limit: 800 << 20, override: map[string]string{"net.core.rmem_max": "212992"}, setting: "net.core.rmem_max", want: "524288"},
+	{name: "-max-conns 1 does not bound sockets: MemoryMax 64M, tcp_mem 256 MiB: held back", cfg: &Config{UpstreamAddr: "exit.invalid:443", MaxConcurrentConns: 1}, limit: 64 << 20, nofile: 524287,
+		override: map[string]string{"net.core.rmem_max": "212992", "net.ipv4.tcp_mem": "30000 45000 65536", "net.core.somaxconn": "4096"}, setting: "net.core.rmem_max", want: "524288 only after the memory budget allows it"},
 
 	{name: "relay, stock wmem: fires", cfg: cfgRelay, override: map[string]string{"net.core.wmem_max": "212992"}, setting: "net.core.wmem_max", want: "524288"},
 	{name: "relay, wmem exactly 512K: fine", cfg: cfgRelay, override: map[string]string{"net.core.wmem_max": "524288"}, setting: "net.core.wmem_max"},
@@ -148,16 +156,17 @@ var hostTuningCases = []hostTuningCase{
 
 	// bbr
 	{name: "cubic, bbr not loaded: fires with modprobe", cfg: cfgExit, override: map[string]string{"net.ipv4.tcp_congestion_control": "cubic", "net.ipv4.tcp_available_congestion_control": "reno cubic"}, setting: "net.ipv4.tcp_congestion_control", want: "bbr",
-		wantIn: []string{"Fix: on the host, modprobe tcp_bbr && sysctl -w net.ipv4.tcp_congestion_control=bbr, then restart the server", "/etc/modules-load.d/tiredvpn.conf", "changes every TCP flow on the host"}},
+		wantIn: []string{"Fix: on the host, modprobe tcp_bbr; then sysctl -w net.ipv4.tcp_congestion_control=bbr in the server's network namespace", ", then restart the server", "/etc/modules-load.d/tiredvpn.conf", "changes every TCP flow on the host"}},
 	{name: "cubic, bbr available: fires without modprobe", cfg: cfgRelay, override: map[string]string{"net.ipv4.tcp_congestion_control": "cubic"}, setting: "net.ipv4.tcp_congestion_control", want: "bbr",
-		wantIn: []string{"Fix: on the host, sysctl -w net.ipv4.tcp_congestion_control=bbr, then restart"}, wantOut: []string{"modprobe"}},
+		wantIn: []string{"Fix: sysctl -w net.ipv4.tcp_congestion_control=bbr in the server's network namespace (in a container: docker --sysctl net.ipv4.tcp_congestion_control=bbr, or the pod's securityContext.sysctls), then restart"}, wantOut: []string{"modprobe", "Fix: on the host"}},
 	{name: "cubic, only bbr2 available: modprobe for bbr", cfg: cfgRelay, override: map[string]string{"net.ipv4.tcp_congestion_control": "cubic", "net.ipv4.tcp_available_congestion_control": "reno cubic bbr2"}, setting: "net.ipv4.tcp_congestion_control", want: "bbr", wantIn: []string{"modprobe tcp_bbr"}},
 	{name: "bbr: fine", cfg: cfgExit, setting: "net.ipv4.tcp_congestion_control"},
 	{name: "bbr2: fine", cfg: cfgExit, override: map[string]string{"net.ipv4.tcp_congestion_control": "bbr2"}, setting: "net.ipv4.tcp_congestion_control"},
 	{name: "bbr3: fine", cfg: cfgExit, override: map[string]string{"net.ipv4.tcp_congestion_control": "bbr3"}, setting: "net.ipv4.tcp_congestion_control"},
 
 	// forwarding
-	{name: "exit pool, forwarding off: fires", cfg: cfgExit, override: map[string]string{"net.ipv4.ip_forward": "0"}, setting: "net.ipv4.ip_forward", want: "1"},
+	{name: "exit pool, forwarding off: fires", cfg: cfgExit, override: map[string]string{"net.ipv4.ip_forward": "0"}, setting: "net.ipv4.ip_forward", want: "1",
+		wantIn: []string{"Fix: sysctl -w net.ipv4.ip_forward=1 in the server's network namespace (in a container: docker --sysctl net.ipv4.ip_forward=1", "(host namespace only)"}, wantOut: []string{"on the host"}},
 	{name: "exit pool, forwarding on: fine", cfg: cfgExit, setting: "net.ipv4.ip_forward"},
 	{name: "relay pool, forwarding off: not this config's concern", cfg: cfgRelay, override: map[string]string{"net.ipv4.ip_forward": "0"}, setting: "net.ipv4.ip_forward"},
 	{name: "proxy-only exit, forwarding off: not this config's concern", cfg: cfgProxyOnly, override: map[string]string{"net.ipv4.ip_forward": "0"}, setting: "net.ipv4.ip_forward"},
@@ -170,13 +179,17 @@ var hostTuningCases = []hostTuningCase{
 	{name: "exit /24, conntrack 8192: fires at 253x256", cfg: cfgExit, override: map[string]string{"net.netfilter.nf_conntrack_max": "8192"}, setting: "net.netfilter.nf_conntrack_max", want: "64768",
 		wantIn: []string{"up to 253 TUN clients", "net.netfilter.nf_conntrack_buckets=64768", "'nf_conntrack' to /etc/modules-load.d/tiredvpn.conf", "'options nf_conntrack hashsize=64768'"}},
 	{name: "exit /24, conntrack 65536: fine", cfg: cfgExit, override: map[string]string{"net.netfilter.nf_conntrack_max": "65536"}, setting: "net.netfilter.nf_conntrack_max"},
+	{name: "exit /24, conntrack 65536 on 8192 buckets: buckets fire", cfg: cfgExit, override: map[string]string{"net.netfilter.nf_conntrack_max": "65536", "net.netfilter.nf_conntrack_buckets": "8192"}, setting: "net.netfilter.nf_conntrack_buckets", want: "64768",
+		wantIn: []string{"65536 entries on 8192 hash buckets", "on the host, sysctl -w net.netfilter.nf_conntrack_buckets=64768", "'options nf_conntrack hashsize=64768'"}},
+	{name: "exit /24, buckets exactly a quarter: fine", cfg: cfgExit, override: map[string]string{"net.netfilter.nf_conntrack_max": "65536", "net.netfilter.nf_conntrack_buckets": "16192"}, setting: "net.netfilter.nf_conntrack_buckets"},
+	{name: "exit /24, buckets unreadable: not guessed", cfg: cfgExit, override: map[string]string{"net.netfilter.nf_conntrack_max": "65536", "net.netfilter.nf_conntrack_buckets": "<missing>"}, setting: "net.netfilter.nf_conntrack_buckets"},
 	{name: "exit /24 with -max-conns 1: QUIC is not admitted, the pool still counts", cfg: &Config{IPPoolNetwork: "10.8.0.0/24", MaxConcurrentConns: 1}, nofile: 524287, override: map[string]string{"net.netfilter.nf_conntrack_max": "8192", "net.core.somaxconn": "4096"}, setting: "net.netfilter.nf_conntrack_max", want: "64768"},
 	{name: "exit /16, 2 GB: the ceiling binds", cfg: cfgExitWide, override: map[string]string{"net.netfilter.nf_conntrack_max": "65536"}, setting: "net.netfilter.nf_conntrack_max", want: "262144"},
 	{name: "exit /16, 960 MB: host RAM binds", cfg: cfgExitWide, ram: stockRAM1, override: map[string]string{"net.netfilter.nf_conntrack_max": "65536"}, setting: "net.netfilter.nf_conntrack_max", want: "196655"},
 	{name: "relay, conntrack 8192: not this config's concern", cfg: cfgRelay, override: map[string]string{"net.netfilter.nf_conntrack_max": "8192"}, setting: "net.netfilter.nf_conntrack_max"},
 
 	// somaxconn
-	{name: "exit, somaxconn 128: fires at 4096", cfg: cfgExit, override: map[string]string{"net.core.somaxconn": "128"}, setting: "net.core.somaxconn", want: "4096", wantIn: []string{"sysctl -w net.core.somaxconn=4096, then restart the server"}},
+	{name: "exit, somaxconn 128: fires at 4096", cfg: cfgExit, override: map[string]string{"net.core.somaxconn": "128"}, setting: "net.core.somaxconn", want: "4096", wantIn: []string{"sysctl -w net.core.somaxconn=4096 in the server's network namespace", "securityContext.sysctls), then restart the server"}},
 	{name: "relay, somaxconn 256 covers admission 256: fine", cfg: cfgRelay, override: map[string]string{"net.core.somaxconn": "256"}, setting: "net.core.somaxconn"},
 	{name: "relay, somaxconn 128: fires at 256", cfg: cfgRelay, override: map[string]string{"net.core.somaxconn": "128"}, setting: "net.core.somaxconn", want: "256"},
 	{name: "explicit -max-conns 100, somaxconn 128: fine", cfg: &Config{MaxConcurrentConns: 100}, override: map[string]string{"net.core.somaxconn": "128"}, setting: "net.core.somaxconn"},
@@ -252,6 +265,9 @@ func shortfallCount(rep hostTuningReport) int {
 }
 
 func TestHostTuningRules(t *testing.T) {
+	if os.Getpagesize() != 4096 {
+		t.Skip("the tcp_mem cases are written for 4 KiB pages")
+	}
 	for _, tc := range hostTuningCases {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, e := range tc.run() {
@@ -266,6 +282,9 @@ func TestHostTuningRules(t *testing.T) {
 // rules gated on the config, one that ignores the gate. A rule whose mutant
 // passes the table has no case pinning it.
 func TestHostTuningRuleMutants(t *testing.T) {
+	if os.Getpagesize() != 4096 {
+		t.Skip("the tcp_mem cases are written for 4 KiB pages")
+	}
 	type checkFn = func(hostTuningInput, hostReader) (*tuningAdvice, string, bool, error)
 	fabricated := func(r hostTuningRule) *tuningAdvice {
 		return &tuningAdvice{setting: r.setting, current: "mutant", want: "mutant", reason: "mutant", fix: "mutant"}
@@ -392,6 +411,12 @@ func TestHostTuningSummary(t *testing.T) {
 			t.Fatalf("summary = %q", last(rep))
 		}
 	})
+	t.Run("unreadable tcp_mem skips the relay buffer rules", func(t *testing.T) {
+		rep := adviseHostTuning(hostTuningInputFor(cfgRelay, false), tunedHost(map[string]string{"net.core.rmem_max": "212992", "net.ipv4.tcp_mem": "<missing>"}))
+		if got, _ := adviceFor(rep, "net.core.rmem_max"); got != "" || len(rep.skipped) != 1 {
+			t.Fatalf("advice %q, skipped %v; want no advice and the rule skipped", got, rep.skipped)
+		}
+	})
 	t.Run("unreadable memory limit skips the relay buffer rules", func(t *testing.T) {
 		h := tunedHost(map[string]string{"net.core.rmem_max": "212992"})
 		h.limitErr = os.ErrNotExist
@@ -477,31 +502,49 @@ func TestCgroupMemLimit(t *testing.T) {
 		"/sys/fs/cgroup/memory/system.slice/c.service/memory.limit_in_bytes": "209715200\n",
 		"/sys/fs/cgroup/memory/memory.limit_in_bytes":                        "9223372036854771712\n",
 		"/sys/fs/cgroup/bad.slice/d.service/memory.max":                      "lots\n",
+		"/sys/fs/cgroup/ns/memory.max":                                       "max\n",
 	}
+	var rootLimited bool
 	read := func(p string) ([]byte, error) {
+		switch {
+		case p == "/sys/fs/cgroup/denied.slice/memory.max":
+			return nil, os.ErrPermission
+		case p == "/sys/fs/cgroup/memory.max" && rootLimited:
+			return []byte("67108864\n"), nil
+		}
 		if v, ok := files[p]; ok {
 			return []byte(v), nil
 		}
 		return nil, os.ErrNotExist
 	}
 	cases := []struct {
-		self    string
-		limit   uint64
-		limited bool
-		err     bool
+		self        string
+		rootLimited bool // a container's own limit at its namespace root
+		limit       uint64
+		limited     bool
+		err         bool
 	}{
-		{"0::/system.slice/tiredvpn-server.service\n", 100 << 20, true, false},
-		{"0::/limited.slice/a.service\n", 50 << 20, true, false}, // the parent's limit binds
-		{"0::/free.slice/b.service\n", 0, false, false},
-		{"0::/\n", 0, false, false},
-		{"12:memory:/system.slice/c.service\n1:name=systemd:/x\n0::/x\n", 200 << 20, true, false},
-		{"0::/bad.slice/d.service\n", 0, false, true},
-		{"1:name=systemd:/x\n", 0, false, true},
+		{"0::/system.slice/tiredvpn-server.service\n", false, 100 << 20, true, false},
+		{"0::/limited.slice/a.service\n", false, 50 << 20, true, false}, // the parent's limit binds
+		{"0::/free.slice/b.service\n", false, 0, false, false},
+		{"0::/\n", false, 0, false, false},
+		{"12:memory:/system.slice/c.service\n1:name=systemd:/x\n0::/x\n", false, 200 << 20, true, false},
+		{"0::/bad.slice/d.service\n", false, 0, false, true},
+		{"1:name=systemd:/x\n", false, 0, false, true},
+		// Only the namespace root is limited, as inside an LXC/Incus or
+		// systemd-in-Docker container.
+		{"0::/free.slice/b.service\n", true, 64 << 20, true, false},
+		{"0::/ns\n", true, 64 << 20, true, false},
+		{"0::/\n", true, 64 << 20, true, false},
+		{"0::/system.slice/tiredvpn-server.service\n", true, 64 << 20, true, false},
+		// A read error other than "missing" makes the limit unknown.
+		{"0::/denied.slice/e.service\n", false, 0, false, true},
 	}
 	for _, tc := range cases {
+		rootLimited = tc.rootLimited
 		limit, limited, err := cgroupMemLimit(tc.self, read)
 		if (err != nil) != tc.err || limit != tc.limit || limited != tc.limited {
-			t.Errorf("%q: got %d %v %v, want %d %v err=%v", tc.self, limit, limited, err, tc.limit, tc.limited, tc.err)
+			t.Errorf("%q (root limited %v): got %d %v %v, want %d %v err=%v", tc.self, tc.rootLimited, limit, limited, err, tc.limit, tc.limited, tc.err)
 		}
 	}
 }
@@ -529,12 +572,22 @@ func TestPoolHostCount(t *testing.T) {
 	}
 }
 
-const (
-	hostTuningDocBegin = "<!-- host-tuning-table:begin (generated from internal/server/host_tuning.go; go test ./internal/server -run TestHostTuningDocsInSync -update-host-tuning-docs) -->\n"
-	hostTuningDocEnd   = "<!-- host-tuning-table:end -->"
-)
+const hostTuningDocsUpdate = "go test ./internal/server -run TestHostTuningDocsInSync -update-host-tuning-docs"
 
-// TestHostTuningDocsInSync keeps the docs table identical to the rule table.
+// hostTuningDocExample is the stock-relay example in docs/server.md, produced
+// by the advisor itself.
+func hostTuningDocExample() string {
+	h := tunedHost(map[string]string{
+		"net.core.rmem_max":               "212992",
+		"net.core.wmem_max":               "212992",
+		"net.ipv4.tcp_congestion_control": "cubic",
+	})
+	rep := adviseHostTuning(hostTuningInputFor(cfgRelay, false), h)
+	return "```\n" + strings.Join(rep.info, "\n") + "\n```\n"
+}
+
+// TestHostTuningDocsInSync keeps the generated blocks of docs/server.md - the
+// rule table and the example output - identical to what the code produces.
 func TestHostTuningDocsInSync(t *testing.T) {
 	const path = "../../docs/server.md"
 	raw, err := os.ReadFile(path)
@@ -542,25 +595,33 @@ func TestHostTuningDocsInSync(t *testing.T) {
 		t.Fatal(err)
 	}
 	doc := string(raw)
-	before, rest, ok := strings.Cut(doc, hostTuningDocBegin)
-	if !ok {
-		t.Fatalf("%s lacks the begin marker %q", path, hostTuningDocBegin)
-	}
-	current, after, ok := strings.Cut(rest, hostTuningDocEnd)
-	if !ok {
-		t.Fatalf("%s lacks the end marker %q", path, hostTuningDocEnd)
-	}
-	want := hostTuningDocTable()
-	if current == want {
-		return
+	for _, blk := range []struct{ name, want string }{
+		{"host-tuning-table", hostTuningDocTable()},
+		{"host-tuning-example", hostTuningDocExample()},
+	} {
+		begin := "<!-- " + blk.name + ":begin (generated from internal/server/host_tuning.go; " + hostTuningDocsUpdate + ") -->\n"
+		end := "<!-- " + blk.name + ":end -->"
+		before, rest, ok := strings.Cut(doc, begin)
+		if !ok {
+			t.Fatalf("%s lacks the begin marker %q", path, begin)
+		}
+		current, after, ok := strings.Cut(rest, end)
+		if !ok {
+			t.Fatalf("%s lacks the end marker %q", path, end)
+		}
+		if current == blk.want {
+			continue
+		}
+		if !*updateHostTuningDocs {
+			t.Fatalf("docs/server.md %s is out of date; run: %s\n--- docs\n%s--- code\n%s", blk.name, hostTuningDocsUpdate, current, blk.want)
+		}
+		doc = before + begin + blk.want + end + after
 	}
 	if *updateHostTuningDocs {
-		if err := os.WriteFile(path, []byte(before+hostTuningDocBegin+want+hostTuningDocEnd+after), 0o644); err != nil {
+		if err := os.WriteFile(path, []byte(doc), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		return
 	}
-	t.Fatalf("docs/server.md Host tuning table is out of date; run: go test ./internal/server -run TestHostTuningDocsInSync -update-host-tuning-docs\n--- docs\n%s--- code\n%s", current, want)
 }
 
 // TestHostTuningConntrackFollowsNAT pins the NAT gate on its own:
