@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -16,6 +17,21 @@ import (
 // never silently drop frames in the pacer itself.
 var ErrShaperOverflow = errors.New("shaper queue overflow")
 
+// ErrShaperCloseIncomplete is returned by Close when frames that Write had
+// already accepted into the pacer queue did not all reach the peer: the
+// peer did not take them within pacerCloseTimeout, or the connection broke
+// with frames still queued. The error wraps the write error that stopped
+// the pacer, if any.
+var ErrShaperCloseIncomplete = errors.New("shaper close did not deliver every accepted frame")
+
+// pacerCloseTimeout bounds how long close() waits for the queue to reach
+// the wire. It is applied as a write deadline on the connection, so it also
+// cuts short a write that is already blocked on a peer that does not read.
+// The queue is bounded (pacerQueueCap frames), so a peer that reads keeps
+// up with it well inside this; one that does not costs Close this long and
+// an ErrShaperCloseIncomplete. A var so tests can shorten it.
+var pacerCloseTimeout = 5 * time.Second
+
 // pacer tuning constants — see ADR §7. Exposed as package-private so tests
 // can reference them without re-deriving.
 const (
@@ -25,7 +41,6 @@ const (
 	pacerCoalesceSkipBelow = 100 * time.Microsecond
 	pacerCoalesceFlushAt   = 200 * time.Microsecond
 	pacerEnqueueTimeout    = 1 * time.Second
-	pacerDrainTimeout      = 100 * time.Millisecond
 	// maxCoalesceFrames bounds the number of buffers in a single writev
 	// vector. 32 × 1500B ≈ 48 KiB ≈ one TCP send window's worth of payload,
 	// which keeps tail-latency bounded while reducing syscall count by an
@@ -53,7 +68,20 @@ type writePacer struct {
 
 	done      chan struct{}
 	closeOnce sync.Once
+	closeErr  error
 	wg        sync.WaitGroup
+
+	// sendMu orders enqueue against close: enqueue sends under the read
+	// lock, close takes the write lock before it closes queue, so no frame
+	// can be accepted after the drain has seen the last one. Without it a
+	// frame sent between the drain finding the queue empty and the goroutine
+	// exiting was accepted by Write and never written.
+	sendMu sync.RWMutex
+	closed bool
+
+	// lost counts the bytes of accepted frames released without reaching
+	// the wire. close() reports them as ErrShaperCloseIncomplete.
+	lost atomic.Int64
 
 	// errSeen holds the last non-nil Conn.Write error observed by the
 	// pacer goroutine. Producers consult it before enqueue so a broken
@@ -150,11 +178,13 @@ func (p *writePacer) run() {
 		if len(pending) == 0 {
 			return false
 		}
-		if _, err := p.writev(&pending); err != nil {
+		want := buffersLen(pending)
+		if n, err := p.writev(&pending); err != nil {
 			e := err
 			p.errSeen.Store(&e)
+			p.lost.Add(want - n)
 			releasePending()
-			p.drain(time.Time{}, releaseFrame)
+			p.drain(false, releaseFrame)
 			return true
 		}
 		releasePending()
@@ -162,15 +192,30 @@ func (p *writePacer) run() {
 	}
 
 	for {
+		// Close takes priority over the queue: once it is called the rest
+		// goes out unpaced, inside the close deadline, instead of sleeping
+		// out shaper delays frame by frame.
 		select {
 		case <-p.done:
 			if flush() {
 				return
 			}
-			p.drain(time.Now().Add(pacerDrainTimeout), releaseFrame)
+			p.drain(true, releaseFrame)
+			return
+		default:
+		}
+		select {
+		case <-p.done:
+			if flush() {
+				return
+			}
+			p.drain(true, releaseFrame)
 			return
 		case f, ok := <-p.queue:
 			if !ok {
+				// close() closed the queue and this select picked it over
+				// done. Nothing is pending: an iteration that leaves the
+				// queue empty flushes, and a closed queue is empty.
 				return
 			}
 			pending = append(pending, f.packet)
@@ -228,22 +273,27 @@ func (p *writePacer) run() {
 	}
 }
 
-// drain best-effort flushes remaining queued frames after stop. If deadline
-// is the zero value (Conn.Write failure path) we just release buffers
-// without touching the wire — connection is dead, frames are unsendable.
+// drain empties the queue after stop. With send set (close path) it writes
+// the frames out in writev batches until close() closes the queue; the
+// write deadline close() put on the connection bounds every batch. Without
+// send (Conn.Write failure path) the connection is dead: it only releases
+// what is queued now, without waiting for close. Every frame released
+// without being written is counted in lost.
 // Uses the writev hook so the same batching path is exercised on shutdown.
-func (p *writePacer) drain(deadline time.Time, release func(pacedFrame)) {
+func (p *writePacer) drain(send bool, release func(pacedFrame)) {
 	var pending net.Buffers
 	var pendingPackets []pacedFrame
 	flushDrain := func() {
 		if len(pending) == 0 {
 			return
 		}
-		if !deadline.IsZero() && time.Now().Before(deadline) && p.errSeen.Load() == nil {
-			if _, err := p.writev(&pending); err != nil {
-				e := err
-				p.errSeen.Store(&e)
-			}
+		want := buffersLen(pending)
+		if p.errSeen.Load() != nil {
+			p.lost.Add(want)
+		} else if n, err := p.writev(&pending); err != nil {
+			e := err
+			p.errSeen.Store(&e)
+			p.lost.Add(want - n)
 		}
 		for _, f := range pendingPackets {
 			release(f)
@@ -251,23 +301,39 @@ func (p *writePacer) drain(deadline time.Time, release func(pacedFrame)) {
 		pending = pending[:0]
 		pendingPackets = pendingPackets[:0]
 	}
-	for {
-		select {
-		case f, ok := <-p.queue:
-			if !ok {
-				flushDrain()
+	if !send {
+		for {
+			select {
+			case f, ok := <-p.queue:
+				if !ok {
+					return
+				}
+				p.lost.Add(int64(len(f.packet)))
+				release(f)
+			default:
 				return
 			}
-			pending = append(pending, f.packet)
-			pendingPackets = append(pendingPackets, f)
-			if len(pending) >= maxCoalesceFrames {
-				flushDrain()
-			}
-		default:
-			flushDrain()
-			return
 		}
 	}
+	for f := range p.queue {
+		pending = append(pending, f.packet)
+		pendingPackets = append(pendingPackets, f)
+		// Batch what is already queued; write once it runs dry or the
+		// vector is full, so the tail does not wait for close.
+		if len(pending) >= maxCoalesceFrames || len(p.queue) == 0 {
+			flushDrain()
+		}
+	}
+	flushDrain()
+}
+
+// buffersLen is the byte length of bufs.
+func buffersLen(bufs net.Buffers) int64 {
+	var n int64
+	for _, b := range bufs {
+		n += int64(len(b))
+	}
+	return n
 }
 
 // enqueue hands a built frame to the pacer goroutine. Returns the cached
@@ -275,6 +341,12 @@ func (p *writePacer) drain(deadline time.Time, release func(pacedFrame)) {
 // the queue stays full for longer than pacerEnqueueTimeout, or nil on
 // successful handoff.
 func (p *writePacer) enqueue(frame pacedFrame) error {
+	p.sendMu.RLock()
+	defer p.sendMu.RUnlock()
+	if p.closed {
+		releasePacketBuf(frame.packet, frame.bucket)
+		return net.ErrClosed
+	}
 	if errp := p.errSeen.Load(); errp != nil {
 		releasePacketBuf(frame.packet, frame.bucket)
 		return *errp
@@ -301,12 +373,37 @@ func (p *writePacer) enqueue(frame pacedFrame) error {
 	}
 }
 
-// close signals the pacer goroutine to stop, drains pending frames within
-// pacerDrainTimeout, and waits for goroutine exit. Safe to call multiple
-// times; subsequent calls are no-ops.
-func (p *writePacer) close() {
+// close stops the pacer and returns once every frame accepted by enqueue
+// has been written or given up on. Queued frames go out unpaced; the whole
+// drain is bounded by pacerCloseTimeout, set as the connection's write
+// deadline. If any accepted frame did not reach the wire, close returns
+// ErrShaperCloseIncomplete with the byte count; it never drops one
+// silently. Safe to call multiple times; later calls return the first
+// result.
+func (p *writePacer) close() error {
 	p.closeOnce.Do(func() {
+		_ = p.conn.SetWriteDeadline(time.Now().Add(pacerCloseTimeout))
 		close(p.done)
+		// Producers parked in enqueue see done and leave; after that none
+		// can send, and closing the queue tells the drain it has the last
+		// frame.
+		p.sendMu.Lock()
+		p.closed = true
+		close(p.queue)
+		p.sendMu.Unlock()
+		p.wg.Wait()
+		// The goroutine may have stopped on a write error before close:
+		// whatever was queued after that is still here.
+		for f := range p.queue {
+			p.lost.Add(int64(len(f.packet)))
+			releasePacketBuf(f.packet, f.bucket)
+		}
+		if lost := p.lost.Load(); lost > 0 {
+			p.closeErr = fmt.Errorf("%w: %d bytes of queued frames not written", ErrShaperCloseIncomplete, lost)
+			if errp := p.errSeen.Load(); errp != nil {
+				p.closeErr = fmt.Errorf("%w: %w", p.closeErr, *errp)
+			}
+		}
 	})
-	p.wg.Wait()
+	return p.closeErr
 }
