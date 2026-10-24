@@ -59,8 +59,18 @@ type relayBridge struct {
 func startRelayBridge(t *testing.T) *relayBridge {
 	t.Helper()
 	secret := []byte("relay-leg-secret-0123456789abcdef")
-	b := &relayBridge{exit: newLegExit(t, secret), done: make(chan struct{})}
-	relayCtx := &serverContext{cfg: &Config{}, upstreamDialer: NewUpstreamDialer(b.exit.addr, secret)}
+	exit := newLegExit(t, secret)
+	b := startRelayBridgeTo(t, exit.addr, secret)
+	b.exit = exit
+	return b
+}
+
+// startRelayBridgeTo is startRelayBridge into the exit at addr, which the
+// test does not run itself.
+func startRelayBridgeTo(t *testing.T, addr string, secret []byte) *relayBridge {
+	t.Helper()
+	b := &relayBridge{done: make(chan struct{})}
+	relayCtx := &serverContext{cfg: &Config{}, upstreamDialer: NewUpstreamDialer(addr, secret)}
 	client, relaySide := tcpPair(t)
 	t.Cleanup(func() { client.Close() })
 	go func() {
