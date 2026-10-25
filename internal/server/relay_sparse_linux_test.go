@@ -200,6 +200,15 @@ func TestASparseDownloadThroughAProxyRelayKeepsItsLeg(t *testing.T) {
 // neither heard from nor acknowledging anything for the window is gone, and
 // the relay stops feeding its leg, which the exit's deadline then ends. Here
 // nothing flows either way after the setup.
+//
+// The round-9 review (P3-10) read this as a client production would keep
+// alive, because the kernel's keepalive would be answered within the window.
+// Measured on loopback, it is not: with keepalive at 1 s on both ends, a
+// conn's tcpi_last_ack_recv was refreshed once by the ACK of the data sent
+// and then grew past 7 s untouched - keepalive probes do not refresh it. So
+// a client the relay sends nothing to does go away by this rule, whatever
+// its socket. A client the relay keeps sending to - the sparse download
+// above - is the case the rule holds, and the one it was changed for.
 func TestAGoneClientLetsTheBridgeLegGo(t *testing.T) {
 	scaleLegClocks(t)
 	b := startRelayBridge(t)
@@ -209,6 +218,22 @@ func TestAGoneClientLetsTheBridgeLegGo(t *testing.T) {
 	}
 	if b.exit.ended.Load() == 0 {
 		t.Fatalf("the relay kept a silent client's leg for %v", relayClientActiveWindow()+3*h2FrameReadTimeout())
+	}
+}
+
+// TestAClientThatHungUpLetsTheBridgeLegGo: a client whose socket is gone
+// acknowledges nothing either, and its leg goes the same way.
+func TestAClientThatHungUpLetsTheBridgeLegGo(t *testing.T) {
+	scaleLegClocks(t)
+	b := startRelayBridge(t)
+	b.client.Close()
+	deadline := time.Now().Add(relayClientActiveWindow() + 3*h2FrameReadTimeout())
+	for b.exit.ended.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if b.exit.ended.Load() == 0 {
+		t.Fatalf("the relay kept the leg of a client that hung up for %v",
+			relayClientActiveWindow()+3*h2FrameReadTimeout())
 	}
 }
 
@@ -241,6 +266,17 @@ func TestClientLiveness(t *testing.T) {
 	}
 	relaySide, client := tcpPair(t)
 	t.Cleanup(func() { relaySide.Close(); client.Close() })
+	// Keepalive on, at a period well inside the window: its probes do not
+	// refresh the ACK age (measured), so an idle conn still ages out.
+	for _, c := range []net.Conn{relaySide, client} {
+		tc := c.(*net.TCPConn)
+		if err := tc.SetKeepAlive(true); err != nil {
+			t.Fatal(err)
+		}
+		if err := tc.SetKeepAlivePeriod(100 * time.Millisecond); err != nil {
+			t.Fatal(err)
+		}
+	}
 	go func() { _, _ = io.Copy(io.Discard, client) }()
 	time.Sleep(400 * time.Millisecond)
 	if (clientLiveness{conn: relaySide, heard: never}).alive() {
