@@ -7,6 +7,7 @@ import (
 	mrand "math/rand"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/log"
@@ -206,6 +207,7 @@ type RTTMaskingConn struct {
 	// buffering a packet nothing would flush.
 	done      chan struct{}
 	closeOnce sync.Once
+	closeErr  error
 
 	// wdl keeps the caller's write deadline, so that Close bounds its
 	// final flush by it instead of replacing it.
@@ -471,22 +473,55 @@ func (c *RTTMaskingConn) SetWriteDeadline(t time.Time) error {
 // Close stops the flush goroutine, flushes any pending burst, and closes
 // connection. The flush runs under the earlier of the caller's write
 // deadline and rttCloseTimeout; the deadline goes down to the wrapped conn,
-// so a MorphedConn under this one drains within the same bound. If the
-// flush is still blocked closeAbortGrace past it, as on a conn that ignores
-// write deadlines, the conn is closed to break it loose. A burst that did
-// not go out, now or in an earlier flush, is reported, joined with the
-// socket's own Close error: Write already returned success for it.
+// so a MorphedConn under this one drains within the same bound. When the
+// burst is lost, or the deadline has passed, the wrapped conn is closed at
+// once (CloseNow, or the socket at the bottom of its NetConn chain): a
+// tls.Conn would otherwise spend another 5 s on close_notify. An abort
+// timer stays armed closeAbortGrace past the deadline through the wrapped
+// conn's own Close and closes that socket if anything still blocks. A
+// burst that did not go out, now or in an earlier flush, is reported and
+// logged, joined with the socket's own Close error: Write already returned
+// success for it. Every call returns the first result.
 func (c *RTTMaskingConn) Close() error {
-	c.closeOnce.Do(func() { close(c.done) })
-	closeBy := c.wdl.begin(c.Conn, rttCloseTimeout)
-	closeConn := sync.OnceValue(c.Conn.Close)
-	abort := time.AfterFunc(time.Until(closeBy)+closeAbortGrace, func() { _ = closeConn() })
+	c.closeOnce.Do(func() { c.closeErr = c.close() })
+	return c.closeErr
+}
+
+// CloseNow aborts the connection: the close deadline expires at once, the
+// pending burst is reported lost, and the wrapped conn is closed at once.
+// It is Close for VPNClient.Stop.
+func (c *RTTMaskingConn) CloseNow() error {
+	c.wdl.abortNow(c.Conn)
+	return c.Close()
+}
+
+func (c *RTTMaskingConn) close() error {
+	close(c.done)
+	var aborted atomic.Bool
+	closeSock := sync.OnceValue(func() error { return closeSocket(c.Conn) })
+	c.wdl.begin(c.Conn, rttCloseTimeout, func() {
+		aborted.Store(true)
+		_ = closeSock()
+	})
+	defer c.wdl.end()
 	_ = c.Flush()
-	abort.Stop()
 	c.mu.Lock()
 	flushErr := c.flushErr
 	c.mu.Unlock()
-	return errors.Join(flushErr, closeConn())
+	if flushErr != nil {
+		log.Warn("RTT masking: close lost the pending burst: %v", flushErr)
+	}
+	if flushErr == nil && !aborted.Load() && !c.wdl.expired() {
+		return c.Conn.Close()
+	}
+	if cn, ok := c.Conn.(closeNower); ok && !aborted.Load() {
+		return errors.Join(flushErr, cn.CloseNow())
+	}
+	sockErr := closeSock()
+	// Release the wrapped conn too. Its error only reports the socket
+	// closed just above.
+	_ = c.Conn.Close()
+	return errors.Join(flushErr, sockErr)
 }
 
 // UpdateConfig allows runtime config updates

@@ -224,9 +224,15 @@ func parkedClient(t *testing.T, conn net.Conn, raw *net.TCPConn) (*MorphedConn, 
 // running after limit.
 func closeParked(t *testing.T, mc *MorphedConn, sh *parkingShaper, during func(), limit time.Duration) (time.Duration, error) {
 	t.Helper()
+	return closeParkedWith(t, mc, sh, mc.Close, during, limit)
+}
+
+// closeParkedWith is closeParked with the close call given.
+func closeParkedWith(t *testing.T, mc *MorphedConn, sh *parkingShaper, closeFn func() error, during func(), limit time.Duration) (time.Duration, error) {
+	t.Helper()
 	start := time.Now()
 	closed := make(chan error, 1)
-	go func() { closed <- mc.Close() }()
+	go func() { closed <- closeFn() }()
 	select {
 	case <-mc.pacer.done:
 	case <-time.After(limit):

@@ -81,6 +81,7 @@ func TestRTTMaskingKeepsTickerFlushError(t *testing.T) {
 // the rest of the buffer too; the error says how much.
 func TestRTTMaskingFlushCountsWhatItLeft(t *testing.T) {
 	c := NewRTTMaskingConn(&failAfterConn{ok: 1}, burstOnlyOnClose)
+	t.Cleanup(func() { _ = c.Close() }) // stops its flushLoop
 	for _, p := range [][]byte{{1}, {2, 2}, {3, 3, 3}} {
 		if _, err := c.Write(p); err != nil {
 			t.Fatalf("Write: %v", err)

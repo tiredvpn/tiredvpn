@@ -55,7 +55,12 @@ func closeTestPayload(n int) []byte {
 // and closes the writer as soon as Write returns, the way a real caller
 // does, while the peer reads slowly: readPause after every 4 KiB. It
 // returns what the peer got before EOF, how long Close took and what it
-// returned.
+// returned. The pause only has to keep the reader behind the pacer, so the
+// queue stays full and a tail is left at Close; a long one risks
+// ErrShaperOverflow instead, which is the producer-side backpressure of a
+// reader starved for a whole second (seen once in 50 under stress -c 20).
+// writeThenClose reports that as overflow=true rather than failing, and
+// the caller retries the round.
 func writeThenClose(t *testing.T, client, server *MorphedConn, payload []byte, readPause time.Duration) ([]byte, time.Duration, error) {
 	t.Helper()
 	type result struct {
@@ -78,6 +83,9 @@ func writeThenClose(t *testing.T, client, server *MorphedConn, payload []byte, r
 	}()
 
 	if _, err := client.Write(payload); err != nil {
+		if errors.Is(err, ErrShaperOverflow) {
+			return nil, 0, err
+		}
 		t.Fatalf("Write: %v", err)
 	}
 	start := time.Now()
@@ -115,13 +123,13 @@ func TestMorphedConnCloseDeliversTail(t *testing.T) {
 			name:      "unpaced, slow reader",
 			client:    func(*testing.T) shaper.Shaper { return &chunkShaper{} },
 			server:    func(*testing.T) shaper.Shaper { return &chunkShaper{} },
-			readPause: 2 * time.Millisecond,
+			readPause: 500 * time.Microsecond,
 		},
 		{
-			name:      "chrome preset, reader pausing 1 ms per 4 KiB",
+			name:      "chrome preset, reader pausing 0.5 ms per 4 KiB",
 			client:    func(t *testing.T) shaper.Shaper { return closeTestShaper(t, presets.PresetChromeBrowsing, 1) },
 			server:    func(t *testing.T) shaper.Shaper { return closeTestShaper(t, presets.PresetChromeBrowsing, 2) },
-			readPause: time.Millisecond,
+			readPause: 500 * time.Microsecond,
 		},
 	}
 	for _, tc := range cases {
@@ -131,6 +139,14 @@ func TestMorphedConnCloseDeliversTail(t *testing.T) {
 
 			want := closeTestPayload(1 << 20)
 			got, took, closeErr := writeThenClose(t, client, server, want, tc.readPause)
+			if errors.Is(closeErr, ErrShaperOverflow) {
+				// The reader was starved past the producer timeout. One
+				// retry on a fresh pair; twice is not load.
+				t.Logf("retrying after producer overflow: %v", closeErr)
+				client2, server2, cleanup2 := NewTestMorphedConnPair(profile, tc.client(t), tc.server(t))
+				defer cleanup2()
+				got, took, closeErr = writeThenClose(t, client2, server2, want, tc.readPause)
+			}
 			if closeErr != nil {
 				t.Fatalf("Close after %v: %v, want nil with a peer that reads", took, closeErr)
 			}
