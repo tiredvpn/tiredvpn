@@ -424,7 +424,11 @@ func TestPoolPauseStaysUnderItsBase(t *testing.T) {
 	if share := float64(n) / float64(len(draws)); share > 0.15 {
 		t.Fatalf("%.0f%% of the pauses in the lowest fifth of the range: piled at the floor", 100*share)
 	}
-	if edge := draws[len(draws)/20] - draws[0]; edge < base/10 {
+	// A hard minimum piles draws on it and leaves this span near zero. The
+	// hump's own lowest 5% span 6.0-7.6 s of a minute (400 trials of 10000
+	// draws), so base/10 sat on its tail and failed about one run in 300;
+	// base/20 keeps the margin both ways.
+	if edge := draws[len(draws)/20] - draws[0]; edge < base/20 {
 		t.Fatalf("the lowest 5%% of pauses span only %v: a hard minimum", edge)
 	}
 }
