@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"io"
 	"net"
-	"time"
 
 	"github.com/xtaci/smux"
 
@@ -251,8 +250,11 @@ func handleREALITYAuthenticated(conn net.Conn, srvCtx *serverContext, logger *lo
 
 	logger.Debug("REALITY: Connecting to destination %s", dest)
 
-	// Connect to real destination
-	destConn, err := net.DialTimeout("tcp", dest, 10*time.Second)
+	// Connect to real destination, through the same donor dial the mirror
+	// uses: one place to point a test at a donor of its own, which before
+	// this was the real SNI host on the internet, so a test of the tunnel
+	// failed whenever that host did not answer from the test machine.
+	destConn, err := srvCtx.dialDonor(dest)
 	if err != nil {
 		logger.Error("REALITY: Failed to connect to %s: %v", dest, err)
 		sendTLSAlert(conn, 0x50) // internal_error
