@@ -75,7 +75,7 @@ func startRelayBridgeTo(t *testing.T, addr string, secret []byte) *relayBridge {
 	t.Cleanup(func() { client.Close() })
 	go func() {
 		defer close(b.done)
-		relayTUNToUpstream(relaySide, relayCtx, testLogger(t), dialTUNHandshake())
+		relayTUNToUpstream(relaySide, relayCtx, testLogger(t), dialTUNHandshake(), clientIdentity{})
 	}()
 	resp, conn, err := tun.ReadTUNHandshakeResponse(client, 0x04, time.Now().Add(10*time.Second))
 	if err != nil {

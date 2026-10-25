@@ -1172,6 +1172,7 @@ func handleQUICConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 		n, err := optimizedRelay(targetConn, conn)
 		atomic.AddInt64(&bytesUp, n)
 		end.note("the client", "the target", err)
+		endTargetWrites(targetConn)
 	}()
 
 	// Target -> Client
@@ -2434,6 +2435,7 @@ func handleMorphConnection(conn net.Conn, srvCtx *serverContext, logger *log.Log
 	// Client -> Target (need to unwrap morph packets)
 	go func() {
 		defer wg.Done()
+		defer endTargetWrites(targetConn)
 		for {
 			// Read morph packet header: [dataLen:4][paddingLen:2]
 			hdr := make([]byte, 6)
@@ -2649,7 +2651,7 @@ func handleMorphTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverConte
 		// Relay: hand this client to the upstream exit instead of terminating it
 		// here, so a client that fell back to morph still exits where it asked.
 		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, remainingData,
-			originOf(conn.RemoteAddr()), conn, func(pkt []byte) error {
+			originOf(conn.RemoteAddr()), relayClientTag(clientID), conn, func(pkt []byte) error {
 				return writeMorphFrame(morphFramePacket(pkt))
 			})
 		if err != nil {
@@ -2666,7 +2668,7 @@ func handleMorphTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverConte
 	} else {
 		// Allocate IP from pool (if available) or use requested IP as fallback
 		if srvCtx.ipPool != nil {
-			allocatedIP, err := allocateTunnelIP(srvCtx, clientID, originOf(conn.RemoteAddr()), requestedIP)
+			allocatedIP, err := allocateTunnelIP(srvCtx, clientID, originOf(conn.RemoteAddr()), "", requestedIP)
 			if err != nil {
 				logger.Error("Failed to allocate IP from pool: %v", err)
 				failPacket := []byte{0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01}
@@ -3090,6 +3092,7 @@ func handleProtocolConfusion(sess *confusionSession, srvCtx *serverContext, logg
 
 	go func() {
 		defer wg.Done()
+		defer endTargetWrites(targetConn)
 		for {
 			data, err := conn.ReadFrame()
 			if err != nil {
@@ -3202,7 +3205,7 @@ func handleConfusionTUNMode(sess *confusionSession, remainingData []byte, srvCtx
 	if srvCtx.upstreamDialer != nil {
 		// Relay: forward to the upstream exit rather than terminating here.
 		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, remainingData,
-			originOf(conn.RemoteAddr()), sess.raw, func(pkt []byte) error {
+			originOf(conn.RemoteAddr()), relayClientTag(clientID), sess.raw, func(pkt []byte) error {
 				frame := make([]byte, 4+len(pkt))
 				binary.BigEndian.PutUint32(frame[:4], uint32(len(pkt)))
 				copy(frame[4:], pkt)
@@ -3221,7 +3224,7 @@ func handleConfusionTUNMode(sess *confusionSession, remainingData []byte, srvCtx
 	} else {
 		// Allocate IP from pool
 		if srvCtx.ipPool != nil {
-			allocatedIP, err := allocateTunnelIP(srvCtx, clientID, originOf(conn.RemoteAddr()), requestedIP)
+			allocatedIP, err := allocateTunnelIP(srvCtx, clientID, originOf(conn.RemoteAddr()), "", requestedIP)
 			if err != nil {
 				logger.Error("Failed to allocate IP from pool: %v", err)
 				conn.Write([]byte{0x01})
@@ -3466,9 +3469,7 @@ func handleRawTunnel(conn net.Conn, srvCtx *serverContext, logger *log.Logger, c
 		n, err := optimizedRelay(targetConn, conn)
 		atomic.AddInt64(&bytesUp, n)
 		end.note("the client", "the target", err)
-		if tc, ok := targetConn.(*net.TCPConn); ok {
-			tc.CloseWrite()
-		}
+		endTargetWrites(targetConn)
 	}()
 
 	go func() {
@@ -3571,7 +3572,7 @@ func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger
 	// branch the loop below writes client packets into our own TUN device, the
 	// kernel never routes them to the upstream, and the client gets no exit.
 	if srvCtx != nil && srvCtx.upstreamDialer != nil {
-		relayTUNToUpstream(conn, srvCtx, logger, handshake)
+		relayTUNToUpstream(conn, srvCtx, logger, handshake, clientID)
 		return
 	}
 
@@ -3595,7 +3596,7 @@ func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger
 	if srvCtx.ipPool != nil {
 		// Use IP Pool - it returns same IP for same lease key (from Redis leases)
 		var err error
-		clientIP, err = allocateTunnelIP(srvCtx, clientID, originOf(conn.RemoteAddr()), requestedIP)
+		clientIP, err = allocateTunnelIP(srvCtx, clientID, originOf(conn.RemoteAddr()), "", requestedIP)
 		if err != nil {
 			logger.Warn("IP allocation failed: %v", err)
 			resp := make([]byte, 9)
@@ -3763,15 +3764,22 @@ func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger
 // IP the upstream assigned) back to the downstream client, then byte-copies the
 // raw [len:4][pkt:N] frames (and zero-length keepalives) in both directions. The
 // relay never touches its own sharedTUN/ippool for these clients.
-func relayTUNToUpstream(conn net.Conn, srvCtx *serverContext, logger *log.Logger, handshake []byte) {
+func relayTUNToUpstream(conn net.Conn, srvCtx *serverContext, logger *log.Logger, handshake []byte, clientID clientIdentity) {
 	// Carry the downstream client's identity upstream. Without it every client
 	// behind this relay reaches the exit as the same anonymous "global" client,
 	// so the exit's sticky IP pool hands them all one tunnel IP and they evict
 	// each other. A relay further down may have attached the origin already;
 	// keep that one so the chain reports the real client, not the middle hop.
 	handshake, origin := splitTUNOrigin(handshake)
+	handshake, tag := splitTUNClientTag(handshake)
 	if origin == "" {
 		origin = originOf(conn.RemoteAddr())
+	}
+	// The origin is the client's IP, which two clients behind one NAT share;
+	// the tag tells them apart on the exit. A relay further down may have
+	// attached one, and that one belongs to the real client.
+	if tag == "" {
+		tag = relayClientTag(clientID)
 	}
 
 	// The client's handshake version travels upstream verbatim, so it is also
@@ -3782,7 +3790,7 @@ func relayTUNToUpstream(conn net.Conn, srvCtx *serverContext, logger *log.Logger
 	}
 
 	dialCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	upstreamConn, upstreamStego, resp, err := srvCtx.upstreamDialer.dialTUN(dialCtx, handshake, origin)
+	upstreamConn, upstreamStego, resp, err := srvCtx.upstreamDialer.dialTUN(dialCtx, handshake, origin, tag)
 	cancel()
 	if err != nil {
 		logger.Warn("Relay: upstream TUN dial failed: %v", err)
@@ -4059,6 +4067,7 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 	// A relay forwarding a downstream client appends that client's origin after
 	// the handshake; strip it before parsing the fixed fields.
 	data, origin := splitTUNOrigin(data)
+	data, clientTag := splitTUNClientTag(data)
 	if origin == "" {
 		origin = tunnel.remoteAddr
 	}
@@ -4124,7 +4133,8 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 
 	if srvCtx.upstreamDialer != nil {
 		// Relay: forward to the upstream exit rather than terminating here.
-		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, data, origin, tunnel.downstream, sendPacketDown)
+		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, data, origin,
+			relayClientTag(tunnel.clientID), tunnel.downstream, sendPacketDown)
 		if err != nil {
 			logger.Warn("H2 TUN relay: upstream dial failed: %v", err)
 			sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, tunnel.secret)
@@ -4135,7 +4145,7 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 	} else {
 		// Allocate IP from pool
 		if srvCtx.ipPool != nil {
-			allocatedIP, err := allocateTunnelIP(srvCtx, tunnel.clientID, origin, requestedIP)
+			allocatedIP, err := allocateTunnelIP(srvCtx, tunnel.clientID, origin, clientTag, requestedIP)
 			if err != nil {
 				logger.Error("Failed to allocate IP from pool: %v", err)
 				sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, tunnel.secret)
@@ -5793,9 +5803,18 @@ func runPollingSessionRelay(sess *HTTPPollingSession, srvCtx *serverContext, log
 		return
 	}
 
+	// A session closed during the dial - up to 10 s - never saw this conn,
+	// and nothing else would close it: an upstream conn's keepalive held it
+	// and its socket for good (P3-4 of the round-9 review). Close sets
+	// closed before it looks at targetConn under targetLock, so one of the
+	// two closes it.
 	sess.targetLock.Lock()
 	sess.targetConn = targetConn
 	sess.targetLock.Unlock()
+	if sess.closed.Load() {
+		targetConn.Close()
+		return
+	}
 
 	// Send success
 	sess.WriteToClient([]byte{0x00})
@@ -5970,7 +5989,8 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 		// Relay: forward to the upstream exit rather than terminating here. This
 		// is the path a client lands on after falling back to meek-style polling,
 		// which used to strand it on the relay's own exit and address pool.
-		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, remainingData, sess.Origin, nil,
+		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, remainingData, sess.Origin,
+			relayClientTag(clientID), nil,
 			func(pkt []byte) error {
 				_, err := pollConn.Write(pkt)
 				return err
@@ -5990,7 +6010,7 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 	} else {
 		// Allocate IP from pool
 		if srvCtx.ipPool != nil {
-			allocatedIP, err := allocateTunnelIP(srvCtx, clientID, sess.Origin, requestedIP)
+			allocatedIP, err := allocateTunnelIP(srvCtx, clientID, sess.Origin, "", requestedIP)
 			if err != nil {
 				logger.Error("HTTP Polling TUN: Failed to allocate IP from pool: %v", err)
 				sess.WriteToClient([]byte{0x01}) // Failure

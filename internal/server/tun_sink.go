@@ -411,16 +411,22 @@ func (s *relayTUNSink) pump(deliver func(pkt []byte) error) {
 // those, so the address always comes from the exit, never from the relay's pool.
 // When the exit negotiated dual-stack, its IPv6 tunnel addresses ride on the
 // sink (see relayTUNSink.dualAddrs).
-func dialRelayTUN(srvCtx *serverContext, logger *log.Logger, handshake []byte, origin string,
+func dialRelayTUN(srvCtx *serverContext, logger *log.Logger, handshake []byte, origin, clientTag string,
 	client net.Conn, deliver func(pkt []byte) error) (*relayTUNSink, net.IP, net.IP, error) {
 
 	handshake, forwarded := splitTUNOrigin(handshake)
+	handshake, forwardedTag := splitTUNClientTag(handshake)
 	if forwarded != "" {
 		origin = forwarded
 	}
+	// A relay further down has already named this client; its tag belongs to
+	// the real client, ours would name the hop.
+	if forwardedTag != "" {
+		clientTag = forwardedTag
+	}
 
 	dialCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	upConn, resp, err := srvCtx.upstreamDialer.DialTUN(dialCtx, handshake, origin)
+	upConn, resp, err := srvCtx.upstreamDialer.DialTUN(dialCtx, handshake, origin, clientTag)
 	cancel()
 	if err != nil {
 		return nil, nil, nil, err

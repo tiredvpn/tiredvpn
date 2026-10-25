@@ -129,6 +129,25 @@ var upstreamKeepaliveSent atomic.Pointer[func()]
 // the exit, of any version, reads a frame and delivers nothing. A conn that
 // is not an upstream stego conn is left alone.
 //
+// What this rule counts as a client being there, and what it does not
+// (P3-10 of the round-9 review):
+//
+//   - It is the ACK of what the relay sent. Measured on loopback with the
+//     kernel keepalive at 1 s on both ends, tcpi_last_ack_recv was
+//     refreshed by the ACK of the data sent and then grew past 7 s
+//     untouched: keepalive probes do not refresh it. So the rule does not
+//     turn every live socket into a live client, as the review read it. A
+//     client the relay sends nothing to goes away by the old rule alone.
+//   - While the relay does keep sending - a sparse download, which is the
+//     case the rule was changed for - whatever acknowledges it counts as
+//     the client: a sleeping phone, which is the point, but also a client
+//     process frozen with its socket open, or an L4 proxy that terminates
+//     the TCP in front of one. Such a client keeps the leg and the exit's
+//     session while its target keeps talking. What ends it is the socket
+//     going away, which the relay's copy up sees as the end of its stream.
+//   - TCP_INFO is Linux only. Elsewhere, and on Polling and QUIC, the rule
+//     falls back to what the transport itself can say.
+//
 // live says what the relay can read of its downstream client; the client
 // also counts as heard whenever its bytes go up the leg.
 func keepUpstreamAlive(up *strategy.HTTP2StegoConn, live clientLiveness, logger *log.Logger) {

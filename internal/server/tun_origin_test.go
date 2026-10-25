@@ -91,7 +91,7 @@ func TestAllocationKey(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := allocationKey(c.id, c.origin); got != c.want {
+			if got := allocationKey(c.id, c.origin, ""); got != c.want {
 				t.Errorf("allocationKey(%+v, %q) = %q, want %q", c.id, c.origin, got, c.want)
 			}
 		})
@@ -106,7 +106,7 @@ func TestUnclassifiedIdentityIsTreatedAsShared(t *testing.T) {
 	var forgotten clientIdentity
 	forgotten.id = "newtransport:whatever"
 
-	if got := allocationKey(forgotten, "192.0.2.170"); got != "newtransport:whatever@192.0.2.170" {
+	if got := allocationKey(forgotten, "192.0.2.170", ""); got != "newtransport:whatever@192.0.2.170" {
 		t.Errorf("an unclassified identity was not qualified: %q", got)
 	}
 }
@@ -157,7 +157,7 @@ func TestSharedSecretClientsGetDistinctIPs(t *testing.T) {
 
 	seen := make(map[string]string, len(addrs))
 	for _, addr := range addrs {
-		got, err := pool.Allocate(allocationKey(id, addr), net.ParseIP("10.8.2.4"), "")
+		got, err := pool.Allocate(allocationKey(id, addr, ""), net.ParseIP("10.8.2.4"), "")
 		if err != nil {
 			t.Fatalf("%s: %v", addr, err)
 		}
@@ -169,7 +169,7 @@ func TestSharedSecretClientsGetDistinctIPs(t *testing.T) {
 
 	// Sticky per client: the same box reconnecting keeps its address, which is
 	// what stops the eviction loop rather than merely spreading it out.
-	first := allocationKey(id, addrs[0])
+	first := allocationKey(id, addrs[0], "")
 	again, err := pool.Allocate(first, net.ParseIP("10.8.2.99"), "")
 	if err != nil {
 		t.Fatal(err)
@@ -190,11 +190,11 @@ func TestRegistryClientKeepsOneLeaseAcrossAddresses(t *testing.T) {
 	}
 
 	named := registryIdentity("c1")
-	home, err := pool.Allocate(allocationKey(named, "192.0.2.170"), net.ParseIP("10.8.2.7"), "")
+	home, err := pool.Allocate(allocationKey(named, "192.0.2.170", ""), net.ParseIP("10.8.2.7"), "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	roaming, err := pool.Allocate(allocationKey(named, "198.51.100.152"), net.ParseIP("10.8.2.7"), "")
+	roaming, err := pool.Allocate(allocationKey(named, "198.51.100.152", ""), net.ParseIP("10.8.2.7"), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,8 +209,8 @@ func TestGlobalClientsGetDistinctIPs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	laptop := allocationKey(sharedIdentity(globalClientID), "192.0.2.170")
-	noder := allocationKey(sharedIdentity(globalClientID), "198.51.100.152")
+	laptop := allocationKey(sharedIdentity(globalClientID), "192.0.2.170", "")
+	noder := allocationKey(sharedIdentity(globalClientID), "198.51.100.152", "")
 
 	first, err := pool.Allocate(laptop, net.ParseIP("10.8.5.2"), "")
 	if err != nil {
@@ -254,7 +254,7 @@ func TestRealityIdentityIsShared(t *testing.T) {
 	if other := realityClientIdentity(secret, sharedIdentity(globalClientID)); other.id != id.id {
 		t.Fatalf("the same secret gave two identities, %q and %q", id.id, other.id)
 	}
-	if allocationKey(id, "192.0.2.161") == allocationKey(id, "198.51.100.152") {
+	if allocationKey(id, "192.0.2.161", "") == allocationKey(id, "198.51.100.152", "") {
 		t.Error("two addresses on one secret produced one lease key")
 	}
 

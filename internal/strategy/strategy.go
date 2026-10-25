@@ -2522,11 +2522,22 @@ func (m *Manager) HandshakeAnswered(s Strategy, cand endpoint.Candidate, hasCand
 		return
 	}
 	key := m.swallowKey(cand.Addr)
+	// The mark was set on every address of the server (HandshakeUnanswered),
+	// so the answer lifts it from every address too: lifting it from this
+	// one alone left the transport set aside on the other family, where
+	// nothing would clear it until the record went stale (P3-11 of the
+	// round-9 review).
+	addrs := []string{cand.Addr}
+	if sel := m.selector(); sel != nil {
+		addrs = append(addrs, sel.Siblings(cand)...)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.unansweredHS, key)
 	if r := m.swallowed[key]; r != nil && s != nil {
-		delete(r.mute[cand.Addr], s.ID())
+		for _, addr := range addrs {
+			delete(r.mute[addr], s.ID())
+		}
 	}
 }
 

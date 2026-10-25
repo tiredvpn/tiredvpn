@@ -114,6 +114,13 @@ Versions follow [Semantic Versioning](https://semver.org/).
   bridge, the raw-tunnel, QUIC and mux relays now log what ended them first
   (the client, the upstream or the target closing, an error, an idle
   timeout).
+- **A transport whose session handshake goes unanswered sits out for about
+  three minutes.** The transport is set aside on every address of the
+  server, another transport connecting there no longer clears it, and no
+  upgrade goes back to it meanwhile. That is deliberate: a server that
+  swallows handshakes on its best transport used to keep the client
+  dialling it. A handshake of that transport answered on any address of the
+  server lifts it at once.
 - **Relay: a sparse download no longer loses its leg every minute.** A
   client sending nothing up - a push every few seconds, no keepalive of its
   own before 1.11.9 - left the relay's TUN bridge and its proxy relays
@@ -123,11 +130,23 @@ Versions follow [Semantic Versioning](https://semver.org/).
   open and an HTTP Polling client that keeps polling: on QUIC and Polling a
   proxied stream through a relay still died after two minutes. Exits of any
   version accept it.
-- **Relay: anti-probe sessions through a relay no longer end 2 s after
-  connecting.**
+- **Anti-probe sessions no longer end 2 s after connecting.** The knock
+  check left its own read deadline on the connection. An exit's TUN loop
+  sets its own, so the tunnel survived there, but a proxied stream - to an
+  exit directly as well as through a relay - lost its uplink two seconds
+  after the knock.
 - **Server: a proxied site that hangs up is passed on at once.** The client,
   directly or through a relay, used to wait up to a minute for the rest of
   an answer that had ended.
+- **Two clients behind one address no longer take one tunnel address from
+  each other through a relay.** A relay told the exit only its client's IP,
+  and two clients behind one NAT - a home router and a phone - share it, so
+  the exit leased them one address and they evicted each other about every
+  half minute. The relay now also says which of its clients it is
+  forwarding. A client with its own credential keeps its address; clients
+  sharing the server's global secret hold a lease per session, since
+  nothing they send tells them apart. Old relays and old exits are
+  unaffected, and keep the old behaviour between themselves.
 - **Server: a client keeps its tunnel address across transports and
   networks.** Leases are keyed on the credential, and leases an older server
   wrote under other keys are folded into it.

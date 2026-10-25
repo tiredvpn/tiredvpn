@@ -3,6 +3,8 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"net"
 )
 
@@ -17,6 +19,78 @@ const globalClientID = "global"
 // seven bytes and ignores the rest of the stego payload, so an older upstream
 // silently drops the extension instead of choking on it.
 var tunOriginMagic = []byte("TRO1")
+
+// tunClientTagMagic marks the optional client-tag extension a relay appends
+// to the TUN setup payload, before the origin trailer: [magic:4][len:1][tag:N].
+// It sits before TRO1 because splitTUNOrigin requires its own trailer to be
+// last. Both are after the fixed seven bytes, which is all any exit parses,
+// so an exit that knows neither drops both.
+//
+// The origin alone was not enough: it is the downstream client's IP, and two
+// clients behind one NAT share it, so they shared one lease on the exit and
+// evicted each other every half minute - the field case behind the msk
+// relays. The tag tells them apart (relayClientTag).
+var tunClientTagMagic = []byte("TRC1")
+
+// appendTUNClientTag returns handshake with tag appended. An empty tag
+// returns it unchanged.
+func appendTUNClientTag(handshake []byte, tag string) []byte {
+	if tag == "" || len(tag) > 255 {
+		return handshake
+	}
+	out := make([]byte, 0, len(handshake)+len(tunClientTagMagic)+1+len(tag))
+	out = append(out, handshake...)
+	out = append(out, tunClientTagMagic...)
+	out = append(out, byte(len(tag)))
+	out = append(out, tag...)
+	return out
+}
+
+// splitTUNClientTag splits a TUN setup payload into the handshake proper and
+// the client tag a relay attached. Call it after splitTUNOrigin: the origin
+// trailer is the outer one. A payload without the extension comes back
+// unchanged with an empty tag.
+func splitTUNClientTag(data []byte) ([]byte, string) {
+	idx := bytes.LastIndex(data, tunClientTagMagic)
+	if idx < 0 {
+		return data, ""
+	}
+	rest := data[idx+len(tunClientTagMagic):]
+	if len(rest) < 1 {
+		return data, ""
+	}
+	n := int(rest[0])
+	if n == 0 || len(rest) != 1+n {
+		return data, ""
+	}
+	return data[:idx], string(rest[1 : 1+n])
+}
+
+// relayClientTag is the tag a relay attaches for a downstream client whose
+// identity it knows and whose address it is about to forward.
+//
+// A client with its own credential gets its own id: two such clients behind
+// one NAT then hold two leases on the exit, and each keeps its address
+// across reconnects and across a change of transport.
+//
+// Clients that share one credential - the server's global secret - cannot be
+// told apart by anything durable they send, so there is nothing stable to
+// key on and the tag is drawn per downstream session. Two boxes behind one
+// NAT then hold two leases instead of fighting over one, and each keeps its
+// address while it reconnects, because a reconnect asks for the address it
+// holds and the pool honours a free request. A box that reconnects after
+// something else took that address gets a new one, as it would after a
+// lease expiry.
+func relayClientTag(id clientIdentity) string {
+	if id.perClient && id.leaseID() != "" {
+		return "c" + id.leaseID()
+	}
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return ""
+	}
+	return "s" + hex.EncodeToString(b[:])
+}
 
 // appendTUNOrigin returns handshake with the downstream client's origin appended
 // as [magic:4][len:1][origin:N]. An empty origin returns the handshake unchanged.
@@ -154,22 +228,31 @@ func (c clientIdentity) prefixed(transport string) clientIdentity {
 // the TRO1 trailer rather than from the socket - qualifying at the point of
 // authentication instead would collapse every client behind one relay back
 // into a single lease.
-func allocationKey(id clientIdentity, origin string) string {
+func allocationKey(id clientIdentity, origin, clientTag string) string {
 	// An empty identity keys nothing, and "@1.2.3.4" would be a key rather than
 	// the absence of one. Callers that have no identity resolve one of their own
 	// before they get here; this keeps the function honest for the ones that do
 	// not, which is what it did before it learned about provenance.
-	if id.id == "" || id.perClient || origin == "" {
+	if id.id == "" || id.perClient {
 		return id.leaseID()
 	}
-	return id.leaseID() + "@" + origin
+	key := id.leaseID()
+	if origin != "" {
+		key += "@" + origin
+	}
+	// The tag a relay attached for its downstream client, which the origin
+	// cannot tell apart behind a NAT. Only a relay sends one.
+	if clientTag != "" {
+		key += "#" + clientTag
+	}
+	return key
 }
 
 // allocateTunnelIP is the one way a TUN session gets its address: the lease
 // keyed by allocationKey, after folding in every lease the client still holds
 // under a key an older server spelled for it (legacyAllocationKeys).
-func allocateTunnelIP(srvCtx *serverContext, id clientIdentity, origin string, requested net.IP) (net.IP, error) {
-	key := allocationKey(id, origin)
+func allocateTunnelIP(srvCtx *serverContext, id clientIdentity, origin, clientTag string, requested net.IP) (net.IP, error) {
+	key := allocationKey(id, origin, clientTag)
 	keys, prefixes := legacyAllocationKeys(srvCtx, id, origin)
 	// Bounded: the Redis search for old leases must not hold a handshake up
 	// for long (adoptScanTimeout); one that runs out is retried next time.

@@ -205,6 +205,11 @@ type VPNClient struct {
 	// lastTx is a monoNow stamp of the last frame written up the tunnel,
 	// keepalives included (keepUplinkAlive).
 	lastTx atomic.Int64
+	// keepaliveMu serialises the two keepalives, the server-silence one
+	// and the uplink's own, from their last look at the stamps to the
+	// write; lastKeepalive is a monoNow stamp of the last one sent.
+	keepaliveMu   sync.Mutex
+	lastKeepalive atomic.Int64
 
 	// stall follows the session's TCP flows for the stall detector
 	// (watchStalls): one table per tunnel connection, replaced together with
@@ -1220,6 +1225,22 @@ func IsHandshakeAnswered(err error) bool {
 	return errors.Is(err, errHandshakeRefused) || errors.Is(err, errHandshakePartlyAnswered)
 }
 
+// KeepHandshakeMark returns outer with what the handshake learned from
+// inner kept on it: a refusal or an answer that came in part, either of
+// which ends the server's run of unanswered handshakes (IsHandshakeAnswered),
+// and a request that never left. A cancellation that replaced the handshake's
+// error dropped the mark, so a run of unanswered handshakes with a partial
+// answer cut short in the middle still read as the server's silence (P3-7 of
+// the round-9 review). Without a mark, outer is returned as it is.
+func KeepHandshakeMark(outer, inner error) error {
+	for _, mark := range []error{errHandshakePartlyAnswered, errHandshakeRefused, errHandshakeNotSent} {
+		if errors.Is(inner, mark) {
+			return fmt.Errorf("%w: %w", mark, outer)
+		}
+	}
+	return outer
+}
+
 // HandshakeRefused is the error for a handshake the server refused with
 // status, for a caller in another package (the client's reconnect).
 func HandshakeRefused(status byte) error {
@@ -1730,23 +1751,36 @@ func (v *VPNClient) sendKeepalive() {
 			// packets do not count: they may draw no reply at all, and then the
 			// echo is the only thing keeping readFromServer under readTimeout.
 			if time.Since(lastRx) >= keepaliveInterval()*9/10 {
-				// Send zero-length packet as keepalive: [length:4=0]
-				keepalivePkt := make([]byte, 4)
-				binary.BigEndian.PutUint32(keepalivePkt, 0)
-
-				conn.SetWriteDeadline(time.Now().Add(keepaliveWriteTimeout))
-				if _, err := conn.Write(keepalivePkt); err != nil {
-					v.connLost(conn, "keepalive write", uplinkFailed(err))
-				} else {
-					v.lastTx.Store(monoNow())
-					log.Debug("Sent keepalive packet")
-				}
+				v.writeSilenceKeepalive(conn)
 			}
 
 		case <-v.stopCh:
 			return
 		}
 	}
+}
+
+// writeSilenceKeepalive sends the keepalive that answers the server's
+// silence, a zero-length frame [length:4=0], under keepaliveMu with the
+// uplink's own keepalive. One of those that went just before - its echo
+// answers the same silence - makes it skip: while one keepalive's write was
+// blocked, the other saw the old stamps and went too, and two keepalives
+// back to back are a pair no client sends (P3-5 of the round-9 review).
+func (v *VPNClient) writeSilenceKeepalive(conn net.Conn) {
+	v.keepaliveMu.Lock()
+	defer v.keepaliveMu.Unlock()
+	if at := v.lastKeepalive.Load(); at != 0 && time.Duration(monoNow()-at) < keepaliveInterval()/2 {
+		return
+	}
+	_ = conn.SetWriteDeadline(time.Now().Add(keepaliveWriteTimeout))
+	if _, err := conn.Write([]byte{0, 0, 0, 0}); err != nil {
+		v.connLost(conn, "keepalive write", uplinkFailed(err))
+		return
+	}
+	now := monoNow()
+	v.lastTx.Store(now)
+	v.lastKeepalive.Store(now)
+	log.Debug("Sent keepalive packet")
 }
 
 // uplinkKeepaliveDraw draws how long the uplink may stay silent before
@@ -1841,9 +1875,12 @@ func (v *VPNClient) keepUplinkAlive() {
 			}
 			km, own := strat.(strategy.KeepaliveMaker)
 			own = own && km.MakesUpKeepalives()
-			// Looked at again with the conn in hand: a write may have gone
-			// up while the lock was waited for, and two keepalives back to
-			// back are a pair no client sends (P3-9 of the round-8 review).
+			// Looked at again with the conn in hand, under keepaliveMu: a
+			// write may have gone up while the lock was waited for, the
+			// server-silence keepalive among them, and two keepalives back
+			// to back are a pair no client sends (P3-9 of the round-8
+			// review, P3-5 of the round-9 one).
+			v.keepaliveMu.Lock()
 			silent = time.Duration(monoNow() - v.lastTx.Load())
 			if silent >= quiet {
 				if conn != nil && !own {
@@ -1851,7 +1888,9 @@ func (v *VPNClient) keepUplinkAlive() {
 					if _, err := conn.Write([]byte{0, 0, 0, 0}); err != nil {
 						v.connLost(conn, "keepalive write", uplinkFailed(err))
 					} else {
-						v.lastTx.Store(monoNow())
+						now := monoNow()
+						v.lastTx.Store(now)
+						v.lastKeepalive.Store(now)
 						log.Debug("Sent keepalive packet (uplink silent %v)", silent.Round(time.Millisecond))
 						if f := uplinkKeepaliveSent.Load(); f != nil {
 							(*f)()
@@ -1861,6 +1900,7 @@ func (v *VPNClient) keepUplinkAlive() {
 				quiet = (*uplinkKeepaliveDraw.Load())()
 				silent = 0
 			}
+			v.keepaliveMu.Unlock()
 		}
 		next := max(quiet-silent, 10*time.Millisecond)
 		if f := uplinkTimerReset.Load(); f != nil {

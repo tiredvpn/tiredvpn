@@ -1700,7 +1700,10 @@ func (cs *ControlServer) performTUNHandshake(ctx context.Context) (assignedIP, s
 	// the first frame back to the relay.
 	resp, n, next, err := readHandshakeResponse(cs.serverConn, version, time.Time{})
 	if !stop() {
-		return nil, nil, fmt.Errorf("handshake interrupted: %w", context.Cause(ctx))
+		// As on the reconnect: the cancellation carries what the handshake
+		// learned (P3-7 of the round-9 review).
+		return nil, nil, KeepHandshakeMark(
+			fmt.Errorf("handshake interrupted: %w", context.Cause(ctx)), err)
 	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("handshake read failed: %w", err)
