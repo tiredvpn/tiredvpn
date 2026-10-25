@@ -1529,7 +1529,7 @@ func (m *Manager) chargeSessionEndpoint(sel *endpoint.Selector, end SessionEnd, 
 		return
 	}
 	if sel.ReportDeadSession(end.Endpoint) {
-		log.Warn("Endpoint %s charged for its session (%s); every address of the server has a verdict - parking the server", end.Endpoint, why)
+		logServerPark(sel, end.Endpoint, fmt.Sprintf("Endpoint %s charged for its session (%s); every address of the server has a verdict - parking the server", end.Endpoint, why))
 	} else {
 		log.Info("Endpoint %s charged for its session (%s)", end.Endpoint, why)
 	}
@@ -1928,7 +1928,7 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 				continue
 			}
 			if sel.ReportSilent(cand, swallowedOn...) {
-				log.Warn("Endpoint %s: every address of the server has a verdict - parking the server", cand)
+				logServerPark(sel, cand, fmt.Sprintf("Endpoint %s: every address of the server has a verdict - parking the server", cand))
 			}
 		} else {
 			sel.Report(cand, false, 0)
@@ -2508,7 +2508,7 @@ func (m *Manager) HandshakeUnanswered(s Strategy, cand endpoint.Candidate, hasCa
 		return ErrCycleUnanswered
 	}
 	if sel.ReportSilent(cand, covered...) {
-		log.Warn("Endpoint %s: every address of the server has a verdict - parking the server", cand)
+		logServerPark(sel, cand, fmt.Sprintf("Endpoint %s: every address of the server has a verdict - parking the server", cand))
 	}
 	m.logEndpointHealth(sel, cand)
 	return ErrAddrSilent
@@ -2539,6 +2539,18 @@ func (m *Manager) HandshakeAnswered(s Strategy, cand endpoint.Candidate, hasCand
 			delete(r.mute[addr], s.ID())
 		}
 	}
+}
+
+// logServerPark says a server was parked: at Warn when the verdict started
+// the park, at Debug when it extended one still running. While a server is
+// parked every SOCKS dial that is forced onto it fails and extends the park,
+// and the Warn line came about every four seconds (the fix13c stand).
+func logServerPark(sel *endpoint.Selector, c endpoint.Candidate, msg string) {
+	if sel.TakeServerParkNotice(c) {
+		log.Warn("%s", msg)
+		return
+	}
+	log.Debug("%s (still parked)", msg)
 }
 
 // endSwallowRun ends addr's run of no-verdict cycles: a cycle reached a
