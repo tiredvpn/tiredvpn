@@ -261,6 +261,9 @@ type partialThenSlowStrategy struct {
 	// partial is true for the connection that answers in part; the others
 	// say nothing at all.
 	partial atomic.Bool
+	// wrote is closed once a partial answer has gone out, so the test can
+	// cancel exactly then instead of racing a budget.
+	wrote chan struct{}
 }
 
 func (s *partialThenSlowStrategy) Name() string                        { return s.id }
@@ -280,6 +283,9 @@ func (s *partialThenSlowStrategy) Connect(context.Context, string) (net.Conn, er
 		}
 		if partial {
 			_, _ = srv.Write([]byte{0x00, 10, 8})
+			if s.wrote != nil {
+				close(s.wrote)
+			}
 		}
 		_, _ = io.Copy(io.Discard, srv)
 	}()
@@ -293,7 +299,7 @@ func (s *partialThenSlowStrategy) Connect(context.Context, string) (net.Conn, er
 // unanswered, partial-answer-cut-short, unanswered still ended in the
 // server's silence verdict, though the server had spoken in between.
 func TestAPartialAnswerCutShortStillEndsTheUnansweredRun(t *testing.T) {
-	old := tun.SetHandshakeReadTimeout(300 * time.Millisecond)
+	old := tun.SetHandshakeReadTimeout(2 * time.Second)
 	t.Cleanup(func() { tun.SetHandshakeReadTimeout(old) })
 	a, b := acceptAll(t), acceptAll(t)
 	m := strategy.NewManager()
@@ -307,15 +313,19 @@ func TestAPartialAnswerCutShortStillEndsTheUnansweredRun(t *testing.T) {
 
 	var errs []error
 	for i := range 3 {
-		// The middle reconnect answers in part and is cut short by the
-		// budget: shorter than the handshake wait, so the read cannot
-		// finish on its own.
+		// The middle reconnect answers in part and is then cancelled -
+		// cancelled at the moment the partial answer has gone out, not by a
+		// budget racing the read's own deadline, which is the same instant
+		// by construction (reconnectHandshake bounds the read by ctx).
 		partial.partial.Store(i == 1)
-		budget := 2 * time.Second
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 		if i == 1 {
-			budget = 150 * time.Millisecond
+			partial.wrote = make(chan struct{})
+			go func() {
+				<-partial.wrote
+				cancel()
+			}()
 		}
-		ctx, cancel := context.WithTimeout(t.Context(), budget)
 		_, _, err := reconnectTUN(ctx, m, a, reconnClientIP, 1280, false, false)
 		cancel()
 		if err == nil {
