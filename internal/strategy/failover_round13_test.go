@@ -192,3 +192,32 @@ func TestAMuteTransportCrossesACoreRestart(t *testing.T) {
 		t.Fatal("the next core forgot that Confusion is mute on a")
 	}
 }
+
+// TestAnAnsweredHandshakeLiftsTheMuteOnEveryAddressOfTheServer is P3-11 of
+// the round-9 review: the mark goes on every address of the server when a
+// session handshake goes unanswered, and lifting it only from the address
+// that answered left the transport set aside on the other family. Nothing
+// cleared it there, so a client on prefer_v6 whose REALITY handshake was
+// lost once on v4 kept REALITY off v6 until the record went stale.
+func TestAnAnsweredHandshakeLiftsTheMuteOnEveryAddressOfTheServer(t *testing.T) {
+	a6, a4 := newHelloListenerAt(t, "[::1]:0"), newHelloListener(t)
+	b6, b4 := newHelloListenerAt(t, "[::1]:0"), newHelloListener(t)
+	m := dualStackPool(t, time.Second, nil, [2]string{a6.addr, a4.addr}, [2]string{b6.addr, b4.addr})
+	reality := &greetingStrategy{id: "reality", priority: 1}
+	m.Register(reality)
+	// A second transport, or the skip list would be dropped as leaving
+	// nothing to dial (swallowSkip).
+	m.Register(&greetingStrategy{id: "polling", priority: 6})
+	sel := m.selector()
+	c4, _ := sel.CandidateForAddr(a4.addr)
+	m.HandshakeUnanswered(reality, c4, true)
+	if m.UpgradeEligible(reality, a4.addr) || m.UpgradeEligible(reality, a6.addr) {
+		t.Fatal("the mute did not reach both addresses - the test proves nothing")
+	}
+	m.HandshakeAnswered(reality, c4, true)
+	for _, addr := range []string{a4.addr, a6.addr} {
+		if !m.UpgradeEligible(reality, addr) {
+			t.Fatalf("REALITY is still set aside on %s after it was answered on the server", addr)
+		}
+	}
+}
