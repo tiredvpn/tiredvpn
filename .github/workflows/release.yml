@@ -89,6 +89,7 @@ jobs:
         env:
           GOOS: linux
           GOARCH: amd64
+          CGO_ENABLED: "0"
         run: |
           go build -ldflags="-s -w -X main.version=${GITHUB_REF_NAME#v}" -o tiredvpn-linux-amd64 ./cmd/tiredvpn/
           tar -czf tiredvpn-linux-amd64.tar.gz tiredvpn-linux-amd64
@@ -97,6 +98,7 @@ jobs:
         env:
           GOOS: linux
           GOARCH: arm64
+          CGO_ENABLED: "0"
         run: |
           go build -ldflags="-s -w -X main.version=${GITHUB_REF_NAME#v}" -o tiredvpn-linux-arm64 ./cmd/tiredvpn/
           tar -czf tiredvpn-linux-arm64.tar.gz tiredvpn-linux-arm64
