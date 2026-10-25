@@ -4,24 +4,23 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
+	"encoding/pem"
 	"errors"
 	"fmt"
-	"go/ast"
-	"go/parser"
-	"go/token"
-	"go/types"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"slices"
-	"strings"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/tiredvpn/tiredvpn/internal/endpoint"
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
 	"github.com/tiredvpn/tiredvpn/internal/tun"
 	"golang.org/x/net/http2/hpack"
@@ -222,14 +221,17 @@ type tunClient struct {
 type tunTransport struct {
 	name string
 	open func(t *testing.T, srvCtx *serverContext) tunClient
+	// conns is the total_conns one session adds: the transports that track
+	// their connection with the registry add one.
+	conns int64
 }
 
 var tunTransports = []tunTransport{
-	{"native", openNativeTUN},
-	{"morph", openMorphTUN},
-	{"confusion", openConfusionTUN},
-	{"h2", openH2TUN},
-	{"polling", openPollingTUN},
+	{"native", openNativeTUN, 1},
+	{"morph", openMorphTUN, 1},
+	{"confusion", openConfusionTUN, 0},
+	{"h2", openH2TUN, 1},
+	{"polling", openPollingTUN, 0},
 }
 
 // streamTUNClient frames packets as [len:4][pkt:N] over a byte stream.
@@ -252,9 +254,12 @@ func streamTUNClient(t *testing.T, conn net.Conn, w io.Writer, r io.Reader) tunC
 	}
 }
 
+// openNativeTUN runs the native TUN under the identity REALITY's
+// authentication gives a registry client - the path most sessions take.
 func openNativeTUN(t *testing.T, srvCtx *serverContext) tunClient {
+	id := realityIdentityFor(t, srvCtx, []byte(trafficSecret))
 	client, server := tcpPair(t)
-	go handleRawTunnel(server, srvCtx, testLogger(t), registryIdentity(trafficClient))
+	go handleRawTunnel(server, srvCtx, testLogger(t), id)
 	if _, err := client.Write(append([]byte{0x02}, v3Handshake()...)); err != nil {
 		t.Fatalf("write handshake: %v", err)
 	}
@@ -287,10 +292,18 @@ func readMorphFrame(r io.Reader) ([]byte, error) {
 	}
 }
 
+// openMorphTUN authenticates for real (TLS, MRPH token from the registry
+// secret) and asks for TUN mode, the way the morph client does.
 func openMorphTUN(t *testing.T, srvCtx *serverContext) tunClient {
-	client, server := tcpPair(t)
-	go handleMorphTUNMode(server, v3Handshake(), srvCtx, testLogger(t), registryIdentity(trafficClient))
+	client, server := tlsLoopbackPair(t)
+	go handleMorphConnection(server, srvCtx, testLogger(t))
 	client.SetReadDeadline(time.Now().Add(10 * time.Second))
+	client.Write(append([]byte("MRPH\x04test"), computeMorphAuthForTest(t, []byte(trafficSecret), clientExporter(t, client))...))
+	ack := make([]byte, 1)
+	if _, err := io.ReadFull(client, ack); err != nil || ack[0] != 0 {
+		t.Fatalf("early ack %x, err %v", ack, err)
+	}
+	client.Write(morphFrame(append([]byte{0x02}, v3Handshake()...)))
 	resp, err := readMorphFrame(client)
 	if err != nil || len(resp) < 9 || resp[0] != 0x00 {
 		t.Fatalf("morph handshake response %x, err %v", resp, err)
@@ -484,6 +497,9 @@ func TestTUNTrafficCountsIPBytes(t *testing.T) {
 				up, down := exchangeTUN(t, c, far, tunSizes)
 				waitTraffic(t, reg, trafficClient, up, down)
 				waitTraffic(t, reg, quietClient, 0, 0)
+				if got := reg.GetStats(trafficClient).TotalConns; got != tr.conns {
+					t.Fatalf("total_conns = %d, want %d", got, tr.conns)
+				}
 			})
 		}
 	}
@@ -698,149 +714,26 @@ func TestSharedIdentityHasNoTraffic(t *testing.T) {
 	}
 }
 
-// fakeStats is the store side of FlushStats.
-type fakeStats struct {
-	mu      sync.Mutex
-	stored  map[string]ClientStats
-	readErr error
-	writes  int
-}
-
-func (f *fakeStats) GetStats(_ context.Context, id string) (*ClientStats, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.readErr != nil {
-		return nil, f.readErr
+// TestTUNFrameMeterMatchesExit: the bridge meter counts what an exit
+// terminating the stream would - packets only, split over any writes, no
+// keepalives, no probe frames, and a length the exit skips is a bare header.
+func TestTUNFrameMeterMatchesExit(t *testing.T) {
+	probe := append([]byte{0x10, 'M', 'T', 0x01}, make([]byte, 60)...)
+	if !tun.IsProbeFrame(probe) {
+		t.Fatal("test probe frame is not one")
 	}
-	s := f.stored[id]
-	s.ClientID = id
-	return &s, nil
-}
-
-func (f *fakeStats) UpdateStats(_ context.Context, id string, s *ClientStats) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.stored[id] = *s
-	f.writes++
-	return nil
-}
-
-func (f *fakeStats) get(id string) ClientStats {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.stored[id]
-}
-
-// TestFlushStatsContinuesStoredTotals: a restart must continue the lifetime
-// count, not overwrite it with what moved since start.
-func TestFlushStatsContinuesStoredTotals(t *testing.T) {
-	seen := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
-	store := &fakeStats{stored: map[string]ClientStats{
-		trafficClient: {TotalConns: 40, BytesUp: 1 << 30, BytesDown: 5 << 30, LastSeen: seen},
-	}}
-	reg := trafficRegistry(t)
-	reg.stats = store
-
-	reg.AddBytes(trafficClient, 100, 900)
-	reg.FlushStats(t.Context())
-	got := store.get(trafficClient)
-	if got.BytesUp != 1<<30+100 || got.BytesDown != 5<<30+900 || got.TotalConns != 40 {
-		t.Fatalf("after first flush: conns/up/down = %d/%d/%d, want 40/%d/%d",
-			got.TotalConns, got.BytesUp, got.BytesDown, 1<<30+100, 5<<30+900)
-	}
-
-	// The stored totals are folded in once, not on every flush.
-	reg.AddBytes(trafficClient, 1, 2)
-	reg.FlushStats(t.Context())
-	got = store.get(trafficClient)
-	if got.BytesUp != 1<<30+101 || got.BytesDown != 5<<30+902 {
-		t.Fatalf("after second flush: up/down = %d/%d, want %d/%d", got.BytesUp, got.BytesDown, 1<<30+101, 5<<30+902)
-	}
-
-	// The API reads the same lifetime totals the store holds.
-	if api := reg.GetStats(trafficClient); api.BytesUp != got.BytesUp || api.BytesDown != got.BytesDown {
-		t.Fatalf("API shows %d/%d, store holds %d/%d", api.BytesUp, api.BytesDown, got.BytesUp, got.BytesDown)
-	}
-}
-
-// TestFlushStatsDropsAliasedRecord: a record the old counters wrote holds the
-// connection count in all three fields. Its byte fields are not bytes.
-func TestFlushStatsDropsAliasedRecord(t *testing.T) {
-	store := &fakeStats{stored: map[string]ClientStats{
-		trafficClient: {TotalConns: 1611, BytesUp: 1611, BytesDown: 1611},
-	}}
-	reg := trafficRegistry(t)
-	reg.stats = store
-
-	reg.AddBytes(trafficClient, 7, 8)
-	reg.FlushStats(t.Context())
-	got := store.get(trafficClient)
-	if got.TotalConns != 1611 || got.BytesUp != 7 || got.BytesDown != 8 {
-		t.Fatalf("conns/up/down = %d/%d/%d, want 1611/7/8", got.TotalConns, got.BytesUp, got.BytesDown)
-	}
-}
-
-// TestFlushStatsKeepsUnreadableRecord: when the stored totals cannot be read,
-// writing the live counters would replace a lifetime count with seconds of it.
-func TestFlushStatsKeepsUnreadableRecord(t *testing.T) {
-	store := &fakeStats{
-		stored:  map[string]ClientStats{trafficClient: {TotalConns: 3, BytesUp: 1 << 40, BytesDown: 1 << 41}},
-		readErr: errors.New("redis down"),
-	}
-	reg := trafficRegistry(t)
-	reg.stats = store
-
-	reg.AddBytes(trafficClient, 5, 5)
-	reg.FlushStats(t.Context())
-	if store.writes != 0 {
-		t.Fatalf("flushed %d records over an unreadable one", store.writes)
-	}
-
-	store.mu.Lock()
-	store.readErr = nil
-	store.mu.Unlock()
-	reg.FlushStats(t.Context())
-	if got := store.get(trafficClient); got.BytesUp != 1<<40+5 || got.BytesDown != 1<<41+5 {
-		t.Fatalf("after recovery: up/down = %d/%d, want %d/%d", got.BytesUp, got.BytesDown, 1<<40+5, 1<<41+5)
-	}
-}
-
-// TestFlushStatsLastSeen: last_seen moves when the client was seen, not on
-// every flush, and a client never seen has none.
-func TestFlushStatsLastSeen(t *testing.T) {
-	seen := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
-	store := &fakeStats{stored: map[string]ClientStats{
-		trafficClient: {TotalConns: 1, BytesUp: 10, BytesDown: 10, LastSeen: seen},
-	}}
-	reg := trafficRegistry(t)
-	reg.stats = store
-
-	// Counters exist (a session looked them up) but nothing moved.
-	reg.traffic(trafficClient)
-	reg.FlushStats(t.Context())
-	if got := store.get(trafficClient).LastSeen; !got.Equal(seen) {
-		t.Fatalf("idle flush moved last_seen to %v, want %v", got, seen)
-	}
-
-	reg.traffic(trafficClient).addDown(1)
-	before := time.Now()
-	reg.FlushStats(t.Context())
-	if got := store.get(trafficClient).LastSeen; got.Before(before) {
-		t.Fatalf("last_seen %v after traffic, want >= %v", got, before)
-	}
-
-	if s := reg.GetStats(quietClient); !s.LastSeen.IsZero() {
-		t.Fatalf("never-seen client has last_seen %v", s.LastSeen)
-	}
-}
-
-func TestTUNFrameMeterSplitWrites(t *testing.T) {
 	var stream []byte
 	want := 0
 	for _, size := range []int{20, 1400, 0, 33, 65535, 0, 0, 512} {
 		stream = append(stream, lenFrame(make([]byte, size))...)
 		want += size
 	}
+	stream = append(stream, lenFrame(probe)...)
+	stream = binary.BigEndian.AppendUint32(stream, 7)     // too short: the exit skips the header
+	stream = binary.BigEndian.AppendUint32(stream, 70000) // too long: same
+	stream = append(stream, lenFrame(make([]byte, 99))...)
+	want += 99
+
 	for _, chunk := range []int{1, 3, 4, 5, 7, 1000, len(stream)} {
 		t.Run(fmt.Sprint(chunk), func(t *testing.T) {
 			var got int
@@ -858,77 +751,210 @@ func TestTUNFrameMeterSplitWrites(t *testing.T) {
 	}
 }
 
-// trafficSinks are the calls that hand a TUN session's counters to the code
-// that moves its packets, with the index of the counters argument.
-var trafficSinks = map[string]int{
-	"RegisterClientGated": 5,
-	"dialRelayTUN":        4,
-	"relayTUNToUpstream":  4,
+// TestSinksSkipProbeFrames: an auto-MTU probe frame is not the client's
+// traffic on any path, whether the transport forwards it or answers it.
+func TestSinksSkipProbeFrames(t *testing.T) {
+	probe := append([]byte{0x10, 'M', 'T', 0x01}, make([]byte, 60)...)
+	var n int
+	countPacket(func(k int) { n += k }, probe)
+	countPacket(func(k int) { n += k }, trafficPacket(net.IPv4(10, 8, 0, 2), 1, 40))
+	if n != 40 {
+		t.Fatalf("counted %d, want only the 40-byte IP packet", n)
+	}
 }
 
-// knownTrafficSinkCalls is every such call in the package with the counters it
-// passes. Each line is a TUN session that TestTUNTrafficCountsIPBytes drives
-// (named in the comment); adding a line is a claim that the new session is
-// accounted, and should come with a case there.
-var knownTrafficSinkCalls = []string{
-	"RegisterClientGated <- handleConfusionTUNMode: srvCtx.trafficOf(clientID)",  // confusion/exit
-	"RegisterClientGated <- handleMorphTUNMode: srvCtx.trafficOf(clientID)",      // morph/exit
-	"RegisterClientGated <- handleTUNModeCore: srvCtx.trafficOf(clientID)",       // native/exit
-	"RegisterClientGated <- runPollingTUNMode: srvCtx.trafficOf(sess.ClientID)",  // polling/exit
-	"RegisterClientGated <- setupH2TUNTunnel: srvCtx.trafficOf(tunnel.clientID)", // h2/exit
-	"dialRelayTUN <- handleConfusionTUNMode: srvCtx.trafficOf(clientID)",         // confusion/relay
-	"dialRelayTUN <- handleMorphTUNMode: srvCtx.trafficOf(clientID)",             // morph/relay
-	"dialRelayTUN <- runPollingTUNMode: srvCtx.trafficOf(sess.ClientID)",         // polling/relay
-	"dialRelayTUN <- setupH2TUNTunnel: srvCtx.trafficOf(tunnel.clientID)",        // h2/relay
-	"relayTUNToUpstream <- handleTUNModeCore: srvCtx.trafficOf(clientID)",        // native/relay
+// TestPollingTUNShedFramesNotCounted: a packet the polling downlink sheds
+// because it is full did not reach the client and is not counted, whether the
+// dispatcher (exit) or the relay pump offered it.
+func TestPollingTUNShedFramesNotCounted(t *testing.T) {
+	for _, node := range []string{"exit", "relay"} {
+		t.Run(node, func(t *testing.T) {
+			reg := trafficRegistry(t)
+			var srvCtx *serverContext
+			var far *os.File
+			if node == "exit" {
+				srvCtx, far = exitContext(t, "fxshed", reg)
+			} else {
+				srvCtx, far = relayContext(t, reg)
+			}
+			sess := pollingSession(t, "traffic-polling-shed-"+node)
+			sess.WriteFromClient(append([]byte{0x02}, v3Handshake()...))
+			go runPollingSessionRelay(sess, srvCtx, testLogger(t))
+			down := &pollingReader{sess: sess}
+			resp := make([]byte, 9)
+			if _, err := io.ReadFull(down, resp); err != nil {
+				t.Fatal(err)
+			}
+			clientIP := net.IP(resp[5:9])
+
+			// Nobody polls: the downlink fills and then sheds.
+			const size = 1400
+			sent := (pollingMaxToClientBuffered / (size + 4)) + 20
+			for i := range sent {
+				if _, err := far.Write(trafficPacket(clientIP, i, size)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			deadline := time.Now().Add(10 * time.Second)
+			for sess.toClientDropped.Load() < 10 && time.Now().Before(deadline) {
+				time.Sleep(10 * time.Millisecond)
+			}
+			if sess.toClientDropped.Load() == 0 {
+				t.Fatal("the downlink never shed a frame; the test proves nothing")
+			}
+			time.Sleep(300 * time.Millisecond)
+			queued := int64(downlinkLen(sess)/(size+4)) * size
+			if got := reg.GetStats(trafficClient).BytesDown; got != queued {
+				t.Fatalf("bytes_down = %d, but only %d bytes were queued for the client (%d frames shed)",
+					got, queued, sess.toClientDropped.Load())
+			}
+		})
+	}
 }
 
-// TestTrafficSinkCallsAreKnown fails when a TUN session is set up somewhere
-// new, or an existing one stops passing its counters, so the next transport is
-// looked at instead of silently counting nothing - the way every TUN transport
-// counted nothing up to 1.11.8.
-func TestTrafficSinkCallsAreKnown(t *testing.T) {
-	fset := token.NewFileSet()
-	files, err := filepath.Glob("*.go")
+// TestRelayPumpDropsNotCounted: a frame the downstream transport refuses as
+// dropped is neither counted nor treated as the end of the tunnel.
+func TestRelayPumpDropsNotCounted(t *testing.T) {
+	up, exit := net.Pipe()
+	defer exit.Close()
+	tr := newClientTraffic()
+	sink := &relayTUNSink{up: up, logger: testLogger(t), traffic: tr, done: make(chan struct{})}
+	delivered := 0
+	go sink.pump(func(pkt []byte) error {
+		delivered++
+		if delivered%2 == 0 {
+			return errFrameShed
+		}
+		return nil
+	})
+	for i := range 4 {
+		exit.Write(lenFrame(trafficPacket(net.IPv4(10, 8, 0, 2), i, 100)))
+	}
+	exit.Close()
+	<-sink.Done()
+	if delivered != 4 {
+		t.Fatalf("pump stopped after %d frames", delivered)
+	}
+	if got := tr.bytesDown.Load(); got != 200 {
+		t.Fatalf("bytes_down = %d, want the 200 bytes delivered", got)
+	}
+}
+
+// TestRelayCountedCountsWhileStreaming: a long proxied stream is counted as it
+// goes, not when it ends - a download still running at SIGTERM used to be
+// lost whole.
+func TestRelayCountedCountsWhileStreaming(t *testing.T) {
+	src, srcFar := tcpPair(t)
+	dst, dstFar := tcpPair(t)
+	var counted atomic.Int64
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		relayCounted(dst, src, func(n int) { counted.Add(int64(n)) })
+	}()
+	go io.Copy(io.Discard, dstFar)
+
+	chunk := make([]byte, relayCountChunk)
+	for range 3 {
+		if _, err := srcFar.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for counted.Load() < 2*relayCountChunk && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := counted.Load(); got < 2*relayCountChunk {
+		t.Fatalf("counted %d bytes of a stream still open after %d", got, 3*relayCountChunk)
+	}
+	srcFar.Write([]byte("tail"))
+	srcFar.Close()
+	<-done
+	if got := counted.Load(); got != 3*relayCountChunk+4 {
+		t.Fatalf("counted %d, want %d", got, 3*relayCountChunk+4)
+	}
+}
+
+// writeCertFiles writes a self-signed certificate and key as PEM files.
+func writeCertFiles(t *testing.T) (certFile, keyFile string) {
+	t.Helper()
+	cert := selfSignedCertForTest(t)
+	dir := t.TempDir()
+	certFile, keyFile = filepath.Join(dir, "srv.crt"), filepath.Join(dir, "srv.key")
+	keyDER, err := x509.MarshalPKCS8PrivateKey(cert.PrivateKey)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var got []string
-	for _, name := range files {
-		if strings.HasSuffix(name, "_test.go") {
-			continue
-		}
-		f, err := parser.ParseFile(fset, name, nil, 0)
-		if err != nil {
-			t.Fatalf("parse %s: %v", name, err)
-		}
-		for _, decl := range f.Decls {
-			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || fn.Body == nil {
-				continue
-			}
-			ast.Inspect(fn.Body, func(n ast.Node) bool {
-				call, ok := n.(*ast.CallExpr)
-				if !ok {
-					return true
-				}
-				var callee string
-				switch f := call.Fun.(type) {
-				case *ast.Ident:
-					callee = f.Name
-				case *ast.SelectorExpr:
-					callee = f.Sel.Name
-				}
-				if idx, ok := trafficSinks[callee]; ok && idx < len(call.Args) {
-					got = append(got, fmt.Sprintf("%s <- %s: %s", callee, fn.Name.Name, types.ExprString(call.Args[idx])))
-				}
-				return true
-			})
-		}
+	os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]}), 0o600)
+	os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), 0o600)
+	return certFile, keyFile
+}
+
+// TestQUICProxyTrafficCounted runs the QUIC listener the server starts and
+// the Salamander QUIC client, authenticated with a registry secret, and
+// proxies a stream through them.
+func TestQUICProxyTrafficCounted(t *testing.T) {
+	const upN, downN = 40001, 60002
+	udp, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
 	}
-	slices.Sort(got)
-	if !slices.Equal(got, knownTrafficSinkCalls) {
-		t.Fatalf("TUN sessions and the counters they pass changed.\ngot:\n  %s\nwant:\n  %s",
-			strings.Join(got, "\n  "), strings.Join(knownTrafficSinkCalls, "\n  "))
+	addr := udp.LocalAddr().String()
+	udp.Close()
+
+	reg := trafficRegistry(t)
+	srvCtx := newTestServerContext(t)
+	srvCtx.registry = reg
+	srvCtx.cfg.QUICEnabled = true
+	srvCtx.cfg.QUICListenAddr = addr
+	srvCtx.cfg.CertFile, srvCtx.cfg.KeyFile = writeCertFiles(t)
+	qs := startQUICServer(srvCtx.cfg, srvCtx)
+	if qs == nil {
+		t.Fatal("QUIC server did not start")
+	}
+	t.Cleanup(func() { qs.Stop() })
+
+	mgr := strategy.NewManager()
+	if err := mgr.SetEndpoints([]endpoint.Endpoint{{Name: "quic", V4: addr}}, endpoint.V4Only); err != nil {
+		t.Fatal(err)
+	}
+	_, port, _ := net.SplitHostPort(addr)
+	p, _ := strconv.Atoi(port)
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	conn, err := strategy.NewQUICSalamanderStrategy(mgr, []byte(trafficSecret), p).Connect(ctx, "unused:0")
+	if err != nil {
+		t.Fatalf("QUIC connect: %v", err)
+	}
+	defer conn.Close()
+
+	conn.Write(targetPacket(proxyTarget(t, upN, downN)))
+	status := make([]byte, 1)
+	if _, err := io.ReadFull(conn, status); err != nil || status[0] != 0 {
+		t.Fatalf("status %x, err %v", status, err)
+	}
+	conn.Write(bytes.Repeat([]byte{2}, upN))
+	readDown(t, conn, downN)
+	waitTraffic(t, reg, trafficClient, upN, downN)
+}
+
+// TestRelayCountedBufferedCountsEachWrite: where no splice is possible (a QUIC
+// stream, TLS without kTLS) every write is counted at once, so a small stream
+// that stays open is not invisible until it closes.
+func TestRelayCountedBufferedCountsEachWrite(t *testing.T) {
+	src, srcFar := net.Pipe()
+	dst, dstFar := tcpPair(t)
+	defer srcFar.Close()
+	var counted atomic.Int64
+	go relayCounted(dst, src, func(n int) { counted.Add(int64(n)) })
+	go io.Copy(io.Discard, dstFar)
+
+	srcFar.Write(make([]byte, 100))
+	deadline := time.Now().Add(5 * time.Second)
+	for counted.Load() != 100 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := counted.Load(); got != 100 {
+		t.Fatalf("counted %d of 100 bytes written to a stream still open", got)
 	}
 }

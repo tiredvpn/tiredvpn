@@ -2,10 +2,12 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/log"
@@ -25,14 +27,18 @@ type ClientRegistry struct {
 	connsByID   map[string][]net.Conn // clientID → connections (for forced disconnect)
 
 	// Per-client traffic counters, created on first use for a known client.
-	// Guarded by trafficMu alone, so the data path never waits on a reload.
+	// The data path holds a pointer to them and takes no lock at all; the map
+	// is only touched when a session starts, at a flush, and on removal.
 	trafficMu sync.RWMutex
 	trafficBy map[string]*clientTraffic
 
-	// stats is where FlushStats reads lifetime totals from and writes them
-	// to: the Redis store in production, nil when there is none.
-	stats   statsStore
-	flushMu sync.Mutex
+	// stats is where FlushStats adds this server's traffic: the Redis store in
+	// production, nil when there is none.
+	stats statsStore
+	// flushSem serialises flushes. A channel rather than a mutex so that a
+	// flush that cannot get it within its context gives up instead of queuing
+	// behind one stuck on Redis.
+	flushSem chan struct{}
 
 	// Hot-reload
 	lastVersion int64
@@ -56,6 +62,7 @@ func NewClientRegistry(store *RedisStore) *ClientRegistry {
 		activeConns: make(map[string]int),
 		connsByID:   make(map[string][]net.Conn),
 		trafficBy:   make(map[string]*clientTraffic),
+		flushSem:    make(chan struct{}, 1),
 		stopReload:  make(chan struct{}),
 	}
 	if store != nil {
@@ -66,8 +73,7 @@ func NewClientRegistry(store *RedisStore) *ClientRegistry {
 
 // statsStore is the part of RedisStore the stats flush needs.
 type statsStore interface {
-	GetStats(ctx context.Context, clientID string) (*ClientStats, error)
-	UpdateStats(ctx context.Context, clientID string, stats *ClientStats) error
+	AddStatsDeltas(ctx context.Context, deltas []StatsDelta) []error
 }
 
 // Start loads clients and starts hot-reload
@@ -173,11 +179,13 @@ func (r *ClientRegistry) removeClient(clientID string) {
 	delete(r.activeConns, clientID)
 	r.connMu.Unlock()
 
-	// The store dropped this client's stats key along with the client; a
-	// client created again under the same id starts from zero.
+	// The store dropped this client's stats key along with the client. Under
+	// r.mu, like creation in traffic, so the two cannot interleave.
+	r.mu.RLock()
 	r.trafficMu.Lock()
 	delete(r.trafficBy, clientID)
 	r.trafficMu.Unlock()
+	r.mu.RUnlock()
 
 	for _, conn := range conns {
 		conn.Close()
@@ -250,6 +258,9 @@ func (r *ClientRegistry) AddConnection(clientID string, conn net.Conn) error {
 	if cfg == nil {
 		return fmt.Errorf("client not found")
 	}
+	// Before connMu: traffic may wait on r.mu, which a reload holds across a
+	// Redis call, and nothing should wait on that while holding connMu.
+	t := r.traffic(clientID)
 
 	r.connMu.Lock()
 	defer r.connMu.Unlock()
@@ -262,7 +273,7 @@ func (r *ClientRegistry) AddConnection(clientID string, conn net.Conn) error {
 	r.activeConns[clientID]++
 	r.connsByID[clientID] = append(r.connsByID[clientID], conn)
 
-	if t := r.traffic(clientID); t != nil {
+	if t != nil {
 		t.conns.Add(1)
 		t.touch(time.Now())
 	}
@@ -322,18 +333,23 @@ func (r *ClientRegistry) GetActiveConns(clientID string) int {
 
 // traffic returns the live counters of a known client, creating them on first
 // use, or nil for an id the registry does not know. Called once per session.
+//
+// The check and the creation happen under r.mu, so they cannot interleave with
+// removeClient: counters are never created for a client that is being deleted.
 func (r *ClientRegistry) traffic(clientID string) *clientTraffic {
 	if t := r.lookupTraffic(clientID); t != nil {
 		return t
 	}
-	if r.GetByID(clientID) == nil {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.byID[clientID] == nil {
 		return nil
 	}
 	r.trafficMu.Lock()
 	defer r.trafficMu.Unlock()
 	t := r.trafficBy[clientID]
 	if t == nil {
-		t = &clientTraffic{}
+		t = newClientTraffic()
 		r.trafficBy[clientID] = t
 	}
 	return t
@@ -352,7 +368,11 @@ func (r *ClientRegistry) AddBytes(clientID string, up, down int64) {
 	r.traffic(clientID).addStream(up, down)
 }
 
-// GetStats returns statistics for a client
+// GetStats returns what this server has seen of a client since it started:
+// the numbers behind /stats, /clients/{id} and the per-client /metrics series.
+// They are this server's own, so a Prometheus counter resets with the process
+// and a sum over servers counts every byte once. The lifetime totals over all
+// servers live in the store (FlushStats).
 func (r *ClientRegistry) GetStats(clientID string) ClientStats {
 	r.connMu.RLock()
 	active := r.activeConns[clientID]
@@ -393,68 +413,109 @@ func (r *ClientRegistry) ClientCount() int {
 	return len(r.byID)
 }
 
-// FlushStats writes every client's totals to the store. Called every flush
-// interval and once on shutdown.
+// statsFlushTimeout bounds one periodic flush, so a Redis that stopped
+// answering cannot hold the flush, and the shutdown flush behind it, for
+// clients x timeouts.
+const statsFlushTimeout = 20 * time.Second
+
+// FlushStats adds what this server saw since its last flush to each client's
+// lifetime record in the store. Called every flush interval and once on
+// shutdown.
 //
-// The totals are lifetime totals: the first flush of a client folds in what
-// the store already holds, so a restart continues the count instead of
-// overwriting it with the few seconds since start. A client whose stored
-// totals cannot be read is skipped rather than overwritten, and retried on the
-// next flush.
+// Deltas, added atomically by the store, so servers sharing one Redis add up
+// instead of overwriting each other, and a restart neither loses the stored
+// total nor needs to read it first. A delta that fails to reach the store is
+// kept and goes out with the next flush. A client the store no longer has
+// (deleted) gets nothing written back, and its counters are dropped.
 func (r *ClientRegistry) FlushStats(ctx context.Context) error {
 	if r.stats == nil {
 		return nil
 	}
-	r.flushMu.Lock()
-	defer r.flushMu.Unlock()
+	select {
+	case r.flushSem <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() { <-r.flushSem }()
 
 	r.trafficMu.RLock()
 	snapshot := maps.Clone(r.trafficBy)
 	r.trafficMu.RUnlock()
 
-	now := time.Now()
+	type pending struct {
+		t                     *clientTraffic
+		conns, up, down, seen int64
+	}
+	var deltas []StatsDelta
+	var sent []pending
 	for clientID, t := range snapshot {
-		if !t.seeded && !r.seedTraffic(ctx, clientID, t) {
+		p := pending{t: t, conns: t.conns.Load(), up: t.bytesUp.Load(), down: t.bytesDown.Load(), seen: t.lastSeen.Load()}
+		if p.conns == t.flushedConns && p.up == t.flushedUp && p.down == t.flushedDown && p.seen == t.flushedSeen {
+			r.pruneIdle(clientID, t)
 			continue
 		}
-		up, down := t.bytesUp.Load(), t.bytesDown.Load()
-		if up != t.flushedUp || down != t.flushedDown {
-			t.touch(now)
+		d := StatsDelta{
+			ClientID:    clientID,
+			Conns:       p.conns - t.flushedConns,
+			BytesUp:     p.up - t.flushedUp,
+			BytesDown:   p.down - t.flushedDown,
+			ActiveConns: r.GetActiveConns(clientID),
 		}
-		stats := r.GetStats(clientID)
-		if err := r.stats.UpdateStats(ctx, clientID, &stats); err != nil {
-			log.Warn("Failed to flush stats for %s: %v", clientID, err)
-			continue
+		if p.seen != t.flushedSeen {
+			d.LastSeen = time.Unix(0, p.seen)
 		}
-		t.flushedUp, t.flushedDown = up, down
+		deltas = append(deltas, d)
+		sent = append(sent, p)
 	}
 
+	if len(deltas) == 0 {
+		return nil
+	}
+	var failed int
+	for i, err := range r.stats.AddStatsDeltas(ctx, deltas) {
+		p, id := sent[i], deltas[i].ClientID
+		switch {
+		case errors.Is(err, errClientGone):
+			r.dropTraffic(id, p.t)
+		case err != nil:
+			failed++
+			if failed == 1 {
+				log.Warn("Failed to flush stats for %s (and maybe others; retried next flush): %v", id, err)
+			}
+		default:
+			p.t.flushedConns, p.t.flushedUp, p.t.flushedDown, p.t.flushedSeen = p.conns, p.up, p.down, p.seen
+		}
+	}
+	if failed > 0 {
+		return fmt.Errorf("stats flush: %d of %d clients not written", failed, len(deltas))
+	}
 	return nil
 }
 
-// seedTraffic folds the totals stored for a client into its live counters,
-// once per counter lifetime. Caller holds flushMu.
-func (r *ClientRegistry) seedTraffic(ctx context.Context, clientID string, t *clientTraffic) bool {
-	stored, err := r.stats.GetStats(ctx, clientID)
-	if err != nil {
-		log.Warn("Failed to read stored stats for %s, not flushing it yet: %v", clientID, err)
-		return false
+// pruneIdle drops the counters of a client the registry no longer has
+// (deleted, disabled or expired) once everything they counted has been
+// flushed and no connection of it is open. Caller holds flushSem.
+func (r *ClientRegistry) pruneIdle(clientID string, t *clientTraffic) {
+	if r.GetActiveConns(clientID) > 0 {
+		return
 	}
-	up, down := stored.BytesUp, stored.BytesDown
-	if up != 0 && up == stored.TotalConns && down == stored.TotalConns {
-		// Written by the aliased counters of 1.11.8 and earlier: both byte
-		// fields hold the connection count, not bytes. Keep the count only.
-		log.Info("Stored stats for %s carry the connection count as bytes (%d), resetting the byte totals", clientID, up)
-		up, down = 0, 0
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.byID[clientID] != nil {
+		return
 	}
-	t.conns.Add(stored.TotalConns)
-	t.bytesUp.Add(up)
-	t.bytesDown.Add(down)
-	t.flushedUp += up
-	t.flushedDown += down
-	if t.lastSeen.Load() == 0 && !stored.LastSeen.IsZero() {
-		t.lastSeen.Store(stored.LastSeen.UnixNano())
+	r.trafficMu.Lock()
+	if r.trafficBy[clientID] == t {
+		delete(r.trafficBy, clientID)
 	}
-	t.seeded = true
-	return true
+	r.trafficMu.Unlock()
+}
+
+// dropTraffic drops the counters of a client the store no longer has.
+func (r *ClientRegistry) dropTraffic(clientID string, t *clientTraffic) {
+	r.trafficMu.Lock()
+	if r.trafficBy[clientID] == t {
+		delete(r.trafficBy, clientID)
+	}
+	r.trafficMu.Unlock()
 }

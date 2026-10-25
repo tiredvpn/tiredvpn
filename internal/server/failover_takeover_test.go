@@ -164,8 +164,8 @@ func TestUnknownOriginIsNotTheSameClient(t *testing.T) {
 	a, a2 := net.Pipe()
 	b, b2 := net.Pipe()
 	t.Cleanup(func() { a.Close(); a2.Close(); b.Close(); b2.Close() })
-	st.RegisterClientGated(ip, "global", "", a, nil, nil)
-	st.RegisterClientGated(ip, "global", "", b, nil, nil)
+	st.RegisterClientGated(ip, "global", "", a, nil, nil, nil)
+	st.RegisterClientGated(ip, "global", "", b, nil, nil, nil)
 	if !strings.Contains(out.String(), "two clients may be sharing one tunnel IP") {
 		t.Fatalf("a live takeover between two unknown origins was not flagged; log:\n%s", out)
 	}

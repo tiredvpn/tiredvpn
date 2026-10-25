@@ -717,7 +717,9 @@ func initRedisMode(cfg *Config, srvCtx *serverContext) error {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			registry.FlushStats(ctx)
+			flushCtx, cancel := context.WithTimeout(ctx, statsFlushTimeout)
+			registry.FlushStats(flushCtx)
+			cancel()
 		}
 	}()
 	return nil
@@ -993,11 +995,16 @@ func buildQUICServerConfig(cfg *Config, srvCtx *serverContext, quicAddr string) 
 func handleShutdownSignal(sigChan chan os.Signal, srvCtx *serverContext, quicServer *strategy.QUICServer, listener net.Listener) {
 	sig := <-sigChan
 	log.Info("Received signal %v, shutting down...", sig)
+	// The flush runs before the listener closes: closing it makes Run return,
+	// and the process exits with it, flush or not.
 	if srvCtx.registry != nil {
 		srvCtx.registry.Stop()
-		// The last flush interval of traffic would otherwise be lost.
+		// The traffic since the last flush would otherwise be lost. Bounded:
+		// a periodic flush stuck on Redis makes this one give up, not wait.
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		srvCtx.registry.FlushStats(ctx)
+		if err := srvCtx.registry.FlushStats(ctx); err != nil {
+			log.Warn("Final stats flush incomplete: %v", err)
+		}
 		cancel()
 	}
 	if srvCtx.store != nil {
@@ -1049,22 +1056,14 @@ func handleQUICConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 
 	logger.Info("QUIC connection from %s (authenticated)", remoteAddr)
 
-	// Extract clientID from QUICServerConn if available
-	var clientID clientIdentity
-	if qc, ok := conn.(*strategy.QUICServerConn); ok {
-		if qc.ClientIDFromRegistry {
-			clientID = registryIdentity(qc.ClientID)
-		} else {
-			clientID = sharedIdentity(qc.ClientID)
-		}
-	}
+	clientID := quicClientIdentity(conn)
 
 	// Track per-client connection for metrics
-	if srvCtx.registry != nil && clientID.id != "" {
-		if err := srvCtx.registry.AddConnection(clientID.id, conn); err != nil {
+	if srvCtx.registry != nil && clientID.perClient {
+		if err := srvCtx.registry.AddConnection(clientID.leaseID(), conn); err != nil {
 			logger.Warn("Failed to track QUIC connection for client %s: %v", clientID, err)
 		} else {
-			defer srvCtx.registry.RemoveConnection(clientID.id, conn)
+			defer srvCtx.registry.RemoveConnection(clientID.leaseID(), conn)
 		}
 	}
 
@@ -1145,6 +1144,7 @@ func handleQUICConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 	// Simple bidirectional relay (no framing needed for QUIC - it handles multiplexing)
 	var wg sync.WaitGroup
 	var bytesUp, bytesDown int64
+	traffic := srvCtx.trafficOf(clientID)
 
 	wg.Add(2)
 
@@ -1153,7 +1153,7 @@ func handleQUICConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 	// Client -> Target
 	go func() {
 		defer wg.Done()
-		n, err := optimizedRelay(targetConn, conn)
+		n, err := relayCounted(targetConn, conn, traffic.addUp)
 		atomic.AddInt64(&bytesUp, n)
 		end.note("the client", "the target", err)
 		endTargetWrites(targetConn)
@@ -1162,7 +1162,7 @@ func handleQUICConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 	// Target -> Client
 	go func() {
 		defer wg.Done()
-		n, err := optimizedRelay(conn, targetConn)
+		n, err := relayCounted(conn, targetConn, traffic.addDown)
 		atomic.AddInt64(&bytesDown, n)
 		end.note("the target", "the client", err)
 	}()
@@ -1174,9 +1174,19 @@ func handleQUICConnection(conn net.Conn, srvCtx *serverContext, connID uint64) {
 	if srvCtx.metrics != nil {
 		srvCtx.metrics.AddBytes(bytesUp, bytesDown)
 	}
+}
 
-	// Per-client totals: io.Copy reports the count only once the stream ends.
-	srvCtx.trafficOf(clientID).addStream(bytesUp, bytesDown)
+// quicClientIdentity is the identity the QUIC listener authenticated conn as,
+// or none for a conn that did not come from it.
+func quicClientIdentity(conn net.Conn) clientIdentity {
+	qc, ok := conn.(*strategy.QUICServerConn)
+	if !ok {
+		return clientIdentity{}
+	}
+	if qc.ClientIDFromRegistry {
+		return registryIdentity(qc.ClientID)
+	}
+	return sharedIdentity(qc.ClientID)
 }
 
 // readFirstPeek reads the first framing unit from conn for protocol
@@ -1801,8 +1811,8 @@ func cleanupH2Conn(conn net.Conn, srvCtx *serverContext, tunnel **h2TunnelState,
 	if *tunnel != nil && (*tunnel).sink != nil {
 		(*tunnel).sink.Close()
 	}
-	if *connTracked && srvCtx.registry != nil && authClientID.id != "" {
-		srvCtx.registry.RemoveConnection(authClientID.id, conn)
+	if *connTracked && srvCtx.registry != nil && authClientID.perClient {
+		srvCtx.registry.RemoveConnection(authClientID.leaseID(), conn)
 	}
 }
 
@@ -1937,8 +1947,8 @@ func processH2HeadersFrame(conn net.Conn, f *http2.HeadersFrame, framer *http2.F
 	*authSecret = secret
 	sendH2AuthAck(framer, f.StreamID, secret)
 
-	if !*connTracked && srvCtx.registry != nil && clientID.id != "" {
-		if err := srvCtx.registry.AddConnection(clientID.id, conn); err != nil {
+	if !*connTracked && srvCtx.registry != nil && clientID.perClient {
+		if err := srvCtx.registry.AddConnection(clientID.leaseID(), conn); err != nil {
 			logger.Warn("Failed to track H2 connection for client %s: %v", clientID, err)
 		} else {
 			*connTracked = true
@@ -2290,12 +2300,12 @@ func handleMorphConnection(conn net.Conn, srvCtx *serverContext, logger *log.Log
 	// Track per-client connection for metrics. Use a closure on the conn
 	// variable so the defer picks up the kTLS-wrapped value if we hand
 	// the socket over later via ktls.TryEnable + registry.SwapConn.
-	if srvCtx.registry != nil && clientID.id != "" {
-		if err := srvCtx.registry.AddConnection(clientID.id, conn); err != nil {
+	if srvCtx.registry != nil && clientID.perClient {
+		if err := srvCtx.registry.AddConnection(clientID.leaseID(), conn); err != nil {
 			logger.Warn("Failed to track connection for client %s: %v", clientID, err)
 		} else {
 			defer func() {
-				srvCtx.registry.RemoveConnection(clientID.id, conn)
+				srvCtx.registry.RemoveConnection(clientID.leaseID(), conn)
 			}()
 		}
 	}
@@ -2315,10 +2325,10 @@ func handleMorphConnection(conn net.Conn, srvCtx *serverContext, logger *log.Log
 	// frame reads (target addr) and writes (relay data) go through kTLS.
 	preSwap := conn
 	conn = ktls.TryEnable(conn, "tired-morph")
-	if conn != preSwap && srvCtx.registry != nil && clientID.id != "" {
+	if conn != preSwap && srvCtx.registry != nil && clientID.perClient {
 		// Replace the stored *tls.Conn with the live *ktls.Conn so
 		// forced-disconnect Close() targets the right socket wrapper.
-		srvCtx.registry.SwapConn(clientID.id, preSwap, conn)
+		srvCtx.registry.SwapConn(clientID.leaseID(), preSwap, conn)
 	}
 
 	// Read first morph packet containing target address
@@ -2606,14 +2616,8 @@ func handleMorphTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverConte
 	cfg := srvCtx.cfg
 	logger.Debug("Processing Morph TUN mode, remaining data: %d bytes, hex=%x", len(remainingData), remainingData)
 
-	// Track per-client connection for metrics
-	if srvCtx.registry != nil && clientID.id != "" {
-		if err := srvCtx.registry.AddConnection(clientID.id, conn); err != nil {
-			logger.Warn("Failed to track connection for client %s: %v", clientID, err)
-		} else {
-			defer srvCtx.registry.RemoveConnection(clientID.id, conn)
-		}
-	}
+	// The connection is tracked by handleMorphConnection, the only caller; a
+	// second AddConnection here counted every morph TUN session twice.
 
 	// Parse TUN handshake from remaining data: [localIP:4][mtu:2][version:1]
 	// Version byte is optional (v1 clients send 6 bytes, v2 clients send 7 bytes)
@@ -2667,7 +2671,7 @@ func handleMorphTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverConte
 		// here, so a client that fell back to morph still exits where it asked.
 		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, remainingData,
 			originOf(conn.RemoteAddr()), relayClientTag(clientID), srvCtx.trafficOf(clientID), conn, func(pkt []byte) error {
-				return writeMorphFrame(morphFramePacket(pkt))
+				return gate.Frame(morphFramePacket(pkt)) // a drop goes back to the pump
 			})
 		if err != nil {
 			logger.Warn("Morph TUN relay: upstream dial failed: %v", err)
@@ -3227,7 +3231,7 @@ func handleConfusionTUNMode(sess *confusionSession, remainingData []byte, srvCtx
 				frame := make([]byte, 4+len(pkt))
 				binary.BigEndian.PutUint32(frame[:4], uint32(len(pkt)))
 				copy(frame[4:], pkt)
-				return writeConfusionFrame(frame)
+				return gate.Frame(frame) // a drop goes back to the pump
 			})
 		if err != nil {
 			logger.Warn("Confusion TUN relay: upstream dial failed: %v", err)
@@ -3384,12 +3388,12 @@ func handleRawTunnel(conn net.Conn, srvCtx *serverContext, logger *log.Logger, c
 	// Track per-client connection for metrics. Use a closure on the conn
 	// variable so the defer picks up the kTLS-wrapped value if we hand
 	// the socket over later via ktls.TryEnable + registry.SwapConn.
-	if srvCtx.registry != nil && clientID.id != "" {
-		if err := srvCtx.registry.AddConnection(clientID.id, conn); err != nil {
+	if srvCtx.registry != nil && clientID.perClient {
+		if err := srvCtx.registry.AddConnection(clientID.leaseID(), conn); err != nil {
 			logger.Warn("Failed to track connection for client %s: %v", clientID, err)
 		} else {
 			defer func() {
-				srvCtx.registry.RemoveConnection(clientID.id, conn)
+				srvCtx.registry.RemoveConnection(clientID.leaseID(), conn)
 			}()
 		}
 	}
@@ -3468,15 +3472,17 @@ func handleRawTunnel(conn net.Conn, srvCtx *serverContext, logger *log.Logger, c
 	// the kernel send buffer.
 	preSwap := conn
 	conn = ktls.TryEnable(conn, "tired-raw")
-	if conn != preSwap && srvCtx.registry != nil && clientID.id != "" {
+	if conn != preSwap && srvCtx.registry != nil && clientID.perClient {
 		// Replace the stored *tls.Conn pointer so forced-disconnect Close()
 		// targets the live ktls.Conn wrapper rather than the stale *tls.Conn.
-		srvCtx.registry.SwapConn(clientID.id, preSwap, conn)
+		srvCtx.registry.SwapConn(clientID.leaseID(), preSwap, conn)
 	}
 
-	// Relay data
+	// Relay data. Counted per chunk, so a long stream shows up while it runs;
+	// relayCounted keeps the kTLS splice path.
 	var wg sync.WaitGroup
 	var bytesUp, bytesDown int64
+	traffic := srvCtx.trafficOf(clientID)
 
 	wg.Add(2)
 
@@ -3484,7 +3490,7 @@ func handleRawTunnel(conn net.Conn, srvCtx *serverContext, logger *log.Logger, c
 
 	go func() {
 		defer wg.Done()
-		n, err := optimizedRelay(targetConn, conn)
+		n, err := relayCounted(targetConn, conn, traffic.addUp)
 		atomic.AddInt64(&bytesUp, n)
 		end.note("the client", "the target", err)
 		endTargetWrites(targetConn)
@@ -3492,7 +3498,7 @@ func handleRawTunnel(conn net.Conn, srvCtx *serverContext, logger *log.Logger, c
 
 	go func() {
 		defer wg.Done()
-		n, err := optimizedRelay(conn, targetConn)
+		n, err := relayCounted(conn, targetConn, traffic.addDown)
 		atomic.AddInt64(&bytesDown, n)
 		end.note("the target", "the client", err)
 		// Pass the target's end on, as the other direction does with
@@ -3513,10 +3519,6 @@ func handleRawTunnel(conn net.Conn, srvCtx *serverContext, logger *log.Logger, c
 	if srvCtx.metrics != nil {
 		srvCtx.metrics.AddBytes(bytesUp, bytesDown)
 	}
-
-	// Per-client totals. optimizedRelay is io.CopyBuffer so the kTLS conn can
-	// splice; the count is only known once the stream ends.
-	srvCtx.trafficOf(clientID).addStream(bytesUp, bytesDown)
 }
 
 // handleTUNModeWithHandshake handles TUN mode with pre-read handshake data (for QUIC)
@@ -3589,7 +3591,7 @@ func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger
 	// branch the loop below writes client packets into our own TUN device, the
 	// kernel never routes them to the upstream, and the client gets no exit.
 	if srvCtx != nil && srvCtx.upstreamDialer != nil {
-		relayTUNToUpstream(conn, srvCtx, logger, handshake, clientID)
+		relayTUNToUpstream(conn, srvCtx, logger, handshake, clientID, srvCtx.trafficOf(clientID))
 		return
 	}
 
@@ -3785,13 +3787,13 @@ func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger
 // raw [len:4][pkt:N] frames (and zero-length keepalives) in both directions. The
 // relay never touches its own sharedTUN/ippool for these clients.
 //
-// The bridged packets are accounted to the client the connection belongs to
-// (trafficOf, nil counts nothing). The bridge copies frames without parsing
-// them, so the count is taken by a meter on each direction's writer that skips
-// the length prefixes and keepalives. Auto-MTU probe frames are forwarded to
-// the exit and so are counted here, which the exit does not do; that is a few
-// kilobytes per session.
-func relayTUNToUpstream(conn net.Conn, srvCtx *serverContext, logger *log.Logger, handshake []byte, clientID clientIdentity) {
+// traffic accounts the bridged packets to the client (nil counts nothing). The
+// bridge copies frames without parsing them, so the count is taken by a meter
+// on each direction's writer that skips the length prefixes and keepalives.
+// Auto-MTU probe frames are forwarded to the exit and so are counted here,
+// which the exit does not do; that is a few kilobytes per session. clientID is
+// carried upstream so the exit leases and counts the real client, not this hop.
+func relayTUNToUpstream(conn net.Conn, srvCtx *serverContext, logger *log.Logger, handshake []byte, clientID clientIdentity, traffic *clientTraffic) {
 	// Carry the downstream client's identity upstream. Without it every client
 	// behind this relay reaches the exit as the same anonymous "global" client,
 	// so the exit's sticky IP pool hands them all one tunnel IP and they evict
@@ -3858,7 +3860,7 @@ func relayTUNToUpstream(conn net.Conn, srvCtx *serverContext, logger *log.Logger
 	if idleTimeout <= 0 {
 		idleTimeout = defaultRelayIdleTimeout
 	}
-	why := runIdleWatchedBridge(conn, upstreamConn, idleTimeout, logger, srvCtx.trafficOf(clientID))
+	why := runIdleWatchedBridge(conn, upstreamConn, idleTimeout, logger, traffic)
 
 	logger.Info("Relay TUN bridge closed (client=%s): %s", conn.RemoteAddr(), why)
 }
@@ -4040,9 +4042,11 @@ func setupH2Tunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, srv
 				return
 			}
 			tunnel.mu.Lock()
-			sendStegoResponse(framer, tunnel.streamID, buf[:n], tunnel.secret)
+			werr := sendStegoResponse(framer, tunnel.streamID, buf[:n], tunnel.secret)
 			tunnel.mu.Unlock()
-			tunnel.traffic.addDown(n)
+			if werr == nil {
+				tunnel.traffic.addDown(n)
+			}
 		}
 	}()
 }
@@ -4050,11 +4054,11 @@ func setupH2Tunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, srv
 // sendStegoResponse sends data via HTTP/2 steganography, keyed to the
 // authenticated client secret so the frame opens with a per-frame keyed marker
 // instead of the old constant "TIRD".
-func sendStegoResponse(framer *http2.Framer, streamID uint32, data []byte, secret []byte) {
+func sendStegoResponse(framer *http2.Framer, streamID uint32, data []byte, secret []byte) error {
 	// Frame format: [nonce][marker][flags:1][length:2][data:N][cover:M]
 	hdr, err := strategy.BuildStegoServerFrameHeader(secret)
 	if err != nil {
-		return
+		return err
 	}
 	h := len(hdr)
 	// Bucketed cover instead of a fixed 30 bytes, so the server->client record
@@ -4071,7 +4075,7 @@ func sendStegoResponse(framer *http2.Framer, streamID uint32, data []byte, secre
 		rand.Read(response[base:]) // Cover traffic
 	}
 
-	framer.WriteData(streamID, false, response)
+	return framer.WriteData(streamID, false, response)
 }
 
 // h2StegoFrameFunc creates framing function for H2 Stego TUN->Client packets
@@ -4147,20 +4151,17 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 	// expects: [len:4][packet:N].
 	gate := newTunFrameGate(func(frame []byte) error {
 		tunnel.mu.Lock()
-		sendStegoResponse(framer, tunnel.streamID, frame, tunnel.secret)
-		tunnel.mu.Unlock()
-		return nil
+		defer tunnel.mu.Unlock()
+		return sendStegoResponse(framer, tunnel.streamID, frame, tunnel.secret)
 	})
 	tunnel.tunGate = gate
+	// A dropped frame comes back as such: the relay pump neither counts it nor
+	// treats it as a dead tunnel.
 	sendPacketDown := func(pkt []byte) error {
 		framed := make([]byte, 4+len(pkt))
 		binary.BigEndian.PutUint32(framed[:4], uint32(len(pkt)))
 		copy(framed[4:], pkt)
-
-		if err := gate.Frame(framed); err != nil && !FrameDropped(err) {
-			return err
-		}
-		return nil
+		return gate.Frame(framed)
 	}
 
 	var clientIP, serverIP net.IP
@@ -4805,8 +4806,8 @@ func handleWebSocketPadded(conn net.Conn, srvCtx *serverContext, logger *log.Log
 	// the kernel send buffer.
 	preSwap := conn
 	conn = ktls.TryEnable(conn, "tired-ws")
-	if conn != preSwap && srvCtx.registry != nil && clientID.id != "" {
-		srvCtx.registry.SwapConn(clientID.id, preSwap, conn)
+	if conn != preSwap && srvCtx.registry != nil && clientID.perClient {
+		srvCtx.registry.SwapConn(clientID.leaseID(), preSwap, conn)
 	}
 
 	// Wrap with SalamanderConn using the authenticated secret
@@ -6103,8 +6104,10 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 			return io.EOF
 		}
 		// A full downlink drops the frame (offerToClient); that is packet
-		// loss, not a dead tunnel, so it is not reported as an error.
-		sess.offerToClient(frame)
+		// loss, not a dead tunnel: reported as a drop, not as an error.
+		if !sess.offerToClient(frame) {
+			return errFrameShed
+		}
 		return nil
 	})
 	pollConn.gate = gate
@@ -6122,10 +6125,9 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 		// is the path a client lands on after falling back to meek-style polling,
 		// which used to strand it on the relay's own exit and address pool.
 		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, remainingData, sess.Origin,
-			relayClientTag(clientID), srvCtx.trafficOf(sess.ClientID), nil,
+			relayClientTag(clientID), srvCtx.trafficOf(clientID), nil,
 			func(pkt []byte) error {
-				_, err := pollConn.Write(pkt)
-				return err
+				return pollConn.sendPacket(pkt) // a drop goes back to the pump
 			})
 		if err != nil {
 			logger.Warn("HTTP Polling TUN relay: upstream dial failed: %v", err)
@@ -6159,7 +6161,7 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 
 		// Register client with shared TUN using custom framer for polling
 		// Polling uses [length:4][packet:N] framing
-		writer := srvCtx.sharedTUN.RegisterClientGated(clientIP, clientID.id, sess.Origin, pollConn, nil, gate, srvCtx.trafficOf(sess.ClientID))
+		writer := srvCtx.sharedTUN.RegisterClientGated(clientIP, clientID.id, sess.Origin, pollConn, nil, gate, srvCtx.trafficOf(clientID))
 		localSink := newLocalTUNSink(srvCtx.sharedTUN, writer, clientIP)
 		sink = localSink
 		defer func() {
@@ -6304,25 +6306,30 @@ func (c *pollingTUNConn) Read(b []byte) (int, error) {
 }
 
 func (c *pollingTUNConn) Write(b []byte) (int, error) {
-	// Write packet to client with length prefix
-	if c.sess.closed.Load() {
-		return 0, io.EOF
+	if err := c.sendPacket(b); err != nil && !FrameDropped(err) {
+		return 0, err
 	}
-	// Frame: [length:4][packet:N]
+	// A dropped packet is reported as written: the inner TCP retransmits.
+	return len(b), nil
+}
+
+// sendPacket frames one packet for the client, [length:4][packet:N], and
+// reports a frame that was not delivered (gate still closed, downlink full)
+// as FrameDropped.
+func (c *pollingTUNConn) sendPacket(b []byte) error {
+	if c.sess.closed.Load() {
+		return io.EOF
+	}
 	frame := make([]byte, 4+len(b))
 	binary.BigEndian.PutUint32(frame[0:4], uint32(len(b)))
 	copy(frame[4:], b)
 	if c.gate != nil {
-		if err := c.gate.Frame(frame); err != nil {
-			if FrameDropped(err) {
-				return len(b), nil // not attached yet; the inner TCP retransmits
-			}
-			return 0, err
-		}
-		return len(b), nil
+		return c.gate.Frame(frame)
 	}
-	c.sess.offerToClient(frame) // dropped when the downlink is full, like a lost packet
-	return len(b), nil
+	if !c.sess.offerToClient(frame) {
+		return errFrameShed
+	}
+	return nil
 }
 
 func (c *pollingTUNConn) Close() error {

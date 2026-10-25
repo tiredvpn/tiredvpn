@@ -268,8 +268,11 @@ Client detail with runtime counters. `200`.
 `{id}` must parse as a UUID, otherwise `400 Invalid client ID format`
 (plain text). Unknown or non-visible ID: `404 {"error":"Client not found"}`.
 
-`last_seen` is the time the response was generated, not the time of the
-client's last activity.
+`stats` are this server's own counts since it started; see
+[Traffic statistics](#traffic-statistics). `last_seen` is the last time this
+server saw the client - a packet (to the second), a connection opening or
+closing - or now while it is connected; it is absent for a client this server
+has not seen.
 
 ### `DELETE /clients/{id}`
 
@@ -355,6 +358,36 @@ tiredvpn admin list -api http://127.0.0.1:8080 -api-token <token>
 
 `TIREDVPN_API_TOKEN` works for both sides, so the token need not appear in
 either command line.
+
+## Traffic statistics
+
+Each server counts, per registry client, the connections it took and the bytes
+it carried in each direction. There are two views of the same counters:
+
+- `/stats`, `/clients/{id}` and the per-client `/metrics` series show this
+  server's own counts since it started. They reset on restart, like any
+  Prometheus counter, and a sum over servers counts every byte once.
+- `<redis-prefix>stats:<uuid>` holds the lifetime totals over every server on
+  that Redis. Every 30 s, and once on shutdown, each server adds what it saw
+  since its last flush; the addition is atomic, so servers sharing one Redis
+  do not overwrite each other. A deleted client's record is not written back.
+  `active_conns` there is the value of whichever server flushed last.
+
+What a byte is depends on the mode. In TUN mode it is the IP packet, headers
+included, as it enters or leaves the server's TUN device (or, on a relay, the
+upstream tunnel); auto-MTU probe frames and keepalives are not counted. In
+proxy mode it is the stream payload between the client and its target,
+counted on every write - except where the kernel splices the stream (a raw
+tunnel on kTLS), which is counted every 1 MiB and at its end, so such a stream
+can be up to 1 MiB behind, and loses at most that much at shutdown.
+
+A relay and an exit on one Redis both count a relayed client: the relay
+counts the client, the exit counts the relay's credential. Per-client numbers
+are right; a sum over all clients counts relayed traffic twice.
+
+Records written by 1.11.8 and earlier carry no `format` field. Their counters
+were one shared integer, so their numbers are not bytes, and the first flush
+after an upgrade starts them over from zero.
 
 ## Client data model
 

@@ -35,6 +35,15 @@ type tunPacketSink interface {
 	Close()
 }
 
+// countPacket accounts one tunnel packet, unless it is an auto-MTU probe
+// frame: those are the transport measuring itself, not the client's traffic,
+// and some transports forward them where others answer them in place.
+func countPacket(add func(int), pkt []byte) {
+	if !tun.IsProbeFrame(pkt) {
+		add(len(pkt))
+	}
+}
+
 // localTUNSink terminates the client on this node's shared TUN device.
 type localTUNSink struct {
 	shared   *SharedTUN
@@ -51,7 +60,7 @@ func (s *localTUNSink) WritePacket(pkt []byte) error {
 	if _, err := s.shared.TUNDevice().Write(pkt); err != nil {
 		return err
 	}
-	s.writer.traffic.addUp(len(pkt))
+	countPacket(s.writer.traffic.addUp, pkt)
 	return nil
 }
 
@@ -150,7 +159,7 @@ func (s *relayTUNSink) WritePacket(pkt []byte) error {
 	if err != nil {
 		return err
 	}
-	s.traffic.addUp(len(pkt))
+	countPacket(s.traffic.addUp, pkt)
 	return nil
 }
 
@@ -409,10 +418,13 @@ func (s *relayTUNSink) pump(deliver func(pkt []byte) error) {
 			return
 		}
 		if err := deliver(pkt); err != nil {
+			if FrameDropped(err) {
+				continue // not delivered, not counted; the inner TCP retransmits
+			}
 			s.why.CompareAndSwap(nil, new("downstream delivery: "+err.Error()))
 			return
 		}
-		s.traffic.addDown(len(pkt))
+		countPacket(s.traffic.addDown, pkt)
 	}
 }
 

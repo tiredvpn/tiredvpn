@@ -10,17 +10,19 @@ Versions follow [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - **Server: per-client traffic stats count bytes.** `bytes_up` and `bytes_down`
-  in Redis, `/stats`, `/clients/{id}` and the per-client `/metrics` series
   showed the client's connection count: the three counters of a client shared
-  one integer, and no TUN transport counted traffic at all. Every data path now
-  accounts the client's payload (IP packet bytes in TUN mode, stream bytes in
-  proxy mode) on exits and relays alike, with one atomic add per packet and no
-  Redis call on the data path. The totals are lifetime totals: a restart
-  continues them, a record written by the old counters keeps its connection
-  count and starts its byte count from zero, and the server flushes on
-  shutdown. `last_seen` is the last time the client was seen and is omitted
-  for a client never seen, instead of the time of the request. Proxy streams
-  relayed with `io.Copy` (raw tunnel, QUIC) are counted when the stream ends.
+  one integer, no TUN transport counted traffic, and REALITY sessions were not
+  attributed to their client at all. Every data path now accounts the client's
+  traffic on exits and relays, with one atomic add per packet and no Redis call
+  on the data path. `/stats`, `/clients/{id}` and `/metrics` report this
+  server's own counts since start. The Redis record holds lifetime totals:
+  servers add their deltas atomically, so several servers can share one Redis,
+  a deleted client's record is not written back, records from 1.11.8 and
+  earlier start over from zero, and the server flushes on shutdown. Proxied
+  streams are counted as they go instead of when they close (spliced kTLS
+  streams every 1 MiB), and dropped downlink packets are not counted. `last_seen` is when the client was last
+  seen and is omitted for a client never seen. See "Traffic statistics" in
+  `docs/admin.md`.
 
 ### Removed
 

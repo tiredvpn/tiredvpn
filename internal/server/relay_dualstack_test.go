@@ -464,7 +464,7 @@ func TestRelayTUNToUpstreamRecordsDualStack(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		relayTUNToUpstream(relaySide, srvCtx, testLogger(t), dialTUNHandshake(), clientIdentity{})
+		relayTUNToUpstream(relaySide, srvCtx, testLogger(t), dialTUNHandshake(), clientIdentity{}, nil)
 	}()
 
 	clientSide.SetReadDeadline(time.Now().Add(10 * time.Second))
