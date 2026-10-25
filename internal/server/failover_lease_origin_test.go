@@ -71,7 +71,7 @@ func TestRegistryRealityLeaseFromAnotherOrigin(t *testing.T) {
 				}
 			}
 			for _, id := range []clientIdentity{reality, registryIdentity("c1")} {
-				got, err := allocateTunnelIP(srvCtxWithPool(srvCtx, pool), id, newOrigin, nil)
+				got, err := allocateTunnelIP(srvCtxWithPool(srvCtx, pool), id, newOrigin, "", nil)
 				if err != nil || !got.Equal(had) {
 					t.Fatalf("%s from %s got %v (%v); it holds %s from %s", id, newOrigin, got, err, had, oldOrigin)
 				}
@@ -105,7 +105,7 @@ func TestGlobalRealityLeaseOfAnotherOriginIsNotAdopted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := allocateTunnelIP(srvCtxWithPool(srvCtx, pool), reality, "198.51.100.152", nil)
+	got, err := allocateTunnelIP(srvCtxWithPool(srvCtx, pool), reality, "198.51.100.152", "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,13 +165,13 @@ func TestRepeatedHandshakesDoNotAskRedisForOldLeases(t *testing.T) {
 			}
 			srvCtx := srvCtxWithPool(tc.srvCtx, pool)
 			id := tc.id(tc.srvCtx)
-			first, err := allocateTunnelIP(srvCtx, id, "192.0.2.170", nil)
+			first, err := allocateTunnelIP(srvCtx, id, "192.0.2.170", "", nil)
 			if err != nil {
 				t.Fatal(err)
 			}
 			gets, scans := count.get.Load(), count.scan.Load()
 			for range 5 {
-				got, err := allocateTunnelIP(srvCtx, id, "192.0.2.170", nil)
+				got, err := allocateTunnelIP(srvCtx, id, "192.0.2.170", "", nil)
 				if err != nil || !got.Equal(first) {
 					t.Fatalf("got %v (%v), want %s", got, err, first)
 				}

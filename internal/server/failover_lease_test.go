@@ -73,9 +73,9 @@ func TestOneClientKeepsItsLeaseAcrossTransports(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			reality := realityIdentityFor(t, srvCtx, tc.secret)
-			want := allocationKey(reality, origin)
+			want := allocationKey(reality, origin, "")
 			for _, other := range tc.others {
-				if got := allocationKey(other, origin); got != want {
+				if got := allocationKey(other, origin, ""); got != want {
 					t.Errorf("%s keys lease %q, REALITY keys %q: one client, two addresses", other, got, want)
 				}
 			}
@@ -86,7 +86,7 @@ func TestOneClientKeepsItsLeaseAcrossTransports(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			held, err := pool.Allocate(allocationKey(tc.others[0], origin), net.ParseIP("10.8.1.4"), "")
+			held, err := pool.Allocate(allocationKey(tc.others[0], origin, ""), net.ParseIP("10.8.1.4"), "")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -109,10 +109,10 @@ func TestGlobalSecretStillSeparatesOrigins(t *testing.T) {
 	srvCtx := &serverContext{cfg: &Config{Secret: global}}
 	reality := realityIdentityFor(t, srvCtx, global)
 
-	if allocationKey(reality, "192.0.2.161") == allocationKey(sharedIdentity(globalClientID), "198.51.100.152") {
+	if allocationKey(reality, "192.0.2.161", "") == allocationKey(sharedIdentity(globalClientID), "198.51.100.152", "") {
 		t.Fatal("two boxes on the global secret at two origins share a lease")
 	}
-	if allocationKey(reality, "192.0.2.161") == allocationKey(reality, "198.51.100.152") {
+	if allocationKey(reality, "192.0.2.161", "") == allocationKey(reality, "198.51.100.152", "") {
 		t.Fatal("two REALITY boxes on the global secret at two origins share a lease")
 	}
 }
@@ -138,18 +138,18 @@ func TestLeaseCarriesOverFromTheOldKey(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := allocateTunnelIP(srvCtxWithPool(srvCtx, pool), reality, origin, had)
+	got, err := allocateTunnelIP(srvCtxWithPool(srvCtx, pool), reality, origin, "", had)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !got.Equal(had) {
 		t.Fatalf("after the update the client got %s, it held %s", got, had)
 	}
-	if lease := pool.GetLease(had); lease == nil || lease.ClientID != allocationKey(reality, origin) {
+	if lease := pool.GetLease(had); lease == nil || lease.ClientID != allocationKey(reality, origin, "") {
 		t.Fatalf("lease %s is held by %+v, want the new key", had, lease)
 	}
 	// And Geneva on the same client now lands on it too.
-	geneva, err := allocateTunnelIP(srvCtxWithPool(srvCtx, pool), sharedIdentity(globalClientID), origin, net.ParseIP("10.8.1.9"))
+	geneva, err := allocateTunnelIP(srvCtxWithPool(srvCtx, pool), sharedIdentity(globalClientID), origin, "", net.ParseIP("10.8.1.9"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,12 +179,12 @@ func TestRegistryRealityLeaseCarriesOver(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := allocateTunnelIP(srvCtxWithPool(srvCtx, pool), reality, origin, had)
+	got, err := allocateTunnelIP(srvCtxWithPool(srvCtx, pool), reality, origin, "", had)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !got.Equal(had) || allocationKey(reality, origin) != "c1" {
-		t.Fatalf("registry REALITY client got %s under %q, it held %s", got, allocationKey(reality, origin), had)
+	if !got.Equal(had) || allocationKey(reality, origin, "") != "c1" {
+		t.Fatalf("registry REALITY client got %s under %q, it held %s", got, allocationKey(reality, origin, ""), had)
 	}
 }
 
@@ -252,7 +252,7 @@ func TestLeaseMigrationLeavesNoOrphans(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		got, err := allocateTunnelIP(srvCtxWithPool(srvCtx, pool), sharedIdentity(globalClientID), origin, plain)
+		got, err := allocateTunnelIP(srvCtxWithPool(srvCtx, pool), sharedIdentity(globalClientID), origin, "", plain)
 		if err != nil || !got.Equal(plain) {
 			t.Fatalf("got %v (%v), want %s", got, err, plain)
 		}
@@ -281,7 +281,7 @@ func TestLeaseMigrationLeavesNoOrphans(t *testing.T) {
 			t.Fatal(err)
 		}
 		// The client comes back over Geneva, asking for some other address.
-		got, err := allocateTunnelIP(srvCtxWithPool(srvCtx, pool), sharedIdentity(globalClientID), origin, net.ParseIP("10.8.1.9"))
+		got, err := allocateTunnelIP(srvCtxWithPool(srvCtx, pool), sharedIdentity(globalClientID), origin, "", net.ParseIP("10.8.1.9"))
 		if err != nil || !got.Equal(had) {
 			t.Fatalf("over Geneva the client got %v (%v), its address is %s", got, err, had)
 		}
@@ -309,7 +309,7 @@ func TestLeaseMigrationLeavesNoOrphans(t *testing.T) {
 				id = reality
 			}
 			wg.Go(func() {
-				got[i], _ = allocateTunnelIP(srvCtxWithPool(srvCtx, pool), id, origin, nil)
+				got[i], _ = allocateTunnelIP(srvCtxWithPool(srvCtx, pool), id, origin, "", nil)
 			})
 		}
 		wg.Wait()

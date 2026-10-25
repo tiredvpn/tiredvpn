@@ -98,6 +98,15 @@ Versions follow [Semantic Versioning](https://semver.org/).
 - **Server: a proxied site that hangs up is passed on at once.** The client,
   directly or through a relay, used to wait up to a minute for the rest of
   an answer that had ended.
+- **Two clients behind one address no longer take one tunnel address from
+  each other through a relay.** A relay told the exit only its client's IP,
+  and two clients behind one NAT - a home router and a phone - share it, so
+  the exit leased them one address and they evicted each other about every
+  half minute. The relay now also says which of its clients it is
+  forwarding. A client with its own credential keeps its address; clients
+  sharing the server's global secret hold a lease per session, since
+  nothing they send tells them apart. Old relays and old exits are
+  unaffected, and keep the old behaviour between themselves.
 - **Server: a client keeps its tunnel address across transports and
   networks.** Leases are keyed on the credential, and leases an older server
   wrote under other keys are folded into it.

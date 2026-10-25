@@ -258,14 +258,14 @@ func (d *UpstreamDialer) dialLive(ctx context.Context, targetAddr string, live c
 // the upstream's full raw handshake response — the version-dependent base layout
 // [status:1][serverIP:4][clientIP:4][flags:1]... plus the trailing 32-byte
 // dual-stack block [serverIP6:16][clientIP6:16] when the exit negotiated it.
-func (d *UpstreamDialer) DialTUN(ctx context.Context, tunHandshake []byte, origin string) (net.Conn, []byte, error) {
-	conn, _, resp, err := d.dialTUN(ctx, tunHandshake, origin)
+func (d *UpstreamDialer) DialTUN(ctx context.Context, tunHandshake []byte, origin, clientTag string) (net.Conn, []byte, error) {
+	conn, _, resp, err := d.dialTUN(ctx, tunHandshake, origin, clientTag)
 	return conn, resp, err
 }
 
 // dialTUN is DialTUN with the stego conn under the tunnel conn, for a
 // caller that keeps it alive (keepUpstreamAlive).
-func (d *UpstreamDialer) dialTUN(ctx context.Context, tunHandshake []byte, origin string) (net.Conn, *strategy.HTTP2StegoConn, []byte, error) {
+func (d *UpstreamDialer) dialTUN(ctx context.Context, tunHandshake []byte, origin, clientTag string) (net.Conn, *strategy.HTTP2StegoConn, []byte, error) {
 	log.Debug("Upstream TUN dial via %s", d.upstreamAddr)
 
 	stegoConn, tlsConn, err := d.connectStego(ctx)
@@ -279,6 +279,9 @@ func (d *UpstreamDialer) dialTUN(ctx context.Context, tunHandshake []byte, origi
 	setup := make([]byte, 1+len(tunHandshake))
 	setup[0] = 0x02 // TUN mode
 	copy(setup[1:], tunHandshake)
+	// The tag first, the origin last: splitTUNOrigin wants its own trailer
+	// at the end of the payload.
+	setup = appendTUNClientTag(setup, clientTag)
 	setup = appendTUNOrigin(setup, origin)
 	if _, err := stegoConn.Write(setup); err != nil {
 		tlsConn.Close()

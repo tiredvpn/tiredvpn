@@ -80,7 +80,7 @@ func TestDialTUNKeepsFirstFrame(t *testing.T) {
 			dialer := NewUpstreamDialer(exit.ln.Addr().String(), secret)
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			conn, resp, err := dialer.DialTUN(ctx, tc.handshake, "test-origin")
+			conn, resp, err := dialer.DialTUN(ctx, tc.handshake, "test-origin", "")
 			if err != nil {
 				t.Fatalf("DialTUN: %v", err)
 			}
@@ -106,7 +106,7 @@ func TestRelayBridgeKeepsFirstFrame(t *testing.T) {
 
 	relaySide, clientSide := net.Pipe()
 	t.Cleanup(func() { clientSide.Close() })
-	go relayTUNToUpstream(relaySide, srvCtx, testLogger(t), v3TUNHandshake())
+	go relayTUNToUpstream(relaySide, srvCtx, testLogger(t), v3TUNHandshake(), clientIdentity{})
 
 	if err := clientSide.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		t.Fatalf("set deadline: %v", err)
@@ -142,7 +142,7 @@ func TestDialTUNConnCarriesNoDeadline(t *testing.T) {
 			dialer := NewUpstreamDialer(exit.ln.Addr().String(), secret)
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			defer cancel()
-			conn, _, err := dialer.DialTUN(ctx, tc.handshake, "test-origin")
+			conn, _, err := dialer.DialTUN(ctx, tc.handshake, "test-origin", "")
 			if err != nil {
 				t.Fatalf("DialTUN: %v", err)
 			}
@@ -187,7 +187,7 @@ func TestDialTUNSilentExitFails(t *testing.T) {
 			defer cancel()
 			done := make(chan error, 1)
 			go func() {
-				conn, _, err := dialer.DialTUN(ctx, tc.handshake, "test-origin")
+				conn, _, err := dialer.DialTUN(ctx, tc.handshake, "test-origin", "")
 				if conn != nil {
 					conn.Close()
 				}
