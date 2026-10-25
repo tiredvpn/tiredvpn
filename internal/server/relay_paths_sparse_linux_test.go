@@ -121,7 +121,7 @@ func newPathRelay(t *testing.T, secret []byte, upstream string, tweak func(*test
 		tweak(t, cfg)
 	}
 	srvCtx := &serverContext{cfg: cfg, tlsConfig: buildTLSProfile(cfg, selfSignedCertForTest(t)),
-		upstreamDialer: NewUpstreamDialer(upstream, secret)}
+		upstreamDialer: NewUpstreamDialer(upstream, secret), donorDialer: testDonorFor(t, cfg)}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)

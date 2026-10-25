@@ -89,7 +89,8 @@ func newLegExitWith(t *testing.T, secret []byte, tweak func(*Config)) *legExit {
 	if tweak != nil {
 		tweak(cfg)
 	}
-	srvCtx := &serverContext{cfg: cfg, tlsConfig: buildTLSProfile(cfg, selfSignedCertForTest(t)), ipPool: pool, sharedTUN: shared}
+	srvCtx := &serverContext{cfg: cfg, tlsConfig: buildTLSProfile(cfg, selfSignedCertForTest(t)), ipPool: pool, sharedTUN: shared,
+		donorDialer: testDonorFor(t, cfg)}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
