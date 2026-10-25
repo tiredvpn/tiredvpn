@@ -174,6 +174,84 @@ jobs:
           done
           exit "$bad"
 
+  # The relay's upstream keepalive has to work against the exits that run in
+  # the field, which are older than it (1.11.8 at the time of writing). These
+  # tests put the relay against the real release binary - verification rule 9,
+  # a reconstructed "before" proves only the reconstruction - and need both the
+  # binary and CAP_NET_ADMIN for the exit's TUN. Without TIREDVPN_OLD_EXIT they
+  # skip, so they never ran in CI (P3-14 of the round-9 review). This job
+  # downloads the release, checks it against the release's own checksums, and
+  # requires a PASS line from each test: a job green on skips claims coverage
+  # it does not have.
+  old_exit_tests:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    timeout-minutes: 15
+    env:
+      OLD_EXIT_TAG: v1.11.8
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Download the old exit from its release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          gh release download "$OLD_EXIT_TAG" --repo "$GITHUB_REPOSITORY"             --pattern 'tiredvpn-linux-amd64.tar.gz' --pattern 'checksums.txt'
+          grep ' tiredvpn-linux-amd64.tar.gz$' checksums.txt | sha256sum -c -
+          tar xzf tiredvpn-linux-amd64.tar.gz
+          test -x tiredvpn-linux-amd64
+          ./tiredvpn-linux-amd64 -version
+
+      - name: Build test binary
+        run: go test -c -o "$RUNNER_TEMP/server.test" ./internal/server/
+
+      - name: Load the tun module
+        run: sudo modprobe tun
+
+      - name: The new relay against the old exit, in a network namespace
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/server.test"
+          log="$RUNNER_TEMP/old-exit-tests.log"
+
+          mapfile -t want < <("$bin" -test.list '^TestAnOldExit' 2>/dev/null |
+            grep -E '^TestAnOldExit[A-Za-z0-9_]*$' || true)
+          if [ "${#want[@]}" -eq 0 ]; then
+            echo "::error::no TestAnOldExit* tests in the binary, nothing would be checked"
+            exit 1
+          fi
+          echo "expecting PASS from ${#want[@]} tests: ${want[*]}"
+
+          set +e
+          sudo unshare -rn sh -c "ip link set lo up &&             TIREDVPN_OLD_EXIT=$RUNNER_TEMP/tiredvpn-linux-amd64             $bin -test.run '^TestAnOldExit' -test.v -test.count=1 -test.timeout=12m" 2>&1 | tee "$log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::old-exit tests failed (exit $rc)"
+            exit "$rc"
+          fi
+
+          bad=0
+          if grep -E -- '--- SKIP' "$log"; then
+            echo "::error::old-exit tests were skipped, see the lines above"
+            bad=1
+          fi
+          for t in "${want[@]}"; do
+            if ! grep -qE -- "^--- PASS: ${t} \(" "$log"; then
+              echo "::error::${t} did not report PASS"
+              bad=1
+            fi
+          done
+          exit "$bad"
+
   benchmark:
     runs-on: ubuntu-latest
     if: github.event_name != 'schedule'
