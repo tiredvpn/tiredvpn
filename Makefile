@@ -9,7 +9,7 @@ build:
 	go build $(LDFLAGS) -o tiredvpn ./cmd/tiredvpn/
 
 build-linux:
-	GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -o tiredvpn-linux-amd64 ./cmd/tiredvpn/
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build $(LDFLAGS) -o tiredvpn-linux-amd64 ./cmd/tiredvpn/
 
 build-android:
 	GOOS=android GOARCH=arm64 CGO_ENABLED=1 go build -buildmode=c-shared $(LDFLAGS) -o libtiredvpn.so ./cmd/tiredvpn/
