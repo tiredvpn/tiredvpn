@@ -220,6 +220,11 @@ type serverChain struct {
 	until time.Time
 	// parked is how long that park lasted, jitter included.
 	parked time.Duration
+	// fresh is set when a verdict parked a server that was not parked, and
+	// taken by TakeServerParkNotice: a park extended while it still runs is
+	// no news, and saying so at Warn on every dial of a parked server filled
+	// the log every few seconds (the fix13c stand).
+	fresh bool
 }
 
 // NewSelector builds a selector from cfg, or returns the process-scoped one
@@ -782,6 +787,7 @@ func (s *Selector) addrVerdictLocked(idx int, now time.Time) (serverParked bool)
 	}
 
 	sc := &s.servers[ep]
+	sc.fresh = !sc.until.After(now)
 	if !sc.until.IsZero() && now.Sub(sc.until) >= sc.parked {
 		sc.backoff = 0
 	}
@@ -799,6 +805,22 @@ func (s *Selector) addrVerdictLocked(idx int, now time.Time) (serverParked bool)
 	}
 	clear(verdicts)
 	return true
+}
+
+// TakeServerParkNotice reports whether the last verdict that parked c's
+// server started the park, rather than extending one that was still
+// running, and clears the notice: it is true once per park.
+func (s *Selector) TakeServerParkNotice(c Candidate) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	idx, ok := s.byAddr[c.Addr]
+	if !ok {
+		return false
+	}
+	sc := &s.servers[s.cands[idx].EndpointIdx]
+	fresh := sc.fresh
+	sc.fresh = false
+	return fresh
 }
 
 // ParkedForDeadSessions reports whether c is in a park for dead sessions:
