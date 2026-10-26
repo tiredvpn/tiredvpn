@@ -4417,6 +4417,59 @@ func (m *Manager) CurrentCandidate() (endpoint.Candidate, bool) {
 	return sel.Current()
 }
 
+// ReturnCandidate reports the more preferred candidate a session on a
+// fallback should return to, once it has dwelt there for the selector's
+// MinDwell (endpoint.Selector.ReturnCandidate). False without a selector.
+func (m *Manager) ReturnCandidate() (endpoint.Candidate, bool) {
+	sel := m.selector()
+	if sel == nil {
+		return endpoint.Candidate{}, false
+	}
+	return sel.ReturnCandidate(sel.Now())
+}
+
+// DialReturn dials s at cand for a session's return to a preferred server:
+// one dial, the endpoint's own secret, no walk. A failed dial is booked on
+// cand as a failed connect, where repeated failures park it; the strategy's
+// own record is not touched, since what failed may be the server.
+func (m *Manager) DialReturn(ctx context.Context, s Strategy, cand endpoint.Candidate) (net.Conn, error) {
+	m.muxMu.Lock()
+	muxEnabled := m.muxEnabled
+	m.muxMu.Unlock()
+	if muxEnabled {
+		return nil, fmt.Errorf("return to a preferred server is not supported with mux")
+	}
+	connectCtx, cancel := context.WithTimeout(m.withDialCandidate(ctx, cand), m.connectTimeout)
+	start := time.Now()
+	conn, err := s.Connect(connectCtx, m.withHoppedPort(cand.Addr))
+	cancel()
+	sel := m.selector()
+	if err != nil {
+		if sel != nil {
+			sel.Report(cand, false, 0)
+		}
+		return nil, err
+	}
+	if sel != nil {
+		sel.Report(cand, true, time.Since(start))
+	}
+	m.mu.RLock()
+	useRTTMasking, rttProfile := m.rttMaskingEnabled, m.rttProfile
+	m.mu.RUnlock()
+	optimizeTCPConn(conn)
+	if useRTTMasking {
+		conn = WrapWithRTTMasking(conn, rttProfile)
+	}
+	return conn, nil
+}
+
+// PinCandidate moves the selector's pin to cand: the session now rides it.
+func (m *Manager) PinCandidate(cand endpoint.Candidate) {
+	if sel := m.selector(); sel != nil {
+		sel.Pin(cand)
+	}
+}
+
 // SetReprobeInterval changes the reprobe interval
 func (m *Manager) SetReprobeInterval(interval time.Duration) {
 	m.mu.Lock()

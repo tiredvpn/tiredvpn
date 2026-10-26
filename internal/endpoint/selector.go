@@ -478,6 +478,31 @@ func (s *Selector) Reconsider(now time.Time) (Candidate, bool) {
 	return s.cands[s.pinnedIdx], true
 }
 
+// ReturnCandidate reports the candidate a session on the pinned one should
+// return to, without moving the pin: the most preferred available candidate
+// ranked above it, once the pin has been held for MinDwell - the same rule
+// Reconsider applies at a reconnect boundary. A TUN session gets no boundary
+// while it is healthy, so the client asks this on its own (see
+// tun.VPNClient.tryReturnToPreferred) and commits with Pin.
+func (s *Selector) ReturnCandidate(now time.Time) (Candidate, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.cands) == 0 {
+		return Candidate{}, false
+	}
+	rank := s.rankLocked()
+	pos := rankPos(rank, s.pinnedIdx)
+	if pos == 0 || now.Sub(s.pinnedAt) < s.cfg.MinDwell {
+		return Candidate{}, false
+	}
+	for _, i := range rank[:pos] {
+		if !s.unavailableLocked(i, now) {
+			return s.cands[i], true
+		}
+	}
+	return Candidate{}, false
+}
+
 // rankLocked returns the candidate indices in preference order under the active
 // selection policy. For every policy but SelectLatency that is the order the
 // candidate list was built in, so this is the identity permutation.

@@ -51,3 +51,42 @@ func TestMovingOffAParkedServerSkipsOneThatFailedRecently(t *testing.T) {
 		})
 	}
 }
+
+// TestReturnCandidateWaitsForTheDwellAndThePark: a session pinned on b
+// returns to a only once it has dwelt there for MinDwell, and not while a
+// is parked. The pin does not move.
+func TestReturnCandidateWaitsForTheDwellAndThePark(t *testing.T) {
+	s, clk := newTestSelector(t, Config{
+		Endpoints:        []Endpoint{{Name: "a", V4: "203.0.113.1:443"}, {Name: "b", V4: "203.0.113.2:443", Order: 1}},
+		Family:           V4Only,
+		FailureThreshold: 2,
+		MinDwell:         5 * time.Minute,
+	})
+	a, b := candFor(t, s, "203.0.113.1:443"), candFor(t, s, "203.0.113.2:443")
+	s.Pin(b)
+	if _, ok := s.ReturnCandidate(clk.Now()); ok {
+		t.Fatal("a return offered before MinDwell")
+	}
+	clk.Advance(4*time.Minute + 30*time.Second)
+	s.ReportSilent(a)
+	clk.Advance(30 * time.Second)
+	if s.IsParked(a) {
+		if _, ok := s.ReturnCandidate(clk.Now()); ok {
+			t.Fatal("a return offered to a parked a")
+		}
+	} else {
+		t.Fatal("a's park ran out with the dwell - the test proves nothing")
+	}
+	s.Unpark(a)
+	got, ok := s.ReturnCandidate(clk.Now())
+	if !ok || got.Addr != a.Addr {
+		t.Fatalf("return candidate %v %v, want a", got, ok)
+	}
+	if cur, _ := s.Current(); cur.Addr != b.Addr {
+		t.Fatalf("ReturnCandidate moved the pin to %s", cur.Addr)
+	}
+	s.Pin(a)
+	if _, ok := s.ReturnCandidate(clk.Now()); ok {
+		t.Fatal("a return offered from the most preferred candidate")
+	}
+}

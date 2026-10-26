@@ -205,6 +205,12 @@ type VPNClient struct {
 	// lastTx is a monoNow stamp of the last frame written up the tunnel,
 	// keepalives included (keepUplinkAlive).
 	lastTx atomic.Int64
+	// lastDataTx is a monoNow stamp of the last packet from the TUN written
+	// up the tunnel: lastTx without keepalives and probes.
+	lastDataTx atomic.Int64
+	// returnNotBefore is a monoNow stamp before which no return to a
+	// preferred server is tried again (tryReturnToPreferred).
+	returnNotBefore atomic.Int64
 	// keepaliveMu serialises the two keepalives, the server-silence one
 	// and the uplink's own, from their last look at the stamps to the
 	// write; lastKeepalive is a monoNow stamp of the last one sent.
@@ -655,6 +661,7 @@ func (v *VPNClient) Start(ctx context.Context) error {
 	go v.sendKeepalive()
 	go v.keepUplinkAlive()
 	go v.watchStalls()
+	go v.watchReturnToPreferred()
 
 	// Auto-MTU: measure the real end-to-end ceiling and apply min(probed, cap).
 	// readFromServer is already running so PROBE_REPLY frames can be routed to the
@@ -1056,6 +1063,20 @@ func (v *VPNClient) connect(parent context.Context) error {
 	// may have had to look at the first byte of the first frame.
 	conn = tunnelConn
 
+	return v.publishSession(conn, strat, cand, hasCand, resp, n, nil)
+}
+
+// errSessionChanged is publishSession refusing a session because the tunnel
+// is no longer riding the conn the caller replaces.
+var errSessionChanged = errors.New("the tunnel changed meanwhile")
+
+// publishSession installs conn, whose TUN handshake answered resp[:n], as the
+// tunnel's session on cand: the conn, the strategy, the addresses the exit
+// assigned (onto the TUN device too), the IPv6 side and the session's
+// bookkeeping. With replaces set it installs only while the tunnel still
+// rides replaces, and leaves closing it to the caller. Called with sessionMu
+// held.
+func (v *VPNClient) publishSession(conn net.Conn, strat strategy.Strategy, cand endpoint.Candidate, hasCand bool, resp []byte, n int, replaces net.Conn) error {
 	// Server sends its TUN IP and assigned client IP.
 	serverIP := net.IP(resp[1:5])
 	assignedIP := net.IP(resp[5:9])
@@ -1075,6 +1096,12 @@ func (v *VPNClient) connect(parent context.Context) error {
 		v.mu.Unlock()
 		conn.Close()
 		return context.Canceled
+	}
+	if replaces != nil && (v.conn != replaces || atomic.LoadInt32(&v.reconnecting) == 1 ||
+		atomic.LoadInt32(&v.portHopInProgress) == 1) {
+		v.mu.Unlock()
+		conn.Close()
+		return errSessionChanged
 	}
 	v.conn = conn
 	v.strategy = strat
@@ -1989,7 +2016,9 @@ func (v *VPNClient) readFromTun() {
 			v.connLost(conn, "server write", uplinkFailed(err))
 			continue
 		}
-		v.lastTx.Store(monoNow())
+		now := monoNow()
+		v.lastTx.Store(now)
+		v.lastDataTx.Store(now)
 
 		if log.DebugEnabled() {
 			log.Debug("TUN->Server: sent %d bytes (payload=%d) to server", written, n)
