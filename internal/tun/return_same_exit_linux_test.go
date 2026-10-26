@@ -313,7 +313,7 @@ func TestASilentHandshakeOnTheSameExitReconnectsOnce(t *testing.T) {
 func TestAReturnWhoseReplyIsLostDoesNotStayOnADisplacedSession(t *testing.T) {
 	shortHandshakeTimeout(t, 500*time.Millisecond)
 	h := newSameExitHarness(t)
-	h.exit.echoing = true
+	h.exit.echoing.Store(true)
 	h.v6.dropReply.Store(true)
 	h.expectReconnectOnV4(t)
 }
