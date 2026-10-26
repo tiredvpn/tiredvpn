@@ -19,14 +19,16 @@ import (
 // endpoint. What it does to a dial is its own; the session behind it is the
 // exit's.
 type returnFront struct {
-	exit      *returnExit
-	dialDelay time.Duration
+	exit *returnExit
+	// dialDelay and answerAfter are nanoseconds; tests set them while the
+	// watcher dials.
+	dialDelay atomic.Int64
 	// mute reads the TUN handshake and never answers it.
 	mute atomic.Bool
 	// requested, when set, is called as the handshake request arrives.
 	requested atomic.Pointer[func()]
 	// answerAfter holds the answer back.
-	answerAfter time.Duration
+	answerAfter atomic.Int64
 	dials       atomic.Int64
 	handshakes  atomic.Int64
 }
@@ -46,7 +48,7 @@ func (s *frontStrategy) Connect(ctx context.Context, target string) (net.Conn, e
 	f := s.fronts[target]
 	f.dials.Add(1)
 	select {
-	case <-time.After(f.dialDelay):
+	case <-time.After(time.Duration(f.dialDelay.Load())):
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -65,7 +67,7 @@ func (s *frontStrategy) Connect(ctx context.Context, target string) (net.Conn, e
 			_, _ = io.Copy(io.Discard, srv)
 			return
 		}
-		time.Sleep(f.answerAfter)
+		time.Sleep(time.Duration(f.answerAfter.Load()))
 		f.exit.serveAnswered(srv)
 	}()
 	return cli, nil
@@ -209,7 +211,7 @@ func (h *sameExitHarness) downlinkWorks(d time.Duration) bool {
 // was gone. It has to stop before the handshake.
 func TestAReturnThatWakesUpDuringItsDialLeavesTheTunnel(t *testing.T) {
 	h := newSameExitHarness(t)
-	h.v6.dialDelay = 600 * time.Millisecond
+	h.v6.dialDelay.Store(int64(600 * time.Millisecond))
 	deadline := time.Now().Add(5 * time.Second)
 	for h.v6.dials.Load() == 0 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
@@ -237,7 +239,7 @@ func TestAReturnThatWakesUpDuringItsDialLeavesTheTunnel(t *testing.T) {
 // the address unregistered. The new session has to be the tunnel.
 func TestAReturnWhoseHandshakeDisplacedTheOldSessionIsKept(t *testing.T) {
 	h := newSameExitHarness(t)
-	h.v6.answerAfter = 300 * time.Millisecond
+	h.v6.answerAfter.Store(int64(300 * time.Millisecond))
 	wake := func() {
 		go func() {
 			for range 5 {
