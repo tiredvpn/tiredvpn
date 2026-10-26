@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -2611,7 +2612,7 @@ func handleMorphTUNMode(conn net.Conn, remainingData []byte, srvCtx *serverConte
 		return
 	}
 
-	requestedIP := net.IP(remainingData[0:4])
+	requestedIP := net.IP(slices.Clone(remainingData[0:4]))
 
 	// Check for version byte (v2 clients send 7 bytes total)
 	var clientVersion uint8 = 1 // Default to v1 for backwards compatibility
@@ -3164,7 +3165,7 @@ func handleConfusionTUNMode(sess *confusionSession, remainingData []byte, srvCtx
 		return
 	}
 
-	requestedIP := net.IP(remainingData[0:4])
+	requestedIP := net.IP(slices.Clone(remainingData[0:4]))
 	// The identity is the one the marker proved, not the peer's address.
 	// Behind a relay every forwarded client shares the relay's address, so the
 	// old derivation gave them all one identity and one lease.
@@ -3523,7 +3524,7 @@ func negotiateMTU(clientMTU, serverMTU int) int {
 // handleTUNModeCore is the core TUN mode handler
 // authClientID is the authenticated client ID from QUIC/etc (empty if not available)
 func handleTUNModeCore(conn net.Conn, cfg *Config, srvCtx *serverContext, logger *log.Logger, handshake []byte, authClientID clientIdentity) {
-	requestedIP := net.IP(handshake[0:4])
+	requestedIP := net.IP(slices.Clone(handshake[0:4]))
 	clientMTU := int(binary.BigEndian.Uint16(handshake[4:6]))
 	// Negotiate MTU: use min(clientMTU, serverMTU) as effective MTU.
 	// serverMTU must match the shared TUN interface MTU (both via resolveTunMTU)
@@ -4081,7 +4082,7 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 		return
 	}
 
-	requestedIP := net.IP(data[0:4])
+	requestedIP := net.IP(slices.Clone(data[0:4]))
 
 	// Check for version byte (v2 clients send 7 bytes total)
 	var clientVersion uint8 = 1 // Default to v1 for backwards compatibility
@@ -5937,7 +5938,7 @@ func runPollingTUNMode(sess *HTTPPollingSession, remainingData []byte, srvCtx *s
 		return
 	}
 
-	requestedIP := net.IP(remainingData[0:4])
+	requestedIP := net.IP(slices.Clone(remainingData[0:4]))
 	clientID := sess.ClientID.prefixed("polling")
 	logger.Debug("HTTP Polling TUN: requestedIP=%s, clientID=%s", requestedIP, clientID)
 

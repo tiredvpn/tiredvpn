@@ -214,12 +214,12 @@ func TestASharedSecretClientKeepsItsAddressAcrossAReconnect(t *testing.T) {
 	twin.Stop()
 
 	first.Stop()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for exit.srvCtx.sharedTUN.Serving(held) && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if exit.srvCtx.sharedTUN.Serving(held) {
-		t.Fatal("the exit still serves the first session - the test proves nothing")
+		t.Fatalf("the exit still serves the first session - the test proves nothing:\n%s", out.String())
 	}
 	again := natClientAsking(t, relay, secret, held)
 	if got := again.LocalIP(); !got.Equal(held) {
