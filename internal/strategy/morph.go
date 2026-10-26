@@ -841,7 +841,7 @@ func (mc *MorphedConn) close() error {
 	// below is ordered after the write in ensurePacer.
 	mc.pacerOnce.Do(func() {})
 	if mc.pacer == nil {
-		if mc.wdl.expired() {
+		if mc.wdl.abortRequested() {
 			// CloseNow on a conn that never shaped a write.
 			err := closeSocket(mc.Conn)
 			_ = mc.Conn.Close()
@@ -858,7 +858,7 @@ func (mc *MorphedConn) close() error {
 	})
 	defer mc.wdl.end()
 	drainErr := mc.pacer.shutdown()
-	if drainErr == nil && !aborted.Load() && !mc.wdl.expired() {
+	if drainErr == nil && !aborted.Load() && !mc.wdl.abortRequested() {
 		return mc.Conn.Close()
 	}
 	if drainErr != nil {

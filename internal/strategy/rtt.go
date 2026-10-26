@@ -511,7 +511,7 @@ func (c *RTTMaskingConn) close() error {
 	if flushErr != nil {
 		log.Warn("RTT masking: close lost the pending burst: %v", flushErr)
 	}
-	if flushErr == nil && !aborted.Load() && !c.wdl.expired() {
+	if flushErr == nil && !aborted.Load() && !c.wdl.abortRequested() {
 		return c.Conn.Close()
 	}
 	if cn, ok := c.Conn.(closeNower); ok && !aborted.Load() {

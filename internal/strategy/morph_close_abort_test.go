@@ -73,11 +73,12 @@ func TestMorphedConnCloseFollowsShorterDeadline(t *testing.T) {
 	}
 }
 
-// TestMorphedConnCloseIdlePacerAfterAbort: Stop on a conn whose pacer has
-// nothing queued. The drain is clean, but tls.Conn.Close then replaced the
-// expired deadline with its own 5 s one for close_notify, and only the
-// abort timer ended it, a second later. With the deadline already passed
-// Close goes straight to the socket.
+// TestMorphedConnCloseIdlePacerAfterAbort: Stop (CloseNow) on a conn whose
+// pacer has nothing queued. The drain is clean, but tls.Conn.Close then
+// replaced the expired deadline with its own 5 s one for close_notify, and
+// only the abort timer ended it, a second later. On an abort Close goes
+// straight to the socket. A bare expired deadline no longer triggers this;
+// only CloseNow does (an idle tunnel's stale deadline must still drain).
 func TestMorphedConnCloseIdlePacerAfterAbort(t *testing.T) {
 	for _, tr := range closeTransports {
 		t.Run(tr.name, func(t *testing.T) {
@@ -89,11 +90,10 @@ func TestMorphedConnCloseIdlePacerAfterAbort(t *testing.T) {
 			// Let the pacer write it and go idle, then shut the window.
 			time.Sleep(50 * time.Millisecond)
 			fillSendBuffer(t, raw)
-			_ = mc.SetDeadline(time.Now())
 			start := time.Now()
-			_ = mc.Close()
+			_ = mc.CloseNow()
 			if took := time.Since(start); took > 500*time.Millisecond {
-				t.Fatalf("Close after an expired deadline took %v with an empty queue", took)
+				t.Fatalf("CloseNow took %v with an empty queue", took)
 			}
 		})
 	}
@@ -473,9 +473,9 @@ func TestMorphedConnCloseNowDuringClose(t *testing.T) {
 				// Wait for the abort itself to land, so a goroutine the
 				// scheduler holds off under load does not look like a
 				// Close that ignored it.
-				for deadline := time.Now().Add(3 * time.Second); !mc.wdl.expired(); time.Sleep(time.Millisecond) {
+				for deadline := time.Now().Add(3 * time.Second); !mc.wdl.abortRequested(); time.Sleep(time.Millisecond) {
 					if time.Now().After(deadline) {
-						t.Fatal("CloseNow did not expire the close deadline")
+						t.Fatal("CloseNow did not request the abort")
 					}
 				}
 				abortAt = time.Now()
@@ -668,3 +668,119 @@ func TestCloseSocketStopsAtANilInnerConn(t *testing.T) {
 type nilNetConn struct{ net.Conn }
 
 func (nilNetConn) NetConn() net.Conn { return nil }
+
+// closeNotifyTap records the client's writes to the wire so a test can see
+// whether a close_notify record actually went out. A bare FIN cannot be
+// told from close_notify by the peer's Read - Go returns io.EOF for both -
+// so the alert has to be observed on the wire. It sits between the TLS
+// layer and the socket; closeSocket walks past it via NetConn to the
+// socket, so the socket-close path leaves no successful alert write here.
+type closeNotifyTap struct {
+	net.Conn
+	mu     sync.Mutex
+	writes []tapWrite
+}
+
+type tapWrite struct {
+	offered int
+	wrote   int
+	first   byte
+}
+
+func (t *closeNotifyTap) Write(p []byte) (int, error) {
+	n, err := t.Conn.Write(p)
+	t.mu.Lock()
+	var first byte
+	if len(p) > 0 {
+		first = p[0]
+	}
+	t.writes = append(t.writes, tapWrite{len(p), n, first})
+	t.mu.Unlock()
+	return n, err
+}
+
+func (t *closeNotifyTap) NetConn() net.Conn { return t.Conn }
+
+// sentCloseNotify reports whether the last write was a fully written small
+// TLS record: in TLS 1.3 close_notify is an encrypted record whose outer
+// content type is application_data (0x17), 24 bytes on the wire.
+func (t *closeNotifyTap) sentCloseNotify() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.writes) == 0 {
+		return false
+	}
+	w := t.writes[len(t.writes)-1]
+	return w.first == 0x17 && w.wrote == w.offered && w.wrote > 0 && w.wrote <= 31
+}
+
+// TestCloseSendsCloseNotifyWithStaleDeadline: nothing clears a conn's write
+// deadline in production - the keepalive sets +5 s, the TUN writer +30 s
+// per packet - so an idle tunnel usually carries a stale, already-passed
+// write deadline into a normal Close. That is not an abort: a plain Close
+// on a healthy peer must still send close_notify over a non-kTLS tls.Conn.
+// The peer's Read can't tell close_notify from a bare FIN (both are
+// io.EOF), so this asserts the 24-byte alert record on the wire. Regression
+// guard for the P3-5 fix, which keyed the socket-close shortcut on any
+// passed deadline; red on that head for all three shaped stacks.
+func TestCloseSendsCloseNotifyWithStaleDeadline(t *testing.T) {
+	stacks := []struct {
+		name  string
+		build func(cli net.Conn) net.Conn
+	}{
+		{"shaped morph", func(cli net.Conn) net.Conn {
+			return &MorphedConn{Conn: cli, profile: &TrafficProfile{Name: "T"}, shaper: &chunkShaper{}}
+		}},
+		{"rtt", func(cli net.Conn) net.Conn {
+			return NewRTTMaskingConn(cli, burstOnlyOnClose)
+		}},
+		{"rtt over shaped morph", func(cli net.Conn) net.Conn {
+			morph := &MorphedConn{Conn: cli, profile: &TrafficProfile{Name: "T"}, shaper: &chunkShaper{}}
+			return NewRTTMaskingConn(morph, burstOnlyOnClose)
+		}},
+	}
+	for _, st := range stacks {
+		t.Run(st.name, func(t *testing.T) {
+			c, s := tcpPair(t)
+			tap := &closeNotifyTap{Conn: c}
+			srvCfg, cliCfg := testTLSConfigs(t)
+			srv := tls.Server(s, srvCfg)
+			hs := make(chan error, 1)
+			go func() { hs <- srv.Handshake() }()
+			cli := tls.Client(tap, cliCfg)
+			if err := cli.Handshake(); err != nil {
+				t.Fatalf("client handshake: %v", err)
+			}
+			if err := <-hs; err != nil {
+				t.Fatalf("server handshake: %v", err)
+			}
+			// A peer that keeps reading: close_notify can go out, and the
+			// drain never blocks, so the deadline is the only variable.
+			readDone := make(chan struct{})
+			go func() { _, _ = io.Copy(io.Discard, srv); close(readDone) }()
+
+			wrapped := st.build(cli)
+			// Enough to start a shaper pacer, so the pacer-drain branch of
+			// Close is the one under test, not the no-pacer shortcut.
+			if _, err := wrapped.Write(make([]byte, 1000)); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			// Let the pacer drain the payload into the reader and go idle,
+			// so Close has nothing queued and only the stale deadline is
+			// under test.
+			time.Sleep(300 * time.Millisecond)
+			// The stale deadline an idle tunnel carries into Close. Two
+			// seconds in the past needs both halves of the fix: the flag,
+			// and begin ignoring a passed caller deadline (otherwise the
+			// abort timer at closeBy+grace is already in the past and fires
+			// at once, racing close_notify).
+			_ = wrapped.SetWriteDeadline(time.Now().Add(-2 * time.Second))
+			if err := wrapped.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+			if !tap.sentCloseNotify() {
+				t.Fatalf("no close_notify on the wire after a plain Close with a stale deadline; a stale deadline was read as an abort")
+			}
+		})
+	}
+}

@@ -251,23 +251,24 @@ func closeParkedWith(t *testing.T, mc *MorphedConn, sh *parkingShaper, closeFn f
 	}
 }
 
-// TestMorphedConnCloseKeepsAbortDeadline is VPNClient.Stop: it sets an
-// expired deadline and then calls Close, expecting the conn to go now.
-// Close used to replace that deadline with its own 5 s one and drain the
-// queue into a peer that does not read: 5.0 s instead of the 32-44 ms of
-// the code before it. Over TLS the close_notify then cost another 5 s.
+// TestMorphedConnCloseKeepsAbortDeadline is VPNClient.Stop (CloseNow):
+// it aborts and expects the conn to go now. Close used to replace that
+// deadline with its own 5 s one and drain the queue into a peer that does
+// not read: 5.0 s instead of the 32-44 ms of the code before it. Over TLS
+// the close_notify then cost another 5 s. Stop drives this through
+// CloseNow now, not a bare expired deadline - that one drains like any
+// idle close.
 func TestMorphedConnCloseKeepsAbortDeadline(t *testing.T) {
 	for _, tr := range closeTransports {
 		t.Run(tr.name, func(t *testing.T) {
 			conn, raw := tr.dial(t)
 			mc, sh := parkedClient(t, conn, raw)
-			_ = mc.SetDeadline(time.Now())
-			took, err := closeParked(t, mc, sh, nil, 20*time.Second)
+			took, err := closeParkedWith(t, mc, sh, mc.CloseNow, nil, 20*time.Second)
 			if took > time.Second {
-				t.Fatalf("Close after an expired deadline took %v", took)
+				t.Fatalf("CloseNow took %v", took)
 			}
 			if !errors.Is(err, ErrShaperCloseIncomplete) {
-				t.Fatalf("Close = %v, want ErrShaperCloseIncomplete for the queue it gave up", err)
+				t.Fatalf("CloseNow = %v, want ErrShaperCloseIncomplete for the queue it gave up", err)
 			}
 		})
 	}

@@ -23,10 +23,10 @@ type closeNower interface {
 // closeDeadline lets a conn wrapper bound the writes its Close still has to
 // make without undoing a deadline the caller set. Close writes under the
 // earlier of the caller's write deadline and now+limit, and from then on a
-// caller can bring that deadline closer but never push it out. Both happen
-// in production: VPNClient.Stop sets an expired deadline right before Close
-// to abort, and the TUN writer moves the write deadline 30 s out before
-// every packet, possibly while Close is running.
+// caller can bring that deadline closer but never push it out. This happens
+// in production: the TUN writer moves the write deadline 30 s out before
+// every packet, possibly while Close is running. To abort instead of drain,
+// VPNClient.Stop calls abortNow (CloseNow), not a bare expired deadline.
 //
 // While Close runs, an abort timer is armed for closeAbortGrace past the
 // deadline, and it moves with the deadline, so the socket is closed in
@@ -35,6 +35,7 @@ type closeDeadline struct {
 	mu      sync.Mutex
 	caller  time.Time // last write deadline the caller set; zero means none
 	abortAt time.Time // set by abortNow before Close began; zero means none
+	aborted bool      // abortNow was called: Close must skip the drain and close_notify
 	closing bool
 	closeBy time.Time // the deadline Close writes under, once closing
 	timer   *time.Timer
@@ -93,6 +94,7 @@ func (d *closeDeadline) abortNow(c net.Conn) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	now := time.Now()
+	d.aborted = true
 	if d.closing {
 		_ = d.shortenLocked(c, now)
 		return
@@ -105,12 +107,24 @@ func (d *closeDeadline) abortNow(c net.Conn) {
 // caller's write deadline, now+limit and an abort asked for earlier - on c
 // as its write deadline, and arms abort for closeAbortGrace past it. Later
 // calls keep the deadline the first one set.
+//
+// A caller write deadline that has already passed is ignored: nothing in
+// production clears it (the keepalive sets +5 s, the TUN writer +30 s per
+// packet), so an idle tunnel usually carries a stale past deadline into
+// Close, and honouring it would leave no time to drain or to send
+// close_notify - and would fire the abort timer at once. An intentional
+// abort comes through abortNow, not a stale deadline.
 func (d *closeDeadline) begin(c net.Conn, limit time.Duration, abort func()) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if !d.closing {
 		d.closing = true
-		d.closeBy = earlierDeadline(d.caller, time.Now().Add(limit))
+		now := time.Now()
+		caller := d.caller
+		if !caller.After(now) {
+			caller = time.Time{}
+		}
+		d.closeBy = earlierDeadline(caller, now.Add(limit))
 		d.closeBy = earlierDeadline(d.closeBy, d.abortAt)
 		if abort != nil {
 			d.timer = time.AfterFunc(time.Until(d.closeBy)+closeAbortGrace, abort)
@@ -129,15 +143,14 @@ func (d *closeDeadline) end() {
 	}
 }
 
-// expired reports whether the close deadline has passed, or an abort was
-// asked for before Close began.
-func (d *closeDeadline) expired() bool {
+// abortRequested reports whether abortNow was called. It is NOT a check on
+// whether the close deadline has passed: a stale caller deadline is a tired
+// idle tunnel, not an abort, and must still get its drain and close_notify.
+// Only CloseNow (VPNClient.Stop) asks to skip them.
+func (d *closeDeadline) abortRequested() bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if !d.closing {
-		return !d.abortAt.IsZero()
-	}
-	return !time.Now().Before(d.closeBy)
+	return d.aborted
 }
 
 // closeSocket closes the socket at the bottom of c's NetConn chain, below

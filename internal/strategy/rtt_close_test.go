@@ -115,14 +115,14 @@ func TestRTTMaskingCloseBounded(t *testing.T) {
 	setForTest(t, &closeAbortGrace, time.Minute)
 	cases := []struct {
 		name  string
-		abort bool // Stop: an expired deadline right before Close
+		abort bool // Stop: CloseNow
 		morph bool // a shaped MorphedConn between the wrapper and TCP
 		limit time.Duration
 	}{
 		{"tcp, close deadline", false, false, 2300 * time.Millisecond},
-		{"tcp, caller's expired deadline", true, false, time.Second},
+		{"tcp, CloseNow", true, false, time.Second},
 		{"morph over tcp, close deadline", false, true, 2300 * time.Millisecond},
-		{"morph over tcp, caller's expired deadline", true, true, time.Second},
+		{"morph over tcp, CloseNow", true, true, time.Second},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -145,12 +145,13 @@ func TestRTTMaskingCloseBounded(t *testing.T) {
 					t.Fatalf("Write: %v", err)
 				}
 			}
+			closeFn := c.Close
 			if tc.abort {
-				_ = c.SetDeadline(time.Now())
+				closeFn = c.CloseNow
 			}
 			closed := make(chan error, 1)
 			start := time.Now()
-			go func() { closed <- c.Close() }()
+			go func() { closed <- closeFn() }()
 			select {
 			case err := <-closed:
 				if took := time.Since(start); took > tc.limit {
