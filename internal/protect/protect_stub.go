@@ -52,6 +52,6 @@ func (d *ProtectDialer) DialContext(ctx context.Context, network, address string
 	if err != nil {
 		return nil, err
 	}
-	tcpConnected(ctx, network)
+	tcpConnected(ctx, network, conn)
 	return conn, nil
 }

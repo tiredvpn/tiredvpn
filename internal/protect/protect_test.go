@@ -409,7 +409,7 @@ func TestConnectedHookFiresBeforeProtect(t *testing.T) {
 	}()
 
 	var hookAt time.Time
-	ctx := WithDialHooks(context.Background(), nil, func() { hookAt = time.Now() })
+	ctx := WithDialHooks(context.Background(), nil, func(net.Conn) { hookAt = time.Now() })
 	conn, err := (&ProtectDialer{}).DialContext(ctx, "tcp", ln.Addr().String())
 	if err != nil {
 		t.Fatalf("DialContext: %v", err)

@@ -48,7 +48,11 @@ type protectedGreeter struct {
 	priority int
 	stall    bool
 	swallow  bool
-	dials    atomic.Int64
+	// hello writes a byte as soon as the TCP connect is up, as a real
+	// handshake's first flight does, so the server's TCP acknowledges it.
+	// A swallowed attempt sends nothing: the censor dropped it.
+	hello bool
+	dials atomic.Int64
 }
 
 func (s *protectedGreeter) Name() string                        { return s.id }
@@ -77,6 +81,12 @@ func (s *protectedGreeter) Connect(ctx context.Context, target string) (net.Conn
 		<-ctx.Done()
 		conn.Close()
 		return nil, ctx.Err()
+	}
+	if s.hello {
+		if _, err := conn.Write([]byte{0x16}); err != nil {
+			conn.Close()
+			return nil, err
+		}
 	}
 	stop := context.AfterFunc(ctx, func() { conn.Close() })
 	defer stop()

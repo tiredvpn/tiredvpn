@@ -40,7 +40,7 @@ func TestTheReportingStrategiesReallyReportTheirDial(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 			defer cancel()
 			ctx = protect.WithDialHooks(m.withDialCandidate(ctx, m.selector().Candidates()[0]),
-				func() { started.Add(1) }, func() { connected.Add(1) })
+				func() { started.Add(1) }, func(net.Conn) { connected.Add(1) })
 			if conn, err := s.Connect(ctx, silent.addr); err == nil {
 				conn.Close()
 				t.Fatal("connected to a silent server - the test proves nothing")

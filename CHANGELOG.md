@@ -49,9 +49,11 @@ Versions follow [Semantic Versioning](https://semver.org/).
   cycle and its backoff per transport per address, and Geneva, which gets
   through, never came up. After a swallowed handshake on the server, or a
   silence verdict on another one, an attempt gets an even share of what is
-  left (at least a sixteenth of the cycle) while other transports wait.
-  The transport that worked last keeps the whole cycle unless it is itself
-  the one seen swallowed, so a slow but live handshake still completes.
+  left (about a sixteenth of the cycle at least, drawn around that size,
+  equal-priority transports in shuffled order) while other transports wait.
+  An attempt whose first flight the server's TCP has acknowledged runs on
+  past its share, so a slow but live handshake still completes; one whose
+  first flight is never acknowledged, as when a censor drops it, is cut.
 - **Server: a session that got the tunnel address it asked for lets go of
   it when it ends.** The exit kept the request's bytes, a slice of a buffer
   the next frame overwrote, and at the end unregistered some other address
