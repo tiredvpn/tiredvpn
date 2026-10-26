@@ -156,9 +156,12 @@ Versions follow [Semantic Versioning](https://semver.org/).
   it holds takes it over, even while the old session is still up. Old
   relays and old exits are unaffected, and keep the old behaviour between
   themselves.
-- **Server: a client keeps its tunnel address across transports and
-  networks.** Leases are keyed on the credential, and leases an older server
-  wrote under other keys are folded into it.
+- **Server: a client keeps its tunnel address across transports, and
+  across networks when it connects straight to the exit.** Leases are keyed
+  on the credential, and leases an older server wrote under other keys are
+  folded into it. Through a relay the lease key still carries the client's
+  address, so a change of network gives it a new tunnel address; to be
+  fixed in 1.11.10.
 
 ### Changed
 
