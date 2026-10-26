@@ -25,6 +25,9 @@ type returnFront struct {
 	dialDelay atomic.Int64
 	// mute reads the TUN handshake and never answers it.
 	mute atomic.Bool
+	// dropReply lets the request reach the exit, which registers the
+	// session, and loses the exit's answer on the way back.
+	dropReply atomic.Bool
 	// requested, when set, is called as the handshake request arrives.
 	requested atomic.Pointer[func()]
 	// answerAfter holds the answer back.
@@ -68,6 +71,10 @@ func (s *frontStrategy) Connect(ctx context.Context, target string) (net.Conn, e
 			return
 		}
 		time.Sleep(time.Duration(f.answerAfter.Load()))
+		if f.dropReply.Load() {
+			f.exit.serveAnswered(&dropFirstWrite{Conn: srv})
+			return
+		}
 		f.exit.serveAnswered(srv)
 	}()
 	return cli, nil
@@ -82,6 +89,19 @@ func (e *returnExit) serveAnswered(srv net.Conn) {
 		pw.Close()
 	}()
 	e.serve(readWriteConn{Conn: srv, r: pr})
+}
+
+// dropFirstWrite loses the first write on it: the handshake's answer.
+type dropFirstWrite struct {
+	net.Conn
+	dropped atomic.Bool
+}
+
+func (c *dropFirstWrite) Write(p []byte) (int, error) {
+	if c.dropped.CompareAndSwap(false, true) {
+		return len(p), nil
+	}
+	return c.Conn.Write(p)
 }
 
 type readWriteConn struct {
@@ -106,11 +126,11 @@ type sameExitHarness struct {
 
 func newSameExitHarness(t *testing.T) *sameExitHarness {
 	t.Helper()
-	oldIdle, oldEvery, oldRetry, oldProbe := returnIdleAfter, returnCheckEvery, returnRetryAfter, returnProbeWait
-	returnIdleAfter, returnCheckEvery, returnProbeWait = 400*time.Millisecond, 50*time.Millisecond, 500*time.Millisecond
+	oldIdle, oldEvery, oldRetry := returnIdleAfter, returnCheckEvery, returnRetryAfter
+	returnIdleAfter, returnCheckEvery = 400*time.Millisecond, 50*time.Millisecond
 	returnRetryAfter = func() time.Duration { return time.Hour }
 	t.Cleanup(func() {
-		returnIdleAfter, returnCheckEvery, returnRetryAfter, returnProbeWait = oldIdle, oldEvery, oldRetry, oldProbe
+		returnIdleAfter, returnCheckEvery, returnRetryAfter = oldIdle, oldEvery, oldRetry
 	})
 
 	ln6, err := net.Listen("tcp", "[::1]:0")
@@ -270,39 +290,80 @@ func TestAReturnWhoseHandshakeDisplacedTheOldSessionIsKept(t *testing.T) {
 	}
 }
 
-// TestASilentHandshakeOnTheSameExitKeepsAHealthyTunnel is P2-3 (b): the v6
-// family connects and never answers the handshake - the swallowed family
-// the return exists to come back from. The healthy v4 tunnel was torn down
-// for it, and the reconnect went back to the silent family. The old session
-// answers its keepalive, so it stays, and the failure is booked on v6
-// (P3-5: a TCP connect used to book it as a success).
-func TestASilentHandshakeOnTheSameExitKeepsAHealthyTunnel(t *testing.T) {
+// TestASilentHandshakeOnTheSameExitReconnectsOnce: the v6 family connects
+// and never answers the handshake. The request may have displaced the old
+// session on the exit or not; nothing the client sees tells. It reconnects
+// once, and with v6 parked for its silence (P3-5: not a success because
+// its TCP connected; P2-1 of the round-11 review: not one failure of two,
+// which left v6 to the reconnect) it lands on v4 again.
+func TestASilentHandshakeOnTheSameExitReconnectsOnce(t *testing.T) {
 	shortHandshakeTimeout(t, 500*time.Millisecond)
 	h := newSameExitHarness(t)
 	h.v6.mute.Store(true)
+	h.expectReconnectOnV4(t)
+}
+
+// TestAReturnWhoseReplyIsLostDoesNotStayOnADisplacedSession is P2-1 of the
+// round-11 review: the request reaches the exit, which registers the new
+// session and takes the address from the old one, and only the answer is
+// lost. The old session stays up and echoes keepalives with no downlink -
+// as an exit's HTTP/2 TUN loop did - and the client, taking an echo for
+// proof that the old session held the address, stayed on it for good. It
+// has to reconnect.
+func TestAReturnWhoseReplyIsLostDoesNotStayOnADisplacedSession(t *testing.T) {
+	shortHandshakeTimeout(t, 500*time.Millisecond)
+	h := newSameExitHarness(t)
+	h.exit.echoing = true
+	h.v6.dropReply.Store(true)
+	h.expectReconnectOnV4(t)
+}
+
+// expectReconnectOnV4 waits for one return handshake on v6, then requires
+// the tunnel to have reconnected, ride v4 with a working downlink, and v6
+// to be parked and dialled no more.
+func (h *sameExitHarness) expectReconnectOnV4(t *testing.T) {
+	t.Helper()
 	h.v.mu.Lock()
 	old := h.v.conn
 	h.v.mu.Unlock()
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for h.v6.handshakes.Load() == 0 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if h.v6.handshakes.Load() == 0 {
 		t.Fatal("no handshake on v6 - the test proves nothing")
 	}
-	time.Sleep(handshakeReadTimeout + returnProbeWait + time.Second)
+	for time.Now().Before(deadline) {
+		h.v.mu.Lock()
+		cur := h.v.conn
+		h.v.mu.Unlock()
+		if cur != nil && cur != old {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	h.v.mu.Lock()
 	cur := h.v.conn
 	h.v.mu.Unlock()
-	if cur != old {
-		t.Fatal("the healthy tunnel was replaced after a silent handshake on the other family")
+	if cur == old || cur == nil {
+		t.Fatal("the tunnel did not reconnect after the silent return")
 	}
-	if !h.downlinkWorks(2 * time.Second) {
-		t.Fatal("the tunnel on v4 no longer carries the downlink")
+	if !h.downlinkWorks(3 * time.Second) {
+		t.Fatal("no downlink after the reconnect")
 	}
+	if got := h.m.GetServerAddr(context.Background()); got == h.v6At {
+		t.Fatalf("the reconnect went back to v6 %s", got)
+	}
+	parked := false
 	for _, st := range h.m.EndpointStates() {
-		if st.Addr == h.v6At && st.ConsecutiveFailures == 0 {
-			t.Fatal("the failed return was not booked on v6")
+		if st.Addr == h.v6At && st.CooldownUntil.After(time.Now()) {
+			parked = true
 		}
+	}
+	if !parked {
+		t.Fatal("v6 is not parked after its silent handshake")
+	}
+	if n := h.v6.handshakes.Load(); n != 1 {
+		t.Fatalf("%d handshakes on v6, want the one", n)
 	}
 }

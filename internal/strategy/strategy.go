@@ -4528,9 +4528,18 @@ func (m *Manager) DialReturn(ctx context.Context, s Strategy, cand endpoint.Cand
 }
 
 // ReturnOutcome books the TUN handshake of a return to cand (DialReturn):
-// a success as a successful connect, a failure as a failed one.
-func (m *Manager) ReturnOutcome(cand endpoint.Candidate, ok bool) {
-	if sel := m.selector(); sel != nil {
+// a success as a successful connect, a failure as a failed one. A request
+// that went out and heard nothing is the address's silence: it parks cand
+// at once, as a silent connect cycle does. Booked as one failure of two,
+// it left cand available, and the reconnect the return then makes went
+// straight back to it (P2-1 of the round-11 review).
+func (m *Manager) ReturnOutcome(cand endpoint.Candidate, ok, silent bool) {
+	sel := m.selector()
+	switch {
+	case sel == nil:
+	case silent:
+		sel.ReportSilent(cand)
+	default:
 		sel.Report(cand, ok, 0)
 	}
 }
