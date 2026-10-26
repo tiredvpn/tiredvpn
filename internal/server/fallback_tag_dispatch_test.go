@@ -150,6 +150,7 @@ func newCountingDonor(t *testing.T) *countingDonor {
 				_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
 				first, _ := readRecord(c)
 				if len(first) > 0 {
+					time.Sleep(400 * time.Millisecond) // EXPERIMENT: a late accept
 					d.conns.Add(1)
 					d.got <- first
 				}
@@ -384,22 +385,6 @@ func expectDonor(t *testing.T, srv *tagServer, record []byte) {
 	}
 }
 
-// settleDonor waits until the donor's connection count has stopped moving,
-// so a connection from earlier in the test cannot be counted against what
-// comes next.
-func settleDonor(t *testing.T, srv *tagServer) {
-	t.Helper()
-	last := srv.donor.conns.Load()
-	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
-		time.Sleep(150 * time.Millisecond)
-		if n := srv.donor.conns.Load(); n == last {
-			return
-		}
-		last = srv.donor.conns.Load()
-	}
-	t.Fatal("the donor kept taking connections for three seconds")
-}
-
 // expectTLSPath sends record to the server and requires a ServerHello from
 // our own TLS stack, with the donor untouched.
 func expectTLSPath(t *testing.T, srv *tagServer, record []byte) {
@@ -498,10 +483,20 @@ func TestANewRegistryClientsTagIsSeenSoon(t *testing.T) {
 	// And carol's next fallback is hers. The first hello may have gone to
 	// the donor, and its accept there lands whenever the machine gets round
 	// to it: counted after expectTLSPath read its baseline, it looked like
-	// the second hello's (P3-9 of the round-9 review). So that hello is
-	// finished with, and the donor's count left to settle, first.
+	// the second hello's (P3-9 of the round-9 review). A stability window
+	// only made that less likely (P3-9 of the round-10 review): the first
+	// hello is finished with explicitly. Our TLS answers it with a
+	// ServerHello; the donor reads it, counts it, sends it on got and hangs
+	// up, so the conn ends - and then the count already holds it.
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if rec, err := readRecord(conn); err != nil || len(rec) < 6 || rec[0] != 0x16 || rec[5] != 0x02 {
+		select {
+		case <-srv.donor.got:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("the first hello reached neither our TLS nor the donor (%v)", err)
+		}
+	}
 	conn.Close()
-	settleDonor(t, srv)
 	expectTLSPath(t, srv, captureFallbackHello(t, tagFallbackStrategies[0].make, carol.Secret))
 }
 
