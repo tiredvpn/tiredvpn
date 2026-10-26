@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"io"
 	"net"
 	"strings"
 	"testing"
@@ -158,12 +159,20 @@ func TestTheRelaysTagIsStableForAKnownClientAndDrawnOtherwise(t *testing.T) {
 // reconnect asks for the address it holds.
 func natClientAsking(t *testing.T, relay string, secret []byte, ask net.IP) *tun.VPNClient {
 	t.Helper()
+	return clientAskingVia(t, relay, ask, func(m *strategy.Manager) strategy.Strategy {
+		return strategy.NewAntiProbeStrategy(m, secret)
+	})
+}
+
+// clientAskingVia is natClientAsking on the transport make makes.
+func clientAskingVia(t *testing.T, relay string, ask net.IP, make func(*strategy.Manager) strategy.Strategy) *tun.VPNClient {
+	t.Helper()
 	m := strategy.NewManager()
 	if err := m.SetEndpoints([]endpoint.Endpoint{{Name: "relay", V4: relay}}, endpoint.V4Only); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(endpoint.ResetSharedSelectors)
-	m.Register(strategy.NewAntiProbeStrategy(m, secret))
+	m.Register(make(m))
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -201,10 +210,13 @@ func TestASharedSecretClientKeepsItsAddressAcrossAReconnect(t *testing.T) {
 	exit := newLegExit(t, secret)
 	relay := legRelay(t, secret, exit)
 
-	first := natClientAsking(t, relay, secret, net.IPv4(10, 8, 7, 60))
-	held := first.LocalIP()
+	// The session before: a bare TUN session through the relay, with no
+	// reconnect of its own - a client that moves to a new session leaves
+	// its old one, it does not dial it again.
+	oldConn, held := rawTUNSession(t, relay, secret, net.IPv4(10, 8, 7, 60))
+	defer oldConn.Close()
 	if held == nil || !exit.srvCtx.sharedTUN.Serving(held) {
-		t.Fatalf("the first client has no address the exit serves: %v", held)
+		t.Fatalf("the first session has no address the exit serves: %v", held)
 	}
 	again := natClientAsking(t, relay, secret, held)
 	if got := again.LocalIP(); !got.Equal(held) {
@@ -225,7 +237,6 @@ func TestASharedSecretClientKeepsItsAddressAcrossAReconnect(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	first.Stop()
 	again.Stop()
 	for exit.srvCtx.sharedTUN.Serving(held) && time.Now().Before(deadline.Add(10*time.Second)) {
 		time.Sleep(10 * time.Millisecond)
@@ -263,4 +274,107 @@ func TestARelayedClientDoesNotTakeADirectClientsLiveAddress(t *testing.T) {
 	if !exit.srvCtx.sharedTUN.Serving(direct.LocalIP()) {
 		t.Fatal("the exit no longer serves the direct client")
 	}
+}
+
+// TestTwinsAskingForThePoolsFirstAddressGetTwo is P1-1 of the round-11
+// review: two boxes on one secret behind one NAT, both asking for the
+// address the pool hands out first - the client's default -tun-ip with the
+// documented pool, and what Android's "auto" resolves to. The first was
+// refused as asked and got the same address from the pool; the second's
+// request then named a lease under the drawn-tag prefix and took it from
+// the live first, which went on without a downlink. Both must get an
+// address of their own and keep it.
+func TestTwinsAskingForThePoolsFirstAddressGetTwo(t *testing.T) {
+	scaleLegClocks(t)
+	out := captureLog(t)
+	secret := []byte("relay-leg-secret-0123456789abcdef")
+	exit := newLegExit(t, secret)
+	relay := legRelay(t, secret, exit)
+	first := net.IPv4(10, 8, 7, 2) // the pool's first free address
+
+	a := natClientAsking(t, relay, secret, first)
+	b := natClientAsking(t, relay, secret, first)
+	if a.LocalIP().Equal(b.LocalIP()) {
+		t.Fatalf("both boxes got %s:\n%s", a.LocalIP(), out.String())
+	}
+	if strings.Contains(out.String(), "taken over") {
+		t.Fatalf("a lease was taken over between the twins:\n%s", out.String())
+	}
+	for _, c := range []*tun.VPNClient{a, b} {
+		w := exitWriterFor(t, exit, c.LocalIP())
+		pkt := ipv4Packet(net.IPv4(10, 8, 7, 9), c.LocalIP())
+		pkt[3] = byte(len(pkt))
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			_ = w.SendPacket(pkt)
+			if _, down, _, _ := c.Stats(); down > 0 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("no downlink reached the box at %s:\n%s", c.LocalIP(), out.String())
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+}
+
+// TestADisplacedH2TUNSessionEnds is the exit half of P1-1 and P2-1 of the
+// round-11 review: a session whose address a later session took over kept
+// running on the HTTP/2 Stego path - its frame loop never looked at the
+// registration, and it echoed the client's keepalives - so its client sat
+// on a tunnel with no downlink and never reconnected. The exit has to end
+// it. Two HTTP/2 Stego clients straight to the exit on one key, one
+// address; real clocks, so no read deadline ends it instead.
+func TestADisplacedH2TUNSessionEnds(t *testing.T) {
+	secret := []byte("relay-leg-secret-0123456789abcdef")
+	exit := newLegExit(t, secret)
+	ask := net.IPv4(10, 8, 7, 66)
+	h2 := func(m *strategy.Manager) strategy.Strategy { return strategy.NewHTTP2StegoStrategy(m, secret, "") }
+	first := clientAskingVia(t, exit.addr, ask, h2)
+	if !first.LocalIP().Equal(ask) {
+		t.Fatalf("the first client got %s", first.LocalIP())
+	}
+	before := exit.ended.Load()
+	second := clientAskingVia(t, exit.addr, ask, h2)
+	if !second.LocalIP().Equal(ask) {
+		t.Fatalf("the second client got %s, want the same lease %s", second.LocalIP(), ask)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for exit.ended.Load() == before && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if exit.ended.Load() == before {
+		t.Fatal("the displaced session is still running 3 s after its address was taken over")
+	}
+}
+
+// rawTUNSession opens a TUN session through relay with anti-probe and a
+// bare handshake asking for ask, and returns its conn and the address the
+// exit gave it. Nothing reconnects it.
+func rawTUNSession(t *testing.T, relay string, secret []byte, ask net.IP) (net.Conn, net.IP) {
+	t.Helper()
+	m := strategy.NewManager()
+	if err := m.SetEndpoints([]endpoint.Endpoint{{Name: "relay", V4: relay}}, endpoint.V4Only); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(endpoint.ResetSharedSelectors)
+	s := strategy.NewAntiProbeStrategy(m, secret)
+	m.Register(s)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, _, err := m.Connect(ctx, "")
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	hs := []byte{0x02, 0, 0, 0, 0, 0x05, 0xdc, 0x03}
+	copy(hs[1:5], ask.To4())
+	if _, err := conn.Write(hs); err != nil {
+		t.Fatal(err)
+	}
+	resp, next, err := tun.ReadTUNHandshakeResponse(conn, 0x03, time.Now().Add(5*time.Second))
+	if err != nil || len(resp) < 9 || resp[0] != 0 {
+		t.Fatalf("handshake: %x %v", resp, err)
+	}
+	go func() { _, _ = io.Copy(io.Discard, next) }()
+	return conn, net.IP(resp[5:9])
 }

@@ -54,7 +54,7 @@ type clientLiveness struct {
 // bytes_acked stayed at 1 (the SYN); 100 bytes written moved it to 101.
 type ackProgress struct {
 	last  atomic.Uint64 // bytes acked at the last look
-	grew  atomic.Int64  // when a look last saw them grow, unix nanoseconds, 0 for never
+	grew  atomic.Int64  // when a look last saw them grow, a monoNow stamp plus one, 0 for never
 	begun atomic.Bool   // a first look has set last
 }
 
@@ -83,7 +83,9 @@ func (a *ackProgress) sinceGrowth(conn net.Conn) (time.Duration, bool) {
 	if !ok {
 		return 0, false
 	}
-	now := time.Now().UnixNano()
+	// The monotonic clock: a wall-clock step back made the age negative,
+	// which read as fresh (P3-8 of the round-11 review).
+	now := monoNow() + 1
 	if prev := a.last.Swap(n); a.begun.Swap(true) && n > prev {
 		a.grew.Store(now)
 	}

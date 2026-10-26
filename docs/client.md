@@ -115,8 +115,12 @@ a dial candidate with its own health:
   all return at the same instant.
 - The client holds a fallback for at least `min_dwell` before it is allowed
   back to a more preferred candidate.
-- Re-evaluation happens only at a reconnect boundary, so it rides a dial that
-  was going to happen anyway and adds no traffic of its own.
+- Re-evaluation happens at a reconnect boundary, so it rides a dial that was
+  going to happen anyway. A desktop TUN tunnel that has carried no data in
+  either direction for 90 s also goes back to a more preferred candidate on
+  its own, after `min_dwell`, with one dial at least 4 minutes apart: a new
+  session there first, the old one closed after. On Android and macOS the
+  return still waits for the next reconnect.
 - When every candidate is parked the least-bad one is un-parked rather than
   leaving the client with nowhere to go.
 

@@ -323,6 +323,18 @@ func (st *SharedTUN) registerClient(clientIP net.IP, clientID, origin string, co
 	return writer
 }
 
+// bindPoolToTUN tells pool which addresses st has a session on, so a lease
+// under a live session is renewed rather than reclaimed (IPPool.SetBusy).
+func bindPoolToTUN(pool *IPPool, st *SharedTUN) {
+	if pool == nil || st == nil {
+		return
+	}
+	pool.SetBusy(func(ip string) bool {
+		addr := net.ParseIP(ip)
+		return addr != nil && st.Serving(addr)
+	})
+}
+
 // Serving reports whether a session is registered for clientIP.
 func (st *SharedTUN) Serving(clientIP net.IP) bool {
 	st.clientsMu.RLock()

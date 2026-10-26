@@ -829,6 +829,7 @@ func initIPPool(cfg *Config, srvCtx *serverContext) error {
 		return fmt.Errorf("failed to create shared TUN: %w", err)
 	}
 	srvCtx.sharedTUN = sharedTUN
+	bindPoolToTUN(pool, sharedTUN)
 	sharedTUN.StartCleanupRoutine(2*time.Minute, 5*time.Minute)
 
 	// Bring up ip_forward + NAT for the pool so client traffic egresses
@@ -4189,6 +4190,18 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 		// is what the gate's writer wraps in a stego response, so there is no
 		// longer a frameFunc that sends on its own and returns nil.
 		writer := srvCtx.sharedTUN.RegisterClientGated(clientIP, tunnel.clientID.id, origin, h2Conn, nil, gate)
+		// A session another one has taken the address from is over: end it.
+		// The native TUN loop checks the writer before each read; this one
+		// reads frames, and a displaced session went on echoing the
+		// client's keepalives with no downlink, so the client never noticed
+		// (P1-1, P2-1 of the round-11 review). On a normal end the writer
+		// is done as the session closes, and this close is a no-op.
+		if down := tunnel.downstream; down != nil {
+			go func() {
+				<-writer.Done()
+				down.Close()
+			}()
+		}
 		tunnel.sharedTUNWriter = writer
 		tunnel.sharedTUN = srvCtx.sharedTUN
 		tunnel.sink = newLocalTUNSink(srvCtx.sharedTUN, writer, clientIP)

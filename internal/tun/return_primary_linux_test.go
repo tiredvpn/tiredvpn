@@ -27,10 +27,17 @@ type returnExit struct {
 	// displace makes a new session close the ones before it, as a real
 	// exit does when it registers the same address again, after its grace.
 	displace bool
-	dials    atomic.Int64
-	up       atomic.Int64
-	mu       sync.Mutex
-	conns    []net.Conn
+	// echoing leaves a displaced session up and echoing keepalives, with no
+	// downlink, as an exit's HTTP/2 TUN loop did until round 17.
+	echoing bool
+	// requested, when set, is called as a handshake request arrives, and
+	// answerAfter (nanoseconds) holds the answer back.
+	requested   atomic.Pointer[func()]
+	answerAfter atomic.Int64
+	dials       atomic.Int64
+	up          atomic.Int64
+	mu          sync.Mutex
+	conns       []net.Conn
 }
 
 func (e *returnExit) serve(srv net.Conn) {
@@ -38,6 +45,10 @@ func (e *returnExit) serve(srv net.Conn) {
 	if _, err := io.ReadFull(srv, req); err != nil {
 		return
 	}
+	if h := e.requested.Load(); h != nil {
+		(*h)()
+	}
+	time.Sleep(time.Duration(e.answerAfter.Load()))
 	// With a flags byte, as an exit of this release answers: a bare 9-byte
 	// answer makes the client wait handshakeFlagsGrace for one.
 	resp := append([]byte{0x00}, e.serverIP.To4()...)
@@ -46,7 +57,7 @@ func (e *returnExit) serve(srv net.Conn) {
 		return
 	}
 	e.mu.Lock()
-	if e.displace {
+	if e.displace && !e.echoing {
 		// After the 200 ms grace a real exit gives the writer it
 		// replaces (registerClient).
 		for _, old := range e.conns {
@@ -133,6 +144,13 @@ func newReturnHarness(t *testing.T) *returnHarness {
 // false is a host-owned interface (Android, macOS).
 func newReturnHarnessOwning(t *testing.T, ownsInterface bool) *returnHarness {
 	t.Helper()
+	return newReturnHarnessWith(t, ownsInterface, false)
+}
+
+// newReturnHarnessWith is newReturnHarnessOwning whose two exits, when
+// alike, hand out the same addresses, as two exits on the default pool do.
+func newReturnHarnessWith(t *testing.T, ownsInterface, alike bool) *returnHarness {
+	t.Helper()
 	oldIdle, oldEvery, oldRetry := returnIdleAfter, returnCheckEvery, returnRetryAfter
 	returnIdleAfter, returnCheckEvery = 400*time.Millisecond, 50*time.Millisecond
 	returnRetryAfter = func() time.Duration { return 600 * time.Millisecond }
@@ -141,6 +159,9 @@ func newReturnHarnessOwning(t *testing.T, ownsInterface bool) *returnHarness {
 	aAt, bAt := newNetcheckListener(t).addr, newNetcheckListener(t).addr
 	a := &returnExit{serverIP: net.IPv4(10, 91, 0, 1), clientIP: net.IPv4(10, 91, 0, 2)}
 	b := &returnExit{serverIP: net.IPv4(10, 92, 0, 1), clientIP: net.IPv4(10, 92, 0, 2)}
+	if alike {
+		b.serverIP, b.clientIP = a.serverIP, a.clientIP
+	}
 	m := strategy.NewManager()
 	if err := m.SetEndpointSelection(endpoint.Config{
 		Endpoints: []endpoint.Endpoint{{Name: "a", V4: aAt}, {Name: "b", V4: bAt, Order: 1}},
@@ -321,5 +342,44 @@ func TestAHostOwnedInterfaceIsNotReturned(t *testing.T) {
 	time.Sleep(returnIdleAfter + 6*returnCheckEvery)
 	if h.onA() || h.a.dials.Load() != 0 {
 		t.Fatalf("a host-owned interface was moved: on a %v, a dialled %d times", h.onA(), h.a.dials.Load())
+	}
+}
+
+// TestAReturnToAnotherExitWithTheSameAddressLeavesABusyTunnel is P3-1 of
+// the round-11 review: two exits on the default pool hand out the same
+// address, and an answer on the old address was taken for the old
+// session's own exit - so a tunnel that woke up during the handshake was
+// moved to the other exit and its healthy session closed. Only the old
+// session's own endpoint is that exit.
+func TestAReturnToAnotherExitWithTheSameAddressLeavesABusyTunnel(t *testing.T) {
+	h := newReturnHarnessWith(t, true, true)
+	h.a.answerAfter.Store(int64(300 * time.Millisecond))
+	wake := func() {
+		go func() {
+			for range 5 {
+				_, _ = h.app.Write(h.upPacket(t))
+				time.Sleep(20 * time.Millisecond)
+			}
+		}()
+	}
+	h.a.requested.Store(&wake)
+	deadline := time.Now().Add(5 * time.Second)
+	for h.a.dials.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if h.a.dials.Load() == 0 {
+		t.Fatal("no return was tried - the test proves nothing")
+	}
+	time.Sleep(time.Second)
+	if h.onA() {
+		t.Fatal("a tunnel that woke up during the handshake moved to the other exit for an equal address")
+	}
+	before := h.down.Load()
+	for i := 0; i < 40 && h.down.Load() == before; i++ {
+		h.b.sendDown(h.upPacket(t))
+		time.Sleep(50 * time.Millisecond)
+	}
+	if h.down.Load() == before {
+		t.Fatal("the tunnel on b no longer carries the downlink")
 	}
 }

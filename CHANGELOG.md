@@ -26,9 +26,11 @@ Versions follow [Semantic Versioning](https://semver.org/).
   drops the old one. The exit changes, and with it the public address and
   usually the tunnel address, so connections inside the tunnel end; 90 s
   of silence keeps a tunnel in use but quiet from being moved. A failed
-  try leaves the tunnel where it is, and the next one waits 4-8 minutes.
-  Desktop TUN client only; on Android and macOS the tunnel still goes
-  back on its next reconnect.
+  try leaves the tunnel where it is, and the next one waits 4-8 minutes -
+  except to the other address family of the same server, where a request
+  that went unanswered may have displaced the old session: the tunnel then
+  reconnects once, and that family is parked. Desktop TUN client only; on
+  Android and macOS the tunnel still goes back on its next reconnect.
 
 - **Client: an SNI pool per server.** `[[servers]] sni = ["name", ...]` or
   `-reality-sni name,name` gives an endpoint its own cover names; REALITY,
@@ -94,6 +96,16 @@ Versions follow [Semantic Versioning](https://semver.org/).
   An attempt whose first flight the server's TCP has acknowledged runs on
   past its share, so a slow but live handshake still completes; one whose
   first flight is never acknowledged, as when a censor drops it, is cut.
+  Limits: on Linux a path with a round trip above about 350-580 ms is cut
+  before its ACK is back; a first flight that is acknowledged and then
+  never answered runs the whole cycle; without TCP_INFO (macOS, Windows) no
+  attempt is cut at its share.
+- **Server: a lease under a live session is renewed, never handed to another
+  client.** A dynamic lease that ran out while its session was up could go
+  to the next client asking, of another credential too.
+- **Server: an HTTP/2 Stego TUN session whose address another session took
+  over ends.** It went on echoing keepalives with no downlink, and its
+  client never reconnected.
 - **Server: a session that got the tunnel address it asked for lets go of
   it when it ends.** The exit kept the request's bytes, a slice of a buffer
   the next frame overwrote, and at the end unregistered some other address
@@ -192,10 +204,15 @@ Versions follow [Semantic Versioning](https://semver.org/).
   forwarding. A client with its own credential keeps its address; clients
   sharing the server's global secret hold a lease per session, since
   nothing they send tells them apart. Such a client gets an address from
-  the pool on its first session, and a reconnect that asks for the address
-  it holds takes it over, even while the old session is still up. Old
-  relays and old exits are unaffected, and keep the old behaviour between
-  themselves.
+  the pool on its first session - never the one it asked for, so two boxes
+  configured alike get two - and a reconnect that asks for the address it
+  holds takes it over, even while the old session is still up. Old relays
+  and old exits are unaffected, and keep the old behaviour between
+  themselves. Known limits until 1.11.10, which needs proof of ownership in
+  the handshake: such a client gets a new address after a fresh start or
+  once its lease is gone, a box failing over between an exit and a relay in
+  front of it changes address, and two boxes that keep asking for the same
+  address they hold are not told apart.
 - **Server: a client keeps its tunnel address across transports, and
   across networks when it connects straight to the exit.** Leases are keyed
   on the credential, and leases an older server wrote under other keys are

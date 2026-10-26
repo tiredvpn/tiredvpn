@@ -139,6 +139,10 @@ func (v *VPNClient) tryReturnToPreferred() bool {
 		case <-ctx.Done():
 		}
 	}()
+	// The other family of the session's own endpoint: the same exit. Two
+	// endpoints may lead to one exit as well (relays in front of it), but
+	// nothing on the client tells, and an equal tunnel address does not.
+	sameExit := hasOldCand && oldCand.EndpointIdx == cand.EndpointIdx
 	conn, err := v.manager.DialReturn(ctx, cur, cand)
 	if err != nil {
 		return failed("did not connect", err)
@@ -162,21 +166,30 @@ func (v *VPNClient) tryReturnToPreferred() bool {
 	if err != nil {
 		v.sessionMu.Unlock()
 		conn.Close()
-		v.manager.ReturnOutcome(cand, false)
-		if !errors.Is(err, errHandshakeNotSent) && !errors.Is(err, errHandshakeRefused) && !v.oldSessionAnswers(oldConn) {
-			// The request went out unanswered, and the old session does
-			// not answer either: on the same exit the request may have
-			// displaced it.
+		answered := errors.Is(err, errHandshakeNotSent) || errors.Is(err, errHandshakeRefused)
+		v.manager.ReturnOutcome(cand, false, !answered)
+		if !answered && sameExit {
+			// The request went out on the old session's own exit and no
+			// answer came: it may have displaced the old session there,
+			// or only the answer may have been lost. An echo on the old
+			// session proves nothing - an exit's displaced session went
+			// on echoing (P2-1 of the round-11 review) - so the tunnel
+			// reconnects once, with the failure booked on cand.
 			v.connLost(oldConn, "return to a preferred server", err)
 			return false
 		}
+		// On another endpoint the old session still stands; if the
+		// request did displace it after all - two endpoints in front of
+		// one exit - that exit ends it, and the read fails.
 		return failed("did not answer the handshake", err)
 	}
-	// A session on the old address displaced the old one on its exit: it is
-	// the tunnel now, busy or not (P2-3 of the round-10 review - dropping it
-	// left the old one unregistered). On another address the old one still
-	// stands, and a tunnel that woke up stays on it.
-	sameAddr := net.IP(resp[5:9]).Equal(localIP)
+	// A session on the old address of the old session's own exit displaced
+	// the old one there: it is the tunnel now, busy or not (P2-3 of the
+	// round-10 review - dropping it left the old one unregistered). Another
+	// endpoint - or another exit that happens to hand out the same address,
+	// as two exits on the default pool do (P3-1 of the round-11 review) -
+	// leaves the old one standing, and a tunnel that woke up stays on it.
+	sameAddr := sameExit && net.IP(resp[5:9]).Equal(localIP)
 	if !sameAddr && v.dataIdleFor() < returnIdleAfter {
 		v.sessionMu.Unlock()
 		tunnelConn.Close()
@@ -190,7 +203,7 @@ func (v *VPNClient) tryReturnToPreferred() bool {
 		return false
 	}
 	oldConn.Close()
-	v.manager.ReturnOutcome(cand, true)
+	v.manager.ReturnOutcome(cand, true, false)
 	v.manager.PinCandidate(cand)
 	v.manager.SessionEnded(strategy.SessionEnd{Strategy: cur.ID(), Replaced: true,
 		Useful: sessionWasUseful(oldConnectedAt, oldLastRx), Endpoint: oldCand, HasEndpoint: hasOldCand})
@@ -198,54 +211,4 @@ func (v *VPNClient) tryReturnToPreferred() bool {
 	// Another exit, maybe another path MTU.
 	v.maybeStartMTUProbe(context.Background(), "return")
 	return true
-}
-
-// returnProbeWait bounds how long oldSessionAnswers waits for the old
-// session to answer its keepalive. A var so tests can shorten it.
-var returnProbeWait = 5 * time.Second
-
-// oldSessionAnswers sends one keepalive on the old session and reports
-// whether the server answered it - or anything came down - within
-// returnProbeWait. A return whose handshake went out unanswered may have
-// displaced the old session on the same exit; it may as well not have, and
-// tearing the tunnel down then lost a healthy one to a swallowed family
-// (P2-3 of the round-10 review: three reconnects into the silent family).
-func (v *VPNClient) oldSessionAnswers(oldConn net.Conn) bool {
-	v.mu.Lock()
-	lastRx := v.lastRx
-	v.mu.Unlock()
-	echoes := v.keepaliveEchoes.Load()
-	// Written here rather than through writeSilenceKeepalive, which skips a
-	// keepalive right after another: this one is a question.
-	v.keepaliveMu.Lock()
-	_ = oldConn.SetWriteDeadline(time.Now().Add(keepaliveWriteTimeout))
-	_, err := oldConn.Write([]byte{0, 0, 0, 0})
-	if err == nil {
-		now := monoNow()
-		v.lastTx.Store(now)
-		v.lastKeepalive.Store(now)
-	}
-	v.keepaliveMu.Unlock()
-	if err != nil {
-		return false
-	}
-	deadline := time.Now().Add(returnProbeWait)
-	for time.Now().Before(deadline) {
-		v.mu.Lock()
-		heard := v.lastRx.After(lastRx)
-		cur := v.conn
-		v.mu.Unlock()
-		if cur != oldConn {
-			return false
-		}
-		if heard || v.keepaliveEchoes.Load() > echoes {
-			return true
-		}
-		select {
-		case <-v.stopCh:
-			return false
-		case <-time.After(20 * time.Millisecond):
-		}
-	}
-	return false
 }

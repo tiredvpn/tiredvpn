@@ -85,6 +85,7 @@ func newLegExitWith(t *testing.T, secret []byte, tweak func(*Config)) *legExit {
 	shared := newTestSharedTUN(t)
 	shared.tunDev = dev
 	shared.mtu = 1500
+	bindPoolToTUN(pool, shared)
 	cfg := &Config{Secret: secret}
 	if tweak != nil {
 		tweak(cfg)
