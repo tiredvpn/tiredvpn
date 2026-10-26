@@ -63,8 +63,9 @@ Versions follow [Semantic Versioning](https://semver.org/).
   longer ends after 60 s.** A client sending nothing up - any SOCKS/HTTP
   proxy client - lost its session to the server's read deadline, on an exit
   directly or on a relay. The server now keeps the session while the
-  client's TCP acknowledges what comes down; a session with nothing coming
-  down still ends on the deadline.
+  client's TCP acknowledges new data coming down. The ACKs of TCP keepalive
+  probes do not count, so a session with nothing coming down, or whose
+  client has hung up, still ends on the deadline.
 - **Client: failover to another server in the pool works when a server goes
   silent, swallows handshakes, or kills every session young.** Dead sessions
   and storms park the server with a growing cooldown; a server that accepts
@@ -130,7 +131,8 @@ Versions follow [Semantic Versioning](https://semver.org/).
   own before 1.11.9 - left the relay's TUN bridge and its proxy relays
   silent toward the exit, which closed the leg after 60 s. The relay now
   keeps the leg fed while its client is alive, which also counts a client
-  whose TCP acknowledges what comes down, a QUIC client whose connection is
+  whose TCP acknowledges new data coming down (not keepalive probes), a
+  QUIC client whose connection is
   open and an HTTP Polling client that keeps polling: on QUIC and Polling a
   proxied stream through a relay still died after two minutes. Exits of any
   version accept it.
@@ -149,9 +151,11 @@ Versions follow [Semantic Versioning](https://semver.org/).
   half minute. The relay now also says which of its clients it is
   forwarding. A client with its own credential keeps its address; clients
   sharing the server's global secret hold a lease per session, since
-  nothing they send tells them apart, and a reconnect gets its address back
-  once no session holds it. Old relays and old exits are unaffected, and
-  keep the old behaviour between themselves.
+  nothing they send tells them apart. Such a client gets an address from
+  the pool on its first session, and a reconnect that asks for the address
+  it holds takes it over, even while the old session is still up. Old
+  relays and old exits are unaffected, and keep the old behaviour between
+  themselves.
 - **Server: a client keeps its tunnel address across transports and
   networks.** Leases are keyed on the credential, and leases an older server
   wrote under other keys are folded into it.
