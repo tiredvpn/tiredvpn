@@ -762,7 +762,10 @@ func (p *IPPool) Allocate(clientID string, requestedIP net.IP, hostname string) 
 					if err := p.saveLease(lease); err != nil {
 						return nil, err
 					}
-					return requestedIP, nil
+					// A copy: the request is usually a slice of the
+					// handshake's read buffer, which the next frame
+					// overwrites, and the session keeps the address.
+					return slices.Clone(requestedIP), nil
 				}
 				// Collision: the requested IP is held by a DIFFERENT clientID. We
 				// must NOT hand it out twice, so we fall through to auto-allocation

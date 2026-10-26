@@ -427,3 +427,19 @@ func TestTakeOverOnlyFromTheSameSharedPrefix(t *testing.T) {
 		t.Fatalf("the old key still gets %v (%v)", got, err)
 	}
 }
+
+// TestAGrantedRequestIsACopy: the address Allocate grants for a request is
+// the pool's own, not the caller's slice - a handshake buffer the next
+// frame overwrites.
+func TestAGrantedRequestIsACopy(t *testing.T) {
+	p := newTestPool(t)
+	req := net.IPv4(10, 8, 0, 70).To4()
+	got, err := p.Allocate("client", req, "")
+	if err != nil || !got.Equal(req) {
+		t.Fatalf("Allocate gave %v (%v), want %s", got, err, req)
+	}
+	copy(req, []byte{143, 18, 120, 236})
+	if !got.Equal(net.IPv4(10, 8, 0, 70)) {
+		t.Fatalf("the granted address changed with the request's buffer: %s", got)
+	}
+}

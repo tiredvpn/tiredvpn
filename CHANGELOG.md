@@ -90,6 +90,11 @@ Versions follow [Semantic Versioning](https://semver.org/).
   through, never came up. After a swallowed handshake on the server, or a
   silence verdict on another one, an attempt gets an even share of what is
   left (at least a sixteenth of the cycle) while other transports wait.
+- **Server: a session that got the tunnel address it asked for lets go of
+  it when it ends.** The exit kept the request's bytes, a slice of a buffer
+  the next frame overwrote, and at the end unregistered some other address
+  while the real one stayed served by a dead session until another took it
+  over.
 - **Server: an HTTP/2 Stego proxied stream with a sparse download no
   longer ends after 60 s.** A client sending nothing up - any SOCKS/HTTP
   proxy client - lost its session to the server's read deadline, on an exit
