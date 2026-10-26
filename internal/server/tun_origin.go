@@ -260,8 +260,11 @@ func allocateTunnelIP(srvCtx *serverContext, id clientIdentity, origin, clientTa
 	ctx, cancel := context.WithTimeout(context.Background(), adoptScanTimeout)
 	defer cancel()
 	srvCtx.ipPool.AdoptAll(ctx, keys, prefixes, key, func(ip string) bool { return serving(srvCtx, ip) })
-	requested = sharedTagRequest(srvCtx, id, origin, clientTag, key, requested)
-	return srvCtx.ipPool.Allocate(key, requested, "")
+	granted, refused := sharedTagRequest(srvCtx, id, origin, clientTag, key, requested)
+	if refused != nil {
+		return srvCtx.ipPool.AllocateAvoiding(key, refused)
+	}
+	return srvCtx.ipPool.Allocate(key, granted, "")
 }
 
 // serving reports whether a session is registered on ip on this exit.
@@ -275,7 +278,8 @@ func serving(srvCtx *serverContext, ip string) bool {
 
 // sharedTagRequest decides what a client on a shared credential behind a
 // relay - a drawn tag, "s" (relayClientTag) - gets for the address it asks
-// for, and returns the request to allocate with.
+// for, and returns the request to allocate with, or the refused request
+// the pool must not hand out instead.
 //
 // The relay draws such a client's tag per session, so every session comes
 // with a new lease key, and what ties a reconnect to its address is the
@@ -289,22 +293,27 @@ func serving(srvCtx *serverContext, ip string) bool {
 // of the round-10 review).
 //
 // Any other request on a drawn tag is not granted as asked: the client gets
-// an address from the pool. Two boxes on one secret behind one NAT ask, on
-// their first session, for the same configured address (-tun-ip, 10.8.0.2
-// by default); granting it would make it a lease under the drawn-tag prefix
-// that the second one then takes over from the first, and they would take
-// it from each other on every reconnect. From the pool they get two
+// an address from the pool - never the one it asked for. Two boxes on one
+// secret behind one NAT ask, on their first session, for the same
+// configured address (-tun-ip, 10.8.0.2 by default, and Android's "auto"
+// resolves to the same); granting it would make it a lease under the
+// drawn-tag prefix that the second one then takes over from the first. So
+// would the pool handing it out: the default is the pool's first free
+// address with the documented 10.8.0.0/24, and the second box took the
+// first one's live address and left it without a downlink (P1-1 of the
+// round-11 review). From the pool, past the request, they get two
 // addresses and each asks for its own. Two boxes that ask for the same
 // address they hold - configured alike and never given another - are not
-// told apart; neither are they on one lease in 1.11.8.
-func sharedTagRequest(srvCtx *serverContext, id clientIdentity, origin, clientTag, key string, requested net.IP) net.IP {
+// told apart; neither are they on one lease in 1.11.8. Telling them apart
+// needs proof of ownership in the handshake, a protocol change (1.11.10).
+func sharedTagRequest(srvCtx *serverContext, id clientIdentity, origin, clientTag, key string, requested net.IP) (granted, refused net.IP) {
 	if !strings.HasPrefix(clientTag, "s") || origin == "" || requested == nil || requested.IsUnspecified() {
-		return requested
+		return requested, nil
 	}
 	if srvCtx.ipPool.TakeOver(requested, allocationKey(id, origin, "")+"#s", key) {
-		return requested
+		return requested, nil
 	}
-	return nil
+	return nil, requested
 }
 
 // legacyAllocationKeys lists the keys a server before the credential lease
