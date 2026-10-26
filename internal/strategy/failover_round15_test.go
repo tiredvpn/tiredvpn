@@ -301,3 +301,101 @@ func TestSwallowPressureSources(t *testing.T) {
 		t.Fatal("pressure in forced mode")
 	}
 }
+
+// TestASlowLastGoodTransportKeepsItsCycleUnderPressure: another server has
+// just had its silence verdict, on Polling, so b's cycle runs under
+// pressure. b is healthy, but slow: REALITY - the transport that worked
+// last - is answered in 60% of the cycle (8-9 s of 15 on a bad mobile link
+// or a server slow to reach its cover). Held to its share it was cut every
+// cycle and the client failed over for nothing. A transport nothing has
+// seen swallowed keeps its cycle on the fast path; the slicing is for the
+// ones under suspicion.
+func TestASlowLastGoodTransportKeepsItsCycleUnderPressure(t *testing.T) {
+	a := newBlackholeListener(t)
+	b := slowHelloListener(t, 900*time.Millisecond)
+	m := newSilenceManager(t, 3*time.Second, a.addr, b)
+	reality := &protectedGreeter{id: "reality", priority: 5}
+	m.Register(reality)
+	m.Register(&protectedGreeter{id: "polling", priority: 6})
+	m.Register(&protectedGreeter{id: "stego", priority: 7})
+	markConnected(m, reality)
+	cb, ok := m.selector().CandidateForAddr(b)
+	if !ok {
+		t.Fatal("no candidate for b")
+	}
+	m.selector().Pin(cb)
+	m.mu.Lock()
+	m.lastDeath = deathMark{server: 0, class: deathSwallowed, ids: []string{"polling"}, at: time.Now()}
+	m.mu.Unlock()
+	if !m.swallowPressure(b) {
+		t.Fatal("no pressure on b - the test proves nothing")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	conn, s, err := m.Connect(ctx, "")
+	if err != nil {
+		t.Fatalf("a slow REALITY on a healthy b was cut under pressure: %v", err)
+	}
+	conn.Close()
+	if s.ID() != "reality" {
+		t.Fatalf("connected via %s, want reality", s.ID())
+	}
+}
+
+// TestASuspectLastGoodTransportIsHeldUnderPressure is the other side: when
+// the transport that worked last is the one the previous server's verdict
+// named, the fast path gets its share like any other attempt, and the
+// transports after it get theirs.
+func TestASuspectLastGoodTransportIsHeldUnderPressure(t *testing.T) {
+	a := newBlackholeListener(t)
+	b := newBlackholeListener(t)
+	m := newSilenceManager(t, 3*time.Second, a.addr, b.addr)
+	reality := &protectedGreeter{id: "reality", priority: 5}
+	m.Register(reality)
+	geneva := &slowAnswer{greetingStrategy: greetingStrategy{id: "geneva", priority: 12}, after: 30 * time.Millisecond}
+	m.Register(geneva)
+	markConnected(m, reality)
+	cb, ok := m.selector().CandidateForAddr(b.addr)
+	if !ok {
+		t.Fatal("no candidate for b")
+	}
+	m.selector().Pin(cb)
+	m.mu.Lock()
+	m.lastDeath = deathMark{server: 0, class: deathSwallowed, ids: []string{"reality"}, at: time.Now()}
+	m.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, _, _ = m.Connect(ctx, "")
+	// b swallows everything, Geneva included; what matters is that REALITY
+	// gave the rest of the cycle up.
+	if n := b.accepts.Load(); n < 2 {
+		t.Fatalf("b accepted %d connections in %v: the suspect REALITY kept the whole cycle", n, time.Since(start).Round(time.Millisecond))
+	}
+}
+
+// TestSwallowSuspectSources: a transport mute on one address of a server is
+// a suspect on its other address; another transport is not.
+func TestSwallowSuspectSources(t *testing.T) {
+	a6, a4 := newHelloListenerAt(t, "[::1]:0"), newHelloListener(t)
+	m := dualStackPool(t, 3*time.Second, nil, [2]string{a6.addr, a4.addr})
+	confusion := &greetingStrategy{id: "confusion", priority: 5}
+	m.Register(confusion)
+	m.Register(&greetingStrategy{id: "geneva", priority: 6})
+	c6, ok := m.selector().CandidateForAddr(a6.addr)
+	if !ok {
+		t.Fatal("no candidate")
+	}
+	if m.swallowSuspect(a4.addr, "confusion") {
+		t.Fatal("a suspect with nothing behind it")
+	}
+	_ = m.HandshakeUnanswered(confusion, c6, true)
+	if !m.swallowSuspect(a4.addr, "confusion") {
+		t.Fatal("a transport mute on a's v6 is no suspect on its v4")
+	}
+	if m.swallowSuspect(a4.addr, "geneva") {
+		t.Fatal("Geneva became a suspect for Confusion's silence")
+	}
+}
