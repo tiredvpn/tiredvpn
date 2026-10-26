@@ -702,19 +702,30 @@ func SetStegoReadPathWriteTimeout(d time.Duration) time.Duration {
 // The record and the socket change together under wdMu, so a restore can
 // never put back a deadline the owner has since replaced (P3-1 of the
 // round-9 review).
+//
+// Once Close has bounded the conn's last writes, the owner's deadline is
+// recorded and not applied: an owner that had taken the conn before Close
+// could otherwise put a 30 s deadline back over the 1 s bound (P3-8 of the
+// round-10 review).
 func (sc *HTTP2StegoConn) SetWriteDeadline(t time.Time) error {
 	sc.wdMu.Lock()
 	defer sc.wdMu.Unlock()
 	sc.ownerWD = t
+	if sc.closing {
+		return nil
+	}
 	return sc.Conn.SetWriteDeadline(t)
 }
 
 // SetDeadline is SetWriteDeadline and SetReadDeadline together, recorded the
-// same way.
+// same way; after Close only the read side is applied.
 func (sc *HTTP2StegoConn) SetDeadline(t time.Time) error {
 	sc.wdMu.Lock()
 	defer sc.wdMu.Unlock()
 	sc.ownerWD = t
+	if sc.closing {
+		return sc.SetReadDeadline(t)
+	}
 	return sc.Conn.SetDeadline(t)
 }
 
@@ -1477,6 +1488,9 @@ func (sc *HTTP2StegoConn) allocateStreamID() uint32 {
 	return id
 }
 
+// stegoCloseBound bounds the writes Close waits for and makes.
+const stegoCloseBound = time.Second
+
 // Close closes the connection
 func (sc *HTTP2StegoConn) Close() error {
 	// GOAWAY goes through the framer like every other write, so under sc.mu:
@@ -1489,12 +1503,27 @@ func (sc *HTTP2StegoConn) Close() error {
 	// own that ends after it puts the owner's deadline back over it.
 	sc.wdMu.Lock()
 	sc.closing = true
-	_ = sc.Conn.SetWriteDeadline(time.Now().Add(time.Second))
+	_ = sc.Conn.SetWriteDeadline(time.Now().Add(stegoCloseBound))
 	sc.wdMu.Unlock()
 	sc.closeOnce.Do(func() { close(sc.closed) })
-	sc.mu.Lock()
-	sc.framer.WriteGoAway(sc.nextStreamID, http2.ErrCodeNo, nil)
-	sc.mu.Unlock()
+	// A write holding sc.mu ends within the bound now; the wait for it is
+	// bounded too, a little past it (P3-8 of the round-10 review). Without
+	// the lock there is no GOAWAY: the framer is not ours to touch.
+	locked := make(chan struct{})
+	go func() {
+		sc.mu.Lock()
+		close(locked)
+	}()
+	select {
+	case <-locked:
+		sc.framer.WriteGoAway(sc.nextStreamID, http2.ErrCodeNo, nil)
+		sc.mu.Unlock()
+	case <-time.After(stegoCloseBound + stegoCloseBound/2):
+		go func() {
+			<-locked
+			sc.mu.Unlock()
+		}()
+	}
 	// A TLS write that failed spent a record number and may have left half
 	// a record on the wire; a close_notify after it reads as "bad record
 	// MAC" at the peer, which then logs a broken session for a close. Shut
