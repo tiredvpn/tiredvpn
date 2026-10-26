@@ -195,7 +195,7 @@ func TestFoldedKeysStayBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := range adoptFoldMax + 100 {
-		pool.AdoptAll(context.Background(), nil, nil, "global@"+net.IPv4(198, 51, byte(i>>8), byte(i)).String())
+		pool.AdoptAll(context.Background(), nil, nil, "global@"+net.IPv4(198, 51, byte(i>>8), byte(i)).String(), nil)
 	}
 	if n := len(pool.folded); n > adoptFoldMax {
 		t.Fatalf("%d fold records, cap %d", n, adoptFoldMax)
@@ -209,7 +209,7 @@ func TestFoldedKeysStayBounded(t *testing.T) {
 	if _, err := pool.Allocate("polling:global@192.0.2.1", net.ParseIP("10.8.1.9"), ""); err != nil {
 		t.Fatal(err)
 	}
-	pool.AdoptAll(context.Background(), []string{"polling:global@192.0.2.1"}, nil, "global@192.0.2.1")
+	pool.AdoptAll(context.Background(), []string{"polling:global@192.0.2.1"}, nil, "global@192.0.2.1", nil)
 	if _, left := leasesOf(pool)["polling:global@192.0.2.1"]; left {
 		t.Fatal("an expired fold record kept the fold from running")
 	}
@@ -254,7 +254,7 @@ func TestTheLeaseSearchDoesNotHoldThePool(t *testing.T) {
 	}
 	searched := make(chan struct{})
 	go func() {
-		pool.AdoptAll(context.Background(), nil, []string{"reality:abc@"}, "c1")
+		pool.AdoptAll(context.Background(), nil, []string{"reality:abc@"}, "c1", nil)
 		close(searched)
 	}()
 	for gate.scans.Load() == 0 {
@@ -296,8 +296,8 @@ func TestAnUnfinishedLeaseSearchIsRetried(t *testing.T) {
 		pool.folded["c1"] = time.Now().Add(-time.Second)
 		pool.mu.Unlock()
 	}
-	pool.AdoptAll(context.Background(), nil, []string{"reality:abc@"}, "c1")
-	pool.AdoptAll(context.Background(), nil, []string{"reality:abc@"}, "c1")
+	pool.AdoptAll(context.Background(), nil, []string{"reality:abc@"}, "c1", nil)
+	pool.AdoptAll(context.Background(), nil, []string{"reality:abc@"}, "c1", nil)
 	if n := gate.scans.Load(); n != 1 {
 		t.Fatalf("%d searches: an unfinished one was repeated on the next handshake", n)
 	}
@@ -309,11 +309,11 @@ func TestAnUnfinishedLeaseSearchIsRetried(t *testing.T) {
 	}
 	gate.fail.Store(false)
 	expire()
-	pool.AdoptAll(context.Background(), nil, []string{"reality:abc@"}, "c1")
+	pool.AdoptAll(context.Background(), nil, []string{"reality:abc@"}, "c1", nil)
 	if n := gate.scans.Load(); n != 2 {
 		t.Fatalf("%d searches, want the failed one retried once its wait ran out", n)
 	}
-	pool.AdoptAll(context.Background(), nil, []string{"reality:abc@"}, "c1")
+	pool.AdoptAll(context.Background(), nil, []string{"reality:abc@"}, "c1", nil)
 	if n := gate.scans.Load(); n != 2 {
 		t.Fatal("a finished search was repeated within its record")
 	}
@@ -334,7 +334,7 @@ func TestAFullFoldMapWithTiedRecordsStillShrinks(t *testing.T) {
 	for i := range adoptFoldMax {
 		pool.folded[fmt.Sprintf("global@tied-%d", i)] = until
 	}
-	pool.AdoptAll(context.Background(), nil, nil, "global@192.0.2.7")
+	pool.AdoptAll(context.Background(), nil, nil, "global@192.0.2.7", nil)
 	if n := len(pool.folded); n > adoptFoldMax/2+1 {
 		t.Fatalf("%d fold records after the cap was hit with tied records, want about half of %d", n, adoptFoldMax)
 	}

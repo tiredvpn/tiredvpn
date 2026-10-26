@@ -488,7 +488,14 @@ func (p *IPPool) stickyLookup(clientID string) string {
 // it. A search that did not finish - cut short, failed, or past its round
 // limit - does not mark the key folded: the next look comes after
 // adoptRetryAfter, not on the next handshake.
-func (p *IPPool) AdoptAll(ctx context.Context, oldKeys, oldPrefixes []string, newKey string) {
+//
+// busy, when set, names addresses a session holds right now; a lease on one
+// is left where it is. An old key is not always old: "global@<origin>" is
+// also the live key of a client on the global secret straight to this exit,
+// or behind a 1.11.8 relay, and adopting it gave a relayed client at the
+// same origin that client's address while it was in use (P2-5 of the
+// round-10 review). A search that left one is not marked folded either.
+func (p *IPPool) AdoptAll(ctx context.Context, oldKeys, oldPrefixes []string, newKey string, busy func(ip string) bool) {
 	if newKey == "" {
 		return
 	}
@@ -509,11 +516,13 @@ func (p *IPPool) AdoptAll(ctx context.Context, oldKeys, oldPrefixes []string, ne
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if complete {
-		defer p.markFolded(newKey, now, now.Add(adoptFoldTTL))
-	} else {
-		defer p.markFolded(newKey, now, now.Add(adoptRetryAfter))
-	}
+	defer func() {
+		if complete {
+			p.markFolded(newKey, now, now.Add(adoptFoldTTL))
+		} else {
+			p.markFolded(newKey, now, now.Add(adoptRetryAfter))
+		}
+	}()
 	have := p.stickyLookup(newKey)
 	for _, prefix := range oldPrefixes {
 		for _, k := range append(p.memoryKeysWithPrefix(prefix), stored...) {
@@ -528,6 +537,10 @@ func (p *IPPool) AdoptAll(ctx context.Context, oldKeys, oldPrefixes []string, ne
 		}
 		ip := p.stickyLookup(oldKey)
 		if ip == "" {
+			continue
+		}
+		if busy != nil && busy(ip) {
+			complete = false
 			continue
 		}
 		lease := p.leases[ip]

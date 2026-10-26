@@ -4132,8 +4132,15 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 
 	if srvCtx.upstreamDialer != nil {
 		// Relay: forward to the upstream exit rather than terminating here.
+		// A relay in a chain passes on the tag the hop below gave its
+		// client; its own would name the hop, and a drawn one would differ
+		// on every session (P3-1 of the round-10 review).
+		tag := clientTag
+		if tag == "" {
+			tag = relayClientTag(tunnel.clientID)
+		}
 		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, data, origin,
-			relayClientTag(tunnel.clientID), tunnel.downstream, sendPacketDown)
+			tag, tunnel.downstream, sendPacketDown)
 		if err != nil {
 			logger.Warn("H2 TUN relay: upstream dial failed: %v", err)
 			sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, tunnel.secret)
