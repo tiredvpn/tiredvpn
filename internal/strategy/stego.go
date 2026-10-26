@@ -852,10 +852,25 @@ func (sc *HTTP2StegoConn) writeKeepalive(quiet time.Duration) (bool, error) {
 		if sc.tunMode {
 			_, err = sc.writeViaDataFast(nil)
 		} else {
-			_, err = sc.writeViaData(nil)
+			_, err = sc.writeViaDataCover(nil, sc.keepaliveCoverLen())
 		}
 	})
 	return err == nil, err
+}
+
+// relayedKeepaliveLen is the payload of the keepalive a relay forwards for
+// its client: the TUN framing's empty frame, [len:4] = 0.
+const relayedKeepaliveLen = 4
+
+// keepaliveCoverLen is the cover of the conn's own empty keepalive frame:
+// what a frame carrying a relayed client keepalive puts after its 4-byte
+// payload, plus 4 for the payload it does not carry. The two then have one
+// size. With the 10-byte cover floor alone the empty frame was 4 bytes
+// shorter than the relayed one, every time, and the size told which of the
+// two an empty-looking frame up a relay's leg was (P3-6 of the round-9
+// review). Only the keepalive: raising the floor would move every frame.
+func (sc *HTTP2StegoConn) keepaliveCoverLen() int {
+	return relayedKeepaliveLen + max(sc.calculateNaivePadding(relayedKeepaliveLen), stegoMinCover)
 }
 
 // readPathWrite runs write, a write the read path makes on its own, under a
@@ -1225,8 +1240,18 @@ func (sc *HTTP2StegoConn) writeViaPaddedData(data []byte) (int, error) {
 	return chunkSize, nil
 }
 
+// stegoMinCover is the least cover a DATA frame of the standard path
+// carries after its payload.
+const stegoMinCover = 10
+
 // writeViaData sends data in normal DATA frames (mixed with cover traffic)
 func (sc *HTTP2StegoConn) writeViaData(data []byte) (int, error) {
+	return sc.writeViaDataCover(data, -1)
+}
+
+// writeViaDataCover is writeViaData with the cover length given, or drawn
+// as writeViaData draws it when cover is negative.
+func (sc *HTTP2StegoConn) writeViaDataCover(data []byte, cover int) (int, error) {
 	var streamID uint32
 
 	// Use persistent stream if available (for TUN mode bidirectional traffic)
@@ -1245,9 +1270,9 @@ func (sc *HTTP2StegoConn) writeViaData(data []byte) (int, error) {
 	chunkSize := minInt(len(data), 1400)
 
 	// Create framed data: [nonce][marker][Flags:1][Length:2][Data:N][NaivePadding:M]
-	coverLen := sc.calculateNaivePadding(chunkSize)
-	if coverLen < 10 {
-		coverLen = 10 // Minimum padding
+	coverLen := cover
+	if coverLen < 0 {
+		coverLen = max(sc.calculateNaivePadding(chunkSize), stegoMinCover)
 	}
 	hdr, err := stegoFrameHeader(sc.secret, sc.writeMarkerLabel())
 	if err != nil {
