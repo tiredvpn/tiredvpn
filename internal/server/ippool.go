@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -89,6 +90,41 @@ type IPPool struct {
 	// keys folded (adoptFoldTTL), or a search for them that did not finish
 	// (adoptRetryAfter). Guarded by mu.
 	folded map[string]time.Time
+
+	// busy, when set, names the addresses a session is registered on; a
+	// lease on one is renewed, never reclaimed (SetBusy).
+	busy atomic.Pointer[func(ip string) bool]
+}
+
+// SetBusy tells the pool which addresses a session is registered on. A
+// dynamic lease was renewed only by a handshake, and cleanup and the scan
+// for a free address reclaimed it once its TTL had run, a session on it or
+// not: a session that outlived its lease had its address handed to another
+// client, of another credential too (P2-4 of the round-11 review). A lease
+// a session holds is renewed instead.
+func (p *IPPool) SetBusy(busy func(ip string) bool) { p.busy.Store(&busy) }
+
+// liveLocked reports whether a session is registered on ip. The busy hook
+// takes the TUN's own lock, never the pool's.
+func (p *IPPool) liveLocked(ip string) bool {
+	f := p.busy.Load()
+	return f != nil && (*f)(ip)
+}
+
+// leaseTTL is the lifetime a dynamic lease gets, and a renewal.
+func (p *IPPool) leaseTTL() time.Duration {
+	if p.config.LeaseTime > 0 {
+		return p.config.LeaseTime
+	}
+	return dynamicLeaseTTL
+}
+
+// renewLocked extends a dynamic lease by its lifetime and stores it.
+func (p *IPPool) renewLocked(lease *IPLease) {
+	lease.ExpiresAt = time.Now().Add(p.leaseTTL())
+	if err := p.saveLease(lease); err != nil {
+		log.Warn("Failed to persist renewed lease %s for %s: %v", lease.IP, lease.ClientID, err)
+	}
 }
 
 // adoptFoldTTL is how long a folded lease key is left alone. Old keys are
@@ -594,7 +630,7 @@ func (p *IPPool) TakeOver(ip net.IP, prefix, newKey string) bool {
 		log.Warn("Failed to persist lease %s taken over from %s by %s: %v", ipStr, oldKey, newKey, err)
 		return false
 	}
-	log.Info("Lease %s taken over from %s by %s: the address its client asked for, held by no session", ipStr, oldKey, newKey)
+	log.Info("Lease %s taken over from %s by %s: the address its client asked for", ipStr, oldKey, newKey)
 	return true
 }
 
@@ -696,6 +732,17 @@ func globEscape(s string) string {
 // If clientID already has a lease, returns existing IP
 // Otherwise allocates a new IP from the pool
 func (p *IPPool) Allocate(clientID string, requestedIP net.IP, hostname string) (net.IP, error) {
+	return p.allocate(clientID, requestedIP, hostname, nil)
+}
+
+// AllocateAvoiding is Allocate with no request, whose free-address scan
+// passes avoid over: a client whose request was refused (sharedTagRequest)
+// must not be handed the address it asked for by the pool instead.
+func (p *IPPool) AllocateAvoiding(clientID string, avoid net.IP) (net.IP, error) {
+	return p.allocate(clientID, nil, "", avoid)
+}
+
+func (p *IPPool) allocate(clientID string, requestedIP net.IP, hostname string, avoid net.IP) (net.IP, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -716,7 +763,7 @@ func (p *IPPool) Allocate(clientID string, requestedIP net.IP, hostname string) 
 					LeasedAt: time.Now(),
 				}
 			}
-			if lease.ExpiresAt.IsZero() || time.Now().Before(lease.ExpiresAt) {
+			if lease.ExpiresAt.IsZero() || time.Now().Before(lease.ExpiresAt) || p.liveLocked(existingIP) {
 				// Renew/refresh the lease so it does not expire mid-session.
 				if !lease.ExpiresAt.IsZero() {
 					if p.config.LeaseTime > 0 {
@@ -807,16 +854,20 @@ func (p *IPPool) Allocate(clientID string, requestedIP net.IP, hostname string) 
 		ip := make(net.IP, 4)
 		binary.BigEndian.PutUint32(ip, ipUint)
 		ipStr := ip.String()
+		if avoid != nil && ip.Equal(avoid) {
+			continue
+		}
 
 		// Check if already leased
 		if lease, ok := p.leases[ipStr]; ok {
-			// Check if lease expired
-			if !lease.ExpiresAt.IsZero() && time.Now().After(lease.ExpiresAt) {
-				// Expired, can reuse
-				p.deleteLease(ipStr)
-			} else {
+			switch {
+			case lease.ExpiresAt.IsZero() || !time.Now().After(lease.ExpiresAt):
 				continue // Still valid
+			case p.liveLocked(ipStr):
+				p.renewLocked(lease) // run out under a live session: renewed
+				continue
 			}
+			p.deleteLease(ipStr) // Expired, can reuse
 		}
 
 		// Found free IP
@@ -938,7 +989,18 @@ func (p *IPPool) CleanupExpired() int {
 	cleaned := 0
 
 	for ip, lease := range p.leases {
-		if !lease.ExpiresAt.IsZero() && now.After(lease.ExpiresAt) {
+		if lease.ExpiresAt.IsZero() {
+			continue
+		}
+		if p.liveLocked(ip) {
+			// A lease a session holds is renewed before it runs out, in
+			// Redis too, whose key would otherwise expire by itself.
+			if time.Until(lease.ExpiresAt) < p.leaseTTL()/2 {
+				p.renewLocked(lease)
+			}
+			continue
+		}
+		if now.After(lease.ExpiresAt) {
 			p.deleteLease(ip)
 			cleaned++
 		}
