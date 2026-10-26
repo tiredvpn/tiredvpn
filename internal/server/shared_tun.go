@@ -323,6 +323,14 @@ func (st *SharedTUN) registerClient(clientIP net.IP, clientID, origin string, co
 	return writer
 }
 
+// Serving reports whether a session is registered for clientIP.
+func (st *SharedTUN) Serving(clientIP net.IP) bool {
+	st.clientsMu.RLock()
+	defer st.clientsMu.RUnlock()
+	_, ok := st.clients[clientIP.String()]
+	return ok
+}
+
 // UnregisterClient removes a client from the shared TUN
 // If expectedWriter is not nil, only unregister if it matches the current writer
 // (prevents race condition where old connection unregisters new connection)

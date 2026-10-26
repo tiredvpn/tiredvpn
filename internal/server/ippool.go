@@ -553,6 +553,38 @@ func (p *IPPool) AdoptAll(ctx context.Context, oldKeys, oldPrefixes []string, ne
 	}
 }
 
+// TakeOver moves the lease on ip to newKey from a key that starts with
+// prefix, and reports whether it did. Not when newKey already holds a lease,
+// nor when ip is leased to anything else. The caller decides that the lease
+// is free to take: no session holds it.
+func (p *IPPool) TakeOver(ip net.IP, prefix, newKey string) bool {
+	if ip == nil || prefix == "" || newKey == "" {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.stickyLookup(newKey) != "" {
+		return false
+	}
+	ipStr := ip.String()
+	lease := p.leases[ipStr]
+	if lease == nil || lease.ClientID == newKey || !strings.HasPrefix(lease.ClientID, prefix) {
+		return false
+	}
+	oldKey := lease.ClientID
+	delete(p.byClient, oldKey)
+	if p.redis != nil {
+		p.redis.Del(context.Background(), p.redisClientKey(oldKey))
+	}
+	lease.ClientID = newKey
+	if err := p.saveLease(lease); err != nil {
+		log.Warn("Failed to persist lease %s taken over from %s by %s: %v", ipStr, oldKey, newKey, err)
+		return false
+	}
+	log.Info("Lease %s taken over from %s by %s: the address its client asked for, held by no session", ipStr, oldKey, newKey)
+	return true
+}
+
 // markFolded leaves newKey alone until until. Caller must hold p.mu.
 func (p *IPPool) markFolded(newKey string, now, until time.Time) {
 	if p.folded == nil {

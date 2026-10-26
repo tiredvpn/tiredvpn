@@ -1,11 +1,15 @@
 package server
 
 import (
+	"context"
 	"net"
 	"strings"
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
+	"github.com/tiredvpn/tiredvpn/internal/endpoint"
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
 	"github.com/tiredvpn/tiredvpn/internal/tun"
 )
@@ -147,5 +151,78 @@ func TestTheRelaysTagIsStableForAKnownClientAndDrawnOtherwise(t *testing.T) {
 	// than falling back to the shared key.
 	if relayClientTag(clientIdentity{}) == "" {
 		t.Fatal("no tag at all for an unnamed client")
+	}
+}
+
+// natClientAsking is natClient asking the exit for ask, as a client's
+// reconnect asks for the address it holds.
+func natClientAsking(t *testing.T, relay string, secret []byte, ask net.IP) *tun.VPNClient {
+	t.Helper()
+	m := strategy.NewManager()
+	if err := m.SetEndpoints([]endpoint.Endpoint{{Name: "relay", V4: relay}}, endpoint.V4Only); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(endpoint.ResetSharedSelectors)
+	m.Register(strategy.NewAntiProbeStrategy(m, secret))
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := newTunApp(fds[1])
+	t.Cleanup(app.close)
+	client, err := tun.NewVPNClient(tun.VPNConfig{TunFd: fds[0], TunName: "nat0", MTU: 1500,
+		LocalIP: ask, RemoteIP: net.IPv4(10, 8, 7, 1), ServerAddr: relay, Manager: m,
+		IPv6Policy: tun.IPv6PolicyOff, NoStrategyUpgrade: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("client start: %v", err)
+	}
+	t.Cleanup(client.Stop)
+	return client
+}
+
+// TestASharedSecretClientKeepsItsAddressAcrossAReconnect is the fix14 stand
+// finding (twocli shared): through a relay, a client on the global secret
+// got a new tunnel address on every reconnect. The relay draws its tag per
+// session, and the lease from the session before - permanent, as requested
+// leases are - still held the address the reconnect asked for. Once no
+// session holds it, the address goes back to the client that asks; while a
+// session does, another client asking for it gets another one.
+func TestASharedSecretClientKeepsItsAddressAcrossAReconnect(t *testing.T) {
+	scaleLegClocks(t)
+	out := captureLog(t)
+	secret := []byte("relay-leg-secret-0123456789abcdef")
+	exit := newLegExit(t, secret)
+	relay := legRelay(t, secret, exit)
+	ask := net.IPv4(10, 8, 7, 60)
+
+	first := natClientAsking(t, relay, secret, ask)
+	held := first.LocalIP()
+	if !held.Equal(ask) {
+		t.Fatalf("the first client got %s, asked for %s", held, ask)
+	}
+	// Another box on the same secret behind the same NAT asks for the same
+	// address while the first holds it.
+	twin := natClientAsking(t, relay, secret, held)
+	if twin.LocalIP().Equal(held) {
+		t.Fatalf("a second client took %s from a live session:\n%s", held, out.String())
+	}
+	twin.Stop()
+
+	first.Stop()
+	deadline := time.Now().Add(5 * time.Second)
+	for exit.srvCtx.sharedTUN.Serving(held) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if exit.srvCtx.sharedTUN.Serving(held) {
+		t.Fatal("the exit still serves the first session - the test proves nothing")
+	}
+	again := natClientAsking(t, relay, secret, held)
+	if got := again.LocalIP(); !got.Equal(held) {
+		t.Fatalf("the reconnect got %s, want the address it held, %s:\n%s", got, held, out.String())
 	}
 }
