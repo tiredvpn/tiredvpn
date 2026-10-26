@@ -1,16 +1,13 @@
 package server
 
-import (
-	"time"
+import "golang.org/x/sys/unix"
 
-	"golang.org/x/sys/unix"
-)
-
-// tcpSinceAckReceived reads tcpi_last_ack_recv off the socket fd.
-func tcpSinceAckReceived(fd uintptr) (time.Duration, bool) {
+// tcpBytesAcked reads tcpi_bytes_acked off the socket fd: how many bytes
+// the peer has acknowledged, the SYN counting one.
+func tcpBytesAcked(fd uintptr) (uint64, bool) {
 	info, err := unix.GetsockoptTCPInfo(int(fd), unix.IPPROTO_TCP, unix.TCP_INFO)
 	if err != nil {
 		return 0, false
 	}
-	return time.Duration(info.Last_ack_recv) * time.Millisecond, true
+	return info.Bytes_acked, true
 }

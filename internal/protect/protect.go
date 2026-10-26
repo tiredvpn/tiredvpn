@@ -273,7 +273,7 @@ func (d *ProtectDialer) DialContext(ctx context.Context, network, address string
 	// returns, and a slow protect round trip on Android (up to protectTimeout)
 	// could otherwise let the caller's dial-limit cut land on a connected
 	// socket and read it as a SYN nobody answered.
-	tcpConnected(ctx, network)
+	tcpConnected(ctx, network, conn)
 
 	if err := ProtectConn(conn); err != nil {
 		conn.Close()

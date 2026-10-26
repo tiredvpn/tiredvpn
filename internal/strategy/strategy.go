@@ -310,16 +310,13 @@ var refusalRetries = []time.Duration{250 * time.Millisecond, 500 * time.Millisec
 func (m *Manager) connectThroughRefusal(ctx context.Context, s Strategy, target string, limit, dialLimit time.Duration, scan *scanState) (conn net.Conn, latency time.Duration, refused bool, err error) {
 	_, reporter := s.(connectReporter)
 	held := scan.held && dialLimit > 0 && dialLimit < limit
-	switch {
-	case held:
-		limit, dialLimit = dialLimit, 0
-	case !reporter && dialLimit > 0:
+	if !reporter && dialLimit > 0 {
 		limit, dialLimit = attemptLimit(s, limit, dialLimit), 0
 	}
 	scan.heldSilent, scan.limit = false, limit
 	for i := 0; ; i++ {
 		connectCtx, cancel := context.WithTimeout(ctx, limit)
-		phase := watchConnect(connectCtx, cancel, limit, dialLimit, reporter)
+		phase := watchConnect(connectCtx, cancel, limit, dialLimit, reporter, held)
 		start := time.Now()
 		conn, err = s.Connect(phase.ctx, target)
 		latency = time.Since(start)
@@ -338,12 +335,17 @@ func (m *Manager) connectThroughRefusal(ctx context.Context, s Strategy, target 
 		if at := phase.connectedAt.Load(); at != 0 {
 			scan.allowance = time.Since(time.Unix(0, at))
 		}
-		if err != nil && phase.connected() && heardNothing(err, latency, limit) &&
-			(phase.extended() && m.swallowEvidence(s, scan.allowance) || held && !isUDPBasedStrategy(s)) {
-			// Held to its share, it counts on less evidence than a whole
-			// cycle: the swallow pressure is the rest of it.
+		switch {
+		case err != nil && phase.heldCut() && !isUDPBasedStrategy(s):
+			// Held to its share and cut with nothing acknowledged: it
+			// counts on less evidence than a whole cycle, the swallow
+			// pressure being the rest of it, and its silence is read
+			// against the share.
 			scan.connectedSilent = append(scan.connectedSilent, s.ID())
-			scan.heldSilent = held
+			scan.heldSilent, scan.limit = true, dialLimit
+		case err != nil && phase.connected() && heardNothing(err, latency, limit) &&
+			phase.extended() && m.swallowEvidence(s, scan.allowance):
+			scan.connectedSilent = append(scan.connectedSilent, s.ID())
 		}
 		if err == nil || isUDPBasedStrategy(s) || !refusedByAddr(err, target, m.GetServerAddr(ctx)) {
 			return conn, latency, false, err
@@ -393,6 +395,7 @@ const (
 	phaseConnected              // the TCP connect is up, the handshake under way
 	phaseCut                    // cut at the dial limit while dialling
 	phaseCutLocal               // cut at the dial limit before any dial went out
+	phaseHeldCut                // held to its share, connected, and cut there: the server acknowledged nothing
 )
 
 // connectPhase follows one attempt through its TCP connect.
@@ -403,6 +406,7 @@ type connectPhase struct {
 	split       bool
 	tracked     bool         // the strategy reports its dial, so state is known
 	connectedAt atomic.Int64 // UnixNano of the TCP connect, 0 before
+	conn        atomic.Pointer[net.Conn]
 }
 
 // dialCutTimer arms an attempt's dialLimit cut. A var so a test can fire the
@@ -413,7 +417,16 @@ var dialCutTimer = time.AfterFunc
 // TCP dial when the strategy reports it (hooked), and arms the dialLimit cut
 // of connectThroughRefusal. Without a split (dialLimit zero or not shorter
 // than limit) the attempt simply runs to limit.
-func watchConnect(ctx context.Context, cancel context.CancelFunc, limit, dialLimit time.Duration, hooked bool) *connectPhase {
+//
+// hold says the attempt is held to its share (scanState.held): at dialLimit
+// a connected attempt is cut too, unless the server's TCP has acknowledged
+// the handshake's first bytes (handshakeProgressed). A server that is slow
+// to answer - 7-9 s through a bad mobile link, or reaching its cover - still
+// acknowledges at once; a censor that drops the ClientHello, as the fix13c
+// stand did, never lets it get there. The share was a cut whatever the
+// progress, and a slow but live handshake was killed every cycle (P2-4 of
+// the round-10 review).
+func watchConnect(ctx context.Context, cancel context.CancelFunc, limit, dialLimit time.Duration, hooked, hold bool) *connectPhase {
 	p := &connectPhase{ctx: ctx}
 	if !hooked {
 		return p
@@ -427,7 +440,8 @@ func watchConnect(ctx context.Context, cancel context.CancelFunc, limit, dialLim
 				p.state.CompareAndSwap(phaseConnected, phaseDialling)
 			}
 		},
-		func() {
+		func(c net.Conn) {
+			p.conn.Store(&c)
 			p.connectedAt.Store(time.Now().UnixNano())
 			p.state.CompareAndSwap(phaseLocal, phaseConnected)
 			p.state.CompareAndSwap(phaseDialling, phaseConnected)
@@ -439,10 +453,23 @@ func watchConnect(ctx context.Context, cancel context.CancelFunc, limit, dialLim
 	p.timer = dialCutTimer(dialLimit, func() {
 		if p.state.CompareAndSwap(phaseDialling, phaseCut) || p.state.CompareAndSwap(phaseLocal, phaseCutLocal) {
 			cancel()
+			return
+		}
+		if hold && p.state.Load() == phaseConnected {
+			if c := p.conn.Load(); c != nil && handshakeProgressed(*c) {
+				return
+			}
+			if p.state.CompareAndSwap(phaseConnected, phaseHeldCut) {
+				cancel()
+			}
 		}
 	})
 	return p
 }
+
+// heldCut reports an attempt held to its share and cut there, connected,
+// with nothing of its handshake acknowledged.
+func (p *connectPhase) heldCut() bool { return p.state.Load() == phaseHeldCut }
 
 func (p *connectPhase) stop() {
 	if p.timer != nil {
@@ -2218,45 +2245,31 @@ func (m *Manager) swallowPressure(addr string) bool {
 		time.Since(d.at) < routeDeathWindow
 }
 
-// swallowSuspect reports whether transport id is under suspicion of being
-// swallowed on addr's route: it heard nothing on an address of the server
-// in the recent cycles (skip or mute), or the last silence verdict on
-// another server, within routeDeathWindow, named it.
-//
-// Under swallow pressure the fast path - the transport that worked last -
-// is held to its share only then. Held regardless, a live handshake that
-// needs more than its share was cut every cycle: the share is a sixteenth
-// of the cycle, 0.94 s of 15, and a REALITY handshake through a bad mobile
-// link or a server slow to reach its cover takes 7-9 s, so the client
-// failed over from a healthy server. A transport nothing has seen
-// swallowed keeps the rest of the cycle; if it is swallowed after all, that
-// cycle books it, and from the next one on it is a suspect.
-func (m *Manager) swallowSuspect(addr, id string) bool {
-	sincePark := m.serverSincePark(addr)
-	key := m.swallowKey(addr)
-	server := -1
-	if sel := m.selector(); sel != nil {
-		if cand, ok := sel.CandidateForAddr(addr); ok {
-			server = cand.EndpointIdx
+// jitterShare draws a held attempt's share around d: a hump between 3/4 and
+// 5/4 of it (HumpDelay), no edge and no grid. Equal shares put up to sixteen
+// connects of different protocols to one address at exactly 0.94 s apart
+// (P3-6 of the round-10 review). No measured reference for the shape.
+func jitterShare(d time.Duration) time.Duration {
+	return HumpDelay(d*3/4, d, d*5/4)
+}
+
+// shuffleEqualPriority shuffles each run of transports of equal priority in
+// list, in place, so the order under swallow pressure is not the same fixed
+// sequence on every cycle and every client. The runs are what the scan
+// would take in any order; priorities between runs stay.
+func shuffleEqualPriority(list []Strategy) {
+	for i := 0; i < len(list); {
+		j := i + 1
+		for j < len(list) && list[j].Priority() == list[i].Priority() {
+			j++
 		}
+		run := list[i:j]
+		for k := len(run) - 1; k > 0; k-- {
+			r := randIntn(k + 1)
+			run[k], run[r] = run[r], run[k]
+		}
+		i = j
 	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if r := m.swallowed[key]; r != nil && !swallowStale(r, sincePark) {
-		for _, ids := range r.skip {
-			if ids[id] {
-				return true
-			}
-		}
-		for _, ids := range r.mute {
-			if ids[id] {
-				return true
-			}
-		}
-	}
-	d := m.lastDeath
-	return d.server >= 0 && d.server != server && (d.class == deathSilent || d.class == deathSwallowed) &&
-		time.Since(d.at) < routeDeathWindow && slices.Contains(d.ids, id)
 }
 
 // pressureShares is the smallest share of a cycle an attempt gets under
@@ -2828,19 +2841,22 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			// land the tunnel on HTTP Polling.
 			budget := m.attemptBudget(ctx)
 			dialBudget := budget
+			// The others a scan would dial after it, by the scan's own
+			// gates: with all of them held back, the fast path is the
+			// only transport there is.
 			others := slices.ContainsFunc(m.GetOrderedStrategies(), func(o Strategy) bool {
-				return o.ID() != lastSuccessful.ID() && o.Priority() > 0 && !excludeMap[o.ID()] && !swallowSkip[o.ID()]
+				return o.ID() != lastSuccessful.ID() && o.Priority() > 0 && !excludeMap[o.ID()] && !swallowSkip[o.ID()] &&
+					(!excludeUDP || !isUDPBasedStrategy(o)) && (m.forced || !m.stormDetector.IsParked(o.ID())) &&
+					m.circuitBreakers.CanTry(o.ID())
 			})
 			// Held only where a connected handshake would keep the rest of
-			// a short cycle, not when it is the only transport there is,
-			// and only when it is itself under suspicion: the transport
-			// that worked last, seen swallowed nowhere, keeps the cycle
-			// as before, so a slow but live handshake on a bad link
-			// completes (swallowSuspect).
-			scan.held = scan.hold && others && budget < m.connectTimeout && m.swallowSuspect(scan.addr, lastSuccessful.ID())
+			// a short cycle, and not when it is the only transport there
+			// is. A handshake the server is acknowledging runs on past its
+			// share (watchConnect).
+			scan.held = scan.hold && others && budget < m.connectTimeout
 			switch {
 			case scan.held:
-				dialBudget = budget / pressureShares
+				dialBudget = jitterShare(budget / pressureShares)
 			case budget < m.connectTimeout:
 				dialBudget = budget / 2
 			}
@@ -2985,6 +3001,9 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 	}
 	rttProfile := m.rttProfile
 	m.mu.RUnlock()
+	if scan.hold {
+		shuffleEqualPriority(strategies)
+	}
 
 	for _, s := range last {
 		if isUDPBasedStrategy(s) {
@@ -3161,7 +3180,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 				// end of the list get a turn too - halving left Geneva,
 				// tenth in the list, a few milliseconds - and no less
 				// than pressureShares of the cycle.
-				dialBudget = min(budget, max(budget/time.Duration(len(strategies)-i), scanStartBudget/pressureShares))
+				dialBudget = min(budget, jitterShare(max(budget/time.Duration(len(strategies)-i), scanStartBudget/pressureShares)))
 			case budget < m.connectTimeout:
 				dialBudget = budget / 2
 			}
@@ -4476,7 +4495,11 @@ func (m *Manager) ReturnCandidate() (endpoint.Candidate, bool) {
 // DialReturn dials s at cand for a session's return to a preferred server:
 // one dial, the endpoint's own secret, no walk. A failed dial is booked on
 // cand as a failed connect, where repeated failures park it; the strategy's
-// own record is not touched, since what failed may be the server.
+// own record is not touched, since what failed may be the server. A dial
+// that connects books nothing: a TCP connect does not show a server that
+// swallows handshakes working, and booking it as a success cleared the
+// failures that keep such a server parked (P3-5 of the round-10 review).
+// The caller books the outcome of the handshake (ReturnOutcome).
 func (m *Manager) DialReturn(ctx context.Context, s Strategy, cand endpoint.Candidate) (net.Conn, error) {
 	m.muxMu.Lock()
 	muxEnabled := m.muxEnabled
@@ -4485,7 +4508,6 @@ func (m *Manager) DialReturn(ctx context.Context, s Strategy, cand endpoint.Cand
 		return nil, fmt.Errorf("return to a preferred server is not supported with mux")
 	}
 	connectCtx, cancel := context.WithTimeout(m.withDialCandidate(ctx, cand), m.connectTimeout)
-	start := time.Now()
 	conn, err := s.Connect(connectCtx, m.withHoppedPort(cand.Addr))
 	cancel()
 	sel := m.selector()
@@ -4495,9 +4517,6 @@ func (m *Manager) DialReturn(ctx context.Context, s Strategy, cand endpoint.Cand
 		}
 		return nil, err
 	}
-	if sel != nil {
-		sel.Report(cand, true, time.Since(start))
-	}
 	m.mu.RLock()
 	useRTTMasking, rttProfile := m.rttMaskingEnabled, m.rttProfile
 	m.mu.RUnlock()
@@ -4506,6 +4525,14 @@ func (m *Manager) DialReturn(ctx context.Context, s Strategy, cand endpoint.Cand
 		conn = WrapWithRTTMasking(conn, rttProfile)
 	}
 	return conn, nil
+}
+
+// ReturnOutcome books the TUN handshake of a return to cand (DialReturn):
+// a success as a successful connect, a failure as a failed one.
+func (m *Manager) ReturnOutcome(cand endpoint.Candidate, ok bool) {
+	if sel := m.selector(); sel != nil {
+		sel.Report(cand, ok, 0)
+	}
 }
 
 // PinCandidate moves the selector's pin to cand: the session now rides it.

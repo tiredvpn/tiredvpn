@@ -509,6 +509,11 @@ type Config struct {
 
 // serverContext holds runtime context for multi-client mode
 type serverContext struct {
+	// noH2ProxyWatch turns h2ProxyWatch off, for tests of what a relay
+	// does on its own: with the exit's watch on, a relay that keeps
+	// acknowledging the exit's downlink keeps its leg whatever its own
+	// keepalive does (P2-1 of the round-10 review). Never set in production.
+	noH2ProxyWatch bool
 	cfg            *Config
 	registry       *ClientRegistry
 	store          *RedisStore
@@ -1856,7 +1861,7 @@ func runH2FrameLoop(connPtr *net.Conn, framerPtr **http2.Framer, hpackDec *hpack
 		conn := *connPtr
 		framer := *framerPtr
 		if watch == nil {
-			if t := *tunnel; t != nil && t.targetConn != nil && t.tunGate == nil {
+			if t := *tunnel; t != nil && t.targetConn != nil && t.tunGate == nil && !srvCtx.noH2ProxyWatch {
 				watch = watchH2ProxyClient(conn, logger)
 			}
 		}
@@ -4146,8 +4151,15 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 
 	if srvCtx.upstreamDialer != nil {
 		// Relay: forward to the upstream exit rather than terminating here.
+		// A relay in a chain passes on the tag the hop below gave its
+		// client; its own would name the hop, and a drawn one would differ
+		// on every session (P3-1 of the round-10 review).
+		tag := clientTag
+		if tag == "" {
+			tag = relayClientTag(tunnel.clientID)
+		}
 		relaySink, upServerIP, upClientIP, err := dialRelayTUN(srvCtx, logger, data, origin,
-			relayClientTag(tunnel.clientID), tunnel.downstream, sendPacketDown)
+			tag, tunnel.downstream, sendPacketDown)
 		if err != nil {
 			logger.Warn("H2 TUN relay: upstream dial failed: %v", err)
 			sendStegoResponse(framer, tunnel.streamID, []byte{0x01}, tunnel.secret)

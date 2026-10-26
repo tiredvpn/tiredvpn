@@ -24,10 +24,13 @@ import (
 type returnExit struct {
 	serverIP, clientIP net.IP
 	refuse             atomic.Bool // the dial fails
-	dials              atomic.Int64
-	up                 atomic.Int64
-	mu                 sync.Mutex
-	conns              []net.Conn
+	// displace makes a new session close the ones before it, as a real
+	// exit does when it registers the same address again, after its grace.
+	displace bool
+	dials    atomic.Int64
+	up       atomic.Int64
+	mu       sync.Mutex
+	conns    []net.Conn
 }
 
 func (e *returnExit) serve(srv net.Conn) {
@@ -35,11 +38,22 @@ func (e *returnExit) serve(srv net.Conn) {
 	if _, err := io.ReadFull(srv, req); err != nil {
 		return
 	}
+	// With a flags byte, as an exit of this release answers: a bare 9-byte
+	// answer makes the client wait handshakeFlagsGrace for one.
 	resp := append([]byte{0x00}, e.serverIP.To4()...)
-	if _, err := srv.Write(append(resp, e.clientIP.To4()...)); err != nil {
+	resp = append(append(resp, e.clientIP.To4()...), tunFlagMTUProbe)
+	if _, err := srv.Write(resp); err != nil {
 		return
 	}
 	e.mu.Lock()
+	if e.displace {
+		// After the 200 ms grace a real exit gives the writer it
+		// replaces (registerClient).
+		for _, old := range e.conns {
+			time.AfterFunc(200*time.Millisecond, func() { old.Close() })
+		}
+		e.conns = nil
+	}
 	e.conns = append(e.conns, srv)
 	e.mu.Unlock()
 	hdr := make([]byte, 4)
@@ -230,7 +244,7 @@ func TestAnIdleTunnelReturnsToThePreferredServer(t *testing.T) {
 	}
 }
 
-// TestABusyTunnelStaysOnTheFallback: traffic every 100 ms, one direction at
+// TestABusyTunnelStaysOnTheFallback: traffic every 50 ms, one direction at
 // a time, for several idle periods - the tunnel stays on b, and a is not
 // even dialled.
 func TestABusyTunnelStaysOnTheFallback(t *testing.T) {
@@ -246,7 +260,9 @@ func TestABusyTunnelStaysOnTheFallback(t *testing.T) {
 				} else {
 					h.b.sendDown(h.upPacket(t))
 				}
-				time.Sleep(100 * time.Millisecond)
+				// An eighth of the idle threshold: 100 ms gaps failed once
+				// at load over 30 (P3-13 of the round-10 review).
+				time.Sleep(50 * time.Millisecond)
 			}
 			if h.onA() || h.a.dials.Load() != 0 {
 				t.Fatalf("a busy tunnel (%s) was moved: on a %v, a dialled %d times", dir, h.onA(), h.a.dials.Load())

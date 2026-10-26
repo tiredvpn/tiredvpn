@@ -186,43 +186,81 @@ func natClientAsking(t *testing.T, relay string, secret []byte, ask net.IP) *tun
 }
 
 // TestASharedSecretClientKeepsItsAddressAcrossAReconnect is the fix14 stand
-// finding (twocli shared): through a relay, a client on the global secret
-// got a new tunnel address on every reconnect. The relay draws its tag per
-// session, and the lease from the session before - permanent, as requested
-// leases are - still held the address the reconnect asked for. Once no
-// session holds it, the address goes back to the client that asks; while a
-// session does, another client asking for it gets another one.
+// finding (twocli shared) and P2-2 of the round-10 review: through a relay,
+// a client on the global secret got a new tunnel address on every
+// reconnect. The relay draws its tag per session, and the lease from the
+// session before still held the address the reconnect asked for. Round 15
+// handed it over only once no session held it, and real reconnects come
+// while one still does - a make-before-break upgrade always. Here the
+// reconnect asks while the first session is up, takes the address and the
+// downlink with it; a later one after a clean stop gets it as well.
 func TestASharedSecretClientKeepsItsAddressAcrossAReconnect(t *testing.T) {
 	scaleLegClocks(t)
 	out := captureLog(t)
 	secret := []byte("relay-leg-secret-0123456789abcdef")
 	exit := newLegExit(t, secret)
 	relay := legRelay(t, secret, exit)
-	ask := net.IPv4(10, 8, 7, 60)
 
-	first := natClientAsking(t, relay, secret, ask)
+	first := natClientAsking(t, relay, secret, net.IPv4(10, 8, 7, 60))
 	held := first.LocalIP()
-	if !held.Equal(ask) {
-		t.Fatalf("the first client got %s, asked for %s", held, ask)
-	}
-	// Another box on the same secret behind the same NAT asks for the same
-	// address while the first holds it.
-	twin := natClientAsking(t, relay, secret, held)
-	if twin.LocalIP().Equal(held) {
-		t.Fatalf("a second client took %s from a live session:\n%s", held, out.String())
-	}
-	twin.Stop()
-
-	first.Stop()
-	deadline := time.Now().Add(15 * time.Second)
-	for exit.srvCtx.sharedTUN.Serving(held) && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if exit.srvCtx.sharedTUN.Serving(held) {
-		t.Fatalf("the exit still serves the first session - the test proves nothing:\n%s", out.String())
+	if held == nil || !exit.srvCtx.sharedTUN.Serving(held) {
+		t.Fatalf("the first client has no address the exit serves: %v", held)
 	}
 	again := natClientAsking(t, relay, secret, held)
 	if got := again.LocalIP(); !got.Equal(held) {
-		t.Fatalf("the reconnect got %s, want the address it held, %s:\n%s", got, held, out.String())
+		t.Fatalf("a reconnect made while the first session is up got %s, want %s:\n%s", got, held, out.String())
+	}
+	w := exitWriterFor(t, exit, held)
+	pkt := ipv4Packet(net.IPv4(10, 8, 7, 9), held)
+	pkt[3] = byte(len(pkt))
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_ = w.SendPacket(pkt)
+		if _, down, _, _ := again.Stats(); down > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the downlink to %s did not reach the reconnect:\n%s", held, out.String())
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	first.Stop()
+	again.Stop()
+	for exit.srvCtx.sharedTUN.Serving(held) && time.Now().Before(deadline.Add(10*time.Second)) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if exit.srvCtx.sharedTUN.Serving(held) {
+		t.Fatal("the exit still serves the address - the test proves nothing")
+	}
+	last := natClientAsking(t, relay, secret, held)
+	if got := last.LocalIP(); !got.Equal(held) {
+		t.Fatalf("the reconnect after a clean stop got %s, want %s:\n%s", got, held, out.String())
+	}
+}
+
+// TestARelayedClientDoesNotTakeADirectClientsLiveAddress is P2-5 of the
+// round-10 review: a client on the global secret straight to the exit holds
+// its address under "global@<origin>", which is also what a relayed client
+// at the same origin finds among its legacy keys. Adopting it gave the
+// relayed client the direct one's address while it was in use, and the
+// downlink with it.
+func TestARelayedClientDoesNotTakeADirectClientsLiveAddress(t *testing.T) {
+	scaleLegClocks(t)
+	out := captureLog(t)
+	secret := []byte("relay-leg-secret-0123456789abcdef")
+	exit := newLegExit(t, secret)
+	relay := legRelay(t, secret, exit)
+
+	direct := natClientAsking(t, exit.addr, secret, net.IPv4(10, 8, 7, 70))
+	if got := direct.LocalIP(); !got.Equal(net.IPv4(10, 8, 7, 70)) {
+		t.Fatalf("the direct client got %s, asked for 10.8.7.70", got)
+	}
+	relayed := natClientAsking(t, relay, secret, net.IPv4(10, 8, 7, 80))
+	if got := relayed.LocalIP(); got.Equal(direct.LocalIP()) {
+		t.Fatalf("the relayed client took the direct client's live address %s:\n%s", got, out.String())
+	}
+	if !exit.srvCtx.sharedTUN.Serving(direct.LocalIP()) {
+		t.Fatal("the exit no longer serves the direct client")
 	}
 }

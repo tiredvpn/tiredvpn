@@ -12,10 +12,10 @@ import (
 // released, and counts the keepalives.
 type blockingKeepaliveConn struct {
 	net.Conn
-	once     sync.Once
-	inWrite  chan struct{}
-	release  chan struct{}
-	mu       sync.Mutex
+	once       sync.Once
+	inWrite    chan struct{}
+	release    chan struct{}
+	mu         sync.Mutex
 	nKeepalive int
 }
 
@@ -82,6 +82,42 @@ func TestTwoKeepalivesNeverGoBackToBack(t *testing.T) {
 		t.Fatal("the uplink keepalive never came round - the test proves nothing")
 	}
 	time.Sleep(150 * time.Millisecond)
+	if n := bc.keepalives(); n != 1 {
+		t.Fatalf("%d keepalives went up back to back, want 1", n)
+	}
+}
+
+// TestASilenceKeepaliveRightAfterAnUplinkOneIsSkipped is the other order,
+// P3-7 of the round-10 review: the uplink keepalive goes first and its
+// write blocks; the server-silence keepalive, decided on the server's
+// silence rather than on lastTx, waits for it and then must not write a
+// second one back to back. Only writeSilenceKeepalive's half-interval skip
+// stops it, and removing the skip left every keepalive test green.
+func TestASilenceKeepaliveRightAfterAnUplinkOneIsSkipped(t *testing.T) {
+	var bc *blockingKeepaliveConn
+	h := newQuietStallHarness(t, func(c net.Conn) net.Conn {
+		bc = &blockingKeepaliveConn{Conn: c, inWrite: make(chan struct{}), release: make(chan struct{})}
+		return bc
+	})
+	restore := SetUplinkKeepaliveDraw(func() time.Duration { return 200 * time.Millisecond })
+	t.Cleanup(func() { SetUplinkKeepaliveDraw(restore) })
+	go h.v.keepUplinkAlive()
+	select {
+	case <-bc.inWrite:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the uplink keepalive never wrote - the test proves nothing")
+	}
+	silence := make(chan struct{})
+	go func() {
+		h.v.writeSilenceKeepalive(bc)
+		close(silence)
+	}()
+	time.AfterFunc(100*time.Millisecond, func() { close(bc.release) })
+	select {
+	case <-silence:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the silence keepalive never returned")
+	}
 	if n := bc.keepalives(); n != 1 {
 		t.Fatalf("%d keepalives went up back to back, want 1", n)
 	}

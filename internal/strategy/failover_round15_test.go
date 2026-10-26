@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net"
 	"slices"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -302,52 +304,63 @@ func TestSwallowPressureSources(t *testing.T) {
 	}
 }
 
-// TestASlowLastGoodTransportKeepsItsCycleUnderPressure: another server has
-// just had its silence verdict, on Polling, so b's cycle runs under
-// pressure. b is healthy, but slow: REALITY - the transport that worked
-// last - is answered in 60% of the cycle (8-9 s of 15 on a bad mobile link
-// or a server slow to reach its cover). Held to its share it was cut every
-// cycle and the client failed over for nothing. A transport nothing has
-// seen swallowed keeps its cycle on the fast path; the slicing is for the
-// ones under suspicion.
-func TestASlowLastGoodTransportKeepsItsCycleUnderPressure(t *testing.T) {
+// TestASlowServerAfterAVerdictElsewhereIsNotCut is P2-4 of the round-10
+// review, through Connect with a real verdict: a swallows every handshake
+// - a censor dropping the first flight, which a's TCP never acknowledges -
+// and gets its silence verdict, which names every transport tried there,
+// REALITY first. b is healthy but slow: it answers in 0.8 s of a 1.5 s
+// cycle (8 s of 15 on a bad mobile link). Under the pressure a's verdict
+// puts on b, every attempt got its share, about 0.1 s here, and was cut
+// whether b was answering or not: the first cycle on b connected nothing,
+// the next landed on the lowest-priority transport. Now a held attempt runs
+// on past its share once b's TCP has acknowledged its first flight, and
+// REALITY connects in the first cycle on b.
+func TestASlowServerAfterAVerdictElsewhereIsNotCut(t *testing.T) {
 	a := newBlackholeListener(t)
-	b := slowHelloListener(t, 900*time.Millisecond)
+	b := slowHelloListener(t, 800*time.Millisecond)
 	m := newSilenceManager(t, 3*time.Second, a.addr, b)
-	reality := &protectedGreeter{id: "reality", priority: 5}
-	m.Register(reality)
-	m.Register(&protectedGreeter{id: "polling", priority: 6})
-	m.Register(&protectedGreeter{id: "stego", priority: 7})
-	markConnected(m, reality)
-	cb, ok := m.selector().CandidateForAddr(b)
-	if !ok {
-		t.Fatal("no candidate for b")
+	var counters []*targetCounter
+	for i, id := range []string{"reality", "polling", "stego", "seqovl", "ws"} {
+		c := &targetCounter{Strategy: &swallowAtGreeter{protectedGreeter{id: id, priority: 5 + i, hello: true}, map[string]bool{a.addr: true}}}
+		counters = append(counters, c)
+		m.Register(c)
 	}
-	m.selector().Pin(cb)
-	m.mu.Lock()
-	m.lastDeath = deathMark{server: 0, class: deathSwallowed, ids: []string{"polling"}, at: time.Now()}
-	m.mu.Unlock()
-	if !m.swallowPressure(b) {
-		t.Fatal("no pressure on b - the test proves nothing")
+	markConnected(m, counters[0])
+	onB := func() bool {
+		return slices.ContainsFunc(counters, func(c *targetCounter) bool { return c.at(b) > 0 })
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
-	defer cancel()
-	conn, s, err := m.Connect(ctx, "")
-	if err != nil {
-		t.Fatalf("a slow REALITY on a healthy b was cut under pressure: %v", err)
+	firstOnB := 0
+	for cycle := 1; cycle <= 10; cycle++ {
+		before := onB()
+		ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+		conn, s, err := m.Connect(ctx, "")
+		cancel()
+		if firstOnB == 0 && !before && onB() {
+			firstOnB = cycle
+		}
+		if err == nil {
+			conn.Close()
+			if got := m.GetServerAddr(context.Background()); got != b || s.ID() != "reality" {
+				t.Fatalf("connected via %s on %s, want reality on b %s", s.ID(), got, b)
+			}
+			if !m.swallowPressure(b) {
+				t.Fatal("no pressure on b - the test proves nothing")
+			}
+			if cycle != firstOnB {
+				t.Fatalf("connected in cycle %d, the first on b was %d", cycle, firstOnB)
+			}
+			return
+		}
 	}
-	conn.Close()
-	if s.ID() != "reality" {
-		t.Fatalf("connected via %s, want reality", s.ID())
-	}
+	t.Fatal("not connected in 10 cycles")
 }
 
-// TestASuspectLastGoodTransportIsHeldUnderPressure is the other side: when
-// the transport that worked last is the one the previous server's verdict
-// named, the fast path gets its share like any other attempt, and the
+// TestASwallowedLastGoodTransportIsHeldUnderPressure is the other side:
+// under pressure, the transport that worked last gets its share like any
+// other attempt when nothing of its handshake is acknowledged, and the
 // transports after it get theirs.
-func TestASuspectLastGoodTransportIsHeldUnderPressure(t *testing.T) {
+func TestASwallowedLastGoodTransportIsHeldUnderPressure(t *testing.T) {
 	a := newBlackholeListener(t)
 	b := newBlackholeListener(t)
 	m := newSilenceManager(t, 3*time.Second, a.addr, b.addr)
@@ -372,30 +385,120 @@ func TestASuspectLastGoodTransportIsHeldUnderPressure(t *testing.T) {
 	// b swallows everything, Geneva included; what matters is that REALITY
 	// gave the rest of the cycle up.
 	if n := b.accepts.Load(); n < 2 {
-		t.Fatalf("b accepted %d connections in %v: the suspect REALITY kept the whole cycle", n, time.Since(start).Round(time.Millisecond))
+		t.Fatalf("b accepted %d connections in %v: the swallowed REALITY kept the whole cycle", n, time.Since(start).Round(time.Millisecond))
 	}
 }
 
-// TestSwallowSuspectSources: a transport mute on one address of a server is
-// a suspect on its other address; another transport is not.
-func TestSwallowSuspectSources(t *testing.T) {
-	a6, a4 := newHelloListenerAt(t, "[::1]:0"), newHelloListener(t)
-	m := dualStackPool(t, 3*time.Second, nil, [2]string{a6.addr, a4.addr})
-	confusion := &greetingStrategy{id: "confusion", priority: 5}
-	m.Register(confusion)
-	m.Register(&greetingStrategy{id: "geneva", priority: 6})
-	c6, ok := m.selector().CandidateForAddr(a6.addr)
+// stampedDialer is quietDialer that records when each of its attempts
+// started, in a log shared by the cycle's transports.
+type stampedDialer struct {
+	quietDialer
+	log *stampLog
+}
+
+type stampLog struct {
+	mu  sync.Mutex
+	ids []string
+	at  []time.Time
+}
+
+func (l *stampLog) add(id string) {
+	l.mu.Lock()
+	l.ids, l.at = append(l.ids, id), append(l.at, time.Now())
+	l.mu.Unlock()
+}
+
+func (s *stampedDialer) Connect(ctx context.Context, target string) (net.Conn, error) {
+	s.log.add(s.id)
+	return s.quietDialer.Connect(ctx, target)
+}
+
+// TestHeldSharesHaveNoRhythm is P3-6 of the round-10 review: under swallow
+// pressure the attempts on one address came at one fixed share apart, in
+// one fixed order. Now the shares are drawn around their size and the runs
+// of equal priority are shuffled. Through Connect, on a server under
+// pressure whose transports all hang.
+func TestHeldSharesHaveNoRhythm(t *testing.T) {
+	a := newHelloListener(t)
+	m := newSilenceManager(t, 3*time.Second, a.addr)
+	log := &stampLog{}
+	for i := range 6 {
+		m.Register(&stampedDialer{quietDialer{id: fmt.Sprintf("conf_%d", i), priority: 25}, log})
+	}
+	m.Register(&stampedDialer{quietDialer{id: "last", priority: 30}, log})
+	ca, ok := m.selector().CandidateForAddr(a.addr)
 	if !ok {
 		t.Fatal("no candidate")
 	}
-	if m.swallowSuspect(a4.addr, "confusion") {
-		t.Fatal("a suspect with nothing behind it")
+	_ = m.HandshakeUnanswered(&quietDialer{id: "conf_0", priority: 25}, ca, true)
+
+	var orders []string
+	var gaps []time.Duration
+	for range 4 {
+		log.mu.Lock()
+		log.ids, log.at = nil, nil
+		log.mu.Unlock()
+		if !m.swallowPressure(a.addr) {
+			t.Fatal("no pressure - the test proves nothing")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+		_, _, _ = m.Connect(ctx, "")
+		cancel()
+		log.mu.Lock()
+		orders = append(orders, strings.Join(log.ids, ","))
+		for i := 1; i < len(log.at); i++ {
+			gaps = append(gaps, log.at[i].Sub(log.at[i-1]))
+		}
+		log.mu.Unlock()
 	}
-	_ = m.HandshakeUnanswered(confusion, c6, true)
-	if !m.swallowSuspect(a4.addr, "confusion") {
-		t.Fatal("a transport mute on a's v6 is no suspect on its v4")
+	if len(gaps) < 8 {
+		t.Fatalf("%d gaps in four cycles - the test proves nothing: %v", len(gaps), orders)
 	}
-	if m.swallowSuspect(a4.addr, "geneva") {
-		t.Fatal("Geneva became a suspect for Confusion's silence")
+	lo, hi := slices.Min(gaps), slices.Max(gaps)
+	if hi-lo < lo/5 {
+		t.Fatalf("attempt gaps %v-%v: a fixed rhythm", lo, hi)
+	}
+	if len(slices.Compact(slices.Sorted(slices.Values(orders)))) == 1 {
+		t.Fatalf("the same order on every cycle: %s", orders[0])
+	}
+}
+
+// TestAFastPathWhoseAlternativesAreGatedKeepsItsCycle: under pressure the
+// fast path is held only when another transport would be dialled after it.
+// Here the only other one is UDP while UDP is excluded, so the fast path is
+// the only transport there is, and a server slow to acknowledge it - none
+// of its first flight is acknowledged by the share - still gets the cycle.
+// Counting the gated transport as an alternative held it to a sixteenth.
+func TestAFastPathWhoseAlternativesAreGatedKeepsItsCycle(t *testing.T) {
+	a := newBlackholeListener(t)
+	b := slowHelloListener(t, 900*time.Millisecond)
+	m := newSilenceManager(t, 3*time.Second, a.addr, b)
+	reality := &protectedGreeter{id: "reality", priority: 5}
+	m.Register(reality)
+	m.Register(&protectedGreeter{id: "quic_salamander", priority: 6})
+	m.mu.Lock()
+	m.excludeUDPStrategies = true
+	m.mu.Unlock()
+	markConnected(m, reality)
+	cb, ok := m.selector().CandidateForAddr(b)
+	if !ok {
+		t.Fatal("no candidate for b")
+	}
+	m.selector().Pin(cb)
+	m.mu.Lock()
+	m.lastDeath = deathMark{server: 0, class: deathSwallowed, ids: []string{"reality"}, at: time.Now()}
+	m.mu.Unlock()
+	if !m.swallowPressure(b) {
+		t.Fatal("no pressure on b - the test proves nothing")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	conn, s, err := m.Connect(ctx, "")
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	conn.Close()
+	if s.ID() != "reality" {
+		t.Fatalf("connected via %s", s.ID())
 	}
 }

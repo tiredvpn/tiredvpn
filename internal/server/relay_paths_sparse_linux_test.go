@@ -326,6 +326,10 @@ func TestEveryRelayPathKeepsASparseProxiedStream(t *testing.T) {
 			scaleLegClocks(t)
 			secret := []byte("relay-leg-secret-0123456789abcdef")
 			exit := newLegExit(t, secret)
+			// The exit's own watch keeps a leg whose relay acknowledges its
+			// downlink, whatever the relay does: off, so each row tests the
+			// relay's liveness and keepalive (P2-1 of the round-10 review).
+			exit.srvCtx.noH2ProxyWatch = true
 			target := newSparseTarget(t)
 			relay := newPathRelay(t, secret, exit.addr, tc.relay)
 			front := relay
