@@ -2218,6 +2218,47 @@ func (m *Manager) swallowPressure(addr string) bool {
 		time.Since(d.at) < routeDeathWindow
 }
 
+// swallowSuspect reports whether transport id is under suspicion of being
+// swallowed on addr's route: it heard nothing on an address of the server
+// in the recent cycles (skip or mute), or the last silence verdict on
+// another server, within routeDeathWindow, named it.
+//
+// Under swallow pressure the fast path - the transport that worked last -
+// is held to its share only then. Held regardless, a live handshake that
+// needs more than its share was cut every cycle: the share is a sixteenth
+// of the cycle, 0.94 s of 15, and a REALITY handshake through a bad mobile
+// link or a server slow to reach its cover takes 7-9 s, so the client
+// failed over from a healthy server. A transport nothing has seen
+// swallowed keeps the rest of the cycle; if it is swallowed after all, that
+// cycle books it, and from the next one on it is a suspect.
+func (m *Manager) swallowSuspect(addr, id string) bool {
+	sincePark := m.serverSincePark(addr)
+	key := m.swallowKey(addr)
+	server := -1
+	if sel := m.selector(); sel != nil {
+		if cand, ok := sel.CandidateForAddr(addr); ok {
+			server = cand.EndpointIdx
+		}
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if r := m.swallowed[key]; r != nil && !swallowStale(r, sincePark) {
+		for _, ids := range r.skip {
+			if ids[id] {
+				return true
+			}
+		}
+		for _, ids := range r.mute {
+			if ids[id] {
+				return true
+			}
+		}
+	}
+	d := m.lastDeath
+	return d.server >= 0 && d.server != server && (d.class == deathSilent || d.class == deathSwallowed) &&
+		time.Since(d.at) < routeDeathWindow && slices.Contains(d.ids, id)
+}
+
 // pressureShares is the smallest share of a cycle an attempt gets under
 // swallow pressure, as a fraction: a sixteenth, 0.94 s of the reconnect's
 // 15. A handshake through a path of a few hundred milliseconds fits, with a
@@ -2791,8 +2832,12 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 				return o.ID() != lastSuccessful.ID() && o.Priority() > 0 && !excludeMap[o.ID()] && !swallowSkip[o.ID()]
 			})
 			// Held only where a connected handshake would keep the rest of
-			// a short cycle, and not when it is the only transport there is.
-			scan.held = scan.hold && others && budget < m.connectTimeout
+			// a short cycle, not when it is the only transport there is,
+			// and only when it is itself under suspicion: the transport
+			// that worked last, seen swallowed nowhere, keeps the cycle
+			// as before, so a slow but live handshake on a bad link
+			// completes (swallowSuspect).
+			scan.held = scan.hold && others && budget < m.connectTimeout && m.swallowSuspect(scan.addr, lastSuccessful.ID())
 			switch {
 			case scan.held:
 				dialBudget = budget / pressureShares

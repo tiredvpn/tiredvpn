@@ -90,6 +90,8 @@ Versions follow [Semantic Versioning](https://semver.org/).
   through, never came up. After a swallowed handshake on the server, or a
   silence verdict on another one, an attempt gets an even share of what is
   left (at least a sixteenth of the cycle) while other transports wait.
+  The transport that worked last keeps the whole cycle unless it is itself
+  the one seen swallowed, so a slow but live handshake still completes.
 - **Server: a session that got the tunnel address it asked for lets go of
   it when it ends.** The exit kept the request's bytes, a slice of a buffer
   the next frame overwrote, and at the end unregistered some other address
