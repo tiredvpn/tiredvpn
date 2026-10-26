@@ -4495,7 +4495,11 @@ func (m *Manager) ReturnCandidate() (endpoint.Candidate, bool) {
 // DialReturn dials s at cand for a session's return to a preferred server:
 // one dial, the endpoint's own secret, no walk. A failed dial is booked on
 // cand as a failed connect, where repeated failures park it; the strategy's
-// own record is not touched, since what failed may be the server.
+// own record is not touched, since what failed may be the server. A dial
+// that connects books nothing: a TCP connect does not show a server that
+// swallows handshakes working, and booking it as a success cleared the
+// failures that keep such a server parked (P3-5 of the round-10 review).
+// The caller books the outcome of the handshake (ReturnOutcome).
 func (m *Manager) DialReturn(ctx context.Context, s Strategy, cand endpoint.Candidate) (net.Conn, error) {
 	m.muxMu.Lock()
 	muxEnabled := m.muxEnabled
@@ -4504,7 +4508,6 @@ func (m *Manager) DialReturn(ctx context.Context, s Strategy, cand endpoint.Cand
 		return nil, fmt.Errorf("return to a preferred server is not supported with mux")
 	}
 	connectCtx, cancel := context.WithTimeout(m.withDialCandidate(ctx, cand), m.connectTimeout)
-	start := time.Now()
 	conn, err := s.Connect(connectCtx, m.withHoppedPort(cand.Addr))
 	cancel()
 	sel := m.selector()
@@ -4514,9 +4517,6 @@ func (m *Manager) DialReturn(ctx context.Context, s Strategy, cand endpoint.Cand
 		}
 		return nil, err
 	}
-	if sel != nil {
-		sel.Report(cand, true, time.Since(start))
-	}
 	m.mu.RLock()
 	useRTTMasking, rttProfile := m.rttMaskingEnabled, m.rttProfile
 	m.mu.RUnlock()
@@ -4525,6 +4525,14 @@ func (m *Manager) DialReturn(ctx context.Context, s Strategy, cand endpoint.Cand
 		conn = WrapWithRTTMasking(conn, rttProfile)
 	}
 	return conn, nil
+}
+
+// ReturnOutcome books the TUN handshake of a return to cand (DialReturn):
+// a success as a successful connect, a failure as a failed one.
+func (m *Manager) ReturnOutcome(cand endpoint.Candidate, ok bool) {
+	if sel := m.selector(); sel != nil {
+		sel.Report(cand, ok, 0)
+	}
 }
 
 // PinCandidate moves the selector's pin to cand: the session now rides it.
