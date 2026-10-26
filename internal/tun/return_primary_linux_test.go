@@ -112,6 +112,13 @@ type returnHarness struct {
 
 func newReturnHarness(t *testing.T) *returnHarness {
 	t.Helper()
+	return newReturnHarnessOwning(t, true)
+}
+
+// newReturnHarnessOwning is newReturnHarness with ownsInterface as given:
+// false is a host-owned interface (Android, macOS).
+func newReturnHarnessOwning(t *testing.T, ownsInterface bool) *returnHarness {
+	t.Helper()
 	oldIdle, oldEvery, oldRetry := returnIdleAfter, returnCheckEvery, returnRetryAfter
 	returnIdleAfter, returnCheckEvery = 400*time.Millisecond, 50*time.Millisecond
 	returnRetryAfter = func() time.Duration { return 600 * time.Millisecond }
@@ -138,7 +145,7 @@ func newReturnHarness(t *testing.T) *returnHarness {
 	dev := &TUNDevice{file: os.NewFile(uintptr(fds[0]), "tun"), mtu: 1500, atomicMTU: 1500, remoteIP: b.serverIP}
 	app := os.NewFile(uintptr(fds[1]), "app")
 	v := &VPNClient{running: 1, stopCh: make(chan struct{}), manager: m, tun: dev, localIP: b.clientIP,
-		serverAddr: bAt, ownsInterface: true, ipv6Policy: IPv6PolicyOff, stall: newFlowTable()}
+		serverAddr: bAt, ownsInterface: ownsInterface, ipv6Policy: IPv6PolicyOff, stall: newFlowTable()}
 	setLog(t, &stampedLog{})
 	if err := v.connect(context.Background()); err != nil {
 		t.Fatalf("connect: %v", err)
@@ -294,10 +301,7 @@ func TestAFailedReturnKeepsTheTunnelAndWaits(t *testing.T) {
 // configures the interface from the session it was told about, and the
 // return hands out another exit's addresses. The idle tunnel stays on b.
 func TestAHostOwnedInterfaceIsNotReturned(t *testing.T) {
-	h := newReturnHarness(t)
-	h.v.mu.Lock()
-	h.v.ownsInterface = false
-	h.v.mu.Unlock()
+	h := newReturnHarnessOwning(t, false)
 	time.Sleep(returnIdleAfter + 6*returnCheckEvery)
 	if h.onA() || h.a.dials.Load() != 0 {
 		t.Fatalf("a host-owned interface was moved: on a %v, a dialled %d times", h.onA(), h.a.dials.Load())
