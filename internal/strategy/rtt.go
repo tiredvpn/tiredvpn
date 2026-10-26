@@ -518,8 +518,11 @@ func (c *RTTMaskingConn) close() error {
 		return errors.Join(flushErr, cn.CloseNow())
 	}
 	sockErr := closeSock()
-	// Release the wrapped conn too. Its error only reports the socket
-	// closed just above.
+	// Release the wrapped conn too. Its error is dropped on purpose: for a
+	// plain socket it only reports the close just above, and for a wrapped
+	// conn that lost its own tail (a MorphedConn returning
+	// ErrShaperCloseIncomplete) that conn already logs the loss itself, so
+	// nothing goes silent. flushErr already carries the RTT burst.
 	_ = c.Conn.Close()
 	return errors.Join(flushErr, sockErr)
 }

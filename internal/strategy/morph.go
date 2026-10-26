@@ -847,6 +847,16 @@ func (mc *MorphedConn) close() error {
 			_ = mc.Conn.Close()
 			return err
 		}
+		// No abort timer here, unlike the pacer path: a CloseNow that lands
+		// after this abortRequested check but before mc.Conn.Close finishes
+		// cannot cut the close_notify short. Its abortNow only sets the
+		// write deadline to now, so at worst crypto/tls replaces it with its
+		// own 5 s one for the alert - bounded, not a hang. It is safe today:
+		// the only CloseNow caller is VPNClient.Stop, and every VPNClient
+		// close path holds v.mu and nils v.conn first, so Stop cannot race
+		// another close on the same conn. An external caller that closes one
+		// unpaced MorphedConn from two goroutines at once is the only way to
+		// hit it, and it costs at most that 5 s.
 		return mc.Conn.Close()
 	}
 
