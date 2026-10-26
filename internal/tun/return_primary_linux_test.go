@@ -29,7 +29,7 @@ type returnExit struct {
 	displace bool
 	// echoing leaves a displaced session up and echoing keepalives, with no
 	// downlink, as an exit's HTTP/2 TUN loop did until round 17.
-	echoing bool
+	echoing atomic.Bool
 	// requested, when set, is called as a handshake request arrives, and
 	// answerAfter (nanoseconds) holds the answer back.
 	requested   atomic.Pointer[func()]
@@ -57,7 +57,7 @@ func (e *returnExit) serve(srv net.Conn) {
 		return
 	}
 	e.mu.Lock()
-	if e.displace && !e.echoing {
+	if e.displace && !e.echoing.Load() {
 		// After the 200 ms grace a real exit gives the writer it
 		// replaces (registerClient).
 		for _, old := range e.conns {
