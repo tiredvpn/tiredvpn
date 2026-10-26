@@ -220,13 +220,33 @@ func TestASteadyOneWayDownloadKeepsTheLeg(t *testing.T) {
 // relay's keepalives.
 func steadyDownload(t *testing.T, size int, every time.Duration) {
 	t.Helper()
+	sentAt, sentLog := keepaliveRecord(t)
+	// lateness is how far past its quiet period the latest keepalive went
+	// up: the margin the exit's read deadline has left is the deadline less
+	// the quiet period less this - 600 ms at 1:25 with the 45 s draw. The
+	// timer's 100 ms floor is in it by design; under -race at load 41-50
+	// the worst of 56 runs was 179 ms. A failure here names the lateness
+	// and how long nothing had gone up, so a late timer can be told from a
+	// keepalive that skipped a period.
+	lateness := func() (worst time.Duration, n int) {
+		for _, k := range sentLog() {
+			worst = max(worst, k.sinceUp-k.quiet)
+			n++
+		}
+		return worst, n
+	}
+	t.Cleanup(func() {
+		worst, n := lateness()
+		t.Logf("%d keepalives up, the latest %v past its quiet period", n, worst.Round(time.Millisecond))
+	})
 	exit, sink, clientIP, down := dialLeg(t)
 	w := exitWriterFor(t, exit, clientIP)
 	pkt := ipv4Packet(net.IPv4(10, 8, 7, 9), clientIP)
 	pkt = append(pkt, make([]byte, size-len(pkt))...)
 	binary.BigEndian.PutUint16(pkt[2:], uint16(len(pkt)))
 	span := legDeadlines * h2FrameReadTimeout()
-	deadline := time.Now().Add(span)
+	start := time.Now()
+	deadline := start.Add(span)
 	clientTick := time.NewTicker(10 * time.Second / legScale)
 	defer clientTick.Stop()
 	stream := time.NewTicker(every)
@@ -235,8 +255,13 @@ func steadyDownload(t *testing.T, size int, every time.Duration) {
 	for time.Now().Before(deadline) {
 		select {
 		case <-sink.Done():
-			t.Fatalf("the leg closed after %v (exit read deadline %v): %s",
-				span-time.Until(deadline), h2FrameReadTimeout(), closeReason(sink))
+			worst, n := lateness()
+			quietUp := time.Since(start)
+			if at := sentAt(); len(at) > 0 {
+				quietUp = time.Since(at[len(at)-1])
+			}
+			t.Fatalf("the leg closed after %v (exit read deadline %v): %s; %d keepalives up, the latest %v past its quiet period, none for the last %v",
+				span-time.Until(deadline), h2FrameReadTimeout(), closeReason(sink), n, worst.Round(time.Millisecond), quietUp.Round(time.Millisecond))
 		case <-clientTick.C:
 			sink.UpdateActivity()
 		case <-stream.C:
