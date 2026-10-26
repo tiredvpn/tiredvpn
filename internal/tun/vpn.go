@@ -205,6 +205,12 @@ type VPNClient struct {
 	// lastTx is a monoNow stamp of the last frame written up the tunnel,
 	// keepalives included (keepUplinkAlive).
 	lastTx atomic.Int64
+	// lastDataTx is a monoNow stamp of the last packet from the TUN written
+	// up the tunnel: lastTx without keepalives and probes.
+	lastDataTx atomic.Int64
+	// returnNotBefore is a monoNow stamp before which no return to a
+	// preferred server is tried again (tryReturnToPreferred).
+	returnNotBefore atomic.Int64
 	// keepaliveMu serialises the two keepalives, the server-silence one
 	// and the uplink's own, from their last look at the stamps to the
 	// write; lastKeepalive is a monoNow stamp of the last one sent.
@@ -655,6 +661,7 @@ func (v *VPNClient) Start(ctx context.Context) error {
 	go v.sendKeepalive()
 	go v.keepUplinkAlive()
 	go v.watchStalls()
+	go v.watchReturnToPreferred()
 
 	// Auto-MTU: measure the real end-to-end ceiling and apply min(probed, cap).
 	// readFromServer is already running so PROBE_REPLY frames can be routed to the
@@ -1056,6 +1063,20 @@ func (v *VPNClient) connect(parent context.Context) error {
 	// may have had to look at the first byte of the first frame.
 	conn = tunnelConn
 
+	return v.publishSession(conn, strat, cand, hasCand, resp, n, nil)
+}
+
+// errSessionChanged is publishSession refusing a session because the tunnel
+// is no longer riding the conn the caller replaces.
+var errSessionChanged = errors.New("the tunnel changed meanwhile")
+
+// publishSession installs conn, whose TUN handshake answered resp[:n], as the
+// tunnel's session on cand: the conn, the strategy, the addresses the exit
+// assigned (onto the TUN device too), the IPv6 side and the session's
+// bookkeeping. With replaces set it installs only while the tunnel still
+// rides replaces, and leaves closing it to the caller. Called with sessionMu
+// held.
+func (v *VPNClient) publishSession(conn net.Conn, strat strategy.Strategy, cand endpoint.Candidate, hasCand bool, resp []byte, n int, replaces net.Conn) error {
 	// Server sends its TUN IP and assigned client IP.
 	serverIP := net.IP(resp[1:5])
 	assignedIP := net.IP(resp[5:9])
@@ -1075,6 +1096,12 @@ func (v *VPNClient) connect(parent context.Context) error {
 		v.mu.Unlock()
 		conn.Close()
 		return context.Canceled
+	}
+	if replaces != nil && (v.conn != replaces || atomic.LoadInt32(&v.reconnecting) == 1 ||
+		atomic.LoadInt32(&v.portHopInProgress) == 1) {
+		v.mu.Unlock()
+		conn.Close()
+		return errSessionChanged
 	}
 	v.conn = conn
 	v.strategy = strat
@@ -1396,7 +1423,7 @@ func readHandshakeResponse(conn net.Conn, clientVersion byte, deadline time.Time
 		// never get here: the 9-byte read above fails on them.)
 		return resp, 9, conn, nil
 	}
-	n, next, err := readHandshakeFlags(conn, resp, clientVersion)
+	n, next, err := readHandshakeFlags(conn, resp, clientVersion, deadline)
 	if err != nil {
 		return nil, 0, conn, fmt.Errorf("%w: %w", errHandshakePartlyAnswered, err)
 	}
@@ -1418,8 +1445,9 @@ func readHandshakeResponse(conn net.Conn, clientVersion byte, deadline time.Time
 // is the first byte of a frame and is handed back through a replayConn. When
 // nothing has arrived within handshakeFlagsGrace the answer is taken to have
 // no flags (the only answer that can end at 9 bytes with nothing behind it),
-// and the read still in flight is handed over too.
-func readHandshakeFlags(conn net.Conn, resp []byte, clientVersion byte) (int, net.Conn, error) {
+// and the read still in flight is handed over too. deadline is the read
+// deadline in force on conn, the one the peek runs under.
+func readHandshakeFlags(conn net.Conn, resp []byte, clientVersion byte, deadline time.Time) (int, net.Conn, error) {
 	if clientVersion >= tunHandshakeVersionDualStack {
 		if _, err := io.ReadFull(conn, resp[9:10]); err != nil {
 			return 9, conn, fmt.Errorf("handshake flags read failed: %w", err)
@@ -1442,7 +1470,7 @@ func readHandshakeFlags(conn net.Conn, resp []byte, clientVersion byte) (int, ne
 			return 9, &replayConn{Conn: conn, pending: []byte{r.b}}, nil
 		}
 	case <-time.After(handshakeFlagsGrace):
-		return 9, &replayConn{Conn: conn, inflight: peek}, nil
+		return 9, &replayConn{Conn: conn, inflight: peek, peekDeadline: deadline}, nil
 	}
 }
 
@@ -1450,6 +1478,7 @@ func readHandshakeFlags(conn net.Conn, resp []byte, clientVersion byte) (int, ne
 type peekResult struct {
 	b   byte
 	err error
+	at  time.Time // when the read came back
 }
 
 // peekHandshakeByte reads the byte after the 9-byte prefix on its own
@@ -1468,7 +1497,7 @@ func peekHandshakeByte(conn net.Conn) <-chan peekResult {
 	go func() {
 		var one [1]byte
 		_, err := io.ReadFull(conn, one[:])
-		ch <- peekResult{b: one[0], err: err}
+		ch <- peekResult{b: one[0], err: err, at: time.Now()}
 	}()
 	return ch
 }
@@ -1494,6 +1523,22 @@ type replayConn struct {
 	pending  []byte
 	inflight <-chan peekResult // a peek read still running, nil once collected
 	err      error             // set once the stream can no longer be framed
+
+	// peekDeadline is the read deadline the peek in flight was started
+	// under.
+	peekDeadline time.Time
+}
+
+// peekOutlived reports a peek that came back with an error on the deadline
+// it was started under. A transport where a deadline reaches a Read already
+// blocked never does that once the handshake reader has cleared it: clearing
+// wakes the read. smux v2, which carries every REALITY tunnel, reads the
+// deadline only when a Read starts, so the peek kept the handshake's deadline
+// after the reader cleared it, and a tunnel that sent nothing down for the
+// rest of the response budget (10 s) was dropped with "server read: timeout"
+// (stand twocli/f14-registry, session=9.396s).
+func (c *replayConn) peekOutlived(r peekResult) bool {
+	return r.err != nil && !c.peekDeadline.IsZero() && !r.at.Before(c.peekDeadline)
 }
 
 func (c *replayConn) Read(p []byte) (int, error) {
@@ -1503,6 +1548,14 @@ func (c *replayConn) Read(p []byte) (int, error) {
 	if c.inflight != nil {
 		r := <-c.inflight
 		c.inflight = nil
+		if c.peekOutlived(r) {
+			// The peek read nothing: read its byte again, under the
+			// deadline in force now. A close or a broken stream comes back
+			// again, and so does a deadline set since that has run out.
+			var one [1]byte
+			_, err := io.ReadFull(c.Conn, one[:])
+			r = peekResult{b: one[0], err: err}
+		}
 		if r.err != nil {
 			// The read ended without a byte; whatever ended it (a deadline
 			// the caller set since, a close) is this read's answer.
@@ -1963,7 +2016,9 @@ func (v *VPNClient) readFromTun() {
 			v.connLost(conn, "server write", uplinkFailed(err))
 			continue
 		}
-		v.lastTx.Store(monoNow())
+		now := monoNow()
+		v.lastTx.Store(now)
+		v.lastDataTx.Store(now)
 
 		if log.DebugEnabled() {
 			log.Debug("TUN->Server: sent %d bytes (payload=%d) to server", written, n)

@@ -1844,9 +1844,21 @@ func tunClientReadTimeout() time.Duration { return time.Duration(tunClientReadTi
 // is invoked exactly once — immediately after auth succeeds — and returns the
 // connection and framer to use for the subsequent relay phase.
 func runH2FrameLoop(connPtr *net.Conn, framerPtr **http2.Framer, hpackDec *hpack.Decoder, srvCtx *serverContext, logger *log.Logger, authenticated *bool, authClientID *clientIdentity, authSecret *[]byte, connTracked *bool, tunnel **h2TunnelState, handover func(net.Conn) (net.Conn, *http2.Framer), ekm []byte) {
+	// watch is set once the session is a proxied stream (h2ProxyWatch).
+	var watch *h2ProxyWatch
+	defer func() {
+		if watch != nil {
+			watch.stop()
+		}
+	}()
 	for {
 		conn := *connPtr
 		framer := *framerPtr
+		if watch == nil {
+			if t := *tunnel; t != nil && t.targetConn != nil && t.tunGate == nil {
+				watch = watchH2ProxyClient(conn, logger)
+			}
+		}
 		deadline := h2FrameReadTimeout()
 		conn.SetReadDeadline(time.Now().Add(deadline))
 		frame, err := framer.ReadFrame()

@@ -77,10 +77,11 @@ func splitTUNClientTag(data []byte) ([]byte, string) {
 // told apart by anything durable they send, so there is nothing stable to
 // key on and the tag is drawn per downstream session. Two boxes behind one
 // NAT then hold two leases instead of fighting over one, and each keeps its
-// address while it reconnects, because a reconnect asks for the address it
-// holds and the pool honours a free request. A box that reconnects after
-// something else took that address gets a new one, as it would after a
-// lease expiry.
+// address while it reconnects: a reconnect asks for the address it holds,
+// and the exit hands the lease from the session before over to the new tag
+// once no session holds it (takeOverSharedLease). A box that reconnects
+// after something else took that address gets a new one, as it would after
+// a lease expiry.
 func relayClientTag(id clientIdentity) string {
 	if id.perClient && id.leaseID() != "" {
 		return "c" + id.leaseID()
@@ -259,7 +260,31 @@ func allocateTunnelIP(srvCtx *serverContext, id clientIdentity, origin, clientTa
 	ctx, cancel := context.WithTimeout(context.Background(), adoptScanTimeout)
 	defer cancel()
 	srvCtx.ipPool.AdoptAll(ctx, keys, prefixes, key)
+	takeOverSharedLease(srvCtx, id, origin, clientTag, key, requested)
 	return srvCtx.ipPool.Allocate(key, requested, "")
+}
+
+// takeOverSharedLease hands a client on a shared credential behind a relay
+// the address it asks for back, when the lease on it is another session tag
+// of the same credential and origin and no session holds it.
+//
+// The relay draws such a client's tag per session (relayClientTag), so every
+// reconnect came with a new lease key. The reconnect asks for the address the
+// client holds, but the lease from the session before still held it -
+// permanent, as requested leases are - and the client got a new address on
+// every reconnect while the old leases piled up (fix14 stand, twocli shared).
+// The client that asks is the one that had it, or another box on the same
+// secret behind the same NAT, which could take it over anyway; a session
+// that holds the address keeps it.
+func takeOverSharedLease(srvCtx *serverContext, id clientIdentity, origin, clientTag, key string, requested net.IP) {
+	if clientTag == "" || origin == "" || requested == nil || requested.IsUnspecified() ||
+		srvCtx.sharedTUN == nil || srvCtx.sharedTUN.Serving(requested) {
+		return
+	}
+	// Only from a drawn tag ("s", relayClientTag) of the same credential and
+	// origin: a client with its own credential keys its lease by its id and
+	// is never under this prefix.
+	srvCtx.ipPool.TakeOver(requested, allocationKey(id, origin, "")+"#s", key)
 }
 
 // legacyAllocationKeys lists the keys a server before the credential lease

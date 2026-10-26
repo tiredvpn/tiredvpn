@@ -35,13 +35,14 @@ import (
 //   - SSH and IMAP name their conn twice (overTransport and the camouflage
 //     conn's NetConn); either alone keeps the row green, both gone turn it
 //     red.
-//   - The HTTP/2 Stego proxy path is driven as the second relay of a chain,
-//     its client the first relay's upstream conn. Its own keepalive does not
-//     show there: every write up, the first relay's empty keepalive frames
-//     included, makes the stego conn flush its WINDOW_UPDATE credit up the
-//     leg. A client of its own that sends nothing loses its session to the
-//     relay's 60 s read deadline before the leg matters, as straight to an
-//     exit, so no shape of a real client shows it.
+//   - The HTTP/2 Stego proxy path has two rows. Driven by its own client,
+//     it is red without h2ProxyWatch: the client sends nothing, and the
+//     relay's 60 s read deadline ended its session before the leg mattered
+//     (proxy-f14-h2-relay on the fix14 stand). As the second relay of a
+//     chain, its client the first relay's upstream conn, its own keepalive
+//     does not show: every write up, the first relay's empty keepalive
+//     frames included, makes the stego conn flush its WINDOW_UPDATE credit
+//     up the leg.
 
 // sparseTarget is the target of the proxied streams: it sends each one 28 B
 // every sparseEvery and keeps what comes up.
@@ -315,6 +316,9 @@ func TestEveryRelayPathKeepsASparseProxiedStream(t *testing.T) {
 		{name: "QUIC", relay: withQUIC, dial: strategyStream(func(m *strategy.Manager, r *pathRelay) strategy.Strategy {
 			return strategy.NewQUICSalamanderStrategy(m, r.srvCtx.cfg.Secret, r.quicPort)
 		})},
+		{name: "HTTP2 Stego proxy", dial: strategyStream(func(m *strategy.Manager, r *pathRelay) strategy.Strategy {
+			return strategy.NewHTTP2StegoStrategy(m, r.srvCtx.cfg.Secret, "")
+		})},
 		{name: "HTTP2 Stego proxy, relay chain", chain: true, dial: strategyStream(antiProbe)},
 		{name: "mux", dial: muxStream},
 	} {
@@ -381,4 +385,87 @@ func proxiedSparseDownload(t *testing.T, exit *legExit, target *sparseTarget, co
 	if got := target.received(); string(got) != "hello" {
 		t.Fatalf("the target got %q, want the client's hello and nothing else", got)
 	}
+}
+
+// TestAnH2ProxySessionWithNothingDownStillEndsOnItsDeadline is the other
+// side of h2ProxyWatch: a proxied stream whose target sends nothing gives
+// the client nothing to acknowledge, so the relay must still end the
+// session on its read deadline - the watch keeps a client that is there,
+// not every open socket. The sparse target is the control: the same path
+// keeps the stream, and the watch is what moved the deadline. Only the
+// relay's session with the client counts: the exit behind it hears the
+// relay's own keepalive, and moving its deadline then changes nothing.
+func TestAnH2ProxySessionWithNothingDownStillEndsOnItsDeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		target func(*testing.T) string
+		ends   bool
+	}{
+		{"quiet target", newQuietTarget, true},
+		{"sparse target", func(t *testing.T) string { return newSparseTarget(t).addr }, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scaleLegClocks(t)
+			secret := []byte("relay-leg-secret-0123456789abcdef")
+			exit := newLegExit(t, secret)
+			relay := newPathRelay(t, secret, exit.addr, nil)
+			var extended atomic.Int64
+			hook := func(c net.Conn) {
+				if c.LocalAddr().String() == relay.addr {
+					extended.Add(1)
+				}
+			}
+			h2ProxyDeadlineExtended.Store(&hook)
+			t.Cleanup(func() { h2ProxyDeadlineExtended.Store(nil) })
+			conn := strategyStream(func(m *strategy.Manager, r *pathRelay) strategy.Strategy {
+				return strategy.NewHTTP2StegoStrategy(m, r.srvCtx.cfg.Secret, "")
+			})(t, relay, tc.target(t))
+			start := time.Now()
+			ended := make(chan error, 1)
+			go func() {
+				_, err := io.Copy(io.Discard, conn)
+				ended <- err
+			}()
+			select {
+			case <-ended:
+				if !tc.ends {
+					t.Fatalf("the stream ended after %v, %d extensions", time.Since(start).Round(time.Millisecond), extended.Load())
+				}
+				if el := time.Since(start); el > 2*h2FrameReadTimeout() {
+					t.Fatalf("the stream ended after %v, want within two read deadlines (%v)", el.Round(time.Millisecond), h2FrameReadTimeout())
+				}
+				if n := extended.Load(); n != 0 {
+					t.Fatalf("the watch moved the deadline %d times for a client it sends nothing to", n)
+				}
+			case <-time.After(3 * h2FrameReadTimeout()):
+				if tc.ends {
+					t.Fatalf("the stream is open after three read deadlines, %d extensions", extended.Load())
+				}
+				if extended.Load() == 0 {
+					t.Fatal("the stream lived without the watch moving the deadline - the row proves nothing about it")
+				}
+			}
+		})
+	}
+}
+
+// newQuietTarget accepts connections, reads what comes and sends nothing.
+func newQuietTarget(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			t.Cleanup(func() { c.Close() })
+			go func() { _, _ = io.Copy(io.Discard, c) }()
+		}
+	}()
+	return ln.Addr().String()
 }

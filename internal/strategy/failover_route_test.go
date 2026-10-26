@@ -114,9 +114,13 @@ func TestDifferentDeathsAreNotTheRoute(t *testing.T) {
 
 // TestRouteWideSwallowingChangesTheTransportOnTheSecondServer: REALITY and
 // Polling handshakes are swallowed on every server, WebSocket gets through.
-// The swallow verdict on a parks a; the same verdict on b parks the two
-// transports instead, and the next cycle connects WebSocket on b. c is never
-// dialled.
+// The transport changes, the pool is not walked: c is never dialled. Until
+// round 15 each cycle tried one swallowed transport - the swallow verdict on
+// a parked a, the same verdict on b set the two transports aside, and the
+// next cycle connected WebSocket on b. Under swallow pressure (REALITY
+// swallowed on a in the first cycle) the second cycle gives each transport
+// its share, and WebSocket connects on a, which never had anything wrong
+// with it.
 func TestRouteWideSwallowingChangesTheTransportOnTheSecondServer(t *testing.T) {
 	a, b, c := newHelloListener(t), newHelloListener(t), newHelloListener(t)
 	m := newSilenceManager(t, 2*time.Second, a.addr, b.addr, c.addr)
@@ -130,8 +134,8 @@ func TestRouteWideSwallowingChangesTheTransportOnTheSecondServer(t *testing.T) {
 	if s == nil || s.ID() != "ws" {
 		t.Fatalf("after %d cycles: connected through %v, want ws", cycles, s)
 	}
-	if got := m.GetServerAddr(context.Background()); got != b.addr {
-		t.Fatalf("connected on %s, want the second server %s", got, b.addr)
+	if got := m.GetServerAddr(context.Background()); got != a.addr || cycles != 2 {
+		t.Fatalf("connected on %s in cycle %d, want the first server %s in the second", got, cycles, a.addr)
 	}
 	if n := c.accepts.Load(); n != 0 {
 		t.Fatalf("the third server was dialled %d times", n)

@@ -305,12 +305,18 @@ var refusalRetries = []time.Duration{250 * time.Millisecond, 500 * time.Millisec
 // handshake is under way, and cutting it is how a REALITY handshake that needs
 // 7-9 s (a slow path, a server reaching its cover domain) lost the cycle to
 // HTTP Polling. Only dials through protect.ProtectDialer report the connect;
-// a strategy dialling on its own is held to dialLimit as a whole.
+// a strategy dialling on its own is held to dialLimit as a whole, and so is
+// every attempt under swallow pressure (scan.held, see swallowPressure).
 func (m *Manager) connectThroughRefusal(ctx context.Context, s Strategy, target string, limit, dialLimit time.Duration, scan *scanState) (conn net.Conn, latency time.Duration, refused bool, err error) {
 	_, reporter := s.(connectReporter)
-	if !reporter && dialLimit > 0 {
+	held := scan.held && dialLimit > 0 && dialLimit < limit
+	switch {
+	case held:
+		limit, dialLimit = dialLimit, 0
+	case !reporter && dialLimit > 0:
 		limit, dialLimit = attemptLimit(s, limit, dialLimit), 0
 	}
+	scan.heldSilent, scan.limit = false, limit
 	for i := 0; ; i++ {
 		connectCtx, cancel := context.WithTimeout(ctx, limit)
 		phase := watchConnect(connectCtx, cancel, limit, dialLimit, reporter)
@@ -332,9 +338,12 @@ func (m *Manager) connectThroughRefusal(ctx context.Context, s Strategy, target 
 		if at := phase.connectedAt.Load(); at != 0 {
 			scan.allowance = time.Since(time.Unix(0, at))
 		}
-		if err != nil && phase.extended() && phase.connected() && heardNothing(err, latency, limit) &&
-			m.swallowEvidence(s, scan.allowance) {
+		if err != nil && phase.connected() && heardNothing(err, latency, limit) &&
+			(phase.extended() && m.swallowEvidence(s, scan.allowance) || held && !isUDPBasedStrategy(s)) {
+			// Held to its share, it counts on less evidence than a whole
+			// cycle: the swallow pressure is the rest of it.
 			scan.connectedSilent = append(scan.connectedSilent, s.ID())
+			scan.heldSilent = held
 		}
 		if err == nil || isUDPBasedStrategy(s) || !refusedByAddr(err, target, m.GetServerAddr(ctx)) {
 			return conn, latency, false, err
@@ -2106,6 +2115,18 @@ type scanState struct {
 	// rejected handshake. One is enough: whatever is wrong from there on is a
 	// property of a transport, which is what the scan exists to work around.
 	answered bool
+	// hold keeps a connected handshake to its attempt's share of the cycle
+	// instead of the rest of it, under swallow pressure (swallowPressure).
+	hold bool
+	// held says the next attempt is held to its share: hold, and other
+	// transports after it. The caller sets it before each attempt.
+	held bool
+	// heldSilent says the last attempt was held to its share, connected,
+	// and heard nothing: evidence for the run like a whole cycle's.
+	heldSilent bool
+	// limit is how long the last attempt was let run, which is what its
+	// silence is read against (attemptLimit, or its share when held).
+	limit time.Duration
 	// timeouts counts non-UDP strategies that died on the connect timeout.
 	timeouts int
 	// addr is the address the cycle's swallow record is kept under: the
@@ -2149,6 +2170,60 @@ type scanState struct {
 func (m *Manager) swallowEvidence(s Strategy, allowance time.Duration) bool {
 	return !isUDPBasedStrategy(s) && allowance >= m.connectTimeout/3
 }
+
+// swallowPressure reports whether addr's cycle runs under evidence that
+// handshakes are being swallowed: a transport went unanswered on an address
+// of the server in the recent cycles, or another server got a silence
+// verdict within routeDeathWindow. Then a connected handshake is held to its
+// share of the cycle (scanState.held), and one that heard nothing there
+// counts for the run and is set aside on the address for the next cycle.
+//
+// Without it a connected handshake keeps the rest of its cycle - a slow one
+// (7-9 s through a lossy path, a server reaching its cover) used to be cut
+// and land the tunnel on HTTP Polling. With it a cycle tried one transport
+// on one address: the fix13c stand dropped every ClientHello over 1500 B on
+// both servers, REALITY, Polling, Stego and Seqovl took one cycle and its
+// backoff each on each of four addresses, and Geneva, which fragments its
+// ClientHello and got through, never came up in 300 s. Under the pressure
+// the slow-handshake case is the one that pays: an answer slower than its
+// share is cut, and the transport tried after the others on that address.
+// Never in forced mode, which has one transport.
+func (m *Manager) swallowPressure(addr string) bool {
+	sincePark := m.serverSincePark(addr)
+	key := m.swallowKey(addr)
+	sel := m.selector()
+	server := -1
+	if sel != nil {
+		if cand, ok := sel.CandidateForAddr(addr); ok {
+			server = cand.EndpointIdx
+		}
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.forced {
+		return false
+	}
+	if r := m.swallowed[key]; r != nil && !swallowStale(r, sincePark) {
+		for _, ids := range r.skip {
+			if len(ids) > 0 {
+				return true
+			}
+		}
+		if !r.muteEmpty() {
+			return true
+		}
+	}
+	d := m.lastDeath
+	return d.server >= 0 && d.server != server && (d.class == deathSilent || d.class == deathSwallowed) &&
+		time.Since(d.at) < routeDeathWindow
+}
+
+// pressureShares is the smallest share of a cycle an attempt gets under
+// swallow pressure, as a fraction: a sixteenth, 0.94 s of the reconnect's
+// 15. A handshake through a path of a few hundred milliseconds fits, with a
+// round trip to the server's cover for REALITY. An eighth left Geneva, tenth
+// of twenty transports, nothing: eight shares of 1.9 s are the cycle.
+const pressureShares = 16
 
 // swallowRecord is what one server's last reconnect cycles left behind. The
 // run is kept per server: a server that swallows handshakes on one family is
@@ -2660,6 +2735,9 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 		log.Info("Strategies %s died on this server and the one before it - trying them last here",
 			strings.Join(slices.Sorted(maps.Keys(routeLast)), ", "))
 	}
+	if scan.hold = m.swallowPressure(scan.addr); scan.hold {
+		log.Info("Handshakes went unanswered on this server or the one before it - each transport gets its share of the cycle, not the rest of it")
+	}
 	defer func() { m.noteSwallowed(scan.addr, scan.connectedSilent); scan.connectedSilent = nil }()
 
 	// Try last successful strategy first if it was recent (within 5 minutes), but
@@ -2709,7 +2787,16 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			// land the tunnel on HTTP Polling.
 			budget := m.attemptBudget(ctx)
 			dialBudget := budget
-			if budget < m.connectTimeout {
+			others := slices.ContainsFunc(m.GetOrderedStrategies(), func(o Strategy) bool {
+				return o.ID() != lastSuccessful.ID() && o.Priority() > 0 && !excludeMap[o.ID()] && !swallowSkip[o.ID()]
+			})
+			// Held only where a connected handshake would keep the rest of
+			// a short cycle, and not when it is the only transport there is.
+			scan.held = scan.hold && others && budget < m.connectTimeout
+			switch {
+			case scan.held:
+				dialBudget = budget / pressureShares
+			case budget < m.connectTimeout:
 				dialBudget = budget / 2
 			}
 			conn, latency, refused, err := m.connectThroughRefusal(ctx, lastSuccessful, target, budget, dialBudget, scan)
@@ -2746,7 +2833,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			// count is how a reconnect spent its whole budget here and then
 			// called the address "answering".
 			if !isUDPBasedStrategy(lastSuccessful) {
-				switch m.classifyAttempt(err, latency, attemptLimit(lastSuccessful, budget, dialBudget)) {
+				switch m.classifyAttempt(err, latency, scan.limit) {
 				case attemptSilent:
 					scan.timeouts++
 					if !dialNeverConnected(err) {
@@ -2758,7 +2845,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 					excludeMap[lastSuccessful.ID()] = true
 				case attemptInconclusive:
 					scan.unheard++
-					if m.swallowEvidence(lastSuccessful, scan.allowance) {
+					if m.swallowEvidence(lastSuccessful, scan.allowance) || scan.heldSilent {
 						scan.inconclusive = append(scan.inconclusive, lastSuccessful.ID())
 					}
 					excludeMap[lastSuccessful.ID()] = true
@@ -2914,6 +3001,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 	attemptCount := 0
 	addrSilent := false
 	toLast := false // skipping to the set-aside transports
+	scanStartBudget := m.attemptBudget(ctx)
 
 	for i, s := range strategies {
 		if ctxErr(ctx) != nil {
@@ -3020,7 +3108,16 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			// connect; once connected, its handshake keeps the rest.
 			budget := m.attemptBudget(ctx)
 			dialBudget := budget
-			if budget < m.connectTimeout && i < len(strategies)-1 {
+			scan.held = scan.hold && i < len(strategies)-1 && budget < m.connectTimeout
+			switch {
+			case i == len(strategies)-1:
+			case scan.held:
+				// An even share of what is left, so the transports at the
+				// end of the list get a turn too - halving left Geneva,
+				// tenth in the list, a few milliseconds - and no less
+				// than pressureShares of the cycle.
+				dialBudget = min(budget, max(budget/time.Duration(len(strategies)-i), scanStartBudget/pressureShares))
+			case budget < m.connectTimeout:
 				dialBudget = budget / 2
 			}
 			conn, latency, refused, err := m.connectThroughRefusal(ctx, s, target, budget, dialBudget, scan)
@@ -3075,7 +3172,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			// containing the word the classifier looks for. A refusal or a
 			// reset arrives in milliseconds; only silence costs the whole
 			// budget.
-			verdict := m.classifyAttempt(err, latency, attemptLimit(s, budget, dialBudget))
+			verdict := m.classifyAttempt(err, latency, scan.limit)
 
 			if timedOut {
 				log.Debug("  Failed: %s TIMEOUT (latency=%v)", s.Name(), latency)
@@ -3103,7 +3200,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 				}
 			case attemptInconclusive:
 				scan.unheard++
-				if m.swallowEvidence(s, scan.allowance) {
+				if m.swallowEvidence(s, scan.allowance) || scan.heldSilent {
 					scan.inconclusive = append(scan.inconclusive, s.ID())
 				}
 			case attemptAnswered:
@@ -4318,6 +4415,59 @@ func (m *Manager) CurrentCandidate() (endpoint.Candidate, bool) {
 		return endpoint.Candidate{}, false
 	}
 	return sel.Current()
+}
+
+// ReturnCandidate reports the more preferred candidate a session on a
+// fallback should return to, once it has dwelt there for the selector's
+// MinDwell (endpoint.Selector.ReturnCandidate). False without a selector.
+func (m *Manager) ReturnCandidate() (endpoint.Candidate, bool) {
+	sel := m.selector()
+	if sel == nil {
+		return endpoint.Candidate{}, false
+	}
+	return sel.ReturnCandidate(sel.Now())
+}
+
+// DialReturn dials s at cand for a session's return to a preferred server:
+// one dial, the endpoint's own secret, no walk. A failed dial is booked on
+// cand as a failed connect, where repeated failures park it; the strategy's
+// own record is not touched, since what failed may be the server.
+func (m *Manager) DialReturn(ctx context.Context, s Strategy, cand endpoint.Candidate) (net.Conn, error) {
+	m.muxMu.Lock()
+	muxEnabled := m.muxEnabled
+	m.muxMu.Unlock()
+	if muxEnabled {
+		return nil, fmt.Errorf("return to a preferred server is not supported with mux")
+	}
+	connectCtx, cancel := context.WithTimeout(m.withDialCandidate(ctx, cand), m.connectTimeout)
+	start := time.Now()
+	conn, err := s.Connect(connectCtx, m.withHoppedPort(cand.Addr))
+	cancel()
+	sel := m.selector()
+	if err != nil {
+		if sel != nil {
+			sel.Report(cand, false, 0)
+		}
+		return nil, err
+	}
+	if sel != nil {
+		sel.Report(cand, true, time.Since(start))
+	}
+	m.mu.RLock()
+	useRTTMasking, rttProfile := m.rttMaskingEnabled, m.rttProfile
+	m.mu.RUnlock()
+	optimizeTCPConn(conn)
+	if useRTTMasking {
+		conn = WrapWithRTTMasking(conn, rttProfile)
+	}
+	return conn, nil
+}
+
+// PinCandidate moves the selector's pin to cand: the session now rides it.
+func (m *Manager) PinCandidate(cand endpoint.Candidate) {
+	if sel := m.selector(); sel != nil {
+		sel.Pin(cand)
+	}
 }
 
 // SetReprobeInterval changes the reprobe interval
