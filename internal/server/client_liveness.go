@@ -20,8 +20,13 @@ import (
 // keepalive, because the server is never silent for 9 s. Its leg died every
 // 60 s on the exit's read deadline, while the client was there all along
 // (the fix12-slow stand run). So where the transport is TCP and the kernel
-// can say, a client whose TCP acknowledged what the relay sent it within
-// the window is alive too: a phone that left stops acknowledging. A
+// can say, a client whose TCP acknowledged new data the relay sent it
+// within the window is alive too (ackProgress): a phone that left stops
+// acknowledging. It used to be the age of the last ACK of any kind
+// (tcpi_last_ack_recv), and the ACK of a TCP keepalive probe refreshes
+// that: every accepted conn carries Go's 15 s keepalive, so any socket
+// still up counted as a client, and a leg whose client had hung up lived
+// as long as its target stayed open (P2-1 of the round-10 review). A
 // transport that is not TCP says so itself: a QUIC conn is open while its
 // client's packets keep coming (peerAlive), an HTTP Polling session is heard
 // by its requests (seen). Without any of these the first rule alone decides.
@@ -35,6 +40,58 @@ type clientLiveness struct {
 	// has no conn of it - an HTTP Polling session's last request - false if
 	// never. Nil for none.
 	seen func() (time.Duration, bool)
+	// acks follows conn's acknowledged bytes from one look to the next;
+	// nil reads no ACKs. It has to outlive the look: one per downstream
+	// client, held by whoever asks.
+	acks *ackProgress
+}
+
+// ackProgress follows a conn's tcpi_bytes_acked from one look to the next
+// and remembers when it last grew. Only an ACK of new data moves the
+// count: the ACK of a keepalive probe acknowledges nothing new. Measured on
+// this kernel (Linux 7.0, loopback, keepalive at 1 s, a peer that never
+// reads or writes): last_ack_recv stayed under 1 s for as long as it ran,
+// bytes_acked stayed at 1 (the SYN); 100 bytes written moved it to 101.
+type ackProgress struct {
+	last  atomic.Uint64 // bytes acked at the last look
+	grew  atomic.Int64  // when a look last saw them grow, unix nanoseconds, 0 for never
+	begun atomic.Bool   // a first look has set last
+}
+
+// start takes the baseline the first look compares with. Called when the
+// watch on conn begins: without it the first look only set the baseline,
+// and a session whose deadline came before a second look lost it.
+func (a *ackProgress) start(conn net.Conn) {
+	if a == nil {
+		return
+	}
+	if n, ok := bytesAcked(conn); ok {
+		a.last.Store(n)
+		a.begun.Store(true)
+	}
+}
+
+// sinceGrowth looks at conn's acknowledged bytes and reports how long ago
+// a look first saw them grow, false if none has, or where the kernel cannot
+// say. Without a baseline (start) the first look only sets it. Looks come
+// at least once per quiet period, so growth is seen at most one look late.
+func (a *ackProgress) sinceGrowth(conn net.Conn) (time.Duration, bool) {
+	if a == nil {
+		return 0, false
+	}
+	n, ok := bytesAcked(conn)
+	if !ok {
+		return 0, false
+	}
+	now := time.Now().UnixNano()
+	if prev := a.last.Swap(n); a.begun.Swap(true) && n > prev {
+		a.grew.Store(now)
+	}
+	at := a.grew.Load()
+	if at == 0 {
+		return 0, false
+	}
+	return time.Duration(now - at), true
 }
 
 // peerAlive is a conn that knows whether its peer is still there: a QUIC
@@ -55,15 +112,15 @@ func (l clientLiveness) alive() bool {
 	if p, ok := l.conn.(peerAlive); ok && p.PeerAlive() {
 		return true
 	}
-	if d, ok := sinceAckReceived(l.conn); ok && d < window {
+	if d, ok := l.acks.sinceGrowth(l.conn); ok && d < window {
 		return true
 	}
 	return false
 }
 
-// sinceAckReceived is how long ago conn's TCP last received an ACK, false
+// bytesAcked is how many bytes conn's TCP peer has acknowledged, false
 // where that cannot be told: not TCP underneath, or no TCP_INFO.
-func sinceAckReceived(conn net.Conn) (time.Duration, bool) {
+func bytesAcked(conn net.Conn) (uint64, bool) {
 	sc := transportSyscallConn(conn)
 	if sc == nil {
 		return 0, false
@@ -72,12 +129,12 @@ func sinceAckReceived(conn net.Conn) (time.Duration, bool) {
 	if err != nil {
 		return 0, false
 	}
-	var d time.Duration
+	var n uint64
 	var ok bool
-	if cerr := raw.Control(func(fd uintptr) { d, ok = tcpSinceAckReceived(fd) }); cerr != nil {
+	if cerr := raw.Control(func(fd uintptr) { n, ok = tcpBytesAcked(fd) }); cerr != nil {
 		return 0, false
 	}
-	return d, ok
+	return n, ok
 }
 
 // transportConn is a conn carried over another, which it names: an smux
@@ -132,12 +189,11 @@ var upstreamKeepaliveSent atomic.Pointer[func()]
 // What this rule counts as a client being there, and what it does not
 // (P3-10 of the round-9 review):
 //
-//   - It is the ACK of what the relay sent. Measured on loopback with the
-//     kernel keepalive at 1 s on both ends, tcpi_last_ack_recv was
-//     refreshed by the ACK of the data sent and then grew past 7 s
-//     untouched: keepalive probes do not refresh it. So the rule does not
-//     turn every live socket into a live client, as the review read it. A
-//     client the relay sends nothing to goes away by the old rule alone.
+//   - It is the ACK of new data the relay sent (ackProgress). The round-14
+//     measurement that keepalive probes leave tcpi_last_ack_recv alone was
+//     wrong - it looked before the first probe went out - and the rule built
+//     on it kept every socket still up alive (P2-1 of the round-10 review).
+//     A client the relay sends nothing to goes away by the old rule alone.
 //   - While the relay does keep sending - a sparse download, which is the
 //     case the rule was changed for - whatever acknowledges it counts as
 //     the client: a sleeping phone, which is the point, but also a client
@@ -155,6 +211,10 @@ func keepUpstreamAlive(up *strategy.HTTP2StegoConn, live clientLiveness, logger 
 		return
 	}
 	live.heard = up.SinceOwnerWrite
+	if live.acks == nil {
+		live.acks = &ackProgress{}
+	}
+	live.acks.start(live.conn)
 	go up.KeepAlive(relayKeepaliveAfter, live.alive, func() {
 		if logger != nil {
 			logger.Debug("Relay: keepalive up the upstream leg")

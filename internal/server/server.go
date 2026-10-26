@@ -496,6 +496,11 @@ type Config struct {
 
 // serverContext holds runtime context for multi-client mode
 type serverContext struct {
+	// noH2ProxyWatch turns h2ProxyWatch off, for tests of what a relay
+	// does on its own: with the exit's watch on, a relay that keeps
+	// acknowledging the exit's downlink keeps its leg whatever its own
+	// keepalive does (P2-1 of the round-10 review). Never set in production.
+	noH2ProxyWatch bool
 	cfg            *Config
 	registry       *ClientRegistry
 	store          *RedisStore
@@ -1837,7 +1842,7 @@ func runH2FrameLoop(connPtr *net.Conn, framerPtr **http2.Framer, hpackDec *hpack
 		conn := *connPtr
 		framer := *framerPtr
 		if watch == nil {
-			if t := *tunnel; t != nil && t.targetConn != nil && t.tunGate == nil {
+			if t := *tunnel; t != nil && t.targetConn != nil && t.tunGate == nil && !srvCtx.noH2ProxyWatch {
 				watch = watchH2ProxyClient(conn, logger)
 			}
 		}

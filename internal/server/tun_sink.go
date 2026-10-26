@@ -87,10 +87,12 @@ type relayTUNSink struct {
 	lastUp       atomic.Int64
 	lastDown     atomic.Int64
 	lastActivity atomic.Int64
-	// client is the downstream conn, nil without one, for clientLiveness.
-	client    net.Conn
-	quietFor  atomic.Int64
-	keepalive atomic.Pointer[time.Timer]
+	// client is the downstream conn, nil without one, for clientLiveness,
+	// and clientAcks follows what it acknowledges from tick to tick.
+	client     net.Conn
+	clientAcks ackProgress
+	quietFor   atomic.Int64
+	keepalive  atomic.Pointer[time.Timer]
 
 	// why is what ended the leg, set by the pump when the exit's side ended
 	// it; logged once, at Info, when the leg closes.
@@ -244,6 +246,7 @@ func (s *relayTUNSink) startKeepalive() {
 	s.lastUp.CompareAndSwap(0, now)
 	s.lastDown.CompareAndSwap(0, now)
 	s.lastActivity.CompareAndSwap(0, now)
+	s.clientAcks.start(s.client)
 	quiet := relayKeepaliveAfter()
 	s.quietFor.Store(int64(quiet))
 	t := time.AfterFunc(time.Hour, s.keepaliveTick)
@@ -259,7 +262,7 @@ func (s *relayTUNSink) keepaliveTick() {
 	}
 	quiet := time.Duration(s.quietFor.Load())
 	sinceOldest := max(monoSince(s.lastUp.Load()), monoSince(s.lastDown.Load()))
-	active := clientLiveness{conn: s.client, heard: func() (time.Duration, bool) {
+	active := clientLiveness{conn: s.client, acks: &s.clientAcks, heard: func() (time.Duration, bool) {
 		return monoSince(s.lastActivity.Load()), true
 	}}.alive()
 	if active && sinceOldest >= quiet {

@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/binary"
+	"golang.org/x/sys/unix"
 	"io"
 	"net"
 	"sync"
@@ -266,29 +267,54 @@ func TestClientLiveness(t *testing.T) {
 	}
 	relaySide, client := tcpPair(t)
 	t.Cleanup(func() { relaySide.Close(); client.Close() })
-	// Keepalive on, at a period well inside the window: its probes do not
-	// refresh the ACK age (measured), so an idle conn still ages out.
+	relayClientActiveWindowNs.Store(int64(5 * time.Second))
+	// The kernel keepalive at 1 s on both ends, and looks past several of
+	// its probes. The ACK of a probe refreshes tcpi_last_ack_recv - the
+	// control below shows it - and the rule built on that kept every socket
+	// still up alive (P2-1 of the round-10 review). The probes acknowledge
+	// no new data, so acknowledged bytes stay put.
 	for _, c := range []net.Conn{relaySide, client} {
-		tc := c.(*net.TCPConn)
-		if err := tc.SetKeepAlive(true); err != nil {
-			t.Fatal(err)
-		}
-		if err := tc.SetKeepAlivePeriod(100 * time.Millisecond); err != nil {
+		if err := c.(*net.TCPConn).SetKeepAliveConfig(net.KeepAliveConfig{Enable: true,
+			Idle: time.Second, Interval: time.Second, Count: 9}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	go func() { _, _ = io.Copy(io.Discard, client) }()
-	time.Sleep(400 * time.Millisecond)
-	if (clientLiveness{conn: relaySide, heard: never}).alive() {
-		t.Fatal("a TCP that acknowledged nothing for the window is alive")
+	acks := &ackProgress{}
+	live := clientLiveness{conn: relaySide, heard: never, acks: acks}
+	if live.alive() {
+		t.Fatal("a TCP that has acknowledged nothing yet is alive")
+	}
+	time.Sleep(2500 * time.Millisecond)
+	if d := lastAckRecv(t, relaySide); d >= 1500*time.Millisecond {
+		t.Fatalf("last ACK %v ago after 2.5 s of 1 s keepalives - the probes did not go out, the test proves nothing", d)
+	}
+	if live.alive() {
+		t.Fatal("a TCP that acknowledged only keepalive probes is alive")
 	}
 	if _, err := relaySide.Write([]byte("x")); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(50 * time.Millisecond)
-	if !(clientLiveness{conn: relaySide, heard: never}).alive() {
+	if !live.alive() {
 		t.Fatal("a TCP that acknowledged data 50 ms ago is not alive")
 	}
+}
+
+// lastAckRecv reads tcpi_last_ack_recv off c.
+func lastAckRecv(t *testing.T, c net.Conn) time.Duration {
+	t.Helper()
+	raw, err := c.(*net.TCPConn).SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var d time.Duration
+	_ = raw.Control(func(fd uintptr) {
+		if info, err := unix.GetsockoptTCPInfo(int(fd), unix.IPPROTO_TCP, unix.TCP_INFO); err == nil {
+			d = time.Duration(info.Last_ack_recv) * time.Millisecond
+		}
+	})
+	return d
 }
 
 // openPeer is a conn that says whether its peer is there, as a QUIC conn does.
