@@ -18,9 +18,44 @@ Versions follow [Semantic Versioning](https://semver.org/).
   blackholes that freeze traffic without breaking the connection - HTTP
   Polling never noticed them. At most three such verdicts in ten minutes.
   Works on the desktop TUN client and on Android.
+- **Client: an idle tunnel goes back to the preferred server.** A TUN
+  session that fell back to another server during a fault used to stay
+  there for as long as it held. Once it has been on the fallback for 5
+  minutes, the preferred server is out of its park and nothing has crossed
+  the tunnel for 90 s, the client sets up a session there and only then
+  drops the old one. The exit changes, and with it the public address and
+  usually the tunnel address, so connections inside the tunnel end; 90 s
+  of silence keeps a tunnel in use but quiet from being moved. A failed
+  try leaves the tunnel where it is, and the next one waits 4-8 minutes.
+  Desktop TUN client only; on Android and macOS the tunnel still goes
+  back on its next reconnect.
 
 ### Fixed
 
+- **Client: a REALITY tunnel that carries nothing in its first 10 s no
+  longer drops.** The client looks at the byte after the server's answer
+  and hands that read on to the tunnel; on REALITY it kept the answer's
+  10 s deadline, and a tunnel with nothing coming down by then reconnected
+  with "server read: timeout".
+- **Client: with two failing servers in the pool, the third is reached.**
+  Moving off a parked server went to the most preferred one available,
+  which was the other failing server once its park had run out; two
+  servers swallowing handshakes kept the client between them for minutes.
+  A server that failed in the last 10 minutes now goes after one that did
+  not.
+- **Client: when handshakes are being swallowed, each transport gets its
+  share of the reconnect cycle.** A transport whose TCP connect was up kept
+  the rest of the cycle, so a censor dropping large ClientHellos cost a
+  cycle and its backoff per transport per address, and Geneva, which gets
+  through, never came up. After a swallowed handshake on the server, or a
+  silence verdict on another one, an attempt gets an even share of what is
+  left (at least a sixteenth of the cycle) while other transports wait.
+- **Server: an HTTP/2 Stego proxied stream with a sparse download no
+  longer ends after 60 s.** A client sending nothing up - any SOCKS/HTTP
+  proxy client - lost its session to the server's read deadline, on an exit
+  directly or on a relay. The server now keeps the session while the
+  client's TCP acknowledges what comes down; a session with nothing coming
+  down still ends on the deadline.
 - **Client: failover to another server in the pool works when a server goes
   silent, swallows handshakes, or kills every session young.** Dead sessions
   and storms park the server with a growing cooldown; a server that accepts
@@ -105,8 +140,9 @@ Versions follow [Semantic Versioning](https://semver.org/).
   half minute. The relay now also says which of its clients it is
   forwarding. A client with its own credential keeps its address; clients
   sharing the server's global secret hold a lease per session, since
-  nothing they send tells them apart. Old relays and old exits are
-  unaffected, and keep the old behaviour between themselves.
+  nothing they send tells them apart, and a reconnect gets its address back
+  once no session holds it. Old relays and old exits are unaffected, and
+  keep the old behaviour between themselves.
 - **Server: a client keeps its tunnel address across transports and
   networks.** Leases are keyed on the credential, and leases an older server
   wrote under other keys are folded into it.
@@ -127,6 +163,10 @@ Versions follow [Semantic Versioning](https://semver.org/).
 - On the wire: a relay sends its exit a small frame when nothing else has
   gone up for a period drawn anew each time between 20 and 45 s, while its
   client is alive. No change to the protocol.
+- On the wire: when handshakes are being swallowed, a reconnect cycle tries
+  up to sixteen transports against one address instead of one.
+- On the wire: an idle desktop TUN client on a fallback server opens one
+  session to its preferred server, tries at least 4 minutes apart.
 
 ## [1.11.8] - 2026-10-20
 
