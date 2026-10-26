@@ -35,9 +35,9 @@ type returnExit struct {
 	requested   atomic.Pointer[func()]
 	answerAfter atomic.Int64
 	dials       atomic.Int64
-	up       atomic.Int64
-	mu       sync.Mutex
-	conns    []net.Conn
+	up          atomic.Int64
+	mu          sync.Mutex
+	conns       []net.Conn
 }
 
 func (e *returnExit) serve(srv net.Conn) {
