@@ -1396,7 +1396,7 @@ func readHandshakeResponse(conn net.Conn, clientVersion byte, deadline time.Time
 		// never get here: the 9-byte read above fails on them.)
 		return resp, 9, conn, nil
 	}
-	n, next, err := readHandshakeFlags(conn, resp, clientVersion)
+	n, next, err := readHandshakeFlags(conn, resp, clientVersion, deadline)
 	if err != nil {
 		return nil, 0, conn, fmt.Errorf("%w: %w", errHandshakePartlyAnswered, err)
 	}
@@ -1418,8 +1418,9 @@ func readHandshakeResponse(conn net.Conn, clientVersion byte, deadline time.Time
 // is the first byte of a frame and is handed back through a replayConn. When
 // nothing has arrived within handshakeFlagsGrace the answer is taken to have
 // no flags (the only answer that can end at 9 bytes with nothing behind it),
-// and the read still in flight is handed over too.
-func readHandshakeFlags(conn net.Conn, resp []byte, clientVersion byte) (int, net.Conn, error) {
+// and the read still in flight is handed over too. deadline is the read
+// deadline in force on conn, the one the peek runs under.
+func readHandshakeFlags(conn net.Conn, resp []byte, clientVersion byte, deadline time.Time) (int, net.Conn, error) {
 	if clientVersion >= tunHandshakeVersionDualStack {
 		if _, err := io.ReadFull(conn, resp[9:10]); err != nil {
 			return 9, conn, fmt.Errorf("handshake flags read failed: %w", err)
@@ -1442,7 +1443,7 @@ func readHandshakeFlags(conn net.Conn, resp []byte, clientVersion byte) (int, ne
 			return 9, &replayConn{Conn: conn, pending: []byte{r.b}}, nil
 		}
 	case <-time.After(handshakeFlagsGrace):
-		return 9, &replayConn{Conn: conn, inflight: peek}, nil
+		return 9, &replayConn{Conn: conn, inflight: peek, peekDeadline: deadline}, nil
 	}
 }
 
@@ -1450,6 +1451,7 @@ func readHandshakeFlags(conn net.Conn, resp []byte, clientVersion byte) (int, ne
 type peekResult struct {
 	b   byte
 	err error
+	at  time.Time // when the read came back
 }
 
 // peekHandshakeByte reads the byte after the 9-byte prefix on its own
@@ -1468,7 +1470,7 @@ func peekHandshakeByte(conn net.Conn) <-chan peekResult {
 	go func() {
 		var one [1]byte
 		_, err := io.ReadFull(conn, one[:])
-		ch <- peekResult{b: one[0], err: err}
+		ch <- peekResult{b: one[0], err: err, at: time.Now()}
 	}()
 	return ch
 }
@@ -1494,6 +1496,22 @@ type replayConn struct {
 	pending  []byte
 	inflight <-chan peekResult // a peek read still running, nil once collected
 	err      error             // set once the stream can no longer be framed
+
+	// peekDeadline is the read deadline the peek in flight was started
+	// under.
+	peekDeadline time.Time
+}
+
+// peekOutlived reports a peek that came back with an error on the deadline
+// it was started under. A transport where a deadline reaches a Read already
+// blocked never does that once the handshake reader has cleared it: clearing
+// wakes the read. smux v2, which carries every REALITY tunnel, reads the
+// deadline only when a Read starts, so the peek kept the handshake's deadline
+// after the reader cleared it, and a tunnel that sent nothing down for the
+// rest of the response budget (10 s) was dropped with "server read: timeout"
+// (stand twocli/f14-registry, session=9.396s).
+func (c *replayConn) peekOutlived(r peekResult) bool {
+	return r.err != nil && !c.peekDeadline.IsZero() && !r.at.Before(c.peekDeadline)
 }
 
 func (c *replayConn) Read(p []byte) (int, error) {
@@ -1503,6 +1521,14 @@ func (c *replayConn) Read(p []byte) (int, error) {
 	if c.inflight != nil {
 		r := <-c.inflight
 		c.inflight = nil
+		if c.peekOutlived(r) {
+			// The peek read nothing: read its byte again, under the
+			// deadline in force now. A close or a broken stream comes back
+			// again, and so does a deadline set since that has run out.
+			var one [1]byte
+			_, err := io.ReadFull(c.Conn, one[:])
+			r = peekResult{b: one[0], err: err}
+		}
 		if r.err != nil {
 			// The read ended without a byte; whatever ended it (a deadline
 			// the caller set since, a close) is this read's answer.

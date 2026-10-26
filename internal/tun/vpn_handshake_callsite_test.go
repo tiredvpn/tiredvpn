@@ -72,6 +72,9 @@ type pipeStrategy struct {
 	resp []byte
 	gap  time.Duration    // 0: 50 ms
 	last *recDeadlineConn // the conn of the latest Connect
+	// overSmux carries the handshake over a smux stream, the conn REALITY
+	// hands the TUN client, instead of a bare pipe.
+	overSmux bool
 }
 
 func (s *pipeStrategy) Name() string                        { return "pipe" }
@@ -82,6 +85,9 @@ func (s *pipeStrategy) RequiresServer() bool                { return false }
 func (s *pipeStrategy) Description() string                 { return "in-memory pipe" }
 func (s *pipeStrategy) Connect(context.Context, string) (net.Conn, error) {
 	cli, srv := net.Pipe()
+	if s.overSmux {
+		cli, srv = smuxPipe(s.t)
+	}
 	s.t.Cleanup(func() { cli.Close(); srv.Close() })
 	gap := s.gap
 	if gap == 0 {
