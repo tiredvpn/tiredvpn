@@ -211,6 +211,9 @@ Versions follow [Semantic Versioning](https://semver.org/).
 - On the wire: a relay sends its exit a small frame when nothing else has
   gone up for a period drawn anew each time between 20 and 45 s, while its
   client is alive. No change to the protocol.
+- On the wire: a relay's own keepalive frame to its exit is now the size of
+  the client keepalive it forwards (4 bytes more cover); it was 4 bytes
+  shorter, every time. Exits of any version drop the cover as before.
 - On the wire: when handshakes are being swallowed, a reconnect cycle tries
   up to sixteen transports against one address instead of one.
 - On the wire: an idle desktop TUN client on a fallback server opens one
