@@ -41,6 +41,15 @@ const (
 	// in the middle of that, and the client went back to the first address
 	// instead of on to the next server.
 	siblingTryHold = 3 * time.Minute
+
+	// recentTroubleWindow is how long a server's failure counts against it
+	// when the client moves off a parked server (Reconsider): a server that
+	// failed within it, with no success since, goes after one that did not.
+	// One pass of a two-server outage - three cycles of 15 s and their
+	// backoff per verdict, a verdict on each family - took 3-5 minutes on the
+	// stand; the window holds two such passes and matches the manager's
+	// route window (routeDeathWindow).
+	recentTroubleWindow = 10 * time.Minute
 )
 
 // DialFunc is the dialer the selector uses for its family probe. Injected so
@@ -447,6 +456,10 @@ func (s *Selector) Reconsider(now time.Time) (Candidate, bool) {
 	rank := s.rankLocked()
 
 	if s.unavailableLocked(s.pinnedIdx, now) {
+		if i, ok := s.firstUntroubledLocked(rank, now); ok {
+			s.repinLocked(i, now)
+			return s.cands[s.pinnedIdx], true
+		}
 		if i, ok := s.firstAvailableLocked(rank, now); ok {
 			s.repinLocked(i, now)
 			return s.cands[s.pinnedIdx], true
@@ -590,6 +603,46 @@ func (s *Selector) firstAvailableLocked(rank []int, now time.Time) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+// firstUntroubledLocked is firstAvailableLocked over the candidates whose
+// server has not failed recently (troubledLocked).
+//
+// Moving off a parked server to the first available one in preference order
+// kept two failing servers in turn and never reached a third (R1 of the
+// fix13c stand, a and b swallowing every handshake, c healthy): each
+// server's park ran out while the other was tried, so the move off b found a
+// available again, and the move off a found b. A server that has failed in
+// this outage is the least promising choice there is; one that has not is
+// tried first. The pinned server's own other address is not held against
+// it: a verdict on one family leaves the other open for one try
+// (addrVerdictLocked). The return to a preferred server after MinDwell is
+// not affected.
+func (s *Selector) firstUntroubledLocked(rank []int, now time.Time) (int, bool) {
+	pinned := s.cands[s.pinnedIdx].EndpointIdx
+	for _, i := range rank {
+		ep := s.cands[i].EndpointIdx
+		if !s.unavailableLocked(i, now) && (ep == pinned || !s.troubledLocked(ep, now)) {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// troubledLocked reports whether server ep failed within
+// recentTroubleWindow: an address of it failed then and has not connected
+// since. A park on the whole server comes from a verdict on one of its
+// addresses, so it shows here too.
+func (s *Selector) troubledLocked(ep int, now time.Time) bool {
+	for j, c := range s.cands {
+		if c.EndpointIdx != ep {
+			continue
+		}
+		if h := s.health[j]; h.consecutiveFailures > 0 && now.Sub(h.lastFailure) < recentTroubleWindow {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Selector) repinLocked(i int, now time.Time) {
