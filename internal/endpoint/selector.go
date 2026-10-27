@@ -738,15 +738,23 @@ func (s *Selector) ReportHandshakeFailed(c Candidate) {
 	h.beforeConnect = clearedByConnect{}
 	h.consecutiveFailures += b.failures
 	h.backoff = max(h.backoff, b.backoff)
+	// A park set since the connect - a late dead-session verdict, a sibling's
+	// verdict widened to the server - is kept as well as the one the connect
+	// lifted (P3-3 of the round-16 review).
+	cooldown, deadPark := h.cooldownUntil, h.deadParkUntil
 	s.recordFailureLocked(idx, s.cfg.Now())
 	// After the failure is recorded: at the threshold it sets a cooldown of
-	// its own, which cut a later restored one short (finding 1 of the
-	// round-15 review). The later of the two stands.
-	if b.cooldownUntil.After(h.cooldownUntil) {
-		h.cooldownUntil = b.cooldownUntil
+	// its own, which cut a later one short (finding 1 of the round-15
+	// review). The latest of each stands.
+	for _, t := range []time.Time{b.cooldownUntil, cooldown} {
+		if t.After(h.cooldownUntil) {
+			h.cooldownUntil = t
+		}
 	}
-	if b.deadParkUntil.After(h.deadParkUntil) {
-		h.deadParkUntil = b.deadParkUntil
+	for _, t := range []time.Time{b.deadParkUntil, deadPark} {
+		if t.After(h.deadParkUntil) {
+			h.deadParkUntil = t
+		}
 	}
 }
 

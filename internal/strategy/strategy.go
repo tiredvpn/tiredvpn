@@ -423,9 +423,9 @@ var dialCutTimer = time.AfterFunc
 // server answered, or acknowledged all it was sent (handshakeProgressed). A
 // server that is slow to answer - 7-9 s through a bad mobile link, or
 // reaching its cover - still acknowledges at once; a censor that drops the
-// ClientHello, as the fix13c stand did, never lets it get there. The share was a cut whatever the
-// progress, and a slow but live handshake was killed every cycle (P2-4 of
-// the round-10 review).
+// ClientHello, as the fix13c stand did, never lets it get there. The share
+// was a cut whatever the progress, and a slow but live handshake was killed
+// every cycle (P2-4 of the round-10 review).
 func watchConnect(ctx context.Context, cancel context.CancelFunc, limit, dialLimit time.Duration, hooked, hold bool) *connectPhase {
 	p := &connectPhase{ctx: ctx}
 	if !hooked {
