@@ -279,7 +279,7 @@ func (s *ICMPTunnelStrategy) Connect(ctx context.Context, target string) (net.Co
 	}
 
 	// Start send/receive loops
-	go tunnel.sendLoop()
+	tunnel.startSendLoop()
 	go tunnel.recvLoop()
 
 	log.Info("ICMP Tunnel: Established to %s (session=%08x, mode=%s)", s.serverAddr, sessionID, s.mode)
@@ -325,6 +325,16 @@ type icmpTunnelConn struct {
 	// State
 	done   chan struct{}
 	closed atomic.Bool
+	// closing tells sendLoop to send what is queued and stop; sendDone is
+	// closed when it has, and is nil until sendLoop runs. closeBy is Close's
+	// bound (UnixNano, 0 before Close); left counts the queued bytes not
+	// sent by then. closeErr is what Close reports, for every call.
+	closing   chan struct{}
+	sendDone  chan struct{}
+	closeBy   atomic.Int64
+	left      atomic.Int64
+	closeOnce sync.Once
+	closeErr  error
 
 	// pathMTU reports the MTU towards the server, 0 if unknown. Packets are
 	// sized to it so the kernel never has to fragment them. It is asked for
@@ -654,6 +664,16 @@ func ParseTunnelHeader(data []byte) TunnelHeader {
 	}
 }
 
+// startSendLoop runs sendLoop, which Close waits on to send what is queued.
+func (c *icmpTunnelConn) startSendLoop() {
+	c.closing = make(chan struct{})
+	c.sendDone = make(chan struct{})
+	go func() {
+		defer close(c.sendDone)
+		c.sendLoop()
+	}()
+}
+
 // sendLoop handles outgoing packets with rate limiting
 func (c *icmpTunnelConn) sendLoop() {
 	// Calculate minimum interval for rate limit
@@ -673,7 +693,19 @@ func (c *icmpTunnelConn) sendLoop() {
 			case <-c.done:
 				return
 			case data = <-c.sendQueue:
+			case <-c.closing:
+				// Closing: what is queued still goes, at the same rate;
+				// with nothing left the loop is done.
+				select {
+				case data = <-c.sendQueue:
+				default:
+					return
+				}
 			}
+		}
+		if c.pastCloseBy() {
+			c.left.Add(int64(len(data)) + c.queuedBytes())
+			return
 		}
 
 		// Rate limiting
@@ -688,9 +720,11 @@ func (c *icmpTunnelConn) sendLoop() {
 		c.rateMu.Unlock()
 
 		// The conn may have closed while we slept; a write held as carry
-		// would otherwise go into the closed socket.
+		// would otherwise go into the closed socket. What it held is what
+		// Close could not send.
 		select {
 		case <-c.done:
+			c.left.Add(int64(len(data) + len(carry)))
 			return
 		default:
 		}
@@ -722,6 +756,25 @@ func (c *icmpTunnelConn) sendLoop() {
 		c.icmpConn.SetWriteDeadline(time.Now().Add(ICMPWriteTimeout))
 		if _, err := c.icmpConn.WriteTo(packet, c.serverIP); err != nil {
 			log.Debug("ICMP Tunnel: send error: %v", err)
+		}
+	}
+}
+
+// pastCloseBy reports a Close whose bound has run out.
+func (c *icmpTunnelConn) pastCloseBy() bool {
+	by := c.closeBy.Load()
+	return by != 0 && time.Now().UnixNano() >= by
+}
+
+// queuedBytes takes what is left in sendQueue and returns its size.
+func (c *icmpTunnelConn) queuedBytes() int64 {
+	var n int64
+	for {
+		select {
+		case b := <-c.sendQueue:
+			n += int64(len(b))
+		default:
+			return n
 		}
 	}
 }
@@ -920,6 +973,9 @@ func (c *icmpTunnelConn) Write(b []byte) (int, error) {
 		chunk := make([]byte, end-i)
 		copy(chunk, b[i:end])
 
+		if c.closed.Load() {
+			return total, io.ErrClosedPipe
+		}
 		select {
 		case <-c.done:
 			return total, io.ErrClosedPipe
@@ -933,14 +989,52 @@ func (c *icmpTunnelConn) Write(b []byte) (int, error) {
 	return total, nil
 }
 
-// Close closes the tunnel
-func (c *icmpTunnelConn) Close() error {
-	if c.closed.Swap(true) {
-		return nil // Already closed
-	}
+// ErrICMPCloseIncomplete is what Close returns when queued writes could not
+// be sent before the tunnel closed.
+var ErrICMPCloseIncomplete = errors.New("icmp tunnel: close left queued bytes unsent")
 
+// icmpCloseTimeout bounds how long Close spends sending what is queued, at
+// the stealth rate. A var so tests can scale it.
+var icmpCloseTimeout = 5 * time.Second
+
+// Close sends what Write queued, at the tunnel's own rate and for at most
+// icmpCloseTimeout, then closes the tunnel and reports the bytes it could not
+// send. It dropped the queue - the same pattern as HTTPPollingConn.Close
+// (issue #131) and MorphedConn.Close (#129). Write fails from the moment
+// Close is called. The transport has no retransmit, so a sent packet can
+// still be lost; what Close answers for is what left the client.
+func (c *icmpTunnelConn) Close() error { return c.closeWithin(icmpCloseTimeout) }
+
+// CloseNow closes the tunnel without sending what is queued, and reports it.
+func (c *icmpTunnelConn) CloseNow() error { return c.closeWithin(0) }
+
+func (c *icmpTunnelConn) closeWithin(d time.Duration) error {
+	c.closeOnce.Do(func() { c.closeErr = c.closeOnceWithin(d) })
+	return c.closeErr
+}
+
+func (c *icmpTunnelConn) closeOnceWithin(d time.Duration) error {
+	c.closed.Store(true)
+	if c.sendDone != nil {
+		c.closeBy.Store(time.Now().Add(d).UnixNano())
+		close(c.closing)
+		wait := time.NewTimer(d)
+		select {
+		case <-c.sendDone:
+		case <-wait.C:
+		}
+		wait.Stop()
+	}
 	close(c.done)
-	return c.icmpConn.Close()
+	if c.sendDone != nil {
+		<-c.sendDone
+	}
+	c.left.Add(c.queuedBytes())
+	err := c.icmpConn.Close()
+	if n := c.left.Load(); n > 0 {
+		return fmt.Errorf("%w: %d bytes", ErrICMPCloseIncomplete, n)
+	}
+	return err
 }
 
 // LocalAddr returns the local network address

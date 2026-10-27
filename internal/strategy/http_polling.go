@@ -201,8 +201,10 @@ func (s *HTTPPollingStrategy) Connect(ctx context.Context, target string) (net.C
 	// Start parallel poll workers with staggered timing
 	for i := 0; i < pollConn.numWorkers; i++ {
 		workerID := i
+		pollConn.workers.Add(1)
 		// Stagger worker starts to avoid burst patterns
 		go func() {
+			defer pollConn.workers.Done()
 			time.Sleep(time.Duration(workerID) * 25 * time.Millisecond)
 			pollConn.pollWorker(workerID)
 		}()
@@ -262,6 +264,8 @@ type HTTPPollingConn struct {
 	// Read deadline support (honors SetReadDeadline/SetDeadline).
 	deadlineMu   sync.Mutex
 	readDeadline time.Time
+	// writeDeadline bounds Close's sending of the uplink left (Close).
+	writeDeadline time.Time
 
 	// Polling config
 	pollInterval time.Duration
@@ -271,8 +275,18 @@ type HTTPPollingConn struct {
 	// State
 	closed    chan struct{}
 	closeOnce sync.Once
-	lastSend  time.Time
-	lastRecv  time.Time
+	// closeErr is what Close reports, for every call: the uplink bytes it
+	// could not send.
+	closeErr error
+	// workers counts the running poll workers, so Close sends what is left
+	// only once none of them holds part of it.
+	workers sync.WaitGroup
+	// pollFailing is set by a poll that failed and cleared by one that went
+	// through: Close does not wait on a peer that is not taking polls.
+	pollFailing atomic.Bool
+
+	lastSend time.Time
+	lastRecv time.Time
 
 	// TLS session resumption
 	tlsSessionCache tls.ClientSessionCache
@@ -444,7 +458,16 @@ func jitterDuration(d time.Duration) time.Duration {
 // cycle actually carried tunnel bytes (sent or received), which the caller uses
 // to tell an active tunnel from an idle keepalive round.
 func (c *HTTPPollingConn) poll() (ok bool, moved bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	return c.pollBy(time.Now().Add(pollTimeout))
+}
+
+// pollTimeout bounds one poll request: the dial, the TLS handshake, and the
+// request's write and read.
+const pollTimeout = 3 * time.Second
+
+// pollBy is poll bounded by deadline as well as pollTimeout.
+func (c *HTTPPollingConn) pollBy(deadline time.Time) (ok bool, moved bool) {
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 
 	// Atomically claim and remove data to send (prevents multiple workers sending same data)
@@ -480,6 +503,7 @@ func (c *HTTPPollingConn) poll() (ok bool, moved bool) {
 	// Do request with ack sequence. The auth token is derived inside doRequest,
 	// bound to the exporter of the TLS session the request actually rides (S22).
 	resp, err := c.doRequest(ctx, sendData, ackSeq)
+	c.pollFailing.Store(err != nil)
 	if err != nil {
 		log.Debug("HTTP Polling: poll error: %v", err)
 		c.statsMu.Lock()
@@ -652,7 +676,11 @@ func (c *HTTPPollingConn) doRequest(ctx context.Context, data []byte, ackSeq int
 		connHeader = "close"
 	}
 
-	resp, err := c.exchange(tlsConn, reader, authToken, data, ackSeq, connHeader)
+	deadline := time.Now().Add(pollTimeout)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
+		deadline = dl
+	}
+	resp, err := c.exchange(tlsConn, reader, authToken, data, ackSeq, connHeader, deadline)
 	if err != nil {
 		// Drop the connection; poll() re-queues any send data and the next poll
 		// dials fresh. We do NOT retry here - a retry on a half-sent request
@@ -715,7 +743,7 @@ func (c *HTTPPollingConn) acquireConn(ctx context.Context) (*tls.Conn, *bufio.Re
 // exchange writes one request and reads its response on an already-established
 // connection. reader must be the persistent reader for that connection so the
 // stream stays aligned for the next keep-alive request. Caller holds reuseMu.
-func (c *HTTPPollingConn) exchange(tlsConn *tls.Conn, reader *bufio.Reader, authToken string, data []byte, ackSeq int64, connHeader string) ([]byte, error) {
+func (c *HTTPPollingConn) exchange(tlsConn *tls.Conn, reader *bufio.Reader, authToken string, data []byte, ackSeq int64, connHeader string, deadline time.Time) ([]byte, error) {
 	var body []byte
 	if len(data) > 0 {
 		body = data
@@ -735,7 +763,7 @@ func (c *HTTPPollingConn) exchange(tlsConn *tls.Conn, reader *bufio.Reader, auth
 
 	// Refresh the deadline every request - a reused connection may have sat idle
 	// past the previous request's deadline.
-	tlsConn.SetDeadline(time.Now().Add(3 * time.Second))
+	tlsConn.SetDeadline(deadline)
 
 	if _, err := tlsConn.Write([]byte(req)); err != nil {
 		return nil, err
@@ -958,8 +986,40 @@ func (c *HTTPPollingConn) waitSendRoomLocked() error {
 	return nil
 }
 
-// Close implements net.Conn
+// ErrPollingCloseIncomplete is what Close returns when uplink bytes Write had
+// accepted could not be sent before the conn closed.
+var ErrPollingCloseIncomplete = errors.New("http_polling: close left uplink bytes unsent")
+
+// pollingCloseTimeout bounds how long Close spends sending what Write
+// accepted. A var so tests can scale it.
+var pollingCloseTimeout = 5 * time.Second
+
+// Close implements net.Conn. It sends what Write accepted and no poll has
+// sent yet, for at most pollingCloseTimeout, and reports the bytes it could
+// not send. It dropped them: up to 1 MiB of uplink a Write had answered for
+// was lost without a word (issue #131, as MorphedConn.Close in #129). Write
+// fails from the moment Close is called.
 func (c *HTTPPollingConn) Close() error {
+	now := time.Now()
+	closeBy := now.Add(pollingCloseTimeout)
+	// A write deadline still ahead shortens the wait; one already past is
+	// left over from an earlier write - a keepalive's, the TUN writer's -
+	// and would turn every Close into CloseNow (as P2 of the round-3 review
+	// of #129 found for MorphedConn). CloseNow is the abort.
+	c.deadlineMu.Lock()
+	if wd := c.writeDeadline; wd.After(now) && wd.Before(closeBy) {
+		closeBy = wd
+	}
+	c.deadlineMu.Unlock()
+	return c.closeBy(closeBy)
+}
+
+// CloseNow closes the conn without sending what Write accepted, and reports
+// those bytes: for a caller that is stopping and will not wait on the peer.
+func (c *HTTPPollingConn) CloseNow() error { return c.closeBy(time.Now()) }
+
+// closeBy is Close with its sending bounded by closeBy.
+func (c *HTTPPollingConn) closeBy(closeBy time.Time) error {
 	c.closeOnce.Do(func() {
 		close(c.closed)
 		if c.sendCond != nil {
@@ -971,12 +1031,49 @@ func (c *HTTPPollingConn) Close() error {
 		c.recvLock.Lock()
 		c.recvCond.Broadcast()
 		c.recvLock.Unlock()
+		c.closeErr = c.flushOnClose(closeBy)
 		// Tear down any reused keep-alive connection.
 		c.reuseMu.Lock()
 		c.dropReuseLocked()
 		c.reuseMu.Unlock()
 	})
-	return nil
+	return c.closeErr
+}
+
+// flushOnClose sends what is left in sendBuf by closeBy, with the polls the
+// workers would have made: the same chunks, one request each. The workers
+// end after the poll they are in; one that failed has put its bytes back.
+func (c *HTTPPollingConn) flushOnClose(closeBy time.Time) error {
+	stopped := make(chan struct{})
+	go func() {
+		c.workers.Wait()
+		close(stopped)
+	}()
+	wait := time.NewTimer(time.Until(closeBy))
+	defer wait.Stop()
+	select {
+	case <-stopped:
+	case <-wait.C:
+	}
+	for {
+		c.sendLock.Lock()
+		left := c.sendBuf.Len()
+		c.sendLock.Unlock()
+		if left == 0 {
+			return nil
+		}
+		// Out of time, or the peer is not taking polls: a conn closed after
+		// its server went silent - a failed handshake, a reconnect - must not
+		// spend the whole bound on it.
+		if !time.Now().Before(closeBy) || c.pollFailing.Load() {
+			return fmt.Errorf("%w: %d bytes", ErrPollingCloseIncomplete, left)
+		}
+		by := time.Now().Add(pollTimeout)
+		if closeBy.Before(by) {
+			by = closeBy
+		}
+		c.pollBy(by)
+	}
 }
 
 func (c *HTTPPollingConn) LocalAddr() net.Addr {
@@ -997,6 +1094,7 @@ func (c *HTTPPollingConn) RemoteAddr() net.Addr {
 }
 
 func (c *HTTPPollingConn) SetDeadline(t time.Time) error {
+	_ = c.SetWriteDeadline(t)
 	return c.SetReadDeadline(t)
 }
 
@@ -1011,7 +1109,12 @@ func (c *HTTPPollingConn) SetReadDeadline(t time.Time) error {
 	return nil
 }
 
+// SetWriteDeadline bounds what Close spends sending the uplink Write
+// accepted. Write itself only queues.
 func (c *HTTPPollingConn) SetWriteDeadline(t time.Time) error {
+	c.deadlineMu.Lock()
+	c.writeDeadline = t
+	c.deadlineMu.Unlock()
 	return nil
 }
 
