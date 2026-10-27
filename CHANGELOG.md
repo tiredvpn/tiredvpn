@@ -103,7 +103,9 @@ Versions follow [Semantic Versioning](https://semver.org/).
   decoy, is cut.
   Limits: on Linux a path with a round trip above about 350-580 ms, or a
   lossy one with a segment awaiting retransmission when the share runs out,
-  is cut before its ACK is back; a first flight that is acknowledged and then
+  is cut before its ACK is back; an attempt runs the whole cycle when its
+  server answered the ClientHello and the records after it are dropped, or
+  when a server or middlebox speaks first while the ClientHello is dropped; a first flight that is acknowledged and then
   never answered runs the whole cycle; on macOS and Windows, which have no
   TCP_INFO here, no attempt is cut at its share (Android follows the Linux
   rule).

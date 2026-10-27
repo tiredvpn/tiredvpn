@@ -233,8 +233,10 @@ func androidControlConfig(cfg *Config, mgr *strategy.Manager, dualStack bool, se
 			case tun.HandshakeFailedOutcome:
 				mgr.HandshakeFailed(cand, hasCand)
 				return err
+			case tun.HandshakeUnansweredOutcome:
+				return fmt.Errorf("%w: %w", mgr.HandshakeUnanswered(strat, cand, hasCand), err)
 			}
-			return fmt.Errorf("%w: %w", mgr.HandshakeUnanswered(strat, cand, hasCand), err)
+			return err
 		},
 		// NetworkFn: the network the app is on now (network_id), which the
 		// carry is taken over on and handed on with.

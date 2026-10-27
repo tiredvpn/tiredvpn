@@ -56,8 +56,8 @@ func TestARefusedRequestIsServedFromAnywhereInThePool(t *testing.T) {
 	}
 	// 253 addresses, 400 draws: a uniform start gives about 200 distinct
 	// ones. .3 also takes the starts on .1 (the server's) and .2 (the
-	// refused), 3 in 253: a mean of 4.7 hits, and more than 20 about once
-	// in 10^6 runs. Top-down put all 400 on one address.
+	// refused), 3 in 253: a mean of 4.7 hits, and more than 20 about 3 in
+	// 10^8 runs. Top-down put all 400 on one address.
 	if len(seen) < 120 {
 		t.Fatalf("400 refused requests landed on %d addresses", len(seen))
 	}

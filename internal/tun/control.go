@@ -188,8 +188,9 @@ type ConnectionMetadata struct {
 type HandshakeOutcome int
 
 const (
-	// HandshakeAnsweredOutcome: answered, refused or in part.
-	HandshakeAnsweredOutcome HandshakeOutcome = iota
+	// HandshakeAnsweredOutcome: answered, refused or in part. Numbered from
+	// one, so an outcome left unset is none of them.
+	HandshakeAnsweredOutcome HandshakeOutcome = iota + 1
 	// HandshakeUnansweredOutcome: the server's silence (IsHandshakeUnanswered).
 	HandshakeUnansweredOutcome
 	// HandshakeFailedOutcome: a reset or an end of stream after the request
@@ -696,7 +697,7 @@ func (cs *ControlServer) handleConnect(ctx context.Context) ControlResponse {
 				err = cs.config.HandshakeOutcomeFn(HandshakeUnansweredOutcome, err)
 			case IsHandshakeAnswered(err):
 				_ = cs.config.HandshakeOutcomeFn(HandshakeAnsweredOutcome, nil)
-			case IsHandshakeFailed(err):
+			case IsHandshakeFailed(opCtx, err):
 				// A reset after the request: the Android core's first
 				// connect booked it as nothing, and a family that resets
 				// every handshake was never parked (P2 of the round-14

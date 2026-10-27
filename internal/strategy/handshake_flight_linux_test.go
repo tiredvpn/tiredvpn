@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/tiredvpn/tiredvpn/internal/protect"
 )
 
@@ -407,4 +409,28 @@ func (s *swallowAtRequest) Connect(ctx context.Context, target string) (net.Conn
 		return swallowed.Connect(ctx, target)
 	}
 	return s.requestFirst.Connect(ctx, target)
+}
+
+// TestFlightThroughOverTCPInfo is finding 4 of the round-15 review: the
+// guard on acknowledged data past the SYN had no test left once the
+// fixture's server stopped speaking first. Synthetic TCP_INFO.
+func TestFlightThroughOverTCPInfo(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		acked, received  uint64
+		unacked, notsent uint32
+		want             bool
+	}{
+		{"SYN only", 1, 0, 0, 0, false},
+		{"server speaks first, client sent nothing", 1, 1, 0, 0, false},
+		{"whole flight acknowledged", 2077, 0, 0, 0, true},
+		{"decoy acknowledged, record in flight", 101, 0, 1, 0, false},
+		{"decoy acknowledged, record unsent", 101, 0, 0, 1976, false},
+		{"answered, writes in flight", 2077, 4096, 2, 0, true},
+	} {
+		info := &unix.TCPInfo{Bytes_acked: tc.acked, Bytes_received: tc.received, Unacked: tc.unacked, Notsent_bytes: tc.notsent}
+		if got := flightThrough(info); got != tc.want {
+			t.Errorf("%s: flightThrough = %v, want %v", tc.name, got, tc.want)
+		}
+	}
 }
