@@ -196,6 +196,7 @@ type RTTMaskingConn struct {
 	burstBuffer   [][]byte
 	lastBurstTime time.Time
 	done          chan struct{}
+	doneOnce      sync.Once
 
 	// writeMu serialises every write to c.Conn - the burst flush from Write, the
 	// ticker Flush, and the simple-delay path. Both the burst flush and the simple
@@ -403,15 +404,32 @@ func (c *RTTMaskingConn) Flush() error {
 
 // Close stops the flush goroutine, flushes any pending burst, and closes connection
 func (c *RTTMaskingConn) Close() error {
-	if c.done != nil {
-		select {
-		case <-c.done:
-		default:
-			close(c.done)
-		}
-	}
+	c.stop()
 	c.Flush()
 	return c.Conn.Close()
+}
+
+// CloseNow aborts: the pending burst is dropped, not flushed, and the
+// wrapped conn is aborted too where it can be (HTTP polling, the ICMP
+// tunnel). Without it a teardown that aborts got Close through this
+// wrapper - the burst flushed and the inner conn drained for up to its
+// bound - whenever RTT masking was on (P3-3 of the round-19 review).
+func (c *RTTMaskingConn) CloseNow() error {
+	c.stop()
+	c.mu.Lock()
+	c.burstBuffer = nil
+	c.mu.Unlock()
+	if cn, ok := c.Conn.(interface{ CloseNow() error }); ok {
+		return cn.CloseNow()
+	}
+	return c.Conn.Close()
+}
+
+// stop ends the flush ticker, once.
+func (c *RTTMaskingConn) stop() {
+	if c.done != nil {
+		c.doneOnce.Do(func() { close(c.done) })
+	}
 }
 
 // UpdateConfig allows runtime config updates

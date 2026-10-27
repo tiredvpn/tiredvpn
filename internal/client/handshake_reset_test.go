@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -225,5 +226,73 @@ func TestAnUnsetHandshakeOutcomeBooksNothing(t *testing.T) {
 	}
 	if parkedNow(m, androidPool[0]) {
 		t.Fatal("an unset outcome parked the server")
+	}
+}
+
+// drainingConn is a pipe end whose Close drains for slowClose and whose
+// CloseNow returns at once, as HTTP polling's and the ICMP tunnel's do.
+type drainingConn struct {
+	net.Conn
+	slowClose time.Duration
+	closed    atomic.Int64
+	aborted   atomic.Int64
+}
+
+func (c *drainingConn) Close() error {
+	c.closed.Add(1)
+	time.Sleep(c.slowClose)
+	return c.Conn.Close()
+}
+
+func (c *drainingConn) CloseNow() error {
+	c.aborted.Add(1)
+	return c.Conn.Close()
+}
+
+// muteDrainingStrategy connects to an exit that reads the request and never
+// answers, over a drainingConn.
+type muteDrainingStrategy struct {
+	resettingStrategy
+	last *drainingConn
+}
+
+func (s *muteDrainingStrategy) Connect(_ context.Context, target string) (net.Conn, error) {
+	s.mu.Lock()
+	s.targets = append(s.targets, target)
+	s.mu.Unlock()
+	cli, srv := net.Pipe()
+	s.t.Cleanup(func() { cli.Close(); srv.Close() })
+	go func() { _, _ = io.Copy(io.Discard, srv) }()
+	s.last = &drainingConn{Conn: cli, slowClose: 3 * time.Second}
+	return s.last, nil
+}
+
+// TestAFailedRelayReconnectAbortsItsConn is P2 of the round-19 review: the
+// Android core's relay reconnect runs under the control server's lock, and
+// a handshake that failed closed its transport with the draining Close -
+// up to 5 s of a polling or ICMP queue - while disconnect and status
+// waited on the lock. It aborts.
+func TestAFailedRelayReconnectAbortsItsConn(t *testing.T) {
+	a, b := acceptAll(t), acceptAll(t)
+	m := strategy.NewManager()
+	if err := m.SetEndpoints([]endpoint.Endpoint{{Name: "a", V4: a}, {Name: "b", V4: b, Order: 1}}, endpoint.V4Only); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(endpoint.ResetSharedSelectors)
+	s := &muteDrainingStrategy{resettingStrategy: resettingStrategy{t: t}}
+	m.Register(s)
+	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, _, err := reconnectTUN(ctx, m, a, reconnClientIP, 1280, false, false)
+	took := time.Since(start)
+	if err == nil || s.last == nil {
+		t.Fatalf("reconnect: %v - want a handshake that failed", err)
+	}
+	if took > 1500*time.Millisecond {
+		t.Fatalf("the failed reconnect took %v: its conn was drained", took)
+	}
+	if s.last.aborted.Load() == 0 || s.last.closed.Load() != 0 {
+		t.Fatalf("CloseNow %d, Close %d - want aborts and no drain", s.last.aborted.Load(), s.last.closed.Load())
 	}
 }

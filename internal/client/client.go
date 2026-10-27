@@ -740,7 +740,10 @@ func reconnectTUN(ctx context.Context, mgr *strategy.Manager, serverAddr string,
 	// a deadline (zero lets the reader apply its default).
 	tunnelConn, serverIP, assignedIP, serverIP6, assignedIP6, err := reconnectHandshake(ctx, conn, currentIP, mtu, dualStack)
 	if err != nil {
-		conn.Close()
+		// Abort, not drain: this runs under the control server's lock,
+		// and a transport's Close sends its queue for up to its bound (P2
+		// of the round-19 review).
+		_ = tun.CloseNow(conn)
 		if tun.IsHandshakeUnanswered(err) {
 			// Booked on the server like the desktop's (R1 of the fix9 stand
 			// run): the transport connected, the server said nothing.
@@ -782,7 +785,7 @@ func reconnectHandshake(ctx context.Context, conn net.Conn, currentIP net.IP, mt
 	if deadline.After(time.Now().Add(tun.HandshakeReadTimeout())) {
 		deadline = time.Time{}
 	}
-	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	stop := context.AfterFunc(ctx, func() { _ = tun.CloseNow(conn) })
 	tunnelConn, serverIP, assignedIP, serverIP6, assignedIP6, err = sendReconnectHandshake(conn, currentIP, mtu, dualStack, deadline)
 	if !stop() {
 		// What the handshake learned goes with the cancellation: an answer
