@@ -214,6 +214,7 @@ func (b *relayBridge) closesCleanly(t *testing.T, out *lockedLog) {
 // write deadline, then one packet up - which failed on the relay and killed
 // the bridge. Scaled 1:25 in time, the 10 ms pacing kept.
 func TestARelayBridgeWritesUpAfterAQuietDownload(t *testing.T) {
+	longTest(t)
 	quiet := 2 * scaleReadPathWrite(t)
 	out := captureLog(t)
 	b := startRelayBridge(t)

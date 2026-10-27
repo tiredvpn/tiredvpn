@@ -13,6 +13,7 @@ import (
 // idle tunnel. Polls are the Polling client's liveness; the cleanup now sees
 // them. Scaled: polls every 100 ms for 2.5 s against a 1 s inactivity limit.
 func TestPollingIdleSessionStaysRegistered(t *testing.T) {
+	longTest(t)
 	srvCtx := newTestServerContext(t)
 	srvCtx.cfg.TunIP = net.IPv4(10, 99, 0, 1).To4()
 	srvCtx.sharedTUN = newTestSharedTUN(t)

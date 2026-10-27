@@ -22,6 +22,7 @@ import (
 // s, and each one woke the idle poll loop out of its backoff. Polling's
 // polls reach the exit on their own: it gets none.
 func TestAnIdlePollingSessionGetsNoUplinkKeepalive(t *testing.T) {
+	longTest(t)
 	forgetNewPollingSessions(t)
 	scaleLegClocks(t)
 	restore := tun.SetUplinkKeepaliveDraw(func() time.Duration {

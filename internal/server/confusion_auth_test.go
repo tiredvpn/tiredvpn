@@ -253,6 +253,7 @@ func TestConfusionEntryPointsCoverEveryCaller(t *testing.T) {
 // unauthenticated peer must get no TCP relay, and no answer it could recognise
 // us by, through any of the three entry points.
 func TestConfusionUnauthenticatedGetsNoRelay(t *testing.T) {
+	longTest(t)
 	for _, ep := range confusionEntryPoints {
 		for _, attack := range []struct {
 			name   string

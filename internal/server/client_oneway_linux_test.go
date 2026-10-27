@@ -28,7 +28,7 @@ import (
 // round-8 review, at which the old client died at exactly the exit's read
 // deadline on real clocks. Scaled 1:25, one a second is one every 40 ms.
 func TestAOneWayDownloadToAClientKeepsTheSession(t *testing.T) {
-	longLegTest(t)
+	longTest(t)
 	for _, every := range []time.Duration{20 * time.Millisecond, time.Second / legScale} {
 		t.Run(every.String(), func(t *testing.T) { oneWayDownload(t, every) })
 	}

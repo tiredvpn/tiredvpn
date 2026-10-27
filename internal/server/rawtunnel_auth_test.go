@@ -102,6 +102,7 @@ func dispatchAnswer(t *testing.T, srvCtx *serverContext, hits chan net.Conn, dis
 }
 
 func TestRawDispatchUnauthenticatedGetsNoTunnel(t *testing.T) {
+	longTest(t)
 	for _, tc := range []struct {
 		name string
 		body func(target string) []byte
@@ -198,6 +199,7 @@ func wsFrame(payload []byte) []byte {
 }
 
 func TestHTTP1UnauthenticatedGetsNoTunnel(t *testing.T) {
+	longTest(t)
 	for _, tc := range []struct {
 		name    string
 		req     string

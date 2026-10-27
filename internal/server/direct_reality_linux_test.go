@@ -20,7 +20,7 @@ import (
 // Stego. The stand's shape, scaled 1:25, for three of the exit's 120 s
 // deadlines, the uplink keepalive drawn as in production and scaled.
 func TestADirectREALITYClientKeepsItsSessionOnASparseDownload(t *testing.T) {
-	longLegTest(t)
+	longTest(t)
 	scaleLegClocks(t)
 	// The draws and the keepalives sent are recorded, so a run says how
 	// late a keepalive came against the period drawn for it and how long
