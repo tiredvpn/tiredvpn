@@ -81,7 +81,9 @@ jobs:
       # run in CI since it was written.
       - name: Integration Tests
         run: |
-          go test -race -timeout 10m -count=1 -v -tags=integration_e2e \
+          # 25m: without -short the server package runs its real-clock and
+          # long leg tests too, past 10 min under -race.
+          go test -race -timeout 25m -count=1 -v -tags=integration_e2e \
             ./internal/strategy/ \
             ./internal/porthopping/ \
             ./internal/server/ \
@@ -231,7 +233,9 @@ jobs:
           echo "expecting PASS from ${#want[@]} tests: ${want[*]}"
 
           set +e
-          sudo unshare -rn sh -c "ip link set lo up &&             TIREDVPN_OLD_EXIT=$RUNNER_TEMP/tiredvpn-linux-amd64             $bin -test.run '^TestAnOldExit' -test.v -test.count=1 -test.timeout=12m" 2>&1 | tee "$log"
+          # -n, not -rn: a user namespace maps root alone, and the runner's
+          # home (750) - where the test binary is - is out of its reach.
+          sudo unshare -n sh -c "ip link set lo up &&             TIREDVPN_OLD_EXIT=$RUNNER_TEMP/tiredvpn-linux-amd64             $bin -test.run '^TestAnOldExit' -test.v -test.count=1 -test.timeout=12m" 2>&1 | tee "$log"
           rc=${PIPESTATUS[0]}
           set -e
           if [ "$rc" -ne 0 ]; then
@@ -260,7 +264,7 @@ jobs:
   real_clock_tests:
     runs-on: ubuntu-latest
     if: github.event_name != 'schedule'
-    timeout-minutes: 10
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -268,14 +272,26 @@ jobs:
           go-version: '1.26'
           cache: true
 
-      - name: Real-clock relay tests
+      # The real-clock hang-up test, and the long leg tests that skip under
+      # -short: run together they took the server package past the 5 min
+      # budget of the test job and of the release workflow.
+      - name: Real-clock and long leg tests
         shell: bash
         run: |
           set -euo pipefail
           log="$RUNNER_TEMP/real-clock-tests.log"
-          want=(TestAHungUpClientsLegEndsOnTheExitsDeadline)
+          want=(TestAHungUpClientsLegEndsOnTheExitsDeadline
+            TestEveryRelayPathKeepsASparseProxiedStream
+            TestAPushOnlyPhoneKeepsItsRelayLeg
+            TestAOneWayDownloadToAClientKeepsTheSession
+            TestASteadyOneWayDownloadKeepsTheLeg
+            TestADialRelayLetsItsLegGoWhenTheClientHangsUp
+            TestADirectREALITYClientKeepsItsSessionOnASparseDownload
+            TestAnOldClientOnASparseDownloadKeepsItsBridgeLeg
+            TestAnOldClientOnASparseDownloadKeepsItsSinkLeg
+            TestASparseDownloadThroughAProxyRelayKeepsItsLeg)
           set +e
-          go test ./internal/server/ -run "^($(IFS='|'; echo "${want[*]}"))\$" -v -count=1 -timeout 8m 2>&1 | tee "$log"
+          go test -race ./internal/server/ -run "^($(IFS='|'; echo "${want[*]}"))\$" -v -count=1 -timeout 20m 2>&1 | tee "$log"
           rc=${PIPESTATUS[0]}
           set -e
           if [ "$rc" -ne 0 ]; then

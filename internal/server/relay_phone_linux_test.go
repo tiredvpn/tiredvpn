@@ -115,6 +115,7 @@ func startPhone(t *testing.T, relay string, mk func(*strategy.Manager) strategy.
 // while a push comes down every 5 s, scaled 1:25, through the relay's bridge
 // (anti-probe) and its sink (Morph). The phone's TCP acknowledges each push.
 func TestAPushOnlyPhoneKeepsItsRelayLeg(t *testing.T) {
+	longLegTest(t)
 	for _, tc := range []struct {
 		name string
 		make func(m *strategy.Manager, secret []byte) strategy.Strategy

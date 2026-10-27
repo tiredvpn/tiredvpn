@@ -52,6 +52,18 @@ func scaleLegClocks(t *testing.T) {
 	})
 }
 
+// longLegTest skips a leg test under -short. These run the legs for tens of
+// seconds up to minutes each, and together they took the package past the
+// 5 min -short budget of CI and of the release workflow - the package went
+// from about 1 min to about 8 under -race. CI's real_clock_tests job runs
+// them by name, without -short, and requires a PASS from each.
+func longLegTest(t *testing.T) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("long leg test: runs in CI's real_clock_tests job")
+	}
+}
+
 // legExit is a TUN exit on loopback: the real dispatcher over a TUN made of a
 // seqpacket socket pair.
 type legExit struct {
@@ -211,12 +223,10 @@ func TestARelayLegOutlivesTheExitsReadDeadline(t *testing.T) {
 // keepalive was due and waited a whole quiet period more - up to two of
 // them without a frame for the exit.
 //
-// -short runs the 45 s draw only.
+// Every draw: 20 s, 30 s and 45 s.
 func TestASteadyOneWayDownloadKeepsTheLeg(t *testing.T) {
-	draws := []time.Duration{45 * time.Second}
-	if !testing.Short() {
-		draws = append(draws, 20*time.Second, 30*time.Second)
-	}
+	longLegTest(t)
+	draws := []time.Duration{45 * time.Second, 20 * time.Second, 30 * time.Second}
 	scaleLegClocks(t)
 	for _, flow := range []struct {
 		name  string
