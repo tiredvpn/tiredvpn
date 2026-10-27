@@ -141,11 +141,7 @@ type health struct {
 	// beforeConnect is the failure streak, backoff and parks a successful
 	// connect cleared (Report), for a session handshake that then fails to
 	// put back (ReportHandshakeFailed).
-	beforeConnect struct {
-		failures                     int
-		backoff                      time.Duration
-		cooldownUntil, deadParkUntil time.Time
-	}
+	beforeConnect clearedByConnect
 	lastSuccess   time.Time
 	lastFailure   time.Time
 	cooldownUntil time.Time
@@ -700,8 +696,8 @@ func (s *Selector) Report(c Candidate, ok bool, latency time.Duration) {
 	now := s.cfg.Now()
 	h := &s.health[idx]
 	if ok {
-		h.beforeConnect.failures, h.beforeConnect.backoff = h.consecutiveFailures, h.backoff
-		h.beforeConnect.cooldownUntil, h.beforeConnect.deadParkUntil = h.cooldownUntil, h.deadParkUntil
+		h.beforeConnect = clearedByConnect{failures: h.consecutiveFailures, backoff: h.backoff,
+			cooldownUntil: h.cooldownUntil, deadParkUntil: h.deadParkUntil}
 		h.consecutiveFailures = 0
 		h.backoff = 0
 		h.cooldownUntil = time.Time{}
@@ -712,6 +708,13 @@ func (s *Selector) Report(c Candidate, ok bool, latency time.Duration) {
 		return
 	}
 	s.recordFailureLocked(idx, now)
+}
+
+// clearedByConnect is what a successful connect cleared on a candidate.
+type clearedByConnect struct {
+	failures                     int
+	backoff                      time.Duration
+	cooldownUntil, deadParkUntil time.Time
 }
 
 // ReportHandshakeFailed books a session handshake that failed on c after
@@ -731,21 +734,20 @@ func (s *Selector) ReportHandshakeFailed(c Candidate) {
 		return
 	}
 	h := &s.health[idx]
-	b := &h.beforeConnect
+	b := h.beforeConnect
+	h.beforeConnect = clearedByConnect{}
 	h.consecutiveFailures += b.failures
 	h.backoff = max(h.backoff, b.backoff)
+	s.recordFailureLocked(idx, s.cfg.Now())
+	// After the failure is recorded: at the threshold it sets a cooldown of
+	// its own, which cut a later restored one short (finding 1 of the
+	// round-15 review). The later of the two stands.
 	if b.cooldownUntil.After(h.cooldownUntil) {
 		h.cooldownUntil = b.cooldownUntil
 	}
 	if b.deadParkUntil.After(h.deadParkUntil) {
 		h.deadParkUntil = b.deadParkUntil
 	}
-	*b = struct {
-		failures                     int
-		backoff                      time.Duration
-		cooldownUntil, deadParkUntil time.Time
-	}{}
-	s.recordFailureLocked(idx, s.cfg.Now())
 }
 
 // ReportProbe records the outcome of a reachability probe (the family probe or
