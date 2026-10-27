@@ -75,10 +75,11 @@ func drainAnswer(t *testing.T, c net.Conn, window time.Duration) []byte {
 
 // targetHit reports whether the server dialled the target, closing that
 // connection so a relay the server did open can wind down.
-func targetHit(hits chan net.Conn) bool {
+func targetHit(t *testing.T, hits chan net.Conn) bool {
+	t.Helper()
 	select {
 	case c := <-hits:
-		c.Close()
+		t.Logf("target hit: %s", hitTrace(c))
 		return true
 	case <-time.After(200 * time.Millisecond):
 		return false
@@ -95,14 +96,13 @@ func dispatchAnswer(t *testing.T, srvCtx *serverContext, hits chan net.Conn, dis
 		t.Fatalf("write: %v", err)
 	}
 	answer := drainAnswer(t, client, time.Second)
-	hit := targetHit(hits)
+	hit := targetHit(t, hits)
 	client.Close()
 	waitHandler(t, done)
 	return answer, hit
 }
 
 func TestRawDispatchUnauthenticatedGetsNoTunnel(t *testing.T) {
-	longTest(t)
 	for _, tc := range []struct {
 		name string
 		body func(target string) []byte
@@ -178,7 +178,7 @@ func http1Answer(t *testing.T, srvCtx *serverContext, hits chan net.Conn, req st
 		_, _ = client.Write(followUp)
 	}
 	rest = drainAnswer(t, &readerConn{Conn: client, r: br}, time.Second)
-	hit = targetHit(hits)
+	hit = targetHit(t, hits)
 	client.Close()
 	waitHandler(t, done)
 	return status, rest, hit
@@ -199,7 +199,6 @@ func wsFrame(payload []byte) []byte {
 }
 
 func TestHTTP1UnauthenticatedGetsNoTunnel(t *testing.T) {
-	longTest(t)
 	for _, tc := range []struct {
 		name    string
 		req     string
