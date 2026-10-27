@@ -2,6 +2,7 @@ package tun
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -29,8 +30,11 @@ type returnFront struct {
 	// session, and loses the exit's answer on the way back.
 	dropReply atomic.Bool
 	// resetOnce closes the next connection right after its handshake
-	// request, once.
-	resetOnce atomic.Bool
+	// request, once; resetAll every one.
+	resetOnce, resetAll atomic.Bool
+	// smuxTimeout makes a read deadline come back as smux v2 reports it -
+	// errors.New("timeout"), no net.Error - as on REALITY.
+	smuxTimeout atomic.Bool
 	// requested, when set, is called as the handshake request arrives.
 	requested atomic.Pointer[func()]
 	// answerAfter holds the answer back.
@@ -73,7 +77,7 @@ func (s *frontStrategy) Connect(ctx context.Context, target string) (net.Conn, e
 			_, _ = io.Copy(io.Discard, srv)
 			return
 		}
-		if f.resetOnce.CompareAndSwap(true, false) {
+		if f.resetOnce.CompareAndSwap(true, false) || f.resetAll.Load() {
 			srv.Close()
 			return
 		}
@@ -84,7 +88,22 @@ func (s *frontStrategy) Connect(ctx context.Context, target string) (net.Conn, e
 		}
 		f.exit.serveAnswered(srv)
 	}()
+	if f.smuxTimeout.Load() {
+		return smuxLikeConn{cli}, nil
+	}
 	return cli, nil
+}
+
+// smuxLikeConn reports a read deadline the way smux v2 does.
+type smuxLikeConn struct{ net.Conn }
+
+func (c smuxLikeConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return n, errors.New("timeout")
+	}
+	return n, err
 }
 
 // serveAnswered is serve past the handshake request, which the front read.
@@ -308,6 +327,63 @@ func TestASilentHandshakeOnTheSameExitReconnectsOnce(t *testing.T) {
 	h := newSameExitHarness(t)
 	h.v6.mute.Store(true)
 	h.expectReconnectOnV4(t)
+}
+
+// TestASilentREALITYReturnParksTheFamily is finding 1 of the round-13
+// review: v6 never answers, and its transport reports the deadline as smux
+// does for REALITY - errors.New("timeout"), no net.Error. The silence went
+// unrecognised, v6 got one failure instead of its park, and the reconnect
+// could go straight back to it. Marked by the client's clock now, it parks.
+func TestASilentREALITYReturnParksTheFamily(t *testing.T) {
+	shortHandshakeTimeout(t, 500*time.Millisecond)
+	h := newSameExitHarness(t)
+	h.v6.smuxTimeout.Store(true)
+	h.v6.mute.Store(true)
+	h.expectReconnectOnV4(t)
+}
+
+// TestAFamilyThatResetsEveryHandshakeIsLeft is the rest of that finding:
+// v6 connects every time and resets every handshake after the request. The
+// return books one failure and reconnects; the reconnect goes back to v6,
+// whose transport connect was booked a success that wiped the failure, and
+// whose handshake failure was booked as nothing. v6 never collected two
+// failures, and the tunnel went round on it. Now the failed handshake
+// undoes the connect's success: v6 is parked, and the tunnel lands on v4.
+func TestAFamilyThatResetsEveryHandshakeIsLeft(t *testing.T) {
+	shortHandshakeTimeout(t, 500*time.Millisecond)
+	h := newSameExitHarness(t)
+	h.v6.resetAll.Store(true)
+	h.v.mu.Lock()
+	old := h.v.conn
+	h.v.mu.Unlock()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		h.v.mu.Lock()
+		cur := h.v.conn
+		h.v.mu.Unlock()
+		if cur != nil && cur != old && h.v6.handshakes.Load() > 0 && h.m.GetServerAddr(context.Background()) != h.v6At {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if h.v6.handshakes.Load() == 0 {
+		t.Fatal("no handshake on v6 - the test proves nothing")
+	}
+	if got := h.m.GetServerAddr(context.Background()); got == h.v6At {
+		t.Fatalf("the tunnel is still on v6 after %d handshakes there", h.v6.handshakes.Load())
+	}
+	if !h.downlinkWorks(3 * time.Second) {
+		t.Fatal("no downlink on v4")
+	}
+	parked := false
+	for _, st := range h.m.EndpointStates() {
+		if st.Addr == h.v6At && st.CooldownUntil.After(time.Now()) {
+			parked = true
+		}
+	}
+	if !parked {
+		t.Fatal("v6 is not parked")
+	}
 }
 
 // TestASilentReturnHoldsTheNextOneBack is finding 6 of the round-12 review:

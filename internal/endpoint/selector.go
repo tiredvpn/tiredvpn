@@ -138,11 +138,18 @@ func (c *Config) applyDefaults() {
 // it; callers get a read-only CandidateState from Snapshot.
 type health struct {
 	consecutiveFailures int
-	lastSuccess         time.Time
-	lastFailure         time.Time
-	cooldownUntil       time.Time
-	backoff             time.Duration
-	latencyEWMA         time.Duration
+	// beforeConnect is the failure streak and backoff a successful connect
+	// cleared (Report), for a session handshake that then fails to put back
+	// (ReportHandshakeFailed).
+	beforeConnect struct {
+		failures int
+		backoff  time.Duration
+	}
+	lastSuccess   time.Time
+	lastFailure   time.Time
+	cooldownUntil time.Time
+	backoff       time.Duration
+	latencyEWMA   time.Duration
 
 	// deadStreak counts the sessions in a row that died young on this
 	// candidate (ReportDeadSession). Unlike consecutiveFailures, a successful
@@ -692,6 +699,7 @@ func (s *Selector) Report(c Candidate, ok bool, latency time.Duration) {
 	now := s.cfg.Now()
 	h := &s.health[idx]
 	if ok {
+		h.beforeConnect.failures, h.beforeConnect.backoff = h.consecutiveFailures, h.backoff
 		h.consecutiveFailures = 0
 		h.backoff = 0
 		h.cooldownUntil = time.Time{}
@@ -702,6 +710,28 @@ func (s *Selector) Report(c Candidate, ok bool, latency time.Duration) {
 		return
 	}
 	s.recordFailureLocked(idx, now)
+}
+
+// ReportHandshakeFailed books a session handshake that failed on c after
+// its transport connect was booked a success: the connect was not one after
+// all. The failure streak the connect cleared is put back and this failure
+// added to it. Booked as a failure on its own, it was one in a row each
+// time - the connect before it had cleared the last - and a family that
+// connects and resets every handshake was never parked; the client went
+// round on it (finding 1 of the round-13 review).
+func (s *Selector) ReportHandshakeFailed(c Candidate) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	idx, found := s.byAddr[c.Addr]
+	if !found {
+		return
+	}
+	h := &s.health[idx]
+	if h.consecutiveFailures == 0 {
+		h.consecutiveFailures, h.backoff = h.beforeConnect.failures, h.beforeConnect.backoff
+	}
+	h.beforeConnect.failures, h.beforeConnect.backoff = 0, 0
+	s.recordFailureLocked(idx, s.cfg.Now())
 }
 
 // ReportProbe records the outcome of a reachability probe (the family probe or

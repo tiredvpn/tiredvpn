@@ -384,11 +384,14 @@ func TestTwinsDoNotShareAnOfflineDirectClientsAddress(t *testing.T) {
 // .3. Box A, configured with -tun-ip .3, then asked for it, found it under
 // the drawn-tag prefix and took it over from the live B, which asked for
 // .3 on its next session and took it back - a flap in both orders. A
-// refused request is now served from the top of the pool down, away from
-// the low addresses people configure. Two boxes that ask for an address
-// one of them was given are still not told apart: that needs proof of
-// ownership (1.11.10).
+// refused request is now served from a random point of the pool on, fixed
+// to the middle here so the test does not hit .3 by chance (1 in 253).
+// Two boxes that ask for an address one of them was given are still not
+// told apart: that needs proof of ownership (1.11.10).
 func TestARefusedBoxIsNotGivenTheNextConfiguredAddress(t *testing.T) {
+	old := refusedScanFrom
+	refusedScanFrom = func(n uint64) uint64 { return n / 2 }
+	t.Cleanup(func() { refusedScanFrom = old })
 	scaleLegClocks(t)
 	out := captureLog(t)
 	secret := []byte("relay-leg-secret-0123456789abcdef")

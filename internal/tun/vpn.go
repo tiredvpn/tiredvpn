@@ -1053,8 +1053,14 @@ func (v *VPNClient) connect(parent context.Context) error {
 			// heard nothing (R1 of the fix9 stand run).
 			return fmt.Errorf("%w: %w", v.manager.HandshakeUnanswered(strat, cand, hasCand), err)
 		}
-		if IsHandshakeAnswered(err) {
+		switch {
+		case IsHandshakeAnswered(err):
 			v.manager.HandshakeAnswered(strat, cand, hasCand)
+		case !errors.Is(err, errHandshakeCutShort):
+			// Neither answered nor silent: a reset or an end of stream
+			// after the request. A failure of cand, which its connect's
+			// success must not hide (finding 1 of the round-13 review).
+			v.manager.HandshakeFailed(cand, hasCand)
 		}
 		return err
 	}
@@ -1235,6 +1241,8 @@ func (v *VPNClient) doHandshake(conn net.Conn, localIP net.IP) ([]byte, int, net
 // that never left or an answer that came in part.
 func IsHandshakeUnanswered(err error) bool {
 	switch {
+	case errors.Is(err, errHandshakeSilent):
+		return true
 	case errors.Is(err, errHandshakeNotSent), errors.Is(err, errHandshakeRefused),
 		errors.Is(err, errHandshakeCutShort), errors.Is(err, errHandshakePartlyAnswered),
 		errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
@@ -1299,6 +1307,14 @@ var (
 	errHandshakeCutShort       = errors.New("TUN handshake read cut short by the caller's budget")
 	errHandshakePartlyAnswered = errors.New("TUN handshake answered in part")
 )
+
+// errHandshakeSilent marks a handshake read that got nothing and came back
+// at or after its full wait, by the client's clock: the server's silence,
+// whatever the transport calls its deadline. smux, which carries REALITY,
+// calls it errors.New("timeout"), no net.Error, and the silence of a
+// REALITY front went unrecognised (finding 1 of the round-13 review; see
+// markSilence).
+var errHandshakeSilent = errors.New("TUN handshake unanswered for the full wait")
 
 // handshakeRespBufSize fits the largest handshake response: the v2 layout
 // with a max-length seed (20+32) plus the 32-byte dual-stack block.
@@ -1414,6 +1430,8 @@ func readHandshakeResponse(conn net.Conn, clientVersion byte, deadline time.Time
 			// server may simply not have had the time (P2-2 of the
 			// round-8 review).
 			err = fmt.Errorf("%w: %w", errHandshakeCutShort, err)
+		case !time.Now().Before(deadline):
+			err = fmt.Errorf("%w: %w", errHandshakeSilent, err)
 		}
 		return nil, 0, conn, err
 	}

@@ -30,6 +30,14 @@ func setH2TUNEndBackstop(t *testing.T, d time.Duration) {
 	t.Cleanup(func() { h2TUNEndBackstopNs.Store(old) })
 }
 
+// setH2TUNEndGrace sets how long a session takes frames after its sink
+// went, for the test.
+func setH2TUNEndGrace(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := h2TUNEndGraceNs.Swap(int64(d))
+	t.Cleanup(func() { h2TUNEndGraceNs.Store(old) })
+}
+
 // clientKeepalives sets both of the client's keepalives - on the server's
 // silence and on its own uplink's - to every for the test.
 func clientKeepalives(t *testing.T, every time.Duration) {
@@ -65,6 +73,7 @@ func waitAbove(n *atomic.Int64, before int64, within time.Duration) bool {
 func TestADisplacedH2TUNSessionEndsOnItsNextFrame(t *testing.T) {
 	clientKeepalives(t, time.Hour)
 	setH2TUNEndBackstop(t, time.Hour)
+	setH2TUNEndGrace(t, 500*time.Millisecond)
 	secret := []byte("relay-leg-secret-0123456789abcdef")
 	exit := newLegExit(t, secret)
 	ask := net.IPv4(10, 8, 7, 66)
@@ -125,6 +134,7 @@ func TestARelayedH2TUNSessionEndsWithItsUpstreamLeg(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			clientKeepalives(t, tc.keepalive)
 			setH2TUNEndBackstop(t, tc.backstop)
+			setH2TUNEndGrace(t, 0)
 			secret := []byte("relay-leg-secret-0123456789abcdef")
 			exit := newLegExit(t, secret)
 			relay, ended := legRelayCounted(t, secret, exit)
@@ -138,5 +148,53 @@ func TestARelayedH2TUNSessionEndsWithItsUpstreamLeg(t *testing.T) {
 				t.Fatal("the relay still runs the client's session 3 s after the exit dropped its leg")
 			}
 		})
+	}
+}
+
+// TestADisplacedH2TUNSessionTakesFramesThroughItsGrace is finding 2 of the
+// round-13 review: a client moving its tunnel - an upgrade is not held back
+// while traffic flows - keeps sending on the old session until the new one
+// answers. Round 18 ended the old session at its first frame after the
+// takeover, 200 ms in, and that end could reach the client first and throw
+// the new session away. Frames every 100 ms: the displaced session takes
+// them through its grace and ends at the first one after it.
+func TestADisplacedH2TUNSessionTakesFramesThroughItsGrace(t *testing.T) {
+	clientKeepalives(t, 100*time.Millisecond)
+	setH2TUNEndBackstop(t, time.Hour)
+	setH2TUNEndGrace(t, 1500*time.Millisecond)
+	secret := []byte("relay-leg-secret-0123456789abcdef")
+	exit := newLegExit(t, secret)
+	ask := net.IPv4(10, 8, 7, 69)
+	clientAskingVia(t, exit.addr, ask, h2Maker(secret))
+	before := exit.ended.Load()
+	clientAskingVia(t, exit.addr, ask, h2Maker(secret))
+	if waitAbove(&exit.ended, before, time.Second) {
+		t.Fatal("the displaced session ended within its grace, on a frame of a client that may be moving")
+	}
+	if !waitAbove(&exit.ended, before, 3*time.Second) {
+		t.Fatal("the displaced session is still running past its grace")
+	}
+}
+
+// TestAnEndedH2TUNSessionLeavesNoBackstop is finding 6 of the round-13
+// review: on every session end the backstop's timer stayed behind for 15 s,
+// holding the ended session and closing its conn a second time. A session
+// that ends stops it.
+func TestAnEndedH2TUNSessionLeavesNoBackstop(t *testing.T) {
+	setH2TUNEndBackstop(t, time.Hour)
+	secret := []byte("relay-leg-secret-0123456789abcdef")
+	exit := newLegExit(t, secret)
+	before := exit.ended.Load()
+	c := clientAskingVia(t, exit.addr, net.IPv4(10, 8, 7, 70), h2Maker(secret))
+	c.Stop()
+	if !waitAbove(&exit.ended, before, 3*time.Second) {
+		t.Fatal("the session did not end - the test proves nothing")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for h2TUNBackstopsArmed.Load() != 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if n := h2TUNBackstopsArmed.Load(); n != 0 {
+		t.Fatalf("%d backstops still armed after the session ended", n)
 	}
 }

@@ -420,7 +420,7 @@ var dialCutTimer = time.AfterFunc
 //
 // hold says the attempt is held to its share (scanState.held): at dialLimit
 // a connected attempt is cut too, unless the server's TCP has acknowledged
-// the handshake's first bytes (handshakeProgressed). A server that is slow
+// the handshake's whole first flight (handshakeProgressed). A server that is slow
 // to answer - 7-9 s through a bad mobile link, or reaching its cover - still
 // acknowledges at once; a censor that drops the ClientHello, as the fix13c
 // stand did, never lets it get there. The share was a cut whatever the
@@ -2641,6 +2641,16 @@ func (m *Manager) HandshakeUnanswered(s Strategy, cand endpoint.Candidate, hasCa
 	}
 	m.logEndpointHealth(sel, cand)
 	return ErrAddrSilent
+}
+
+// HandshakeFailed books a session handshake on cand that failed with
+// neither an answer nor the server's silence - a reset or an end of stream
+// after the request - as a failure of cand, past the success its transport
+// connect was booked (Selector.ReportHandshakeFailed).
+func (m *Manager) HandshakeFailed(cand endpoint.Candidate, hasCand bool) {
+	if sel := m.selector(); sel != nil && hasCand {
+		sel.ReportHandshakeFailed(cand)
+	}
 }
 
 // HandshakeAnswered ends cand's server's run of unanswered session

@@ -96,14 +96,24 @@ Versions follow [Semantic Versioning](https://semver.org/).
   silence verdict on another one, an attempt gets an even share of what is
   left (about a sixteenth of the cycle at least, drawn around that size,
   equal-priority transports in shuffled order) while other transports wait.
-  An attempt whose first flight the server's TCP has acknowledged runs on
-  past its share, so a slow but live handshake still completes; one whose
-  first flight is never acknowledged, as when a censor drops it, is cut.
+  An attempt whose whole first flight the server's TCP has acknowledged
+  runs on past its share, so a slow but live handshake still completes; one
+  whose first flight is not acknowledged in full, as when a censor drops the
+  ClientHello behind an acknowledged decoy, is cut.
   Limits: on Linux a path with a round trip above about 350-580 ms is cut
   before its ACK is back; a first flight that is acknowledged and then
   never answered runs the whole cycle; on macOS and Windows, which have no
   TCP_INFO here, no attempt is cut at its share (Android follows the Linux
   rule).
+- **Client: a server address that connects and then resets or never
+  answers every session handshake is left.** The transport connect was
+  booked a success that cleared the failure before it, and a reset after
+  the request was booked as nothing, so the address never collected two
+  failures and the tunnel went round on it; a REALITY handshake that
+  never answered was not recognised as silence at all, since smux names
+  its deadline differently.
+- **Server: an IP pool smaller than a /30 is refused at startup.** On a /31
+  or /32 the pool handed out addresses outside its network.
 - **Server: a lease under a live session is renewed instead of running
   out.** A dynamic lease that ran out while its session was up could go to
   the next client asking, of another credential too. (A shared-secret
@@ -112,8 +122,9 @@ Versions follow [Semantic Versioning](https://semver.org/).
 - **Server: an HTTP/2 Stego TUN session ends once its address is taken over
   on the exit, or once the exit ends a relay's upstream leg.** It went on
   echoing keepalives with no downlink, and its client never reconnected. It
-  now ends at the client's next frame, or 15 s later if none comes, so a
-  client moving to the new session gets its answer first.
+  now ends at the client's first frame 5 s or more after that, or 15 s
+  after it if none comes. A client moving its tunnel to the new session is
+  unlikely to lose it to the old one's end.
 - **Server: a session that got the tunnel address it asked for lets go of
   it when it ends.** The exit kept the request's bytes, a slice of a buffer
   the next frame overwrote, and at the end unregistered some other address
@@ -212,11 +223,13 @@ Versions follow [Semantic Versioning](https://semver.org/).
   forwarding. A client with its own credential keeps its address; clients
   sharing the server's global secret hold a lease per session, since
   nothing they send tells them apart. Such a client gets an address from
-  the pool on its first session, from the top of the pool down - not the
+  the pool on its first session, from a random point of the pool - not the
   one it asked for, so two boxes configured alike get two - and a reconnect
   that asks for the address it holds takes it over, even while the old
   session is still up. A box that came through a 1.11.8 relay gets a new
-  address once. Old relays and old exits are unaffected, and keep the old
+  address once, and the old lease is not released: it runs out with its
+  TTL, or, if it was a requested lease in Redis, stays until deleted by
+  hand. Old relays and old exits are unaffected, and keep the old
   behaviour between themselves. Known limits until 1.11.10, which needs
   proof of ownership in the handshake: such a client gets a new address
   after a fresh start or once its lease is gone, a box failing over between
