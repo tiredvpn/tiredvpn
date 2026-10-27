@@ -4,7 +4,9 @@ import (
 	"context"
 	"io"
 	"net"
+	"os"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -126,5 +128,79 @@ func TestAnAndroidConnectWhoseHandshakeIsResetParksTheAddress(t *testing.T) {
 	conn.Close()
 	if got := s.last(); got != androidPool[1] {
 		t.Fatalf("the third connect dialled %s, want %s", got, androidPool[1])
+	}
+}
+
+// failingConn fails the reconnect's request write or its response read with
+// err, as the client's socket reports it.
+type failingConn struct {
+	net.Conn
+	write, read error
+}
+
+func (c failingConn) Write(p []byte) (int, error) {
+	if c.write != nil {
+		return 0, c.write
+	}
+	return c.Conn.Write(p)
+}
+
+func (c failingConn) Read(p []byte) (int, error) {
+	if c.read != nil {
+		return 0, c.read
+	}
+	return c.Conn.Read(p)
+}
+
+// failingStrategy connects to a pipe whose request write or response read
+// fails as failingConn says.
+type failingStrategy struct {
+	resettingStrategy
+	write, read error
+}
+
+func (s *failingStrategy) Connect(ctx context.Context, target string) (net.Conn, error) {
+	c, err := s.resettingStrategy.Connect(ctx, target)
+	if err != nil {
+		return nil, err
+	}
+	return failingConn{Conn: c, write: s.write, read: s.read}, nil
+}
+
+// TestReconnectHandshakeFailuresAreBookedByWhoseSideFailed is findings 2
+// and 3 of the round-15 review, through reconnectTUN: a request write the
+// peer reset (EPIPE) is the server's failure and parks a after two; a
+// read the host aborted (ECONNABORTED: netd destroying the sockets of a
+// lost address) is the client's own and parks nothing.
+func TestReconnectHandshakeFailuresAreBookedByWhoseSideFailed(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		write, read error
+		parked      bool
+	}{
+		{"request write reset by the peer", syscall.EPIPE, nil, true},
+		{"read aborted by the host", nil, &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("read", syscall.ECONNABORTED)}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, b := acceptAll(t), acceptAll(t)
+			m := strategy.NewManager()
+			if err := m.SetEndpoints([]endpoint.Endpoint{{Name: "a", V4: a}, {Name: "b", V4: b, Order: 1}}, endpoint.V4Only); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(endpoint.ResetSharedSelectors)
+			s := &failingStrategy{resettingStrategy: resettingStrategy{t: t}, write: tc.write, read: tc.read}
+			m.Register(s)
+			for i := 1; i <= 2; i++ {
+				ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+				_, _, err := reconnectTUN(ctx, m, a, reconnClientIP, 1280, false, false)
+				cancel()
+				if err == nil || s.last() != a {
+					t.Fatalf("reconnect %d on %s: %v - the test proves nothing", i, s.last(), err)
+				}
+			}
+			if got := parkedNow(m, a); got != tc.parked {
+				t.Fatalf("a parked = %v after two of them, want %v", got, tc.parked)
+			}
+		})
 	}
 }

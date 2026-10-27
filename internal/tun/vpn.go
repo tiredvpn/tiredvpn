@@ -1056,7 +1056,7 @@ func (v *VPNClient) connect(parent context.Context) error {
 		switch {
 		case IsHandshakeAnswered(err):
 			v.manager.HandshakeAnswered(strat, cand, hasCand)
-		case IsHandshakeFailed(err):
+		case IsHandshakeFailed(ctx, err):
 			// Neither answered nor silent: a reset or an end of stream
 			// after the request. A failure of cand, which its connect's
 			// success must not hide (finding 1 of the round-13 review).
@@ -1252,24 +1252,50 @@ func IsHandshakeUnanswered(err error) bool {
 	return errors.As(err, &ne) && ne.Timeout()
 }
 
-// IsHandshakeFailed reports a session handshake that failed after its
-// request went out with neither an answer nor the server's silence: a reset
-// or an end of stream after the request. Such a failure is the candidate's
-// (Manager.HandshakeFailed). Not one whose request never left, whose wait
-// the caller's budget cut short, or that a cancellation or a timeout ended:
-// a client stopping, or a write running into its deadline, says nothing of
-// the server (P3-2 of the round-14 review).
-func IsHandshakeFailed(err error) bool {
+// IsHandshakeFailed reports a session handshake on ctx that the server's
+// side ended with neither an answer nor silence: a reset or an end of
+// stream after the request, or a request write the peer reset. Such a
+// failure is the candidate's (Manager.HandshakeFailed).
+//
+// What says nothing of the server is left out, both ways the round-15
+// review found it wrong:
+//   - a wait the caller's budget cut short, a cancellation - ctx done, or a
+//     conn closed under the handshake - and a timeout: a client stopping, or
+//     a write running into its deadline (P3-2 of the round-14 review);
+//   - a local abort: netd destroying the sockets of an address Android lost
+//     (ECONNABORTED), or a network or route gone under the handshake. Booked,
+//     a Wi-Fi to LTE flap charged a healthy server (finding 2).
+//
+// A request that never left is a failure when the peer reset it (EPIPE,
+// ECONNRESET): left out whole, a session that dies on the write - smux,
+// polling - brought back the loop round 13 closed (finding 3).
+func IsHandshakeFailed(ctx context.Context, err error) bool {
 	if err == nil || IsHandshakeUnanswered(err) || IsHandshakeAnswered(err) {
 		return false
 	}
+	if ctx != nil && ctx.Err() != nil {
+		return false
+	}
 	switch {
-	case errors.Is(err, errHandshakeNotSent), errors.Is(err, errHandshakeCutShort),
-		errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+	case errors.Is(err, errHandshakeCutShort), errors.Is(err, net.ErrClosed),
+		errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled),
+		localNetAbort(err):
 		return false
 	}
 	var ne net.Error
 	return !errors.As(err, &ne) || !ne.Timeout()
+}
+
+// localNetAbort reports an error the client's own host or network raised:
+// the socket aborted under it, or the network, route or address gone.
+func localNetAbort(err error) bool {
+	for _, local := range []error{syscall.ECONNABORTED, syscall.ENETDOWN, syscall.ENETUNREACH,
+		syscall.EHOSTUNREACH, syscall.EADDRNOTAVAIL} {
+		if errors.Is(err, local) {
+			return true
+		}
+	}
+	return false
 }
 
 // IsHandshakeAnswered reports whether a failed session handshake was

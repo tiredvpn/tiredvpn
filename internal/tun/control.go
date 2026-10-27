@@ -696,7 +696,7 @@ func (cs *ControlServer) handleConnect(ctx context.Context) ControlResponse {
 				err = cs.config.HandshakeOutcomeFn(HandshakeUnansweredOutcome, err)
 			case IsHandshakeAnswered(err):
 				_ = cs.config.HandshakeOutcomeFn(HandshakeAnsweredOutcome, nil)
-			case IsHandshakeFailed(err):
+			case IsHandshakeFailed(opCtx, err):
 				// A reset after the request: the Android core's first
 				// connect booked it as nothing, and a family that resets
 				// every handshake was never parked (P2 of the round-14
