@@ -132,7 +132,7 @@ startup, and polls the `<prefix>version` counter every 30 s as a fallback.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-ip-pool` | | CIDR for client tunnel addresses, e.g. `10.8.0.0/24`. Enables the shared TUN device, the IP pool and the NAT bootstrap. |
+| `-ip-pool` | | CIDR for client tunnel addresses, e.g. `10.8.0.0/24`, a /30 at least. Enables the shared TUN device, the IP pool and the NAT bootstrap. |
 | `-ip-pool-lease` | `24h` | Lease duration per client. `0` = permanent. |
 | `-ip-pool-v6` | | ULA prefix for dual-stack clients, e.g. `fd00:10:8::/64`. Enables IPv6 inside the tunnel and NAT66. |
 | `-tun-ip` | `10.8.0.1` | Server-side TUN address. Must parse as IPv4; anything else aborts startup. |
@@ -178,7 +178,8 @@ Leases taken by an older server under its per-transport keys are moved to the
 credential key the first time the client connects, and any extra old lease the
 client still holds is released. A global-secret client behind a relay is the
 exception: its lease is per session, it adopts no old lease, and it gets a new
-address once. A registry client's old REALITY lease is found
+address once. The old lease is not released either: it runs out with its TTL,
+or, if it was a requested lease in Redis, stays until you delete it. A registry client's old REALITY lease is found
 whichever address it was taken from; on the global secret only the lease taken
 from the client's current address is its own. Each credential is checked at
 most once per 10 minutes, so an older exit writing old keys into the same Redis
