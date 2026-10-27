@@ -2643,6 +2643,16 @@ func (m *Manager) HandshakeUnanswered(s Strategy, cand endpoint.Candidate, hasCa
 	return ErrAddrSilent
 }
 
+// HandshakeFailed books a session handshake on cand that failed with
+// neither an answer nor the server's silence - a reset or an end of stream
+// after the request - as a failure of cand, past the success its transport
+// connect was booked (Selector.ReportHandshakeFailed).
+func (m *Manager) HandshakeFailed(cand endpoint.Candidate, hasCand bool) {
+	if sel := m.selector(); sel != nil && hasCand {
+		sel.ReportHandshakeFailed(cand)
+	}
+}
+
 // HandshakeAnswered ends cand's server's run of unanswered session
 // handshakes: the server answered one, on s, which is no longer mute on
 // cand's address.
