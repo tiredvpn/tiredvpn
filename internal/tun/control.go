@@ -188,8 +188,9 @@ type ConnectionMetadata struct {
 type HandshakeOutcome int
 
 const (
-	// HandshakeAnsweredOutcome: answered, refused or in part.
-	HandshakeAnsweredOutcome HandshakeOutcome = iota
+	// HandshakeAnsweredOutcome: answered, refused or in part. Numbered from
+	// one, so an outcome left unset is none of them.
+	HandshakeAnsweredOutcome HandshakeOutcome = iota + 1
 	// HandshakeUnansweredOutcome: the server's silence (IsHandshakeUnanswered).
 	HandshakeUnansweredOutcome
 	// HandshakeFailedOutcome: a reset or an end of stream after the request

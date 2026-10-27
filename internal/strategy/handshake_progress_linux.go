@@ -41,10 +41,12 @@ func handshakeProgressed(conn net.Conn) bool {
 	return flightThrough(info)
 }
 
-// flightThrough: data past the SYN is acknowledged, and the server has
-// answered or nothing is left in flight or unsent. The acknowledged data is
-// asked for with an answer too: a server that speaks first answers a client
-// that sent nothing.
+// flightThrough: the server's TCP has acknowledged data past the SYN, and
+// either the server has sent something back or nothing of the client's is
+// left in flight or unsent. The first condition holds even when the server
+// has answered: a server or middlebox that speaks first sends bytes to a
+// client that has sent nothing, and that is no sign its handshake got
+// through.
 func flightThrough(info *unix.TCPInfo) bool {
 	if info.Bytes_acked <= 1 {
 		return false

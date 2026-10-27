@@ -204,3 +204,26 @@ func TestReconnectHandshakeFailuresAreBookedByWhoseSideFailed(t *testing.T) {
 		})
 	}
 }
+
+// TestAnUnsetHandshakeOutcomeBooksNothing: the outcomes are numbered from
+// one, and one left unset is none of them - not "answered", which ended a
+// run of silence, and not "unanswered" (nit of the round-15 review).
+func TestAnUnsetHandshakeOutcomeBooksNothing(t *testing.T) {
+	m, _ := androidPoolManager(t)
+	sess := &androidSession{mgr: m, linkUp: func() bool { return true }}
+	ccfg := androidControlConfig(&Config{ServerAddr: androidPool[0], TunMTU: 1280}, m, false, sess)
+	_, _, conn, err := ccfg.ConnectFn(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
+	var unset tun.HandshakeOutcome
+	for range 3 {
+		if got := ccfg.HandshakeOutcomeFn(unset, io.EOF); got != io.EOF {
+			t.Fatalf("an unset outcome answered %v, want the error back as it came", got)
+		}
+	}
+	if parkedNow(m, androidPool[0]) {
+		t.Fatal("an unset outcome parked the server")
+	}
+}
