@@ -689,7 +689,7 @@ func (cs *ControlServer) handleConnect(ctx context.Context) ControlResponse {
 	// by concurrent relay + handshake; here there is no relay yet, so it's safe.
 	realAssignedIP, realServerIP, err := cs.performTUNHandshake(opCtx)
 	if err != nil {
-		conn.Close()
+		_ = closeNow(conn)
 		cs.serverConn = nil
 		if cs.config.HandshakeOutcomeFn != nil {
 			switch {
@@ -902,7 +902,7 @@ func (cs *ControlServer) handleDisconnect() ControlResponse {
 	cs.releaseTunLocked()
 
 	if cs.serverConn != nil {
-		cs.serverConn.Close()
+		_ = closeNow(cs.serverConn)
 		cs.serverConn = nil
 	}
 
@@ -978,7 +978,7 @@ func (cs *ControlServer) handleReconnect(ctx context.Context, reason string, new
 
 	// Close existing server connection (but keep TUN fd!)
 	if cs.serverConn != nil {
-		cs.serverConn.Close()
+		_ = closeNow(cs.serverConn)
 		cs.serverConn = nil
 	}
 
@@ -1509,7 +1509,7 @@ func (cs *ControlServer) attemptReconnect(ctx context.Context, networkChanged bo
 
 	// Close existing server connection
 	if cs.serverConn != nil {
-		cs.serverConn.Close()
+		_ = closeNow(cs.serverConn)
 		cs.serverConn = nil
 	}
 

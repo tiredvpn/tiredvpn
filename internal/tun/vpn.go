@@ -819,7 +819,7 @@ func (v *VPNClient) ForceReconnect() {
 	// Close current connection to trigger reconnect in readFromServer/readFromTun
 	v.mu.Lock()
 	if v.conn != nil {
-		v.conn.Close()
+		_ = closeNow(v.conn)
 		v.conn = nil
 	}
 	v.mu.Unlock()
@@ -1031,7 +1031,7 @@ func (v *VPNClient) connect(parent context.Context) error {
 	localIP := v.localIP
 	v.mu.Unlock()
 	if oldConn != nil {
-		oldConn.Close()
+		_ = closeNow(oldConn)
 	}
 
 	// Connect via strategy manager (no lock held — may block on the network).
@@ -1046,7 +1046,7 @@ func (v *VPNClient) connect(parent context.Context) error {
 	defer v.sessionMu.Unlock()
 	resp, n, tunnelConn, err := v.doHandshake(conn, localIP)
 	if err != nil {
-		conn.Close()
+		_ = closeNow(conn)
 		if IsHandshakeUnanswered(err) {
 			// The transport connected and the server swallowed the session
 			// handshake: not a success of the transport, and a cycle that
@@ -1612,6 +1612,19 @@ func peekHandshakeByte(conn net.Conn) <-chan peekResult {
 // so only a transport stall inside that answer gets here.
 var errLateHandshakeFlags = errors.New("handshake flags byte arrived after the grace window")
 
+// closeNow closes conn on a path that will not wait on the peer: Stop, a
+// dead session, a forced reconnect, a handshake that failed. A conn that can
+// abort (CloseNow: HTTP polling, the ICMP tunnel) gives up its queued uplink
+// and reports it instead of spending up to its close bound on a peer that
+// is gone or no longer wanted (P2-2 of the round-18 review). A graceful
+// Close - the old session after a port hop or an upgrade - still sends it.
+func closeNow(conn net.Conn) error {
+	if c, ok := conn.(interface{ CloseNow() error }); ok {
+		return c.CloseNow()
+	}
+	return conn.Close()
+}
+
 // replayConn returns bytes the handshake reader had to look at before the
 // packet loop reads from the underlying conn, and finishes a peek read the
 // reader stopped waiting for. It deliberately exposes no Unwrap/NetConn
@@ -1626,6 +1639,11 @@ type replayConn struct {
 	// peekDeadline is the read deadline the peek in flight was started
 	// under.
 	peekDeadline time.Time
+}
+
+// CloseNow passes an abort through to the inner conn (see closeNow).
+func (c *replayConn) CloseNow() error {
+	return closeNow(c.Conn)
 }
 
 // peekOutlived reports a peek that came back with an error on the deadline
@@ -2584,7 +2602,7 @@ func (v *VPNClient) disconnect(conn net.Conn, reason string, err error) {
 		return
 	}
 	if v.conn != nil {
-		v.conn.Close()
+		_ = closeNow(v.conn)
 		v.conn = nil
 	}
 	endedStrategy := v.strategy
@@ -3246,7 +3264,7 @@ func (v *VPNClient) Stop() {
 	live := v.conn != nil
 	if v.conn != nil {
 		v.conn.SetDeadline(time.Now()) // Force immediate timeout
-		v.conn.Close()
+		_ = closeNow(v.conn)
 		v.conn = nil // nothing may be swapped in on top of a stopped client
 	}
 	endedStrategy, sessionCand, hasSessionCand := v.strategy, v.sessionCand, v.hasSessionCand
@@ -3445,7 +3463,7 @@ func (r *tunRelay) idleDuration() time.Duration {
 // now instead of after the read timeout.
 func (r *tunRelay) connFailed() {
 	if !r.ownerStopped() {
-		r.serverConn.Close()
+		_ = closeNow(r.serverConn)
 	}
 }
 
@@ -3474,7 +3492,7 @@ func (r *tunRelay) run() {
 		log.Info("TUN relay stopped by its owner")
 		return
 	}
-	r.serverConn.Close()
+	_ = closeNow(r.serverConn)
 	log.Info("TUN relay stopped (reason: %s)", errorReason)
 
 	if r.callbacks != nil && r.callbacks.OnSessionEnd != nil {
