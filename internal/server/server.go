@@ -1860,6 +1860,13 @@ func runH2FrameLoop(connPtr *net.Conn, framerPtr **http2.Framer, hpackDec *hpack
 			}
 			return
 		}
+		if h2TUNSinkGone(*tunnel) {
+			// Displaced on an exit, or the upstream leg ended on a relay:
+			// the session is over, and its client learns it now, at its own
+			// frame, with nothing echoed (backstopH2TUNEnd).
+			logger.Info("H2 TUN session ended: its sink is gone (the address was taken over, or the upstream leg ended)")
+			return
+		}
 		logger.Debug("Received frame: %T (stream=%d)", frame, frame.Header().StreamID)
 
 		switch f := frame.(type) {
@@ -4171,18 +4178,6 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 		// is what the gate's writer wraps in a stego response, so there is no
 		// longer a frameFunc that sends on its own and returns nil.
 		writer := srvCtx.sharedTUN.RegisterClientGated(clientIP, tunnel.clientID.id, origin, h2Conn, nil, gate)
-		// A session another one has taken the address from is over: end it.
-		// The native TUN loop checks the writer before each read; this one
-		// reads frames, and a displaced session went on echoing the
-		// client's keepalives with no downlink, so the client never noticed
-		// (P1-1, P2-1 of the round-11 review). On a normal end the writer
-		// is done as the session closes, and this close is a no-op.
-		if down := tunnel.downstream; down != nil {
-			go func() {
-				<-writer.Done()
-				down.Close()
-			}()
-		}
 		tunnel.sharedTUNWriter = writer
 		tunnel.sharedTUN = srvCtx.sharedTUN
 		tunnel.sink = newLocalTUNSink(srvCtx.sharedTUN, writer, clientIP)
@@ -4190,6 +4185,7 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 
 	h2Conn.clientIP = clientIP
 	tunnel.targetConn = h2Conn // Mark as TUN mode
+	backstopH2TUNEnd(tunnel)
 
 	// Send success response: shared-constructor payload sent as raw stego data.
 	// Local exit: v6 addrs from our pool. Relay: v6 addrs assigned by the
@@ -4206,6 +4202,54 @@ func setupH2TUNTunnel(tunnel *h2TunnelState, framer *http2.Framer, data []byte, 
 	}
 
 	logger.Info("H2 TUN mode established (client=%s, server=%s)", clientIP, serverIP)
+}
+
+// h2TUNEndBackstopNs is how long an HTTP/2 TUN session may outlive its sink
+// when no frame comes from its client to end it (runH2FrameLoop): 15 s, past
+// the client's 10 s keepalive, so a live client's next frame ends it first.
+// Atomic so tests can scale it.
+var h2TUNEndBackstopNs = func() *atomic.Int64 {
+	var v atomic.Int64
+	v.Store(int64(15 * time.Second))
+	return &v
+}()
+
+// backstopH2TUNEnd closes the client's conn some time after the session's
+// sink is gone: on an exit, another session took the address over; on a
+// relay, the exit ended the upstream leg. The session went on echoing the
+// client's keepalives with no downlink, so its client never noticed - on an
+// exit until round 17, on a relay until now (P1-1 and P2-1 of the round-11
+// review, finding 1 of the round-12 one).
+//
+// The frame loop ends such a session on the client's next frame, as the
+// native TUN loop does. Closing it as soon as the sink went raced the
+// client's own move: a return or an upgrade displaces its old session, and
+// the end of stream could reach the client before the new session's answer
+// and throw that away (finding 4 of the round-12 review). This close only
+// covers a client that sends nothing. On a normal end the sink goes as the
+// session closes, and the close is a no-op.
+func backstopH2TUNEnd(tunnel *h2TunnelState) {
+	down, sink := tunnel.downstream, tunnel.sink
+	if down == nil || sink == nil {
+		return
+	}
+	go func() {
+		<-sink.Done()
+		time.AfterFunc(time.Duration(h2TUNEndBackstopNs.Load()), func() { down.Close() })
+	}()
+}
+
+// h2TUNSinkGone reports whether the sink of an HTTP/2 TUN session is gone.
+func h2TUNSinkGone(t *h2TunnelState) bool {
+	if t == nil || t.tunGate == nil || t.sink == nil {
+		return false
+	}
+	select {
+	case <-t.sink.Done():
+		return true
+	default:
+		return false
+	}
 }
 
 // h2TunConn adapts HTTP/2 framer to net.Conn interface for SharedTUN

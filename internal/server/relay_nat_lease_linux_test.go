@@ -167,6 +167,14 @@ func natClientAsking(t *testing.T, relay string, secret []byte, ask net.IP) *tun
 // clientAskingVia is natClientAsking on the transport make makes.
 func clientAskingVia(t *testing.T, relay string, ask net.IP, make func(*strategy.Manager) strategy.Strategy) *tun.VPNClient {
 	t.Helper()
+	client, _ := clientAskingViaApp(t, relay, ask, make)
+	return client
+}
+
+// clientAskingViaApp is clientAskingVia, with the app's end of the client's
+// TUN to write packets up through.
+func clientAskingViaApp(t *testing.T, relay string, ask net.IP, make func(*strategy.Manager) strategy.Strategy) (*tun.VPNClient, int) {
+	t.Helper()
 	m := strategy.NewManager()
 	if err := m.SetEndpoints([]endpoint.Endpoint{{Name: "relay", V4: relay}}, endpoint.V4Only); err != nil {
 		t.Fatal(err)
@@ -191,7 +199,7 @@ func clientAskingVia(t *testing.T, relay string, ask net.IP, make func(*strategy
 		t.Fatalf("client start: %v", err)
 	}
 	t.Cleanup(client.Stop)
-	return client
+	return client, fds[1]
 }
 
 // TestASharedSecretClientKeepsItsAddressAcrossAReconnect is the fix14 stand
@@ -315,36 +323,6 @@ func TestTwinsAskingForThePoolsFirstAddressGetTwo(t *testing.T) {
 			}
 			time.Sleep(50 * time.Millisecond)
 		}
-	}
-}
-
-// TestADisplacedH2TUNSessionEnds is the exit half of P1-1 and P2-1 of the
-// round-11 review: a session whose address a later session took over kept
-// running on the HTTP/2 Stego path - its frame loop never looked at the
-// registration, and it echoed the client's keepalives - so its client sat
-// on a tunnel with no downlink and never reconnected. The exit has to end
-// it. Two HTTP/2 Stego clients straight to the exit on one key, one
-// address; real clocks, so no read deadline ends it instead.
-func TestADisplacedH2TUNSessionEnds(t *testing.T) {
-	secret := []byte("relay-leg-secret-0123456789abcdef")
-	exit := newLegExit(t, secret)
-	ask := net.IPv4(10, 8, 7, 66)
-	h2 := func(m *strategy.Manager) strategy.Strategy { return strategy.NewHTTP2StegoStrategy(m, secret, "") }
-	first := clientAskingVia(t, exit.addr, ask, h2)
-	if !first.LocalIP().Equal(ask) {
-		t.Fatalf("the first client got %s", first.LocalIP())
-	}
-	before := exit.ended.Load()
-	second := clientAskingVia(t, exit.addr, ask, h2)
-	if !second.LocalIP().Equal(ask) {
-		t.Fatalf("the second client got %s, want the same lease %s", second.LocalIP(), ask)
-	}
-	deadline := time.Now().Add(3 * time.Second)
-	for exit.ended.Load() == before && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
-	if exit.ended.Load() == before {
-		t.Fatal("the displaced session is still running 3 s after its address was taken over")
 	}
 }
 

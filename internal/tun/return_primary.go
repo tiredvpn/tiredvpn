@@ -180,7 +180,8 @@ func (v *VPNClient) tryReturnToPreferred() bool {
 		}
 		// On another endpoint the old session still stands; if the
 		// request did displace it after all - two endpoints in front of
-		// one exit - that exit ends it, and the read fails.
+		// one exit - the exit ends it at the next frame, a relay in front
+		// of it does once the exit ends its leg, and the read fails.
 		return failed("did not answer the handshake", err)
 	}
 	// A session on the old address of the old session's own exit displaced

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,6 +18,15 @@ import (
 // to exit, terminating no client itself.
 func legRelay(t *testing.T, secret []byte, exit *legExit) string {
 	t.Helper()
+	addr, _ := legRelayCounted(t, secret, exit)
+	return addr
+}
+
+// legRelayCounted is legRelay, with a count of the client connections the
+// relay has ended.
+func legRelayCounted(t *testing.T, secret []byte, exit *legExit) (string, *atomic.Int64) {
+	t.Helper()
+	ended := new(atomic.Int64)
 	cfg := &Config{Secret: secret}
 	srvCtx := &serverContext{cfg: cfg, tlsConfig: buildTLSProfile(cfg, selfSignedCertForTest(t)),
 		upstreamDialer: NewUpstreamDialer(exit.addr, secret)}
@@ -33,10 +43,13 @@ func legRelay(t *testing.T, secret []byte, exit *legExit) string {
 				return
 			}
 			id++
-			go handleConnection(c, srvCtx, id)
+			go func(c net.Conn, id uint64) {
+				handleConnection(c, srvCtx, id)
+				ended.Add(1)
+			}(c, id)
 		}
 	}()
-	return ln.Addr().String()
+	return ln.Addr().String(), ended
 }
 
 // clientVia starts a desktop client that reaches the exit through the relay
