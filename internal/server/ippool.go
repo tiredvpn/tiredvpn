@@ -737,7 +737,8 @@ func (p *IPPool) Allocate(clientID string, requestedIP net.IP, hostname string) 
 
 // AllocateAvoiding is Allocate with no request, whose free-address scan
 // passes avoid over: a client whose request was refused (sharedTagRequest)
-// must not be handed the address it asked for by the pool instead.
+// must not be handed the address it asked for by the pool instead. The scan
+// runs from the top of the pool down.
 func (p *IPPool) AllocateAvoiding(clientID string, avoid net.IP) (net.IP, error) {
 	return p.allocate(clientID, nil, "", avoid)
 }
@@ -845,8 +846,16 @@ func (p *IPPool) allocate(clientID string, requestedIP net.IP, hostname string, 
 		}
 	}
 
-	// Find a free IP
-	for ipUint := p.startIP; ipUint <= p.endIP; ipUint++ {
+	// Find a free IP. For a refused request (avoid) from the top of the pool
+	// down: the scan from the bottom handed it the address right after the
+	// default, which a box configured with -tun-ip on it then took over
+	// (finding 2 of the round-12 review). The low addresses are the ones
+	// people configure; this lowers the odds, it does not tell boxes apart.
+	for i := uint32(0); i <= p.endIP-p.startIP; i++ {
+		ipUint := p.startIP + i
+		if avoid != nil {
+			ipUint = p.endIP - i
+		}
 		if p.reserved[ipUint] {
 			continue
 		}

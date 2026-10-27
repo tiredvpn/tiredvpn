@@ -59,6 +59,19 @@ type legExit struct {
 	srvCtx *serverContext
 	app    *tunApp
 	ended  atomic.Int64 // connections handleConnection has returned from
+	mu     sync.Mutex
+	conns  []net.Conn // every connection accepted, for dropAll
+}
+
+// dropAll closes every connection the exit accepted, as an exit restart
+// does to the legs that reach it.
+func (e *legExit) dropAll() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, c := range e.conns {
+		c.Close()
+	}
+	e.conns = nil
 }
 
 func newLegExit(t *testing.T, secret []byte) *legExit {
@@ -107,6 +120,9 @@ func newLegExitWith(t *testing.T, secret []byte, tweak func(*Config)) *legExit {
 				return
 			}
 			id++
+			e.mu.Lock()
+			e.conns = append(e.conns, c)
+			e.mu.Unlock()
 			wg.Add(1)
 			go func(c net.Conn, id uint64) {
 				defer wg.Done()

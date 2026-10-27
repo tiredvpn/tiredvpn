@@ -167,6 +167,14 @@ func natClientAsking(t *testing.T, relay string, secret []byte, ask net.IP) *tun
 // clientAskingVia is natClientAsking on the transport make makes.
 func clientAskingVia(t *testing.T, relay string, ask net.IP, make func(*strategy.Manager) strategy.Strategy) *tun.VPNClient {
 	t.Helper()
+	client, _ := clientAskingViaApp(t, relay, ask, make)
+	return client
+}
+
+// clientAskingViaApp is clientAskingVia, with the app's end of the client's
+// TUN to write packets up through.
+func clientAskingViaApp(t *testing.T, relay string, ask net.IP, make func(*strategy.Manager) strategy.Strategy) (*tun.VPNClient, int) {
+	t.Helper()
 	m := strategy.NewManager()
 	if err := m.SetEndpoints([]endpoint.Endpoint{{Name: "relay", V4: relay}}, endpoint.V4Only); err != nil {
 		t.Fatal(err)
@@ -191,7 +199,7 @@ func clientAskingVia(t *testing.T, relay string, ask net.IP, make func(*strategy
 		t.Fatalf("client start: %v", err)
 	}
 	t.Cleanup(client.Stop)
-	return client
+	return client, fds[1]
 }
 
 // TestASharedSecretClientKeepsItsAddressAcrossAReconnect is the fix14 stand
@@ -318,33 +326,85 @@ func TestTwinsAskingForThePoolsFirstAddressGetTwo(t *testing.T) {
 	}
 }
 
-// TestADisplacedH2TUNSessionEnds is the exit half of P1-1 and P2-1 of the
-// round-11 review: a session whose address a later session took over kept
-// running on the HTTP/2 Stego path - its frame loop never looked at the
-// registration, and it echoed the client's keepalives - so its client sat
-// on a tunnel with no downlink and never reconnected. The exit has to end
-// it. Two HTTP/2 Stego clients straight to the exit on one key, one
-// address; real clocks, so no read deadline ends it instead.
-func TestADisplacedH2TUNSessionEnds(t *testing.T) {
+// TestTwinsDoNotShareAnOfflineDirectClientsAddress is finding 3 of the
+// round-12 review, the rest of P1-1: a direct client C on the global secret
+// at the same origin has gone offline, and its lease "global@<origin>" on
+// the pool's first address stays. The first relayed box adopted it as a
+// legacy lease onto its drawn tag, so its refused request came back from
+// the sticky path as granted; the second box, asking for the same default
+// address, took it over from the live first one. Neither box held it, and C
+// lost it too. Both boxes get addresses of their own, nothing is taken
+// over, and C's lease stays where it was.
+func TestTwinsDoNotShareAnOfflineDirectClientsAddress(t *testing.T) {
+	scaleLegClocks(t)
+	out := captureLog(t)
 	secret := []byte("relay-leg-secret-0123456789abcdef")
 	exit := newLegExit(t, secret)
-	ask := net.IPv4(10, 8, 7, 66)
-	h2 := func(m *strategy.Manager) strategy.Strategy { return strategy.NewHTTP2StegoStrategy(m, secret, "") }
-	first := clientAskingVia(t, exit.addr, ask, h2)
-	if !first.LocalIP().Equal(ask) {
-		t.Fatalf("the first client got %s", first.LocalIP())
+	relay := legRelay(t, secret, exit)
+	first := net.IPv4(10, 8, 7, 2) // the pool's first free address
+
+	c := natClientAsking(t, exit.addr, secret, first)
+	if !c.LocalIP().Equal(first) {
+		t.Fatalf("the direct client got %s, asked for %s", c.LocalIP(), first)
 	}
-	before := exit.ended.Load()
-	second := clientAskingVia(t, exit.addr, ask, h2)
-	if !second.LocalIP().Equal(ask) {
-		t.Fatalf("the second client got %s, want the same lease %s", second.LocalIP(), ask)
+	c.Stop()
+	deadline := time.Now().Add(5 * time.Second)
+	for exit.srvCtx.sharedTUN.Serving(first) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
 	}
-	deadline := time.Now().Add(3 * time.Second)
-	for exit.ended.Load() == before && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
+	if exit.srvCtx.sharedTUN.Serving(first) {
+		t.Fatal("the exit still serves the direct client - the test proves nothing")
 	}
-	if exit.ended.Load() == before {
-		t.Fatal("the displaced session is still running 3 s after its address was taken over")
+	direct := allocationKey(sharedIdentity(globalClientID), "127.0.0.1", "")
+	if got := exit.srvCtx.ipPool.stickyLookup(direct); got != first.String() {
+		t.Fatalf("the direct client's lease %q is on %q, want %s - the test proves nothing", direct, got, first)
+	}
+
+	a := natClientAsking(t, relay, secret, first)
+	b := natClientAsking(t, relay, secret, first)
+	for _, box := range []*tun.VPNClient{a, b} {
+		if box.LocalIP().Equal(first) {
+			t.Fatalf("a relayed box got the offline direct client's address %s:\n%s", first, out.String())
+		}
+	}
+	if a.LocalIP().Equal(b.LocalIP()) {
+		t.Fatalf("both boxes got %s:\n%s", a.LocalIP(), out.String())
+	}
+	if strings.Contains(out.String(), "taken over") {
+		t.Fatalf("a lease was taken over between the twins:\n%s", out.String())
+	}
+	if got := exit.srvCtx.ipPool.stickyLookup(direct); got != first.String() {
+		t.Fatalf("the direct client's lease is on %q now, want %s", got, first)
+	}
+}
+
+// TestARefusedBoxIsNotGivenTheNextConfiguredAddress is finding 2 of the
+// round-12 review: box B asks for the default first address and is
+// refused; the free scan, passing the refusal over, gave it the next one,
+// .3. Box A, configured with -tun-ip .3, then asked for it, found it under
+// the drawn-tag prefix and took it over from the live B, which asked for
+// .3 on its next session and took it back - a flap in both orders. A
+// refused request is now served from the top of the pool down, away from
+// the low addresses people configure. Two boxes that ask for an address
+// one of them was given are still not told apart: that needs proof of
+// ownership (1.11.10).
+func TestARefusedBoxIsNotGivenTheNextConfiguredAddress(t *testing.T) {
+	scaleLegClocks(t)
+	out := captureLog(t)
+	secret := []byte("relay-leg-secret-0123456789abcdef")
+	exit := newLegExit(t, secret)
+	relay := legRelay(t, secret, exit)
+
+	b := natClientAsking(t, relay, secret, net.IPv4(10, 8, 7, 2))
+	a := natClientAsking(t, relay, secret, net.IPv4(10, 8, 7, 3))
+	if a.LocalIP().Equal(b.LocalIP()) {
+		t.Fatalf("both boxes got %s:\n%s", a.LocalIP(), out.String())
+	}
+	if strings.Contains(out.String(), "taken over") {
+		t.Fatalf("a lease was taken over between the boxes:\n%s", out.String())
+	}
+	if !exit.srvCtx.sharedTUN.Serving(b.LocalIP()) || !exit.srvCtx.sharedTUN.Serving(a.LocalIP()) {
+		t.Fatal("the exit does not serve both boxes")
 	}
 }
 

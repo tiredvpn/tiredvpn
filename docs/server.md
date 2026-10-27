@@ -169,11 +169,16 @@ Two consequences to know about:
   release that was already the case on every transport except REALITY.
 - **Global secret behind one NAT.** Two boxes on the global secret behind the
   same public address share one lease and evict each other, on any mix of
-  transports. Boxes at different addresses keep separate leases.
+  transports. Boxes at different addresses keep separate leases. Through a
+  relay of this release they hold a lease per session instead, and a box
+  that asks for an address another box was given can still take it over
+  until proof of ownership lands (1.11.10).
 
 Leases taken by an older server under its per-transport keys are moved to the
 credential key the first time the client connects, and any extra old lease the
-client still holds is released. A registry client's old REALITY lease is found
+client still holds is released. A global-secret client behind a relay is the
+exception: its lease is per session, it adopts no old lease, and it gets a new
+address once. A registry client's old REALITY lease is found
 whichever address it was taken from; on the global secret only the lease taken
 from the client's current address is its own. Each credential is checked at
 most once per 10 minutes, so an older exit writing old keys into the same Redis

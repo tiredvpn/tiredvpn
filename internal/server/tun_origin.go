@@ -254,12 +254,22 @@ func allocationKey(id clientIdentity, origin, clientTag string) string {
 // under a key an older server spelled for it (legacyAllocationKeys).
 func allocateTunnelIP(srvCtx *serverContext, id clientIdentity, origin, clientTag string, requested net.IP) (net.IP, error) {
 	key := allocationKey(id, origin, clientTag)
-	keys, prefixes := legacyAllocationKeys(srvCtx, id, origin)
-	// Bounded: the Redis search for old leases must not hold a handshake up
-	// for long (adoptScanTimeout); one that runs out is retried next time.
-	ctx, cancel := context.WithTimeout(context.Background(), adoptScanTimeout)
-	defer cancel()
-	srvCtx.ipPool.AdoptAll(ctx, keys, prefixes, key, func(ip string) bool { return serving(srvCtx, ip) })
+	// A drawn tag adopts nothing. Its legacy key, "global@<origin>", is
+	// also the live key of a direct client at that origin, and a box that
+	// adopted an offline one's lease got it back on the sticky path, past
+	// the refusal below - the next box asking for the same default address
+	// then took it over from the live first (finding 3 of the round-12
+	// review). The cost: a box coming from a 1.11.8 relay gets a new
+	// address once.
+	if !drawnTag(clientTag) {
+		keys, prefixes := legacyAllocationKeys(srvCtx, id, origin)
+		// Bounded: the Redis search for old leases must not hold a
+		// handshake up for long (adoptScanTimeout); one that runs out is
+		// retried next time.
+		ctx, cancel := context.WithTimeout(context.Background(), adoptScanTimeout)
+		defer cancel()
+		srvCtx.ipPool.AdoptAll(ctx, keys, prefixes, key, func(ip string) bool { return serving(srvCtx, ip) })
+	}
 	granted, refused := sharedTagRequest(srvCtx, id, origin, clientTag, key, requested)
 	if refused != nil {
 		return srvCtx.ipPool.AllocateAvoiding(key, refused)
@@ -275,6 +285,10 @@ func serving(srvCtx *serverContext, ip string) bool {
 	addr := net.ParseIP(ip)
 	return addr != nil && srvCtx.sharedTUN.Serving(addr)
 }
+
+// drawnTag reports whether a relay drew clientTag for a client on a shared
+// credential (relayClientTag), new on every session.
+func drawnTag(clientTag string) bool { return strings.HasPrefix(clientTag, "s") }
 
 // sharedTagRequest decides what a client on a shared credential behind a
 // relay - a drawn tag, "s" (relayClientTag) - gets for the address it asks
@@ -307,7 +321,7 @@ func serving(srvCtx *serverContext, ip string) bool {
 // told apart; neither are they on one lease in 1.11.8. Telling them apart
 // needs proof of ownership in the handshake, a protocol change (1.11.10).
 func sharedTagRequest(srvCtx *serverContext, id clientIdentity, origin, clientTag, key string, requested net.IP) (granted, refused net.IP) {
-	if !strings.HasPrefix(clientTag, "s") || origin == "" || requested == nil || requested.IsUnspecified() {
+	if !drawnTag(clientTag) || origin == "" || requested == nil || requested.IsUnspecified() {
 		return requested, nil
 	}
 	if srvCtx.ipPool.TakeOver(requested, allocationKey(id, origin, "")+"#s", key) {

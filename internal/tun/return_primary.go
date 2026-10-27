@@ -166,21 +166,30 @@ func (v *VPNClient) tryReturnToPreferred() bool {
 	if err != nil {
 		v.sessionMu.Unlock()
 		conn.Close()
+		// Parked for silence only when nothing came back in the full wait
+		// (IsHandshakeUnanswered); a reset or an answer in part after the
+		// request is a failure (finding 5 of the round-12 review). Whether
+		// the request may have displaced the old session is wider: anything
+		// but "not sent" and "refused".
 		answered := errors.Is(err, errHandshakeNotSent) || errors.Is(err, errHandshakeRefused)
-		v.manager.ReturnOutcome(cand, false, !answered)
+		v.manager.ReturnOutcome(cand, false, IsHandshakeUnanswered(err))
 		if !answered && sameExit {
 			// The request went out on the old session's own exit and no
 			// answer came: it may have displaced the old session there,
 			// or only the answer may have been lost. An echo on the old
 			// session proves nothing - an exit's displaced session went
 			// on echoing (P2-1 of the round-11 review) - so the tunnel
-			// reconnects once, with the failure booked on cand.
+			// reconnects once, with the failure booked on cand, and the
+			// next return waits like after any failed one (finding 6 of the
+			// round-12 review).
+			v.returnNotBefore.Store(monoNow() + int64(returnRetryAfter()))
 			v.connLost(oldConn, "return to a preferred server", err)
 			return false
 		}
 		// On another endpoint the old session still stands; if the
 		// request did displace it after all - two endpoints in front of
-		// one exit - that exit ends it, and the read fails.
+		// one exit - the exit ends it at the next frame, a relay in front
+		// of it does once the exit ends its leg, and the read fails.
 		return failed("did not answer the handshake", err)
 	}
 	// A session on the old address of the old session's own exit displaced
