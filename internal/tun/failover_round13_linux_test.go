@@ -14,10 +14,10 @@ import (
 // unanswered handshakes either.
 func TestAnAndroidConnectRefusalCountsAsAnAnswer(t *testing.T) {
 	var mu sync.Mutex
-	var outcomes []bool
-	h := newCtlHarnessWith(t, &ControlConfig{MTU: 1280, HandshakeOutcomeFn: func(answered bool, err error) error {
+	var outcomes []HandshakeOutcome
+	h := newCtlHarnessWith(t, &ControlConfig{MTU: 1280, HandshakeOutcomeFn: func(outcome HandshakeOutcome, err error) error {
 		mu.Lock()
-		outcomes = append(outcomes, answered)
+		outcomes = append(outcomes, outcome)
 		mu.Unlock()
 		return err
 	}})
@@ -50,7 +50,7 @@ func TestAnAndroidConnectRefusalCountsAsAnAnswer(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(outcomes) != 1 || !outcomes[0] {
+	if len(outcomes) != 1 || outcomes[0] != HandshakeAnsweredOutcome {
 		t.Fatalf("handshake outcomes %v, want one answered", outcomes)
 	}
 }
@@ -160,5 +160,48 @@ func TestANumericNetworkIDKeepsTheCommand(t *testing.T) {
 	defer mu.Unlock()
 	if len(named) != 2 {
 		t.Fatalf("networks named %q, want the two valid ones only", named)
+	}
+}
+
+// TestAnAndroidConnectResetAfterTheRequestIsAFailure is the control
+// server's half of the P2 of the round-14 review: a handshake the exit
+// resets after reading the request is reported as failed, not dropped.
+func TestAnAndroidConnectResetAfterTheRequestIsAFailure(t *testing.T) {
+	var mu sync.Mutex
+	var outcomes []HandshakeOutcome
+	h := newCtlHarnessWith(t, &ControlConfig{MTU: 1280, HandshakeOutcomeFn: func(outcome HandshakeOutcome, err error) error {
+		mu.Lock()
+		outcomes = append(outcomes, outcome)
+		mu.Unlock()
+		return err
+	}})
+	cli, srv := net.Pipe()
+	t.Cleanup(func() { cli.Close(); srv.Close() })
+	go func() {
+		_, _ = io.ReadFull(srv, make([]byte, 8))
+		srv.Close()
+	}()
+	h.cs.mu.Lock()
+	h.cs.serverConn = nil
+	h.cs.assignedIP = nil
+	h.cs.serverIP = nil
+	h.cs.waitingForFd = false
+	h.cs.config.ConnectFn = func(context.Context) (net.IP, net.IP, net.Conn, error) {
+		return net.IPv4(10, 9, 0, 2), net.IPv4(10, 9, 0, 1), cli, nil
+	}
+	h.cs.mu.Unlock()
+
+	select {
+	case resp := <-h.sendAsync(`{"command":"connect"}`+"\n", -1):
+		if resp.Status != "error" {
+			t.Fatalf("a reset connect answered %+v", resp)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the connect never answered")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(outcomes) != 1 || outcomes[0] != HandshakeFailedOutcome {
+		t.Fatalf("handshake outcomes %v, want one failed", outcomes)
 	}
 }

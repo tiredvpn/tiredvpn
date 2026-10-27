@@ -183,6 +183,20 @@ type ConnectionMetadata struct {
 	Attempts  int
 }
 
+// HandshakeOutcome is how a session handshake after a connect went, for
+// ControlConfig.HandshakeOutcomeFn.
+type HandshakeOutcome int
+
+const (
+	// HandshakeAnsweredOutcome: answered, refused or in part.
+	HandshakeAnsweredOutcome HandshakeOutcome = iota
+	// HandshakeUnansweredOutcome: the server's silence (IsHandshakeUnanswered).
+	HandshakeUnansweredOutcome
+	// HandshakeFailedOutcome: a reset or an end of stream after the request
+	// (IsHandshakeFailed).
+	HandshakeFailedOutcome
+)
+
 // ControlConfig holds configuration for control server
 type ControlConfig struct {
 	ServerAddr string
@@ -225,9 +239,10 @@ type ControlConfig struct {
 	ConnectRequestedFn func()
 
 	// HandshakeOutcomeFn, when set, is told how the session handshake after
-	// a connect went: answered, or unanswered (IsHandshakeUnanswered). For an
-	// unanswered one it returns the error to answer the host with instead.
-	HandshakeOutcomeFn func(answered bool, err error) error
+	// a connect went: answered, unanswered (IsHandshakeUnanswered) or failed
+	// after its request (IsHandshakeFailed). For an unanswered one it returns
+	// the error to answer the host with instead.
+	HandshakeOutcomeFn func(outcome HandshakeOutcome, err error) error
 
 	// NetworkFn, when set, is told the network_id of every command that
 	// carries one, in the order the host sent them, the moment it is read:
@@ -678,15 +693,21 @@ func (cs *ControlServer) handleConnect(ctx context.Context) ControlResponse {
 		if cs.config.HandshakeOutcomeFn != nil {
 			switch {
 			case IsHandshakeUnanswered(err):
-				err = cs.config.HandshakeOutcomeFn(false, err)
+				err = cs.config.HandshakeOutcomeFn(HandshakeUnansweredOutcome, err)
 			case IsHandshakeAnswered(err):
-				_ = cs.config.HandshakeOutcomeFn(true, nil)
+				_ = cs.config.HandshakeOutcomeFn(HandshakeAnsweredOutcome, nil)
+			case IsHandshakeFailed(err):
+				// A reset after the request: the Android core's first
+				// connect booked it as nothing, and a family that resets
+				// every handshake was never parked (P2 of the round-14
+				// review).
+				_ = cs.config.HandshakeOutcomeFn(HandshakeFailedOutcome, err)
 			}
 		}
 		return ControlResponse{Status: "error", Error: fmt.Sprintf("TUN handshake failed: %v", err)}
 	}
 	if cs.config.HandshakeOutcomeFn != nil {
-		_ = cs.config.HandshakeOutcomeFn(true, nil)
+		_ = cs.config.HandshakeOutcomeFn(HandshakeAnsweredOutcome, nil)
 	}
 
 	cs.assignedIP = realAssignedIP

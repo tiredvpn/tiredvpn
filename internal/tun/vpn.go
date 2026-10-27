@@ -1056,7 +1056,7 @@ func (v *VPNClient) connect(parent context.Context) error {
 		switch {
 		case IsHandshakeAnswered(err):
 			v.manager.HandshakeAnswered(strat, cand, hasCand)
-		case !errors.Is(err, errHandshakeCutShort):
+		case IsHandshakeFailed(err):
 			// Neither answered nor silent: a reset or an end of stream
 			// after the request. A failure of cand, which its connect's
 			// success must not hide (finding 1 of the round-13 review).
@@ -1252,6 +1252,26 @@ func IsHandshakeUnanswered(err error) bool {
 	return errors.As(err, &ne) && ne.Timeout()
 }
 
+// IsHandshakeFailed reports a session handshake that failed after its
+// request went out with neither an answer nor the server's silence: a reset
+// or an end of stream after the request. Such a failure is the candidate's
+// (Manager.HandshakeFailed). Not one whose request never left, whose wait
+// the caller's budget cut short, or that a cancellation or a timeout ended:
+// a client stopping, or a write running into its deadline, says nothing of
+// the server (P3-2 of the round-14 review).
+func IsHandshakeFailed(err error) bool {
+	if err == nil || IsHandshakeUnanswered(err) || IsHandshakeAnswered(err) {
+		return false
+	}
+	switch {
+	case errors.Is(err, errHandshakeNotSent), errors.Is(err, errHandshakeCutShort),
+		errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		return false
+	}
+	var ne net.Error
+	return !errors.As(err, &ne) || !ne.Timeout()
+}
+
 // IsHandshakeAnswered reports whether a failed session handshake was
 // answered all the same: refused with an error status, or answered in part.
 // Either ends the server's run of unanswered handshakes (P3-4 of the
@@ -1425,12 +1445,18 @@ func readHandshakeResponse(conn net.Conn, clientVersion byte, deadline time.Time
 		switch {
 		case got > 0:
 			err = fmt.Errorf("%w: %w", errHandshakePartlyAnswered, err)
+		case time.Now().Before(deadline):
+			// Ended before the wait did - a reset or an end of stream:
+			// neither silence nor a wait cut short, whatever the budget.
+			// Marked cut short whenever the budget was the shorter, a reset
+			// on a reconnect was booked as nothing (P2 of the round-14
+			// review).
 		case deadline.Before(full):
 			// The caller's budget ran out before the full wait: the
 			// server may simply not have had the time (P2-2 of the
 			// round-8 review).
 			err = fmt.Errorf("%w: %w", errHandshakeCutShort, err)
-		case !time.Now().Before(deadline):
+		default:
 			err = fmt.Errorf("%w: %w", errHandshakeSilent, err)
 		}
 		return nil, 0, conn, err
