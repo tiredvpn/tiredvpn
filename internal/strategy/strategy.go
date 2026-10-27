@@ -420,7 +420,7 @@ var dialCutTimer = time.AfterFunc
 //
 // hold says the attempt is held to its share (scanState.held): at dialLimit
 // a connected attempt is cut too, unless the server's TCP has acknowledged
-// the handshake's first bytes (handshakeProgressed). A server that is slow
+// the handshake's whole first flight (handshakeProgressed). A server that is slow
 // to answer - 7-9 s through a bad mobile link, or reaching its cover - still
 // acknowledges at once; a censor that drops the ClientHello, as the fix13c
 // stand did, never lets it get there. The share was a cut whatever the
