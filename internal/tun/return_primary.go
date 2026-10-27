@@ -179,7 +179,10 @@ func (v *VPNClient) tryReturnToPreferred() bool {
 			// or only the answer may have been lost. An echo on the old
 			// session proves nothing - an exit's displaced session went
 			// on echoing (P2-1 of the round-11 review) - so the tunnel
-			// reconnects once, with the failure booked on cand.
+			// reconnects once, with the failure booked on cand, and the
+			// next return waits like after any failed one (finding 6 of the
+			// round-12 review).
+			v.returnNotBefore.Store(monoNow() + int64(returnRetryAfter()))
 			v.connLost(oldConn, "return to a preferred server", err)
 			return false
 		}

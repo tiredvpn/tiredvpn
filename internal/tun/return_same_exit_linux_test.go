@@ -310,6 +310,21 @@ func TestASilentHandshakeOnTheSameExitReconnectsOnce(t *testing.T) {
 	h.expectReconnectOnV4(t)
 }
 
+// TestASilentReturnHoldsTheNextOneBack is finding 6 of the round-12 review:
+// the reconnect after a silent same-exit return skipped what every other
+// failed return does - holding the next return back by returnRetryAfter -
+// so each time v6's park ran out an idle return tore a healthy v4 session
+// down again, about every 3 min against the documented 4-8.
+func TestASilentReturnHoldsTheNextOneBack(t *testing.T) {
+	shortHandshakeTimeout(t, 500*time.Millisecond)
+	h := newSameExitHarness(t)
+	h.v6.mute.Store(true)
+	h.expectReconnectOnV4(t)
+	if at := h.v.returnNotBefore.Load(); at == 0 || at <= monoNow() {
+		t.Fatal("no hold on the next return after a silent one")
+	}
+}
+
 // TestAReturnWhoseReplyIsLostDoesNotStayOnADisplacedSession is P2-1 of the
 // round-11 review: the request reaches the exit, which registers the new
 // session and takes the address from the old one, and only the answer is
