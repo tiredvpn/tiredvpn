@@ -65,10 +65,11 @@ Versions follow [Semantic Versioning](https://semver.org/).
   lossy one with a segment awaiting retransmission when the share runs out,
   is cut before its ACK is back; an attempt runs the whole cycle when its
   server answered the ClientHello and the records after it are dropped, or
-  when a server or middlebox speaks first while the ClientHello is dropped; a first flight that is acknowledged and then
-  never answered runs the whole cycle; on macOS and Windows, which have no
-  TCP_INFO here, no attempt is cut at its share (Android follows the Linux
-  rule).
+  when a server or middlebox speaks first while the ClientHello behind an
+  acknowledged decoy is dropped; a first flight that is acknowledged and
+  then never answered runs the whole cycle; on macOS and Windows, which
+  have no TCP_INFO here, no attempt is cut at its share (Android follows
+  the Linux rule).
 - **Client: a server address that connects and then resets or never
   answers every session handshake is left.** The transport connect was
   booked a success that cleared the failure before it, and a reset after
