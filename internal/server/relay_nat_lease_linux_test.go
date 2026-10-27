@@ -378,6 +378,36 @@ func TestTwinsDoNotShareAnOfflineDirectClientsAddress(t *testing.T) {
 	}
 }
 
+// TestARefusedBoxIsNotGivenTheNextConfiguredAddress is finding 2 of the
+// round-12 review: box B asks for the default first address and is
+// refused; the free scan, passing the refusal over, gave it the next one,
+// .3. Box A, configured with -tun-ip .3, then asked for it, found it under
+// the drawn-tag prefix and took it over from the live B, which asked for
+// .3 on its next session and took it back - a flap in both orders. A
+// refused request is now served from the top of the pool down, away from
+// the low addresses people configure. Two boxes that ask for an address
+// one of them was given are still not told apart: that needs proof of
+// ownership (1.11.10).
+func TestARefusedBoxIsNotGivenTheNextConfiguredAddress(t *testing.T) {
+	scaleLegClocks(t)
+	out := captureLog(t)
+	secret := []byte("relay-leg-secret-0123456789abcdef")
+	exit := newLegExit(t, secret)
+	relay := legRelay(t, secret, exit)
+
+	b := natClientAsking(t, relay, secret, net.IPv4(10, 8, 7, 2))
+	a := natClientAsking(t, relay, secret, net.IPv4(10, 8, 7, 3))
+	if a.LocalIP().Equal(b.LocalIP()) {
+		t.Fatalf("both boxes got %s:\n%s", a.LocalIP(), out.String())
+	}
+	if strings.Contains(out.String(), "taken over") {
+		t.Fatalf("a lease was taken over between the boxes:\n%s", out.String())
+	}
+	if !exit.srvCtx.sharedTUN.Serving(b.LocalIP()) || !exit.srvCtx.sharedTUN.Serving(a.LocalIP()) {
+		t.Fatal("the exit does not serve both boxes")
+	}
+}
+
 // rawTUNSession opens a TUN session through relay with anti-probe and a
 // bare handshake asking for ask, and returns its conn and the address the
 // exit gave it. Nothing reconnects it.
