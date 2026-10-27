@@ -283,6 +283,14 @@ type HTTPPollingConn struct {
 	// pollFailing is set by a poll that failed and cleared by one that went
 	// through: Close does not wait on a peer that is not taking polls.
 	pollFailing atomic.Bool
+	// aborted is set, and abortC closed, when Close's bound runs out or
+	// CloseNow is called: the poll in flight is cut (inflight is its
+	// connection) and no new one starts. abortC is made by abortChan.
+	aborted   atomic.Bool
+	abortOnce sync.Once
+	abortInit sync.Once
+	abortC    chan struct{}
+	inflight  atomic.Pointer[tls.Conn]
 
 	lastSend time.Time
 	lastRecv time.Time
@@ -380,6 +388,13 @@ func (c *HTTPPollingConn) pollWorker(workerID int) {
 	defer timer.Stop()
 
 	for {
+		// Closed first: the select below picks at random among ready
+		// cases, and a pending sendSignal started a poll after Close, on
+		// its own 3 s rather than Close's bound (P2-1 of the round-18
+		// review).
+		if c.isClosed() {
+			return
+		}
 		select {
 		case <-c.closed:
 			return
@@ -391,10 +406,16 @@ func (c *HTTPPollingConn) pollWorker(workerID int) {
 				default:
 				}
 			}
+			if c.isClosed() {
+				return
+			}
 			c.poll()
 			idleRounds = 0
 			timer.Reset(jitterDuration(c.pollInterval))
 		case <-timer.C:
+			if c.isClosed() {
+				return
+			}
 			ok, moved := c.poll()
 			switch {
 			case !ok:
@@ -416,6 +437,34 @@ func (c *HTTPPollingConn) pollWorker(workerID int) {
 				timer.Reset(jitterDuration(c.idleInterval(idleRounds)))
 			}
 		}
+	}
+}
+
+// isClosed reports whether Close has been called.
+func (c *HTTPPollingConn) isClosed() bool {
+	select {
+	case <-c.closed:
+		return true
+	default:
+		return false
+	}
+}
+
+// abortChan is closed when the conn is aborted (abortNow).
+func (c *HTTPPollingConn) abortChan() chan struct{} {
+	c.abortInit.Do(func() { c.abortC = make(chan struct{}) })
+	return c.abortC
+}
+
+// abortNow cuts the poll in flight and keeps any other from starting.
+func (c *HTTPPollingConn) abortNow() {
+	ch := c.abortChan()
+	c.abortOnce.Do(func() {
+		c.aborted.Store(true)
+		close(ch)
+	})
+	if tc := c.inflight.Load(); tc != nil {
+		_ = tc.Close()
 	}
 }
 
@@ -468,6 +517,14 @@ const pollTimeout = 3 * time.Second
 func (c *HTTPPollingConn) pollBy(deadline time.Time) (ok bool, moved bool) {
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
+	// An abort cuts a dial or a TLS handshake in progress too.
+	go func() {
+		select {
+		case <-c.abortChan():
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 
 	// Atomically claim and remove data to send (prevents multiple workers sending same data)
 	c.sendLock.Lock()
@@ -654,9 +711,20 @@ func (c *HTTPPollingConn) doRequest(ctx context.Context, data []byte, ackSeq int
 	c.reuseMu.Lock()
 	defer c.reuseMu.Unlock()
 
+	if c.aborted.Load() {
+		return nil, errPollingAborted
+	}
 	tlsConn, reader, err := c.acquireConn(ctx)
 	if err != nil {
 		return nil, err
+	}
+	// Abortable from here on (abortNow); an abort that came between the
+	// check above and this store finds the conn on the re-check.
+	c.inflight.Store(tlsConn)
+	defer c.inflight.CompareAndSwap(tlsConn, nil)
+	if c.aborted.Load() {
+		c.dropReuseLocked()
+		return nil, errPollingAborted
 	}
 
 	// Bind the auth token to the exporter of the TLS session this request rides
@@ -940,6 +1008,13 @@ func (c *HTTPPollingConn) Write(p []byte) (int, error) {
 		c.sendLock.Unlock()
 		return 0, err
 	}
+	// Again under sendLock: a Close since the check above counts what is
+	// left under it, and bytes appended after that count would be neither
+	// sent nor reported (P3-1 of the round-18 review).
+	if c.isClosed() {
+		c.sendLock.Unlock()
+		return 0, errors.New("connection closed")
+	}
 	n, err := c.sendBuf.Write(p)
 	c.uplinkAccepted.Add(uint64(n))
 	c.sendLock.Unlock()
@@ -985,6 +1060,9 @@ func (c *HTTPPollingConn) waitSendRoomLocked() error {
 	return nil
 }
 
+// errPollingAborted is a poll refused or cut by an abort (abortNow).
+var errPollingAborted = errors.New("http_polling: aborted")
+
 // ErrPollingCloseIncomplete is what Close returns when uplink bytes Write had
 // accepted could not be sent before the conn closed.
 var ErrPollingCloseIncomplete = errors.New("http_polling: close left uplink bytes unsent")
@@ -1014,8 +1092,13 @@ func (c *HTTPPollingConn) Close() error {
 }
 
 // CloseNow closes the conn without sending what Write accepted, and reports
-// those bytes: for a caller that is stopping and will not wait on the peer.
-func (c *HTTPPollingConn) CloseNow() error { return c.closeBy(time.Now()) }
+// those bytes: for a caller that is stopping, or leaving a dead session, and
+// will not wait on the peer. It cuts the poll in flight, and a Close already
+// sending - which waits on its own bound - with it.
+func (c *HTTPPollingConn) CloseNow() error {
+	c.abortNow()
+	return c.closeBy(time.Now())
+}
 
 // closeBy is Close with its sending bounded by closeBy.
 func (c *HTTPPollingConn) closeBy(closeBy time.Time) error {
@@ -1040,20 +1123,29 @@ func (c *HTTPPollingConn) closeBy(closeBy time.Time) error {
 }
 
 // flushOnClose sends what is left in sendBuf by closeBy, with the polls the
-// workers would have made: the same chunks, one request each. The workers
-// end after the poll they are in; one that failed has put its bytes back.
+// workers would have made: the same chunks, one request each.
+//
+// It counts what is left only once the workers have stopped: a worker in a
+// poll holds a chunk outside sendBuf, and puts it back if the poll fails.
+// Counted earlier, an empty sendBuf read as all sent while the worker's poll
+// was about to fail - the silent loss this exists to stop - and the count
+// left that chunk out (P2-1 of the round-18 review). At closeBy, or on
+// CloseNow, the poll in flight is cut, so the wait stays inside the bound.
 func (c *HTTPPollingConn) flushOnClose(closeBy time.Time) error {
-	stopped := make(chan struct{})
+	done := make(chan struct{})
+	defer close(done)
 	go func() {
-		c.workers.Wait()
-		close(stopped)
+		t := time.NewTimer(time.Until(closeBy))
+		defer t.Stop()
+		select {
+		case <-t.C:
+			c.abortNow()
+		case <-c.abortChan():
+		case <-done:
+		}
 	}()
-	wait := time.NewTimer(time.Until(closeBy))
-	defer wait.Stop()
-	select {
-	case <-stopped:
-	case <-wait.C:
-	}
+	c.workers.Wait()
+	triedOwn := false
 	for {
 		c.sendLock.Lock()
 		left := c.sendBuf.Len()
@@ -1061,12 +1153,15 @@ func (c *HTTPPollingConn) flushOnClose(closeBy time.Time) error {
 		if left == 0 {
 			return nil
 		}
-		// Out of time, or the peer is not taking polls: a conn closed after
-		// its server went silent - a failed handshake, a reconnect - must not
-		// spend the whole bound on it.
-		if !time.Now().Before(closeBy) || c.pollFailing.Load() {
+		// Out of time, aborted, or the peer is not taking polls and one poll
+		// of our own did not go through either: a conn closed after its
+		// server went silent must not spend the whole bound on it. One
+		// failed poll is not enough - a stale keep-alive fails once (P3-2
+		// of the round-18 review).
+		if c.aborted.Load() || !time.Now().Before(closeBy) || (c.pollFailing.Load() && triedOwn) {
 			return fmt.Errorf("%w: %d bytes", ErrPollingCloseIncomplete, left)
 		}
+		triedOwn = true
 		by := time.Now().Add(pollTimeout)
 		if closeBy.Before(by) {
 			by = closeBy
