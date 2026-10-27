@@ -220,14 +220,19 @@ func androidControlConfig(cfg *Config, mgr *strategy.Manager, dualStack bool, se
 		ConnectRequestedFn: func() { sess.stopped.Store(false) },
 		// HandshakeOutcomeFn: a session handshake the server never answered
 		// is booked on the session's server, as on the desktop (R1 of the
-		// fix9 stand run).
-		HandshakeOutcomeFn: func(answered bool, err error) error {
+		// fix9 stand run), and so is one reset after its request (P2 of the
+		// round-14 review).
+		HandshakeOutcomeFn: func(outcome tun.HandshakeOutcome, err error) error {
 			sess.mu.Lock()
 			strat, cand, hasCand := sess.stratObj, sess.cand, sess.hasCand
 			sess.mu.Unlock()
-			if answered {
+			switch outcome {
+			case tun.HandshakeAnsweredOutcome:
 				mgr.HandshakeAnswered(strat, cand, hasCand)
 				return nil
+			case tun.HandshakeFailedOutcome:
+				mgr.HandshakeFailed(cand, hasCand)
+				return err
 			}
 			return fmt.Errorf("%w: %w", mgr.HandshakeUnanswered(strat, cand, hasCand), err)
 		},

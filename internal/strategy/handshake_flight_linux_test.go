@@ -3,10 +3,10 @@ package strategy
 import (
 	"context"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -78,9 +78,11 @@ func silentServer(t *testing.T, bind string) string {
 	return readingServer(t, bind, false)
 }
 
-// readingServer is silentServer that, with greet, speaks first - one byte,
-// which a greeting transport such as the test's Geneva waits for.
-func readingServer(t *testing.T, bind string, greet bool) string {
+// readingServer is silentServer that, with answer, answers a request it
+// has read - a read that starts with 'G' - with one byte, as a server
+// answers a ClientHello that reached it. It does not speak first, and it
+// does not answer a decoy.
+func readingServer(t *testing.T, bind string, answer bool) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", bind)
 	if err != nil {
@@ -94,11 +96,17 @@ func readingServer(t *testing.T, bind string, greet bool) string {
 				return
 			}
 			go func() {
-				if greet {
-					_, _ = c.Write([]byte{'x'})
+				defer c.Close()
+				buf := make([]byte, 64<<10)
+				for {
+					n, err := c.Read(buf)
+					if err != nil {
+						return
+					}
+					if answer && n > 0 && buf[0] == 'G' {
+						_, _ = c.Write([]byte{'x'})
+					}
 				}
-				_, _ = io.Copy(io.Discard, c)
-				c.Close()
 			}()
 		}
 	}()
@@ -224,7 +232,7 @@ func TestUnderTheStandsCutGenevaComesUpInTheSecondCycle(t *testing.T) {
 	m.Register(&decoyGreeter{id: "stego", priority: 7})
 	m.Register(&decoyGreeter{id: "seqovl", priority: 7})
 	m.Register(&quietDialer{id: "ws", priority: 8})
-	m.Register(&slowAnswer{greetingStrategy: greetingStrategy{id: "geneva", priority: 12}, after: 30 * time.Millisecond})
+	m.Register(&requestFirst{id: "geneva", priority: 12, after: 30 * time.Millisecond})
 	markConnected(m, reality)
 
 	backoff := time.Second
@@ -278,4 +286,125 @@ func TestAFlightStuckBehindAClosedWindowHasNotProgressed(t *testing.T) {
 	if handshakeProgressed(c) {
 		t.Fatal("a flight stuck behind a closed window counts as through")
 	}
+}
+
+// requestFirst sends a request the server answers ('G...') and waits for
+// the answer, then after: Geneva to the test, whose fragmented ClientHello
+// gets past the cut.
+type requestFirst struct {
+	id       string
+	priority int
+	after    time.Duration
+	// then, after the answer, writes a TLS record the cut drops and waits
+	// after with it in flight, before it returns: HTTP/2 Stego writing its
+	// preface and auth after TLS and waiting for the server's ack.
+	then bool
+}
+
+func (s *requestFirst) Name() string                        { return s.id }
+func (s *requestFirst) ID() string                          { return s.id }
+func (s *requestFirst) Priority() int                       { return s.priority }
+func (s *requestFirst) RequiresServer() bool                { return true }
+func (s *requestFirst) Description() string                 { return "a request, then its answer" }
+func (s *requestFirst) Probe(context.Context, string) error { return nil }
+func (*requestFirst) reportsTCPConnect()                    {}
+
+func (s *requestFirst) Connect(ctx context.Context, target string) (net.Conn, error) {
+	conn, err := (&protect.ProtectDialer{}).DialContext(ctx, "tcp", target)
+	if err != nil {
+		return nil, err
+	}
+	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stop()
+	if _, err := conn.Write([]byte("GET")); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	if _, err := conn.Read(make([]byte, 1)); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	if s.then {
+		if _, err := conn.Write(clientHelloRecord()); err != nil {
+			conn.Close()
+			return nil, err
+		}
+	}
+	select {
+	case <-time.After(s.after):
+		return conn, nil
+	case <-ctx.Done():
+		conn.Close()
+		return nil, ctx.Err()
+	}
+}
+
+// TestAnAnsweredAttemptWithAWriteInFlightIsHeld is the P2 of the round-14
+// review: under swallow pressure, an attempt whose server has answered and
+// whose next write is still in flight when its share runs out - HTTP/2
+// Stego waiting for its auth ack - counted as not through and was cut,
+// and a working transport was booked as swallowed. a swallows every
+// handshake and gets its verdict; on b the first transport is answered and
+// then holds a write in flight (the cut drops it) for 0.4 s of a 1.5 s
+// cycle. It is held and connects in the first cycle on b.
+func TestAnAnsweredAttemptWithAWriteInFlightIsHeld(t *testing.T) {
+	if !underStandCut(t) {
+		return
+	}
+	a := newBlackholeListener(t)
+	b := readingServer(t, "127.0.0.1:0", true)
+	m := newSilenceManager(t, 3*time.Second, a.addr, b)
+	var counters []*targetCounter
+	for i, id := range []string{"reality", "polling", "stego", "seqovl", "ws"} {
+		var s Strategy = &swallowAtGreeter{protectedGreeter{id: id, priority: 5 + i, hello: true}, map[string]bool{a.addr: true}}
+		if i == 0 {
+			s = &swallowAtRequest{requestFirst: requestFirst{id: id, priority: 5, after: 400 * time.Millisecond, then: true}, at: a.addr}
+		}
+		c := &targetCounter{Strategy: s}
+		counters = append(counters, c)
+		m.Register(c)
+	}
+	markConnected(m, counters[0])
+	onB := func() bool {
+		return slices.ContainsFunc(counters, func(c *targetCounter) bool { return c.at(b) > 0 })
+	}
+	firstOnB := 0
+	for cycle := 1; cycle <= 10; cycle++ {
+		before := onB()
+		ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+		conn, s, err := m.Connect(ctx, "")
+		cancel()
+		if firstOnB == 0 && !before && onB() {
+			firstOnB = cycle
+		}
+		if err == nil {
+			conn.Close()
+			if got := m.GetServerAddr(context.Background()); got != b || s.ID() != "reality" {
+				t.Fatalf("connected via %s on %s, want reality on b %s", s.ID(), got, b)
+			}
+			if !m.swallowPressure(b) {
+				t.Fatal("no pressure on b - the test proves nothing")
+			}
+			if cycle != firstOnB {
+				t.Fatalf("connected in cycle %d, the first on b was %d", cycle, firstOnB)
+			}
+			fmt.Printf("connected in cycle %d, the first on b\n", cycle)
+			return
+		}
+	}
+	t.Fatal("not connected in 10 cycles")
+}
+
+// swallowAtRequest is requestFirst, swallowed at at.
+type swallowAtRequest struct {
+	requestFirst
+	at string
+}
+
+func (s *swallowAtRequest) Connect(ctx context.Context, target string) (net.Conn, error) {
+	if target == s.at {
+		swallowed := protectedGreeter{id: s.id, priority: s.priority, swallow: true}
+		return swallowed.Connect(ctx, target)
+	}
+	return s.requestFirst.Connect(ctx, target)
 }

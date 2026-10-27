@@ -96,12 +96,14 @@ Versions follow [Semantic Versioning](https://semver.org/).
   silence verdict on another one, an attempt gets an even share of what is
   left (about a sixteenth of the cycle at least, drawn around that size,
   equal-priority transports in shuffled order) while other transports wait.
-  An attempt whose whole first flight the server's TCP has acknowledged
-  runs on past its share, so a slow but live handshake still completes; one
-  whose first flight is not acknowledged in full, as when a censor drops the
-  ClientHello behind an acknowledged decoy, is cut.
-  Limits: on Linux a path with a round trip above about 350-580 ms is cut
-  before its ACK is back; a first flight that is acknowledged and then
+  An attempt whose server has answered, or acknowledged its whole first
+  flight, runs on past its share, so a slow but live handshake still
+  completes; one whose first flight is not acknowledged in full and not
+  answered, as when a censor drops the ClientHello behind an acknowledged
+  decoy, is cut.
+  Limits: on Linux a path with a round trip above about 350-580 ms, or a
+  lossy one with a segment awaiting retransmission when the share runs out,
+  is cut before its ACK is back; a first flight that is acknowledged and then
   never answered runs the whole cycle; on macOS and Windows, which have no
   TCP_INFO here, no attempt is cut at its share (Android follows the Linux
   rule).

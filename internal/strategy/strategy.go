@@ -337,7 +337,7 @@ func (m *Manager) connectThroughRefusal(ctx context.Context, s Strategy, target 
 		}
 		switch {
 		case err != nil && phase.heldCut() && !isUDPBasedStrategy(s):
-			// Held to its share and cut with nothing acknowledged: it
+			// Held to its share and cut with its handshake not through: it
 			// counts on less evidence than a whole cycle, the swallow
 			// pressure being the rest of it, and its silence is read
 			// against the share.
@@ -395,7 +395,7 @@ const (
 	phaseConnected              // the TCP connect is up, the handshake under way
 	phaseCut                    // cut at the dial limit while dialling
 	phaseCutLocal               // cut at the dial limit before any dial went out
-	phaseHeldCut                // held to its share, connected, and cut there: the server acknowledged nothing
+	phaseHeldCut                // held to its share, connected, and cut there: its handshake had not got through
 )
 
 // connectPhase follows one attempt through its TCP connect.
@@ -419,10 +419,10 @@ var dialCutTimer = time.AfterFunc
 // than limit) the attempt simply runs to limit.
 //
 // hold says the attempt is held to its share (scanState.held): at dialLimit
-// a connected attempt is cut too, unless the server's TCP has acknowledged
-// the handshake's whole first flight (handshakeProgressed). A server that is slow
-// to answer - 7-9 s through a bad mobile link, or reaching its cover - still
-// acknowledges at once; a censor that drops the ClientHello, as the fix13c
+// a connected attempt is cut too, unless its handshake has got through - the
+// server answered, or acknowledged all it was sent (handshakeProgressed). A
+// server that is slow to answer - 7-9 s through a bad mobile link, or
+// reaching its cover - still acknowledges at once; a censor that drops the ClientHello, as the fix13c
 // stand did, never lets it get there. The share was a cut whatever the
 // progress, and a slow but live handshake was killed every cycle (P2-4 of
 // the round-10 review).
@@ -468,7 +468,7 @@ func watchConnect(ctx context.Context, cancel context.CancelFunc, limit, dialLim
 }
 
 // heldCut reports an attempt held to its share and cut there, connected,
-// with nothing of its handshake acknowledged.
+// with its handshake not through.
 func (p *connectPhase) heldCut() bool { return p.state.Load() == phaseHeldCut }
 
 func (p *connectPhase) stop() {

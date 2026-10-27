@@ -747,6 +747,10 @@ func reconnectTUN(ctx context.Context, mgr *strategy.Manager, serverAddr string,
 			err = fmt.Errorf("%w: %w", mgr.HandshakeUnanswered(sess.strat, sess.cand, sess.hasCand), err)
 		} else if tun.IsHandshakeAnswered(err) {
 			mgr.HandshakeAnswered(sess.strat, sess.cand, sess.hasCand)
+		} else if tun.IsHandshakeFailed(err) {
+			// A reset after the request, on the relay's reconnect too (P2
+			// of the round-14 review).
+			mgr.HandshakeFailed(sess.cand, sess.hasCand)
 		}
 		return tun.ReconnectResult{}, reconnectedSession{}, err
 	}

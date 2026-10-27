@@ -138,12 +138,13 @@ func (c *Config) applyDefaults() {
 // it; callers get a read-only CandidateState from Snapshot.
 type health struct {
 	consecutiveFailures int
-	// beforeConnect is the failure streak and backoff a successful connect
-	// cleared (Report), for a session handshake that then fails to put back
-	// (ReportHandshakeFailed).
+	// beforeConnect is the failure streak, backoff and parks a successful
+	// connect cleared (Report), for a session handshake that then fails to
+	// put back (ReportHandshakeFailed).
 	beforeConnect struct {
-		failures int
-		backoff  time.Duration
+		failures                     int
+		backoff                      time.Duration
+		cooldownUntil, deadParkUntil time.Time
 	}
 	lastSuccess   time.Time
 	lastFailure   time.Time
@@ -700,6 +701,7 @@ func (s *Selector) Report(c Candidate, ok bool, latency time.Duration) {
 	h := &s.health[idx]
 	if ok {
 		h.beforeConnect.failures, h.beforeConnect.backoff = h.consecutiveFailures, h.backoff
+		h.beforeConnect.cooldownUntil, h.beforeConnect.deadParkUntil = h.cooldownUntil, h.deadParkUntil
 		h.consecutiveFailures = 0
 		h.backoff = 0
 		h.cooldownUntil = time.Time{}
@@ -718,7 +720,9 @@ func (s *Selector) Report(c Candidate, ok bool, latency time.Duration) {
 // added to it. Booked as a failure on its own, it was one in a row each
 // time - the connect before it had cleared the last - and a family that
 // connects and resets every handshake was never parked; the client went
-// round on it (finding 1 of the round-13 review).
+// round on it (finding 1 of the round-13 review). A park the connect lifted
+// is put back too, and a failure booked in between adds to the streak
+// rather than replacing it (P3-3 of the round-14 review).
 func (s *Selector) ReportHandshakeFailed(c Candidate) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -727,10 +731,20 @@ func (s *Selector) ReportHandshakeFailed(c Candidate) {
 		return
 	}
 	h := &s.health[idx]
-	if h.consecutiveFailures == 0 {
-		h.consecutiveFailures, h.backoff = h.beforeConnect.failures, h.beforeConnect.backoff
+	b := &h.beforeConnect
+	h.consecutiveFailures += b.failures
+	h.backoff = max(h.backoff, b.backoff)
+	if b.cooldownUntil.After(h.cooldownUntil) {
+		h.cooldownUntil = b.cooldownUntil
 	}
-	h.beforeConnect.failures, h.beforeConnect.backoff = 0, 0
+	if b.deadParkUntil.After(h.deadParkUntil) {
+		h.deadParkUntil = b.deadParkUntil
+	}
+	*b = struct {
+		failures                     int
+		backoff                      time.Duration
+		cooldownUntil, deadParkUntil time.Time
+	}{}
 	s.recordFailureLocked(idx, s.cfg.Now())
 }
 
