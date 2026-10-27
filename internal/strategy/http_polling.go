@@ -279,7 +279,11 @@ type HTTPPollingConn struct {
 	closeErr error
 	// workers counts the running poll workers, so Close sends what is left
 	// only once none of them holds part of it.
-	workers  sync.WaitGroup
+	workers sync.WaitGroup
+	// pollFailing is set by a poll that failed and cleared by one that went
+	// through: Close does not wait on a peer that is not taking polls.
+	pollFailing atomic.Bool
+
 	lastSend time.Time
 	lastRecv time.Time
 
@@ -498,6 +502,7 @@ func (c *HTTPPollingConn) pollBy(deadline time.Time) (ok bool, moved bool) {
 	// Do request with ack sequence. The auth token is derived inside doRequest,
 	// bound to the exporter of the TLS session the request actually rides (S22).
 	resp, err := c.doRequest(ctx, sendData, ackSeq)
+	c.pollFailing.Store(err != nil)
 	if err != nil {
 		log.Debug("HTTP Polling: poll error: %v", err)
 		c.statsMu.Lock()
@@ -1056,7 +1061,10 @@ func (c *HTTPPollingConn) flushOnClose(closeBy time.Time) error {
 		if left == 0 {
 			return nil
 		}
-		if !time.Now().Before(closeBy) {
+		// Out of time, or the peer is not taking polls: a conn closed after
+		// its server went silent - a failed handshake, a reconnect - must not
+		// spend the whole bound on it.
+		if !time.Now().Before(closeBy) || c.pollFailing.Load() {
 			return fmt.Errorf("%w: %d bytes", ErrPollingCloseIncomplete, left)
 		}
 		by := time.Now().Add(pollTimeout)

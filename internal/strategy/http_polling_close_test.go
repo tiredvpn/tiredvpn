@@ -205,3 +205,51 @@ func TestAPollingCloseNowSendsNothing(t *testing.T) {
 		t.Fatalf("CloseNow with bytes left: %v, want ErrPollingCloseIncomplete", err)
 	}
 }
+
+// TestAPollingCloseDoesNotWaitOnAPeerThatRefusesPolls: every poll fails at
+// once - the server closes each connection after the dispatch. Close does
+// not spend its 5 s bound retrying: it reports the loss as soon as the
+// worker is out of its poll. A conn closed after its server went silent
+// (a failed handshake, a reconnect) must not hold the caller.
+func TestAPollingCloseDoesNotWaitOnAPeerThatRefusesPolls(t *testing.T) {
+	cert, err := generateTestCert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"http/1.1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				_, _ = protocol.ReadDispatch(c)
+				c.Close()
+			}()
+		}
+	}()
+	c := pollingConnTo(t, ln.Addr().String())
+	if _, err := c.Write(bytes.Repeat([]byte{0x11}, 16<<10)); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for !c.pollFailing.Load() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !c.pollFailing.Load() {
+		t.Fatal("no poll failed - the test proves nothing")
+	}
+	start := time.Now()
+	err = c.Close()
+	if took := time.Since(start); took > 2*time.Second {
+		t.Fatalf("close took %v retrying a peer that refuses every poll", took)
+	}
+	if !errors.Is(err, ErrPollingCloseIncomplete) {
+		t.Fatalf("close: %v, want ErrPollingCloseIncomplete", err)
+	}
+}
