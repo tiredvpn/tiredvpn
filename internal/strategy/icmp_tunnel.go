@@ -335,6 +335,14 @@ type icmpTunnelConn struct {
 	left      atomic.Int64
 	closeOnce sync.Once
 	closeErr  error
+	// abortC is closed by CloseNow (abortChan), to cut a Close already
+	// waiting on its bound; writes counts the Writes between their closed
+	// check and their enqueue, which Close waits out before its final
+	// count.
+	abortOnce sync.Once
+	abortInit sync.Once
+	abortC    chan struct{}
+	writes    atomic.Int64
 
 	// pathMTU reports the MTU towards the server, 0 if unknown. Packets are
 	// sized to it so the kernel never has to fragment them. It is asked for
@@ -746,16 +754,33 @@ func (c *icmpTunnelConn) sendLoop() {
 			data, carry = c.coalesceQueued(data, limit)
 		}
 
-		// Build and send packet
+		// Build and send packet. While closing, a payload that does not
+		// leave the client is what Close could not send (P2-3 of the
+		// round-18 review), and a send that fails ends the drain: on a dead
+		// route every send after it fails too, at 10 packets a second for
+		// the whole bound (P2-2).
+		closing := c.closeBy.Load() != 0
 		packet, err := c.buildPacket(data, 0)
 		if err != nil {
 			log.Debug("ICMP Tunnel: build packet error: %v", err)
+			if closing {
+				c.left.Add(int64(len(data)))
+			}
 			continue
 		}
 
-		c.icmpConn.SetWriteDeadline(time.Now().Add(ICMPWriteTimeout))
+		wd := time.Now().Add(ICMPWriteTimeout)
+		if by := c.closeBy.Load(); by != 0 && by < wd.UnixNano() {
+			wd = time.Unix(0, by)
+		}
+		c.icmpConn.SetWriteDeadline(wd)
 		if _, err := c.icmpConn.WriteTo(packet, c.serverIP); err != nil {
 			log.Debug("ICMP Tunnel: send error: %v", err)
+			// Read again: a Close may have begun during the send.
+			if closing || c.closeBy.Load() != 0 {
+				c.left.Add(int64(len(data)+len(carry)) + c.queuedBytes())
+				return
+			}
 		}
 	}
 }
@@ -956,6 +981,11 @@ func (c *icmpTunnelConn) Read(b []byte) (int, error) {
 
 // Write implements io.Writer
 func (c *icmpTunnelConn) Write(b []byte) (int, error) {
+	// Counted before the closed check, so a Close that has set closed and
+	// then sees no Write in progress knows none will enqueue after its
+	// final count (P3-1 of the round-18 review).
+	c.writes.Add(1)
+	defer c.writes.Add(-1)
 	if c.closed.Load() {
 		return 0, io.ErrClosedPipe
 	}
@@ -1002,11 +1032,36 @@ var icmpCloseTimeout = 5 * time.Second
 // send. It dropped the queue - the same pattern as HTTPPollingConn.Close
 // (issue #131) and MorphedConn.Close (#129). Write fails from the moment
 // Close is called. The transport has no retransmit, so a sent packet can
-// still be lost; what Close answers for is what left the client.
+// still be lost; what Close answers for is what left the client: a packet
+// the socket refused is counted as not sent, and ends the drain.
 func (c *icmpTunnelConn) Close() error { return c.closeWithin(icmpCloseTimeout) }
 
 // CloseNow closes the tunnel without sending what is queued, and reports it.
-func (c *icmpTunnelConn) CloseNow() error { return c.closeWithin(0) }
+// A Close already waiting on its bound is cut short with it.
+func (c *icmpTunnelConn) CloseNow() error {
+	c.abortNow()
+	return c.closeWithin(0)
+}
+
+// abortChan is closed by abortNow.
+func (c *icmpTunnelConn) abortChan() chan struct{} {
+	c.abortInit.Do(func() { c.abortC = make(chan struct{}) })
+	return c.abortC
+}
+
+// abortNow moves Close's bound to now - the send loop stops at its next
+// packet - and wakes a Close waiting on the old one.
+func (c *icmpTunnelConn) abortNow() {
+	now := time.Now().UnixNano()
+	for {
+		by := c.closeBy.Load()
+		if (by != 0 && by <= now) || c.closeBy.CompareAndSwap(by, now) {
+			break
+		}
+	}
+	ch := c.abortChan()
+	c.abortOnce.Do(func() { close(ch) })
+}
 
 func (c *icmpTunnelConn) closeWithin(d time.Duration) error {
 	c.closeOnce.Do(func() { c.closeErr = c.closeOnceWithin(d) })
@@ -1015,26 +1070,42 @@ func (c *icmpTunnelConn) closeWithin(d time.Duration) error {
 
 func (c *icmpTunnelConn) closeOnceWithin(d time.Duration) error {
 	c.closed.Store(true)
+	sockClosed := false
+	var sockErr error
 	if c.sendDone != nil {
-		c.closeBy.Store(time.Now().Add(d).UnixNano())
+		c.closeBy.CompareAndSwap(0, time.Now().Add(d).UnixNano())
 		close(c.closing)
-		wait := time.NewTimer(d)
+		wait := time.NewTimer(time.Until(time.Unix(0, c.closeBy.Load())))
 		select {
 		case <-c.sendDone:
 		case <-wait.C:
+		case <-c.abortChan():
 		}
 		wait.Stop()
+		select {
+		case <-c.sendDone:
+		default:
+			// Out of time with a send still under way: closing the socket
+			// ends it, where joining it first waited out its write
+			// deadline (P2 of the round-18 review).
+			sockErr, sockClosed = c.icmpConn.Close(), true
+		}
 	}
 	close(c.done)
 	if c.sendDone != nil {
 		<-c.sendDone
 	}
+	for c.writes.Load() != 0 {
+		time.Sleep(time.Millisecond)
+	}
 	c.left.Add(c.queuedBytes())
-	err := c.icmpConn.Close()
+	if !sockClosed {
+		sockErr = c.icmpConn.Close()
+	}
 	if n := c.left.Load(); n > 0 {
 		return fmt.Errorf("%w: %d bytes", ErrICMPCloseIncomplete, n)
 	}
-	return err
+	return sockErr
 }
 
 // LocalAddr returns the local network address
