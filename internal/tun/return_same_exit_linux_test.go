@@ -28,6 +28,9 @@ type returnFront struct {
 	// dropReply lets the request reach the exit, which registers the
 	// session, and loses the exit's answer on the way back.
 	dropReply atomic.Bool
+	// resetOnce closes the next connection right after its handshake
+	// request, once.
+	resetOnce atomic.Bool
 	// requested, when set, is called as the handshake request arrives.
 	requested atomic.Pointer[func()]
 	// answerAfter holds the answer back.
@@ -68,6 +71,10 @@ func (s *frontStrategy) Connect(ctx context.Context, target string) (net.Conn, e
 		}
 		if f.mute.Load() {
 			_, _ = io.Copy(io.Discard, srv)
+			return
+		}
+		if f.resetOnce.CompareAndSwap(true, false) {
+			srv.Close()
 			return
 		}
 		time.Sleep(time.Duration(f.answerAfter.Load()))
@@ -316,6 +323,47 @@ func TestAReturnWhoseReplyIsLostDoesNotStayOnADisplacedSession(t *testing.T) {
 	h.exit.echoing.Store(true)
 	h.v6.dropReply.Store(true)
 	h.expectReconnectOnV4(t)
+}
+
+// TestAReturnCutAfterItsRequestDoesNotParkTheAddress is finding 5 of the
+// round-12 review: the request reaches v6 and the connection ends with no
+// answer - a reset, not a silence. Round 17 booked every handshake error
+// but "not sent" and "refused" as silence and parked v6 at once; on an
+// endpoint with one usable address that parks the whole server after one
+// attempt. The tunnel still reconnects, since the request may have
+// displaced the old session, but v6 is only charged a failure, so the
+// reconnect, preferring v6, lands there.
+func TestAReturnCutAfterItsRequestDoesNotParkTheAddress(t *testing.T) {
+	shortHandshakeTimeout(t, 500*time.Millisecond)
+	h := newSameExitHarness(t)
+	h.v6.resetOnce.Store(true)
+	h.v.mu.Lock()
+	old := h.v.conn
+	h.v.mu.Unlock()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		h.v.mu.Lock()
+		cur := h.v.conn
+		h.v.mu.Unlock()
+		if cur != nil && cur != old && h.m.GetServerAddr(context.Background()) == h.v6At {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if h.v6.resetOnce.Load() {
+		t.Fatal("no handshake on v6 - the test proves nothing")
+	}
+	for _, st := range h.m.EndpointStates() {
+		if st.Addr == h.v6At && st.CooldownUntil.After(time.Now()) {
+			t.Fatal("v6 is parked after one handshake cut short by a reset")
+		}
+	}
+	if got := h.m.GetServerAddr(context.Background()); got != h.v6At {
+		t.Fatalf("the tunnel is on %s, want v6 %s", got, h.v6At)
+	}
+	if !h.downlinkWorks(3 * time.Second) {
+		t.Fatal("no downlink on v6")
+	}
 }
 
 // expectReconnectOnV4 waits for one return handshake on v6, then requires
