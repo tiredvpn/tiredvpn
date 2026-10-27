@@ -18,6 +18,7 @@ import (
 // upstream conn its owner is done: no keepalive goes after the client's
 // close, and the exit's deadline ends the leg within one deadline of it.
 func TestADialRelayLetsItsLegGoWhenTheClientHangsUp(t *testing.T) {
+	longLegTest(t)
 	for _, tc := range []struct {
 		name  string
 		relay func(*testing.T, *Config)

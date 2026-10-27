@@ -281,6 +281,7 @@ func realityV2(m *strategy.Manager, r *pathRelay) strategy.Strategy {
 }
 
 func TestEveryRelayPathKeepsASparseProxiedStream(t *testing.T) {
+	longLegTest(t)
 	for _, tc := range []struct {
 		name  string
 		relay func(*testing.T, *Config)

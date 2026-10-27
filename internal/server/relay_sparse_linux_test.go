@@ -56,6 +56,7 @@ func sparseDownload(t *testing.T, exit *legExit, clientIP net.IP) int64 {
 // itself, on its own path: a 1.11.8-like client over anti-probe, which the
 // relay terminates in handleRawTunnel and bridges (relayTUNToUpstream).
 func TestAnOldClientOnASparseDownloadKeepsItsBridgeLeg(t *testing.T) {
+	longLegTest(t)
 	scaleLegClocks(t)
 	secret := []byte("relay-leg-secret-0123456789abcdef")
 	exit := newLegExit(t, secret)
@@ -76,6 +77,7 @@ func TestAnOldClientOnASparseDownloadKeepsItsBridgeLeg(t *testing.T) {
 // nothing loses its session to the relay's own deadline, as it would
 // straight to an exit; no relay keepalive can hold that one.
 func TestAnOldClientOnASparseDownloadKeepsItsSinkLeg(t *testing.T) {
+	longLegTest(t)
 	scaleLegClocks(t)
 	secret := []byte("relay-leg-secret-0123456789abcdef")
 	exit := newLegExit(t, secret)
@@ -109,6 +111,7 @@ func waitDown(t *testing.T, client *tun.VPNClient, sent int64) {
 // The client's TCP acknowledges what comes down; at the end "hello" up has
 // to reach the target, which must have got nothing else.
 func TestASparseDownloadThroughAProxyRelayKeepsItsLeg(t *testing.T) {
+	longLegTest(t)
 	scaleLegClocks(t)
 	secret := []byte("relay-leg-secret-0123456789abcdef")
 	exit := newLegExit(t, secret)
