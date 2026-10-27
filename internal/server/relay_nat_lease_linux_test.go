@@ -326,6 +326,58 @@ func TestTwinsAskingForThePoolsFirstAddressGetTwo(t *testing.T) {
 	}
 }
 
+// TestTwinsDoNotShareAnOfflineDirectClientsAddress is finding 3 of the
+// round-12 review, the rest of P1-1: a direct client C on the global secret
+// at the same origin has gone offline, and its lease "global@<origin>" on
+// the pool's first address stays. The first relayed box adopted it as a
+// legacy lease onto its drawn tag, so its refused request came back from
+// the sticky path as granted; the second box, asking for the same default
+// address, took it over from the live first one. Neither box held it, and C
+// lost it too. Both boxes get addresses of their own, nothing is taken
+// over, and C's lease stays where it was.
+func TestTwinsDoNotShareAnOfflineDirectClientsAddress(t *testing.T) {
+	scaleLegClocks(t)
+	out := captureLog(t)
+	secret := []byte("relay-leg-secret-0123456789abcdef")
+	exit := newLegExit(t, secret)
+	relay := legRelay(t, secret, exit)
+	first := net.IPv4(10, 8, 7, 2) // the pool's first free address
+
+	c := natClientAsking(t, exit.addr, secret, first)
+	if !c.LocalIP().Equal(first) {
+		t.Fatalf("the direct client got %s, asked for %s", c.LocalIP(), first)
+	}
+	c.Stop()
+	deadline := time.Now().Add(5 * time.Second)
+	for exit.srvCtx.sharedTUN.Serving(first) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if exit.srvCtx.sharedTUN.Serving(first) {
+		t.Fatal("the exit still serves the direct client - the test proves nothing")
+	}
+	direct := allocationKey(sharedIdentity(globalClientID), "127.0.0.1", "")
+	if got := exit.srvCtx.ipPool.stickyLookup(direct); got != first.String() {
+		t.Fatalf("the direct client's lease %q is on %q, want %s - the test proves nothing", direct, got, first)
+	}
+
+	a := natClientAsking(t, relay, secret, first)
+	b := natClientAsking(t, relay, secret, first)
+	for _, box := range []*tun.VPNClient{a, b} {
+		if box.LocalIP().Equal(first) {
+			t.Fatalf("a relayed box got the offline direct client's address %s:\n%s", first, out.String())
+		}
+	}
+	if a.LocalIP().Equal(b.LocalIP()) {
+		t.Fatalf("both boxes got %s:\n%s", a.LocalIP(), out.String())
+	}
+	if strings.Contains(out.String(), "taken over") {
+		t.Fatalf("a lease was taken over between the twins:\n%s", out.String())
+	}
+	if got := exit.srvCtx.ipPool.stickyLookup(direct); got != first.String() {
+		t.Fatalf("the direct client's lease is on %q now, want %s", got, first)
+	}
+}
+
 // rawTUNSession opens a TUN session through relay with anti-probe and a
 // bare handshake asking for ask, and returns its conn and the address the
 // exit gave it. Nothing reconnects it.
