@@ -31,6 +31,9 @@ want=(
   TestPollingIdleSessionStaysRegistered
   TestHTTP1UnauthenticatedGetsNoTunnel
   TestPlaintextH2RefusesUnboundToken
+  TestUntaggedAndForeignFallbacksStillGoToTheDonor
+  TestReplayedFallbackHelloGoesToTheDonor
+  TestWeakRegistrySecretsAreSaidWithTheTag
 )
 
 log="${RUNNER_TEMP:-$(mktemp -d)}/long-tests.log"

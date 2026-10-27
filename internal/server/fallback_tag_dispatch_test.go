@@ -232,6 +232,7 @@ func TestTaggedFallbacksReachTheirHandlersOnAB1Server(t *testing.T) {
 // the tag), and one tagged with a key the server does not hold, both go to the
 // donor byte for byte.
 func TestUntaggedAndForeignFallbacksStillGoToTheDonor(t *testing.T) {
+	longTest(t)
 	for _, cover := range []string{"", "www.microsoft.com"} {
 		for _, tc := range tagFallbackStrategies {
 			t.Run(tc.name+" cover="+cover, func(t *testing.T) {
@@ -252,6 +253,7 @@ func TestUntaggedAndForeignFallbacksStillGoToTheDonor(t *testing.T) {
 // through once; the same bytes again are a prober's and go to the donor. So
 // does a tag made outside the clock-skew window.
 func TestReplayedFallbackHelloGoesToTheDonor(t *testing.T) {
+	longTest(t)
 	for _, tc := range tagFallbackStrategies {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := newTagServer(t, "")
@@ -651,6 +653,7 @@ func TestStartupWarnsAboutSecrets(t *testing.T) {
 // Driven through the dispatcher: the registry changes, a stranger's hello
 // comes in, and the gate's own refresh rebuilds the index.
 func TestWeakRegistrySecretsAreSaidWithTheTag(t *testing.T) {
+	longTest(t)
 	log.SetDedupWindow(0) // count each line, repeats included
 	t.Cleanup(func() { log.SetDedupWindow(5 * time.Second) })
 	stranger := captureFallbackHello(t, tagFallbackStrategies[0].make, "a-stranger-who-holds-no-secret-of-ours")
