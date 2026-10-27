@@ -167,6 +167,12 @@ func NewIPPool(cfg IPPoolConfig, redisClient *redis.Client) (*IPPool, error) {
 	if bits != 32 {
 		return nil, fmt.Errorf("only IPv4 supported")
 	}
+	// A /31 or /32 has no address between network and broadcast: the range
+	// below would wrap, and the scan hand out addresses outside the network
+	// (finding 3 of the round-13 review).
+	if ones > 30 {
+		return nil, fmt.Errorf("IP pool %s is too small: a /30 at least", cfg.Network)
+	}
 
 	// Optional dual-stack prefix. Validated here (fails server startup via
 	// initIPPool) rather than per-client so a bad -ip-pool-v6 is caught at
