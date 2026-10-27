@@ -1202,9 +1202,10 @@ func (v *VPNClient) doHandshake(conn net.Conn, localIP net.IP) ([]byte, int, net
 	binary.BigEndian.PutUint16(handshake[5:7], uint16(v.tun.mtu))
 	handshake[7] = v.handshakeVersion() // v3: auto-MTU probe; v4: + dual-stack
 
-	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	writeDeadline := time.Now().Add(10 * time.Second)
+	conn.SetWriteDeadline(writeDeadline)
 	if _, err := conn.Write(handshake); err != nil {
-		return nil, 0, nil, fmt.Errorf("%w: %w", errHandshakeNotSent, err)
+		return nil, 0, nil, fmt.Errorf("%w: %w", errHandshakeNotSent, markWriteTimeout(err, writeDeadline))
 	}
 
 	// Read server response.
@@ -1253,22 +1254,28 @@ func IsHandshakeUnanswered(err error) bool {
 }
 
 // IsHandshakeFailed reports a session handshake on ctx that the server's
-// side ended with neither an answer nor silence: a reset or an end of
-// stream after the request, or a request write the peer reset. Such a
-// failure is the candidate's (Manager.HandshakeFailed).
+// side ended with neither an answer nor silence: a reset or an end of stream
+// after the request, or a request write the peer reset. Such a failure is
+// the candidate's (Manager.HandshakeFailed).
 //
-// What says nothing of the server is left out, both ways the round-15
-// review found it wrong:
-//   - a wait the caller's budget cut short, a cancellation - ctx done, or a
-//     conn closed under the handshake - and a timeout: a client stopping, or
-//     a write running into its deadline (P3-2 of the round-14 review);
-//   - a local abort: netd destroying the sockets of an address Android lost
-//     (ECONNABORTED), or a network or route gone under the handshake. Booked,
-//     a Wi-Fi to LTE flap charged a healthy server (finding 2).
+// A request that never left counts only when the peer reset it - EPIPE or
+// ECONNRESET - and nothing else does: booking all but a list of exclusions
+// charged a healthy server with smux's write timeout, a mux closed locally
+// and every errno the list missed (P3-1 of the round-16 review). Left out
+// whole, a session that dies on the write - smux, polling - brought back
+// the loop round 13 closed (finding 3 of the round-15 review).
 //
-// A request that never left is a failure when the peer reset it (EPIPE,
-// ECONNRESET): left out whole, a session that dies on the write - smux,
-// polling - brought back the loop round 13 closed (finding 3).
+// After the request, everything counts except what says nothing of the
+// server: a wait the caller's budget cut short; a cancellation - ctx done,
+// or a conn closed under the handshake (net.ErrClosed, or smux's
+// io.ErrClosedPipe, which it returns only for a local close); a timeout;
+// and a local abort - netd destroying the sockets of an address Android
+// lost, or a network or route gone (finding 2 of the round-15 review).
+//
+// Not caught: on smux a local abort can come back to the request's write as
+// a bare EPIPE, the abort itself consumed by the session's reader (P3-2 of
+// the round-16 review, a window of microseconds after the session starts).
+// Known until 1.11.10.
 func IsHandshakeFailed(ctx context.Context, err error) bool {
 	if err == nil || IsHandshakeUnanswered(err) || IsHandshakeAnswered(err) {
 		return false
@@ -1276,8 +1283,11 @@ func IsHandshakeFailed(ctx context.Context, err error) bool {
 	if ctx != nil && ctx.Err() != nil {
 		return false
 	}
+	if errors.Is(err, errHandshakeNotSent) {
+		return errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET)
+	}
 	switch {
-	case errors.Is(err, errHandshakeCutShort), errors.Is(err, net.ErrClosed),
+	case errors.Is(err, errHandshakeCutShort), errors.Is(err, net.ErrClosed), errors.Is(err, io.ErrClosedPipe),
 		errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled),
 		localNetAbort(err):
 		return false
@@ -1297,6 +1307,25 @@ func localNetAbort(err error) bool {
 	}
 	return false
 }
+
+// markWriteTimeout makes a write error that came back at or after deadline
+// report itself as a timeout. smux calls its deadline errors.New("timeout"),
+// no net.Error; the client's clock says what it was (as markSilence does for
+// reads).
+func markWriteTimeout(err error, deadline time.Time) error {
+	if err == nil || time.Now().Before(deadline) {
+		return err
+	}
+	return &writeTimeoutError{err: err}
+}
+
+// writeTimeoutError is a write error that came back at its deadline.
+type writeTimeoutError struct{ err error }
+
+func (e *writeTimeoutError) Error() string   { return e.err.Error() }
+func (e *writeTimeoutError) Unwrap() error   { return e.err }
+func (e *writeTimeoutError) Timeout() bool   { return true }
+func (e *writeTimeoutError) Temporary() bool { return true }
 
 // IsHandshakeAnswered reports whether a failed session handshake was
 // answered all the same: refused with an error status, or answered in part.
