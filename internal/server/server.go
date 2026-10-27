@@ -1711,6 +1711,12 @@ func handleMorphConnectionWithALPN(conn net.Conn, srvCtx *serverContext, logger 
 // h2TunnelState holds state for HTTP/2 stego tunnel
 type h2TunnelState struct {
 	targetConn net.Conn
+	// sinkGoneAt is when the TUN session's sink went, a monoNow stamp plus
+	// one, 0 while it stands; ended closes as the session's conn is cleaned
+	// up. Both for backstopH2TUNEnd and the frame loop.
+	sinkGoneAt atomic.Int64
+	ended      chan struct{}
+	endOnce    sync.Once
 	// downstream is the client's conn, for a relay's clientLiveness.
 	downstream      net.Conn
 	streamID        uint32
@@ -1789,6 +1795,9 @@ func initH2Framer(conn net.Conn, logger *log.Logger) (*http2.Framer, error) {
 
 // cleanupH2Conn closes tunnel target and removes per-client connection tracking on defer.
 func cleanupH2Conn(conn net.Conn, srvCtx *serverContext, tunnel **h2TunnelState, connTracked *bool, authClientID *clientIdentity) {
+	if t := *tunnel; t != nil && t.ended != nil {
+		t.endOnce.Do(func() { close(t.ended) })
+	}
 	if *tunnel != nil && (*tunnel).targetConn != nil {
 		(*tunnel).targetConn.Close()
 	}
@@ -1860,10 +1869,11 @@ func runH2FrameLoop(connPtr *net.Conn, framerPtr **http2.Framer, hpackDec *hpack
 			}
 			return
 		}
-		if h2TUNSinkGone(*tunnel) {
-			// Displaced on an exit, or the upstream leg ended on a relay:
-			// the session is over, and its client learns it now, at its own
-			// frame, with nothing echoed (backstopH2TUNEnd).
+		if h2TUNSessionOver(*tunnel) {
+			// Displaced on an exit, or the upstream leg ended on a relay,
+			// and the grace is over: the session is over, and its client
+			// learns it now, at its own frame, with nothing echoed
+			// (backstopH2TUNEnd).
 			logger.Info("H2 TUN session ended: its sink is gone (the address was taken over, or the upstream leg ended)")
 			return
 		}
@@ -4214,6 +4224,19 @@ var h2TUNEndBackstopNs = func() *atomic.Int64 {
 	return &v
 }()
 
+// h2TUNEndGraceNs is how long after its sink went an HTTP/2 TUN session
+// still takes its client's frames: 5 s. A client that upgrades or returns
+// keeps sending on the old session until the new one answers, and an old
+// session ended at its first frame after the takeover - 200 ms in, as in
+// round 17 - reached the client before that answer and threw the new
+// session away (finding 2 of the round-13 review). Atomic so tests can
+// scale it.
+var h2TUNEndGraceNs = func() *atomic.Int64 {
+	var v atomic.Int64
+	v.Store(int64(5 * time.Second))
+	return &v
+}()
+
 // backstopH2TUNEnd closes the client's conn some time after the session's
 // sink is gone: on an exit, another session took the address over; on a
 // relay, the exit ended the upstream leg. The session went on echoing the
@@ -4222,34 +4245,57 @@ var h2TUNEndBackstopNs = func() *atomic.Int64 {
 // review, finding 1 of the round-12 one).
 //
 // The frame loop ends such a session on the client's next frame, as the
-// native TUN loop does. Closing it as soon as the sink went raced the
-// client's own move: a return or an upgrade displaces its old session, and
-// the end of stream could reach the client before the new session's answer
-// and throw that away (finding 4 of the round-12 review). This close only
-// covers a client that sends nothing. On a normal end the sink goes as the
-// session closes, and the close is a no-op.
+// native TUN loop does, once the grace (h2TUNEndGraceNs) is over. Closing it
+// as soon as the sink went raced the client's own move: a return or an
+// upgrade displaces its old session, and the end of stream could reach the
+// client before the new session's answer and throw that away (finding 4 of
+// the round-12 review). This close only covers a client that sends
+// nothing. A session that ends first stops it (cleanupH2Conn closes ended):
+// a timer left behind held every ended session for 15 s and closed its conn
+// a second time (finding 6 of the round-13 review).
 func backstopH2TUNEnd(tunnel *h2TunnelState) {
 	down, sink := tunnel.downstream, tunnel.sink
 	if down == nil || sink == nil {
 		return
 	}
+	tunnel.ended = make(chan struct{})
+	ended := tunnel.ended
 	go func() {
-		<-sink.Done()
-		time.AfterFunc(time.Duration(h2TUNEndBackstopNs.Load()), func() { down.Close() })
+		select {
+		case <-sink.Done():
+		case <-ended:
+			return
+		}
+		tunnel.sinkGoneAt.CompareAndSwap(0, monoNow()+1)
+		h2TUNBackstopsArmed.Add(1)
+		defer h2TUNBackstopsArmed.Add(-1)
+		t := time.NewTimer(time.Duration(h2TUNEndBackstopNs.Load()))
+		defer t.Stop()
+		select {
+		case <-t.C:
+			down.Close()
+		case <-ended:
+		}
 	}()
 }
 
-// h2TUNSinkGone reports whether the sink of an HTTP/2 TUN session is gone.
-func h2TUNSinkGone(t *h2TunnelState) bool {
+// h2TUNBackstopsArmed counts the backstops waiting on a session whose sink
+// went, for tests.
+var h2TUNBackstopsArmed atomic.Int64
+
+// h2TUNSessionOver reports whether an HTTP/2 TUN session's sink has been
+// gone for the grace: the session is over at this frame.
+func h2TUNSessionOver(t *h2TunnelState) bool {
 	if t == nil || t.tunGate == nil || t.sink == nil {
 		return false
 	}
 	select {
 	case <-t.sink.Done():
-		return true
 	default:
 		return false
 	}
+	t.sinkGoneAt.CompareAndSwap(0, monoNow()+1)
+	return monoNow()+1-t.sinkGoneAt.Load() >= h2TUNEndGraceNs.Load()
 }
 
 // h2TunConn adapts HTTP/2 framer to net.Conn interface for SharedTUN
