@@ -152,20 +152,20 @@ func (v *VPNClient) tryReturnToPreferred() bool {
 	// endpoints in front of one exit - that displaces the old one: a tunnel
 	// that woke up meanwhile stays where it is, and is left untouched.
 	if v.dataIdleFor() < returnIdleAfter {
-		conn.Close()
+		_ = closeNow(conn)
 		log.Info("Return: the tunnel carried traffic during the dial, staying on %s", oldCand)
 		return false
 	}
 
 	if !v.sessionMu.TryLock() {
 		// A reconnect or a port hop is mid-handshake.
-		conn.Close()
+		_ = closeNow(conn)
 		return false
 	}
 	resp, n, tunnelConn, err := v.doHandshake(conn, localIP)
 	if err != nil {
 		v.sessionMu.Unlock()
-		conn.Close()
+		_ = closeNow(conn)
 		// Parked for silence only when nothing came back in the full wait
 		// (IsHandshakeUnanswered); a reset or an answer in part after the
 		// request is a failure (finding 5 of the round-12 review). Whether
@@ -201,7 +201,7 @@ func (v *VPNClient) tryReturnToPreferred() bool {
 	sameAddr := sameExit && net.IP(resp[5:9]).Equal(localIP)
 	if !sameAddr && v.dataIdleFor() < returnIdleAfter {
 		v.sessionMu.Unlock()
-		tunnelConn.Close()
+		_ = closeNow(tunnelConn)
 		log.Info("Return: the tunnel carried traffic during the handshake, staying on %s", oldCand)
 		return false
 	}

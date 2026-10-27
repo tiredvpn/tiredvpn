@@ -894,12 +894,12 @@ func (v *VPNClient) seamlessPortHop(newPort int) {
 	v.sessionMu.Lock()
 	defer v.sessionMu.Unlock()
 	if atomic.LoadInt32(&v.running) == 0 {
-		newConn.Close()
+		_ = closeNow(newConn)
 		return
 	}
 	tunnelConn, handshakeErr := v.performHandshake(newConn)
 	if handshakeErr != nil {
-		newConn.Close()
+		_ = closeNow(newConn)
 		log.Warn("VPN: port hop handshake failed: %v, falling back to force reconnect", handshakeErr)
 		v.ForceReconnect()
 		return
@@ -911,7 +911,7 @@ func (v *VPNClient) seamlessPortHop(newPort int) {
 	v.mu.Lock()
 	if atomic.LoadInt32(&v.running) == 0 {
 		v.mu.Unlock()
-		tunnelConn.Close()
+		_ = closeNow(tunnelConn)
 		return
 	}
 	oldConn := v.conn
@@ -945,9 +945,13 @@ func (v *VPNClient) seamlessPortHop(newPort int) {
 		log.Info("VPN: port hop abandoned the pending upgrade to %s; the next reprobe may offer it again", abandoned.Name())
 	}
 
-	// Close old connection after swap
+	// Close old connection after swap - gracefully, so what it still has
+	// queued goes out, and in the background: this runs under sessionMu with
+	// portHopInProgress set, and a drain here held up to its close bound
+	// both the reconnect of a new session lost meanwhile and the loss's
+	// detection (P3-4 of the round-19 review).
 	if oldConn != nil {
-		oldConn.Close()
+		go func() { _ = oldConn.Close() }()
 	}
 
 	elapsed := time.Since(start)
@@ -1624,6 +1628,10 @@ func closeNow(conn net.Conn) error {
 	}
 	return conn.Close()
 }
+
+// CloseNow is closeNow for callers outside the package: the Android core's
+// relay reconnect (client.reconnectTUN).
+func CloseNow(conn net.Conn) error { return closeNow(conn) }
 
 // replayConn returns bytes the handshake reader had to look at before the
 // packet loop reads from the underlying conn, and finishes a peek read the
@@ -2438,7 +2446,7 @@ func (v *VPNClient) handshakeUpgrade(oldConn, conn net.Conn, cur, next strategy.
 	if !v.sessionMu.TryLock() {
 		// A reconnect or a port hop is mid-handshake. Registering ours now
 		// would evict theirs on the exit.
-		conn.Close()
+		_ = closeNow(conn)
 		log.Info("Strategy upgrade: another session change is in progress, not upgrading to %s now", next.Name())
 		return
 	}
@@ -2448,7 +2456,7 @@ func (v *VPNClient) handshakeUpgrade(oldConn, conn net.Conn, cur, next strategy.
 	v.mu.Unlock()
 	if stale {
 		v.sessionMu.Unlock()
-		conn.Close()
+		_ = closeNow(conn)
 		log.Info("Strategy upgrade: the tunnel changed before the %s handshake, dropping it", next.Name())
 		return
 	}
@@ -2456,7 +2464,7 @@ func (v *VPNClient) handshakeUpgrade(oldConn, conn net.Conn, cur, next strategy.
 	resp, n, tunnelConn, err := v.doHandshake(conn, localIP)
 	if err != nil {
 		v.sessionMu.Unlock()
-		conn.Close()
+		_ = closeNow(conn)
 		v.manager.UpgradeOutcome(next, false)
 		if errors.Is(err, errHandshakeNotSent) || errors.Is(err, errHandshakeRefused) {
 			log.Info("Strategy upgrade: %s handshake failed (%v), staying on %s", next.Name(), err, cur.Name())
@@ -2495,7 +2503,7 @@ func (v *VPNClient) handshakeUpgrade(oldConn, conn net.Conn, cur, next strategy.
 		// A different address means the exit leased the new session apart
 		// from the old one (an exit older than the credential lease), so the
 		// old session still stands.
-		tunnelConn.Close()
+		_ = closeNow(tunnelConn)
 		v.manager.UpgradeOutcome(next, false)
 		// It will answer the same way every time; stop spending a dial and a
 		// handshake per reprobe cycle on it.
@@ -2511,7 +2519,7 @@ func (v *VPNClient) handshakeUpgrade(oldConn, conn net.Conn, cur, next strategy.
 		// old one is gone with it: whatever made us drop the new one, the
 		// tunnel is lost, and keeping the old conn would only wait out the
 		// read deadline on a dead session.
-		tunnelConn.Close()
+		_ = closeNow(tunnelConn)
 		v.manager.UpgradeOutcome(next, false)
 		v.connLost(oldConn, "strategy upgrade", errUpgradeRejected)
 	}
