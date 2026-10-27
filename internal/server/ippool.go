@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math/rand/v2"
 	"net"
 	"slices"
 	"strings"
@@ -744,10 +745,14 @@ func (p *IPPool) Allocate(clientID string, requestedIP net.IP, hostname string) 
 // AllocateAvoiding is Allocate with no request, whose free-address scan
 // passes avoid over: a client whose request was refused (sharedTagRequest)
 // must not be handed the address it asked for by the pool instead. The scan
-// runs from the top of the pool down.
+// starts at a random point of the pool (refusedScanFrom).
 func (p *IPPool) AllocateAvoiding(clientID string, avoid net.IP) (net.IP, error) {
 	return p.allocate(clientID, nil, "", avoid)
 }
+
+// refusedScanFrom draws where in a pool of n addresses the scan for a
+// refused request starts. A var so a test can fix it.
+var refusedScanFrom = func(n uint64) uint64 { return rand.Uint64N(n) }
 
 func (p *IPPool) allocate(clientID string, requestedIP net.IP, hostname string, avoid net.IP) (net.IP, error) {
 	p.mu.Lock()
@@ -852,16 +857,19 @@ func (p *IPPool) allocate(clientID string, requestedIP net.IP, hostname string, 
 		}
 	}
 
-	// Find a free IP. For a refused request (avoid) from the top of the pool
-	// down: the scan from the bottom handed it the address right after the
-	// default, which a box configured with -tun-ip on it then took over
-	// (finding 2 of the round-12 review). The low addresses are the ones
-	// people configure; this lowers the odds, it does not tell boxes apart.
-	for i := uint32(0); i <= p.endIP-p.startIP; i++ {
-		ipUint := p.startIP + i
-		if avoid != nil {
-			ipUint = p.endIP - i
-		}
+	// Find a free IP. For a refused request (avoid) from a random point of
+	// the pool on: from the bottom it got the address right after the
+	// default, from the top .254, and a box configured with -tun-ip on
+	// either then took it over (finding 2 of the round-12 review, finding 5
+	// of the round-13 one). This lowers the odds; it does not tell boxes
+	// apart.
+	n := uint64(p.endIP-p.startIP) + 1
+	var from uint64
+	if avoid != nil {
+		from = refusedScanFrom(n)
+	}
+	for i := range n {
+		ipUint := p.startIP + uint32((from+i)%n)
 		if p.reserved[ipUint] {
 			continue
 		}
