@@ -134,6 +134,7 @@ func TestPollingHeadBlockBoundedBeforeAuth(t *testing.T) {
 // goroutine and its buffer for as long as it likes. It now gets the 10s the
 // ALPN entry gives its first read. Takes pollingHeadTimeout to run.
 func TestPollingFirstHeadHasDeadline(t *testing.T) {
+	longTest(t)
 	srvEnd, cliEnd := net.Pipe()
 	defer cliEnd.Close()
 	done := make(chan struct{})

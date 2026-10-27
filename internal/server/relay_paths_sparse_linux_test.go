@@ -281,7 +281,7 @@ func realityV2(m *strategy.Manager, r *pathRelay) strategy.Strategy {
 }
 
 func TestEveryRelayPathKeepsASparseProxiedStream(t *testing.T) {
-	longLegTest(t)
+	longTest(t)
 	for _, tc := range []struct {
 		name  string
 		relay func(*testing.T, *Config)
@@ -401,6 +401,7 @@ func proxiedSparseDownload(t *testing.T, exit *legExit, target *sparseTarget, co
 // relay's session with the client counts: the exit behind it hears the
 // relay's own keepalive, and moving its deadline then changes nothing.
 func TestAnH2ProxySessionWithNothingDownStillEndsOnItsDeadline(t *testing.T) {
+	longTest(t)
 	for _, tc := range []struct {
 		name   string
 		target func(*testing.T) string

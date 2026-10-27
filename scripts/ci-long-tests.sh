@@ -3,8 +3,9 @@
 #
 # The unit-test step of CI and of the release workflow runs
 # go test -race -timeout 5m -short, and these tests skip under -short
-# (longLegTest, or a Short check of their own): run with it, they took
-# internal/server past 5 minutes. This script is their gate in both
+# (longTest, or a Short check of their own): run with it, they took
+# internal/server past 5 minutes, then left it too close to them. Every
+# server test above about 5 s under -race is here. This script is their gate in both
 # workflows. It runs them with -race and fails unless each one reports
 # PASS - a test that skipped, or vanished from the list, fails it too.
 set -euo pipefail
@@ -20,6 +21,16 @@ want=(
   TestAnOldClientOnASparseDownloadKeepsItsBridgeLeg
   TestAnOldClientOnASparseDownloadKeepsItsSinkLeg
   TestASparseDownloadThroughAProxyRelayKeepsItsLeg
+  TestConfusionUnauthenticatedGetsNoRelay
+  TestAnH2ProxySessionWithNothingDownStillEndsOnItsDeadline
+  TestPollingFirstHeadHasDeadline
+  TestAnIdlePollingSessionGetsNoUplinkKeepalive
+  TestTheRelayKeepaliveIsOffTheClientsGrid
+  TestARelayBridgeWritesUpAfterAQuietDownload
+  TestRawDispatchUnauthenticatedGetsNoTunnel
+  TestPollingIdleSessionStaysRegistered
+  TestHTTP1UnauthenticatedGetsNoTunnel
+  TestPlaintextH2RefusesUnboundToken
 )
 
 log="${RUNNER_TEMP:-$(mktemp -d)}/long-tests.log"

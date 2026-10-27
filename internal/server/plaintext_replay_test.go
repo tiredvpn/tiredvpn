@@ -191,6 +191,7 @@ func h2PlaintextAuth(t *testing.T, apiKey, requestID string) bool {
 }
 
 func TestPlaintextH2RefusesUnboundToken(t *testing.T) {
+	longTest(t)
 	if h2PlaintextAuth(t, strings.Repeat("00", 16), strings.Repeat("00", 16)) {
 		t.Fatal("wrong token authenticated")
 	}
