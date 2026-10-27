@@ -73,3 +73,30 @@ func TestARestoredParkOutlastsTheHandshakeFailuresOwnCooldown(t *testing.T) {
 		t.Fatal("5 min into a restored 10 min park it is over: the handshake failure's own cooldown cut it short")
 	}
 }
+
+// TestAParkSetDuringTheHandshakeOutlastsItsFailure is P3-3 of the round-16
+// review: a park set between the connect and the failed handshake - here
+// a sibling's verdict widened to the server, 50 min - was overwritten by
+// the cooldown recording the failure sets, 2 min.
+func TestAParkSetDuringTheHandshakeOutlastsItsFailure(t *testing.T) {
+	s, clk := newTestSelector(t, Config{
+		Endpoints:        []Endpoint{{Name: "a", V4: "203.0.113.1:443"}, {Name: "b", V4: "203.0.113.2:443", Order: 1}},
+		Family:           V4Only,
+		FailureThreshold: 2,
+		Cooldown:         time.Minute,
+		MaxCooldown:      time.Hour,
+	})
+	a := candFor(t, s, "203.0.113.1:443")
+	s.Report(a, true, 0)
+	s.mu.Lock()
+	h := &s.health[s.byAddr[a.Addr]]
+	h.consecutiveFailures, h.backoff = 1, time.Minute
+	h.cooldownUntil = clk.Now().Add(50 * time.Minute)
+	h.deadParkUntil = h.cooldownUntil
+	s.mu.Unlock()
+	s.ReportHandshakeFailed(a)
+	clk.Advance(5 * time.Minute)
+	if !s.ParkedForDeadSessions(a) {
+		t.Fatal("5 min into a 50 min park set during the handshake it is over: the failure's own cooldown cut it short")
+	}
+}
