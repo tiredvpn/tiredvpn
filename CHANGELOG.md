@@ -7,6 +7,27 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Server: host tuning advice at startup.** On Linux the server reads the
+  kernel and process settings that bound it (socket buffer ceilings on a
+  relay, forwarding and conntrack on an exit with `-ip-pool`, congestion
+  control, `somaxconn`, `RLIMIT_NOFILE`), compares each with what its own
+  configuration asks for, and logs one line per shortfall with the exact fix.
+  Measured and required shortfalls are logged at INFO, estimates at DEBUG.
+  Buffer advice is held back when the host's TCP memory limit would not fit in
+  half of the service's memory limit. The server changes nothing on the host. See "Host
+  tuning" in docs/server.md.
+
+### Fixed
+
+- **QUIC: the UDP socket is now sized.** quic-go sizes its socket through
+  `SetReadBuffer`/`SetWriteBuffer`, and neither QUIC wrapper (Salamander, SNI
+  reassembly) forwarded them, so the socket always stayed at the kernel
+  default. Both wrappers forward the two calls now; the kernel clamps the
+  7 MiB request to `net.core.rmem_max` / `wmem_max`. The old startup warning
+  about QUIC buffers is gone.
+
 ## [1.11.8] - 2026-10-20
 
 ### Security

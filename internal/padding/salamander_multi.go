@@ -1,6 +1,7 @@
 package padding
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -267,4 +268,23 @@ func (s *MultiSecretSalamanderPacketConn) SetReadDeadline(t time.Time) error {
 // SetWriteDeadline sets the write deadline
 func (s *MultiSecretSalamanderPacketConn) SetWriteDeadline(t time.Time) error {
 	return s.PacketConn.SetWriteDeadline(t)
+}
+
+// SetReadBuffer forwards to the wrapped socket, so quic-go can size the UDP
+// receive buffer through this wrapper. SyscallConn is deliberately not
+// forwarded: with it quic-go would also set DF and run path MTU discovery,
+// which changes what goes on the wire.
+func (s *MultiSecretSalamanderPacketConn) SetReadBuffer(bytes int) error {
+	if b, ok := s.PacketConn.(interface{ SetReadBuffer(int) error }); ok {
+		return b.SetReadBuffer(bytes)
+	}
+	return errors.ErrUnsupported
+}
+
+// SetWriteBuffer forwards to the wrapped socket, see SetReadBuffer.
+func (s *MultiSecretSalamanderPacketConn) SetWriteBuffer(bytes int) error {
+	if b, ok := s.PacketConn.(interface{ SetWriteBuffer(int) error }); ok {
+		return b.SetWriteBuffer(bytes)
+	}
+	return errors.ErrUnsupported
 }
