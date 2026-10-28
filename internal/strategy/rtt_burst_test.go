@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"bytes"
+	"errors"
 	"net"
 	"sync"
 	"testing"
@@ -23,6 +24,9 @@ func (c *recordingConn) Write(p []byte) (int, error) {
 }
 
 func (c *recordingConn) Close() error { return nil }
+
+// SetWriteDeadline is a no-op: the recording never blocks.
+func (c *recordingConn) SetWriteDeadline(time.Time) error { return nil }
 
 func (c *recordingConn) snapshot() [][]byte {
 	c.mu.Lock()
@@ -115,5 +119,30 @@ func TestWriteWithBurst_FlushesPartialBurst(t *testing.T) {
 	}
 	if !bytes.Equal(got[0], want) {
 		t.Fatalf("flushed %q, want %q", got[0], want)
+	}
+}
+
+// failingConn refuses every Write, like a socket the peer has reset.
+type failingConn struct{ net.Conn }
+
+func (failingConn) Write([]byte) (int, error)        { return 0, errFakeWrite }
+func (failingConn) Close() error                     { return nil }
+func (failingConn) SetWriteDeadline(time.Time) error { return nil }
+
+// TestRTTMaskingCloseReportsUnsentBurst: a packet held for the next burst
+// was accepted by Write, so a Close whose final flush cannot send it must
+// say so instead of returning the socket's nil.
+func TestRTTMaskingCloseReportsUnsentBurst(t *testing.T) {
+	c := NewRTTMaskingConn(failingConn{}, RTTMaskingConfig{
+		Enabled:       true,
+		BurstMode:     true,
+		BurstSize:     3,
+		BurstInterval: time.Hour, // only Close may flush
+	})
+	if n, err := c.Write([]byte{1, 2, 3}); err != nil || n != 3 {
+		t.Fatalf("Write = %d, %v; want the packet buffered for the burst", n, err)
+	}
+	if err := c.Close(); !errors.Is(err, errFakeWrite) {
+		t.Fatalf("Close = %v, want the failed flush reported", err)
 	}
 }

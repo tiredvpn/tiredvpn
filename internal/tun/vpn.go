@@ -1206,6 +1206,18 @@ func peekHandshakeByte(conn net.Conn) <-chan peekResult {
 // so only a transport stall inside that answer gets here.
 var errLateHandshakeFlags = errors.New("handshake flags byte arrived after the grace window")
 
+// closeNow closes conn for Stop. A conn that can abort (CloseNow, as on
+// MorphedConn and RTTMaskingConn) skips its queued tail and TLS
+// close_notify instead of spending up to its close timeout on them: the
+// TUN writer may set its +30 s write deadline between Stop's
+// SetDeadline(now) and the Close.
+func closeNow(conn net.Conn) error {
+	if c, ok := conn.(interface{ CloseNow() error }); ok {
+		return c.CloseNow()
+	}
+	return conn.Close()
+}
+
 // replayConn returns bytes the handshake reader had to look at before the
 // packet loop reads from the underlying conn, and finishes a peek read the
 // reader stopped waiting for. It deliberately exposes no Unwrap/NetConn
@@ -1216,6 +1228,11 @@ type replayConn struct {
 	pending  []byte
 	inflight <-chan peekResult // a peek read still running, nil once collected
 	err      error             // set once the stream can no longer be framed
+}
+
+// CloseNow passes an abort through to the inner conn (see closeNow).
+func (c *replayConn) CloseNow() error {
+	return closeNow(c.Conn)
 }
 
 func (c *replayConn) Read(p []byte) (int, error) {
@@ -2019,7 +2036,7 @@ func (v *VPNClient) Stop() {
 	v.mu.Lock()
 	if v.conn != nil {
 		v.conn.SetDeadline(time.Now()) // Force immediate timeout
-		v.conn.Close()
+		_ = closeNow(v.conn)
 	}
 	v.mu.Unlock()
 
