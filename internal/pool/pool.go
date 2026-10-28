@@ -94,6 +94,15 @@ func NewTunnelPool(mgr *strategy.Manager, serverAddr string, cfg Config) *Tunnel
 	}
 }
 
+// NewTunnelPoolFromConnector builds a pool over an arbitrary Connector. The
+// production constructor takes the concrete *strategy.Manager; this one lets a
+// caller's relay handler be exercised against a scripted tunnel (a net.Pipe
+// exit) without a live manager, so the pool-slot accounting a handler relies on
+// can be tested end to end.
+func NewTunnelPoolFromConnector(c Connector, cfg Config) *TunnelPool {
+	return &TunnelPool{config: cfg, manager: c}
+}
+
 // Get establishes a fresh tunnel connection, bounded by MaxConnections.
 //
 // The slot is reserved atomically: AddInt32 both checks and claims in one

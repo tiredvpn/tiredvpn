@@ -1298,6 +1298,31 @@ type targetDialer interface {
 	DialTarget(ctx context.Context, targetAddr string) (*pool.PooledConn, error)
 }
 
+// plainHTTPResponseIdle bounds how long handlePlainHTTPPooled waits for more
+// response bytes before it tears the relay down. A tunnel never closes itself,
+// so without an idle cap the response copy could block forever and leak the
+// pooled connection. A package var so tests can shorten it.
+var plainHTTPResponseIdle = 30 * time.Second
+
+// copyUntilIdle copies src->dst until src returns EOF/error or no bytes arrive
+// for idle. Unlike io.Copy it refreshes a read deadline on src, so it always
+// returns and the caller's deferred Close can run.
+func copyUntilIdle(dst, src net.Conn, idle time.Duration) {
+	buf := make([]byte, 32*1024)
+	for {
+		src.SetReadDeadline(time.Now().Add(idle))
+		n, err := src.Read(buf)
+		if n > 0 {
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
 // handleConnectionPooled auto-detects protocol using pooled connections
 func handleConnectionPooled(conn net.Conn, tunnelPool targetDialer, connID uint64) {
 	// Track connection in metrics
@@ -1401,6 +1426,9 @@ func handleHTTPProxyPooled(conn net.Conn, tunnelPool targetDialer, connID uint64
 		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return
 	}
+	// Own the pooled connection from here: Close releases its slot in the pool
+	// counter on every exit path (relay error, early return, panic unwind).
+	defer serverConn.Close()
 
 	// Record successful connection
 	strat := serverConn.Strategy()
@@ -1418,9 +1446,6 @@ func handleHTTPProxyPooled(conn net.Conn, tunnelPool targetDialer, connID uint64
 	if err != nil && err != io.EOF {
 		logger.Debug("Relay ended: %v", err)
 	}
-
-	// Connection is used for specific target, close it (don't reuse)
-	serverConn.Close()
 	logger.Debug("Connection closed (strategy=%s)", serverConn.Strategy().Name())
 }
 
@@ -1472,6 +1497,12 @@ func handlePlainHTTPPooled(conn net.Conn, tunnelPool targetDialer, request strin
 		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return
 	}
+	// Own the pooled connection: Close releases its pool slot on every exit
+	// path. The old trailing Close was unreachable whenever the copy below
+	// blocked forever on a keep-alive tunnel that never sent EOF - that stuck
+	// goroutine was the pool counter leak (totalConns pinned at the cap with no
+	// live sockets, Get -> ErrPoolExhausted, proxy clients dropped).
+	defer serverConn.Close()
 
 	// Rewrite request to relative path
 	path := parsedURL.Path
@@ -1510,12 +1541,14 @@ func handlePlainHTTPPooled(conn net.Conn, tunnelPool targetDialer, request strin
 	serverConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 	serverConn.Write([]byte(rewritten.String()))
 
-	// Relay response
-	serverConn.SetDeadline(time.Time{})
+	// Relay the response until the exit closes the stream or it goes idle. The
+	// tunnel is a single-use connection, but the exit's own upstream may be
+	// HTTP keep-alive and never yield EOF, so an unbounded io.Copy here used to
+	// block forever and the pooled conn was never Closed. Bound it by an idle
+	// read deadline so this goroutine always returns and the deferred Close
+	// runs.
 	conn.SetDeadline(time.Time{})
-	io.Copy(conn, serverConn.Conn)
-
-	serverConn.Close()
+	copyUntilIdle(conn, serverConn.Conn, plainHTTPResponseIdle)
 }
 
 // handleSOCKS5Pooled handles SOCKS5 with connection pooling
@@ -1610,6 +1643,9 @@ func handleSOCKS5Pooled(conn net.Conn, tunnelPool targetDialer, connID uint64) {
 		conn.Write([]byte{0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
+	// Own the pooled connection from here: Close releases its slot in the pool
+	// counter on every exit path (relay error, early return, panic unwind).
+	defer serverConn.Close()
 
 	// Record successful connection
 	strat := serverConn.Strategy()
@@ -1627,9 +1663,6 @@ func handleSOCKS5Pooled(conn net.Conn, tunnelPool targetDialer, connID uint64) {
 	if err != nil && err != io.EOF {
 		logger.Debug("Relay ended: %v", err)
 	}
-
-	// Connection used for specific target, close (don't reuse)
-	serverConn.Close()
 	logger.Debug("Connection closed (strategy=%s)", serverConn.Strategy().Name())
 }
 
