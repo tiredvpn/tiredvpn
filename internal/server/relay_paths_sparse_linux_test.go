@@ -339,8 +339,23 @@ func TestEveryRelayPathKeepsASparseProxiedStream(t *testing.T) {
 			}
 			ktlsBefore, _ := ktls.Stats()
 			conn := tc.dial(t, front, target.addr)
-			if on, _ := ktls.Stats(); tc.ktls && on == ktlsBefore {
-				t.Fatal("the relay's conn never went over to kTLS - the row proves nothing")
+			if tc.ktls {
+				// This row only proves anything if the relay's conn went over
+				// to kTLS. It does not when the host has no kTLS - the tls
+				// kernel module is not loaded and cannot be auto-loaded, so the
+				// relay falls back to userspace crypto (ktls.Supported reports
+				// the same signal the relay decides on). Skip there rather than
+				// fail: a CI runner without the module is an environment gap,
+				// not a regression. But when kTLS IS available and the conn
+				// still did not use it, that is a real bug - fail.
+				switch on, _ := ktls.Stats(); {
+				case on != ktlsBefore:
+					// went over to kTLS, as the row needs
+				case !ktls.Supported():
+					t.Skip("kTLS unavailable in this environment (tls kernel module not loaded; relay fell back to userspace crypto), so this row cannot exercise the kTLS path")
+				default:
+					t.Fatal("kTLS is available but the relay's conn never went over to it - the row proves nothing")
+				}
 			}
 			proxiedSparseDownload(t, exit, target, conn)
 		})
