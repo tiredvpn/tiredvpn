@@ -1688,7 +1688,7 @@ func (cs *ControlServer) performTUNHandshake(ctx context.Context) (assignedIP, s
 	// cancelled ctx closes the conn to end it. stop() reporting false means
 	// that already happened and the conn is gone.
 	conn := cs.serverConn
-	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	stop := context.AfterFunc(ctx, func() { _ = closeNow(conn) })
 	defer stop()
 
 	// Get MTU from config or use default

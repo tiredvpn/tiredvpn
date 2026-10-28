@@ -963,9 +963,14 @@ func (c *icmpTunnelConn) Read(b []byte) (int, error) {
 	default:
 	}
 
-	// Wait for new data
+	// Wait for new data. A Close under way ends reads at once: the drain
+	// that sends what is queued can take its whole bound, and a reader -
+	// the tunnel's, on the old session after a hop - waited it out (P3-5
+	// of the round-20 review). closing is nil without a send loop.
 	select {
 	case <-c.done:
+		return 0, io.EOF
+	case <-c.closing:
 		return 0, io.EOF
 	case <-expired:
 		return 0, os.ErrDeadlineExceeded

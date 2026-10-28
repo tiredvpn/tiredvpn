@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -271,5 +272,149 @@ func TestAnUpgradeClosesTheOldSessionGracefully(t *testing.T) {
 	}
 	if old.closed.Load() != 1 || old.aborted.Load() != 0 {
 		t.Fatalf("the old session: Close %d, CloseNow %d - want one graceful Close", old.closed.Load(), old.aborted.Load())
+	}
+}
+
+// hangingConn's Close blocks until CloseNow is called (or for hang), as
+// RTTMaskingConn's did behind a Write blocked on a full polling queue.
+type hangingConn struct {
+	abortRecConn
+	release chan struct{}
+	once    sync.Once
+	hang    time.Duration
+}
+
+func newHangingConn(t *testing.T, hang time.Duration) *hangingConn {
+	cli, srv := net.Pipe()
+	t.Cleanup(func() { cli.Close(); srv.Close() })
+	return &hangingConn{abortRecConn: abortRecConn{Conn: cli}, release: make(chan struct{}), hang: hang}
+}
+
+func (c *hangingConn) Close() error {
+	c.closed.Add(1)
+	select {
+	case <-c.release:
+	case <-time.After(c.hang):
+	}
+	return c.Conn.Close()
+}
+
+func (c *hangingConn) CloseNow() error {
+	c.aborted.Add(1)
+	c.once.Do(func() { close(c.release) })
+	return c.Conn.Close()
+}
+
+func setGracefulCloseLimit(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := gracefulCloseLimitNs.Swap(int64(d))
+	t.Cleanup(func() { gracefulCloseLimitNs.Store(old) })
+}
+
+// TestAGracefulCloseThatHangsIsAbortedAtItsLimit is #2 of the round-20
+// review: a graceful close had no bound of its own - a wrapper could wait
+// about 20 s before the transport's bounded drain even started. At its
+// limit it is aborted.
+func TestAGracefulCloseThatHangsIsAbortedAtItsLimit(t *testing.T) {
+	setGracefulCloseLimit(t, 300*time.Millisecond)
+	c := newHangingConn(t, 20*time.Second)
+	start := time.Now()
+	done := make(chan struct{})
+	go func() { closeGracefully(c); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the graceful close is still running 3 s in, against a 300 ms limit")
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("the graceful close took %v against a 300 ms limit", took)
+	}
+	if c.closed.Load() != 1 || c.aborted.Load() != 1 {
+		t.Fatalf("Close %d, CloseNow %d - want the graceful close, then the abort", c.closed.Load(), c.aborted.Load())
+	}
+}
+
+// TestAGracefulCloseThatFinishesIsNotAborted: a drain that ends inside the
+// limit is left alone, and the limit is above the 5 s the transports give
+// their own drain, so a live drain is never cut by it.
+func TestAGracefulCloseThatFinishesIsNotAborted(t *testing.T) {
+	if limit := time.Duration(gracefulCloseLimitNs.Load()); limit <= 5*time.Second {
+		t.Fatalf("the graceful close limit %v does not leave the transports their 5 s drain", limit)
+	}
+	setGracefulCloseLimit(t, time.Second)
+	c := newHangingConn(t, 400*time.Millisecond)
+	closeGracefully(c)
+	if c.closed.Load() != 1 || c.aborted.Load() != 0 {
+		t.Fatalf("Close %d, CloseNow %d - want one graceful Close and no abort", c.closed.Load(), c.aborted.Load())
+	}
+}
+
+// TestAPortHopAbortsAnOldSessionWhoseCloseHangs: the old session of a hop,
+// closed in the background, is aborted at the limit rather than left
+// running.
+func TestAPortHopAbortsAnOldSessionWhoseCloseHangs(t *testing.T) {
+	setGracefulCloseLimit(t, 300*time.Millisecond)
+	v := newCallsiteClient(newPipeManager(t))
+	old := newHangingConn(t, 20*time.Second)
+	v.conn = old
+	v.seamlessPortHop(8443)
+	deadline := time.Now().Add(2 * time.Second)
+	for old.aborted.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if old.closed.Load() != 1 || old.aborted.Load() != 1 {
+		t.Fatalf("the old session: Close %d, CloseNow %d - want the graceful close, then the abort", old.closed.Load(), old.aborted.Load())
+	}
+}
+
+// TestADroppedSessionIsAbortedWhenTheTunnelMovedOn is #1 of the round-20
+// review: publishSession dropped a session whose tunnel had moved on - a
+// return finding a reconnect in progress - with the draining Close, under
+// sessionMu that the reconnect waited on.
+func TestADroppedSessionIsAbortedWhenTheTunnelMovedOn(t *testing.T) {
+	v := newCallsiteClient(newPipeManager(t))
+	cur, curPeer := net.Pipe()
+	t.Cleanup(func() { cur.Close(); curPeer.Close() })
+	v.conn = cur
+	other, otherPeer := net.Pipe()
+	t.Cleanup(func() { other.Close(); otherPeer.Close() })
+	cli, srv := net.Pipe()
+	t.Cleanup(func() { cli.Close(); srv.Close() })
+	conn := &abortRecConn{Conn: cli, slowClose: 3 * time.Second}
+	start := time.Now()
+	err := v.publishSession(conn, &pipeStrategy{t: t}, endpoint.Candidate{}, false, bareV3Response(), 9, other)
+	if err == nil {
+		t.Fatal("published over a tunnel that had moved on - the test proves nothing")
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("dropping the session took %v", took)
+	}
+	if conn.aborted.Load() != 1 || conn.closed.Load() != 0 {
+		t.Fatalf("CloseNow %d, Close %d - want one abort", conn.aborted.Load(), conn.closed.Load())
+	}
+}
+
+// TestAnUpgradeDoesNotWaitForTheOldSessionsDrain is #3 of the round-20
+// review on the upgrade path: the old session's graceful close held the
+// upgrade - and the outcome it books after - for its whole drain. It runs
+// aside now, still graceful.
+func TestAnUpgradeDoesNotWaitForTheOldSessionsDrain(t *testing.T) {
+	v := newCallsiteClient(newPipeManager(t))
+	oldPipe, oldPeer := net.Pipe()
+	t.Cleanup(func() { oldPipe.Close(); oldPeer.Close() })
+	old := &abortRecConn{Conn: oldPipe, slowClose: 2 * time.Second}
+	v.conn = old
+	next := &pipeStrategy{t: t, resp: bareV3Response()}
+	conn, err := next.Connect(t.Context(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	v.handshakeUpgrade(old, conn, &pipeStrategy{t: t}, next, callsiteClientIP, endpoint.Candidate{})
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("the upgrade took %v: it waited for the old session's drain", took)
+	}
+	if v.conn == old {
+		t.Fatal("the upgrade did not swap the connection - the test proves nothing")
 	}
 }

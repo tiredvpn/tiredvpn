@@ -235,3 +235,37 @@ func TestAnICMPCloseDoesNotWaitOutABlockedSend(t *testing.T) {
 		t.Fatalf("close took %v with a send blocked against a 300 ms bound", took)
 	}
 }
+
+// TestAnICMPCloseEndsReadsAtOnce is P3-5 of the round-20 review: Read
+// ended only when done closed, after the drain, so the tunnel's reader on
+// the old session of a hop waited up to the whole bound. A Close under way
+// ends reads at once, and the drain goes on.
+func TestAnICMPCloseEndsReadsAtOnce(t *testing.T) {
+	c, _ := icmpCloseConnOver(t, false, false)
+	for i := range 15 {
+		if _, err := c.Write(bytes.Repeat([]byte{byte(i)}, MaxPayloadSize)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read := make(chan error, 1)
+	go func() {
+		_, err := c.Read(make([]byte, 64))
+		read <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	closed := make(chan struct{})
+	go func() { _ = c.Close(); close(closed) }()
+	select {
+	case err := <-read:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("Read during Close: %v, want io.EOF", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Read still blocked 500 ms into a Close that drains 1.5 s of queue")
+	}
+	select {
+	case <-closed:
+		t.Fatal("Close finished at once - the queue was not drained, the test proves nothing")
+	default:
+	}
+}

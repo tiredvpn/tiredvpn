@@ -951,7 +951,7 @@ func (v *VPNClient) seamlessPortHop(newPort int) {
 	// both the reconnect of a new session lost meanwhile and the loss's
 	// detection (P3-4 of the round-19 review).
 	if oldConn != nil {
-		go func() { _ = oldConn.Close() }()
+		go closeGracefully(oldConn)
 	}
 
 	elapsed := time.Since(start)
@@ -1102,15 +1102,17 @@ func (v *VPNClient) publishSession(conn net.Conn, strat strategy.Strategy, cand 
 	// Publish the new connection under the lock. If Stop() ran while we were
 	// dialing, abandon the freshly built conn instead of resurrecting the tunnel.
 	v.mu.Lock()
+	// A session dropped here is aborted, not drained: the caller holds
+	// sessionMu, and a reconnect waits on it (#1 of the round-20 review).
 	if atomic.LoadInt32(&v.running) == 0 {
 		v.mu.Unlock()
-		conn.Close()
+		_ = closeNow(conn)
 		return context.Canceled
 	}
 	if replaces != nil && (v.conn != replaces || atomic.LoadInt32(&v.reconnecting) == 1 ||
 		atomic.LoadInt32(&v.portHopInProgress) == 1) {
 		v.mu.Unlock()
-		conn.Close()
+		_ = closeNow(conn)
 		return errSessionChanged
 	}
 	v.conn = conn
@@ -1627,6 +1629,40 @@ func closeNow(conn net.Conn) error {
 		return c.CloseNow()
 	}
 	return conn.Close()
+}
+
+// gracefulCloseLimitNs bounds closeGracefully: 5.5 s, past the 5 s a
+// transport's own Close spends sending its queue (HTTP polling, the ICMP
+// tunnel), so a drain still going on its own is not cut. Atomic so tests
+// can scale it.
+var gracefulCloseLimitNs = func() *atomic.Int64 {
+	var v atomic.Int64
+	v.Store(int64(5500 * time.Millisecond))
+	return &v
+}()
+
+// closeGracefully closes the old session of a hop, an upgrade or a return:
+// the graceful Close, so what it has queued still goes out, but within
+// gracefulCloseLimitNs. A Close still running then is aborted (closeNow).
+// The transports bound their own drain, but a wrapper could wait before it
+// even started: RTTMaskingConn's flush waits on a Write blocked on a full
+// polling queue until the poll layer is declared dead, about 20 s. This
+// bounds every graceful close the client makes on a path it cares about,
+// whatever the conn underneath (#2 of the round-20 review).
+func closeGracefully(conn net.Conn) {
+	done := make(chan struct{})
+	go func() {
+		_ = conn.Close()
+		close(done)
+	}()
+	t := time.NewTimer(time.Duration(gracefulCloseLimitNs.Load()))
+	defer t.Stop()
+	select {
+	case <-done:
+	case <-t.C:
+		log.Debug("Graceful close of the old session still running after %v, aborting it", time.Duration(gracefulCloseLimitNs.Load()))
+		_ = closeNow(conn)
+	}
 }
 
 // CloseNow is closeNow for callers outside the package: the Android core's
@@ -2490,7 +2526,10 @@ func (v *VPNClient) handshakeUpgrade(oldConn, conn net.Conn, cur, next strategy.
 
 	switch verdict {
 	case upgradeSwapped:
-		oldConn.Close()
+		// Gracefully and aside: this runs holding v.upgrading, and the
+		// outcome booked below waited for the drain (P3-3 of the round-20
+		// review).
+		go closeGracefully(oldConn)
 		// The fallback session the swap ends did not die, it was replaced.
 		// If it was useful the endpoint has to hear it: that clears its
 		// dead-session streak like any useful end. A young one - an upgrade
