@@ -223,12 +223,18 @@ func TestPortHopperJitter(t *testing.T) {
 
 	intervals := make([]time.Duration, 100)
 
+	// The drawn interval itself, not TimeUntilNextHop: that is the interval
+	// less the time since the hopper was built, and under -race with the
+	// machine loaded the gap between the two calls ate tens of ms (minimum
+	// 11 ms against the 70 ms floor in CI-like runs).
 	for i := range 100 {
 		hopper, err := NewPortHopper(config)
 		if err != nil {
 			t.Fatalf("failed to create hopper: %v", err)
 		}
-		intervals[i] = hopper.TimeUntilNextHop()
+		hopper.mu.RLock()
+		intervals[i] = hopper.jitteredInterval
+		hopper.mu.RUnlock()
 	}
 
 	// Check jitter range (70% to 130% of base interval)
@@ -245,18 +251,45 @@ func TestPortHopperJitter(t *testing.T) {
 		}
 	}
 
-	// Allow some tolerance
-	tolerance := 10 * time.Millisecond
-	if min < minExpected-tolerance {
+	// Exact bounds: the value no longer depends on the clock.
+	if min < minExpected {
 		t.Errorf("minimum interval %v below expected %v", min, minExpected)
 	}
-	if max > maxExpected+tolerance {
+	if max > maxExpected {
 		t.Errorf("maximum interval %v above expected %v", max, maxExpected)
 	}
 
 	// Check that there's actual variation (not all same)
 	if max-min < 20*time.Millisecond {
 		t.Errorf("jitter variation too small: min=%v, max=%v", min, max)
+	}
+}
+
+// TestTimeUntilNextHop checks that the time left counts down from the drawn
+// interval, not the base one, with intervals far apart from both the base
+// and any stall a loaded machine can add between the two clock reads.
+func TestTimeUntilNextHop(t *testing.T) {
+	config := DefaultConfig()
+	config.HopInterval = 100 * time.Millisecond
+
+	hopper, err := NewPortHopper(config)
+	if err != nil {
+		t.Fatalf("failed to create hopper: %v", err)
+	}
+	hopper.mu.Lock()
+	hopper.jitteredInterval = time.Hour
+	hopper.lastHop = time.Now().Add(-10 * time.Minute)
+	hopper.mu.Unlock()
+
+	if left := hopper.TimeUntilNextHop(); left > 50*time.Minute || left < 49*time.Minute {
+		t.Errorf("TimeUntilNextHop = %v 10 min into a 1h interval, want just under 50 min", left)
+	}
+
+	hopper.mu.Lock()
+	hopper.lastHop = time.Now().Add(-2 * time.Hour)
+	hopper.mu.Unlock()
+	if left := hopper.TimeUntilNextHop(); left != 0 {
+		t.Errorf("TimeUntilNextHop = %v past the interval, want 0", left)
 	}
 }
 

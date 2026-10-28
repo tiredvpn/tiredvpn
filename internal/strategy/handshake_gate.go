@@ -109,6 +109,15 @@ func (g *handshakeGate) spacing() time.Duration {
 	return g.minSpacing + time.Duration(g.rnd.Int63n(int64(g.jitter)))
 }
 
+// gateNow and gateTimer are acquire's clock and wait timer. Vars so a test
+// can hold the clock still and record the waits acquire asks for. Nothing
+// guards them: a test that replaces them must not run in parallel with
+// anything that goes through a handshake gate.
+var (
+	gateNow   = time.Now
+	gateTimer = time.NewTimer
+)
+
 // acquire blocks until a handshake to sni may start, and returns the function
 // that releases the slot. The returned release is nil when the error is
 // non-nil; callers must call it exactly once (defer) once they have it.
@@ -127,12 +136,12 @@ func (g *handshakeGate) acquire(ctx context.Context, sni string) (func(), error)
 
 	release := func() { <-lane.slots }
 
-	wait := lane.reserve(time.Now(), g.spacing())
+	wait := lane.reserve(gateNow(), g.spacing())
 	if wait <= 0 {
 		return release, nil
 	}
 
-	timer := time.NewTimer(wait)
+	timer := gateTimer(wait)
 	defer timer.Stop()
 	select {
 	case <-timer.C:
