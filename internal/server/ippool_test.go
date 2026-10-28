@@ -393,3 +393,53 @@ func TestDualStackDoesNotChangeV4Allocation(t *testing.T) {
 		t.Fatalf("sticky lease flapped: %s -> %s (err=%v)", ip, again, err)
 	}
 }
+
+// TestTakeOverOnlyFromTheSameSharedPrefix: a lease moves to the asking key
+// only from a key under the shared prefix - never from a client with its
+// own credential, never onto a key that already holds a lease.
+func TestTakeOverOnlyFromTheSameSharedPrefix(t *testing.T) {
+	p := newTestPool(t)
+	own := net.IPv4(10, 8, 0, 50)
+	if _, err := p.Allocate("denis-phone", own, ""); err != nil {
+		t.Fatal(err)
+	}
+	prefix := globalClientID + "@203.0.113.7#s"
+	if p.TakeOver(own, prefix, prefix+"new") {
+		t.Fatal("a shared client took the lease of a client with its own credential")
+	}
+	shared := net.IPv4(10, 8, 0, 60)
+	if _, err := p.Allocate(prefix+"old", shared, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Allocate(prefix+"other", nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	if p.TakeOver(shared, prefix, prefix+"other") {
+		t.Fatal("a key that holds a lease took a second one")
+	}
+	if !p.TakeOver(shared, prefix, prefix+"new") {
+		t.Fatal("the shared lease was not taken over")
+	}
+	if got, err := p.Allocate(prefix+"new", shared, ""); err != nil || !got.Equal(shared) {
+		t.Fatalf("the new key got %v (%v), want %s", got, err, shared)
+	}
+	if got, err := p.Allocate(prefix+"old", shared, ""); err != nil || got.Equal(shared) {
+		t.Fatalf("the old key still gets %v (%v)", got, err)
+	}
+}
+
+// TestAGrantedRequestIsACopy: the address Allocate grants for a request is
+// the pool's own, not the caller's slice - a handshake buffer the next
+// frame overwrites.
+func TestAGrantedRequestIsACopy(t *testing.T) {
+	p := newTestPool(t)
+	req := net.IPv4(10, 8, 0, 70).To4()
+	got, err := p.Allocate("client", req, "")
+	if err != nil || !got.Equal(req) {
+		t.Fatalf("Allocate gave %v (%v), want %s", got, err, req)
+	}
+	copy(req, []byte{143, 18, 120, 236})
+	if !got.Equal(net.IPv4(10, 8, 0, 70)) {
+		t.Fatalf("the granted address changed with the request's buffer: %s", got)
+	}
+}

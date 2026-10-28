@@ -5,7 +5,312 @@ All notable changes to TiredVPN are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.11.9] - 2026-10-28
+
+### Added
+
+- **Server: host tuning advice at startup.** On Linux the server reads the
+  kernel and process settings that bound it (socket buffer ceilings on a
+  relay, forwarding and conntrack on an exit with `-ip-pool`, congestion
+  control, `somaxconn`, `RLIMIT_NOFILE`), compares each with what its own
+  configuration asks for, and logs one line per shortfall with the exact fix.
+  Measured and required shortfalls are logged at INFO, estimates at DEBUG.
+  Buffer advice is held back when the host's TCP memory limit would not fit in
+  half of the service's memory limit. The server changes nothing on the host. See "Host
+  tuning" in docs/server.md.
+
+- **Client: a tunnel that is up but carries nothing is given up.** The client
+  follows the TCP flows it carries. When an application's data in a flow that
+  was being answered waits 30 s for anything back, two keepalives confirm it;
+  if neither is echoed, the session ends, the server is parked and the client
+  moves on. An echo means the tunnel works and the flow's own peer is slow or
+  gone, and nothing happens. Aimed at per-flow byte caps and one-way
+  blackholes that freeze traffic without breaking the connection - HTTP
+  Polling never noticed them. At most three such verdicts in ten minutes.
+  Works on the desktop TUN client and on Android.
+- **Client: an idle tunnel goes back to the preferred server.** A TUN
+  session that fell back to another server during a fault used to stay
+  there for as long as it held. Once it has been on the fallback for 5
+  minutes, the preferred server is out of its park and nothing has crossed
+  the tunnel for 90 s, the client sets up a session there and only then
+  drops the old one. The exit changes, and with it the public address and
+  usually the tunnel address, so connections inside the tunnel end; 90 s
+  of silence keeps a tunnel in use but quiet from being moved. A failed
+  try leaves the tunnel where it is, and the next one waits 4-8 minutes -
+  except to the other address family of the same server, where a request
+  that went unanswered may have displaced the old session: the tunnel then
+  reconnects once, that family is parked if nothing at all came back, and
+  the next try waits 4-8 minutes too. A relay and the exit behind it count
+  as two servers, so a return between them can cut the tunnel once.
+  Desktop TUN client only; on Android and macOS the tunnel still goes back
+  on its next reconnect.
+
+- **Client: an SNI pool per server.** `[[servers]] sni = ["name", ...]` or
+  `-reality-sni name,name` gives an endpoint its own cover names; REALITY,
+  Seqovl, HTTP/2 Stego, QUIC, HTTP Polling, WebSocket, Geneva, anti-probe,
+  Traffic Morph and State Exhaustion draw from it, one uniformly chosen name
+  per connection. Names must be DNS
+  host names. Set the same names on the exit with its own `-reality-sni`, so
+  that a probe replaying one is mirrored to that site.
+  **Clients 1.11.8 and older do not start with a config that has
+  `sni = [...]`** ("cannot decode TOML array into ... SNI of type string").
+  Hand such configs out only after the clients are updated.
+- **Server: `-reality-sni`** adds operator-chosen donor names to the built-in
+  list, on the B1 and the legacy unauthenticated paths.
+- **Server: `reality_fallback_tag_total`** counts the TLS fallback connections
+  the B1 gate let through on a fallback-transport tag.
+
+### Fixed
+
+- **QUIC: the UDP socket is now sized.** quic-go sizes its socket through
+  `SetReadBuffer`/`SetWriteBuffer`, and neither QUIC wrapper (Salamander, SNI
+  reassembly) forwarded them, so the socket always stayed at the kernel
+  default. Both wrappers forward the two calls now; the kernel clamps the
+  7 MiB request to `net.core.rmem_max` / `wmem_max`. The old startup warning
+  about QUIC buffers is gone.
+
+- **Traffic Morph: Close no longer drops the shaped tail.** A MorphedConn's
+  Close returned before the shaper had written what it still held, so the
+  last packets of a session were lost silently, it could block on a peer
+  that had gone away, and it still accepted a Write after Close and dropped
+  it. Close now drains the shaped queue within its deadline, refuses a Write
+  once it has started, and reports the bytes it could not send.
+
+- **HTTP Polling and the ICMP tunnel drain and report on Close.** Their Close
+  sends what is still queued within a bound, instead of cutting it off or
+  blocking on a peer that is gone, and reports the bytes it could not get
+  out.
+
+- **Teardown aborts instead of draining.** A user's disconnect, a dead
+  session's failover, a forced reconnect and the Android core's disconnect
+  no longer wait up to 5 s for a transport to drain its queue into a peer
+  that is gone or no longer wanted: they abort it at once, through RTT
+  masking and the handshake-replay wrapper as well. A graceful close - the
+  old session after a port hop or an upgrade - still sends what it has,
+  within a bound.
+
+- **TLS fallback transports can reach their handlers on a `-reality-b1`
+  server, with the new `-reality-fallback-tag` (off by default).** HTTP
+  Polling, WebSocket padded, Geneva, anti-probe, HTTP/2 Stego, Traffic Morph,
+  State Exhaustion and a relay's upstream leg put a tag derived from their
+  secret in the ClientHello `session_id`. With the flag on, the B1 gate hands
+  a fresh tag to the ordinary TLS path instead of proxying it to the donor
+  its SNI names, or to `-reality-cover-domain`; replayed, stale and foreign
+  tags still go to the donor. With the flag off, tagged hellos are mirrored
+  as in 1.11.8. The flag is off by default because the tag binds neither the
+  hello nor the exit: a copied tag opens every exit that shares the secret
+  once. Turn it on only with per-client registry secrets. Binding the tag to
+  the hello is planned for 1.11.10.
+  **Update `-reality-b1` exits and turn the flag on before handing out SNI
+  pools** of donor names: otherwise every TLS fallback of those clients is
+  proxied to the donor there. Exits without `-reality-b1` are not affected.
+  With the flag on, the tag carries the client's clock, as B1 does: a client
+  more than `-reality-max-time-diff` off has its fallbacks sent to the donor.
+- **Server and client: a weak secret is warned about** (under 16 bytes,
+  fewer than 8 distinct characters, a repeating string, a common word, or
+  under about 90 bits): the client's own at startup, the server's global
+  `-secret` at startup, and with `-reality-fallback-tag` each weak registry
+  secret once. One captured fallback-transport tag lets anyone test guesses
+  at the secret offline; a secret that passes is not therefore safe.
+- **Client: TLS session tickets are kept per server**, so a ticket from one
+  exit is never offered to another that shares a cover name.
+- **Client: a REALITY tunnel that carries nothing in its first 10 s no
+  longer drops.** The client looks at the byte after the server's answer
+  and hands that read on to the tunnel; on REALITY it kept the answer's
+  10 s deadline, and a tunnel with nothing coming down by then reconnected
+  with "server read: timeout".
+- **Client: with two failing servers in the pool, the third is reached.**
+  Moving off a parked server went to the most preferred one available,
+  which was the other failing server once its park had run out; two
+  servers swallowing handshakes kept the client between them for minutes.
+  A server that failed in the last 10 minutes now goes after one that did
+  not.
+- **Client: when handshakes are being swallowed, each transport gets its
+  share of the reconnect cycle.** A transport whose TCP connect was up kept
+  the rest of the cycle, so a censor dropping large ClientHellos cost a
+  cycle and its backoff per transport per address, and Geneva, which gets
+  through, never came up. After a swallowed handshake on the server, or a
+  silence verdict on another one, an attempt gets an even share of what is
+  left (about a sixteenth of the cycle at least, drawn around that size,
+  equal-priority transports in shuffled order) while other transports wait.
+  An attempt whose server has answered, or acknowledged its whole first
+  flight, runs on past its share, so a slow but live handshake still
+  completes; one whose first flight is not acknowledged in full and not
+  answered, as when a censor drops the ClientHello behind an acknowledged
+  decoy, is cut.
+  Limits: on Linux a path with a round trip above about 350-580 ms, or a
+  lossy one with a segment awaiting retransmission when the share runs out,
+  is cut before its ACK is back; an attempt runs the whole cycle when its
+  server answered the ClientHello and the records after it are dropped, or
+  when a server or middlebox speaks first while the ClientHello behind an
+  acknowledged decoy is dropped; a first flight that is acknowledged and
+  then never answered runs the whole cycle; on macOS and Windows, which
+  have no TCP_INFO here, no attempt is cut at its share (Android follows
+  the Linux rule).
+- **Client: a server address that connects and then resets or never
+  answers every session handshake is left.** The transport connect was
+  booked a success that cleared the failure before it, and a reset after
+  the request was booked as nothing, so the address never collected two
+  failures and the tunnel went round on it; a REALITY handshake that
+  never answered was not recognised as silence at all, since smux names
+  its deadline differently.
+- **Server: an IP pool smaller than a /30 is refused at startup.** On a /31
+  or /32 the pool handed out addresses outside its network.
+- **Server: a lease under a live session is renewed instead of running
+  out.** A dynamic lease that ran out while its session was up could go to
+  the next client asking, of another credential too. (A shared-secret
+  client's reconnect through a relay still takes over the address it asks
+  for, by design; see below.)
+- **Server: an HTTP/2 Stego TUN session ends once its address is taken over
+  on the exit, or once the exit ends a relay's upstream leg.** It went on
+  echoing keepalives with no downlink, and its client never reconnected. It
+  now ends at the client's first frame 5 s or more after that, or 15 s
+  after it if none comes. A client moving its tunnel to the new session is
+  unlikely to lose it to the old one's end.
+- **Server: a session that got the tunnel address it asked for lets go of
+  it when it ends.** The exit kept the request's bytes, a slice of a buffer
+  the next frame overwrote, and at the end unregistered some other address
+  while the real one stayed served by a dead session until another took it
+  over.
+- **Server: an HTTP/2 Stego proxied stream with a sparse download no
+  longer ends after 60 s.** A client sending nothing up - any SOCKS/HTTP
+  proxy client - lost its session to the server's read deadline, on an exit
+  directly or on a relay. The server now keeps the session while the
+  client's TCP acknowledges new data coming down. The ACKs of TCP keepalive
+  probes do not count, so a session with nothing coming down, or whose
+  client has hung up, still ends on the deadline.
+- **Client: failover to another server in the pool works when a server goes
+  silent, swallows handshakes, or kills every session young.** Dead sessions
+  and storms park the server with a growing cooldown; a server that accepts
+  TCP and answers no handshake gets the same verdict after two or three
+  cycles; the first reconnect after a silent session walks the pool.
+- **Client: a failing dual-stack server is left whole.** A verdict on one of
+  its addresses (silence, swallowed handshakes, a dead or stalled session)
+  gets the other address one try; a verdict there too parks the server, for
+  longer each time, and the client goes to the next one. It used to go back
+  and forth between the two addresses of one server.
+- **Client: a transport that dies the same way on two servers in a row is
+  set aside.** The route is blamed, not the servers: the transport is set
+  aside for 5 minutes on those two servers, and the client tries another one
+  on the second server instead of walking the whole pool on a transport that
+  works nowhere. A third server is not assumed to share their fate: it pays
+  one death of its own before the rule applies there.
+- **Client: the tunnel moves back to a better strategy after a fault.** After
+  a periodic reprobe finds it working again, the client switches over without
+  dropping the tunnel, and keeps the old strategy if the new one fails.
+- **Client: back within about 30 s after a fault ends**, instead of after a
+  backoff grown to 2 minutes, when the server answered TCP but nothing else.
+- **Client: fewer probes and polls on a fixed period.** Reprobes, pool polls,
+  upgrade offers and emergency reprobes are spaced by drawn pauses, and no
+  reprobe runs while the client is reconnecting.
+- **Android: what the client learned about the servers survives the app's
+  core restart after a dead connection** - parks, the route verdict, the
+  swallowed transports, the storm history - so it does not come straight
+  back to the server it just left; Android sessions now feed the storm
+  detector. A stop by the user, a restart more than 2 minutes later, and -
+  with an app that names its network on `connect` (`network_id`) - a
+  restart on another network start from nothing. `network_id` may be a
+  string or a number; the carry is stamped with the network its state was
+  learned on.
+- **Server: an idle HTTP Polling session is no longer dropped after ~6
+  minutes** while its client keeps polling, directly or through a relay.
+- **Client and relay: an HTTP/2 Stego connection carrying a one-way download
+  no longer breaks.** Every 256 KB down the connection returns flow-control
+  credit from its read path; that write ran into the deadline the last
+  ordinary write had left, failed, and a failed write breaks a TLS
+  connection for good. Through a relay, a leg with a steady download and
+  nothing going up died within two minutes.
+- **Client: a one-way download with nothing going up no longer drops after
+  about a minute.** The client sent a keepalive only when the server had been
+  silent; a server streaming down never is, and the exit closed the session
+  on its read deadline (about 68 s for HTTP/2 Stego, 120 s for Morph and
+  Confusion). The desktop client now also sends one when nothing has gone up
+  for a while.
+- **Relay: the `-upstream` TUN bridge and proxy relays close cleanly and say
+  why.** A write that failed on the upstream TLS connection used to be
+  followed by close_notify, which the exit read as "bad record MAC". The
+  bridge, the raw-tunnel, QUIC and mux relays now log what ended them first
+  (the client, the upstream or the target closing, an error, an idle
+  timeout).
+- **A transport whose session handshake goes unanswered sits out for about
+  three minutes.** The transport is set aside on every address of the
+  server, another transport connecting there no longer clears it, and no
+  upgrade goes back to it meanwhile. That is deliberate: a server that
+  swallows handshakes on its best transport used to keep the client
+  dialling it. A handshake of that transport answered on any address of the
+  server lifts it at once.
+- **Relay: a sparse download no longer loses its leg every minute.** A
+  client sending nothing up - a push every few seconds, no keepalive of its
+  own before 1.11.9 - left the relay's TUN bridge and its proxy relays
+  silent toward the exit, which closed the leg after 60 s. The relay now
+  keeps the leg fed while its client is alive, which also counts a client
+  whose TCP acknowledges new data coming down (not keepalive probes), a
+  QUIC client whose connection is
+  open and an HTTP Polling client that keeps polling: on QUIC and Polling a
+  proxied stream through a relay still died after two minutes. Exits of any
+  version accept it.
+- **Anti-probe sessions no longer end 2 s after connecting.** The knock
+  check left its own read deadline on the connection. An exit's TUN loop
+  sets its own, so the tunnel survived there, but a proxied stream - to an
+  exit directly as well as through a relay - lost its uplink two seconds
+  after the knock.
+- **Server: a proxied site that hangs up is passed on at once.** The client,
+  directly or through a relay, used to wait up to a minute for the rest of
+  an answer that had ended.
+- **Two clients behind one address no longer take one tunnel address from
+  each other through a relay.** A relay told the exit only its client's IP,
+  and two clients behind one NAT - a home router and a phone - share it, so
+  the exit leased them one address and they evicted each other about every
+  half minute. The relay now also says which of its clients it is
+  forwarding. A client with its own credential keeps its address; clients
+  sharing the server's global secret hold a lease per session, since
+  nothing they send tells them apart. Such a client gets an address from
+  the pool on its first session, from a random point of the pool - not the
+  one it asked for, so two boxes configured alike get two - and a reconnect
+  that asks for the address it holds takes it over, even while the old
+  session is still up. A box that came through a 1.11.8 relay gets a new
+  address once, and the old lease is not released: it runs out with its
+  TTL, or, if it was a requested lease in Redis, stays until deleted by
+  hand. Old relays and old exits are unaffected, and keep the old
+  behaviour between themselves. Known limits until 1.11.10, which needs
+  proof of ownership in the handshake: such a client gets a new address
+  after a fresh start or once its lease is gone, a box failing over between
+  an exit and a relay in front of it changes address, and two boxes that
+  ask for the same address - one holding it, or configured with an address
+  the pool gave the other - are not told apart.
+- **Server: a client keeps its tunnel address across transports, and
+  across networks when it connects straight to the exit.** Leases are keyed
+  on the credential, and leases an older server wrote under other keys are
+  folded into it. Through a relay the lease key still carries the client's
+  address, so a change of network gives it a new tunnel address; to be
+  fixed in 1.11.10.
+
+### Changed
+
+- On the wire: when a fault hits every server the same way, the client
+  touches both addresses of one server and one other server, then changes
+  transport instead of dialling the rest of the pool.
+- On the wire: up to two keepalives when a flow stalls, also while a
+  download trickles; HTTP Polling leaves a frozen server 32-42 s in; a relay
+  whose client is active sends a keepalive to its exit, on a timer of its
+  own, once either direction of the leg has been silent for a period drawn
+  anew each time between 20 and 45 s; a leg busy both ways gets none; the
+  desktop client does the same for its own uplink, on top of its keepalive
+  when the server is silent, except on HTTP Polling, whose polls already
+  reach the exit. No change to the protocol.
+- On the wire: the TLS fallback transports' `session_id` is a keyed tag
+  instead of random bytes. Same 32 bytes, different on every connection; the
+  rest of the ClientHello is unchanged.
+- On the wire: a relay sends its exit a small frame when nothing else has
+  gone up for a period drawn anew each time between 20 and 45 s, while its
+  client is alive. No change to the protocol.
+- On the wire: a relay's own keepalive frame to its exit is now the size of
+  the client keepalive it forwards (4 bytes more cover); it was 4 bytes
+  shorter, every time. Exits of any version drop the cover as before.
+- On the wire: when handshakes are being swallowed, a reconnect cycle tries
+  up to sixteen transports against one address instead of one.
+- On the wire: an idle desktop TUN client on a fallback server opens one
+  session to its preferred server, tries at least 4 minutes apart.
 
 ## [1.11.8] - 2026-10-20
 

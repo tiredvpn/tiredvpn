@@ -143,7 +143,7 @@ func TestReconnectTUNSilentPeerFails(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		_, err := reconnectTUN(ctx, mgr, "203.0.113.10:443", reconnClientIP, 1280, true)
+		_, _, err := reconnectTUN(ctx, mgr, "203.0.113.10:443", reconnClientIP, 1280, true, true)
 		done <- err
 	}()
 	select {
@@ -179,7 +179,7 @@ func TestReconnectTUNKeepsFirstFrame(t *testing.T) {
 	mgr := strategy.NewManager()
 	mgr.Register(&pipeReconnectStrategy{t: t})
 
-	res, err := reconnectTUN(t.Context(), mgr, "203.0.113.10:443", reconnClientIP, 1280, false)
+	res, _, err := reconnectTUN(t.Context(), mgr, "203.0.113.10:443", reconnClientIP, 1280, false, true)
 	if err != nil {
 		t.Fatalf("reconnectTUN: %v", err)
 	}

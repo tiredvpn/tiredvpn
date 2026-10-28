@@ -132,7 +132,7 @@ startup, and polls the `<prefix>version` counter every 30 s as a fallback.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-ip-pool` | | CIDR for client tunnel addresses, e.g. `10.8.0.0/24`. Enables the shared TUN device, the IP pool and the NAT bootstrap. |
+| `-ip-pool` | | CIDR for client tunnel addresses, e.g. `10.8.0.0/24`. A /30 at least, which leaves one client address next to the server's. Enables the shared TUN device, the IP pool and the NAT bootstrap. |
 | `-ip-pool-lease` | `24h` | Lease duration per client. `0` = permanent. |
 | `-ip-pool-v6` | | ULA prefix for dual-stack clients, e.g. `fd00:10:8::/64`. Enables IPv6 inside the tunnel and NAT66. |
 | `-tun-ip` | `10.8.0.1` | Server-side TUN address. Must parse as IPv4; anything else aborts startup. |
@@ -150,6 +150,41 @@ it.
 inside `fc00::/7`. Each client's v6 address is its v4 lease embedded in the low
 32 bits of the prefix; the server takes `prefix::1`. Only clients handshaking at
 protocol version `0x04` or later receive a v6 address.
+
+#### How a client keeps its address
+
+A tunnel address is leased per **credential**, not per transport: a registry
+client by its client ID, a client on the global secret by `global` plus the
+address it connects from. The same client therefore gets the same tunnel
+address over REALITY, Polling, Geneva or any other transport, which is what lets
+a client move a live tunnel to a better transport without renumbering.
+
+Two consequences to know about:
+
+- **One registry credential on several devices.** A registry client's lease
+  carries no origin, so the client keeps its address when it roams between
+  networks. The flip side: two devices sharing one registry credential at the
+  same time share one tunnel address and push each other off it ("replacing
+  LIVE connection" in the log). Give each device its own client. Before this
+  release that was already the case on every transport except REALITY.
+- **Global secret behind one NAT.** Two boxes on the global secret behind the
+  same public address share one lease and evict each other, on any mix of
+  transports. Boxes at different addresses keep separate leases. Through a
+  relay of this release they hold a lease per session instead, and a box
+  that asks for an address another box was given can still take it over
+  until proof of ownership lands (1.11.10).
+
+Leases taken by an older server under its per-transport keys are moved to the
+credential key the first time the client connects, and any extra old lease the
+client still holds is released. A global-secret client behind a relay is the
+exception: its lease is per session, it adopts no old lease, and it gets a new
+address once. The old lease is not released either: it runs out with its TTL,
+or, if it was a requested lease in Redis, stays until you delete it. A registry
+client's old REALITY lease is found whichever address it was taken from; on the
+global secret only the lease taken from the client's current address is its
+own. Each credential is checked at
+most once per 10 minutes, so an older exit writing old keys into the same Redis
+has them folded within that time.
 
 Package installs set `-ip-pool 10.8.0.0/24` by default (via `TIREDVPN_IP_POOL`
 in `/etc/tiredvpn/env`). An empty `TIREDVPN_IP_POOL` (or `--proxy-only`) starts
@@ -177,9 +212,15 @@ the set. Deterministic strategies require the same seed on both ends.
 | `-quic-listen` | *(empty)* | QUIC address. Empty means "the `-listen` address, UDP". |
 | `-quic-sni-reassembly` | `false` | Reassemble fragmented SNI in the QUIC Initial. Required for clients using `-quic-sni-frag`. |
 
-At startup the server reads `/proc/sys/net/core/rmem_max` and `wmem_max` and
-warns if either is below 7.5 MB. With `-port-range` set, QUIC listens on the
-same multi-port set.
+quic-go asks for 7 MiB socket buffers on the UDP listener, and the kernel
+clamps the request to `net.core.rmem_max` / `wmem_max`. The host tuning advisor
+does not recommend raising them for QUIC: on an exit the same ceilings lift the
+clamp on the 4 MiB target-dial buffers, whose memory cost has not been measured
+(see [Host tuning](#host-tuning)). With `-port-range` set, QUIC listens on the
+same multi-port set, one socket per port. Each socket can hold up to
+2 x min(7 MiB, ceiling) per direction: 14 MiB each way on a host with 16 MiB
+ceilings, 416 KiB each way on stock Ubuntu. This UDP memory is not part of the
+advisor's TCP memory budget.
 
 ### Multi-hop / relay
 
@@ -220,11 +261,13 @@ Two limitations, both logged at startup:
 |------|---------|-------------|
 | `-reality-legacy` | `true` | Accept the legacy transport (credentials in padding extension `0x0015`). |
 | `-reality-b1` | `false` | Accept the B1 transport: real TLS 1.3, authentication in `session_id`. Requires `-reality-private-key`. |
+| `-reality-fallback-tag` | `false` | With `-reality-b1`: let a ClientHello carrying a valid fallback-transport tag reach its handler instead of the donor (see below). Off, tagged hellos are mirrored as in 1.11.8. Use per-client registry secrets when it is on. |
 | `-reality-private-key` | | Server's static X25519 key, base64. Falls back to `TIREDVPN_REALITY_PRIVATE_KEY`. Generate with `tiredvpn reality-keygen`. |
-| `-reality-max-time-diff` | `300` | Client clock skew tolerated by B1 auth, in seconds. `0` disables the check; negative aborts startup. |
+| `-reality-max-time-diff` | `300` | Client clock skew tolerated by B1 auth and by the fallback-transport tag, in seconds. `0` disables the check; negative aborts startup. |
 | `-reality-min-client-ver` | | Lowest client version B1 accepts, `X.Y.Z`. Empty disables the check. An unparsable value aborts startup. |
 | `-reality-mirror` | `adaptive` | Donor mirroring for sources that have not authenticated: `off`, `adaptive`, `always`. `always` dials a donor for every connection including real users - measurement only. |
-| `-reality-cover-domain` | | Hostname that unauthorised REALITY probes are transparently proxied to (port 443). Empty drops them silently. Operator-set, never derived from the client's SNI. |
+| `-reality-cover-domain` | | Hostname that unauthorised REALITY connections are transparently proxied to (port 443) when their SNI is not a donor (the built-in list or `-reality-sni`). A donor SNI is mirrored to that donor instead. Empty: a connection naming no donor is handed to the ordinary TLS path and gets the fake website. An SNI on neither list is never dialled. A ClientHello with a valid fallback-transport tag is never taken (see below). |
+| `-reality-sni` | | Comma-separated cover names this exit's clients are configured with (client `-reality-sni` or `[[servers]] sni`), on top of the built-in donor list. An unauthenticated REALITY connection naming one is mirrored to that site: on B1 always, on the legacy transport when `-reality-cover-domain` is set. Names match case-insensitively. Without it, a probe replaying such a name gets the cover domain's certificate for it. |
 | `-reality-require-data-v2` | `false` | Reject clients that do not negotiate the v2 data layer (per-connection keys + AEAD). Turn on only after every client is upgraded. |
 
 Turning both `-reality-b1` and `-reality-legacy` off aborts startup - no REALITY
@@ -233,6 +276,137 @@ key pair at boot, so B1 clients pinning a public key must not rely on it. With
 `-reality-b1` and no key, startup fails rather than silently generating a
 throwaway that would drop every client on the next restart. The public half is
 printed in the startup log.
+
+#### What a probe sees for a pool name
+
+A client's SNI pool hides the exit only if a probe that sends one of those
+names gets that site back. What decides it is the exit's flags, and a plain
+probe (`openssl s_client`, any ClientHello without REALITY credentials)
+differs from one that replays a real client's hello:
+
+| Exit | Plain probe, pool name | Replayed client hello, pool name |
+|---|---|---|
+| `-reality-b1`, `-reality-sni` lists the name | mirrored to that site | mirrored to that site; with `-reality-fallback-tag`, see below |
+| `-reality-b1`, name not listed | `-reality-cover-domain` if set, else the server's own `-cert` | the same; with `-reality-fallback-tag`, see below |
+| legacy only, `-reality-cover-domain` set | the server's own `-cert` | mirrored if listed (built-in or `-reality-sni`), else the cover domain |
+| legacy only, no `-reality-cover-domain` | the server's own `-cert` | the server's own `-cert`; `-reality-sni` changes nothing |
+
+With `-reality-fallback-tag` on, a replayed hello of a TLS fallback is the
+exception. Its `session_id` carries a fallback-transport tag (next section).
+Each exit remembers the tags it has let through, so a replay to the same exit
+is still mirrored. But the tag is bound neither to the hello nor to the exit.
+A copy - even of the 32-byte `session_id` alone, in the prober's own
+ClientHello with its own random and key share - is let through once on every
+other exit with the same secret within the clock window. The prober then
+completes TLS with that exit's own stack. That is why the flag is off by
+default. Per-client registry secrets, rather than one shared `-secret`, limit
+a copy to the exits that know that one client.
+
+The legacy transport is on by default (`-reality-legacy`). On an exit that
+runs both, a probe whose ClientHello carries a padding extension of 64 bytes
+or more (OpenSSL adds one to hellos of 256-511 bytes) is handed to the legacy
+path and gets the legacy row.
+
+On a legacy-only exit the pool is not protected without
+`-reality-cover-domain`, and even with it a plain probe gets the server's
+own certificate. The stand showed `CN=www.example.com` coming back for
+`www.google.com` (final acceptance, N12). Recommended exit setup for clients
+with an SNI pool:
+
+```
+-reality-b1 -reality-private-key <key> \
+-reality-sni <the clients' pool names> \
+-reality-cover-domain <a real site for every other name>
+```
+
+Add `-reality-fallback-tag` if the clients' TLS fallbacks must work on that
+exit, and then give the clients per-client registry secrets (next section).
+
+#### TLS fallback transports on a B1 server
+
+With `-reality-b1` the gate reads every TLS ClientHello on the port, not only
+REALITY's. HTTP Polling, WebSocket padded, Geneva, anti-probe, HTTP/2 Stego,
+Traffic Morph, State Exhaustion and a relay's `-upstream` leg all open with a
+plain crypto/tls ClientHello, and their SNI comes from the endpoint's pool -
+donor names by design. The gate proxies them to the donor, and they never
+reach their handlers.
+
+Clients put a fallback-transport tag in their `session_id` instead of 32
+random bytes. The tag is a nonce, the time masked by a keyed pad, and a MAC,
+with the key derived (HKDF, its own info string) from the secret the client
+dials with. With `-reality-fallback-tag` the gate checks it against every
+client in its index - each registry client's own secret and the global
+`-secret`:
+
+- a fresh tag (inside `-reality-max-time-diff`, not seen before) hands the
+  connection to the ordinary TLS path and its dispatch byte, ahead of the
+  donor and `-reality-cover-domain`;
+- a replayed or stale tag, an unknown key, and no tag at all go to the donor
+  or the cover domain, exactly as an unauthenticated stranger does.
+
+Without the flag - the default - the tag is not looked at, costs nothing, and
+a tagged hello is treated like any other, as in 1.11.8. So on a B1 exit the
+TLS fallbacks of clients with a donor-name pool work only with the flag on.
+
+"Treated like any other" is not "mirrored": the flag only decides tag
+admission. These hellos reach the exit's own TLS stack whatever it says,
+each a way for a probe to tell the exit from the site it imitates:
+
+- a valid ClientHello with no X25519 key share (P-256 only, say), which the
+  B1 gate cannot read;
+- any ClientHello when no donor can be dialled;
+- a hello with a padding extension of 64 bytes or more, with
+  `-reality-legacy` on (it goes to the legacy path, see the probe table);
+- IMAP STARTTLS on the IMAP camouflage port, which runs its own TLS server.
+
+Before turning the flag on, know what it opens. The tag binds neither the
+hello nor the exit, so a copy works once on every exit that shares the secret
+(previous section). Binding it to the hello's random and key share is planned
+for 1.11.10, as tag version 2 under its own key (HKDF info
+`tiredvpn-fallback-tag-v2`). The plan is that a 1.11.10 exit with the flag on
+admits v2 tags only: TLS fallbacks of 1.11.9 clients go to the donor there,
+as with the flag off, so upgrade the clients before you turn the flag on.
+Admitting v1 next to v2 would keep the exposure and would take an opt-in of
+its own. Until then:
+
+- use per-client registry secrets, not one global `-secret`, on any exit
+  with the flag on (the server warns at startup otherwise);
+- use random secrets of 32 bytes or more. One captured tag lets anyone test
+  guesses at the secret offline; a secret like `pass-424242` falls to a
+  dictionary in about a second. The client warns at startup about each weak
+  secret it uses, and the server about its global `-secret` and, with the
+  flag on, about each weak registry secret (once per client). Weak means
+  under 16 bytes, fewer than 8 distinct characters, a string that repeats
+  itself, a common word in it, or under about 90 bits by its character
+  classes. Passing the check is not "safe": any secret a person chose can be
+  guessed by a dictionary that knows how people choose. Generate secrets.
+
+The tag is not a B1 credential and a B1 `session_id` is not a tag. It looks
+like the random value it replaces to anyone without the secret, differs on
+every connection, and leaves the rest of the ClientHello as crypto/tls builds
+it. It carries the client's clock: with the flag on, a client more than
+`-reality-max-time-diff` (300 s by default) off has its TLS fallbacks sent to
+the donor, as its B1 hellos are.
+
+| Client | Exit | Result |
+|---|---|---|
+| 1.11.8 or older with `sni = [...]` in its config | any | does not start ("cannot decode TOML array") |
+| new, pool of donor names | `-reality-b1` without `-reality-fallback-tag` (any version) | TLS fallbacks go to the donor or the cover domain; REALITY, QUIC and the non-TLS transports work |
+| new, pool of donor names | new, `-reality-b1 -reality-fallback-tag` | TLS fallbacks reach their handlers |
+| 1.11.8 or older (no tag) | new, `-reality-b1` | TLS fallbacks mirrored when the SNI is a donor or a cover domain is set, otherwise the ordinary path - as before |
+| any | without `-reality-b1` | the tag is ignored; as before |
+| new relay (`-upstream`) | new, `-reality-b1 -reality-fallback-tag` | the upstream leg is tagged with its upstream secret and reaches its handler |
+| new relay (`-upstream`) | `-reality-b1` without the flag, with `-reality-cover-domain` | the upstream leg goes to the cover domain, as in 1.11.8 |
+
+**Update B1 exits and turn on `-reality-fallback-tag` before handing out SNI
+pools** of donor names to clients that need their TLS fallbacks.
+
+Cost, with the flag on: one HMAC per index entry for each ClientHello that B1
+turns down and the legacy transport does not take: about 0.8 µs and five small allocations per
+client, measured (0.8 ms at 1000 clients), on the order of the TLS handshake
+the connection costs anyway. A legacy-REALITY hello skips it.
+`reality_fallback_tag_total` on `/metrics` counts the connections let through
+on a tag.
 
 ### Burst reshaping
 
@@ -291,7 +465,7 @@ For flag-backed variables the precedence is flag > env > default.
 - `-seqovl-packet-drop`: warned and forced off.
 - NAT or NAT66 bootstrap failure: the server comes up proxy-degraded.
 - No `-ip-pool` on an exit node: native full-tunnel clients will be rejected.
-- QUIC enabled with UDP buffers below 7.5 MB.
+- A kernel or process limit below what the config needs (see [Host tuning](#host-tuning)).
 - API bound to a non-loopback address without `-api-token`.
 - A forward-hook chain that is not ours has policy `drop` (see below).
 - `-node-max-clients` set on a relay.
@@ -336,6 +510,76 @@ If you would rather manage NAT yourself, that is fine: the automatic setup only
 ever touches the `-ip-pool` CIDR, so your own rules coexist with it. See
 [Server firewall and forwarding](../README.md#server-firewall-and-forwarding-required-for-tun-mode)
 in the README for manual commands.
+
+## Host tuning
+
+At startup the server reads the kernel and process settings below and compares
+each with what **its own configuration** asks of the host. Every setting that
+falls short gets one line with the current value, the recommended one, a
+reason, the command that fixes it and the line that keeps it across reboots. A
+summary line at `INFO` follows; on a well-tuned host it is the only line. On a
+stock Ubuntu relay:
+
+<!-- host-tuning-example:begin (generated from internal/server/host_tuning.go; go test ./internal/server -run TestHostTuningDocsInSync -update-host-tuning-docs) -->
+```
+Host tuning: net.core.rmem_max is 212992, recommended 524288 - the upstream dialer requests 524288-byte socket buffers and the kernel silently clamps them to this ceiling. Fix: on the host, sysctl -w net.core.rmem_max=524288, then restart the server (open sockets keep the clamped size); persist: add 'net.core.rmem_max = 524288' to /etc/sysctl.d/90-tiredvpn.conf
+Host tuning: net.core.wmem_max is 212992, recommended 524288 - the upstream dialer requests 524288-byte socket buffers and the kernel silently clamps them to this ceiling. Fix: on the host, sysctl -w net.core.wmem_max=524288, then restart the server (open sockets keep the clamped size); persist: add 'net.core.wmem_max = 524288' to /etc/sysctl.d/90-tiredvpn.conf
+Host tuning: 5 settings checked for this config, 2 to adjust, 1 more unmeasured at debug level; the server changes none of them itself
+```
+<!-- host-tuning-example:end -->
+
+The level follows the rule's basis. A shortfall that was measured on our nodes,
+or that the config cannot work without, is logged at `INFO`. An estimate is
+logged only at `DEBUG` (`-debug`), tagged `(unmeasured)`, and the summary
+counts it. With `-debug` every setting that is fine gets an `ok` line too.
+
+A buffer ceiling is recommended only while the worst case fits in half of the
+service's memory budget. The budget is the tightest cgroup memory limit from
+the process's own cgroup up to its namespace root (the unit's `MemoryMax`, or a
+container's limit), or host RAM without one; a limit that cannot be read
+suppresses the advice. The worst case is the host-wide TCP memory limit, the
+third field of `net.ipv4.tcp_mem`: nothing in the server bounds how many
+sockets fill their buffers (one admitted connection can carry many mux
+streams, each with its own upstream socket, and QUIC opens sockets outside TCP
+admission), so the kernel's limit is the only real bound. When it does not
+fit, the line says so and asks for a larger memory limit, or a lower
+`tcp_mem`, instead of the `sysctl`. Exits get no buffer advice at all for now
+(see the table).
+
+The server never writes these settings itself. The one exception predates the
+advisor: the NAT bootstrap described above enables `ip_forward` and IPv6
+forwarding, and the forwarding rules only report when it failed. Rules that do
+not apply to the config are not checked: a relay gets no forwarding or
+conntrack advice, an exit no buffer advice. A value that cannot be read (for
+example `nf_conntrack_max` before the module is loaded) is skipped and counted,
+never guessed; when as many settings are unreadable as were checked, the
+summary says "inconclusive" instead of "all fine". Where a fix has to run
+depends on the setting: `somaxconn`, `ip_forward`, IPv6 forwarding and
+`tcp_congestion_control` are kept per network namespace, so a server in a
+container needs them in its own namespace (`docker --sysctl`, or the pod's
+`securityContext.sysctls`) and a `sysctl -w` on the host does not reach it; the
+buffer ceilings, `tcp_mem` and conntrack are host-wide and can only be set on
+the host. The hints say which. Outside Linux the advisor is silent.
+
+<!-- host-tuning-table:begin (generated from internal/server/host_tuning.go; go test ./internal/server -run TestHostTuningDocsInSync -update-host-tuning-docs) -->
+| Setting | Checked when | Recommended | Basis | Why | Evidence |
+|---|---|---|---|---|---|
+| `net.core.rmem_max` | `-upstream` (relay) | >= the relay's upstream buffer (`-relay-upstream-buf`, default 512 KiB), only while the host's TCP memory limit (`tcp_mem`) fits in half of the memory budget | measured | `SO_RCVBUF` above this is clamped without an error, so the receive window of the upstream leg is capped | Relay on stock Ubuntu 24.04, 146 ms upstream leg (2026-10-24): 212992 held the leg at `rcv_ssthresh` 210439 and TUN downloads at 6.3-8.7 Mbit/s; 1 MiB gave 19.8-20.1 Mbit/s. Exits are not checked: their target dials request 4 MiB, and lifting that clamp can cost 8 MiB of kernel memory per slow download, which has not been measured |
+| `net.core.wmem_max` | `-upstream` (relay) | same as `net.core.rmem_max` | measured | `SO_SNDBUF` is clamped the same way, capping how much the upstream leg keeps in flight | Raised together with `rmem_max` in the relay measurement above, not measured on its own |
+| `net.ipv4.ip_forward` | `-ip-pool` on an exit (no `-upstream`) | 1 | required | TUN clients' packets are forwarded out of this host; the server sets it at startup, so 0 here means its own attempt failed | Set by the NAT bootstrap (internal/tun/nat_linux.go); the advisor runs after it and only reports |
+| `net.ipv6.conf.all.forwarding` | `-ip-pool` with `-ip-pool-v6` on an exit | 1 | required | same as `ip_forward`, for the dual-stack pool | Set by the NAT66 bootstrap; without it v6 inside the tunnel is blackholed |
+| `net.ipv4.tcp_congestion_control` | always; the setting is host-wide and changes every TCP flow on the host | `bbr` (any version) | estimate | loss-based cubic backs off on random loss over long-RTT paths | One of the seven nodes read on 2026-10-24 runs bbr, six run cubic. No A/B throughput measurement has been made |
+| `net.netfilter.nf_conntrack_max` | `-ip-pool` on an exit (skipped while nf_conntrack is not loaded) | >= pool size x 256, at most 262144 and at most 1/16 of host RAM at 320 bytes per entry; `nf_conntrack_buckets` at least a quarter of that (raised to match when advised) | estimate | every masqueraded flow takes an entry and a full table drops new flows | The kernel default scales with RAM and sets buckets equal to the maximum: 8192 on a 960 MB exit, 65536 on 2 GB ones; no `table full` in their kernel logs (2026-10-24). 256 flows per client is an assumption. The whole pool counts because QUIC serves TUN clients outside TCP admission |
+| `net.core.somaxconn` | always | >= min(admission limit, 4096) | estimate | Go uses it as the listen backlog; a reconnect storm overflows a short accept queue before admission control sees it | 4096 on every node we run (kernel >= 5.4 default; read 2026-10-24); older kernels default to 128. No overflow has been observed, the rule only catches an old kernel or a host tuned below the default |
+| `RLIMIT_NOFILE` | always | >= admission limit x 4 + 1024 (a floor: mux streams and QUIC are not bounded by admission) | estimate | each admitted connection holds a client socket and a target or upstream leg, more with mux streams | Our nodes run 524287 (Go raises the soft limit to the hard one) or the 65536 the packaged unit sets (read 2026-10-24). 4 descriptors per connection is an estimate, not a measurement |
+<!-- host-tuning-table:end -->
+
+Considered and left out, for lack of evidence that they matter here: the
+`tcp_rmem` / `tcp_wmem` autotuning ceilings (stock values are already above
+4 MiB and raising them has the same memory cost), a QUIC buffer rule (see
+[QUIC](#quic)), MTU and MSS (the server clamps MSS on the TUN device and sizes
+the TUN MTU itself), and `net.core.default_qdisc=fq` next to `bbr` (estimated as
+a small effect, never measured).
 
 ## Configuration via TOML
 

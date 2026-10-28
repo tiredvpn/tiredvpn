@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	mathrand "math/rand/v2"
 	"net"
 	"strconv"
 	"strings"
@@ -352,7 +353,7 @@ func (s *QUICStrategy) Connect(ctx context.Context, target string) (net.Conn, er
 	// TLS config - we'll use whitelisted SNI
 	tlsConfig := &tls.Config{
 		InsecureSkipVerify: true,
-		ServerName:         s.selectSNI(),
+		ServerName:         s.selectSNI(ctx),
 		// Advertise the RFC 9114 HTTP/3 token: the ALPN in a QUIC ClientHello is
 		// readable one Initial-decrypt away, so it must name a protocol other
 		// peers use, not the deployment. The tunnel discriminator moved into the
@@ -531,10 +532,26 @@ func (s *QUICStrategy) Connect(ctx context.Context, target string) (net.Conn, er
 // per connection so independent clients do not move in lockstep.
 var quicSNIRotator = evasion.NewSNIRotator(evasion.StrategyRandom)
 
-// selectSNI chooses a whitelisted SNI for the connection, fresh each call.
-func (s *QUICStrategy) selectSNI() string {
+// selectSNI chooses the connection's SNI, fresh each call: from the
+// endpoint's own pool when it has one, from the shared whitelist otherwise.
+func (s *QUICStrategy) selectSNI(ctx context.Context) string {
+	if pool := dialSNIs(ctx); len(pool) > 0 {
+		return pickSNI(pool)
+	}
 	return quicSNIRotator.Next()
 }
+
+// pickSNI draws one name from an endpoint's own SNI pool, uniformly and
+// independently per connection - the same StrategyRandom the shared rotators
+// for stego and QUIC use, so a configured pool does not change the shape of
+// the choice, only its members.
+func pickSNI(pool []string) string {
+	return pool[sniIndex(len(pool))]
+}
+
+// sniIndex is pickSNI's draw, mathrand.IntN. A var so a test can make the
+// draws its own instead of asserting on what random ones happened to be.
+var sniIndex = mathrand.IntN
 
 // extractHost extracts hostname from target address
 func (s *QUICStrategy) extractHost(target string) string {
@@ -1162,6 +1179,13 @@ func (c *QUICServerConn) Close() error {
 	c.stream.Close()
 	return c.CloseWithError(0, "server closed")
 }
+
+// PeerAlive reports whether the QUIC connection is still open. quic-go closes
+// it once nothing has come from the client for MaxIdleTimeout (30 s), and the
+// client's keepalive goes every 10 s, so an open connection is a client that
+// was heard from within 30 s, whatever its stream carries. A relay asks it of
+// a client that writes nothing up (the server's clientLiveness).
+func (c *QUICServerConn) PeerAlive() bool { return c.Conn.Context().Err() == nil }
 
 // LocalAddr implements net.Conn
 func (c *QUICServerConn) LocalAddr() net.Addr {

@@ -4,11 +4,13 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	mathrand "math/rand/v2"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/evasion"
@@ -16,6 +18,7 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/protocol"
 	"github.com/tiredvpn/tiredvpn/internal/shaper"
+	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 )
 
 // TrafficMorphStrategy morphs traffic to match target application patterns
@@ -301,8 +304,22 @@ func (s *TrafficMorphStrategy) Probe(ctx context.Context, target string) error {
 	if s.baseStrat != nil {
 		return s.baseStrat.Probe(ctx, target)
 	}
-	return nil
+	// Without a base strategy there is nothing to ask that a reprobe could
+	// trust - see errProbeUnknown.
+	return errProbeUnknown
 }
+
+// errProbeUnknown is a probe's way of saying it cannot tell. ProbeAll counts
+// it as not available and leaves confidence alone.
+//
+// Traffic Morph without a base strategy and State Table Exhaustion used to
+// answer their probe with nil without touching the network; a reprobe during
+// an outage then reported them available, raised their confidence to 0.92
+// while every honest probe failed, and the client came back from the outage on
+// Traffic Morph instead of REALITY. Making them dial instead added five bare
+// connect-and-close dials to every reprobe burst. A probe that cannot learn
+// anything a scan would use should say so and stay off the wire.
+var errProbeUnknown = errors.New("probe cannot tell")
 
 func (s *TrafficMorphStrategy) Connect(ctx context.Context, target string) (net.Conn, error) {
 	// Establish base connection
@@ -319,11 +336,15 @@ func (s *TrafficMorphStrategy) Connect(ctx context.Context, target string) (net.
 		serverAddr := s.manager.GetServerAddr(ctx)
 		log.Debug("Traffic Morph: Using server address: %s", serverAddr)
 
-		// Use TLS connection with standard ALPN (no fingerprint in ClientHello)
+		// Use TLS connection with standard ALPN (no fingerprint in ClientHello).
+		// The SNI is drawn from the endpoint's pool, like every other
+		// strategy's; without a pool there is none, as before (P3-7 of the
+		// round-7 review).
 		tlsConfig := &tls.Config{
+			ServerName:         coverNameFor(ctx, ""),
 			InsecureSkipVerify: true,
 			NextProtos:         []string{"http/1.1"},
-			ClientSessionCache: s.manager.TLSSessionCache(), // resume across reconnects
+			ClientSessionCache: s.manager.TLSSessionCache(serverAddr), // resume across reconnects
 		}
 		// Use context-aware dialing (respects Android optimized timeouts)
 		dialer := &net.Dialer{}
@@ -342,7 +363,7 @@ func (s *TrafficMorphStrategy) Connect(ctx context.Context, target string) (net.
 		fragConn := evasion.NewFragmentedWriter(tcpConn, fragConfig)
 		log.Debug("Morph: TLS ClientHello fragmentation enabled (size=%d)", fragConfig.FragmentSize)
 
-		tlsConn := tls.Client(fragConn, tlsConfig)
+		tlsConn := tls.Client(fragConn, customtls.WithFallbackTag(tlsConfig, secret))
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			tcpConn.Close()
 			return nil, err
@@ -484,9 +505,16 @@ type MorphedConn struct {
 	// pacer drains shaped frames asynchronously so the producer Write
 	// never blocks on per-frame time.Sleep. Lazy-initialised via pacerOnce
 	// on the first shaped Write; nil while the connection only sees
-	// NoopShaper traffic.
+	// NoopShaper traffic, and for good if Close came first.
 	pacer     *writePacer
 	pacerOnce sync.Once
+
+	// wdl keeps the caller's write deadline, so that Close bounds the drain
+	// by it instead of replacing it.
+	wdl closeDeadline
+
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // NetConn returns the underlying net.Conn for TCP optimization
@@ -774,14 +802,105 @@ func (mc *MorphedConn) Read(p []byte) (int, error) {
 	return copied, nil
 }
 
+// SetDeadline sets the read and write deadlines. Once Close has started,
+// the write deadline can only move closer.
+func (mc *MorphedConn) SetDeadline(t time.Time) error {
+	return mc.wdl.setDeadline(mc.Conn, t)
+}
+
+// SetWriteDeadline sets the write deadline. Once Close has started, it can
+// only move closer.
+func (mc *MorphedConn) SetWriteDeadline(t time.Time) error {
+	return mc.wdl.setWriteDeadline(mc.Conn, t)
+}
+
 // Close closes the underlying connection. If the async shaped-write pacer
-// has been started, it is stopped first so its drain timeout has a chance
-// to flush queued frames before the socket goes away.
+// has been started, it is stopped first and writes out every frame Write
+// already accepted before the socket goes away, under the earlier of the
+// caller's write deadline and pacerCloseTimeout. A connection that does not
+// take them by then makes Close return ErrShaperCloseIncomplete instead of
+// losing the tail silently. In that case, and when the deadline has
+// already passed, the socket is closed below any TLS layer without
+// close_notify, which tls.Conn would otherwise spend another 5 s trying to
+// send. Whatever is still writing closeAbortGrace past the deadline - a
+// write on a connection that ignores write deadlines, or the close_notify
+// after a complete drain into a window that has just shut - is cut off by
+// closing the socket. That bounds Close as long as closing a socket
+// unblocks a Write on it, which holds for every conn checked. The socket's
+// own Close error, if any, is joined in. Close is safe to call more than
+// once and from several goroutines; every call returns the first result.
+//
+// On a tls.Conn without kTLS, a lost tail leaves a TLS record cut short on
+// the wire before the FIN: the deadline expires inside the write of one
+// record, part of which the kernel has already taken. crypto/tls reports
+// zero bytes written and marks the connection broken for writes, so the
+// record cannot be finished afterwards, and writing one record at a time
+// does not help - a single record write blocks the same way. The peer's
+// TLS reader sees io.ErrUnexpectedEOF instead of io.EOF. kTLS conns, which
+// is the default Morph path, frame records in the kernel and are not
+// affected.
 func (mc *MorphedConn) Close() error {
-	if mc.pacer != nil {
-		mc.pacer.close()
+	mc.closeOnce.Do(func() { mc.closeErr = mc.close() })
+	return mc.closeErr
+}
+
+// CloseNow aborts the connection: the close deadline expires at once,
+// whatever deadline the caller sets meanwhile, so the queued tail is
+// reported lost rather than written, and the socket is closed without
+// close_notify. It is Close for VPNClient.Stop. A Close already running is
+// cut short too.
+func (mc *MorphedConn) CloseNow() error {
+	mc.wdl.abortNow(mc.Conn)
+	return mc.Close()
+}
+
+func (mc *MorphedConn) close() error {
+	// Use up pacerOnce: a shaped Write that has not started the pacer yet
+	// can no longer start one on a closed conn, and the read of mc.pacer
+	// below is ordered after the write in ensurePacer.
+	mc.pacerOnce.Do(func() {})
+	if mc.pacer == nil {
+		if mc.wdl.abortRequested() {
+			// CloseNow on a conn that never shaped a write.
+			err := closeSocket(mc.Conn)
+			_ = mc.Conn.Close()
+			return err
+		}
+		// No abort timer here, unlike the pacer path: a CloseNow that lands
+		// after this abortRequested check but before mc.Conn.Close finishes
+		// cannot cut the close_notify short. Its abortNow only sets the
+		// write deadline to now, so at worst crypto/tls replaces it with its
+		// own 5 s one for the alert - bounded, not a hang. It is safe today:
+		// CloseNow on a client's own transport comes only from VPNClient
+		// teardown - Stop, a dead session's failover (disconnect), a forced
+		// reconnect, the Android core's disconnect, and a port hop or upgrade
+		// whose new conn is abandoned - and each holds v.mu and nils v.conn
+		// (or the session's conn) before closing it, so no two race a close
+		// on the same conn. An external caller that closes one unpaced
+		// MorphedConn from two goroutines at once is the only way to hit it,
+		// and it costs at most that 5 s.
+		return mc.Conn.Close()
 	}
-	return mc.Conn.Close()
+
+	var aborted atomic.Bool
+	closeSock := sync.OnceValue(func() error { return closeSocket(mc.Conn) })
+	mc.wdl.begin(mc.Conn, pacerCloseTimeout, func() {
+		aborted.Store(true)
+		_ = closeSock()
+	})
+	defer mc.wdl.end()
+	drainErr := mc.pacer.shutdown()
+	if drainErr == nil && !aborted.Load() && !mc.wdl.abortRequested() {
+		return mc.Conn.Close()
+	}
+	if drainErr != nil {
+		log.Warn("Morph: close lost the queued tail: %v", drainErr)
+	}
+	sockErr := closeSock()
+	// Release the wrapper too. Its error only reports the socket closed
+	// just above.
+	_ = mc.Conn.Close()
+	return errors.Join(drainErr, sockErr)
 }
 
 // Stats returns traffic statistics

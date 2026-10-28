@@ -9,8 +9,10 @@ import (
 // TestPacer_SaturationDoesNotDeadlock pumps 100 MiB through a slow shaper
 // (5 ms per-frame target delay, capped to 50 ms by pacerMaxDelay) into a
 // fast consumer. Under adaptive throttle the queue fills, factor → 0, and
-// the producer must keep making progress. We assert completion within a
-// generous bound; the test fails by timeout if the pacer ever deadlocks.
+// the producer must keep making progress. The tight bound is on progress:
+// a deadlock writes nothing at all, while a loaded machine only makes the
+// 20-29 s run slower (a 30 s total budget flaked once). The total budget
+// stays, six times wider, for a pacer that crawls without stopping.
 func TestPacer_SaturationDoesNotDeadlock(t *testing.T) {
 	if testing.Short() {
 		t.Skip("perf-sensitive saturation test")
@@ -32,13 +34,28 @@ func TestPacer_SaturationDoesNotDeadlock(t *testing.T) {
 		doneCh <- nil
 	}()
 
-	select {
-	case err := <-doneCh:
-		if err != nil {
-			t.Fatalf("enqueue failed under saturation: %v", err)
+	const stall = 10 * time.Second
+	tick := time.NewTicker(stall)
+	defer tick.Stop()
+	budget := time.After(3 * time.Minute)
+	last := int64(-1)
+wait:
+	for {
+		select {
+		case err := <-doneCh:
+			if err != nil {
+				t.Fatalf("enqueue failed under saturation: %v", err)
+			}
+			break wait
+		case <-tick.C:
+			got := c.Writes()
+			if got == last {
+				t.Fatalf("pacer deadlocked: no frame written in %v, %d/%d so far", stall, got, totalFrames)
+			}
+			last = got
+		case <-budget:
+			t.Fatalf("pacer crawls: %d/%d frames in 3m", c.Writes(), totalFrames)
 		}
-	case <-time.After(30 * time.Second):
-		t.Fatalf("pacer deadlocked: enqueued %d/%d frames in 30s", c.Writes(), totalFrames)
 	}
 	p.close()
 	if got := c.Writes(); int(got) != totalFrames {

@@ -154,9 +154,13 @@ func (s *HTTP2StegoStrategy) Connect(ctx context.Context, target string) (net.Co
 	// an hour-of-day index that moves every client at once) keeps the SNI a
 	// donor TSPU does not IP-range-check against us, and keeps the two views of
 	// the same name - the cleartext SNI and the encrypted :authority - agreeing.
-	// A caller that pinned a cover host in config keeps it.
+	// A caller that pinned a cover host in config keeps it - unless the endpoint
+	// has its own SNI pool ([[servers]] sni / -reality-sni), which is the more
+	// specific setting and wins.
 	coverHost := s.coverHost
-	if coverHost == "" {
+	if pool := dialSNIs(ctx); len(pool) > 0 {
+		coverHost = pickSNI(pool)
+	} else if coverHost == "" {
 		coverHost = stegoCoverRotator.Next()
 	}
 	log.Debug("HTTP/2 Stego: Using server address: %s (cover %s)", serverAddr, coverHost)
@@ -168,7 +172,7 @@ func (s *HTTP2StegoStrategy) Connect(ctx context.Context, target string) (net.Co
 		InsecureSkipVerify: true,
 		ServerName:         coverHost,
 		NextProtos:         []string{"h2", "http/1.1"},
-		ClientSessionCache: s.manager.TLSSessionCache(), // resume across reconnects
+		ClientSessionCache: s.manager.TLSSessionCache(serverAddr), // resume across reconnects
 	}
 
 	var conn *tls.Conn
@@ -189,7 +193,7 @@ func (s *HTTP2StegoStrategy) Connect(ctx context.Context, target string) (net.Co
 			return nil, dialErr
 		}
 
-		conn = tls.Client(tcpConn, tlsConfig)
+		conn = tls.Client(tcpConn, customtls.WithFallbackTag(tlsConfig, secret))
 		if err = conn.HandshakeContext(ctx); err != nil {
 			tcpConn.Close()
 			// Fallback to non-ECH on failure
@@ -198,7 +202,7 @@ func (s *HTTP2StegoStrategy) Connect(ctx context.Context, target string) (net.Co
 			if dialErr != nil {
 				return nil, dialErr
 			}
-			conn = tls.Client(tcpConn2, tlsConfig)
+			conn = tls.Client(tcpConn2, customtls.WithFallbackTag(tlsConfig, secret))
 			if err = conn.HandshakeContext(ctx); err != nil {
 				tcpConn2.Close()
 				return nil, err
@@ -209,7 +213,7 @@ func (s *HTTP2StegoStrategy) Connect(ctx context.Context, target string) (net.Co
 		if dialErr != nil {
 			return nil, dialErr
 		}
-		conn = tls.Client(tcpConn, tlsConfig)
+		conn = tls.Client(tcpConn, customtls.WithFallbackTag(tlsConfig, secret))
 		if err = conn.HandshakeContext(ctx); err != nil {
 			tcpConn.Close()
 			return nil, err
@@ -266,6 +270,31 @@ func (s *HTTP2StegoStrategy) Connect(ctx context.Context, target string) (net.Co
 // HTTP2StegoConn implements net.Conn with HTTP/2 steganography
 type HTTP2StegoConn struct {
 	net.Conn
+
+	// ownerWD is the write deadline the conn's owner last set; wdMu guards
+	// it apart from mu, which a blocked write holds, together with every
+	// change of the socket's write deadline. closing is set by Close, which
+	// owns the write deadline from then on.
+	wdMu    sync.Mutex
+	ownerWD time.Time
+	closing bool
+
+	// writeFailed is set once a write on the conn failed (stegoWriter).
+	writeFailed atomic.Bool
+
+	// lastWrite is a stegoMono stamp of the last frame the conn put on the
+	// wire, whoever wrote it; lastOwnerWrite of the last data its owner
+	// wrote (Write). Zero before the first.
+	lastWrite      atomic.Int64
+	lastOwnerWrite atomic.Int64
+
+	// closed is closed by Close; KeepAlive ends with it.
+	closed    chan struct{}
+	closeOnce sync.Once
+	// ownerDone is closed by OwnerDone: the owner writes no more.
+	ownerDone     chan struct{}
+	ownerDoneOnce sync.Once
+
 	secret      []byte
 	isClient    bool
 	paddingMode NaivePaddingMode
@@ -322,10 +351,12 @@ func NewHTTP2StegoConn(conn net.Conn, secret []byte, isClient bool, paddingMode 
 		isClient:    isClient,
 		paddingMode: paddingMode,
 		ekm:         ekm,
+		closed:      make(chan struct{}),
+		ownerDone:   make(chan struct{}),
 	}
 
 	// Initialize HTTP/2 framer
-	sc.framer = http2.NewFramer(conn, conn)
+	sc.framer = http2.NewFramer(stegoWriter{sc}, conn)
 	sc.framer.AllowIllegalWrites = true
 	sc.framer.AllowIllegalReads = true
 
@@ -649,8 +680,234 @@ func (sc *HTTP2StegoConn) proactiveFlushWindowUpdate() {
 		return
 	}
 	sc.mu.Lock()
-	sc.flushWindowUpdate()
+	sc.readPathWrite(sc.flushWindowUpdate)
 	sc.mu.Unlock()
+}
+
+// stegoReadPathWriteTimeout bounds a write the read path makes on its own:
+// WINDOW_UPDATE credit, a SETTINGS ack. Atomic so tests in other packages
+// can scale it (SetStegoReadPathWriteTimeout).
+var stegoReadPathWriteTimeoutNs atomic.Int64
+
+func init() { stegoReadPathWriteTimeoutNs.Store(int64(10 * time.Second)) }
+
+func stegoReadPathWriteTimeout() time.Duration {
+	return time.Duration(stegoReadPathWriteTimeoutNs.Load())
+}
+
+// SetStegoReadPathWriteTimeout replaces the read path's write deadline for
+// a test and returns the old one.
+func SetStegoReadPathWriteTimeout(d time.Duration) time.Duration {
+	return time.Duration(stegoReadPathWriteTimeoutNs.Swap(int64(d)))
+}
+
+// SetWriteDeadline records the owner's write deadline and sets it: the
+// conn's own writes (readPathWrite, Close) put it back when they are done.
+// The record and the socket change together under wdMu, so a restore can
+// never put back a deadline the owner has since replaced (P3-1 of the
+// round-9 review).
+//
+// Once Close has bounded the conn's last writes, the owner's deadline is
+// recorded and not applied: an owner that had taken the conn before Close
+// could otherwise put a 30 s deadline back over the 1 s bound (P3-8 of the
+// round-10 review).
+func (sc *HTTP2StegoConn) SetWriteDeadline(t time.Time) error {
+	sc.wdMu.Lock()
+	defer sc.wdMu.Unlock()
+	sc.ownerWD = t
+	if sc.closing {
+		return nil
+	}
+	return sc.Conn.SetWriteDeadline(t)
+}
+
+// SetDeadline is SetWriteDeadline and SetReadDeadline together, recorded the
+// same way; after Close only the read side is applied.
+func (sc *HTTP2StegoConn) SetDeadline(t time.Time) error {
+	sc.wdMu.Lock()
+	defer sc.wdMu.Unlock()
+	sc.ownerWD = t
+	if sc.closing {
+		return sc.SetReadDeadline(t)
+	}
+	return sc.Conn.SetDeadline(t)
+}
+
+// stegoRestoreHook, when a test sets it, runs in restoreOwnerWD: at "enter"
+// before wdMu is taken, at "apply" with wdMu held, before the deadline is
+// put back. Nil in production.
+var stegoRestoreHook atomic.Pointer[func(at string)]
+
+// restoreOwnerWD puts back the write deadline the conn's owner last set,
+// zero for an owner that sets none. Once Close has bounded the conn's last
+// writes it leaves that bound alone: putting back an owner's zero there let
+// the GOAWAY wait forever on a peer that stopped reading (P3-2 of the
+// round-9 review).
+func (sc *HTTP2StegoConn) restoreOwnerWD() {
+	if f := stegoRestoreHook.Load(); f != nil {
+		(*f)("enter")
+	}
+	sc.wdMu.Lock()
+	defer sc.wdMu.Unlock()
+	if sc.closing {
+		return
+	}
+	if f := stegoRestoreHook.Load(); f != nil {
+		(*f)("apply")
+	}
+	_ = sc.Conn.SetWriteDeadline(sc.ownerWD)
+}
+
+// stegoWriter is the framer's writer: the conn's writes, with a failed one
+// recorded for Close.
+type stegoWriter struct{ sc *HTTP2StegoConn }
+
+func (w stegoWriter) Write(p []byte) (int, error) {
+	n, err := w.sc.Conn.Write(p)
+	if err != nil {
+		w.sc.writeFailed.Store(true)
+	} else {
+		w.sc.lastWrite.Store(stegoMono())
+	}
+	return n, err
+}
+
+// stegoMonoBase anchors stegoMono to the monotonic clock.
+var stegoMonoBase = time.Now()
+
+// stegoMono is a monotonic stamp, in nanoseconds since stegoMonoBase; never 0.
+func stegoMono() int64 { return int64(time.Since(stegoMonoBase)) + 1 }
+
+// SinceOwnerWrite is how long ago the conn's owner last wrote data on it,
+// and false before the first time. The conn's own frames - flow-control
+// credit, a keepalive - do not count.
+func (sc *HTTP2StegoConn) SinceOwnerWrite() (time.Duration, bool) {
+	at := sc.lastOwnerWrite.Load()
+	if at == 0 {
+		return 0, false
+	}
+	return time.Duration(stegoMono() - at), true
+}
+
+// KeepAlive feeds the peer's read deadline on a conn whose owner may write
+// nothing for minutes: a relay's upstream leg carrying a sparse download,
+// whose exit closes a connection after 60 s without a frame. Whenever
+// nothing has gone out on the conn for quiet() - redrawn after each one - it
+// writes an empty stego DATA frame: no payload, cover as on any frame. The
+// frame does not touch the byte stream the owner writes, so it needs no
+// frame boundary of the owner's; an exit of any version reads it, which
+// feeds its deadline, and finds nothing to deliver.
+//
+// Not before the owner's first write: the exit takes the first payload on a
+// connection as the tunnel's setup, and an empty one would be a broken
+// setup. alive, when set, is asked before each keepalive: while it says
+// the owner's client is gone, none goes, and the exit's deadline ends the
+// leg as before. sent, when set, is told of each keepalive written.
+//
+// It returns when the conn is closed, when its owner is done writing
+// (OwnerDone), or when a keepalive cannot be written.
+func (sc *HTTP2StegoConn) KeepAlive(quiet func() time.Duration, alive func() bool, sent func()) {
+	q := quiet()
+	timer := time.NewTimer(q)
+	defer timer.Stop()
+	for {
+		select {
+		case <-sc.closed:
+			return
+		case <-sc.ownerDone:
+			return
+		case <-timer.C:
+		}
+		silent := time.Duration(stegoMono() - sc.lastWrite.Load())
+		if silent >= q {
+			if sc.lastOwnerWrite.Load() != 0 && (alive == nil || alive()) {
+				wrote, err := sc.writeKeepalive(q)
+				if err != nil {
+					return
+				}
+				if wrote && sent != nil {
+					sent()
+				}
+			}
+			q = quiet()
+			silent = 0
+		}
+		timer.Reset(max(q-silent, 10*time.Millisecond))
+	}
+}
+
+// OwnerDone tells the conn its owner will write no more on it: a relay
+// whose client has sent its last byte. The keepalive stops, so the peer's
+// read deadline ends the conn unless the peer answers first. Nothing goes on
+// the wire: the stego stream has no half-close. The conn can still be read.
+func (sc *HTTP2StegoConn) OwnerDone() {
+	sc.ownerDoneOnce.Do(func() { close(sc.ownerDone) })
+}
+
+// stegoKeepaliveLocked, when a test sets it, runs once writeKeepalive holds
+// sc.mu, before it looks at the conn's last write again. Nil in production.
+var stegoKeepaliveLocked atomic.Pointer[func()]
+
+// writeKeepalive writes an empty stego DATA frame, under a write deadline
+// of its own like the read path's writes (readPathWrite), unless something
+// went out within quiet after all: KeepAlive decided before it held sc.mu,
+// and a frame written while it waited was followed by an empty one at
+// once, a pair (P3-5 of the round-9 review). It says whether it wrote.
+func (sc *HTTP2StegoConn) writeKeepalive(quiet time.Duration) (bool, error) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if f := stegoKeepaliveLocked.Load(); f != nil {
+		(*f)()
+	}
+	if time.Duration(stegoMono()-sc.lastWrite.Load()) < quiet {
+		return false, nil
+	}
+	var err error
+	sc.readPathWrite(func() {
+		if sc.tunMode {
+			_, err = sc.writeViaDataFast(nil)
+		} else {
+			_, err = sc.writeViaDataCover(nil, sc.keepaliveCoverLen())
+		}
+	})
+	return err == nil, err
+}
+
+// relayedKeepaliveLen is the payload of the keepalive a relay forwards for
+// its client: the TUN framing's empty frame, [len:4] = 0.
+const relayedKeepaliveLen = 4
+
+// keepaliveCoverLen is the cover of the conn's own empty keepalive frame:
+// what a frame carrying a relayed client keepalive puts after its 4-byte
+// payload, plus 4 for the payload it does not carry. The two then have one
+// size. With the 10-byte cover floor alone the empty frame was 4 bytes
+// shorter than the relayed one, every time, and the size told which of the
+// two an empty-looking frame up a relay's leg was (P3-6 of the round-9
+// review). Only the keepalive: raising the floor would move every frame.
+func (sc *HTTP2StegoConn) keepaliveCoverLen() int {
+	return relayedKeepaliveLen + max(sc.calculateNaivePadding(relayedKeepaliveLen), stegoMinCover)
+}
+
+// readPathWrite runs write, a write the read path makes on its own, under a
+// deadline of its own. The caller's last deadline belongs to the caller's
+// last write and may long have passed: a one-way download writes nothing
+// else, and a WINDOW_UPDATE flush that hit a stale deadline failed, which
+// tls.Conn makes permanent - every later write on the conn failed and the
+// tunnel died (P2-1 of the round-7 review).
+//
+// The owner's deadline is put back afterwards. Left at now+10s it broke the
+// owners that set none - the relay's TUN bridge and its proxy relays write
+// upstream without a deadline - and the first write up more than 10 s after
+// a download failed for good (P1-1 of the round-8 review). Must be called
+// with sc.mu held.
+func (sc *HTTP2StegoConn) readPathWrite(write func()) {
+	sc.wdMu.Lock()
+	if !sc.closing {
+		_ = sc.Conn.SetWriteDeadline(time.Now().Add(stegoReadPathWriteTimeout()))
+	}
+	sc.wdMu.Unlock()
+	write()
+	sc.restoreOwnerWD()
 }
 
 // Write sends data using various steganographic channels
@@ -696,6 +953,9 @@ func (sc *HTTP2StegoConn) Write(p []byte) (int, error) {
 		}
 		written += n
 	}
+	if written > 0 {
+		sc.lastOwnerWrite.Store(stegoMono())
+	}
 
 	return written, nil
 }
@@ -706,7 +966,11 @@ func (sc *HTTP2StegoConn) writeFast(p []byte) (int, error) {
 	defer sc.mu.Unlock()
 
 	sc.flushWindowUpdate()
-	return sc.writeViaDataFast(p)
+	n, err := sc.writeViaDataFast(p)
+	if n > 0 {
+		sc.lastOwnerWrite.Store(stegoMono())
+	}
+	return n, err
 }
 
 type covertMethod int
@@ -991,8 +1255,18 @@ func (sc *HTTP2StegoConn) writeViaPaddedData(data []byte) (int, error) {
 	return chunkSize, nil
 }
 
+// stegoMinCover is the least cover a DATA frame of the standard path
+// carries after its payload.
+const stegoMinCover = 10
+
 // writeViaData sends data in normal DATA frames (mixed with cover traffic)
 func (sc *HTTP2StegoConn) writeViaData(data []byte) (int, error) {
+	return sc.writeViaDataCover(data, -1)
+}
+
+// writeViaDataCover is writeViaData with the cover length given, or drawn
+// as writeViaData draws it when cover is negative.
+func (sc *HTTP2StegoConn) writeViaDataCover(data []byte, cover int) (int, error) {
 	var streamID uint32
 
 	// Use persistent stream if available (for TUN mode bidirectional traffic)
@@ -1011,9 +1285,9 @@ func (sc *HTTP2StegoConn) writeViaData(data []byte) (int, error) {
 	chunkSize := minInt(len(data), 1400)
 
 	// Create framed data: [nonce][marker][Flags:1][Length:2][Data:N][NaivePadding:M]
-	coverLen := sc.calculateNaivePadding(chunkSize)
-	if coverLen < 10 {
-		coverLen = 10 // Minimum padding
+	coverLen := cover
+	if coverLen < 0 {
+		coverLen = max(sc.calculateNaivePadding(chunkSize), stegoMinCover)
 	}
 	hdr, err := stegoFrameHeader(sc.secret, sc.writeMarkerLabel())
 	if err != nil {
@@ -1156,7 +1430,7 @@ func (sc *HTTP2StegoConn) extractCovertData(frame http2.Frame) []byte {
 		return nil
 	case *http2.SettingsFrame:
 		if !f.IsAck() {
-			sc.framer.WriteSettingsAck()
+			sc.readPathWrite(func() { sc.framer.WriteSettingsAck() })
 		}
 		return nil
 	default:
@@ -1218,10 +1492,51 @@ func (sc *HTTP2StegoConn) allocateStreamID() uint32 {
 	return id
 }
 
+// stegoCloseBound bounds the writes Close waits for and makes.
+const stegoCloseBound = time.Second
+
 // Close closes the connection
 func (sc *HTTP2StegoConn) Close() error {
-	// Send GOAWAY frame
-	sc.framer.WriteGoAway(sc.nextStreamID, http2.ErrCodeNo, nil)
+	// GOAWAY goes through the framer like every other write, so under sc.mu:
+	// the read path writes WINDOW_UPDATE under it, and a teardown during a
+	// download touched the framer from two goroutines (P3-1 of the round-7
+	// review). A deadline of its own: whatever deadline the last write left
+	// may have passed, and a GOAWAY failing on it would spend a TLS record
+	// number before close_notify.
+	// The bound is set under wdMu with closing, so no write of the conn's
+	// own that ends after it puts the owner's deadline back over it.
+	sc.wdMu.Lock()
+	sc.closing = true
+	_ = sc.Conn.SetWriteDeadline(time.Now().Add(stegoCloseBound))
+	sc.wdMu.Unlock()
+	sc.closeOnce.Do(func() { close(sc.closed) })
+	// A write holding sc.mu ends within the bound now; the wait for it is
+	// bounded too, a little past it (P3-8 of the round-10 review). Without
+	// the lock there is no GOAWAY: the framer is not ours to touch.
+	locked := make(chan struct{})
+	go func() {
+		sc.mu.Lock()
+		close(locked)
+	}()
+	select {
+	case <-locked:
+		sc.framer.WriteGoAway(sc.nextStreamID, http2.ErrCodeNo, nil)
+		sc.mu.Unlock()
+	case <-time.After(stegoCloseBound + stegoCloseBound/2):
+		go func() {
+			<-locked
+			sc.mu.Unlock()
+		}()
+	}
+	// A TLS write that failed spent a record number and may have left half
+	// a record on the wire; a close_notify after it reads as "bad record
+	// MAC" at the peer, which then logs a broken session for a close. Shut
+	// the socket under TLS instead: the peer reads the end of the stream.
+	if sc.writeFailed.Load() {
+		if tc, ok := sc.Conn.(interface{ NetConn() net.Conn }); ok {
+			return tc.NetConn().Close()
+		}
+	}
 	return sc.Conn.Close()
 }
 

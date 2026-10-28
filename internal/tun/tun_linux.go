@@ -915,12 +915,26 @@ func (t *TUNDevice) physicalRouteTo(ip net.IP) (*netlink.Route, error) {
 	if err != nil {
 		return nil, fmt.Errorf("route list failed: %w", err)
 	}
+	if best := bestPhysicalRoute(routes, ip, tunIdx); best != nil {
+		return best, nil
+	}
+	return nil, fmt.Errorf("%w to %s", errNoPhysicalRoute, ip)
+}
 
+// bestPhysicalRoute picks the most specific route to ip that does not go
+// through the tunnel (link tunIdx) and whose link is up.
+//
+// A route flagged linkdown carries nothing: the kernel keeps IPv6 routes, and
+// on-link IPv4 ones, on an interface whose carrier went away. Counting them as
+// a path kept the IPv6 family "reachable" through a dead link in the stand's
+// run #5c; the endpoint probe then failed on it, charged a live server, and the
+// client moved to another one for good.
+func bestPhysicalRoute(routes []netlink.Route, ip net.IP, tunIdx int) *netlink.Route {
 	var best *netlink.Route
 	bestOnes := -1
 	for i := range routes {
 		r := &routes[i]
-		if r.LinkIndex == tunIdx || r.LinkIndex <= 0 {
+		if r.LinkIndex == tunIdx || r.LinkIndex <= 0 || r.Flags&unix.RTNH_F_LINKDOWN != 0 {
 			continue
 		}
 		ones := 0
@@ -939,10 +953,7 @@ func (t *TUNDevice) physicalRouteTo(ip net.IP) (*netlink.Route, error) {
 			bestOnes = ones
 		}
 	}
-	if best == nil {
-		return nil, fmt.Errorf("%w to %s", errNoPhysicalRoute, ip)
-	}
-	return best, nil
+	return best
 }
 
 // errNoPhysicalRoute is the definite "this host cannot reach that address off
@@ -1101,7 +1112,16 @@ func (t *TUNDevice) ensureBypass(ip net.IP) {
 	}
 	resolved, err := netlink.RouteGet(ip)
 	if err == nil && len(resolved) > 0 && resolved[0].LinkIndex != link.Attrs().Index {
-		return // still leaving through a physical link, nothing to do
+		// Leaving through a physical link, nothing to pin. If this address
+		// was marked unroutable, re-admit it: this early return used to skip
+		// that, and a family whose route came back without a re-pin (a v4-only
+		// tunnel with a dual-stack pool) stayed excluded from selection.
+		if t.isBypassUnroutable(ip) {
+			if _, perr := t.physicalRouteTo(ip); perr == nil {
+				t.clearBypassUnroutable(ip)
+			}
+		}
+		return
 	}
 	// Traffic to ip would go through the tunnel (or the lookup failed): it wants
 	// a bypass pin. When we already know this family has no physical route, do

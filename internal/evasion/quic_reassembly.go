@@ -1,6 +1,7 @@
 package evasion
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -228,6 +229,25 @@ func (c *QUICReassemblyPacketConn) SetReadDeadline(t time.Time) error {
 // SetWriteDeadline sets write deadline
 func (c *QUICReassemblyPacketConn) SetWriteDeadline(t time.Time) error {
 	return c.PacketConn.SetWriteDeadline(t)
+}
+
+// SetReadBuffer forwards to the wrapped socket, so quic-go can size the UDP
+// receive buffer through this wrapper. SyscallConn is deliberately not
+// forwarded: with it quic-go would also set DF and run path MTU discovery,
+// which changes what goes on the wire.
+func (c *QUICReassemblyPacketConn) SetReadBuffer(bytes int) error {
+	if b, ok := c.PacketConn.(interface{ SetReadBuffer(int) error }); ok {
+		return b.SetReadBuffer(bytes)
+	}
+	return errors.ErrUnsupported
+}
+
+// SetWriteBuffer forwards to the wrapped socket, see SetReadBuffer.
+func (c *QUICReassemblyPacketConn) SetWriteBuffer(bytes int) error {
+	if b, ok := c.PacketConn.(interface{ SetWriteBuffer(int) error }); ok {
+		return b.SetWriteBuffer(bytes)
+	}
+	return errors.ErrUnsupported
 }
 
 // Ensure interface compliance

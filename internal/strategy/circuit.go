@@ -278,6 +278,18 @@ func (cb *CircuitBreaker) BeginHalfOpenAttempt() bool {
 	return true
 }
 
+// CancelHalfOpenAttempt gives back a half-open slot taken by
+// BeginHalfOpenAttempt for an attempt that ended without a verdict on the
+// strategy - a refused port says nothing about the transport. No-op outside
+// half-open.
+func (cb *CircuitBreaker) CancelHalfOpenAttempt() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if cb.state == CircuitHalfOpen && cb.halfOpenCount > 0 {
+		cb.halfOpenCount--
+	}
+}
+
 // Allow is retained for backward compatibility and is equivalent to
 // BeginHalfOpenAttempt: it both checks admission and occupies a half-open slot.
 // Call sites that only need a non-mutating check must use CanTry instead.
@@ -747,6 +759,12 @@ func (m *CircuitBreakerManager) CanTry(strategyID string) bool {
 // BeginHalfOpenAttempt occupies a half-open probe slot right before a real dial.
 func (m *CircuitBreakerManager) BeginHalfOpenAttempt(strategyID string) bool {
 	return m.Get(strategyID).BeginHalfOpenAttempt()
+}
+
+// CancelHalfOpenAttempt gives back a half-open slot; see the method on
+// CircuitBreaker.
+func (m *CircuitBreakerManager) CancelHalfOpenAttempt(strategyID string) {
+	m.Get(strategyID).CancelHalfOpenAttempt()
 }
 
 // RecordSuccess records success for strategy and clears network-down

@@ -43,9 +43,15 @@ func (d *ProtectDialer) Dial(network, address string) (net.Conn, error) {
 }
 
 func (d *ProtectDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
-	if d.Dialer != nil {
-		return d.Dialer.DialContext(ctx, network, address)
+	dialer := d.Dialer
+	if dialer == nil {
+		dialer = &net.Dialer{}
 	}
-	var dialer net.Dialer
-	return dialer.DialContext(ctx, network, address)
+	tcpDialStarted(ctx, network)
+	conn, err := dialer.DialContext(ctx, network, address)
+	if err != nil {
+		return nil, err
+	}
+	tcpConnected(ctx, network, conn)
+	return conn, nil
 }

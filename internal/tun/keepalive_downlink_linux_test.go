@@ -35,9 +35,8 @@ func (c *recordingConn) Close() error                     { return nil }
 // the keepalive and data frame counts the server would have received.
 func runKeepaliveScenario(t *testing.T, downlinkAlive bool) (keepalives, frames int32) {
 	t.Helper()
-	saved := keepaliveInterval
-	keepaliveInterval = 100 * time.Millisecond
-	t.Cleanup(func() { keepaliveInterval = saved })
+	saved := SetKeepaliveInterval(100 * time.Millisecond)
+	t.Cleanup(func() { SetKeepaliveInterval(saved) })
 
 	r, w, err := os.Pipe()
 	if err != nil {

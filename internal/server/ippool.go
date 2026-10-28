@@ -6,8 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
+	"math/rand/v2"
 	"net"
+	"slices"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -81,7 +86,66 @@ type IPPool struct {
 	redis    *redis.Client
 	leases   map[string]*IPLease // In-memory: IP -> Lease
 	byClient map[string]string   // In-memory: ClientID -> IP
+
+	// folded records until when AdoptAll leaves a lease key alone: its old
+	// keys folded (adoptFoldTTL), or a search for them that did not finish
+	// (adoptRetryAfter). Guarded by mu.
+	folded map[string]time.Time
+
+	// busy, when set, names the addresses a session is registered on; a
+	// lease on one is renewed, never reclaimed (SetBusy).
+	busy atomic.Pointer[func(ip string) bool]
 }
+
+// SetBusy tells the pool which addresses a session is registered on. A
+// dynamic lease was renewed only by a handshake, and cleanup and the scan
+// for a free address reclaimed it once its TTL had run, a session on it or
+// not: a session that outlived its lease had its address handed to another
+// client, of another credential too (P2-4 of the round-11 review). A lease
+// a session holds is renewed instead.
+func (p *IPPool) SetBusy(busy func(ip string) bool) { p.busy.Store(&busy) }
+
+// liveLocked reports whether a session is registered on ip. The busy hook
+// takes the TUN's own lock, never the pool's.
+func (p *IPPool) liveLocked(ip string) bool {
+	f := p.busy.Load()
+	return f != nil && (*f)(ip)
+}
+
+// leaseTTL is the lifetime a dynamic lease gets, and a renewal.
+func (p *IPPool) leaseTTL() time.Duration {
+	if p.config.LeaseTime > 0 {
+		return p.config.LeaseTime
+	}
+	return dynamicLeaseTTL
+}
+
+// renewLocked extends a dynamic lease by its lifetime and stores it.
+func (p *IPPool) renewLocked(lease *IPLease) {
+	lease.ExpiresAt = time.Now().Add(p.leaseTTL())
+	if err := p.saveLease(lease); err != nil {
+		log.Warn("Failed to persist renewed lease %s for %s: %v", lease.IP, lease.ClientID, err)
+	}
+}
+
+// adoptFoldTTL is how long a folded lease key is left alone. Old keys are
+// written only by servers before the credential lease, so once folded there is
+// nothing more to find, and each look was up to three Redis GETs (or a SCAN)
+// under the pool lock on every TUN handshake. Not forever: an older exit
+// sharing the same Redis can still write an old key, and this bounds how long
+// that lease waits for its fold.
+const adoptFoldTTL = 10 * time.Minute
+
+// adoptRetryAfter is how long a lease key waits after a search for its old
+// keys that did not finish. Not marking it at all made every TUN handshake of
+// the client pay the search again - up to 64 SCAN rounds on a Redis with more
+// than about 32k keys, where the search never finishes (P3-8 of the round-5
+// review). A minute bounds that to one search per minute per credential.
+const adoptRetryAfter = time.Minute
+
+// adoptFoldMax caps folded. Shared keys carry the client's origin, so the map
+// grows with every address a global-secret client comes from.
+const adoptFoldMax = 4096
 
 // NewIPPool creates a new IP pool manager
 func NewIPPool(cfg IPPoolConfig, redisClient *redis.Client) (*IPPool, error) {
@@ -103,6 +167,12 @@ func NewIPPool(cfg IPPoolConfig, redisClient *redis.Client) (*IPPool, error) {
 	ones, bits := network.Mask.Size()
 	if bits != 32 {
 		return nil, fmt.Errorf("only IPv4 supported")
+	}
+	// A /31 or /32 has no address between network and broadcast: the range
+	// below would wrap, and the scan hand out addresses outside the network
+	// (finding 3 of the round-13 review).
+	if ones > 30 {
+		return nil, fmt.Errorf("IP pool %s is too small: a /30 at least", cfg.Network)
 	}
 
 	// Optional dual-stack prefix. Validated here (fails server startup via
@@ -154,7 +224,13 @@ func NewIPPool(cfg IPPoolConfig, redisClient *redis.Client) (*IPPool, error) {
 		log.Warn("Failed to load IP leases: %v", err)
 	}
 
-	poolSize := int(endIP-startIP+1) - len(reserved)
+	// Reserved addresses outside start..end (network, broadcast) take no slot.
+	poolSize := int(endIP - startIP + 1)
+	for ip := range reserved {
+		if ip >= startIP && ip <= endIP {
+			poolSize--
+		}
+	}
 	if networkV6 != nil {
 		log.Info("IP Pool initialized: %s (size=%d, server=%s) + dual-stack %s (server=%s)",
 			cfg.Network, poolSize, cfg.ServerIP, networkV6, pool.ServerIP6())
@@ -448,11 +524,243 @@ func (p *IPPool) stickyLookup(clientID string) string {
 	return ip
 }
 
+// AdoptAll folds the leases held under oldKeys, and under every key that
+// starts with one of oldPrefixes, into newKey: if newKey has no lease, the first
+// old one found moves to it and the client keeps its address; every other old
+// lease is released. It is the carry-over for a client whose lease key changed
+// spelling between releases (see legacyAllocationKeys), and it leaves no lease
+// behind under an old key.
+//
+// The Redis part of the prefix search runs outside the pool lock and stops
+// with ctx: a SCAN walks the whole keyspace whatever its MATCH, and under the
+// lock a reconnect herd of cold credentials queued every allocation behind
+// it. A search that did not finish - cut short, failed, or past its round
+// limit - does not mark the key folded: the next look comes after
+// adoptRetryAfter, not on the next handshake.
+//
+// busy, when set, names addresses a session holds right now; a lease on one
+// is left where it is. An old key is not always old: "global@<origin>" is
+// also the live key of a client on the global secret straight to this exit,
+// or behind a 1.11.8 relay, and adopting it gave a relayed client at the
+// same origin that client's address while it was in use (P2-5 of the
+// round-10 review). A search that left one is not marked folded either.
+func (p *IPPool) AdoptAll(ctx context.Context, oldKeys, oldPrefixes []string, newKey string, busy func(ip string) bool) {
+	if newKey == "" {
+		return
+	}
+	now := time.Now()
+	p.mu.Lock()
+	until, ok := p.folded[newKey]
+	p.mu.Unlock()
+	if ok && now.Before(until) {
+		return
+	}
+	var stored []string
+	complete := true
+	for _, prefix := range oldPrefixes {
+		keys, done := p.scanClientKeys(ctx, prefix)
+		stored = append(stored, keys...)
+		complete = complete && done
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	defer func() {
+		if complete {
+			p.markFolded(newKey, now, now.Add(adoptFoldTTL))
+		} else {
+			p.markFolded(newKey, now, now.Add(adoptRetryAfter))
+		}
+	}()
+	have := p.stickyLookup(newKey)
+	for _, prefix := range oldPrefixes {
+		for _, k := range append(p.memoryKeysWithPrefix(prefix), stored...) {
+			if strings.HasPrefix(k, prefix) && !slices.Contains(oldKeys, k) {
+				oldKeys = append(oldKeys, k)
+			}
+		}
+	}
+	for _, oldKey := range oldKeys {
+		if oldKey == "" || oldKey == newKey {
+			continue
+		}
+		ip := p.stickyLookup(oldKey)
+		if ip == "" {
+			continue
+		}
+		if busy != nil && busy(ip) {
+			complete = false
+			continue
+		}
+		lease := p.leases[ip]
+		delete(p.byClient, oldKey)
+		if p.redis != nil {
+			p.redis.Del(context.Background(), p.redisClientKey(oldKey))
+		}
+		if lease == nil || lease.ClientID != oldKey {
+			continue
+		}
+		if have == "" {
+			lease.ClientID = newKey
+			if err := p.saveLease(lease); err != nil {
+				log.Warn("Failed to persist lease %s moved from %s to %s: %v", ip, oldKey, newKey, err)
+				continue
+			}
+			have = ip
+			log.Info("Lease %s moved from %s to %s", ip, oldKey, newKey)
+			continue
+		}
+		p.deleteLease(ip)
+		log.Info("Lease %s under %s released: the client holds %s under %s", ip, oldKey, have, newKey)
+	}
+}
+
+// TakeOver moves the lease on ip to newKey from a key that starts with
+// prefix, and reports whether it did. Not when newKey already holds a lease,
+// nor when ip is leased to anything else. The caller decides that the lease
+// is free to take: no session holds it.
+func (p *IPPool) TakeOver(ip net.IP, prefix, newKey string) bool {
+	if ip == nil || prefix == "" || newKey == "" {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.stickyLookup(newKey) != "" {
+		return false
+	}
+	ipStr := ip.String()
+	lease := p.leases[ipStr]
+	if lease == nil || lease.ClientID == newKey || !strings.HasPrefix(lease.ClientID, prefix) {
+		return false
+	}
+	oldKey := lease.ClientID
+	delete(p.byClient, oldKey)
+	if p.redis != nil {
+		p.redis.Del(context.Background(), p.redisClientKey(oldKey))
+	}
+	lease.ClientID = newKey
+	if err := p.saveLease(lease); err != nil {
+		log.Warn("Failed to persist lease %s taken over from %s by %s: %v", ipStr, oldKey, newKey, err)
+		return false
+	}
+	log.Info("Lease %s taken over from %s by %s: the address its client asked for", ipStr, oldKey, newKey)
+	return true
+}
+
+// markFolded leaves newKey alone until until. Caller must hold p.mu.
+func (p *IPPool) markFolded(newKey string, now, until time.Time) {
+	if p.folded == nil {
+		p.folded = make(map[string]time.Time)
+	}
+	if len(p.folded) >= adoptFoldMax {
+		maps.DeleteFunc(p.folded, func(_ string, u time.Time) bool { return !now.Before(u) })
+		if len(p.folded) >= adoptFoldMax {
+			// Still full of live records: drop the half closest to running
+			// out, not all of them. Clearing the map let every key search
+			// again at once under churn, the very throttle this map is for
+			// (P3-12 of the round-6 review).
+			// By count, not by a cut time: with records tied on their end, a
+			// cut deleted none (P3-12 of the round-7 review).
+			keys := slices.SortedFunc(maps.Keys(p.folded), func(a, b string) int {
+				return p.folded[a].Compare(p.folded[b])
+			})
+			for _, k := range keys[:len(keys)/2] {
+				delete(p.folded, k)
+			}
+		}
+	}
+	p.folded[newKey] = until
+}
+
+// adoptScanBatch and adoptScanRounds bound the Redis SCAN of
+// scanClientKeys: a few hundred keys per round, and a stop well past any
+// keyspace an exit holds (leases, client keys, the registry) rather than a walk
+// of whatever else shares the Redis.
+const (
+	adoptScanBatch  = 512
+	adoptScanRounds = 64
+	// adoptScanTimeout bounds the whole search for one handshake.
+	adoptScanTimeout = 2 * time.Second
+)
+
+// memoryKeysWithPrefix returns the client keys this process holds that
+// start with prefix. Caller must hold p.mu.
+func (p *IPPool) memoryKeysWithPrefix(prefix string) []string {
+	if prefix == "" {
+		return nil
+	}
+	var out []string
+	for k := range p.byClient {
+		if strings.HasPrefix(k, prefix) {
+			out = append(out, k)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// scanClientKeys returns the client keys in Redis that start with prefix: a
+// pool outside 10.0.0.0/8 does not load them at startup (see
+// leaseKeyPattern). Without p.mu. complete is false when the search stopped
+// early - ctx, an error, or the round limit - and the list may then miss
+// keys.
+func (p *IPPool) scanClientKeys(ctx context.Context, prefix string) (keys []string, complete bool) {
+	if prefix == "" || p.redis == nil {
+		return nil, true
+	}
+	ns := p.redisClientKey("")
+	match := ns + globEscape(prefix) + "*"
+	var cursor uint64
+	for range adoptScanRounds {
+		batch, next, err := p.redis.Scan(ctx, cursor, match, adoptScanBatch).Result()
+		if err != nil {
+			log.Warn("IP pool: scanning for leases under %s*: %v", prefix, err)
+			return keys, false
+		}
+		for _, k := range batch {
+			keys = append(keys, strings.TrimPrefix(k, ns))
+		}
+		if cursor = next; cursor == 0 {
+			return keys, true
+		}
+	}
+	log.Warn("IP pool: scanning for leases under %s* stopped after %d rounds", prefix, adoptScanRounds)
+	return keys, false
+}
+
+// globEscape quotes the characters a Redis MATCH pattern treats as special.
+func globEscape(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if strings.ContainsRune(`*?[]\`, r) {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
 // Allocate allocates an IP address for a client
 // If requestedIP is provided and available, it will be used
 // If clientID already has a lease, returns existing IP
 // Otherwise allocates a new IP from the pool
 func (p *IPPool) Allocate(clientID string, requestedIP net.IP, hostname string) (net.IP, error) {
+	return p.allocate(clientID, requestedIP, hostname, nil)
+}
+
+// AllocateAvoiding is Allocate with no request, whose free-address scan
+// passes avoid over: a client whose request was refused (sharedTagRequest)
+// must not be handed the address it asked for by the pool instead. The scan
+// starts at a random point of the pool (refusedScanFrom).
+func (p *IPPool) AllocateAvoiding(clientID string, avoid net.IP) (net.IP, error) {
+	return p.allocate(clientID, nil, "", avoid)
+}
+
+// refusedScanFrom draws where in a pool of n addresses the scan for a
+// refused request starts. A var so a test can fix it.
+var refusedScanFrom = func(n uint64) uint64 { return rand.Uint64N(n) }
+
+func (p *IPPool) allocate(clientID string, requestedIP net.IP, hostname string, avoid net.IP) (net.IP, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -473,7 +781,7 @@ func (p *IPPool) Allocate(clientID string, requestedIP net.IP, hostname string) 
 					LeasedAt: time.Now(),
 				}
 			}
-			if lease.ExpiresAt.IsZero() || time.Now().Before(lease.ExpiresAt) {
+			if lease.ExpiresAt.IsZero() || time.Now().Before(lease.ExpiresAt) || p.liveLocked(existingIP) {
 				// Renew/refresh the lease so it does not expire mid-session.
 				if !lease.ExpiresAt.IsZero() {
 					if p.config.LeaseTime > 0 {
@@ -532,7 +840,10 @@ func (p *IPPool) Allocate(clientID string, requestedIP net.IP, hostname string) 
 					if err := p.saveLease(lease); err != nil {
 						return nil, err
 					}
-					return requestedIP, nil
+					// A copy: the request is usually a slice of the
+					// handshake's read buffer, which the next frame
+					// overwrites, and the session keeps the address.
+					return slices.Clone(requestedIP), nil
 				}
 				// Collision: the requested IP is held by a DIFFERENT clientID. We
 				// must NOT hand it out twice, so we fall through to auto-allocation
@@ -552,8 +863,19 @@ func (p *IPPool) Allocate(clientID string, requestedIP net.IP, hostname string) 
 		}
 	}
 
-	// Find a free IP
-	for ipUint := p.startIP; ipUint <= p.endIP; ipUint++ {
+	// Find a free IP. For a refused request (avoid) from a random point of
+	// the pool on: from the bottom it got the address right after the
+	// default, from the top .254, and a box configured with -tun-ip on
+	// either then took it over (finding 2 of the round-12 review, finding 5
+	// of the round-13 one). This lowers the odds; it does not tell boxes
+	// apart.
+	n := uint64(p.endIP-p.startIP) + 1
+	var from uint64
+	if avoid != nil {
+		from = refusedScanFrom(n)
+	}
+	for i := range n {
+		ipUint := p.startIP + uint32((from+i)%n)
 		if p.reserved[ipUint] {
 			continue
 		}
@@ -561,16 +883,20 @@ func (p *IPPool) Allocate(clientID string, requestedIP net.IP, hostname string) 
 		ip := make(net.IP, 4)
 		binary.BigEndian.PutUint32(ip, ipUint)
 		ipStr := ip.String()
+		if avoid != nil && ip.Equal(avoid) {
+			continue
+		}
 
 		// Check if already leased
 		if lease, ok := p.leases[ipStr]; ok {
-			// Check if lease expired
-			if !lease.ExpiresAt.IsZero() && time.Now().After(lease.ExpiresAt) {
-				// Expired, can reuse
-				p.deleteLease(ipStr)
-			} else {
+			switch {
+			case lease.ExpiresAt.IsZero() || !time.Now().After(lease.ExpiresAt):
 				continue // Still valid
+			case p.liveLocked(ipStr):
+				p.renewLocked(lease) // run out under a live session: renewed
+				continue
 			}
+			p.deleteLease(ipStr) // Expired, can reuse
 		}
 
 		// Found free IP
@@ -692,7 +1018,18 @@ func (p *IPPool) CleanupExpired() int {
 	cleaned := 0
 
 	for ip, lease := range p.leases {
-		if !lease.ExpiresAt.IsZero() && now.After(lease.ExpiresAt) {
+		if lease.ExpiresAt.IsZero() {
+			continue
+		}
+		if p.liveLocked(ip) {
+			// A lease a session holds is renewed before it runs out, in
+			// Redis too, whose key would otherwise expire by itself.
+			if time.Until(lease.ExpiresAt) < p.leaseTTL()/2 {
+				p.renewLocked(lease)
+			}
+			continue
+		}
+		if now.After(lease.ExpiresAt) {
 			p.deleteLease(ip)
 			cleaned++
 		}

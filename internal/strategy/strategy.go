@@ -1,22 +1,30 @@
 package strategy
 
 import (
+	"cmp"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
+	"math"
+	"math/rand/v2"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/endpoint"
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/mux"
 	"github.com/tiredvpn/tiredvpn/internal/porthopping"
+	"github.com/tiredvpn/tiredvpn/internal/protect"
 	"github.com/tiredvpn/tiredvpn/internal/shaper"
 	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 )
@@ -109,11 +117,13 @@ type Manager struct {
 	reprobeInterval time.Duration
 	stopReprobe     chan struct{}
 	reprobeRunning  bool
+	reprobeHeld     atomic.Bool // see HoldReprobe
 
 	// Emergency re-probe (for network recovery)
 	emergencyReprobeRunning bool
 	emergencyReprobeStop    chan struct{}
 	lastEmergencyReprobe    time.Time
+	emergencyInterval       time.Duration // mean pause between emergency reprobes
 
 	// Manager lifecycle. Background goroutines the manager spawns on its own
 	// (e.g. the emergency reprobe fired from a failed scan) hang off lifeCtx so
@@ -152,6 +162,16 @@ type Manager struct {
 	fastReconnectFirst    time.Time
 	fastReconnectLast     time.Time // when the previous counted attempt happened
 
+	// swallowed is, per server (swallowKey), the run of reconnect cycles that
+	// ended with no verdict because a connected handshake heard nothing (see
+	// swallowCycle). Guarded by m.mu.
+	swallowed map[string]*swallowRecord
+
+	// unansweredHS is, per server (swallowKey), the run of session
+	// handshakes that went unanswered after their transport had connected
+	// (HandshakeUnanswered). Guarded by m.mu.
+	unansweredHS map[string]*handshakeRun
+
 	// Connectivity checker for pre-flight checks
 	connectivityChecker  *ConnectivityChecker
 	excludeUDPStrategies bool // Temporarily exclude UDP-based strategies if UDP is blocked
@@ -178,6 +198,29 @@ type Manager struct {
 	// signal rather than a one-off reset. Reset on any successful connect.
 	// Guarded by m.mu.
 	consecutiveConnectFailures int
+
+	// preflightArmed makes the next Connect run the pre-flight gate even on
+	// the hot reconnect path. Set by NoteServerSilent when the tunnel died of
+	// silence; cleared by the gate run it causes. Guarded by m.mu.
+	preflightArmed bool
+
+	// lastDeath is the last verdict a session or a cycle gave a server (see
+	// routeDeath); server -1 when a useful session has ended since. Guarded by
+	// m.mu.
+	lastDeath deathMark
+
+	// routeParked holds, per server (endpoint index), the transports a
+	// route verdict set aside there and until when (routeDeath). Guarded by
+	// m.mu.
+	routeParked map[int]map[string]time.Time
+
+	// Strategy upgrade (see offerUpgrade). upgradeCallback receives the
+	// candidates a periodic reprobe found working; upgradeFails counts each
+	// strategy's consecutive failed upgrade dials and upgradeSkip how many more
+	// reprobes it sits out. Guarded by m.mu.
+	upgradeCallback func([]Strategy)
+	upgradeFails    map[string]int
+	upgradeSkip     map[string]int
 
 	// Android mode - deprioritize QUIC/UDP strategies
 	androidMode bool
@@ -235,6 +278,301 @@ const (
 // "nothing was eligible", which say nothing about the address.
 var errStrategyScanFailed = errors.New("all strategies failed")
 
+// errAddrRefused is the verdict that the address's port is closed: a TCP
+// strategy's dial to it came back with ECONNREFUSED, and kept doing so through
+// refusalRetries. Every TCP transport rides that one port, so the next strategy
+// in the list cannot do better, and the failure says nothing about the strategy
+// that met it. A server being restarted refuses for half a second; walking the
+// list through that half second used to land the client on whichever strategy
+// happened to be dialling when the port reopened - HTTP Polling, on the stand
+// and in production.
+//
+// Errors carrying it also carry errStrategyScanFailed: a port that stays
+// closed is an endpoint verdict, and the walk moves on to the next candidate.
+var errAddrRefused = errors.New("address refused the connection")
+
+// refusalRetries is how long a refused strategy waits before dialling the same
+// address again, one entry per retry. 1.75 s in all: a restart (0.4-0.6 s on
+// the stand) is over within it, a stopped server is not.
+var refusalRetries = []time.Duration{250 * time.Millisecond, 500 * time.Millisecond, time.Second}
+
+// connectThroughRefusal dials s with an attempt limit, and when the address
+// refuses, waits and dials it again per refusalRetries. refused reports that
+// the last answer was still a refusal.
+//
+// dialLimit, when shorter than limit, is how long the attempt may wait for its
+// TCP connect. An attempt whose connect is up by then runs on to limit: its
+// handshake is under way, and cutting it is how a REALITY handshake that needs
+// 7-9 s (a slow path, a server reaching its cover domain) lost the cycle to
+// HTTP Polling. Only dials through protect.ProtectDialer report the connect;
+// a strategy dialling on its own is held to dialLimit as a whole, and so is
+// every attempt under swallow pressure (scan.held, see swallowPressure).
+func (m *Manager) connectThroughRefusal(ctx context.Context, s Strategy, target string, limit, dialLimit time.Duration, scan *scanState) (conn net.Conn, latency time.Duration, refused bool, err error) {
+	_, reporter := s.(connectReporter)
+	held := scan.held && dialLimit > 0 && dialLimit < limit
+	if !reporter && dialLimit > 0 {
+		limit, dialLimit = attemptLimit(s, limit, dialLimit), 0
+	}
+	scan.heldSilent, scan.limit = false, limit
+	for i := 0; ; i++ {
+		connectCtx, cancel := context.WithTimeout(ctx, limit)
+		phase := watchConnect(connectCtx, cancel, limit, dialLimit, reporter, held)
+		start := time.Now()
+		conn, err = s.Connect(phase.ctx, target)
+		latency = time.Since(start)
+		phase.stop()
+		cancel()
+		switch {
+		case err == nil:
+		case phase.wasCut():
+			err = fmt.Errorf("%w: %w", errTCPConnectCut, err)
+		case phase.neverDialled():
+			err = fmt.Errorf("%w: %w", errNotDialled, err)
+		}
+		// How long the attempt had to hear an answer: since its TCP connect
+		// when that is known, else its whole run.
+		scan.allowance = latency
+		if at := phase.connectedAt.Load(); at != 0 {
+			scan.allowance = time.Since(time.Unix(0, at))
+		}
+		switch {
+		case err != nil && phase.heldCut() && !isUDPBasedStrategy(s):
+			// Held to its share and cut with its handshake not through: it
+			// counts on less evidence than a whole cycle, the swallow
+			// pressure being the rest of it, and its silence is read
+			// against the share.
+			scan.connectedSilent = append(scan.connectedSilent, s.ID())
+			scan.heldSilent, scan.limit = true, dialLimit
+		case err != nil && phase.connected() && heardNothing(err, latency, limit) &&
+			phase.extended() && m.swallowEvidence(s, scan.allowance):
+			scan.connectedSilent = append(scan.connectedSilent, s.ID())
+		}
+		if err == nil || isUDPBasedStrategy(s) || !refusedByAddr(err, target, m.GetServerAddr(ctx)) {
+			return conn, latency, false, err
+		}
+		if i >= len(refusalRetries) {
+			return nil, latency, true, err
+		}
+		if i == 0 {
+			log.Info("%s: %s refused the connection - waiting for the port instead of trying other transports on it", s.Name(), target)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, latency, true, err
+		case <-time.After(refusalRetries[i]):
+		}
+	}
+}
+
+// attemptLimit is how long connectThroughRefusal lets one attempt of s run:
+// limit, or dialLimit as a whole for a strategy that does not report its TCP
+// connect. Its silence is read against the same figure: read against limit,
+// an attempt cut at half of it never burned "nearly all of its budget", and a
+// cut that came back as "use of closed network connection" counted as an
+// answer.
+func attemptLimit(s Strategy, limit, dialLimit time.Duration) time.Duration {
+	if _, ok := s.(connectReporter); ok || dialLimit <= 0 {
+		return limit
+	}
+	return min(limit, dialLimit)
+}
+
+// connectReporter marks a strategy whose Connect dials the server only through
+// protect.ProtectDialer, so the manager hears when its TCP connect is up (see
+// connectThroughRefusal). A strategy without it gives no such signal, and a cut
+// at the dial limit could land in the middle of its handshake.
+type connectReporter interface{ reportsTCPConnect() }
+
+func (*REALITYStrategy) reportsTCPConnect()     {}
+func (*SeqovlStrategy) reportsTCPConnect()      {}
+func (*HTTP2StegoStrategy) reportsTCPConnect()  {}
+func (*HTTPPollingStrategy) reportsTCPConnect() {}
+
+// Connect phases of one attempt, see watchConnect.
+const (
+	phaseLocal     int32 = iota // no TCP dial out yet: a local wait, a handshake gate
+	phaseDialling               // the TCP dial is out
+	phaseConnected              // the TCP connect is up, the handshake under way
+	phaseCut                    // cut at the dial limit while dialling
+	phaseCutLocal               // cut at the dial limit before any dial went out
+	phaseHeldCut                // held to its share, connected, and cut there: its handshake had not got through
+)
+
+// connectPhase follows one attempt through its TCP connect.
+type connectPhase struct {
+	ctx         context.Context
+	state       atomic.Int32
+	timer       *time.Timer
+	split       bool
+	tracked     bool         // the strategy reports its dial, so state is known
+	connectedAt atomic.Int64 // UnixNano of the TCP connect, 0 before
+	conn        atomic.Pointer[net.Conn]
+}
+
+// dialCutTimer arms an attempt's dialLimit cut. A var so a test can fire the
+// cut itself rather than race a wall-clock budget under load.
+var dialCutTimer = time.AfterFunc
+
+// watchConnect follows an attempt on ctx, whose cancel is cancel, through its
+// TCP dial when the strategy reports it (hooked), and arms the dialLimit cut
+// of connectThroughRefusal. Without a split (dialLimit zero or not shorter
+// than limit) the attempt simply runs to limit.
+//
+// hold says the attempt is held to its share (scanState.held): at dialLimit
+// a connected attempt is cut too, unless its handshake has got through - the
+// server answered, or acknowledged all it was sent (handshakeProgressed). A
+// server that is slow to answer - 7-9 s through a bad mobile link, or
+// reaching its cover - still acknowledges at once; a censor that drops the
+// ClientHello, as the fix13c stand did, never lets it get there. The share
+// was a cut whatever the progress, and a slow but live handshake was killed
+// every cycle (P2-4 of the round-10 review).
+func watchConnect(ctx context.Context, cancel context.CancelFunc, limit, dialLimit time.Duration, hooked, hold bool) *connectPhase {
+	p := &connectPhase{ctx: ctx}
+	if !hooked {
+		return p
+	}
+	p.tracked = true
+	p.ctx = protect.WithDialHooks(ctx,
+		func() {
+			// A dial after a connect - Stego's second try without ECH - is
+			// a TCP connect still to come, and the dial limit bounds it too.
+			if !p.state.CompareAndSwap(phaseLocal, phaseDialling) {
+				p.state.CompareAndSwap(phaseConnected, phaseDialling)
+			}
+		},
+		func(c net.Conn) {
+			p.conn.Store(&c)
+			p.connectedAt.Store(time.Now().UnixNano())
+			p.state.CompareAndSwap(phaseLocal, phaseConnected)
+			p.state.CompareAndSwap(phaseDialling, phaseConnected)
+		})
+	if dialLimit <= 0 || dialLimit >= limit {
+		return p
+	}
+	p.split = true
+	p.timer = dialCutTimer(dialLimit, func() {
+		if p.state.CompareAndSwap(phaseDialling, phaseCut) || p.state.CompareAndSwap(phaseLocal, phaseCutLocal) {
+			cancel()
+			return
+		}
+		if hold && p.state.Load() == phaseConnected {
+			if c := p.conn.Load(); c != nil && handshakeProgressed(*c) {
+				return
+			}
+			if p.state.CompareAndSwap(phaseConnected, phaseHeldCut) {
+				cancel()
+			}
+		}
+	})
+	return p
+}
+
+// heldCut reports an attempt held to its share and cut there, connected,
+// with its handshake not through.
+func (p *connectPhase) heldCut() bool { return p.state.Load() == phaseHeldCut }
+
+func (p *connectPhase) stop() {
+	if p.timer != nil {
+		p.timer.Stop()
+	}
+}
+
+// extended reports an attempt allowed past dialLimit once connected.
+func (p *connectPhase) extended() bool { return p.split }
+
+func (p *connectPhase) connected() bool { return p.state.Load() == phaseConnected }
+
+// wasCut reports an attempt stopped at dialLimit with its TCP dial out and no
+// connect.
+func (p *connectPhase) wasCut() bool { return p.state.Load() == phaseCut }
+
+// neverDialled reports an attempt of a strategy that reports its dial which
+// ended - cut at dialLimit, out of time, or failed - before its TCP dial went
+// out at all.
+func (p *connectPhase) neverDialled() bool {
+	st := p.state.Load()
+	return p.tracked && (st == phaseLocal || st == phaseCutLocal)
+}
+
+// errNotDialled marks an attempt that ended while it was still waiting on the
+// client - REALITY queued at its per-SNI handshake gate - with no packet sent.
+// It says nothing about the address.
+var errNotDialled = errors.New("cut before any TCP dial went out")
+
+// errTCPConnectCut marks an attempt cut at its dial limit before its TCP
+// connect completed: a dial timeout, whatever the strategy made of the
+// cancellation.
+var errTCPConnectCut = tcpConnectCut{}
+
+type tcpConnectCut struct{}
+
+func (tcpConnectCut) Error() string   { return "no TCP connect within the attempt's dial limit" }
+func (tcpConnectCut) Timeout() bool   { return true }
+func (tcpConnectCut) Temporary() bool { return true }
+
+// refusedScan is the error a scan ends with when the address kept refusing.
+func refusedScan(target string, err error) error {
+	log.Warn("Address %s refused every connection for %v - port closed", target, sumDurations(refusalRetries))
+	return fmt.Errorf("%w: %w: %w", errAddrRefused, errStrategyScanFailed, err)
+}
+
+func sumDurations(ds []time.Duration) time.Duration {
+	var total time.Duration
+	for _, d := range ds {
+		total += d
+	}
+	return total
+}
+
+// refusedByAddr reports whether err is a refused dial to one of addrs. The
+// address check keeps a refusal from somewhere else - a relay, another port -
+// from being read as a verdict about the server. A name instead of an IP in
+// addrs (a single-server client configured by hostname) matches on the port.
+func refusedByAddr(err error, addrs ...string) bool {
+	if !errors.Is(err, syscall.ECONNREFUSED) {
+		return false
+	}
+	opErr, ok := errors.AsType[*net.OpError](err)
+	if !ok || opErr.Op != "dial" || opErr.Addr == nil {
+		return false
+	}
+	gotHost, gotPort, err := net.SplitHostPort(opErr.Addr.String())
+	if err != nil {
+		return false
+	}
+	gotIP := net.ParseIP(gotHost)
+	for _, a := range addrs {
+		host, port, err := net.SplitHostPort(a)
+		if err != nil || port != gotPort {
+			continue
+		}
+		ip := net.ParseIP(host)
+		if ip == nil || ip.Equal(gotIP) {
+			return true
+		}
+	}
+	return false
+}
+
+// ErrNoServerAnswered is the pre-flight gate's verdict that it walked every
+// address it was given and not one completed a TCP handshake. It is about the
+// path to the whole pool, not about any strategy or any one endpoint: the
+// caller decides whether that means "no network" or "servers unreachable from
+// this network", and in neither case does backing off longer help it notice
+// the moment one of them answers again.
+var ErrNoServerAnswered = errors.New("no connectivity to server")
+
+// ErrAddrSilent is errAddrSilent for callers outside the package: the cycle
+// ended because an address answered no transport.
+var ErrAddrSilent = errAddrSilent
+
+// ErrCycleUnanswered marks a connect cycle that ended with no verdict on the
+// address while the transports it dialled heard nothing back: a swallowed
+// handshake that used up the cycle, a cut attempt. Not silence yet (one cycle
+// is never a verdict), but nothing a longer backoff helps with either: the
+// reconnect loop caps its backoff as it does for silence.
+var ErrCycleUnanswered = errors.New("connect cycle heard nothing back")
+
 // errAddrSilent narrows errStrategyScanFailed: the scan was abandoned because
 // the address accepted connections and then answered nothing, on one transport
 // after another. Every failure was a timeout at connectTimeout - no refusal, no
@@ -265,10 +603,158 @@ func silenceLatency(connectTimeout time.Duration) time.Duration {
 	return connectTimeout - connectTimeout/10
 }
 
+// attemptBudget is how long a strategy attempt started now can really run: the
+// connect timeout, unless the caller's context runs out first. The reconnect
+// loop gives a whole cycle 15 seconds and a single attempt is allowed 30, so
+// measuring silence against the 30 never fired - the deadline cut the attempt
+// at 15 and the scan read that as an answer.
+func (m *Manager) attemptBudget(ctx context.Context) time.Duration {
+	budget := m.connectTimeout
+	if dl, ok := ctx.Deadline(); ok {
+		budget = min(budget, time.Until(dl))
+	}
+	return budget
+}
+
+// addrUnreachable reports a dial that went out and found no host: nothing came
+// back from the server, and every transport aimed at the same address meets
+// the same wall. On a shared segment a dead host shows up exactly like this,
+// after the kernel's neighbour discovery gives up, rather than as a timeout.
+//
+// ENETUNREACH is not in it: that is the local stack with no route at all, the
+// client's network rather than the server, and charging the address for it
+// parked live servers whenever the link was down (the selector already reads
+// it as local, see ProbeCurrent).
+func addrUnreachable(err error) bool {
+	return errors.Is(err, syscall.EHOSTUNREACH)
+}
+
+// heardNothing reports whether a failed attempt is evidence of silence: a
+// timeout, an attempt that burned (nearly) its whole budget whatever its error
+// says, or a dial that could not reach the address.
+func heardNothing(err error, latency, budget time.Duration) bool {
+	return isTimeoutError(err) || latency >= silenceLatency(budget) || addrUnreachable(err)
+}
+
+// attemptSilence is what one failed attempt says about the address.
+type attemptSilence int
+
+const (
+	attemptAnswered     attemptSilence = iota // a refusal, a reset, a rejected handshake
+	attemptSilent                             // heard nothing: counts toward the silence verdict
+	attemptInconclusive                       // cut short by a shortened budget after TCP connected
+	attemptNotDialled                         // cut while still waiting locally: nothing went out
+)
+
+// classifyAttempt reads a failed attempt. heardNothing is the base; an attempt
+// whose budget was shortened below connectTimeout (half of a short cycle) is
+// silence only if the TCP connect itself never completed - a dial timeout or
+// an unreachable host. A handshake still waiting when the shortened budget ran
+// out heard nothing in less time than a server is given to answer, so it is
+// no verdict either way: counting it parked live servers whose Polling
+// handshake simply needed a couple of seconds.
+func (m *Manager) classifyAttempt(err error, latency, budget time.Duration) attemptSilence {
+	if errors.Is(err, errNotDialled) {
+		return attemptNotDialled
+	}
+	if !heardNothing(err, latency, budget) {
+		return attemptAnswered
+	}
+	if budget < m.connectTimeout && !dialNeverConnected(err) {
+		return attemptInconclusive
+	}
+	return attemptSilent
+}
+
+// dialNeverConnected reports a failure in the TCP connect itself: a dial that
+// timed out, or a host that could not be reached.
+func dialNeverConnected(err error) bool {
+	if addrUnreachable(err) || errors.Is(err, errTCPConnectCut) {
+		return true
+	}
+	opErr, ok := errors.AsType[*net.OpError](err)
+	return ok && opErr.Op == "dial" && opErr.Timeout()
+}
+
+// scanOutOfTime ends a scan whose context ran out.
+//
+// Two silent transports at least: one swallowed handshake is a property of that
+// transport (a censor that resets or eats only REALITY's), not of the address.
+//
+// A deadline that fell while the address had answered nothing is the silence
+// verdict, reached the slow way: the caller's budget ran out before
+// tcpFailuresBeforeQUIC transports could each time out. Reporting it as a plain
+// context error left the address unpunished, so the next cycle dialled the same
+// silent server with the same result.
+func scanOutOfTime(ctx context.Context, target string, scan *scanState, lastErr error) error {
+	err := ctxErr(ctx)
+	if errors.Is(err, context.DeadlineExceeded) && !scan.answered && scan.timeouts >= 2 {
+		log.Info("Address %s answered nothing on %d transports before the connect budget ran out",
+			target, scan.timeouts)
+		if lastErr == nil {
+			lastErr = err
+		}
+		return fmt.Errorf("%w: %w, last error: %w", errAddrSilent, errStrategyScanFailed, lastErr)
+	}
+	log.Warn("Connection cancelled by context")
+	return err
+}
+
+// ctxErr is ctx.Err(), except that a deadline already behind us reads as
+// context.DeadlineExceeded even before the context's own timer has fired.
+//
+// That timer runs on its own and can be late. A dial bounded by the same
+// deadline comes back with "i/o timeout" from the netpoller first, and under
+// load the scan then found ctx.Err() still nil: the last transport's silence
+// read as an ordinary failure, the endpoint walk moved to the next server on a
+// context about to expire, and the cycle ended with no verdict at all.
+func ctxErr(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if dl, ok := ctx.Deadline(); ok && !time.Now().Before(dl) {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
 // preflightFailThreshold is how many consecutive failed connects must pile up
 // before Connect re-arms the blocking pre-flight connectivity check. See
 // Manager.consecutiveConnectFailures.
 const preflightFailThreshold = 2
+
+// hasUDPStrategies reports whether any registered strategy rides UDP - the
+// only reason to spend a UDP probe on the gate.
+func (m *Manager) hasUDPStrategies() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return slices.ContainsFunc(m.strategies, isUDPBasedStrategy)
+}
+
+// NoteServerSilent tells the manager the tunnel died because the server went
+// quiet - a read deadline, not a reset or an EOF.
+//
+// The hot reconnect path skips the pre-flight gate on the theory that a server
+// which just reset us is back in a moment and the real connect reaches it
+// first. Silence is the opposite case: the address may be gone, and every
+// strategy dialled at it burns the reconnect budget on a SYN nobody answers.
+// The gate walks the whole pool for the price of a few TCP handshakes and pins
+// whatever answers, so the next Connect runs it instead of waiting for
+// preflightFailThreshold failed cycles - on the stand that was 42 seconds of
+// outage spent before the gate was allowed to look.
+func (m *Manager) NoteServerSilent() {
+	m.mu.Lock()
+	m.preflightArmed = true
+	m.mu.Unlock()
+}
+
+// PreflightArmed reports whether the next Connect runs the pre-flight gate
+// regardless of the hot-path rule (see NoteServerSilent).
+func (m *Manager) PreflightArmed() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.preflightArmed
+}
 
 // recordConnectResult tracks the consecutive-failure streak that gates the
 // pre-flight connectivity check on reconnect.
@@ -417,9 +903,11 @@ func NewManager() *Manager {
 		circuitBreakers:       NewCircuitBreakerManager(DefaultCircuitBreakerConfig()),
 		stormDetector:         NewStormDetector(StormConfig{}),
 		reprobeInterval:       5 * time.Minute,
+		emergencyInterval:     30 * time.Second,
 		stopReprobe:           make(chan struct{}),
 		tcpFailuresBeforeQUIC: 3, // Switch to QUIC after 3 TCP timeouts
 		tlsSessionCache:       tls.NewLRUClientSessionCache(64),
+		lastDeath:             deathMark{server: -1},
 	}
 	m.lifeCtx, m.lifeCancel = context.WithCancel(context.Background())
 	log.Debug("Strategy Manager created (probeTimeout=%v, connectTimeout=%v, maxRetries=%d)",
@@ -583,6 +1071,18 @@ func isUDPBasedStrategy(s Strategy) bool {
 		strings.Contains(strings.ToLower(s.Name()), "quic")
 }
 
+// confidenceWeight is how many priority points the whole confidence range is
+// worth in the scan order.
+//
+// It was 10, and one failure costs about 0.33 confidence, so a single failed
+// attempt moved a strategy three priority points down: REALITY (5) fell behind
+// HTTP Polling (6), H2 Stego and seqovl (7) and WebSocket Padded (8) after one
+// bad reconnect, and the next full scan picked one of them. At 2 one failure
+// moves a strategy less than one priority point and never past its neighbour;
+// two in a row do, and the circuit breaker and storm parking still take a
+// strategy that keeps failing out of the scan altogether.
+const confidenceWeight = 2.0
+
 // sortStrategies sorts by priority and confidence
 func (m *Manager) sortStrategies() {
 	// Simple bubble sort (small list)
@@ -592,8 +1092,8 @@ func (m *Manager) sortStrategies() {
 			r1, r2 := m.results[s1.ID()], m.results[s2.ID()]
 
 			// Compare by adjusted priority (priority - confidence bonus)
-			score1 := float64(s1.Priority()) - r1.Confidence*10
-			score2 := float64(s2.Priority()) - r2.Confidence*10
+			score1 := float64(s1.Priority()) - r1.Confidence*confidenceWeight
+			score2 := float64(s2.Priority()) - r2.Confidence*confidenceWeight
 
 			// Android mode: adaptive penalty for UDP/QUIC strategies
 			// Base penalty is 50, but decreases with each TCP timeout
@@ -699,13 +1199,14 @@ func (m *Manager) ProbeAll(ctx context.Context, target string) []Result {
 	// configured endpoint on a timer would multiply this client's traffic by the
 	// size of its server list and hand an observer a periodic fan-out pattern
 	// that nothing else on the wire produces.
+	//
+	// Same endpoint, same key: the address and the secret come from one read of
+	// the pin, and travel on the context to every probe.
+	ctx = m.ensureDialSecret(ctx)
 	if addr := m.GetServerAddr(ctx); addr != "" {
 		target = addr
 		log.Debug("Probing with effective server address: %s", target)
 	}
-	// Same endpoint, same key: a probe that authenticates does it against the
-	// pinned endpoint, which is the one whose address was just resolved above.
-	ctx = m.ensureDialSecret(ctx)
 
 	m.mu.RLock()
 	// Filter out disabled strategies (priority <= 0)
@@ -757,6 +1258,11 @@ func (m *Manager) ProbeAll(ctx context.Context, target string) []Result {
 			}
 
 			results[idx] = result
+
+			if errors.Is(err, errProbeUnknown) {
+				// Nothing learned, nothing recorded.
+				return
+			}
 
 			// Update stored results. A probe is (almost always) a bare TCP
 			// connect - it says the address is reachable, not that the strategy's
@@ -898,6 +1404,12 @@ func (m *Manager) RecordSessionStart(strategyID string) {
 	m.stormDetector.SessionOpened(strategyID)
 }
 
+// SessionOpenedAt reports when the storm detector's clock for strategyID's
+// open session started, for logs and tests.
+func (m *Manager) SessionOpenedAt(strategyID string) (time.Time, bool) {
+	return m.stormDetector.SessionOpenedAt(strategyID)
+}
+
 // RecordSessionEnd reports that the session for strategyID has ended and
 // returns whether the strategy is now storming (repeatedly short-lived
 // sessions). On a storm in auto-mode the strategy is parked and excluded from
@@ -930,6 +1442,287 @@ func (m *Manager) RecordSessionEnd(strategyID string) (storming bool) {
 	return true
 }
 
+// SessionEnd describes a tunnel session that has just ended.
+type SessionEnd struct {
+	// Strategy is the ID of the strategy that carried the session.
+	Strategy string
+
+	// Endpoint is the candidate the session rode, as ConnectSession returned
+	// it; HasEndpoint is false when there is none (no selector, mux stream).
+	Endpoint    endpoint.Candidate
+	HasEndpoint bool
+
+	// Useful says the session carried downlink for a meaningful time. Only a
+	// session that did not is evidence against the strategy: a tunnel that ran
+	// for fifteen minutes and then lost its server to a restart, or its network
+	// to a dead link, says nothing about the transport, and charging it for that
+	// dropped REALITY below HTTP Polling after a single server restart.
+	Useful bool
+
+	// Replaced says the session did not die: the client moved the tunnel
+	// off it on purpose (an upgrade swap, a port hop). A useful one ends like
+	// any useful session. A young one is no evidence about anything - not a
+	// short session for the storm detector, not a failure of its strategy -
+	// and it clears nothing either: a fallback a few seconds old said nothing
+	// about the endpoint's dead-session streak.
+	Replaced bool
+
+	// UpgradeFailed says the session was a pending strategy upgrade that died
+	// before proving itself. UpgradeOutcome has already charged the strategy,
+	// so it is not charged a second time here.
+	UpgradeFailed bool
+
+	// LocalNetworkUp, when set, is asked before the endpoint is charged for
+	// a dead session or a storm: a link that dropped on the client's side
+	// kills sessions just the same, and parking a server for it is D7 over
+	// again. It reports false when it cannot tell. Nil means "up".
+	LocalNetworkUp func() bool
+
+	// Dead says the session ended in silence with its downlink dead almost from
+	// the start, while the local network was up: every connect to the endpoint
+	// succeeds - so connect-based health never notices, and each success reset
+	// its streak - but no session survives. That is what a byte-count freeze on
+	// the route looks like (the TSPU #490 pattern, stand run #7b: ten choices of
+	// one address in six minutes, the data plane alive 4% of the time).
+	Dead bool
+
+	// Degraded says the client gave the session up as alive but useless: a
+	// TCP flow inside it waited 30 s for an answer and two keepalives went
+	// unanswered (tun's stall detector). It is booked like Dead whatever the
+	// session's age - a session under a per-flow byte cap can live for hours
+	// while nothing gets through it - and never as useful.
+	Degraded bool
+}
+
+// SessionEnded books the end of a tunnel session.
+//
+// A session that was not useful costs its strategy confidence. A useful one
+// restarts the fast-reconnect clock (it used to run from the moment the session
+// connected, so any session longer than five minutes ended with the fast path
+// expired) and clears the endpoint's dead-session streak. A dead session, and a
+// storm, park the endpoint - see chargeSessionEndpoint.
+//
+// It feeds the storm detector exactly as RecordSessionEnd does and returns its
+// verdict.
+func (m *Manager) SessionEnded(end SessionEnd) (storming bool) {
+	if end.Replaced && !end.Useful {
+		m.stormDetector.SessionAbandoned(end.Strategy)
+		return false
+	}
+	if !end.Useful && !end.UpgradeFailed {
+		m.UpdateStrategyConfidence(end.Strategy, false)
+	}
+	storming = m.RecordSessionEnd(end.Strategy)
+	sel := m.selector()
+
+	if end.Useful && !storming && !end.Dead && !end.Degraded {
+		m.mu.Lock()
+		if m.lastSuccessfulStrategy != nil && m.lastSuccessfulStrategy.ID() == end.Strategy {
+			m.lastSuccessfulTime = time.Now()
+		}
+		m.lastDeath = deathMark{server: -1}
+		m.mu.Unlock()
+		if sel != nil && end.HasEndpoint {
+			sel.ReportSessionUseful(end.Endpoint)
+		}
+		return storming
+	}
+
+	switch {
+	case end.Dead:
+		m.chargeSessionEndpoint(sel, end, deathDead, "session went silent right after connecting")
+	case end.Degraded:
+		m.chargeSessionEndpoint(sel, end, deathDegraded, "session degraded: a flow stalled and keepalives went unanswered")
+	case storming && !end.UpgradeFailed:
+		// A strategy whose sessions keep dying on this endpoint is evidence
+		// against the endpoint too: a freeze keyed to the address kills every
+		// transport in turn, and the storm detector alone only ever walks the
+		// strategy list on the same server, 2.5-3.5 minutes per strategy. One
+		// ordinary failure here was reset by the next connect and never parked
+		// anything.
+		//
+		// Not when the storm is completed by a failed upgrade: the storm
+		// detector keys on the strategy, so short sessions from before the
+		// switch to the fallback are still in its history, and the server the
+		// fallback carries traffic on is not what failed.
+		m.chargeSessionEndpoint(sel, end, deathStorm, "storm")
+	}
+	return storming
+}
+
+// chargeSessionEndpoint parks the endpoint a dead session or a storm happened
+// on, growing the park with each one in a row (Selector.ReportDeadSession) -
+// unless it is the route's death (routeDeath).
+func (m *Manager) chargeSessionEndpoint(sel *endpoint.Selector, end SessionEnd, class deathClass, why string) {
+	if sel == nil || !end.HasEndpoint {
+		return
+	}
+	if end.LocalNetworkUp != nil && !end.LocalNetworkUp() {
+		log.Info("Endpoint %s: %s, but the local network cannot be confirmed up - not charging it", end.Endpoint, why)
+		return
+	}
+	if m.routeDeath(end.Endpoint, class, why, []string{end.Strategy}) {
+		return
+	}
+	if sel.ReportDeadSession(end.Endpoint) {
+		logServerPark(sel, end.Endpoint, fmt.Sprintf("Endpoint %s charged for its session (%s); every address of the server has a verdict - parking the server", end.Endpoint, why))
+	} else {
+		log.Info("Endpoint %s charged for its session (%s)", end.Endpoint, why)
+	}
+	m.logEndpointHealth(sel, end.Endpoint)
+}
+
+// deathClass names the kind of verdict a server got, for routeDeath.
+type deathClass string
+
+const (
+	deathSilent    deathClass = "silence"
+	deathSwallowed deathClass = "swallowed handshakes"
+	deathDead      deathClass = "dead session"
+	deathDegraded  deathClass = "stalled session"
+	deathStorm     deathClass = "storm"
+)
+
+// deathMark is the last verdict given to a server: which one, of what kind,
+// on which transports, and when.
+type deathMark struct {
+	server int
+	class  deathClass
+	ids    []string
+	at     time.Time
+}
+
+// routeDeathWindow bounds how far apart two deaths may be and still be "in a
+// row". The chain between them - the other family of the first server, a
+// reconnect, a session dying on the second - takes three or four minutes at
+// most; a mark older than this is about a route that may have changed since,
+// and must not decide a park on its own (P1-4 of the round-5 review, now that
+// the mark survives an Android core restart).
+const routeDeathWindow = 10 * time.Minute
+
+// routeDeath books a verdict of class on cand's server and reports whether it
+// is the route's rather than the server's. Then it parks the transports that
+// died - ids - instead of the server, and the caller charges nothing.
+//
+// The same death on two different servers in a row, with nothing useful in
+// between, says the route: a censor killing one transport on every exit, the
+// way the stand's Polling throttle did. Parking every server it touches walked
+// the client through the whole pool - listing it for an observer and burning
+// every address - on the transport that cannot work anywhere, and a stall
+// verdict never changed the strategy at all (P2-7 of the round-4 review). So
+// the second server is not charged, the transports are set aside on the two
+// servers where they died (routeSkip), and the next cycle tries another
+// transport on the same server. The pool walk stops at two servers. Deaths on the two
+// families of one server are one server's, and are charged as usual.
+//
+// The mark moves on every verdict: kept on the first server, it made every
+// later death on the second look like "the same death on another server" and
+// spared it forever. A server gets one pass after a switch and is charged on
+// its second death in a row.
+func (m *Manager) routeDeath(cand endpoint.Candidate, class deathClass, why string, ids []string) bool {
+	// Wall clock: the mark crosses Android core restarts, and a phone asleep
+	// between two deaths must count the sleep (P3-3 of the round-6 review).
+	now := time.Now().Round(0)
+	if len(ids) == 0 {
+		// A verdict that names no transport - an address that never answered
+		// a SYN - says nothing about the route, and must not become the
+		// "previous death" the next server is compared with (P2-D of the
+		// round-6 review: an IP-blocked server followed by a swallowing one
+		// set three transports aside on both).
+		return false
+	}
+	m.mu.Lock()
+	prev := m.lastDeath
+	m.lastDeath = deathMark{server: cand.EndpointIdx, class: class, ids: slices.Clone(ids), at: now}
+	m.mu.Unlock()
+	if prev.server < 0 || prev.server == cand.EndpointIdx || prev.class != class || now.Sub(prev.at) > routeDeathWindow {
+		return false
+	}
+	// The same death means the same transports, except for a storm: the
+	// storm detector parks a storming transport everywhere at once, so the
+	// next server never runs it, and the storms there are of the next one.
+	if class != deathStorm {
+		ids = slices.DeleteFunc(slices.Clone(ids), func(id string) bool { return !slices.Contains(prev.ids, id) })
+		if len(ids) == 0 {
+			return false
+		}
+	}
+	if m.IsForced() {
+		log.Warn("Endpoint %s: %s, as on the previous server - the route, not the server; forced strategy, nothing else to try", cand, why)
+		return true
+	}
+	until := now.Add(stormCooldown)
+	m.mu.Lock()
+	if m.routeParked == nil {
+		m.routeParked = make(map[int]map[string]time.Time)
+	}
+	for _, server := range []int{prev.server, cand.EndpointIdx} {
+		if m.routeParked[server] == nil {
+			m.routeParked[server] = make(map[string]time.Time)
+		}
+		for _, id := range ids {
+			m.routeParked[server][id] = until
+		}
+	}
+	m.mu.Unlock()
+	log.Warn("Endpoint %s: %s, as on the previous server - the route, not the server: setting %s aside on these two servers for %v and trying other transports here",
+		cand, why, strings.Join(ids, ", "), stormCooldown)
+	return true
+}
+
+// routeSkip returns the transports a route verdict set aside on addr's
+// server (routeDeath), for the scan to try last there, after every other
+// eligible transport, and for the upgrade path to leave alone. Scoped to the servers where the transport died:
+// a third server is not assumed to share their fate, and pays one death of
+// its own before the rule applies to it (P2-2 of the round-5 review; parked
+// for every server, a false route verdict kept a healthy one on a lesser
+// transport for five minutes). Empty in forced mode, which has nothing else
+// to try. Takes m.mu: not to be called with it held.
+func (m *Manager) routeSkip(addr string) map[string]bool {
+	sel := m.selector()
+	if sel == nil {
+		return nil
+	}
+	cand, ok := sel.CandidateForAddr(addr)
+	if !ok {
+		return nil
+	}
+	now := time.Now()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.forced {
+		return nil
+	}
+	var out map[string]bool
+	for id, until := range m.routeParked[cand.EndpointIdx] {
+		if now.Before(until) {
+			if out == nil {
+				out = make(map[string]bool)
+			}
+			out[id] = true
+		}
+	}
+	return out
+}
+
+// rescanPause draws the pause before a rescan after a route verdict. A var
+// so tests can shorten it.
+var rescanPause = func() time.Duration {
+	return HumpDelay(300*time.Millisecond, 800*time.Millisecond, 2*time.Second)
+}
+
+// sleepCtx waits d, or less if ctx ends; false means ctx ended.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
 // maxEndpointAttempts caps how many endpoint candidates a single Connect may
 // try. Two, and no more: handleDisconnect gives the whole reconnect 15 seconds,
 // and each candidate costs a full strategy scan. A deeper walk would blow that
@@ -938,6 +1731,15 @@ const maxEndpointAttempts = 2
 
 // Connect tries strategies in order until one succeeds
 func (m *Manager) Connect(ctx context.Context, target string) (net.Conn, Strategy, error) {
+	conn, s, _, _, err := m.ConnectSession(ctx, target)
+	return conn, s, err
+}
+
+// ConnectSession is Connect that also names the endpoint candidate the
+// connection rides, for a caller that books the session's end against it
+// (SessionEnded). ok is false when there is none: no selector, or a stream on
+// an existing mux carrier.
+func (m *Manager) ConnectSession(ctx context.Context, target string) (net.Conn, Strategy, endpoint.Candidate, bool, error) {
 	// Mux fast-path: if mux is enabled and a live session already exists, open a
 	// new stream on it and return immediately - do NOT dial a fresh transport.
 	// Without this, every call (e.g. every proxy CONNECT routed through
@@ -947,13 +1749,13 @@ func (m *Manager) Connect(ctx context.Context, target string) (net.Conn, Strateg
 	// peek-buffer + admission slot) until probeReadDeadline, and under a busy
 	// client the accumulation outpaces reclamation -> server OOM.
 	if stream, strat, ok := m.tryMuxFastPath(); ok {
-		return stream, strat, nil
+		return stream, strat, endpoint.Candidate{}, false, nil
 	}
 
-	conn, strategy, err := m.dialEndpoints(ctx, target)
+	conn, strategy, cand, hasCand, err := m.dialEndpoints(ctx, target)
 	if err != nil {
 		m.recordConnectResult(false)
-		return nil, nil, err
+		return nil, nil, endpoint.Candidate{}, false, err
 	}
 	m.recordConnectResult(true)
 
@@ -969,13 +1771,13 @@ func (m *Manager) Connect(ctx context.Context, target string) (net.Conn, Strateg
 		if muxErr != nil {
 			log.Warn("Mux wrap failed, using direct connection: %v", muxErr)
 			// Fallback to direct connection without mux
-			return conn, strategy, nil
+			return conn, strategy, cand, hasCand, nil
 		}
 		log.Debug("Connection wrapped with mux layer")
-		return muxConn, strategy, nil
+		return muxConn, strategy, cand, hasCand, nil
 	}
 
-	return conn, strategy, nil
+	return conn, strategy, cand, hasCand, nil
 }
 
 // dialEndpoints walks the endpoint candidates until one of them yields a
@@ -987,13 +1789,17 @@ func (m *Manager) Connect(ctx context.Context, target string) (net.Conn, Strateg
 // pre-flight gate is skipped. A pre-flight that fails outright means the whole
 // network is down, not this endpoint, so it stops the loop without touching
 // anyone's health: otherwise closing a laptop lid would park every candidate.
-func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, Strategy, error) {
+func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, Strategy, endpoint.Candidate, bool, error) {
 	sel := m.selector()
 	if sel == nil {
 		if _, err := m.preflightCandidate(ctx, nil, endpoint.Candidate{Addr: target}); err != nil {
-			return nil, nil, err
+			return nil, nil, endpoint.Candidate{}, false, err
 		}
-		return m.ConnectExcluding(ctx, m.withHoppedPort(target), nil)
+		conn, s, err := m.connectScan(ctx, m.withHoppedPort(target), nil, &scanState{addr: target})
+		if err == nil {
+			m.clearSwallowed(target)
+		}
+		return conn, s, endpoint.Candidate{}, false, err
 	}
 
 	// Family connectivity preflight BEFORE any strategy scan: drop the families
@@ -1004,7 +1810,7 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 
 	cand, ok := sel.Reconsider(sel.Now())
 	if !ok {
-		return nil, nil, fmt.Errorf("no endpoint candidates configured")
+		return nil, nil, endpoint.Candidate{}, false, fmt.Errorf("no endpoint candidates configured")
 	}
 	// Without this line a log shows a client dialling the same address over and
 	// over and cannot say whether the endpoint layer never condemned it or
@@ -1015,8 +1821,12 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 	budget := min(maxEndpointAttempts, len(sel.Candidates()))
 	var lastErr error
 
-	for attempt := range budget {
-		if attempt > 0 {
+	// stayHere repeats the scan on the same candidate once, after a route
+	// verdict parked the transports that died there (routeDeath).
+	stayHere, rescanned := false, false
+	var rescanExclude []string // the transports the route verdict was about
+	for attempt := 0; attempt < budget; attempt++ {
+		if attempt > 0 && !stayHere {
 			next, ok := sel.Next(sel.Now())
 			if !ok {
 				break
@@ -1025,14 +1835,26 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 			sel.Pin(next)
 			cand = next
 		}
+		rescan := stayHere
+		stayHere = false
 
-		gated, err := m.preflightCandidate(ctx, sel, cand)
-		if err != nil {
-			// The gate found no network at all. That is not this endpoint's
-			// fault and nobody has been charged for it - see the comment above.
-			return nil, nil, err
+		if rescan {
+			// The same server again, right after the route verdict: no second
+			// pre-flight (one more bare TCP connect and close), and a short
+			// pause first, so the server does not see two volleys back to
+			// back (P3-7 of the round-6 review).
+			if !sleepCtx(ctx, rescanPause()) {
+				break
+			}
+		} else {
+			gated, err := m.preflightCandidate(ctx, sel, cand)
+			if err != nil {
+				// The gate found no network at all. That is not this endpoint's
+				// fault and nobody has been charged for it - see the comment above.
+				return nil, nil, endpoint.Candidate{}, false, err
+			}
+			cand = gated
 		}
-		cand = gated
 
 		// Family probe: one dial, at most once per candidate, and only when
 		// there is somewhere to fall back to (see Selector.ProbeCurrent). It
@@ -1041,7 +1863,16 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 		// as probed, so this is a no-op then. On the hot reconnect path, where
 		// the gate is skipped, this is the only thing that notices a dead
 		// family - which is exactly what the old one-shot IPv6 check did.
-		cand, _ = sel.ProbeCurrent(ctx)
+		if !rescan {
+			probed, kept := sel.ProbeCurrent(ctx)
+			if !kept && probed.Addr != cand.Addr {
+				// The family probe moved the pin. Before this line the move was
+				// silent, and a log that announced one address went on to show
+				// the client on another.
+				log.Info("Endpoint %s did not answer the family probe, switching to %s", cand, probed)
+			}
+			cand = probed
+		}
 
 		// Name the secret for THIS candidate, on this dial's own context. The
 		// pinned candidate can move underneath us - a concurrent Connect, the
@@ -1049,30 +1880,104 @@ func (m *Manager) dialEndpoints(ctx context.Context, target string) (net.Conn, S
 		// strategy would let a handshake authenticate to one server with another
 		// server's key. Here the address and the key are decided together and
 		// travel together.
-		dialCtx := withDialSecret(ctx, m.secretForCandidate(cand))
+		dialCtx := m.withDialCandidate(ctx, cand)
 
 		start := time.Now()
-		conn, strategy, err := m.ConnectExcluding(dialCtx, m.withHoppedPort(cand.Addr), nil)
+		scan := &scanState{addr: cand.Addr}
+		var swallowedOn, swallowedTransports []string
+		var exclude []string
+		if rescan {
+			// Only the transports still standing: the ones this verdict was
+			// about died here a moment ago. Not every route park on the
+			// server - an older one may be on a transport that works again,
+			// and leaving it out left nothing to dial (P2-2 of the round-7
+			// review).
+			exclude = rescanExclude
+		}
+		conn, strategy, err := m.connectScan(dialCtx, m.withHoppedPort(cand.Addr), exclude, scan)
 		if err == nil {
+			m.clearSwallowed(cand.Addr)
 			sel.Report(cand, true, time.Since(start))
-			return conn, strategy, nil
+			return conn, strategy, cand, true, nil
 		}
 		lastErr = err
 
+		if rescan && errors.Is(err, errStrategyScanFailed) && !errors.Is(err, errAddrSilent) &&
+			!scan.answered && scan.timeouts > 0 && scan.unheard == 0 {
+			// The rescan heard nothing from the transports left after the
+			// route verdict, however few: with one or two left the scan
+			// never reached the silence threshold, and the server was not
+			// charged (P2-C of the round-6 review). It is the server's
+			// second verdict - if each of them ran out its own timeout. An
+			// attempt the cycle cut short is no verdict either way (P3-3
+			// of the round-7 review).
+			err = fmt.Errorf("%w: %w, the transports left heard nothing either: %w", errAddrSilent, errStrategyScanFailed, err)
+			lastErr = err
+		}
+
 		if !errors.Is(err, errStrategyScanFailed) {
-			// Context cancelled, or no strategy was even eligible. Neither says
-			// anything about this endpoint.
-			break
+			// Context cancelled, or no strategy was even eligible. Neither
+			// says anything about this endpoint on its own; a run of them in
+			// which its handshakes heard nothing does (swallowCycle).
+			verdict, covered, heard := m.swallowCycle(cand.Addr, scan)
+			if !verdict {
+				if !scan.answered && (scan.timeouts > 0 || scan.unheard > 0) {
+					lastErr = fmt.Errorf("%w: %w", ErrCycleUnanswered, err)
+				}
+				// The run is the server's. Its other family gets the next
+				// cycle, once: under a censor the two are often in different
+				// states, and two cycles on one family before it reached the
+				// other were how a swallowing server kept the client for five.
+				if len(covered) > 0 {
+					if sib, ok := m.swallowSibling(sel, cand, covered); ok {
+						log.Info("Endpoint %s heard nothing this cycle - the next one tries the server's other address %s", cand, sib)
+						sel.Pin(sib)
+					}
+				}
+				break
+			}
+			err = fmt.Errorf("%w: %w, handshakes swallowed cycle after cycle: %w", errAddrSilent, errStrategyScanFailed, err)
+			lastErr = err
+			swallowedOn, swallowedTransports = covered, heard
+		} else {
+			m.endSwallowRun(cand.Addr)
 		}
 		if errors.Is(err, errAddrSilent) {
-			sel.ReportSilent(cand)
+			class, died := deathSilent, scan.silent
+			if swallowedOn != nil {
+				class, died = deathSwallowed, swallowedTransports
+			}
+			if m.routeDeath(cand, class, "it answered nothing", died) {
+				// Not the server's: the transports still standing get their
+				// turn here, now, without counting as another candidate. If
+				// they are silent too, the second verdict on this server is
+				// its own and charges it: the route verdict costs a server
+				// that is down for good one scan, not a cycle of its own.
+				if rescanned || ctxErr(ctx) != nil || m.IsForced() {
+					// Forced mode has nothing else to try: the rescan would
+					// dial the same transport again (P3-1 of the round-6
+					// review).
+					break
+				}
+				rescanned, stayHere, rescanExclude = true, true, died
+				attempt--
+				continue
+			}
+			if sel.ReportSilent(cand, swallowedOn...) {
+				logServerPark(sel, cand, fmt.Sprintf("Endpoint %s: every address of the server has a verdict - parking the server", cand))
+			}
 		} else {
 			sel.Report(cand, false, 0)
 		}
 		m.logEndpointHealth(sel, cand)
+		if ctxErr(ctx) != nil {
+			// The verdict is in; the next candidate gets the next cycle. Its
+			// pre-flight on a dead context would read as "no network" instead.
+			break
+		}
 	}
 
-	return nil, nil, lastErr
+	return nil, nil, endpoint.Candidate{}, false, lastErr
 }
 
 // endpointRoster renders the pool the way a reader of the log needs it: which
@@ -1131,16 +2036,22 @@ func (m *Manager) withHoppedPort(target string) string {
 // connect, or once several connects in a row have failed - the signal that the
 // network is genuinely down rather than a one-off server RST.
 func (m *Manager) preflightCandidate(ctx context.Context, sel *endpoint.Selector, cand endpoint.Candidate) (endpoint.Candidate, error) {
-	m.mu.RLock()
+	m.mu.Lock()
 	checker := m.connectivityChecker
 	connectedBefore := m.lastSuccessfulStrategy != nil
 	fails := m.consecutiveConnectFailures
-	m.mu.RUnlock()
+	armed := m.preflightArmed
+	if checker != nil && (!connectedBefore || fails >= preflightFailThreshold || armed) {
+		// This run is the one the flag asked for; a second candidate in the
+		// same cycle goes back to the ordinary rule.
+		m.preflightArmed = false
+	}
+	m.mu.Unlock()
 
 	if checker == nil {
 		return cand, nil
 	}
-	if connectedBefore && fails < preflightFailThreshold {
+	if connectedBefore && fails < preflightFailThreshold && !armed {
 		return cand, nil
 	}
 
@@ -1151,13 +2062,21 @@ func (m *Manager) preflightCandidate(ctx context.Context, sel *endpoint.Selector
 		checker.SetAddrs(cand.Addr, sel.GateAddrs(cand)...)
 	}
 
-	result := checker.Check(ctx)
+	// TCP to the pool and nothing else: the gate's question is whether any of
+	// these addresses answers. The UDP probe only feeds the QUIC gate, so it
+	// runs only for a client that has a QUIC strategy to gate (see Check).
+	var result ConnectivityResult
+	if m.hasUDPStrategies() {
+		result = checker.Check(ctx)
+	} else {
+		result = checker.CheckTCP(ctx)
+	}
 	if !result.TCP {
 		// No TCP connectivity - wait in loop until it's restored
 		log.Warn("No TCP connectivity to server, waiting for network...")
 		result = checker.WaitForConnectivity(ctx, defaultProbeInterval)
 		if !result.TCP {
-			return cand, fmt.Errorf("no connectivity to server: %w", result.Error)
+			return cand, fmt.Errorf("%w: %w", ErrNoServerAnswered, result.Error)
 		}
 	}
 
@@ -1223,16 +2142,590 @@ type scanState struct {
 	// rejected handshake. One is enough: whatever is wrong from there on is a
 	// property of a transport, which is what the scan exists to work around.
 	answered bool
+	// hold keeps a connected handshake to its attempt's share of the cycle
+	// instead of the rest of it, under swallow pressure (swallowPressure).
+	hold bool
+	// held says the next attempt is held to its share: hold, and other
+	// transports after it. The caller sets it before each attempt.
+	held bool
+	// heldSilent says the last attempt was held to its share, connected,
+	// and heard nothing: evidence for the run like a whole cycle's.
+	heldSilent bool
+	// limit is how long the last attempt was let run, which is what its
+	// silence is read against (attemptLimit, or its share when held).
+	limit time.Duration
 	// timeouts counts non-UDP strategies that died on the connect timeout.
 	timeouts int
+	// addr is the address the cycle's swallow record is kept under: the
+	// candidate as the endpoint layer names it, since the dial target can
+	// carry a hopped port. Empty means the dial target.
+	addr string
+	// connectedSilent lists the transports whose TCP connect came up and
+	// whose handshake then heard nothing until its attempt ran out.
+	connectedSilent []string
+	// inconclusive lists the transports whose attempt heard nothing and was
+	// still no verdict (attemptInconclusive), with a real chance to answer
+	// (swallowEvidence).
+	inconclusive []string
+	// allowance is how long the last attempt had to hear an answer, from
+	// its TCP connect when known (connectThroughRefusal).
+	allowance time.Duration
+	// unheard counts the attempts that heard nothing and were no verdict,
+	// evidence or not: what makes a cycle "unanswered" (ErrCycleUnanswered).
+	unheard int
+	// silent lists the non-UDP transports whose TCP connect completed and
+	// whose attempt was then silence (attemptSilent): what a silence verdict
+	// says died. A SYN nobody answered is left out - every transport dials
+	// the same host:port, so it says the address is unreachable (an IP
+	// block, a dead host), nothing about the transports, and counting it
+	// parked working transports for the route (P1-2 of the round-5 review).
+	silent []string
+}
+
+// swallowEvidence reports whether an attempt of s that heard nothing for
+// allowance is evidence that the address swallows handshakes. Not for a UDP
+// transport: a datagram blackhole is the route's, not the server's. And not
+// for an attempt that had less than a third of connectTimeout (10 s on the
+// desktop) to answer: cut by what was left of the cycle - half of it taken
+// by another transport - a healthy Polling handshake needing a couple of
+// seconds looked swallowed, and a working server was parked.
+//
+// A strategy that does not report its TCP connect is held to half of a
+// short cycle as a whole, under the floor: it never counts. A server that
+// swallows every handshake swallows the reporting ones too (REALITY, Polling,
+// Stego, Seqovl), and the first of them in a cycle runs to the cycle's end.
+func (m *Manager) swallowEvidence(s Strategy, allowance time.Duration) bool {
+	return !isUDPBasedStrategy(s) && allowance >= m.connectTimeout/3
+}
+
+// swallowPressure reports whether addr's cycle runs under evidence that
+// handshakes are being swallowed: a transport went unanswered on an address
+// of the server in the recent cycles, or another server got a silence
+// verdict within routeDeathWindow. Then a connected handshake is held to its
+// share of the cycle (scanState.held), and one that heard nothing there
+// counts for the run and is set aside on the address for the next cycle.
+//
+// Without it a connected handshake keeps the rest of its cycle - a slow one
+// (7-9 s through a lossy path, a server reaching its cover) used to be cut
+// and land the tunnel on HTTP Polling. With it a cycle tried one transport
+// on one address: the fix13c stand dropped every ClientHello over 1500 B on
+// both servers, REALITY, Polling, Stego and Seqovl took one cycle and its
+// backoff each on each of four addresses, and Geneva, which fragments its
+// ClientHello and got through, never came up in 300 s. Under the pressure
+// the slow-handshake case is the one that pays: an answer slower than its
+// share is cut, and the transport tried after the others on that address.
+// Never in forced mode, which has one transport.
+func (m *Manager) swallowPressure(addr string) bool {
+	sincePark := m.serverSincePark(addr)
+	key := m.swallowKey(addr)
+	sel := m.selector()
+	server := -1
+	if sel != nil {
+		if cand, ok := sel.CandidateForAddr(addr); ok {
+			server = cand.EndpointIdx
+		}
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.forced {
+		return false
+	}
+	if r := m.swallowed[key]; r != nil && !swallowStale(r, sincePark) {
+		for _, ids := range r.skip {
+			if len(ids) > 0 {
+				return true
+			}
+		}
+		if !r.muteEmpty() {
+			return true
+		}
+	}
+	d := m.lastDeath
+	return d.server >= 0 && d.server != server && (d.class == deathSilent || d.class == deathSwallowed) &&
+		time.Since(d.at) < routeDeathWindow
+}
+
+// jitterShare draws a held attempt's share around d: a hump between 3/4 and
+// 5/4 of it (HumpDelay), no edge and no grid. Equal shares put up to sixteen
+// connects of different protocols to one address at exactly 0.94 s apart
+// (P3-6 of the round-10 review). No measured reference for the shape.
+func jitterShare(d time.Duration) time.Duration {
+	return HumpDelay(d*3/4, d, d*5/4)
+}
+
+// shuffleEqualPriority shuffles each run of transports of equal priority in
+// list, in place, so the order under swallow pressure is not the same fixed
+// sequence on every cycle and every client. The runs are what the scan
+// would take in any order; priorities between runs stay.
+func shuffleEqualPriority(list []Strategy) {
+	for i := 0; i < len(list); {
+		j := i + 1
+		for j < len(list) && list[j].Priority() == list[i].Priority() {
+			j++
+		}
+		run := list[i:j]
+		for k := len(run) - 1; k > 0; k-- {
+			r := randIntn(k + 1)
+			run[k], run[r] = run[r], run[k]
+		}
+		i = j
+	}
+}
+
+// pressureShares is the smallest share of a cycle an attempt gets under
+// swallow pressure, as a fraction: a sixteenth, 0.94 s of the reconnect's
+// 15. A handshake through a path of a few hundred milliseconds fits, with a
+// round trip to the server's cover for REALITY. An eighth left Geneva, tenth
+// of twenty transports, nothing: eight shares of 1.9 s are the cycle.
+const pressureShares = 16
+
+// swallowRecord is what one server's last reconnect cycles left behind. The
+// run is kept per server: a server that swallows handshakes on one family is
+// checked on its other family next (N9 of the 1.11.9 acceptance), and the run
+// counts the cycles on both. The skip lists stay per address: under a censor
+// the two families are often in different states, and a transport swallowed
+// on v6 may well work on v4 (P1-3 of the round-5 review).
+type swallowRecord struct {
+	// skip holds, per address, the transports whose connected handshake heard
+	// nothing there; the next cycle on that address starts without them.
+	skip map[string]map[string]bool
+	// mute holds, per address, the transports whose session handshake went
+	// unanswered there (HandshakeUnanswered). Unlike skip, another
+	// transport's connect does not clear it - Protocol Confusion connects
+	// without hearing the server, and its connect cleared the list that
+	// held it, so the next scan and the next upgrade offer went straight
+	// back to it (P3-5 of the round-8 review). A handshake of that
+	// transport answered on the address clears it (HandshakeAnswered).
+	mute map[string]map[string]bool
+	last time.Time
+	// cycles counts the cycles in a row that ended with no verdict while a
+	// transport heard nothing there, and heardNothing names those
+	// transports (see swallowCycle).
+	cycles       int
+	heardNothing map[string]bool
+	// addrs are the server's addresses those cycles ran on.
+	addrs map[string]bool
+	// unanswered counts the cycles in a row that ended with no verdict and
+	// no answer at all, evidence or not (see swallowUnansweredMax).
+	unanswered int
+}
+
+// muteEmpty reports whether no transport is mute on any address.
+func (r *swallowRecord) muteEmpty() bool {
+	for _, ids := range r.mute {
+		if len(ids) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// endRun ends the run of no-verdict cycles; the skip lists stay.
+func (r *swallowRecord) endRun() {
+	r.cycles, r.unanswered, r.heardNothing, r.addrs = 0, 0, make(map[string]bool), make(map[string]bool)
+}
+
+// swallowKey names the swallow record addr belongs to: its server when the
+// selector knows the address, else the address itself. Takes m.mu (through
+// selector): not to be called with it held.
+func (m *Manager) swallowKey(addr string) string {
+	if sel := m.selector(); sel != nil {
+		if cand, ok := sel.CandidateForAddr(addr); ok {
+			return fmt.Sprintf("server %d", cand.EndpointIdx)
+		}
+	}
+	return addr
+}
+
+// swallowSibling returns the address of cand's server that the run has not
+// covered yet - routable and not parked - for the next cycle to try. False when
+// there is none: the run has seen every family of the server, or it has one.
+func (m *Manager) swallowSibling(sel *endpoint.Selector, cand endpoint.Candidate, covered []string) (endpoint.Candidate, bool) {
+	for _, addr := range sel.Siblings(cand) {
+		sib, ok := sel.CandidateForAddr(addr)
+		if !ok || slices.Contains(covered, addr) || !sel.Reachable(addr) || sel.IsParked(sib) {
+			continue
+		}
+		return sib, true
+	}
+	return endpoint.Candidate{}, false
+}
+
+// swallowCyclesMax is how many no-verdict cycles in a row, with a handshake
+// heard nothing in each, are an address's silence verdict on one transport.
+// Two cycles are enough when they span two transports.
+const swallowCyclesMax = 3
+
+// swallowUnansweredMax is how many cycles in a row with no verdict and no
+// answer from any transport are the server's silence verdict, whether or not
+// a cycle had evidence (swallowEvidence). The backstop for transports that do
+// not report their TCP connect and so never count as swallowed: a server that
+// swallows every handshake of a forced Geneva, or of a set without a
+// reporting transport, kept the client for good (P3-12 of the round-5
+// review). Four cycles, one more than swallowCyclesMax, because these cycles
+// prove less.
+const swallowUnansweredMax = 4
+
+// swallowWindow is how long a swallow record outlives its last cycle. The
+// reconnect backoff reaches two minutes and a cycle takes 15-30 s more, so a
+// shorter window would forget a run of cycles between two of them.
+const swallowWindow = 3 * time.Minute
+
+// swallowSkip returns the transports the next cycle on addr starts without:
+// those whose connected handshake heard nothing in the recent cycles there.
+// Empty in forced mode, which has nothing else to try, and when skipping them
+// would leave no transport at all.
+func (m *Manager) swallowSkip(addr string) map[string]bool {
+	sincePark := m.serverSincePark(addr)
+	key := m.swallowKey(addr)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r := m.swallowed[key]
+	if r == nil || len(r.skip[addr])+len(r.mute[addr]) == 0 || m.forced || swallowStale(r, sincePark) {
+		return nil
+	}
+	skip := maps.Clone(r.skip[addr])
+	if skip == nil {
+		skip = make(map[string]bool)
+	}
+	maps.Copy(skip, r.mute[addr])
+	if !slices.ContainsFunc(m.strategies, func(s Strategy) bool { return s.Priority() > 0 && !skip[s.ID()] }) {
+		return nil
+	}
+	return skip
+}
+
+// noteMute books s's session handshake, unanswered, against addr.
+func (m *Manager) noteMute(addr, id string) {
+	sincePark := m.serverSincePark(addr)
+	key := m.swallowKey(addr)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r := m.swallowRecordLocked(key, sincePark)
+	if r.mute == nil {
+		r.mute = make(map[string]map[string]bool)
+	}
+	if r.mute[addr] == nil {
+		r.mute[addr] = make(map[string]bool)
+	}
+	r.mute[addr][id] = true
+}
+
+// noteSwallowed books the transports whose connected handshake heard nothing
+// this cycle against addr.
+func (m *Manager) noteSwallowed(addr string, ids []string) {
+	if len(ids) == 0 {
+		return
+	}
+	sincePark := m.serverSincePark(addr)
+	key := m.swallowKey(addr)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r := m.swallowRecordLocked(key, sincePark)
+	if r.skip[addr] == nil {
+		r.skip[addr] = make(map[string]bool)
+	}
+	for _, id := range ids {
+		r.skip[addr][id] = true
+	}
+}
+
+// swallowRecordLocked returns the swallow record under key, fresh if it had
+// none or it is stale (swallowStale), and stamps it now. m.mu held;
+// sincePark is serverSincePark for the address in hand, asked before taking it.
+func (m *Manager) swallowRecordLocked(key string, sincePark time.Duration) *swallowRecord {
+	r := m.swallowed[key]
+	if r == nil || swallowStale(r, sincePark) {
+		r = &swallowRecord{skip: make(map[string]map[string]bool), heardNothing: make(map[string]bool), addrs: make(map[string]bool)}
+		if m.swallowed == nil {
+			m.swallowed = make(map[string]*swallowRecord)
+		}
+		m.swallowed[key] = r
+	}
+	// Wall clock: the record crosses an Android core restart, and the
+	// monotonic clock stops while the phone sleeps (P3-6 of the round-7
+	// review).
+	r.last = time.Now().Round(0)
+	return r
+}
+
+// swallowStale reports a record whose last cycle, and the end of its
+// server's last park, are both more than swallowWindow ago. A park can outlast
+// the window (it doubles), and counting from the last cycle alone, a client
+// coming back to the server after a park of more than three minutes had
+// forgotten which transports the server swallows and lost its first cycle to
+// them again (P2-3 of the round-5 review). sincePark is serverSincePark for
+// the record's address.
+func swallowStale(r *swallowRecord, sincePark time.Duration) bool {
+	return time.Since(r.last) > swallowWindow && sincePark > swallowWindow
+}
+
+// neverParked is serverSincePark's answer for a server with no park on record.
+const neverParked = time.Duration(math.MaxInt64)
+
+// serverSincePark reports how long ago the last park of addr's server ended:
+// negative while any of its addresses is parked, neverParked when none has a
+// park on record. Takes m.mu (through selector): not to be called with it
+// held.
+func (m *Manager) serverSincePark(addr string) time.Duration {
+	sel := m.selector()
+	if sel == nil {
+		return neverParked
+	}
+	cand, ok := sel.CandidateForAddr(addr)
+	if !ok {
+		return neverParked
+	}
+	var end time.Time
+	for _, st := range sel.Snapshot() {
+		if st.EndpointIdx == cand.EndpointIdx && st.CooldownUntil.After(end) {
+			end = st.CooldownUntil
+		}
+	}
+	if end.IsZero() {
+		return neverParked
+	}
+	return sel.Now().Sub(end)
+}
+
+// swallowCycle books a cycle on addr that ended with no verdict and reports
+// whether the run of such cycles is now the silence verdict, with the
+// addresses of the server the run covered (addr among them) and, on a
+// verdict, the transports that heard nothing.
+//
+// Since a connected handshake may use the rest of its cycle, a server that
+// completes every TCP connect and then answers nothing ends each cycle on one
+// swallowed transport, out of time, with nothing counted: the next cycle comes
+// back to it with the next transport, and it is never charged. Two cycles in
+// a row in which the address heard nothing on two different transports, or
+// swallowCyclesMax cycles on any, are the verdict. One cycle never is - a
+// single slow handshake, Polling's included, parks nothing - and a cycle in
+// which any transport got an answer ends the run.
+//
+// The run is the server's: cycles on both its families count together.
+func (m *Manager) swallowCycle(addr string, scan *scanState) (verdict bool, covered, heard []string) {
+	sincePark := m.serverSincePark(addr)
+	key := m.swallowKey(addr)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if scan.answered {
+		if r := m.swallowed[key]; r != nil {
+			r.endRun()
+		}
+		return false, nil, nil
+	}
+	if len(scan.inconclusive) == 0 && scan.unheard == 0 {
+		return false, nil, nil
+	}
+	r := m.swallowRecordLocked(key, sincePark)
+	r.addrs[addr] = true
+	r.unanswered++
+	if len(scan.inconclusive) > 0 {
+		r.cycles++
+		for _, id := range scan.inconclusive {
+			r.heardNothing[id] = true
+		}
+	}
+	covered = slices.Sorted(maps.Keys(r.addrs))
+	if r.unanswered < swallowUnansweredMax && r.cycles < swallowCyclesMax && (r.cycles < 2 || len(r.heardNothing) < 2) {
+		return false, covered, nil
+	}
+	if r.cycles < 2 || (r.cycles < swallowCyclesMax && len(r.heardNothing) < 2) {
+		// The verdict of the unanswered cycles alone: no transport counted as
+		// swallowed, so there is none to name.
+		log.Warn("%s answered nothing over %d cycles in a row (%s) - its silence verdict",
+			key, r.unanswered, strings.Join(covered, ", "))
+	} else {
+		log.Warn("%s heard nothing on %s over %d cycles in a row (%s) - its silence verdict",
+			key, strings.Join(slices.Sorted(maps.Keys(r.heardNothing)), ", "), r.cycles, strings.Join(covered, ", "))
+	}
+	heard = slices.Sorted(maps.Keys(r.heardNothing))
+	r.endRun()
+	return true, covered, heard
+}
+
+// handshakeRun is a server's run of unanswered session handshakes.
+type handshakeRun struct {
+	count int
+	addrs map[string]bool
+	ids   map[string]bool
+	last  time.Time
+}
+
+// handshakeRunVerdict is how many unanswered session handshakes in a row
+// are the server's verdict: two, so the server's other family gets one try
+// in between, as with a swallowed transport handshake.
+const handshakeRunVerdict = 2
+
+// HandshakeUnanswered books a session handshake the server never answered:
+// s connected to cand, the tunnel's request went out, and nothing came
+// back before the read deadline. Some transports connect without hearing
+// from the server at all (Protocol Confusion), so their connect had been
+// booked as a success: the fast path took the same transport to the same
+// server every cycle, the server was never parked, and two swallowing
+// servers kept the client from the healthy third for over seven minutes,
+// the backoff growing to 2 minutes (R1 of the fix9 stand run).
+//
+// The transport is set aside like a swallowed one, on every address of the
+// server, and loses the fast path; the server's other family gets the next
+// try, with another transport; a second unanswered handshake on the server is
+// its silence verdict, or the route's when the same transport died that way
+// on the server before (routeDeath). Set aside on the one address only, the
+// mute transport was tried again on the other family, and its second miss
+// condemned a server another transport worked on (P2-3 of the round-8
+// review). The other cure, a verdict only from two distinct transports, was
+// not taken: a client with one transport would never reach one, and it costs
+// the healthy transport a cycle.
+// The error to wrap the handshake failure in is returned: ErrAddrSilent on
+// a verdict, ErrCycleUnanswered otherwise - both cap the reconnect backoff
+// at the silence cap.
+func (m *Manager) HandshakeUnanswered(s Strategy, cand endpoint.Candidate, hasCand bool) error {
+	if s == nil {
+		return ErrCycleUnanswered
+	}
+	id := s.ID()
+	m.mu.Lock()
+	if m.lastSuccessfulStrategy != nil && m.lastSuccessfulStrategy.ID() == id {
+		m.lastSuccessfulStrategy = nil
+	}
+	m.updateConfidence(id, false)
+	m.sortStrategies()
+	m.mu.Unlock()
+
+	sel := m.selector()
+	if sel == nil || !hasCand {
+		return ErrCycleUnanswered
+	}
+	for _, addr := range append([]string{cand.Addr}, sel.Siblings(cand)...) {
+		m.noteMute(addr, id)
+	}
+	key := m.swallowKey(cand.Addr)
+	now := time.Now().Round(0)
+	m.mu.Lock()
+	if m.unansweredHS == nil {
+		m.unansweredHS = make(map[string]*handshakeRun)
+	}
+	r := m.unansweredHS[key]
+	if r == nil || now.Sub(r.last) > routeDeathWindow {
+		r = &handshakeRun{addrs: make(map[string]bool), ids: make(map[string]bool)}
+		m.unansweredHS[key] = r
+	}
+	r.count++
+	r.addrs[cand.Addr] = true
+	r.ids[id] = true
+	r.last = now
+	covered := slices.Sorted(maps.Keys(r.addrs))
+	ids := slices.Sorted(maps.Keys(r.ids))
+	verdict := r.count >= handshakeRunVerdict
+	if verdict {
+		delete(m.unansweredHS, key)
+	}
+	m.mu.Unlock()
+
+	if !verdict {
+		if sib, ok := m.swallowSibling(sel, cand, covered); ok {
+			log.Info("Endpoint %s: the %s session handshake went unanswered - the next cycle tries the server's other address %s", cand, s.Name(), sib)
+			sel.Pin(sib)
+		} else {
+			log.Info("Endpoint %s: the %s session handshake went unanswered", cand, s.Name())
+		}
+		return ErrCycleUnanswered
+	}
+	log.Warn("%s left %d session handshakes unanswered in a row (%s on %s) - its silence verdict",
+		key, handshakeRunVerdict, strings.Join(ids, ", "), strings.Join(covered, ", "))
+	if m.routeDeath(cand, deathSwallowed, "its session handshake went unanswered", ids) {
+		return ErrCycleUnanswered
+	}
+	if sel.ReportSilent(cand, covered...) {
+		logServerPark(sel, cand, fmt.Sprintf("Endpoint %s: every address of the server has a verdict - parking the server", cand))
+	}
+	m.logEndpointHealth(sel, cand)
+	return ErrAddrSilent
+}
+
+// HandshakeFailed books a session handshake on cand that failed with
+// neither an answer nor the server's silence - a reset or an end of stream
+// after the request - as a failure of cand, past the success its transport
+// connect was booked (Selector.ReportHandshakeFailed).
+func (m *Manager) HandshakeFailed(cand endpoint.Candidate, hasCand bool) {
+	if sel := m.selector(); sel != nil && hasCand {
+		sel.ReportHandshakeFailed(cand)
+	}
+}
+
+// HandshakeAnswered ends cand's server's run of unanswered session
+// handshakes: the server answered one, on s, which is no longer mute on
+// cand's address.
+func (m *Manager) HandshakeAnswered(s Strategy, cand endpoint.Candidate, hasCand bool) {
+	if !hasCand {
+		return
+	}
+	key := m.swallowKey(cand.Addr)
+	// The mark was set on every address of the server (HandshakeUnanswered),
+	// so the answer lifts it from every address too: lifting it from this
+	// one alone left the transport set aside on the other family, where
+	// nothing would clear it until the record went stale (P3-11 of the
+	// round-9 review).
+	addrs := []string{cand.Addr}
+	if sel := m.selector(); sel != nil {
+		addrs = append(addrs, sel.Siblings(cand)...)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.unansweredHS, key)
+	if r := m.swallowed[key]; r != nil && s != nil {
+		for _, addr := range addrs {
+			delete(r.mute[addr], s.ID())
+		}
+	}
+}
+
+// logServerPark says a server was parked: at Warn when the verdict started
+// the park, at Debug when it extended one still running. While a server is
+// parked every SOCKS dial that is forced onto it fails and extends the park,
+// and the Warn line came about every four seconds (the fix13c stand).
+func logServerPark(sel *endpoint.Selector, c endpoint.Candidate, msg string) {
+	if sel.TakeServerParkNotice(c) {
+		log.Warn("%s", msg)
+		return
+	}
+	log.Debug("%s (still parked)", msg)
+}
+
+// endSwallowRun ends addr's run of no-verdict cycles: a cycle reached a
+// verdict. The skip list stays until a transport gets through.
+func (m *Manager) endSwallowRun(addr string) {
+	key := m.swallowKey(addr)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if r := m.swallowed[key]; r != nil {
+		r.endRun()
+	}
+}
+
+// clearSwallowed forgets addr's swallow record: a transport got through.
+//
+// Only addr's part: the run ends - the server answered - and addr's skip
+// list goes, but the other family's stays. Deleting the whole record cost a
+// cycle on the next return to v6 when v4 had connected (P3-6 of the round-6
+// review).
+func (m *Manager) clearSwallowed(addr string) {
+	key := m.swallowKey(addr)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r := m.swallowed[key]
+	if r == nil {
+		return
+	}
+	r.endRun()
+	delete(r.skip, addr)
+	if len(r.skip) == 0 && r.muteEmpty() {
+		delete(m.swallowed, key)
+	}
 }
 
 // ConnectExcluding tries strategies excluding specified ones (for fallback)
 func (m *Manager) ConnectExcluding(ctx context.Context, target string, excludeIDs []string) (net.Conn, Strategy, error) {
-	m.mu.RLock()
-	rttEnabled := m.rttMaskingEnabled
-	m.mu.RUnlock()
-
 	// One scan, not two. RTT masking is a post-success wrapper (WrapWithRTTMasking
 	// on an already-connected conn); it never changes whether a strategy connects.
 	// The old code scanned once WITHOUT masking and, on total failure, scanned the
@@ -1241,7 +2734,15 @@ func (m *Manager) ConnectExcluding(ctx context.Context, target string, excludeID
 	// round did not. Decide masking up front and make a single pass, so a
 	// successful connection is wrapped when masking is on and a failed scan is not
 	// paid for twice.
-	return m.connectWithRTTScan(ctx, target, excludeIDs, rttEnabled, &scanState{})
+	return m.connectScan(ctx, target, excludeIDs, &scanState{})
+}
+
+// connectScan is ConnectExcluding on a scan state the caller reads afterwards.
+func (m *Manager) connectScan(ctx context.Context, target string, excludeIDs []string, scan *scanState) (net.Conn, Strategy, error) {
+	m.mu.RLock()
+	rttEnabled := m.rttMaskingEnabled
+	m.mu.RUnlock()
+	return m.connectWithRTTScan(ctx, target, excludeIDs, rttEnabled, scan)
 }
 
 // connectWithRTT is the internal connect method with optional RTT masking. It
@@ -1274,6 +2775,34 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 	for _, id := range excludeIDs {
 		excludeMap[id] = true
 	}
+	// A connected handshake may use the rest of its cycle, so a swallowed one
+	// costs the cycle; the transports swallowed on this address in the recent
+	// cycles keep it from costing the next ones too. All of them, not the last
+	// one: with one slot two swallowed transports took turns, cycle after
+	// cycle, and the one that worked was never reached.
+	if scan.addr == "" {
+		scan.addr = target
+	}
+	swallowSkip := m.swallowSkip(scan.addr)
+	if len(swallowSkip) > 0 {
+		log.Info("Strategies %s ran out a recent cycle on %s in their handshake - leaving them out this cycle unless nothing else is left",
+			strings.Join(slices.Sorted(maps.Keys(swallowSkip)), ", "), scan.addr)
+	}
+	// The transports a route verdict set aside on this server are tried
+	// last, after every other eligible one - not left out while anything else
+	// is eligible: a transport refused on both servers could hold them off
+	// for cycle after cycle, each one charging the servers (P2-E of the
+	// round-6 review). The route park is weaker evidence than a swallow and
+	// lasts longer.
+	routeLast := m.routeSkip(scan.addr)
+	if len(routeLast) > 0 {
+		log.Info("Strategies %s died on this server and the one before it - trying them last here",
+			strings.Join(slices.Sorted(maps.Keys(routeLast)), ", "))
+	}
+	if scan.hold = m.swallowPressure(scan.addr); scan.hold {
+		log.Info("Handshakes went unanswered on this server or the one before it - each transport gets its share of the cycle, not the rest of it")
+	}
+	defer func() { m.noteSwallowed(scan.addr, scan.connectedSilent); scan.connectedSilent = nil }()
 
 	// Try last successful strategy first if it was recent (within 5 minutes), but
 	// only if it clears the same gates the full scan applies to every other
@@ -1286,10 +2815,13 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 	fastEligible := lastSuccessful != nil &&
 		time.Since(lastSuccessfulTime) < 5*time.Minute &&
 		!excludeMap[lastSuccessful.ID()] &&
+		!swallowSkip[lastSuccessful.ID()] && !routeLast[lastSuccessful.ID()] &&
 		(!excludeUDP || !isUDPBasedStrategy(lastSuccessful)) &&
 		(m.forced || !m.stormDetector.IsParked(lastSuccessful.ID())) &&
 		m.circuitBreakers.CanTry(lastSuccessful.ID())
 
+	fastSilent := false // the fast path heard nothing this cycle
+	var fastErr error   // how the fast path failed this cycle, if it was dialled
 	if fastEligible {
 		// Loop guard: a strategy that connects but whose tunnel dies seconds later
 		// can ride this fast path in a tight reconnect loop without ever being
@@ -1310,11 +2842,35 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 		default:
 			log.Info("Trying last successful strategy first: %s", lastSuccessful.Name())
 
-			connectCtx, cancel := context.WithTimeout(ctx, m.connectTimeout)
-			start := time.Now()
-			conn, err := lastSuccessful.Connect(connectCtx, target)
-			latency := time.Since(start)
-			cancel()
+			// The fast path may not wait out the whole cycle for a TCP
+			// connect: the reconnect gives a cycle 15 s and an attempt may
+			// take 30, and half is left for the scan. A connect that is up
+			// keeps the rest, because the handshake on it is the one that
+			// worked last time, and a slow one (7-9 s through a lossy path
+			// or a server dialling its cover) used to be cut at half and
+			// land the tunnel on HTTP Polling.
+			budget := m.attemptBudget(ctx)
+			dialBudget := budget
+			// The others a scan would dial after it, by the scan's own
+			// gates: with all of them held back, the fast path is the
+			// only transport there is.
+			others := slices.ContainsFunc(m.GetOrderedStrategies(), func(o Strategy) bool {
+				return o.ID() != lastSuccessful.ID() && o.Priority() > 0 && !excludeMap[o.ID()] && !swallowSkip[o.ID()] &&
+					(!excludeUDP || !isUDPBasedStrategy(o)) && (m.forced || !m.stormDetector.IsParked(o.ID())) &&
+					m.circuitBreakers.CanTry(o.ID())
+			})
+			// Held only where a connected handshake would keep the rest of
+			// a short cycle, and not when it is the only transport there
+			// is. A handshake the server is acknowledging runs on past its
+			// share (watchConnect).
+			scan.held = scan.hold && others && budget < m.connectTimeout
+			switch {
+			case scan.held:
+				dialBudget = jitterShare(budget / pressureShares)
+			case budget < m.connectTimeout:
+				dialBudget = budget / 2
+			}
+			conn, latency, refused, err := m.connectThroughRefusal(ctx, lastSuccessful, target, budget, dialBudget, scan)
 
 			if err == nil {
 				// Success - update stats (also records the breaker success)
@@ -1336,6 +2892,45 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 				return conn, lastSuccessful, nil
 			}
 
+			if refused {
+				// Not the strategy's failure: the port is closed to all of them.
+				m.circuitBreakers.CancelHalfOpenAttempt(lastSuccessful.ID())
+				return nil, nil, refusedScan(target, fmt.Errorf("%s: %w", lastSuccessful.Name(), err))
+			}
+
+			// The fast path is the first transport of this cycle, and what it
+			// heard is evidence about the address like any other: a silent
+			// server costs the fast path the most, and leaving it out of the
+			// count is how a reconnect spent its whole budget here and then
+			// called the address "answering".
+			if !isUDPBasedStrategy(lastSuccessful) {
+				switch m.classifyAttempt(err, latency, scan.limit) {
+				case attemptSilent:
+					scan.timeouts++
+					if !dialNeverConnected(err) {
+						scan.silent = append(scan.silent, lastSuccessful.ID())
+					}
+					fastSilent = true
+					// It had its turn this cycle; dialling it again in the
+					// scan would only spend the rest of the budget the same way.
+					excludeMap[lastSuccessful.ID()] = true
+				case attemptInconclusive:
+					scan.unheard++
+					if m.swallowEvidence(lastSuccessful, scan.allowance) || scan.heldSilent {
+						scan.inconclusive = append(scan.inconclusive, lastSuccessful.ID())
+					}
+					excludeMap[lastSuccessful.ID()] = true
+				case attemptNotDialled:
+					// Still queued on this client when its dial limit came:
+					// no verdict, and the queue is not shorter in the scan.
+					excludeMap[lastSuccessful.ID()] = true
+				default:
+					scan.answered = true
+				}
+			}
+
+			fastErr = fmt.Errorf("%s: %w", lastSuccessful.Name(), err)
+
 			// Record the failure so a fast reconnect that keeps failing feeds the
 			// breaker and confidence stats instead of looping invisibly past them.
 			// Mirror the scan: one record per attempt, timeout counted as timeout.
@@ -1355,6 +2950,9 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 	// Filter out disabled strategies (priority <= 0) and excluded strategies
 	var strategies []Strategy
 	var quicStrategies []Strategy // Collect QUIC strategies separately for fast fallback
+	skippedOthers := 0            // held back by a breaker, a storm park or the UDP gate
+	var sittingOut []Strategy     // eligible, but swallowed in a recent cycle here
+	var last []Strategy           // eligible, set aside here by a route verdict: tried last
 
 	for _, s := range m.strategies {
 		if s.Priority() <= 0 {
@@ -1370,17 +2968,38 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 		// actual dial, so listing a strategy never burns a recovery attempt.
 		if !m.circuitBreakers.CanTry(s.ID()) {
 			log.Debug("Skipping strategy %s (circuit breaker open)", s.Name())
+			skippedOthers++
 			continue
 		}
 		// Skip strategies parked by the storm detector (auto-mode only).
 		// Forced mode keeps its single strategy regardless.
 		if !m.forced && m.stormDetector.IsParked(s.ID()) {
 			log.Debug("Skipping strategy %s (storm cooldown)", s.Name())
+			skippedOthers++
 			continue
 		}
 		// Skip UDP-based strategies (like QUIC) if UDP is not working
 		if excludeUDP && isUDPBasedStrategy(s) {
 			log.Debug("Skipping UDP strategy %s (UDP connectivity issue)", s.Name())
+			skippedOthers++
+			continue
+		}
+
+		if swallowSkip[s.ID()] {
+			// Held back, not gone: the fast path alone being silent is not
+			// "every transport" while this one sits out its turn. Checked
+			// after the gates, so only an otherwise eligible transport sits
+			// out - and before the route's set-aside: a transport swallowed
+			// here sits out even if the route also set it aside (P3-5 of
+			// the round-7 review).
+			log.Debug("Skipping strategy %s (handshake swallowed in a recent cycle)", s.Name())
+			skippedOthers++
+			sittingOut = append(sittingOut, s)
+			continue
+		}
+
+		if routeLast[s.ID()] {
+			last = append(last, s)
 			continue
 		}
 
@@ -1392,6 +3011,33 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 	}
 	rttProfile := m.rttProfile
 	m.mu.RUnlock()
+	if scan.hold {
+		shuffleEqualPriority(strategies)
+	}
+
+	for _, s := range last {
+		if isUDPBasedStrategy(s) {
+			quicStrategies = append(quicStrategies, s)
+		}
+		strategies = append(strategies, s)
+	}
+	// strategies[lastFrom:] are the set-aside transports.
+	lastFrom := len(strategies) - len(last)
+
+	if len(strategies) == 0 && len(sittingOut) > 0 {
+		// Every eligible transport is sitting out its turn: the skip list
+		// was meant to let the others go first, and there are no others.
+		// Skipping anyway emptied the cycle, gave no verdict and grew the
+		// backoff, and the run of swallowed cycles never reached its
+		// verdict either.
+		log.Info("Only transports swallowed in a recent cycle are eligible - trying them again")
+		strategies, skippedOthers = sittingOut, skippedOthers-len(sittingOut)
+		for _, s := range sittingOut {
+			if isUDPBasedStrategy(s) {
+				quicStrategies = append(quicStrategies, s)
+			}
+		}
+	}
 
 	if len(strategies) == 0 {
 		// If storm parking emptied the list, unpark everything and retry with
@@ -1401,6 +3047,20 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			log.Warn("All strategies parked by storm cooldown - unparking to avoid total outage")
 			m.stormDetector.Reset()
 			return m.connectWithRTTScan(ctx, target, excludeIDs, useRTTMasking, scan)
+		}
+		if fastSilent && skippedOthers == 0 {
+			// The fast path was the only transport there is, and it heard
+			// nothing: that is every transport. Not when the others were only
+			// held back by a breaker, a storm park or the UDP gate.
+			return nil, nil, fmt.Errorf("%w: %w, only transport silent", errAddrSilent, errStrategyScanFailed)
+		}
+		if fastErr != nil {
+			// The fast path was the only transport left and it was dialled:
+			// its failure is the cycle's. "No available strategies" read as a
+			// circuit-breaker problem and doubled the backoff to 2 minutes
+			// (Geneva on the 2026-10-22 stand: back 63 s after the fault
+			// ended).
+			return nil, nil, fastErr
 		}
 		return nil, nil, fmt.Errorf("no available strategies (all excluded or circuit-broken)")
 	}
@@ -1414,9 +3074,28 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 	var lastErr error
 	attemptCount := 0
 	addrSilent := false
+	toLast := false // skipping to the set-aside transports
+	scanStartBudget := m.attemptBudget(ctx)
 
 	for i, s := range strategies {
-		if !scan.answered && scan.timeouts >= tcpFailuresThreshold && !isUDPBasedStrategy(s) {
+		if ctxErr(ctx) != nil {
+			// Out of time before this strategy was dialled. Dialling it anyway
+			// fails at once and charges it for the caller's deadline.
+			return nil, nil, scanOutOfTime(ctx, target, scan, lastErr)
+		}
+		if !scan.answered && scan.timeouts >= tcpFailuresThreshold && !isUDPBasedStrategy(s) && len(last) > 0 && i < lastFrom {
+			// The verdict is in, but the transports the route set aside here
+			// have not been dialled: they died elsewhere, and may be what
+			// works here now. Abandoning the scan before them left them
+			// never tried on a server where everything else timed out (P3-5
+			// of the round-7 review).
+			if !toLast {
+				log.Info("Address %s answered nothing on %d transports - trying the ones set aside before giving up", target, scan.timeouts)
+				toLast = true
+			}
+			continue
+		}
+		if !scan.answered && scan.timeouts >= tcpFailuresThreshold && !isUDPBasedStrategy(s) && len(last) == 0 {
 			// Nothing has come back from this address on any transport. Walking
 			// the rest of the list means one connect timeout per strategy for a
 			// verdict already in hand, and the endpoint layer is waiting for
@@ -1498,12 +3177,24 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			attemptCount++
 			log.Debug("  Attempt %d/%d for %s", retry+1, m.maxRetries, s.Name())
 
-			connectCtx, cancel := context.WithTimeout(ctx, m.connectTimeout)
-			start := time.Now()
-
-			conn, err := s.Connect(connectCtx, target)
-			latency := time.Since(start)
-			cancel()
+			// Same rule as the fast path: while other transports remain, one
+			// attempt may not wait the whole of a short cycle for its TCP
+			// connect; once connected, its handshake keeps the rest.
+			budget := m.attemptBudget(ctx)
+			dialBudget := budget
+			scan.held = scan.hold && i < len(strategies)-1 && budget < m.connectTimeout
+			switch {
+			case i == len(strategies)-1:
+			case scan.held:
+				// An even share of what is left, so the transports at the
+				// end of the list get a turn too - halving left Geneva,
+				// tenth in the list, a few milliseconds - and no less
+				// than pressureShares of the cycle.
+				dialBudget = min(budget, jitterShare(max(budget/time.Duration(len(strategies)-i), scanStartBudget/pressureShares)))
+			case budget < m.connectTimeout:
+				dialBudget = budget / 2
+			}
+			conn, latency, refused, err := m.connectThroughRefusal(ctx, s, target, budget, dialBudget, scan)
 
 			if err == nil {
 				// Success - update confidence with latency and save for fast reconnect
@@ -1537,6 +3228,11 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 
 			lastErr = fmt.Errorf("%s: %w", s.Name(), err)
 
+			if refused {
+				m.circuitBreakers.CancelHalfOpenAttempt(s.ID())
+				return nil, nil, refusedScan(target, lastErr)
+			}
+
 			// Distinguish between timeout and regular errors. The circuit
 			// breaker is NOT recorded per retry here - it is recorded once when
 			// the strategy is exhausted, so one logical failure counts once
@@ -1550,7 +3246,7 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			// containing the word the classifier looks for. A refusal or a
 			// reset arrives in milliseconds; only silence costs the whole
 			// budget.
-			heardNothing := timedOut || latency >= silenceLatency(m.connectTimeout)
+			verdict := m.classifyAttempt(err, latency, scan.limit)
 
 			if timedOut {
 				log.Debug("  Failed: %s TIMEOUT (latency=%v)", s.Name(), latency)
@@ -1559,9 +3255,13 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 			}
 			strategyTimedOut = timedOut
 
-			if heardNothing {
+			switch verdict {
+			case attemptSilent:
 				if !isUDPBasedStrategy(s) {
 					scan.timeouts++
+					if !dialNeverConnected(err) {
+						scan.silent = append(scan.silent, s.ID())
+					}
 					log.Debug("TCP silence count: %d/%d", scan.timeouts, tcpFailuresThreshold)
 				}
 				// Track TCP timeouts for Android fast fallback
@@ -1572,7 +3272,12 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 					m.sortStrategies()
 					m.mu.Unlock()
 				}
-			} else {
+			case attemptInconclusive:
+				scan.unheard++
+				if m.swallowEvidence(s, scan.allowance) || scan.heldSilent {
+					scan.inconclusive = append(scan.inconclusive, s.ID())
+				}
+			case attemptAnswered:
 				// A refusal, a reset, a handshake that got an answer it did not
 				// like: the address is talking. Whatever is wrong here is a
 				// property of this transport, which is precisely the case the
@@ -1580,12 +3285,18 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 				// for the silence verdict this cycle.
 				scan.answered = true
 			}
+			if verdict != attemptAnswered {
+				// Silence once per transport per cycle, not once per attempt:
+				// with the desktop's two attempts a single swallowed transport
+				// made "two silent transports", and the retry spent the budget
+				// the next transport needed.
+				break
+			}
 
 			// Brief pause before retry
 			select {
 			case <-ctx.Done():
-				log.Warn("Connection cancelled by context")
-				return nil, nil, ctx.Err()
+				return nil, nil, scanOutOfTime(ctx, target, scan, lastErr)
 			case <-time.After(100 * time.Millisecond):
 			}
 		}
@@ -1607,6 +3318,20 @@ func (m *Manager) connectWithRTTScan(ctx context.Context, target string, exclude
 		log.Debug("Strategy %s exhausted, moving to next", s.Name())
 	}
 
+	if !addrSilent && !scan.answered && scan.timeouts >= tcpFailuresThreshold {
+		// The last transport walked was the one that completed the count:
+		// the same verdict as abandoning the scan before the next one. It
+		// read as an ordinary failure, under the threshold of two, so a
+		// server whose remaining transports were all silent after a route
+		// verdict was not charged (routeDeath).
+		log.Info("Address %s answered nothing on %d transports%s", target, scan.timeouts, modeStr)
+		addrSilent = true
+	}
+	if !addrSilent && ctxErr(ctx) != nil {
+		// The last transport ran into the caller's deadline: the same ending
+		// as running out of time between transports.
+		return nil, nil, scanOutOfTime(ctx, target, scan, lastErr)
+	}
 	if addrSilent {
 		// No emergency reprobe here: it exists to find a way back to an address
 		// that went dark, and this scan's whole point is that the client should
@@ -1672,6 +3397,64 @@ type StrategyConn struct {
 	strategy Strategy
 }
 
+// NetConn returns the wrapped connection.
+func (sc *StrategyConn) NetConn() net.Conn { return sc.Conn }
+
+// ServerKeepaliveCounter is implemented by a tunnel conn that splices
+// keepalive frames of its own into what it delivers - HTTP Polling's feeder,
+// which keeps the TUN reader's deadline fed while polls succeed.
+// ServerKeepalives counts only the zero-length frames the server sent, which
+// is what a keepalive echo has to be judged by.
+type ServerKeepaliveCounter interface {
+	// ServerKeepalives returns the count; tracked is false while the conn
+	// can not tell the server's frames apart (before the TUN frame stream,
+	// or after losing its framing), and the count then says nothing.
+	ServerKeepalives() (n uint64, tracked bool)
+}
+
+// KeepaliveMaker is implemented by a strategy whose conns splice keepalive
+// frames of their own into the downlink (HTTP Polling). A caller that judges
+// echoes needs those conns' ServerKeepaliveCounter, and must not judge them
+// without it.
+type KeepaliveMaker interface {
+	MakesUpKeepalives() bool
+}
+
+// ServerKeepaliveCounterOf finds a ServerKeepaliveCounter in conn or under
+// its wrappers (anything with NetConn).
+func ServerKeepaliveCounterOf(conn net.Conn) (ServerKeepaliveCounter, bool) {
+	return findUnder[ServerKeepaliveCounter](conn)
+}
+
+// UplinkQueue is implemented by a tunnel conn whose Write only queues: HTTP
+// Polling, where a write is on its way only when a poll takes it. See
+// HTTPPollingConn.UplinkProgress.
+type UplinkQueue interface {
+	UplinkProgress() (accepted, sent uint64)
+}
+
+// UplinkQueueOf finds an UplinkQueue in conn or under its wrappers.
+func UplinkQueueOf(conn net.Conn) (UplinkQueue, bool) {
+	return findUnder[UplinkQueue](conn)
+}
+
+// findUnder looks for a T in conn and under its wrappers (anything with
+// NetConn), a few levels deep.
+func findUnder[T any](conn net.Conn) (T, bool) {
+	for range 8 {
+		if c, ok := conn.(T); ok {
+			return c, true
+		}
+		w, ok := conn.(interface{ NetConn() net.Conn })
+		if !ok {
+			break
+		}
+		conn = w.NetConn()
+	}
+	var zero T
+	return zero, false
+}
+
 // Strategy returns the strategy used for this connection
 func (sc *StrategyConn) Strategy() Strategy {
 	return sc.strategy
@@ -1685,7 +3468,7 @@ type DefaultManagerConfig struct {
 	ServerAddr string       // Server address for server-based strategies
 	Secret     []byte       // Shared secret for authentication
 	RelayNodes []*RelayNode // Mesh relay nodes (optional)
-	CoverHost  string       // Host to impersonate for HTTP/2 stego
+	CoverHost  string       // HTTP/2 stego cover host; an endpoint SNI pool wins over it
 
 	// IPv6 Transport Layer
 	ServerAddrV6 string // IPv6 server address (e.g., "[2001:db8::100]:995")
@@ -2311,8 +4094,8 @@ func (m *Manager) StartPeriodicReprobe(ctx context.Context) {
 	log.Info("Starting periodic reprobe (interval=%v, target=%s)", m.reprobeInterval, m.GetServerAddr(ctx))
 
 	go func() {
-		ticker := time.NewTicker(m.reprobeInterval)
-		defer ticker.Stop()
+		timer := time.NewTimer(nextReprobeDelay(m.reprobeInterval))
+		defer timer.Stop()
 
 		for {
 			select {
@@ -2322,11 +4105,24 @@ func (m *Manager) StartPeriodicReprobe(ctx context.Context) {
 			case <-m.stopReprobe:
 				log.Info("Periodic reprobe stopped")
 				return
-			case <-ticker.C:
+			case <-timer.C:
 				m.doPeriodicReprobe(ctx)
+				timer.Reset(nextReprobeDelay(m.reprobeInterval))
 			}
 		}
 	}()
+}
+
+// nextReprobeDelay is the pause before the next periodic reprobe.
+//
+// It was a strict time.Ticker: a burst of probe connects to the pinned server
+// every 300.000 s from process start, the cleanest metronome the client put
+// on the wire. Now each pause is RandomDelay(interval/2, interval, 2 x
+// interval): the mean stays near the interval, the gaps vary, and nothing lands
+// on a fixed value. No measured reference; not uniform jitter (verification
+// rule 3).
+func nextReprobeDelay(interval time.Duration) time.Duration {
+	return RandomDelay(interval/2, interval, 2*interval)
 }
 
 // StopPeriodicReprobe stops background re-probing
@@ -2340,8 +4136,25 @@ func (m *Manager) StopPeriodicReprobe() {
 	}
 }
 
+// HoldReprobe holds periodic reprobes off while held is true. The TUN client
+// holds them while it has no tunnel and is reconnecting.
+//
+// A reprobe in an outage probed the pinned server that had just gone silent:
+// about 16 connects, 30-40 SYNs with their retransmits, within ~20 s, from a
+// client whose reconnect loop was already dialling that same pool - the burst
+// a sweep against a blocked address looks like. It found nothing (0/21 on the
+// stand), the upgrade it feeds needs a live tunnel, and the reconnect and the
+// pool poll already say when a server answers again.
+func (m *Manager) HoldReprobe(held bool) {
+	m.reprobeHeld.Store(held)
+}
+
 // doPeriodicReprobe performs a single reprobe cycle
 func (m *Manager) doPeriodicReprobe(ctx context.Context) {
+	if m.reprobeHeld.Load() {
+		log.Debug("Periodic reprobe skipped: no tunnel, the reconnect is dialling")
+		return
+	}
 	target := m.GetServerAddr(ctx)
 	if target == "" {
 		log.Warn("No reprobe target set")
@@ -2364,6 +4177,388 @@ func (m *Manager) doPeriodicReprobe(ctx context.Context) {
 		}
 	}
 	log.Info("Periodic reprobe complete: %d/%d strategies available", available, len(results))
+
+	m.offerUpgrade(results)
+}
+
+// SetStrategyUpgradeCallback registers fn to hear, some time after a periodic
+// reprobe, which strategies the reprobe found reachable and the upgrade backoff
+// lets through, best first (UpgradeRank). The TUN client uses it to move a live
+// tunnel off a fallback strategy (see VPNClient.tryStrategyUpgrade). Nil turns
+// upgrades off.
+func (m *Manager) SetStrategyUpgradeCallback(fn func([]Strategy)) {
+	m.mu.Lock()
+	m.upgradeCallback = fn
+	m.mu.Unlock()
+}
+
+// upgradeMaxSkip caps how many reprobes a strategy sits out after failed
+// upgrades: six reprobes, half an hour at the default interval.
+const upgradeMaxSkip = 6
+
+// upgradeDelay is how long after a reprobe the upgrade offer goes out. A var
+// so tests can make it immediate.
+//
+// The offer used to go out the moment the reprobe burst finished, so on the
+// wire a burst of probe connects was followed at once by a new session to the
+// same server, on the reprobe's 5-minute grid. RandomDelay with a 20 s floor,
+// a 90 s mean and a 4 min ceiling: an upgrade is
+// one event per degradation episode, and the memoryless shape is what
+// independent user-driven events have. There is no measured reference for it;
+// it is chosen to unhook the switch from the reprobe, not to imitate anything.
+var upgradeDelay = func() time.Duration {
+	return RandomDelay(20*time.Second, 90*time.Second, 4*time.Minute)
+}
+
+// RandomDelay draws a pause of floor plus an exponential with mean
+// (mean - floor), redrawn - not clamped - while it exceeds ceiling.
+//
+// Clamping put a spike of exact values on the wire: about 5% of reprobe gaps
+// came out at exactly 600.000 s and 4% of upgrade delays at exactly 240 s, a
+// fixed value an observer can count. The redraw keeps the tail inside the
+// ceiling without piling it up there. There is no measured reference
+// distribution behind the shape; it is chosen to have no grid and no spike,
+// and it is not uniform jitter (verification rule 3).
+func RandomDelay(floor, mean, ceiling time.Duration) time.Duration {
+	span := float64(mean - floor)
+	if span <= 0 || ceiling <= floor {
+		return floor
+	}
+	for range 64 {
+		if d := floor + time.Duration(rand.ExpFloat64()*span); d < ceiling {
+			return d
+		}
+	}
+	return floor + time.Duration(rand.Float64()*float64(ceiling-floor))
+}
+
+// HumpDelay draws a pause of floor plus a gamma of shape 3 with mean
+// (mean - floor), redrawn while it reaches ceiling.
+//
+// RandomDelay's exponential piles its draws at the floor: about 40% of them
+// land in the lowest fifth of the range, and the floor becomes a hard edge in
+// the gap distribution - a minimum an observer of many gaps reads off at once.
+// A gamma of shape 3 has no density at the floor and its bulk in the middle,
+// so the lower edge is soft. There is no measured reference distribution
+// behind the shape either (verification rule 3); it is chosen to have no
+// edge, no grid and no spike.
+func HumpDelay(floor, mean, ceiling time.Duration) time.Duration {
+	theta := float64(mean-floor) / 3
+	if theta <= 0 || ceiling <= floor {
+		return floor
+	}
+	for range 64 {
+		g := rand.ExpFloat64() + rand.ExpFloat64() + rand.ExpFloat64()
+		if d := floor + time.Duration(g*theta); d < ceiling {
+			return d
+		}
+	}
+	return floor + time.Duration(rand.Float64()*float64(ceiling-floor))
+}
+
+// UpgradeRank is the order an upgrade compares strategies in: the base
+// priority plus the Android UDP penalty the scan applies (sortStrategies).
+// Lower is better.
+//
+// Confidence is left out on purpose. A strategy that was blocked during the
+// fault comes out of it with its confidence on the floor, and it rises by one
+// probe's worth per reprobe - two or three reprobes before it would outrank a
+// fallback that never failed, for no information the real upgrade dial does
+// not provide better. What the rank must not ignore is what the scan would
+// refuse: QUIC on Android ranks behind TCP until TCP has timed out, and a
+// UDP strategy while UDP is excluded is not offered at all.
+func (m *Manager) UpgradeRank(s Strategy) float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	rank := float64(s.Priority())
+	if m.androidMode && isUDPBasedStrategy(s) {
+		rank += max(10-5*float64(m.consecutiveTCPTimeouts), 0)
+	}
+	return rank
+}
+
+// ScanScore is the score the full scan orders strategies by (sortStrategies):
+// priority minus weighted confidence, plus the Android UDP penalty. Lower is
+// better.
+func (m *Manager) ScanScore(s Strategy) float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	score := float64(s.Priority())
+	if r := m.results[s.ID()]; r != nil {
+		score -= r.Confidence * confidenceWeight
+	}
+	if m.androidMode && isUDPBasedStrategy(s) {
+		score += max(10-5*float64(m.consecutiveTCPTimeouts), 0)
+	}
+	return score
+}
+
+// UpgradeEligible reports whether a scan on addr would admit s right now: not
+// a UDP strategy while UDP is excluded, not storm-parked, breaker closed, not
+// set aside on addr's server by a route verdict (routeSkip), and not set
+// aside on addr as swallowed or mute (swallowSkip, P3-5 of the round-8
+// review). The offer
+// checks it when it is built; the dial comes up to minutes later and checks it
+// again. Without the last check an upgrade moved the tunnel straight back
+// onto the transport the route had just killed there, and its next death
+// charged the server - the false charge the route rule exists to prevent
+// (P2-B of the round-6 review).
+func (m *Manager) UpgradeEligible(s Strategy, addr string) bool {
+	if m.routeSkip(addr)[s.ID()] || m.swallowSkip(addr)[s.ID()] {
+		return false
+	}
+	m.mu.RLock()
+	excludeUDP := m.excludeUDPStrategies
+	m.mu.RUnlock()
+	id := s.ID()
+	return (!excludeUDP || !isUDPBasedStrategy(s)) && !m.stormDetector.IsParked(id) && m.circuitBreakers.CanTry(id)
+}
+
+// offerUpgrade hands the upgrade callback, after upgradeDelay, the strategies
+// this reprobe found reachable and that a scan would admit right now, best
+// first.
+//
+// Nothing else ever moves a live tunnel off the strategy it connected with.
+// The reprobe only refreshed confidence, so a client that fell back to HTTP
+// Polling or Geneva during a fault stayed there for as long as the session
+// held - fourteen minutes and two clean reprobes in the stand's run #9.
+//
+// A probe is a TCP connect and proves only the port; the callback's real dial,
+// handshake and a useful session are what prove the strategy
+// (UpgradeOutcome). A strategy whose upgrades keep failing (REALITY under a
+// censor that resets its handshake) sits out 1, 2, 4 and then 6 reprobes after
+// its second, third, fourth and later consecutive failure. The first failure
+// costs nothing: a fault that has just been lifted is the common case.
+func (m *Manager) offerUpgrade(results []Result) {
+	m.muxMu.Lock()
+	muxEnabled := m.muxEnabled
+	m.muxMu.Unlock()
+
+	// The reprobe ran against the pinned server, and the tunnel rides it.
+	var routeSkip, swallowSkip map[string]bool
+	if sel := m.selector(); sel != nil {
+		if cand, ok := sel.Current(); ok {
+			routeSkip = m.routeSkip(cand.Addr)
+			swallowSkip = m.swallowSkip(cand.Addr)
+		}
+	}
+
+	m.mu.Lock()
+	cb := m.upgradeCallback
+	if cb == nil || m.forced || muxEnabled {
+		// With mux the tunnel rides a shared carrier that budget recycling
+		// swaps; an upgrade from here would race it.
+		m.mu.Unlock()
+		return
+	}
+	excludeUDP := m.excludeUDPStrategies
+	var cands []Strategy
+	for _, r := range results {
+		s := r.Strategy
+		if s == nil {
+			continue
+		}
+		id := s.ID()
+		if n := m.upgradeSkip[id]; n > 0 {
+			m.upgradeSkip[id] = n - 1 // one more reprobe sat out
+			continue
+		}
+		if !r.Success || s.Priority() <= 0 {
+			continue
+		}
+		if (excludeUDP && isUDPBasedStrategy(s)) || m.stormDetector.IsParked(id) || !m.circuitBreakers.CanTry(id) ||
+			routeSkip[id] || swallowSkip[id] {
+			continue
+		}
+		cands = append(cands, s)
+	}
+	m.mu.Unlock()
+
+	if len(cands) == 0 {
+		return
+	}
+	slices.SortStableFunc(cands, func(a, b Strategy) int { return cmp.Compare(m.UpgradeRank(a), m.UpgradeRank(b)) })
+	delay := upgradeDelay()
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Error("strategy upgrade panic: %v", r)
+			}
+		}()
+		select {
+		case <-time.After(delay):
+		case <-m.lifeCtx.Done():
+			return
+		}
+		cb(cands)
+	}()
+}
+
+// recordUpgradeResultLocked books one upgrade of id. Caller holds m.mu.
+func (m *Manager) recordUpgradeResultLocked(id string, ok bool) {
+	if m.upgradeFails == nil {
+		m.upgradeFails = make(map[string]int)
+		m.upgradeSkip = make(map[string]int)
+	}
+	if ok {
+		delete(m.upgradeFails, id)
+		delete(m.upgradeSkip, id)
+		return
+	}
+	m.upgradeFails[id]++
+	if n := m.upgradeFails[id]; n >= 2 {
+		m.upgradeSkip[id] = min(1<<(n-2), upgradeMaxSkip)
+	}
+}
+
+// UpgradeFailures reports how many upgrades to id have failed in a row, for
+// logs and tests.
+func (m *Manager) UpgradeFailures(id string) int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.upgradeFails[id]
+}
+
+// UpgradeOutcome books how an upgrade to s ended after its dial: ok once the
+// upgraded session has carried traffic for a meaningful time, not ok when the
+// handshake failed, the session was rejected, or it died before proving
+// itself. Only a confirmed upgrade makes s the fast-reconnect strategy; until
+// then a reconnect goes back the way the tunnel came.
+func (m *Manager) UpgradeOutcome(s Strategy, ok bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.recordUpgradeResultLocked(s.ID(), ok)
+	if !ok {
+		m.updateConfidenceStats(s.ID(), false, 0)
+		return
+	}
+	m.lastSuccessfulStrategy = s
+	m.lastSuccessfulTime = time.Now()
+	m.updateConfidenceWithLatency(s.ID(), true, 0)
+	m.sortStrategies()
+	m.lastConnectionStrategy = s.Name()
+	m.lastConnectionStrategyID = s.ID()
+}
+
+// ConnectStrategy dials exactly s at cand - the endpoint the tunnel's session
+// rides - with that endpoint's secret. It is the upgrade dial: the caller
+// already has a working tunnel and wants this strategy specifically, so there
+// is no fallback to anything else and no endpoint walk. A failed dial is booked
+// as a failed upgrade; a successful one is not booked at all until
+// UpgradeOutcome says how the session went.
+func (m *Manager) ConnectStrategy(ctx context.Context, s Strategy, cand endpoint.Candidate) (net.Conn, error) {
+	m.muxMu.Lock()
+	muxEnabled := m.muxEnabled
+	m.muxMu.Unlock()
+	if muxEnabled {
+		return nil, fmt.Errorf("strategy upgrade is not supported with mux")
+	}
+
+	dialCtx := m.withDialCandidate(ctx, cand)
+	connectCtx, cancel := context.WithTimeout(dialCtx, m.connectTimeout)
+	conn, err := s.Connect(connectCtx, m.withHoppedPort(cand.Addr))
+	cancel()
+
+	if err != nil {
+		m.mu.Lock()
+		m.recordUpgradeResultLocked(s.ID(), false)
+		m.updateConfidenceStats(s.ID(), false, 0)
+		if isTimeoutError(err) {
+			m.circuitBreakers.RecordTimeout(s.ID())
+		} else {
+			m.circuitBreakers.RecordFailure(s.ID())
+		}
+		m.mu.Unlock()
+		return nil, err
+	}
+	m.mu.RLock()
+	useRTTMasking, rttProfile := m.rttMaskingEnabled, m.rttProfile
+	m.mu.RUnlock()
+
+	optimizeTCPConn(conn)
+	if useRTTMasking {
+		conn = WrapWithRTTMasking(conn, rttProfile)
+	}
+	return conn, nil
+}
+
+// CurrentCandidate returns the pinned endpoint candidate.
+func (m *Manager) CurrentCandidate() (endpoint.Candidate, bool) {
+	sel := m.selector()
+	if sel == nil {
+		return endpoint.Candidate{}, false
+	}
+	return sel.Current()
+}
+
+// ReturnCandidate reports the more preferred candidate a session on a
+// fallback should return to, once it has dwelt there for the selector's
+// MinDwell (endpoint.Selector.ReturnCandidate). False without a selector.
+func (m *Manager) ReturnCandidate() (endpoint.Candidate, bool) {
+	sel := m.selector()
+	if sel == nil {
+		return endpoint.Candidate{}, false
+	}
+	return sel.ReturnCandidate(sel.Now())
+}
+
+// DialReturn dials s at cand for a session's return to a preferred server:
+// one dial, the endpoint's own secret, no walk. A failed dial is booked on
+// cand as a failed connect, where repeated failures park it; the strategy's
+// own record is not touched, since what failed may be the server. A dial
+// that connects books nothing: a TCP connect does not show a server that
+// swallows handshakes working, and booking it as a success cleared the
+// failures that keep such a server parked (P3-5 of the round-10 review).
+// The caller books the outcome of the handshake (ReturnOutcome).
+func (m *Manager) DialReturn(ctx context.Context, s Strategy, cand endpoint.Candidate) (net.Conn, error) {
+	m.muxMu.Lock()
+	muxEnabled := m.muxEnabled
+	m.muxMu.Unlock()
+	if muxEnabled {
+		return nil, fmt.Errorf("return to a preferred server is not supported with mux")
+	}
+	connectCtx, cancel := context.WithTimeout(m.withDialCandidate(ctx, cand), m.connectTimeout)
+	conn, err := s.Connect(connectCtx, m.withHoppedPort(cand.Addr))
+	cancel()
+	sel := m.selector()
+	if err != nil {
+		if sel != nil {
+			sel.Report(cand, false, 0)
+		}
+		return nil, err
+	}
+	m.mu.RLock()
+	useRTTMasking, rttProfile := m.rttMaskingEnabled, m.rttProfile
+	m.mu.RUnlock()
+	optimizeTCPConn(conn)
+	if useRTTMasking {
+		conn = WrapWithRTTMasking(conn, rttProfile)
+	}
+	return conn, nil
+}
+
+// ReturnOutcome books the TUN handshake of a return to cand (DialReturn):
+// a success as a successful connect, a failure as a failed one. A request
+// that went out and heard nothing is the address's silence: it parks cand
+// at once, as a silent connect cycle does. Booked as one failure of two,
+// it left cand available, and the reconnect the return then makes went
+// straight back to it (P2-1 of the round-11 review).
+func (m *Manager) ReturnOutcome(cand endpoint.Candidate, ok, silent bool) {
+	sel := m.selector()
+	switch {
+	case sel == nil:
+	case silent:
+		sel.ReportSilent(cand)
+	default:
+		sel.Report(cand, ok, 0)
+	}
+}
+
+// PinCandidate moves the selector's pin to cand: the session now rides it.
+func (m *Manager) PinCandidate(cand endpoint.Candidate) {
+	if sel := m.selector(); sel != nil {
+		sel.Pin(cand)
+	}
 }
 
 // SetReprobeInterval changes the reprobe interval
@@ -2641,7 +4836,18 @@ func optimizeTCPConn(conn net.Conn) {
 
 // TriggerEmergencyReprobe starts aggressive re-probing when all strategies fail
 // This helps recover from network outages by periodically retrying with short intervals
+//
+// Not while the reprobe is held (HoldReprobe): the TUN client holds it while it
+// reconnects, and a reconnect is where every failed scan used to start one -
+// ProbeAll against the pinned server every 30.000 s, next to a reconnect loop
+// already dialling it, the burst HoldReprobe exists to keep off the wire. The
+// reconnect is the recovery there. Where nothing holds it (no TUN) the pauses
+// are drawn like the periodic reprobe's, not ticked.
 func (m *Manager) TriggerEmergencyReprobe(ctx context.Context) {
+	if m.reprobeHeld.Load() {
+		log.Debug("Emergency reprobe skipped: no tunnel, the reconnect is dialling")
+		return
+	}
 	// Read the pinned candidate BEFORE taking m.mu: GetServerAddr takes the
 	// same lock to reach the selector.
 	target := m.GetServerAddr(ctx)
@@ -2684,8 +4890,8 @@ func (m *Manager) TriggerEmergencyReprobe(ctx context.Context) {
 			log.Info("Emergency reprobe stopped")
 		}()
 
-		ticker := time.NewTicker(30 * time.Second) // Aggressive: every 30 seconds
-		defer ticker.Stop()
+		timer := time.NewTimer(nextReprobeDelay(m.emergencyInterval))
+		defer timer.Stop()
 
 		maxAttempts := 10 // Try for 5 minutes max
 		attempt := 0
@@ -2696,7 +4902,12 @@ func (m *Manager) TriggerEmergencyReprobe(ctx context.Context) {
 				return
 			case <-stopCh:
 				return
-			case <-ticker.C:
+			case <-timer.C:
+				timer.Reset(nextReprobeDelay(m.emergencyInterval))
+				if m.reprobeHeld.Load() {
+					// A reconnect started since: it is the recovery now.
+					return
+				}
 				attempt++
 				if attempt > maxAttempts {
 					log.Warn("Emergency reprobe giving up after %d attempts", maxAttempts)
@@ -2775,22 +4986,14 @@ func (m *Manager) ResetForNetworkChange() {
 	defer m.mu.Unlock()
 
 	log.Info("Network change detected - resetting all circuit breakers and confidences")
-
-	// Reset all circuit breakers
-	for _, s := range m.strategies {
-		cb := m.circuitBreakers.Get(s.ID())
-		cb.Reset()
-
-		// Reset confidence to neutral (0.5) - don't punish strategies for old network failures
-		if result, exists := m.results[s.ID()]; exists {
-			result.Confidence = 0.5
-			result.ConsecutiveFail = 0
-			result.LastFailure = time.Time{}
-		}
-	}
+	m.resetStrategyBlocksLocked()
 
 	// Storm state is tied to the old network - clear it after a network change.
 	m.stormDetector.Reset()
+	m.lastDeath = deathMark{server: -1}
+	m.swallowed = nil
+	m.unansweredHS = nil
+	m.routeParked = nil
 
 	// So is the UDP verdict: it gated QUIC for the old network (or for no
 	// network at all, when this runs because the link went down). Void it,
@@ -2819,6 +5022,207 @@ func (m *Manager) ResetForNetworkChange() {
 
 	// Re-sort strategies by priority (confidence is now neutral for all)
 	m.sortStrategies()
+}
+
+// EndpointHealth returns the selector's per-candidate health, for a manager
+// that takes over from this one (ImportEndpointHealth). Nil without a
+// selector.
+func (m *Manager) EndpointHealth() []endpoint.HealthRecord {
+	if sel := m.selector(); sel != nil {
+		return sel.ExportHealth()
+	}
+	return nil
+}
+
+// ImportEndpointHealth takes over what another manager over the same pool
+// learned about its candidates: failures and parks.
+func (m *Manager) ImportEndpointHealth(recs []endpoint.HealthRecord) {
+	if sel := m.selector(); sel != nil {
+		sel.ImportHealth(recs)
+	}
+}
+
+// StormHistory returns the storm detector, for a manager that takes over
+// from this one (AdoptStormHistory).
+func (m *Manager) StormHistory() *StormDetector { return m.stormDetector }
+
+// AdoptStormHistory makes d this manager's storm detector: the session
+// history another manager collected goes on counting here.
+func (m *Manager) AdoptStormHistory(d *StormDetector) {
+	if d != nil {
+		m.stormDetector = d
+	}
+}
+
+// RouteMemory is what a manager knows about the route beyond endpoint health
+// and storm history: the last server verdict (routeDeath), the runs of
+// swallowed handshakes with their skip lists, and the transports a route
+// verdict set aside per server. Opaque; see RouteHistory.
+//
+// Servers are named by address in it, not by their index in the pool: a pool
+// reordered between two cores must not move a verdict onto another server
+// (P3-2 of the round-6 review). Each server is named by its first address in
+// candidate order.
+type RouteMemory struct {
+	death     deathMark
+	deathAddr string
+	swallowed map[string]*swallowRecord // key: server address, or the dial address without a selector
+	parked    map[string]map[string]time.Time
+	// handshakes are the runs of unanswered session handshakes, by server
+	// address: on Android every unanswered handshake ends the core, and a run
+	// that did not cross the restart never reached its verdict.
+	handshakes map[string]*handshakeRun
+}
+
+// serverAddr names endpoint idx by its first candidate address; "" if none.
+func serverAddr(sel *endpoint.Selector, idx int) string {
+	for _, c := range sel.Candidates() {
+		if c.EndpointIdx == idx {
+			return c.Addr
+		}
+	}
+	return ""
+}
+
+// RouteHistory returns a copy of the route verdict marker, the swallow runs
+// and the route parks, for a manager that takes over from this one
+// (AdoptRouteHistory). The Android app replaces the whole core on every dead
+// connection; without these the next core's first verdict was a first
+// verdict again, and the route rule never fired there (P1-4 of the round-5
+// review).
+func (m *Manager) RouteHistory() RouteMemory {
+	sel := m.selector()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := RouteMemory{death: m.lastDeath, swallowed: make(map[string]*swallowRecord, len(m.swallowed)),
+		parked: make(map[string]map[string]time.Time, len(m.routeParked))}
+	if sel == nil {
+		return out
+	}
+	if m.lastDeath.server >= 0 {
+		out.deathAddr = serverAddr(sel, m.lastDeath.server)
+	}
+	for server, ids := range m.routeParked {
+		if addr := serverAddr(sel, server); addr != "" {
+			out.parked[addr] = maps.Clone(ids)
+		}
+	}
+	for k, r := range m.unansweredHS {
+		var idx int
+		if _, err := fmt.Sscanf(k, "server %d", &idx); err != nil {
+			continue
+		}
+		if addr := serverAddr(sel, idx); addr != "" {
+			if out.handshakes == nil {
+				out.handshakes = make(map[string]*handshakeRun)
+			}
+			out.handshakes[addr] = &handshakeRun{count: r.count, addrs: maps.Clone(r.addrs), ids: maps.Clone(r.ids), last: r.last}
+		}
+	}
+	for k, r := range m.swallowed {
+		c := &swallowRecord{
+			skip:         make(map[string]map[string]bool, len(r.skip)),
+			last:         r.last,
+			cycles:       r.cycles,
+			unanswered:   r.unanswered,
+			heardNothing: maps.Clone(r.heardNothing),
+			addrs:        maps.Clone(r.addrs),
+		}
+		for a, ids := range r.skip {
+			c.skip[a] = maps.Clone(ids)
+		}
+		for a, ids := range r.mute {
+			if c.mute == nil {
+				c.mute = make(map[string]map[string]bool, len(r.mute))
+			}
+			c.mute[a] = maps.Clone(ids)
+		}
+		var idx int
+		if _, err := fmt.Sscanf(k, "server %d", &idx); err == nil {
+			k = serverAddr(sel, idx)
+		}
+		if k != "" {
+			out.swallowed[k] = c
+		}
+	}
+	return out
+}
+
+// AdoptRouteHistory takes over another manager's RouteHistory. Whatever
+// names a server this manager's pool does not have is dropped. The zero
+// RouteMemory changes nothing.
+func (m *Manager) AdoptRouteHistory(rm RouteMemory) {
+	if rm.swallowed == nil && rm.death.at.IsZero() && rm.handshakes == nil {
+		return
+	}
+	sel := m.selector()
+	if sel == nil {
+		return
+	}
+	server := func(addr string) (int, bool) {
+		c, ok := sel.CandidateForAddr(addr)
+		return c.EndpointIdx, ok
+	}
+	death := deathMark{server: -1}
+	if idx, ok := server(rm.deathAddr); ok {
+		death = rm.death
+		death.server = idx
+	}
+	parked := make(map[int]map[string]time.Time, len(rm.parked))
+	for addr, ids := range rm.parked {
+		if idx, ok := server(addr); ok {
+			parked[idx] = ids
+		}
+	}
+	swallowed := make(map[string]*swallowRecord, len(rm.swallowed))
+	for addr, r := range rm.swallowed {
+		if idx, ok := server(addr); ok {
+			swallowed[fmt.Sprintf("server %d", idx)] = r
+		}
+	}
+	handshakes := make(map[string]*handshakeRun, len(rm.handshakes))
+	for addr, r := range rm.handshakes {
+		if idx, ok := server(addr); ok {
+			handshakes[fmt.Sprintf("server %d", idx)] = r
+		}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lastDeath = death
+	m.swallowed = swallowed
+	m.routeParked = parked
+	m.unansweredHS = handshakes
+}
+
+// ResetStrategyBlocks closes every circuit breaker and puts every strategy's
+// confidence back to neutral, and nothing else. It is for a reconnect whose
+// strategies are all blocked on the same network - not a network change, so
+// what the client learned about the endpoints (parks, swallowed handshakes,
+// the route marker, the UDP verdict) stays. The reconnect loop used to call
+// ResetForNetworkChange here, once per failed cycle, which wiped that every
+// 15 s: a run of swallowed cycles never reached its verdict, and parks were
+// lifted as soon as they were set.
+func (m *Manager) ResetStrategyBlocks() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	log.Info("Resetting circuit breakers and confidences (endpoint health kept)")
+	m.resetStrategyBlocksLocked()
+	m.sortStrategies()
+}
+
+// resetStrategyBlocksLocked is ResetStrategyBlocks without the lock and the
+// re-sort. m.mu held.
+func (m *Manager) resetStrategyBlocksLocked() {
+	for _, s := range m.strategies {
+		m.circuitBreakers.Get(s.ID()).Reset()
+		// Neutral confidence: don't punish strategies for failures that were
+		// the network's.
+		if result, exists := m.results[s.ID()]; exists {
+			result.Confidence = 0.5
+			result.ConsecutiveFail = 0
+			result.LastFailure = time.Time{}
+		}
+	}
 }
 
 // ConnectForReconnect is optimized for network change scenarios
@@ -3300,11 +5704,33 @@ func (m *Manager) IsPortHoppingEnabled() bool {
 	return m.portHopper != nil
 }
 
-// TLSSessionCache returns the shared client session cache used by stdlib-TLS
-// strategies for resumption across reconnects. Safe for concurrent use; the
-// returned value is fixed at construction and never replaced.
-func (m *Manager) TLSSessionCache() tls.ClientSessionCache {
-	return m.tlsSessionCache
+// TLSSessionCache returns the client session cache stdlib-TLS strategies use
+// for resumption across reconnects, scoped to serverAddr, the server the
+// connection dials. Safe for concurrent use.
+//
+// crypto/tls keys a session by ServerName, and the cover names are shared:
+// two exits in one SNI pool, or the fixed hosts of WS, Geneva and anti-probe,
+// put the same name on connections to different servers. A ticket server A
+// issued was then offered to server B in the ClientHello - the same opaque
+// ticket bytes sent to two addresses, which links them on the wire for anyone
+// who sees both.
+func (m *Manager) TLSSessionCache(serverAddr string) tls.ClientSessionCache {
+	return scopedSessionCache{inner: m.tlsSessionCache, scope: serverAddr}
+}
+
+// scopedSessionCache keeps one server's tickets apart from every other's in a
+// shared cache.
+type scopedSessionCache struct {
+	inner tls.ClientSessionCache
+	scope string
+}
+
+func (c scopedSessionCache) Get(key string) (*tls.ClientSessionState, bool) {
+	return c.inner.Get(c.scope + "\x00" + key)
+}
+
+func (c scopedSessionCache) Put(key string, cs *tls.ClientSessionState) {
+	c.inner.Put(c.scope+"\x00"+key, cs)
 }
 
 // GetServerAddr returns the address of the currently pinned endpoint candidate.
@@ -3315,8 +5741,13 @@ func (m *Manager) TLSSessionCache() tls.ClientSessionCache {
 // explicit step per connect cycle (see dialEndpoints); this returns whatever
 // that step decided, so a whole scan sees one and the same address.
 //
-// The ctx parameter is retained for the fifteen existing call sites.
-func (m *Manager) GetServerAddr(_ context.Context) string {
+// A dial that was decided for a particular candidate carries its address on
+// ctx (see withDialCandidate), and that address wins over the pin: the pin may
+// have moved since the dial started, the dial's key has not.
+func (m *Manager) GetServerAddr(ctx context.Context) string {
+	if a, ok := dialAddr(ctx); ok {
+		return a
+	}
 	sel := m.selector()
 	if sel == nil {
 		return ""
@@ -3326,6 +5757,90 @@ func (m *Manager) GetServerAddr(_ context.Context) string {
 		return ""
 	}
 	return c.Addr
+}
+
+// PoolAddrs returns the addresses of every candidate with a physical route,
+// in preference order - what a "does anyone answer" poll walks.
+//
+// The route verdicts are refreshed first. They used to be refreshed only by a
+// connect cycle's family preflight, and the pool wait does not run connect
+// cycles: a family whose route came back mid-wait stayed excluded while the
+// family that was left kept timing out. The refresh reads the routing table
+// and sends nothing.
+func (m *Manager) PoolAddrs() []string {
+	sel := m.selector()
+	if sel == nil {
+		return nil
+	}
+	m.familyReachabilityPreflight(sel)
+	var out []string
+	for _, c := range sel.Candidates() {
+		if sel.Reachable(c.Addr) {
+			out = append(out, c.Addr)
+		}
+	}
+	return out
+}
+
+// PinAnswering moves the pin to the candidate at addr after a TCP poll found it
+// answering while the rest of the pool was silent, so the reconnect that
+// follows starts there instead of walking the silent addresses first. It
+// reports whether it did.
+//
+// A parked candidate is un-parked and pinned too. The gate refuses to switch to
+// a parked address because a blackhole answers TCP; but this poll runs only
+// when no address answered at all, and an answer after that is newer evidence
+// than the park - and the only way out. Leaving it parked sent the reconnect
+// walking the silent addresses again.
+//
+// Except a park for dead sessions: sessions there connect and then die, so a
+// TCP answer is exactly what that server gives and no evidence at all. Lifting
+// it undid the escalation - a server parked for one minute, then two, then
+// four was unparked by the next poll 5-8 s later and the client died on it
+// again about every 45 s. It stays parked until its cooldown runs out.
+func (m *Manager) PinAnswering(addr string) bool {
+	sel := m.selector()
+	if sel == nil {
+		return true
+	}
+	cand, ok := sel.CandidateForAddr(addr)
+	if !ok {
+		return true
+	}
+	if sel.ParkedForDeadSessions(cand) {
+		log.Debug("Pool poll: %s answers but is parked for dead sessions - waiting out its park", cand)
+		return false
+	}
+	sel.ReportProbe(cand, true, 0)
+	if sel.IsParked(cand) {
+		log.Info("Pool poll: %s answered after the pool went silent - lifting its park", cand)
+		sel.Unpark(cand)
+	}
+	if cur, _ := sel.Current(); cur.Addr != cand.Addr {
+		log.Info("Pool poll: %s answered first, pinning it", cand)
+	}
+	sel.Pin(cand)
+	return true
+}
+
+// PinParkedAnswering pins the candidate at addr whatever its park says, and
+// lifts the park, keeping its history: for a pool poll that has heard only
+// this server, parked for dead sessions, for long enough (see the TUN
+// client's waitForPool). The dead-session park doubles up to MaxCooldown, and
+// a single-server pool would otherwise wait it out in full.
+func (m *Manager) PinParkedAnswering(addr string) {
+	sel := m.selector()
+	if sel == nil {
+		return
+	}
+	cand, ok := sel.CandidateForAddr(addr)
+	if !ok {
+		return
+	}
+	log.Info("Pool poll: %s answers and nothing else does - lifting its park for dead sessions", cand)
+	sel.ReportProbe(cand, true, 0)
+	sel.Unpark(cand)
+	sel.Pin(cand)
 }
 
 // ProbeEndpointFamily runs the one-shot transport-family probe for the pinned

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"net"
 	"testing"
 )
@@ -55,5 +56,36 @@ func TestClientRegistry_SwapConn_NoMatch(t *testing.T) {
 
 	if got := r.GetActiveConns("c1"); got != 1 {
 		t.Fatalf("active=%d, want 1 (unchanged)", got)
+	}
+}
+
+// TestRegistryGenerationMovesOnEveryChange: the B1 gate's index compares it
+// to tell that a client was added, changed or removed (P3-2 of the round-5
+// review). Each of the three ways the client set changes must move it.
+func TestRegistryGenerationMovesOnEveryChange(t *testing.T) {
+	rdb := startRedis(t)
+	store, err := NewRedisStore(rdb.Options().Addr, 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	cfg, err := store.CreateClient(ctx, "carol", "", 1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := NewClientRegistry(store)
+	for _, step := range []struct {
+		name string
+		do   func()
+	}{
+		{"reload", func() { _ = r.reload(ctx) }},
+		{"reloadClient", func() { r.reloadClient(ctx, cfg.ID) }},
+		{"removeClient", func() { r.removeClient(cfg.ID) }},
+	} {
+		before := r.Generation()
+		step.do()
+		if r.Generation() == before {
+			t.Fatalf("%s left the generation at %d", step.name, before)
+		}
 	}
 }

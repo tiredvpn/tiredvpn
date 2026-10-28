@@ -32,7 +32,15 @@ type ClientRegistry struct {
 	// Hot-reload
 	lastVersion int64
 	stopReload  chan struct{}
+
+	// generation moves on every change to the client set (reload,
+	// reloadClient, removeClient), so a cache built from ListClients can tell
+	// cheaply that it is out of date (Generation).
+	generation atomic.Uint64
 }
+
+// Generation returns a number that changes whenever the client set does.
+func (r *ClientRegistry) Generation() uint64 { return r.generation.Load() }
 
 // NewClientRegistry creates a new client registry
 func NewClientRegistry(store *RedisStore) *ClientRegistry {
@@ -109,6 +117,7 @@ func (r *ClientRegistry) reload(ctx context.Context) error {
 
 	v, _ := r.store.GetVersion(ctx)
 	r.lastVersion = v
+	r.generation.Add(1)
 
 	log.Debug("Reloaded %d clients from Redis", len(r.byID))
 	return nil
@@ -124,6 +133,7 @@ func (r *ClientRegistry) reloadClient(ctx context.Context, clientID string) {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	defer r.generation.Add(1)
 
 	// Remove old secret mapping if exists
 	if old, exists := r.byID[clientID]; exists {
@@ -156,6 +166,7 @@ func (r *ClientRegistry) removeClient(clientID string) {
 		delete(r.bySecret, cfg.Secret)
 		delete(r.byID, clientID)
 	}
+	r.generation.Add(1)
 	r.mu.Unlock()
 
 	// Close all active connections for this client

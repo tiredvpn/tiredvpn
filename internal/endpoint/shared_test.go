@@ -7,7 +7,7 @@ import (
 
 func sharedTestEndpoints() []Endpoint {
 	return []Endpoint{
-		{Name: "a", V4: "198.51.100.1:443", V6: "[2001:db8::1]:443", Order: 0, Weight: 1, Secret: "s1", SNI: "a.example"},
+		{Name: "a", V4: "198.51.100.1:443", V6: "[2001:db8::1]:443", Order: 0, Weight: 1, Secret: "s1", SNI: []string{"a.example"}},
 		{Name: "b", V4: "198.51.100.2:443", Order: 1, Weight: 2},
 	}
 }
@@ -101,7 +101,7 @@ func TestSharedKeySeparatesEveryPolicyField(t *testing.T) {
 		"endpointWeight":   func(c *Config) { c.Endpoints[0].Weight += 7 },
 		"endpointOrder":    func(c *Config) { c.Endpoints[0].Order += 7 },
 		"endpointSecret":   func(c *Config) { c.Endpoints[0].Secret = "other" },
-		"endpointSNI":      func(c *Config) { c.Endpoints[0].SNI = "other.example" },
+		"endpointSNI":      func(c *Config) { c.Endpoints[0].SNI = []string{"other.example"} },
 	}
 
 	baseKey := sharedKey(base)

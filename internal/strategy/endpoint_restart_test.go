@@ -38,7 +38,13 @@ type blackholeListener struct {
 
 func newBlackholeListener(t *testing.T) *blackholeListener {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	return newBlackholeListenerAt(t, "127.0.0.1:0")
+}
+
+// newBlackholeListenerAt is newBlackholeListener on bind, e.g. "[::1]:0".
+func newBlackholeListenerAt(t *testing.T, bind string) *blackholeListener {
+	t.Helper()
+	ln, err := net.Listen("tcp", bind)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -94,7 +100,13 @@ type helloListener struct {
 
 func newHelloListener(t *testing.T) *helloListener {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	return newHelloListenerAt(t, "127.0.0.1:0")
+}
+
+// newHelloListenerAt is newHelloListener on bind, e.g. "[::1]:0".
+func newHelloListenerAt(t *testing.T, bind string) *helloListener {
+	t.Helper()
+	ln, err := net.Listen("tcp", bind)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}

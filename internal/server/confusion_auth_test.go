@@ -3,8 +3,11 @@ package server
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
+	"runtime"
 	"testing"
 	"time"
 
@@ -60,11 +63,34 @@ func tcpPair(t *testing.T) (client, server net.Conn) {
 	return client, r.c
 }
 
+// hitTrace says where a connection to a dead target came from and what it
+// sent first, and closes it: a hit on a security test must be traced, not
+// waved off.
+func hitTrace(c net.Conn) string {
+	defer c.Close()
+	buf := make([]byte, 64)
+	_ = c.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	n, _ := c.Read(buf)
+	return fmt.Sprintf("from %v to %v, first bytes %q", c.RemoteAddr(), c.LocalAddr(), buf[:n])
+}
+
 // deadTarget returns the address of a listener that records every connection
 // it accepts. Nothing must ever reach it on an unauthenticated path.
+//
+// On Linux it listens on a random address of 127/8, not 127.0.0.1: a hit is
+// any connection to it, and a connection a goroutine left over from another
+// test made to its own old 127.0.0.1 port - one the kernel had handed this
+// listener - read as the server opening a relay for an unauthenticated
+// peer. That failed once in a full run of the package and never alone
+// (2026-10-27). The server still reaches a target at this address, which
+// the authenticated case checks.
 func deadTarget(t *testing.T) (addr string, hits chan net.Conn) {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	bind := "127.0.0.1:0"
+	if runtime.GOOS == "linux" {
+		bind = fmt.Sprintf("127.%d.%d.%d:0", 1+rand.IntN(254), rand.IntN(256), 1+rand.IntN(254))
+	}
+	ln, err := net.Listen("tcp", bind)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -288,8 +314,7 @@ func TestConfusionUnauthenticatedGetsNoRelay(t *testing.T) {
 
 				select {
 				case c := <-hits:
-					c.Close()
-					t.Fatal("the server opened a relay to the target for an unauthenticated peer")
+					t.Fatalf("the server opened a relay to the target for an unauthenticated peer (%s)", hitTrace(c))
 				case <-time.After(200 * time.Millisecond):
 				}
 

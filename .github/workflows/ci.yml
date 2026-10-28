@@ -81,7 +81,9 @@ jobs:
       # run in CI since it was written.
       - name: Integration Tests
         run: |
-          go test -race -timeout 10m -count=1 -v -tags=integration_e2e \
+          # 25m: without -short the server package runs its real-clock and
+          # long leg tests too, past 10 min under -race.
+          go test -race -timeout 25m -count=1 -v -tags=integration_e2e \
             ./internal/strategy/ \
             ./internal/porthopping/ \
             ./internal/server/ \
@@ -129,8 +131,10 @@ jobs:
           go-version: '1.26'
           cache: true
 
-      - name: Build test binary
-        run: go test -c -o "$RUNNER_TEMP/tun.test" ./internal/tun/
+      - name: Build test binaries
+        run: |
+          go test -c -o "$RUNNER_TEMP/tun.test" ./internal/tun/
+          go test -c -o "$RUNNER_TEMP/server.test" ./internal/server/
 
       - name: Load link modules
         run: sudo modprobe dummy && sudo modprobe tun
@@ -139,31 +143,113 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          bin="$RUNNER_TEMP/tun.test"
-          log="$RUNNER_TEMP/netns-tests.log"
+          bad=0
+          for pkg in tun server; do
+            bin="$RUNNER_TEMP/$pkg.test"
+            log="$RUNNER_TEMP/netns-tests-$pkg.log"
 
-          # Package init may log to the same stream; keep only test names.
-          mapfile -t want < <("$bin" -test.list '^TestRoot' 2>/dev/null |
-            grep -E '^TestRoot[A-Za-z0-9_]*$' || true)
+            # Package init may log to the same stream; keep only test names.
+            mapfile -t want < <("$bin" -test.list '^TestRoot' 2>/dev/null |
+              grep -E '^TestRoot[A-Za-z0-9_]*$' || true)
+            if [ "${#want[@]}" -eq 0 ]; then
+              echo "::error::no TestRoot* tests in the $pkg binary, nothing would be checked"
+              exit 1
+            fi
+            echo "$pkg: expecting PASS from ${#want[@]} tests: ${want[*]}"
+
+            set +e
+            sudo unshare -n env TIREDVPN_NETNS_TESTS=1 \
+              "$bin" -test.run '^TestRoot' -test.v -test.count=1 -test.timeout=5m 2>&1 | tee "$log"
+            rc=${PIPESTATUS[0]}
+            set -e
+            if [ "$rc" -ne 0 ]; then
+              echo "::error::$pkg netns tests failed (exit $rc)"
+              exit "$rc"
+            fi
+
+            if grep -E -- '--- SKIP' "$log"; then
+              echo "::error::$pkg netns tests were skipped, see the lines above"
+              bad=1
+            fi
+            for t in "${want[@]}"; do
+              if ! grep -qE -- "^--- PASS: ${t} \(" "$log"; then
+                echo "::error::$pkg ${t} did not report PASS"
+                bad=1
+              fi
+            done
+          done
+          exit "$bad"
+
+  # The relay's upstream keepalive has to work against the exits that run in
+  # the field, which are older than it (1.11.8 at the time of writing). These
+  # tests put the relay against the real release binary - verification rule 9,
+  # a reconstructed "before" proves only the reconstruction - and need both the
+  # binary and CAP_NET_ADMIN for the exit's TUN. Without TIREDVPN_OLD_EXIT they
+  # skip, so they never ran in CI (P3-14 of the round-9 review). This job
+  # downloads the release, checks it against the release's own checksums, and
+  # requires a PASS line from each test: a job green on skips claims coverage
+  # it does not have.
+  old_exit_tests:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    timeout-minutes: 15
+    env:
+      OLD_EXIT_TAG: v1.11.8
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Download the old exit from its release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          gh release download "$OLD_EXIT_TAG" --repo "$GITHUB_REPOSITORY"             --pattern 'tiredvpn-linux-amd64.tar.gz' --pattern 'checksums.txt'
+          grep ' tiredvpn-linux-amd64.tar.gz$' checksums.txt | sha256sum -c -
+          tar xzf tiredvpn-linux-amd64.tar.gz
+          test -x tiredvpn-linux-amd64
+          ./tiredvpn-linux-amd64 -version
+
+      - name: Build test binary
+        run: go test -c -o "$RUNNER_TEMP/server.test" ./internal/server/
+
+      - name: Load the tun module
+        run: sudo modprobe tun
+
+      - name: The new relay against the old exit, in a network namespace
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/server.test"
+          log="$RUNNER_TEMP/old-exit-tests.log"
+
+          mapfile -t want < <("$bin" -test.list '^TestAnOldExit' 2>/dev/null |
+            grep -E '^TestAnOldExit[A-Za-z0-9_]*$' || true)
           if [ "${#want[@]}" -eq 0 ]; then
-            echo "::error::no TestRoot* tests in the binary, nothing would be checked"
+            echo "::error::no TestAnOldExit* tests in the binary, nothing would be checked"
             exit 1
           fi
           echo "expecting PASS from ${#want[@]} tests: ${want[*]}"
 
           set +e
-          sudo unshare -n env TIREDVPN_NETNS_TESTS=1 \
-            "$bin" -test.run '^TestRoot' -test.v -test.count=1 -test.timeout=5m 2>&1 | tee "$log"
+          # -n, not -rn: a user namespace maps root alone, and the runner's
+          # home (750) - where the test binary is - is out of its reach.
+          sudo unshare -n sh -c "ip link set lo up &&             TIREDVPN_OLD_EXIT=$RUNNER_TEMP/tiredvpn-linux-amd64             $bin -test.run '^TestAnOldExit' -test.v -test.count=1 -test.timeout=12m" 2>&1 | tee "$log"
           rc=${PIPESTATUS[0]}
           set -e
           if [ "$rc" -ne 0 ]; then
-            echo "::error::netns tests failed (exit $rc)"
+            echo "::error::old-exit tests failed (exit $rc)"
             exit "$rc"
           fi
 
           bad=0
           if grep -E -- '--- SKIP' "$log"; then
-            echo "::error::netns tests were skipped, see the lines above"
+            echo "::error::old-exit tests were skipped, see the lines above"
             bad=1
           fi
           for t in "${want[@]}"; do
@@ -173,6 +259,28 @@ jobs:
             fi
           done
           exit "$bad"
+
+  # Tests on real clocks and the kernel's own TCP keepalive, which -short
+  # skips: the hang-up of a proxied stream's client has to end the exit's
+  # session on its 60 s read deadline, not last as long as the socket (P2-1
+  # of the round-10 review, P3-12 of the round-11 review). A PASS line from
+  # each is required, as for the old-exit tests.
+  real_clock_tests:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: true
+
+      # The real-clock hang-up test, and the long leg tests that skip under
+      # -short: run together they took the server package past the 5 min
+      # budget of the test job and of the release workflow.
+      - name: Real-clock and long leg tests
+        run: bash scripts/ci-long-tests.sh
 
   benchmark:
     runs-on: ubuntu-latest

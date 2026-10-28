@@ -13,6 +13,7 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/protocol"
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
+	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 	"github.com/tiredvpn/tiredvpn/internal/tun"
 )
 
@@ -70,7 +71,7 @@ func NewUpstreamDialer(addr string, secret []byte) *UpstreamDialer {
 // completes the stego handshake. It is shared by Dial (address-proxy mode) and
 // DialTUN (multi-hop TUN bridge). Returns the live stego conn and the underlying
 // tls.Conn (caller closes the latter on any post-handshake failure).
-func (d *UpstreamDialer) connectStego(ctx context.Context) (net.Conn, *tls.Conn, error) {
+func (d *UpstreamDialer) connectStego(ctx context.Context) (*strategy.HTTP2StegoConn, *tls.Conn, error) {
 	// Get timeout from context or use default
 	deadline, hasDeadline := ctx.Deadline()
 	timeout := 30 * time.Second
@@ -106,8 +107,13 @@ func (d *UpstreamDialer) connectStego(ctx context.Context) (net.Conn, *tls.Conn,
 		tc.SetWriteBuffer(sockBuf)
 	}
 
-	// TLS handshake on the optimized TCP connection
-	tlsConn := tls.Client(tcpConn, d.tlsConfig)
+	// TLS handshake on the optimized TCP connection. The session_id carries
+	// the fallback-transport tag, so an exit running -reality-b1 with
+	// -reality-fallback-tag takes the relay for one of its own clients rather
+	// than a stranger. Without the flag it is a stranger's hello, as in
+	// 1.11.8: an exit with a cover domain sends it there, and one without
+	// sends it on to the ordinary path, its SNI being no donor.
+	tlsConn := tls.Client(tcpConn, customtls.WithFallbackTag(d.tlsConfig, d.upstreamSecret))
 
 	// Set deadline for handshake
 	if hasDeadline {
@@ -173,8 +179,35 @@ func (d *UpstreamDialer) connectStego(ctx context.Context) (net.Conn, *tls.Conn,
 }
 
 // Dial connects to the target address through the upstream TiredVPN server
-// Returns a net.Conn that transparently tunnels through the upstream
-func (d *UpstreamDialer) Dial(ctx context.Context, targetAddr string) (net.Conn, error) {
+// Returns a net.Conn that transparently tunnels through the upstream.
+//
+// The conn keeps the exit's read deadline fed while client - the relay's
+// downstream conn, nil without one - is alive (keepUpstreamAlive): a relay
+// copies bytes up only as its client sends them.
+func (d *UpstreamDialer) Dial(ctx context.Context, targetAddr string, client net.Conn) (net.Conn, error) {
+	return d.dialLive(ctx, targetAddr, clientLiveness{conn: client})
+}
+
+// endTargetWrites passes on that a relay's client has sent its last byte.
+// A TCP target gets a FIN and may still answer. A relay's upstream conn
+// stops its keepalive (OwnerDone): the stego stream has no half-close, so
+// the exit's read deadline ends the leg unless the target answers first,
+// at most a minute after the last write up, as before round 13b. A leg kept
+// fed after its client left lingered up to about 2 3/4 minutes (P3-3 of the
+// round-9 review). Checked before CloseWrite on purpose: the stego conn
+// embeds a tls.Conn, whose CloseWrite would end the TLS stream.
+func endTargetWrites(target net.Conn) {
+	switch c := target.(type) {
+	case interface{ OwnerDone() }:
+		c.OwnerDone()
+	case *net.TCPConn:
+		_ = c.CloseWrite()
+	}
+}
+
+// dialLive is Dial with what the relay can read of its client spelled out,
+// for a client that has no conn of its own (HTTP Polling).
+func (d *UpstreamDialer) dialLive(ctx context.Context, targetAddr string, live clientLiveness) (net.Conn, error) {
 	log.Debug("Upstream dial to %s via %s", targetAddr, d.upstreamAddr)
 
 	stegoConn, tlsConn, err := d.connectStego(ctx)
@@ -207,6 +240,7 @@ func (d *UpstreamDialer) Dial(ctx context.Context, targetAddr string) (net.Conn,
 	}
 
 	log.Debug("Upstream connection established to %s", targetAddr)
+	keepUpstreamAlive(stegoConn, live, nil)
 
 	// Return the stego connection - it implements net.Conn
 	// Read/Write will automatically handle HTTP/2 stego framing
@@ -230,12 +264,19 @@ func (d *UpstreamDialer) Dial(ctx context.Context, targetAddr string) (net.Conn,
 // the upstream's full raw handshake response — the version-dependent base layout
 // [status:1][serverIP:4][clientIP:4][flags:1]... plus the trailing 32-byte
 // dual-stack block [serverIP6:16][clientIP6:16] when the exit negotiated it.
-func (d *UpstreamDialer) DialTUN(ctx context.Context, tunHandshake []byte, origin string) (net.Conn, []byte, error) {
+func (d *UpstreamDialer) DialTUN(ctx context.Context, tunHandshake []byte, origin, clientTag string) (net.Conn, []byte, error) {
+	conn, _, resp, err := d.dialTUN(ctx, tunHandshake, origin, clientTag)
+	return conn, resp, err
+}
+
+// dialTUN is DialTUN with the stego conn under the tunnel conn, for a
+// caller that keeps it alive (keepUpstreamAlive).
+func (d *UpstreamDialer) dialTUN(ctx context.Context, tunHandshake []byte, origin, clientTag string) (net.Conn, *strategy.HTTP2StegoConn, []byte, error) {
 	log.Debug("Upstream TUN dial via %s", d.upstreamAddr)
 
 	stegoConn, tlsConn, err := d.connectStego(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	// Send the TUN-mode setup over the stego stream. The upstream's setupH2Tunnel
@@ -244,10 +285,13 @@ func (d *UpstreamDialer) DialTUN(ctx context.Context, tunHandshake []byte, origi
 	setup := make([]byte, 1+len(tunHandshake))
 	setup[0] = 0x02 // TUN mode
 	copy(setup[1:], tunHandshake)
+	// The tag first, the origin last: splitTUNOrigin wants its own trailer
+	// at the end of the payload.
+	setup = appendTUNClientTag(setup, clientTag)
 	setup = appendTUNOrigin(setup, origin)
 	if _, err := stegoConn.Write(setup); err != nil {
 		tlsConn.Close()
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	// Read the handshake response: the version-dependent base layout and, when
@@ -299,27 +343,27 @@ func (d *UpstreamDialer) DialTUN(ctx context.Context, tunHandshake []byte, origi
 	resp, tunnelConn, err := tun.ReadTUNHandshakeResponse(stegoConn, clientVersion, deadline)
 	if err != nil {
 		tlsConn.Close()
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if len(resp) < 9 {
 		tlsConn.Close()
-		return nil, nil, fmt.Errorf("short upstream TUN handshake response: %d bytes", len(resp))
+		return nil, nil, nil, fmt.Errorf("short upstream TUN handshake response: %d bytes", len(resp))
 	}
 
 	if resp[0] != 0x00 {
 		tlsConn.Close()
-		return nil, nil, errors.New("upstream rejected TUN handshake")
+		return nil, nil, nil, errors.New("upstream rejected TUN handshake")
 	}
 
 	log.Debug("Upstream TUN tunnel established (assigned IP=%s)", net.IP(resp[5:9]))
-	return tunnelConn, resp, nil
+	return tunnelConn, stegoConn, resp, nil
 }
 
 // DialTimeout is a convenience wrapper with explicit timeout
 func (d *UpstreamDialer) DialTimeout(targetAddr string, timeout time.Duration) (net.Conn, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	return d.Dial(ctx, targetAddr)
+	return d.Dial(ctx, targetAddr, nil)
 }
 
 // Close releases resources

@@ -9,7 +9,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -30,7 +29,7 @@ const (
 type ConnectivityResult struct {
 	TCP  bool // TCP connect to server port succeeded
 	UDP  bool // UDP connectivity check passed
-	ICMP bool // ICMP ping succeeded (optional)
+	ICMP bool // always false: the :443/:80 "ICMP" dials that set it are gone (see Check)
 
 	// UDPKnown is true when UDP carries a verdict: a probe to this address
 	// finished with silence (works) or an ICMP refusal (blocked), this round
@@ -62,9 +61,9 @@ func (r ConnectivityResult) HasBasicConnectivity() bool {
 // ConnectivityChecker performs pre-flight connectivity checks before trying strategies
 type ConnectivityChecker struct {
 	timeout     time.Duration // timeout for the TCP gate (2-3 sec)
-	auxTimeout  time.Duration // bounded timeout for the UDP/ICMP probes
-	auxGrace    time.Duration // how long Check waits for UDP/ICMP after TCP lands
-	androidMode bool          // skip ICMP check on Android (os/exec not allowed)
+	auxTimeout  time.Duration // bounded timeout for the UDP probe
+	auxGrace    time.Duration // how long Check waits for UDP after TCP lands
+	androidMode bool          // client runs on Android (kept for callers; no longer changes the probes)
 
 	// serverAddr and altAddrs move with the pinned endpoint, so both are
 	// guarded: Connect rewrites them per cycle while a wait loop may be reading
@@ -95,10 +94,6 @@ type ConnectivityChecker struct {
 	// tcpDial opens the TCP gate's connections; nil means a plain net.Dialer.
 	// Tests use it for an address that times out instead of refusing.
 	tcpDial func(ctx context.Context, network, addr string) (net.Conn, error)
-
-	// icmpCheck stands in for checkICMP when set. Tests use it for a host
-	// whose 443 and 80 swallow the ICMP check's dials.
-	icmpCheck func(ctx context.Context, host string) error
 
 	// rttHost and rttMin are the path RTT the auto-mode QUIC budget scales
 	// with: the minimum TCP connect time to the host that answered the gate.
@@ -320,7 +315,11 @@ func (c *ConnectivityChecker) currentUDPVerdict() (ok, known bool) {
 	return c.cachedUDPVerdict(c.udpProbeAddr(primary))
 }
 
-// Check performs TCP, UDP and ICMP connectivity checks
+// Check performs the TCP gate and the UDP probe.
+//
+// It used to run a third, "ICMP", leg: TCP dials to the server host's :443 and
+// :80. Nothing read its verdict, and it put two ports the client never uses on
+// the wire after every disconnect - visible in the stand's WAN-down capture.
 func (c *ConnectivityChecker) Check(ctx context.Context) ConnectivityResult {
 	result := ConnectivityResult{
 		CheckedAt: time.Now(),
@@ -338,9 +337,9 @@ func (c *ConnectivityChecker) Check(ctx context.Context) ConnectivityResult {
 	}
 
 	// TCP is the only gate (HasBasicConnectivity == TCP), so it runs on the hot
-	// reconnect path and decides the result. UDP/ICMP only gate QUIC selection,
-	// so they run concurrently but must never delay the TCP verdict: we wait for
-	// them just auxGrace, then fall back to the last known value and let them
+	// reconnect path and decides the result. UDP only gates QUIC selection,
+	// so it runs concurrently but must never delay the TCP verdict: we wait for
+	// it just auxGrace, then fall back to the last known value and let it
 	// finish updating the cache in the background.
 	var tcpErr error
 	var tcpAddr string
@@ -351,9 +350,7 @@ func (c *ConnectivityChecker) Check(ctx context.Context) ConnectivityResult {
 		close(tcpDone)
 	}()
 
-	// UDP and ICMP run apart: only UDP gates anything, and the ICMP check's
-	// TCP dials (700ms each on a silent port) must not hold a refused UDP
-	// verdict back past the grace.
+	// The UDP probe runs alongside and is waited for only auxGrace.
 	udpAddr := c.udpProbeAddr(primary)
 	udpStart := time.Now()
 	var udpV udpGateVerdict
@@ -362,23 +359,6 @@ func (c *ConnectivityChecker) Check(ctx context.Context) ConnectivityResult {
 		defer close(udpDone)
 		udpV, _ = c.checkUDP(ctx, udpAddr)
 	}()
-	var icmpOK atomic.Bool
-	icmpDone := make(chan struct{})
-	go func() {
-		defer close(icmpDone)
-		// ICMP check (optional, may fail without root).
-		// Skip on Android - os/exec causes SIGSYS due to seccomp.
-		if !c.androidMode {
-			c.mu.RLock()
-			check := c.icmpCheck
-			c.mu.RUnlock()
-			if check == nil {
-				check = c.checkICMP
-			}
-			icmpOK.Store(check(ctx, host) == nil)
-		}
-	}()
-
 	<-tcpDone
 	result.TCP = tcpErr == nil
 	if result.TCP {
@@ -414,21 +394,6 @@ func (c *ConnectivityChecker) Check(ctx context.Context) ConnectivityResult {
 		result.UDP, result.UDPKnown = c.cachedUDPVerdict(udpAddr)
 	}
 
-	select {
-	case <-icmpDone:
-		result.ICMP = icmpOK.Load()
-	default:
-		c.mu.RLock()
-		result.ICMP = c.lastResult.ICMP
-		c.mu.RUnlock()
-		go func() {
-			<-icmpDone
-			c.mu.Lock()
-			c.lastResult.ICMP = icmpOK.Load()
-			c.mu.Unlock()
-		}()
-	}
-
 	// The address that ANSWERED, not the one the walk started from. The gate
 	// tries the pool in order, so a line naming only the first address reads as
 	// "this one is up" when the verdict may have come from a different server
@@ -437,17 +402,26 @@ func (c *ConnectivityChecker) Check(ctx context.Context) ConnectivityResult {
 	if answered == "" {
 		answered = "none"
 	}
-	log.Debug("Connectivity check from %s - TCP:%v (answered=%s) UDP:%v (known=%v) ICMP:%v (latency=%v)",
-		net.JoinHostPort(host, port), result.TCP, answered, result.UDP, result.UDPKnown, result.ICMP, result.Latency)
+	log.Debug("Connectivity check from %s - TCP:%v (answered=%s) UDP:%v (known=%v) (latency=%v)",
+		net.JoinHostPort(host, port), result.TCP, answered, result.UDP, result.UDPKnown, result.Latency)
 
 	c.cacheResult(result)
 	return result
 }
 
+// CheckTCP runs the TCP leg of the gate alone, over every address it is set
+// to, and caches the result like Check does. It sends nothing but the TCP
+// handshakes, no UDP probe. The pre-flight gate and the reconnect loop's
+// network check use it: their question is TCP to the pool, and the probe would
+// repeat with every round.
+func (c *ConnectivityChecker) CheckTCP(ctx context.Context) ConnectivityResult {
+	return c.checkTCPOnly(ctx)
+}
+
 // checkTCPOnly performs just the TCP gate, carrying forward the last known
-// UDP/ICMP verdict. Used on the hot retry path (WaitForConnectivity) where the
+// UDP verdict. Used on the hot retry path (WaitForConnectivity) where the
 // only thing that matters is whether the server's TCP port is back; pulling in
-// UDP/ICMP probes there only adds latency to recovery.
+// the UDP probe there only adds latency to recovery.
 func (c *ConnectivityChecker) checkTCPOnly(ctx context.Context) ConnectivityResult {
 	result := ConnectivityResult{CheckedAt: time.Now()}
 
@@ -460,14 +434,13 @@ func (c *ConnectivityChecker) checkTCPOnly(ctx context.Context) ConnectivityResu
 		result.Addr = addr
 	}
 
-	// Carry forward last known UDP/ICMP (they gate QUIC and rarely flip) -
+	// Carry forward last known UDP (it gates QUIC and rarely flip) -
 	// unless the TCP gate failed, which voids the UDP verdict (see Check).
 	if !result.TCP {
 		c.invalidateUDPVerdict()
 	}
 	c.mu.RLock()
 	result.UDP = c.lastResult.UDP
-	result.ICMP = c.lastResult.ICMP
 	result.UDPKnown = c.lastResult.UDPKnown
 	c.mu.RUnlock()
 	c.cacheResult(result)
@@ -560,28 +533,13 @@ func (c *ConnectivityChecker) checkUDP(ctx context.Context, addr string) (udpGat
 	}
 }
 
-func (c *ConnectivityChecker) checkICMP(ctx context.Context, host string) error {
-	d := net.Dialer{Timeout: c.auxTimeout}
-	var err error
-	for _, port := range []string{"443", "80"} {
-		// JoinHostPort, not host+":"+port: host is unbracketed here, and
-		// "2001:db8::1:443" is not an address net.Dial accepts.
-		var conn net.Conn
-		if conn, err = d.DialContext(ctx, "tcp", net.JoinHostPort(host, port)); err == nil {
-			conn.Close()
-			return nil
-		}
-	}
-	return fmt.Errorf("host unreachable: %w", err)
-}
-
 // WaitForConnectivity waits in a loop until TCP connectivity is available.
 //
 // interval is the FIRST retry delay; on each miss it backs off by
 // probeBackoffFactor up to maxProbeInterval. A short server-side reset is
 // usually back within a few hundred ms, so the early retries are fast (recovery
 // drops from the old flat ~5s to <1s) while the ceiling keeps a truly-down
-// network from being hammered. Only the TCP gate is probed here — UDP/ICMP just
+// network from being hammered. Only the TCP gate is probed here — UDP just
 // gate QUIC selection and are carried forward from the cache.
 func (c *ConnectivityChecker) WaitForConnectivity(ctx context.Context, interval time.Duration) ConnectivityResult {
 	if interval <= 0 {

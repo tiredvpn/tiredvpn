@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"net"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -36,7 +37,7 @@ func TestResolveEndpoints_LegacySingleServer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second ResolveEndpoints: %v", err)
 	}
-	if len(again) != 1 || again[0] != eps[0] {
+	if len(again) != 1 || !reflect.DeepEqual(again[0], eps[0]) {
 		t.Fatalf("not idempotent: %+v then %+v", eps, again)
 	}
 }

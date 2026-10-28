@@ -45,6 +45,10 @@ type meekStreamTracker struct {
 	hdr      [4]byte
 	hdrN     int
 	bodyLeft int
+
+	// keepalives counts the zero-length frames the server sent. The feeder's
+	// own frames never pass through the tracker.
+	keepalives uint64
 }
 
 type meekDownState uint8
@@ -214,6 +218,9 @@ func (t *meekStreamTracker) consumeFrames(p []byte) []byte {
 			return nil
 		}
 		t.bodyLeft = int(l)
+		if l == 0 {
+			t.keepalives++
+		}
 	}
 	return nil
 }
