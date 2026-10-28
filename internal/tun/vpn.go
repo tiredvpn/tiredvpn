@@ -1645,7 +1645,10 @@ var gracefulCloseLimitNs = func() *atomic.Int64 {
 // RTT masking: RTTMaskingConn.Close flushes its burst before the transport
 // under it starts its own 5 s drain, so a limit counted from the outer
 // Close cut a drain that was still going (P3-1 of the round-21 review). 5 s
-// for the flush, 10.5 s in all. Atomic so tests can scale it.
+// for the flush, 10.5 s in all. Atomic so tests can scale it. This is an
+// upper bound: RTTMaskingConn.close bounds its own flush by rttCloseTimeout
+// and aborts the conn under it closeAbortGrace later (~6 s total), so the
+// flush cannot actually run to this allowance.
 var wrappedCloseAllowanceNs = func() *atomic.Int64 {
 	var v atomic.Int64
 	v.Store(int64(5 * time.Second))
@@ -1673,9 +1676,12 @@ func gracefulCloseLimit(conn net.Conn) time.Duration {
 // gracefulCloseLimit. A Close still running then is aborted. The
 // transports bound their own drain, but a wrapper could wait before it
 // even started: RTTMaskingConn's flush waits on a Write blocked on a full
-// polling queue until the poll layer is declared dead, about 20 s. This
-// bounds every graceful close the client makes on a path it cares about,
-// whatever the conn underneath (#2 of the round-20 review).
+// polling queue. RTTMaskingConn.close now bounds that itself - the flush
+// runs under rttCloseTimeout and the conn under it is aborted closeAbortGrace
+// later, about 6 s - where it once waited for the poll layer to be declared
+// dead, about 20 s. This stays as the outer bound on every graceful close the
+// client makes on a path it cares about, whatever the conn underneath (#2 of
+// the round-20 review).
 //
 // Before the abort the conn's deadline is set to now: a conn with no
 // CloseNow gets a second Close from closeNow, and one that writes its

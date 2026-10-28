@@ -46,9 +46,18 @@ func (c *drainingConn) SetDeadline(time.Time) error      { return nil }
 func (c *drainingConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *drainingConn) SetWriteDeadline(time.Time) error { return nil }
 
+// closeRecorder is a test conn that counts how it was torn down: CloseNow
+// (abort) versus Close (drain).
+type closeRecorder interface {
+	counts() (aborted, closed int64)
+}
+
+func (c *drainingConn) counts() (int64, int64)      { return c.aborted.Load(), c.closed.Load() }
+func (c *blockingWriteConn) counts() (int64, int64) { return c.aborted.Load(), c.closed.Load() }
+
 // tearDownWithin runs teardown and fails if it took longer than limit, or
 // if inner was drained instead of aborted.
-func tearDownWithin(t *testing.T, inner *drainingConn, limit time.Duration, teardown func()) {
+func tearDownWithin(t *testing.T, inner closeRecorder, limit time.Duration, teardown func()) {
 	t.Helper()
 	done := make(chan time.Duration, 1)
 	go func() {
@@ -64,8 +73,8 @@ func tearDownWithin(t *testing.T, inner *drainingConn, limit time.Duration, tear
 	case <-time.After(10 * time.Second):
 		t.Fatal("teardown hung on the conn's drain")
 	}
-	if inner.aborted.Load() != 1 || inner.closed.Load() != 0 {
-		t.Fatalf("CloseNow %d times, Close %d times: want one abort and no drain", inner.aborted.Load(), inner.closed.Load())
+	if aborted, closed := inner.counts(); aborted != 1 || closed != 0 {
+		t.Fatalf("CloseNow %d times, Close %d times: want one abort and no drain", aborted, closed)
 	}
 }
 
@@ -129,8 +138,86 @@ func TestAnAndroidDisconnectAbortsTheTransport(t *testing.T) {
 func TestStopAbortsThroughTheRTTWrapper(t *testing.T) {
 	inner := &drainingConn{slowClose: 3 * time.Second}
 	cfg := strategy.DefaultRTTMaskingConfig()
-	v := stoppableClient(t, &replayConn{Conn: strategy.NewRTTMaskingConn(inner, cfg)})
+	rtt := strategy.NewRTTMaskingConn(inner, cfg)
+	// Buffer a packet so Close has a non-empty burst to flush, not the empty
+	// one the abort can skip past: without it the test passes even when the
+	// flush path leaks the drain.
+	_, _ = rtt.Write([]byte("queued"))
+	v := stoppableClient(t, &replayConn{Conn: rtt})
 	tearDownWithin(t, inner, time.Second, v.Stop)
+}
+
+// blockingWriteConn is a transport whose Write blocks until the conn is
+// closed - HTTP polling with a full queue, where RTTMaskingConn's burst
+// flush waits on the Write and ignores the write deadline. CloseNow unblocks
+// it at once; Close drains for slowClose first. It exposes no NetConn, so
+// closeSocket's chain walk stops at it and must abort it directly.
+type blockingWriteConn struct {
+	slowClose time.Duration
+	release   chan struct{}
+	entered   chan struct{}
+	relOnce   sync.Once
+	entOnce   sync.Once
+	closed    atomic.Int64
+	aborted   atomic.Int64
+}
+
+func newBlockingWriteConn(slowClose time.Duration) *blockingWriteConn {
+	return &blockingWriteConn{slowClose: slowClose, release: make(chan struct{}), entered: make(chan struct{})}
+}
+
+func (c *blockingWriteConn) Read([]byte) (int, error) { return 0, net.ErrClosed }
+func (c *blockingWriteConn) Write(p []byte) (int, error) {
+	c.entOnce.Do(func() { close(c.entered) })
+	<-c.release
+	return 0, net.ErrClosed
+}
+
+// Close drains for slowClose - unless the conn was already aborted, in which
+// case abortNow has cut the drain and Close is a fast no-op, as HTTP
+// polling's and the ICMP tunnel's are once abortNow ran. closed counts a real
+// drain only, so RTTMaskingConn.close's trailing Close of an already-aborted
+// conn does not register as one.
+func (c *blockingWriteConn) Close() error {
+	select {
+	case <-c.release:
+		return nil
+	default:
+	}
+	c.closed.Add(1)
+	time.Sleep(c.slowClose)
+	c.relOnce.Do(func() { close(c.release) })
+	return nil
+}
+func (c *blockingWriteConn) CloseNow() error {
+	c.aborted.Add(1)
+	c.relOnce.Do(func() { close(c.release) })
+	return nil
+}
+func (c *blockingWriteConn) LocalAddr() net.Addr              { return &net.IPAddr{} }
+func (c *blockingWriteConn) RemoteAddr() net.Addr             { return &net.IPAddr{} }
+func (c *blockingWriteConn) SetDeadline(time.Time) error      { return nil }
+func (c *blockingWriteConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *blockingWriteConn) SetWriteDeadline(time.Time) error { return nil }
+
+// TestStopAbortsThroughABlockedRTTFlush covers the gap the NetConn method
+// alone does not: RTT masking over a transport whose Write blocks (a full
+// HTTP polling queue) and that exposes no NetConn. The burst flush parks in
+// that Write holding writeMu, so Close cannot reach its own CloseNow of the
+// inner conn - only the abort timer's closeSocket runs, and it must abort
+// the inner conn instead of taking its 5 s drain. Rule 1: drop the
+// closeNower branch in closeSocket and this drains (closed == 1, took
+// ~slowClose) instead of aborting.
+func TestStopAbortsThroughABlockedRTTFlush(t *testing.T) {
+	inner := newBlockingWriteConn(3 * time.Second)
+	// BurstInterval 0 and Profile nil: every write flushes at once with no
+	// delay, so this Write reaches inner.Write and parks there.
+	cfg := strategy.RTTMaskingConfig{Enabled: true, BurstMode: true, BurstSize: 8}
+	rtt := strategy.NewRTTMaskingConn(inner, cfg)
+	go func() { _, _ = rtt.Write([]byte("packet")) }()
+	<-inner.entered // the flush is parked in inner.Write before Stop
+	v := stoppableClient(t, &replayConn{Conn: rtt})
+	tearDownWithin(t, inner, 1500*time.Millisecond, v.Stop)
 }
 
 // abortRecConn is a pipe end that records how it was closed.

@@ -159,6 +159,13 @@ func (d *closeDeadline) abortRequested() bool {
 // and tls.Conn.Close would spend another 5 s of its own trying to send the
 // alert into a peer that does not read. The chain is followed at most 16
 // levels down, in case a wrapper returns itself.
+//
+// When the bottom conn aborts (CloseNow), it is aborted rather than Closed:
+// a transport with a drain of its own - HTTP polling, the ICMP tunnel -
+// exposes no NetConn to walk past, so the chain stops at it, and a plain
+// Close would let it spend up to 5 s draining a queue into a peer that is
+// gone. Its abortNow is outside its close-once, so it also cuts a drain
+// already running from an earlier Close.
 func closeSocket(c net.Conn) error {
 	for range 16 {
 		nc, ok := c.(interface{ NetConn() net.Conn })
@@ -170,6 +177,9 @@ func closeSocket(c net.Conn) error {
 			break
 		}
 		c = inner
+	}
+	if cn, ok := c.(closeNower); ok {
+		return cn.CloseNow()
 	}
 	return c.Close()
 }

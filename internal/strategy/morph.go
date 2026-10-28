@@ -871,11 +871,14 @@ func (mc *MorphedConn) close() error {
 		// cannot cut the close_notify short. Its abortNow only sets the
 		// write deadline to now, so at worst crypto/tls replaces it with its
 		// own 5 s one for the alert - bounded, not a hang. It is safe today:
-		// the only CloseNow caller is VPNClient.Stop, and every VPNClient
-		// close path holds v.mu and nils v.conn first, so Stop cannot race
-		// another close on the same conn. An external caller that closes one
-		// unpaced MorphedConn from two goroutines at once is the only way to
-		// hit it, and it costs at most that 5 s.
+		// CloseNow on a client's own transport comes only from VPNClient
+		// teardown - Stop, a dead session's failover (disconnect), a forced
+		// reconnect, the Android core's disconnect, and a port hop or upgrade
+		// whose new conn is abandoned - and each holds v.mu and nils v.conn
+		// (or the session's conn) before closing it, so no two race a close
+		// on the same conn. An external caller that closes one unpaced
+		// MorphedConn from two goroutines at once is the only way to hit it,
+		// and it costs at most that 5 s.
 		return mc.Conn.Close()
 	}
 

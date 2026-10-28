@@ -69,6 +69,26 @@ Versions follow [Semantic Versioning](https://semver.org/).
   7 MiB request to `net.core.rmem_max` / `wmem_max`. The old startup warning
   about QUIC buffers is gone.
 
+- **Traffic Morph: Close no longer drops the shaped tail.** A MorphedConn's
+  Close returned before the shaper had written what it still held, so the
+  last packets of a session were lost silently, it could block on a peer
+  that had gone away, and it still accepted a Write after Close and dropped
+  it. Close now drains the shaped queue within its deadline, refuses a Write
+  once it has started, and reports the bytes it could not send.
+
+- **HTTP Polling and the ICMP tunnel drain and report on Close.** Their Close
+  sends what is still queued within a bound, instead of cutting it off or
+  blocking on a peer that is gone, and reports the bytes it could not get
+  out.
+
+- **Teardown aborts instead of draining.** A user's disconnect, a dead
+  session's failover, a forced reconnect and the Android core's disconnect
+  no longer wait up to 5 s for a transport to drain its queue into a peer
+  that is gone or no longer wanted: they abort it at once, through RTT
+  masking and the handshake-replay wrapper as well. A graceful close - the
+  old session after a port hop or an upgrade - still sends what it has,
+  within a bound.
+
 - **TLS fallback transports can reach their handlers on a `-reality-b1`
   server, with the new `-reality-fallback-tag` (off by default).** HTTP
   Polling, WebSocket padded, Geneva, anti-probe, HTTP/2 Stego, Traffic Morph,

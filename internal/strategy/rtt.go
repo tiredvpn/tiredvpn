@@ -440,6 +440,12 @@ func (c *RTTMaskingConn) Read(p []byte) (int, error) {
 	return c.Conn.Read(p)
 }
 
+// NetConn returns the wrapped connection, so findUnder and the other
+// unwrappers can walk past the RTT layer - a stall-failover over
+// -rtt-masking-over-polling needs to reach the transport under it. Not put on
+// replayConn, which the stall helpers unwrap explicitly.
+func (c *RTTMaskingConn) NetConn() net.Conn { return c.Conn }
+
 // Flush sends any buffered data immediately without waiting for burst. A
 // failed write loses the rest of the buffer; the error says how much.
 func (c *RTTMaskingConn) Flush() error {
