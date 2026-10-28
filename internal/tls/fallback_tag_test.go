@@ -304,28 +304,42 @@ func TestWeakSecret(t *testing.T) {
 		}
 	}
 
-	// No false alarms on random secrets of the usual forms: hex of 16 and 32
-	// bytes, base64 of 24 and 32 bytes, UUIDs. Sixteen characters of base64
-	// (12 bytes) sit near the line: the reviewer saw 60% of them flagged.
-	// Now only a draw that happens to lack a whole letter case is - about
-	// one in two thousand.
-	short := 0
-	const draws = 2000
+	// Almost no false alarms on random secrets of the usual forms: hex of 16
+	// and 32 bytes, base64 of 24 and 32 bytes, UUIDs. Almost, because a
+	// random string does contain a listed word now and then: "123456" in hex
+	// and "admin" in base64 hit about one draw in 300000, so 10000 draws flag
+	// none, or one now and then. A word list that hits random strings for real
+	// ("dead", "vpn") flags ten or more. Draws are counted, not secrets: the
+	// two hex forms share a prefix and are flagged together.
+	//
+	// Sixteen characters of base64 (12 bytes) sit near the line: the reviewer
+	// saw 60% of them flagged. Now only a draw that happens to lack a whole
+	// letter case is - about one in two thousand.
+	short, flagged := 0, 0
+	const draws = 10000
 	for n := range draws {
 		var b [32]byte
 		_, _ = rand.Read(b[:])
+		hit := false
 		for _, sec := range []string{
 			hex.EncodeToString(b[:16]), hex.EncodeToString(b[:]),
 			base64.StdEncoding.EncodeToString(b[:24]), base64.RawURLEncoding.EncodeToString(b[:]),
 			fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]),
 		} {
 			if why, weak := WeakSecret([]byte(sec)); weak {
-				t.Fatalf("draw %d: random %q flagged: %s", n, sec, why)
+				hit = true
+				t.Logf("draw %d: random %q flagged: %s", n, sec, why)
 			}
+		}
+		if hit {
+			flagged++
 		}
 		if _, weak := WeakSecret([]byte(base64.RawStdEncoding.EncodeToString(b[:12]))); weak {
 			short++
 		}
+	}
+	if flagged > 2 {
+		t.Errorf("%d of %d draws of random secrets flagged", flagged, draws)
 	}
 	if short > draws/100 {
 		t.Fatalf("%d of %d random 16-character base64 secrets flagged", short, draws)
