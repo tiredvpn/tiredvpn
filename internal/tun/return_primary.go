@@ -211,7 +211,9 @@ func (v *VPNClient) tryReturnToPreferred() bool {
 		log.Info("Return: %v, dropping the session on %s", err, cand)
 		return false
 	}
-	oldConn.Close()
+	// Gracefully and aside, as after a hop: the outcome booked below waited
+	// for the old session's drain (P3-3 of the round-20 review).
+	go closeGracefully(oldConn)
 	v.manager.ReturnOutcome(cand, true, false)
 	v.manager.PinCandidate(cand)
 	v.manager.SessionEnded(strategy.SessionEnd{Strategy: cur.ID(), Replaced: true,
