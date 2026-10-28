@@ -209,3 +209,29 @@ func GenerateREALITYKeyPair() (privB64, pubB64 string, err error) {
 	}
 	return EncodeREALITYKey(priv), EncodeREALITYKey(pub), nil
 }
+
+// warnREALITYSecrets logs, once at startup, what the configuration leaves
+// open: a -reality-fallback-tag without B1 (it does nothing), a weak global
+// -secret, and with the tag on, a global secret at all.
+//
+// A client's fallback-transport tag is checked with nothing but its secret,
+// so one captured tag lets anyone test guesses offline; a secret like
+// "pass-424242" fell to a dictionary run in about a second (P2-1 of the
+// round-5 review). And with the tag admitted, every exit sharing a secret
+// accepts a copy of any tag made under it once: per-client registry secrets
+// keep a copy to the exits that know that one client.
+func warnREALITYSecrets(cfg *Config) {
+	if cfg.REALITYFallbackTag && !cfg.REALITYB1Enabled {
+		log.Warn("-reality-fallback-tag has no effect without -reality-b1")
+	}
+	if len(cfg.Secret) > 0 {
+		if why, weak := customtls.WeakSecret(cfg.Secret); weak {
+			log.Warn("The global -secret is weak (%s): one captured fallback-transport tag lets anyone check guesses "+
+				"against it offline. Use a random secret of 32 bytes or more", why)
+		}
+		if cfg.REALITYFallbackTag && cfg.REALITYB1Enabled {
+			log.Warn("-reality-fallback-tag with a global -secret: a copied tag opens every exit that shares it. " +
+				"Prefer per-client registry secrets")
+		}
+	}
+}

@@ -18,6 +18,7 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/log"
 	"github.com/tiredvpn/tiredvpn/internal/protocol"
 	"github.com/tiredvpn/tiredvpn/internal/shaper"
+	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 )
 
 // TrafficMorphStrategy morphs traffic to match target application patterns
@@ -303,8 +304,22 @@ func (s *TrafficMorphStrategy) Probe(ctx context.Context, target string) error {
 	if s.baseStrat != nil {
 		return s.baseStrat.Probe(ctx, target)
 	}
-	return nil
+	// Without a base strategy there is nothing to ask that a reprobe could
+	// trust - see errProbeUnknown.
+	return errProbeUnknown
 }
+
+// errProbeUnknown is a probe's way of saying it cannot tell. ProbeAll counts
+// it as not available and leaves confidence alone.
+//
+// Traffic Morph without a base strategy and State Table Exhaustion used to
+// answer their probe with nil without touching the network; a reprobe during
+// an outage then reported them available, raised their confidence to 0.92
+// while every honest probe failed, and the client came back from the outage on
+// Traffic Morph instead of REALITY. Making them dial instead added five bare
+// connect-and-close dials to every reprobe burst. A probe that cannot learn
+// anything a scan would use should say so and stay off the wire.
+var errProbeUnknown = errors.New("probe cannot tell")
 
 func (s *TrafficMorphStrategy) Connect(ctx context.Context, target string) (net.Conn, error) {
 	// Establish base connection
@@ -321,11 +336,15 @@ func (s *TrafficMorphStrategy) Connect(ctx context.Context, target string) (net.
 		serverAddr := s.manager.GetServerAddr(ctx)
 		log.Debug("Traffic Morph: Using server address: %s", serverAddr)
 
-		// Use TLS connection with standard ALPN (no fingerprint in ClientHello)
+		// Use TLS connection with standard ALPN (no fingerprint in ClientHello).
+		// The SNI is drawn from the endpoint's pool, like every other
+		// strategy's; without a pool there is none, as before (P3-7 of the
+		// round-7 review).
 		tlsConfig := &tls.Config{
+			ServerName:         coverNameFor(ctx, ""),
 			InsecureSkipVerify: true,
 			NextProtos:         []string{"http/1.1"},
-			ClientSessionCache: s.manager.TLSSessionCache(), // resume across reconnects
+			ClientSessionCache: s.manager.TLSSessionCache(serverAddr), // resume across reconnects
 		}
 		// Use context-aware dialing (respects Android optimized timeouts)
 		dialer := &net.Dialer{}
@@ -344,7 +363,7 @@ func (s *TrafficMorphStrategy) Connect(ctx context.Context, target string) (net.
 		fragConn := evasion.NewFragmentedWriter(tcpConn, fragConfig)
 		log.Debug("Morph: TLS ClientHello fragmentation enabled (size=%d)", fragConfig.FragmentSize)
 
-		tlsConn := tls.Client(fragConn, tlsConfig)
+		tlsConn := tls.Client(fragConn, customtls.WithFallbackTag(tlsConfig, secret))
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			tcpConn.Close()
 			return nil, err

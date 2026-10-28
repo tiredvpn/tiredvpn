@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 // netlink represents a default route either as a nil Dst or as an explicit
@@ -88,5 +89,36 @@ func TestPhysicalGateAddrsLiveTable(t *testing.T) {
 		if _, _, err := net.SplitHostPort(addr); err != nil {
 			t.Errorf("malformed dial target %q: %v", addr, err)
 		}
+	}
+}
+
+// TestPhysicalGateAddrsReadsEveryTableWhenMainHasNoDefault: Android keeps a
+// network's default route in that network's own table; reading main alone
+// found no gateway on a phone, ever.
+func TestPhysicalGateAddrsReadsEveryTableWhenMainHasNoDefault(t *testing.T) {
+	_, lan, _ := net.ParseCIDR("192.168.1.0/24")
+	old := listRoutes
+	t.Cleanup(func() { listRoutes = old })
+	listRoutes = func(table int) ([]netlink.Route, error) {
+		if table == unix.RT_TABLE_MAIN {
+			return []netlink.Route{{Dst: lan, LinkIndex: 7}, {Dst: nil, LinkIndex: 30}}, nil // a LAN route, a gatewayless tun default
+		}
+		return []netlink.Route{
+			{Dst: lan, Gw: net.ParseIP("192.168.1.5"), LinkIndex: 7, Table: 1003}, // not a default
+			{Dst: nil, Gw: net.ParseIP("192.168.1.1"), LinkIndex: 7, Table: 1003},
+		}, nil
+	}
+	if got := physicalGateAddrs(); len(got) != 1 || got[0] != "192.168.1.1:53" {
+		t.Fatalf("got %v, want the gateway from the per-network table", got)
+	}
+
+	listRoutes = func(table int) ([]netlink.Route, error) {
+		if table != unix.RT_TABLE_MAIN {
+			t.Fatal("main had a default and the other tables were read anyway")
+		}
+		return []netlink.Route{{Dst: nil, Gw: net.ParseIP("10.0.0.1"), LinkIndex: 2}}, nil
+	}
+	if got := physicalGateAddrs(); len(got) != 1 || got[0] != "10.0.0.1:53" {
+		t.Fatalf("got %v", got)
 	}
 }

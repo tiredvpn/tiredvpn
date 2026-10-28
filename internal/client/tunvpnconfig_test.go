@@ -58,3 +58,18 @@ func TestNewTUNVPNConfigIPv6AllowBadSpec(t *testing.T) {
 		t.Errorf("error %q does not name the flag at fault", err)
 	}
 }
+
+// TestFallbackFlagGovernsStrategyUpgrade: -fallback used to be printed and
+// nothing else. It now decides whether a live tunnel may move back to a better
+// strategy, and the default keeps that on.
+func TestFallbackFlagGovernsStrategyUpgrade(t *testing.T) {
+	for _, enabled := range []bool{true, false} {
+		vpnCfg, err := newTUNVPNConfig(&Config{TunIP: "10.8.1.2", ServerAddr: "203.0.113.10:443", EnableFallback: enabled}, nil)
+		if err != nil {
+			t.Fatalf("newTUNVPNConfig: %v", err)
+		}
+		if vpnCfg.NoStrategyUpgrade == enabled {
+			t.Fatalf("-fallback=%v gave NoStrategyUpgrade=%v", enabled, vpnCfg.NoStrategyUpgrade)
+		}
+	}
+}

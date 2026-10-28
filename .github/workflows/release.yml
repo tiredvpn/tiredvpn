@@ -42,9 +42,25 @@ jobs:
           # change - not by loosening it back to latest for freshness.
           version: v2.13.1
 
+  # The server tests too long for the -short unit tests above. They were in
+  # them until they took the package past the 5 min timeout; skipped there
+  # now, they gate the release here (scripts/ci-long-tests.sh).
+  long_tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Real-clock and long leg tests
+        run: bash scripts/ci-long-tests.sh
+
   docker:
     runs-on: ubuntu-latest
-    needs: [test]
+    needs: [test, long_tests]
     steps:
       - uses: actions/checkout@v7
 
@@ -76,7 +92,7 @@ jobs:
 
   release:
     runs-on: ubuntu-latest
-    needs: [test]
+    needs: [test, long_tests]
     steps:
       - uses: actions/checkout@v7
 

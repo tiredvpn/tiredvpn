@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/log"
+	customtls "github.com/tiredvpn/tiredvpn/internal/tls"
 )
 
 // androidModeEnabled disables strategies that require root (raw sockets, ICMP, etc.)
@@ -80,19 +81,17 @@ func (s *StateExhaustionStrategy) Probe(ctx context.Context, target string) erro
 	// Android mode: warn but don't fail (will use fallback)
 	if androidModeEnabled {
 		log.Debug("State Exhaustion on Android: will use fallback mode (no raw sockets)")
-		return nil
-	}
-
-	// Quick check - can we create raw sockets?
-	// If not, we'll fallback to normal TCP in Connect()
-	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_TCP)
-	if err != nil {
+	} else if fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_TCP); err != nil {
+		// Quick check - can we create raw sockets? If not, Connect falls back
+		// to normal TCP.
 		log.Debug("State Exhaustion: raw sockets unavailable, will use fallback mode")
-		return nil // Don't fail - fallback available
+	} else {
+		syscall.Close(fd)
 	}
-	syscall.Close(fd)
 
-	return nil
+	// The raw-socket check is local; whether the server is there it cannot
+	// say - see errProbeUnknown.
+	return errProbeUnknown
 }
 
 func (s *StateExhaustionStrategy) Connect(ctx context.Context, target string) (net.Conn, error) {
@@ -135,14 +134,18 @@ func (s *StateExhaustionStrategy) Connect(ctx context.Context, target string) (n
 		return s.baseStrat.Connect(ctx, target)
 	}
 
-	// Use TLS connection with Confusion wrapper (server requires protocol magic)
+	// Use TLS connection with Confusion wrapper (server requires protocol magic).
+	// The SNI is drawn from the endpoint's pool, like every other strategy's;
+	// without a pool it is the target's host name, or none for an address,
+	// as before (P3-7 of the round-7 review).
 	tlsConfig := &tls.Config{
+		ServerName:         coverNameFor(ctx, ""),
 		InsecureSkipVerify: true,
 		NextProtos:         []string{"http/1.1"},
-		ClientSessionCache: s.manager.TLSSessionCache(), // resume across reconnects
+		ClientSessionCache: s.manager.TLSSessionCache(target), // resume across reconnects
 	}
 	dialer := &net.Dialer{Timeout: 30 * time.Second}
-	conn, err := tls.DialWithDialer(dialer, "tcp", target, tlsConfig)
+	conn, err := tls.DialWithDialer(dialer, "tcp", target, customtls.WithFallbackTag(tlsConfig, secret))
 	if err != nil {
 		return nil, err
 	}

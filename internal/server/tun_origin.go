@@ -2,7 +2,11 @@ package server
 
 import (
 	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"net"
+	"strings"
 )
 
 // globalClientID is the client identity every caller authenticated with the
@@ -16,6 +20,78 @@ const globalClientID = "global"
 // seven bytes and ignores the rest of the stego payload, so an older upstream
 // silently drops the extension instead of choking on it.
 var tunOriginMagic = []byte("TRO1")
+
+// tunClientTagMagic marks the optional client-tag extension a relay appends
+// to the TUN setup payload, before the origin trailer: [magic:4][len:1][tag:N].
+// It sits before TRO1 because splitTUNOrigin requires its own trailer to be
+// last. Both are after the fixed seven bytes, which is all any exit parses,
+// so an exit that knows neither drops both.
+//
+// The origin alone was not enough: it is the downstream client's IP, and two
+// clients behind one NAT share it, so they shared one lease on the exit and
+// evicted each other every half minute - the field case behind the msk
+// relays. The tag tells them apart (relayClientTag).
+var tunClientTagMagic = []byte("TRC1")
+
+// appendTUNClientTag returns handshake with tag appended. An empty tag
+// returns it unchanged.
+func appendTUNClientTag(handshake []byte, tag string) []byte {
+	if tag == "" || len(tag) > 255 {
+		return handshake
+	}
+	out := make([]byte, 0, len(handshake)+len(tunClientTagMagic)+1+len(tag))
+	out = append(out, handshake...)
+	out = append(out, tunClientTagMagic...)
+	out = append(out, byte(len(tag)))
+	out = append(out, tag...)
+	return out
+}
+
+// splitTUNClientTag splits a TUN setup payload into the handshake proper and
+// the client tag a relay attached. Call it after splitTUNOrigin: the origin
+// trailer is the outer one. A payload without the extension comes back
+// unchanged with an empty tag.
+func splitTUNClientTag(data []byte) ([]byte, string) {
+	idx := bytes.LastIndex(data, tunClientTagMagic)
+	if idx < 0 {
+		return data, ""
+	}
+	rest := data[idx+len(tunClientTagMagic):]
+	if len(rest) < 1 {
+		return data, ""
+	}
+	n := int(rest[0])
+	if n == 0 || len(rest) != 1+n {
+		return data, ""
+	}
+	return data[:idx], string(rest[1 : 1+n])
+}
+
+// relayClientTag is the tag a relay attaches for a downstream client whose
+// identity it knows and whose address it is about to forward.
+//
+// A client with its own credential gets its own id: two such clients behind
+// one NAT then hold two leases on the exit, and each keeps its address
+// across reconnects and across a change of transport.
+//
+// Clients that share one credential - the server's global secret - cannot be
+// told apart by anything durable they send, so there is nothing stable to
+// key on and the tag is drawn per downstream session. Two boxes behind one
+// NAT then hold two leases instead of fighting over one, and each keeps its
+// address while it reconnects: a reconnect asks for the address it holds,
+// and the exit hands the lease from the session before over to the new tag
+// (sharedTagRequest). A box that reconnects after something else took that
+// address gets a new one, as it would after a lease expiry.
+func relayClientTag(id clientIdentity) string {
+	if id.perClient && id.leaseID() != "" {
+		return "c" + id.leaseID()
+	}
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return ""
+	}
+	return "s" + hex.EncodeToString(b[:])
+}
 
 // appendTUNOrigin returns handshake with the downstream client's origin appended
 // as [magic:4][len:1][origin:N]. An empty origin returns the handshake unchanged.
@@ -91,6 +167,26 @@ type clientIdentity struct {
 	// second lease after it changes address; the opposite default hands two
 	// clients one tunnel IP and they evict each other until one gives up.
 	perClient bool
+
+	// lease is the credential behind id, without the transport's label: the
+	// registry client's ID, or "global" for the shared secret. One client
+	// presents one credential over every transport, so this is what keys its
+	// tunnel address. Empty means id itself.
+	//
+	// It used to be id, and id differs by transport: REALITY says
+	// "reality:<hmac-of-secret>", HTTP polling "polling:global", the rest
+	// "global". A client that moved from Geneva to REALITY in the middle of a
+	// session - the strategy upgrade - arrived as somebody else and was handed
+	// another address, so the move could never be committed.
+	lease string
+}
+
+// leaseID is the identity a lease is keyed on - see lease.
+func (c clientIdentity) leaseID() string {
+	if c.lease != "" {
+		return c.lease
+	}
+	return c.id
 }
 
 // sharedIdentity marks an identity derived from a credential every client
@@ -117,7 +213,7 @@ func (c clientIdentity) prefixed(transport string) clientIdentity {
 	if c.id == "" {
 		return c
 	}
-	return clientIdentity{id: transport + ":" + c.id, perClient: c.perClient}
+	return clientIdentity{id: transport + ":" + c.id, perClient: c.perClient, lease: c.leaseID()}
 }
 
 // allocationKey qualifies the IP-pool lease key with the client's origin when
@@ -133,13 +229,166 @@ func (c clientIdentity) prefixed(transport string) clientIdentity {
 // the TRO1 trailer rather than from the socket - qualifying at the point of
 // authentication instead would collapse every client behind one relay back
 // into a single lease.
-func allocationKey(id clientIdentity, origin string) string {
+func allocationKey(id clientIdentity, origin, clientTag string) string {
 	// An empty identity keys nothing, and "@1.2.3.4" would be a key rather than
 	// the absence of one. Callers that have no identity resolve one of their own
 	// before they get here; this keeps the function honest for the ones that do
 	// not, which is what it did before it learned about provenance.
-	if id.id == "" || id.perClient || origin == "" {
-		return id.id
+	if id.id == "" || id.perClient {
+		return id.leaseID()
 	}
-	return id.id + "@" + origin
+	key := id.leaseID()
+	if origin != "" {
+		key += "@" + origin
+	}
+	// The tag a relay attached for its downstream client, which the origin
+	// cannot tell apart behind a NAT. Only a relay sends one.
+	if clientTag != "" {
+		key += "#" + clientTag
+	}
+	return key
+}
+
+// allocateTunnelIP is the one way a TUN session gets its address: the lease
+// keyed by allocationKey, after folding in every lease the client still holds
+// under a key an older server spelled for it (legacyAllocationKeys).
+func allocateTunnelIP(srvCtx *serverContext, id clientIdentity, origin, clientTag string, requested net.IP) (net.IP, error) {
+	key := allocationKey(id, origin, clientTag)
+	// A drawn tag adopts nothing. Its legacy key, "global@<origin>", is
+	// also the live key of a direct client at that origin, and a box that
+	// adopted an offline one's lease got it back on the sticky path, past
+	// the refusal below - the next box asking for the same default address
+	// then took it over from the live first (finding 3 of the round-12
+	// review). The cost: a box coming from a 1.11.8 relay gets a new
+	// address once.
+	if !drawnTag(clientTag) {
+		keys, prefixes := legacyAllocationKeys(srvCtx, id, origin)
+		// Bounded: the Redis search for old leases must not hold a
+		// handshake up for long (adoptScanTimeout); one that runs out is
+		// retried next time.
+		ctx, cancel := context.WithTimeout(context.Background(), adoptScanTimeout)
+		defer cancel()
+		srvCtx.ipPool.AdoptAll(ctx, keys, prefixes, key, func(ip string) bool { return serving(srvCtx, ip) })
+	}
+	granted, refused := sharedTagRequest(srvCtx, id, origin, clientTag, key, requested)
+	if refused != nil {
+		return srvCtx.ipPool.AllocateAvoiding(key, refused)
+	}
+	return srvCtx.ipPool.Allocate(key, granted, "")
+}
+
+// serving reports whether a session is registered on ip on this exit.
+func serving(srvCtx *serverContext, ip string) bool {
+	if srvCtx.sharedTUN == nil {
+		return false
+	}
+	addr := net.ParseIP(ip)
+	return addr != nil && srvCtx.sharedTUN.Serving(addr)
+}
+
+// drawnTag reports whether a relay drew clientTag for a client on a shared
+// credential (relayClientTag), new on every session.
+func drawnTag(clientTag string) bool { return strings.HasPrefix(clientTag, "s") }
+
+// sharedTagRequest decides what a client on a shared credential behind a
+// relay - a drawn tag, "s" (relayClientTag) - gets for the address it asks
+// for, and returns the request to allocate with, or the refused request
+// the pool must not hand out instead.
+//
+// The relay draws such a client's tag per session, so every session comes
+// with a new lease key, and what ties a reconnect to its address is the
+// request: a reconnect asks for the address it holds. An address leased
+// under another drawn tag of the same credential and origin is taken over
+// by the asking key - whether a session still holds it or not. A
+// make-before-break upgrade always asks while the old session is up, and a
+// reconnect after a silent loss usually does, since the relay keeps the old
+// leg for up to two minutes; waiting for the old session to go gave the
+// client a new address on each of them and left the old lease behind (P2-2
+// of the round-10 review).
+//
+// Any other request on a drawn tag is not granted as asked: the client gets
+// an address from the pool - never the one it asked for. Two boxes on one
+// secret behind one NAT ask, on their first session, for the same
+// configured address (-tun-ip, 10.8.0.2 by default, and Android's "auto"
+// resolves to the same); granting it would make it a lease under the
+// drawn-tag prefix that the second one then takes over from the first. So
+// would the pool handing it out: the default is the pool's first free
+// address with the documented 10.8.0.0/24, and the second box took the
+// first one's live address and left it without a downlink (P1-1 of the
+// round-11 review). From the pool, past the request, they get two
+// addresses and each asks for its own. Two boxes that ask for the same
+// address they hold - configured alike and never given another - are not
+// told apart; neither are they on one lease in 1.11.8. Telling them apart
+// needs proof of ownership in the handshake, a protocol change (1.11.10).
+func sharedTagRequest(srvCtx *serverContext, id clientIdentity, origin, clientTag, key string, requested net.IP) (granted, refused net.IP) {
+	if !drawnTag(clientTag) || origin == "" || requested == nil || requested.IsUnspecified() {
+		return requested, nil
+	}
+	if srvCtx.ipPool.TakeOver(requested, allocationKey(id, origin, "")+"#s", key) {
+		return requested, nil
+	}
+	return nil, requested
+}
+
+// legacyAllocationKeys lists the keys a server before the credential lease
+// could have spelled for this client, over any transport: the plain one,
+// HTTP polling's "polling:" one, and REALITY's "reality:<hmac>@origin" (always
+// origin-qualified - it used to be classified as shared even for a registry
+// client). The REALITY key needs the credential's secret, looked up here.
+//
+// All of them, not just the incoming transport's: a client whose lease was
+// taken over REALITY and who comes back over Geneva would otherwise get a new
+// address and leave the REALITY lease behind. Requested leases are permanent
+// in Redis, so an orphan never goes away on its own. Drop this once every exit
+// has run a release with the credential lease.
+//
+// prefixes names keys by their start instead: a registry client's REALITY
+// lease under ANY origin, "reality:<hmac>@". Its key no longer has an origin,
+// so the lease it took from another network is its own, and looking only under
+// the current origin left that one behind and handed out a new address. On the
+// global secret the origin is what tells boxes apart, and another origin's
+// REALITY lease is somebody else's: there only the current origin's key is
+// listed.
+func legacyAllocationKeys(srvCtx *serverContext, id clientIdentity, origin string) (keys, prefixes []string) {
+	lease := id.leaseID()
+	if lease == "" {
+		return nil, nil
+	}
+	qualify := func(k string, shared bool) string {
+		if !shared || origin == "" {
+			return k
+		}
+		return k + "@" + origin
+	}
+	keys = []string{
+		qualify(lease, !id.perClient),
+		qualify("polling:"+lease, !id.perClient),
+	}
+	if secret := credentialSecret(srvCtx, lease, id.perClient); len(secret) > 0 {
+		realityKey := realityClientIdentity(secret, clientIdentity{}).id
+		if id.perClient {
+			prefixes = append(prefixes, realityKey+"@")
+		} else {
+			keys = append(keys, qualify(realityKey, true))
+		}
+	}
+	return keys, prefixes
+}
+
+// credentialSecret is the secret behind a lease identity: the global secret,
+// or the registry client's own.
+func credentialSecret(srvCtx *serverContext, lease string, perClient bool) []byte {
+	if !perClient {
+		if lease == globalClientID && srvCtx.cfg != nil {
+			return srvCtx.cfg.Secret
+		}
+		return nil
+	}
+	if srvCtx.registry == nil {
+		return nil
+	}
+	if c := srvCtx.registry.GetByID(lease); c != nil {
+		return []byte(c.Secret)
+	}
+	return nil
 }

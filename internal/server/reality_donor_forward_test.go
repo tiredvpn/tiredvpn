@@ -56,7 +56,7 @@ func TestDonorForwardIsByteIdentical(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		handleREALITYUnauthorized(server, hello, "127.0.0.1", testLogger(t))
+		handleREALITYUnauthorized(server, hello, &serverContext{cfg: &Config{REALITYCoverDomain: "127.0.0.1"}}, testLogger(t))
 	}()
 
 	forwarded := <-got
@@ -71,5 +71,40 @@ func TestDonorForwardIsByteIdentical(t *testing.T) {
 		t.Fatalf("the ClientHello was altered on the way to the donor: sent %d bytes, "+
 			"donor got %d; any difference breaks the transcript hash and the client "+
 			"fails the handshake with a decrypt error", len(hello), len(forwarded))
+	}
+}
+
+// TestLegacyUnauthorizedPathFollowsTheDonorPolicy is P3-15 of the round-3
+// review of PR #127: -reality-sni only reached the B1 path. The legacy
+// unauthenticated path sent every probe to the cover domain, so one replaying
+// a name the operator listed got another site's certificate for it. Built-in
+// donors match whatever the case, like operator names already did, and a name
+// on neither list still goes to the cover domain.
+func TestLegacyUnauthorizedPathFollowsTheDonorPolicy(t *testing.T) {
+	for _, tc := range []struct{ sni, want string }{
+		{"www.gstatic.com", "www.gstatic.com:443"},
+		{"YANDEX.RU", "YANDEX.RU:443"},
+		{"attacker.example", "www.microsoft.com:443"},
+	} {
+		dialled := make(chan string, 1)
+		srvCtx := &serverContext{
+			cfg: &Config{REALITYCoverDomain: "www.microsoft.com", REALITYSNIs: []string{"www.gstatic.com"}},
+			donorDialer: func(addr string) (net.Conn, error) {
+				dialled <- addr
+				return nil, io.EOF
+			},
+		}
+		client, server := net.Pipe()
+		handleREALITYUnauthorized(server, helloWithPadding(t, tc.sni, 512), srvCtx, testLogger(t))
+		client.Close()
+		server.Close()
+		select {
+		case got := <-dialled:
+			if got != tc.want {
+				t.Errorf("SNI %s: dialled %s, want %s", tc.sni, got, tc.want)
+			}
+		default:
+			t.Errorf("SNI %s: nothing dialled", tc.sni)
+		}
 	}
 }

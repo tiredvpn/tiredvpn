@@ -30,19 +30,6 @@ import (
 // bodies keep arriving, the way a busy client does, and check what comes out
 // the other side byte for byte.
 
-// newPollingSession builds a session the way GetOrCreate does, without putting
-// it in the global manager.
-func newPollingSession(id string) *HTTPPollingSession {
-	sess := &HTTPPollingSession{
-		ID:         id,
-		Created:    time.Now(),
-		toClient:   bytes.NewBuffer(nil),
-		fromClient: bytes.NewBuffer(nil),
-	}
-	sess.touch(time.Now())
-	return sess
-}
-
 // uplinkPacket builds a minimal IPv4 packet whose payload carries seq and a
 // pattern derived from it, so reordering, loss and corruption are all visible.
 func uplinkPacket(seq uint32, size int) []byte {

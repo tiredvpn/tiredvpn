@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/tiredvpn/tiredvpn/internal/log"
+	"github.com/tiredvpn/tiredvpn/internal/strategy"
 	"golang.org/x/sys/unix"
 )
 
@@ -22,6 +24,32 @@ type ControlCommand struct {
 	TunFd   int    `json:"tun_fd,omitempty"`
 	Pid     int    `json:"pid,omitempty"`    // Parent process PID for /proc/PID/fd/N access
 	Reason  string `json:"reason,omitempty"` // For network_changed: "wifi_to_lte", "lte_to_wifi", "cell_handoff"
+	// NetworkID names the network the command is sent on, opaque to the
+	// core: the Android app sends its Network handle. Optional, on
+	// "connect", "network_changed" and "reconnect". See NetworkFn.
+	NetworkID NetworkID `json:"network_id,omitempty"`
+}
+
+// NetworkID is a command's network_id: a string, or the JSON number
+// Kotlin's put("network_id", network.networkHandle) writes. A number made
+// the whole command undecodable, and it was dropped unanswered (P3-2 of the
+// round-8 review). Any other value is ignored, not the command with it.
+type NetworkID string
+
+func (n *NetworkID) UnmarshalJSON(b []byte) error {
+	var s string
+	if json.Unmarshal(b, &s) == nil {
+		*n = NetworkID(s)
+		return nil
+	}
+	var num json.Number
+	if json.Unmarshal(b, &num) == nil {
+		*n = NetworkID(num.String())
+		return nil
+	}
+	log.Warn("Control: ignoring a network_id that is neither a string nor a number (%q)", clip(b))
+	*n = ""
+	return nil
 }
 
 // ControlResponse represents response to Android app
@@ -111,8 +139,18 @@ type ControlServer struct {
 	// Control connection for sending events back to Android
 	controlConn net.Conn
 
+	// readers are the control connections' readers. Close gives them a
+	// moment to read what the host has already sent - a "disconnect" the
+	// app wrote just before stopping the core - before the core goes. Kept
+	// apart from mu, which a running command holds.
+	readersMu   sync.Mutex
+	readerConns map[net.Conn]struct{}
+	readers     sync.WaitGroup
+
 	// Config for connection
 	config *ControlConfig
+	// netCheck replaces checkNetworkConnectivity's probe in tests.
+	netCheck func() bool
 }
 
 // ReconnectResult is the outcome of a reconnect handshake performed by
@@ -145,6 +183,21 @@ type ConnectionMetadata struct {
 	Attempts  int
 }
 
+// HandshakeOutcome is how a session handshake after a connect went, for
+// ControlConfig.HandshakeOutcomeFn.
+type HandshakeOutcome int
+
+const (
+	// HandshakeAnsweredOutcome: answered, refused or in part. Numbered from
+	// one, so an outcome left unset is none of them.
+	HandshakeAnsweredOutcome HandshakeOutcome = iota + 1
+	// HandshakeUnansweredOutcome: the server's silence (IsHandshakeUnanswered).
+	HandshakeUnansweredOutcome
+	// HandshakeFailedOutcome: a reset or an end of stream after the request
+	// (IsHandshakeFailed).
+	HandshakeFailedOutcome
+)
+
 // ControlConfig holds configuration for control server
 type ControlConfig struct {
 	ServerAddr string
@@ -162,13 +215,47 @@ type ControlConfig struct {
 	ConnectFn  func(ctx context.Context) (assignedIP, serverIP net.IP, conn net.Conn, err error)
 	StartVPNFn func(tunFd int, localIP, remoteIP net.IP, conn net.Conn) error
 
-	// ReconnectFn is called on network change to re-establish connection.
-	// It receives the current assigned IP to send in handshake and returns a
-	// new server connection with the handshake already done.
-	ReconnectFn func(ctx context.Context, currentIP net.IP, mtu int) (ReconnectResult, error)
+	// ReconnectFn re-establishes the connection. It receives the current
+	// assigned IP to send in handshake and returns a new server connection
+	// with the handshake already done. networkChanged is false when the
+	// relay died on a network that did not change (auto-reconnect): what the
+	// client learned about the servers - a park for a degraded session - must
+	// survive that reconnect, where a network change voids it.
+	ReconnectFn func(ctx context.Context, currentIP net.IP, mtu int, networkChanged bool) (ReconnectResult, error)
 
 	// GetConnectionInfoFn returns metadata about the last connection (for Android UI)
 	GetConnectionInfoFn func() ConnectionMetadata
+
+	// SessionEndedFn, when set, is told that the relay's session ended on its
+	// own (a death or the stall detector's verdict), before the relay reports
+	// it dead. It books the end against the strategy and the endpoint.
+	SessionEndedFn func(RelaySessionEnd)
+
+	// DisconnectedFn, when set, is told that the host asked for the tunnel
+	// to go down ("disconnect": the user's stop, not a dead connection).
+	// ConnectRequestedFn is told that the host asked for it to come up
+	// ("connect"), which takes a stop back. Both are told in the order the
+	// host sent the commands, the moment they are read.
+	DisconnectedFn     func()
+	ConnectRequestedFn func()
+
+	// HandshakeOutcomeFn, when set, is told how the session handshake after
+	// a connect went: answered, unanswered (IsHandshakeUnanswered) or failed
+	// after its request (IsHandshakeFailed). For an unanswered one it returns
+	// the error to answer the host with instead.
+	HandshakeOutcomeFn func(outcome HandshakeOutcome, err error) error
+
+	// NetworkFn, when set, is told the network_id of every command that
+	// carries one, in the order the host sent them, the moment it is read:
+	// the network the host is on now.
+	NetworkFn func(id string)
+
+	// SessionStrategyFn, when set, names the strategy carrying the current
+	// session, for the relay's stall detector: a conn whose keepalive counter
+	// sits under a wrapper the detector cannot see through is then still
+	// known by its strategy, and a strategy that makes up keepalives (HTTP
+	// Polling's feeder) is not judged on them. Nil leaves only the conn.
+	SessionStrategyFn func() strategy.Strategy
 }
 
 // NewControlServer creates a new control server
@@ -290,17 +377,103 @@ func (cs *ControlServer) handleConnection(ctx context.Context, conn net.Conn) {
 	// part of one. Parsing each read as a single JSON value turned the host's
 	// network_available + network_changed, written back to back, into a parse
 	// error, a closed connection and a full core restart on the host.
+	//
+	// Reading runs apart from the commands. A "disconnect" is the user's
+	// stop, and the host does not wait for its answer before it stops the
+	// core: read only after a running "connect" returned, or after the stop
+	// had begun, it was lost, and the carry for the next core survived the
+	// user's stop (P3-2 of the round-7 review). The reader tells
+	// DisconnectedFn the moment it reads one, and ConnectRequestedFn of a
+	// "connect", which takes the stop back; the commands themselves run in
+	// turn, below.
+	batches := make(chan controlBatch, 8)
+	if !cs.addReader(conn) {
+		return
+	}
+	go cs.readControl(unixConn, batches)
+	defer func() {
+		// The reader may still be handing over batches; their descriptors
+		// are ours to close.
+		go func() {
+			for b := range batches {
+				for _, m := range b.msgs {
+					releaseReceivedFd(m.fd)
+				}
+			}
+		}()
+	}()
+
+	for b := range batches {
+		for i, m := range b.msgs {
+			resp, ok := cs.dispatchControl(ctx, m)
+			if !ok {
+				continue
+			}
+			if err := encoder.Encode(resp); err != nil {
+				log.Debug("Control encode error: %v", err)
+				for _, rest := range b.msgs[i+1:] {
+					releaseReceivedFd(rest.fd)
+				}
+				return
+			}
+		}
+	}
+}
+
+// controlBatch is what one read of a control connection completed.
+type controlBatch struct{ msgs []controlMsg }
+
+// addReader registers conn's reader, unless Close has begun.
+func (cs *ControlServer) addReader(conn net.Conn) bool {
+	cs.readersMu.Lock()
+	defer cs.readersMu.Unlock()
+	if cs.closed.Load() {
+		return false
+	}
+	if cs.readerConns == nil {
+		cs.readerConns = make(map[net.Conn]struct{})
+	}
+	cs.readerConns[conn] = struct{}{}
+	cs.readers.Add(1)
+	return true
+}
+
+// readControl reads conn's commands into batches until the connection ends,
+// and tells DisconnectedFn and ConnectRequestedFn at once of every
+// "disconnect" and "connect" it reads, and NetworkFn of every network_id.
+func (cs *ControlServer) readControl(conn *net.UnixConn, batches chan<- controlBatch) {
+	var drainedOnce sync.Once
+	drained := func() { drainedOnce.Do(cs.readers.Done) }
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error("control reader panic: %v", r)
+		}
+		cs.readersMu.Lock()
+		delete(cs.readerConns, conn)
+		cs.readersMu.Unlock()
+		close(batches)
+		drained()
+	}()
 	framer := newControlFramer()
 	defer framer.release()
 	buf := make([]byte, 4096)
 	// Room for a few descriptors: the host sends one, and any extra that
 	// arrive are closed below rather than left to the kernel's truncation.
 	oob := make([]byte, unix.CmsgSpace(4*4))
-
 	for {
-		n, oobn, flags, _, err := unixConn.ReadMsgUnix(buf, oob)
+		n, oobn, flags, _, err := conn.ReadMsgUnix(buf, oob)
 		fd := receivedFd(oob[:oobn], flags)
-		if n == 0 {
+		if n <= 0 && errors.Is(err, os.ErrDeadlineExceeded) && cs.closed.Load() {
+			// Close's read window ran out: everything the host had sent
+			// is in. The connection stays: a command it sends from now on
+			// is answered, with an error.
+			drained()
+			_ = conn.SetReadDeadline(time.Time{})
+			continue
+		}
+		if n <= 0 {
+			// n is -1 with some errors, and buf[:n] panicked (P3-9 of the
+			// round-7 review).
 			releaseReceivedFd(fd)
 			if err != nil {
 				log.Debug("Control read: %v", err)
@@ -308,18 +481,24 @@ func (cs *ControlServer) handleConnection(ctx context.Context, conn net.Conn) {
 			return
 		}
 		msgs, ferr := framer.feed(buf[:n], fd)
-		for i, m := range msgs {
-			resp, ok := cs.dispatchControl(ctx, m)
-			if !ok {
-				continue
+		for _, m := range msgs {
+			name, network := controlCommandHead(m.data)
+			if network != "" && cs.config.NetworkFn != nil {
+				cs.config.NetworkFn(network)
 			}
-			if err := encoder.Encode(resp); err != nil {
-				log.Debug("Control encode error: %v", err)
-				for _, rest := range msgs[i+1:] {
-					releaseReceivedFd(rest.fd)
+			switch name {
+			case "disconnect":
+				if cs.config.DisconnectedFn != nil {
+					cs.config.DisconnectedFn()
 				}
-				return
+			case "connect":
+				if cs.config.ConnectRequestedFn != nil {
+					cs.config.ConnectRequestedFn()
+				}
 			}
+		}
+		if len(msgs) > 0 {
+			batches <- controlBatch{msgs: msgs}
 		}
 		if ferr != nil {
 			log.Warn("Control: %v, closing the connection", ferr)
@@ -329,6 +508,40 @@ func (cs *ControlServer) handleConnection(ctx context.Context, conn net.Conn) {
 			log.Debug("Control read: %v", err)
 			return
 		}
+	}
+}
+
+// controlCommandHead is the command data names and the network it names,
+// "" for either that is missing.
+func controlCommandHead(data []byte) (command, network string) {
+	var cmd struct {
+		Command   string    `json:"command"`
+		NetworkID NetworkID `json:"network_id"`
+	}
+	if json.Unmarshal(data, &cmd) != nil {
+		return "", ""
+	}
+	return cmd.Command, string(cmd.NetworkID)
+}
+
+// closeReadWait is how long Close lets the control readers take in what the
+// host has already sent.
+const closeReadWait = 100 * time.Millisecond
+
+// drainReaders gives every control reader closeReadWait to read what is
+// already in its socket, and waits until each has.
+func (cs *ControlServer) drainReaders() {
+	cs.readersMu.Lock()
+	cut := time.Now().Add(closeReadWait)
+	for c := range cs.readerConns {
+		_ = c.SetReadDeadline(cut)
+	}
+	cs.readersMu.Unlock()
+	done := make(chan struct{})
+	go func() { cs.readers.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * closeReadWait):
 	}
 }
 
@@ -405,6 +618,11 @@ func (cs *ControlServer) dispatchControl(ctx context.Context, m controlMsg) (Con
 		case "connect":
 			resp = cs.handleConnect(ctx)
 		case "disconnect":
+			// The host's own stop. DisconnectedFn was told when the command
+			// was read (readControl), not in handleDisconnect: Close runs
+			// that too, on every core shutdown - after a dead connection as
+			// well - and the carry for the next core was wiped each time
+			// (P1-B of the round-6 review).
 			resp = cs.handleDisconnect()
 		case "status":
 			resp = cs.handleStatus()
@@ -471,9 +689,26 @@ func (cs *ControlServer) handleConnect(ctx context.Context) ControlResponse {
 	// by concurrent relay + handshake; here there is no relay yet, so it's safe.
 	realAssignedIP, realServerIP, err := cs.performTUNHandshake(opCtx)
 	if err != nil {
-		conn.Close()
+		_ = closeNow(conn)
 		cs.serverConn = nil
+		if cs.config.HandshakeOutcomeFn != nil {
+			switch {
+			case IsHandshakeUnanswered(err):
+				err = cs.config.HandshakeOutcomeFn(HandshakeUnansweredOutcome, err)
+			case IsHandshakeAnswered(err):
+				_ = cs.config.HandshakeOutcomeFn(HandshakeAnsweredOutcome, nil)
+			case IsHandshakeFailed(opCtx, err):
+				// A reset after the request: the Android core's first
+				// connect booked it as nothing, and a family that resets
+				// every handshake was never parked (P2 of the round-14
+				// review).
+				_ = cs.config.HandshakeOutcomeFn(HandshakeFailedOutcome, err)
+			}
+		}
 		return ControlResponse{Status: "error", Error: fmt.Sprintf("TUN handshake failed: %v", err)}
+	}
+	if cs.config.HandshakeOutcomeFn != nil {
+		_ = cs.config.HandshakeOutcomeFn(HandshakeAnsweredOutcome, nil)
 	}
 
 	cs.assignedIP = realAssignedIP
@@ -556,7 +791,7 @@ func (cs *ControlServer) handleSetFdWithReceivedFd(ctx context.Context, fd int) 
 		cs.relayGeneration++
 		myGen := cs.relayGeneration
 
-		cs.relay = startTUNRelay(tunDev, cs.serverConn, cs.assignedIP, cs.serverIP, cs.relayStopCh, &RelayCallbacks{
+		cs.relay = cs.startRelay(tunDev, cs.serverConn, cs.assignedIP, cs.serverIP, cs.relayStopCh, &RelayCallbacks{
 			OnError: func(reason string) {
 				cs.mu.Lock()
 				current := cs.relayGeneration
@@ -577,6 +812,7 @@ func (cs *ControlServer) handleSetFdWithReceivedFd(ctx context.Context, fd int) 
 			OnKeepalive: func() {
 				cs.sendEvent("keepalive", "")
 			},
+			OnSessionEnd: cs.sessionEnded,
 		})
 	}
 
@@ -666,7 +902,7 @@ func (cs *ControlServer) handleDisconnect() ControlResponse {
 	cs.releaseTunLocked()
 
 	if cs.serverConn != nil {
-		cs.serverConn.Close()
+		_ = closeNow(cs.serverConn)
 		cs.serverConn = nil
 	}
 
@@ -742,7 +978,7 @@ func (cs *ControlServer) handleReconnect(ctx context.Context, reason string, new
 
 	// Close existing server connection (but keep TUN fd!)
 	if cs.serverConn != nil {
-		cs.serverConn.Close()
+		_ = closeNow(cs.serverConn)
 		cs.serverConn = nil
 	}
 
@@ -809,7 +1045,12 @@ func (cs *ControlServer) handleReconnect(ctx context.Context, reason string, new
 	opCtx, cancel := cs.opContext(ctx)
 	defer cancel()
 	if cs.config.ReconnectFn != nil {
-		res, err := cs.config.ReconnectFn(opCtx, cs.assignedIP, cs.mtu)
+		// A network change, always. The app (TiredVpnService.kt, checked at
+		// tiredvpn-android 60e5148) sends "network_changed" when the network
+		// moves and never sends "reconnect"; a host that sent "reconnect" for
+		// any other reason would wipe what the core learned about the servers
+		// (P3-6 of the round-5 review). It is accepted for older hosts.
+		res, err := cs.config.ReconnectFn(opCtx, cs.assignedIP, cs.mtu, true)
 		if err != nil {
 			log.Error("Reconnect failed: %v", err)
 			clearReconnecting()
@@ -884,7 +1125,7 @@ func (cs *ControlServer) handleReconnect(ctx context.Context, reason string, new
 	cs.relayStopCh = make(chan struct{})
 	cs.relayGeneration++
 	myRelayGen := cs.relayGeneration
-	cs.relay = startTUNRelay(cs.tunDev, cs.serverConn, cs.assignedIP, cs.serverIP, cs.relayStopCh, &RelayCallbacks{
+	cs.relay = cs.startRelay(cs.tunDev, cs.serverConn, cs.assignedIP, cs.serverIP, cs.relayStopCh, &RelayCallbacks{
 		OnError: func(reason string) {
 			cs.mu.Lock()
 			current := cs.relayGeneration
@@ -899,6 +1140,7 @@ func (cs *ControlServer) handleReconnect(ctx context.Context, reason string, new
 		OnKeepalive: func() {
 			cs.sendEvent("keepalive", "")
 		},
+		OnSessionEnd: cs.sessionEnded,
 	})
 
 	// Clear reconnecting flag - we're done, future events should be sent
@@ -1004,12 +1246,15 @@ const closeTeardownWait = 500 * time.Millisecond
 // frees (the command, seeing closed, installs nothing on the way out).
 func (cs *ControlServer) Close() error {
 	cs.closeOnce.Do(func() {
+		cs.readersMu.Lock()
 		cs.closed.Store(true)
+		cs.readersMu.Unlock()
 		if cs.lifeCancel != nil {
 			cs.lifeCancel()
 		}
 		cs.closeErr = cs.listener.Close()
 		cs.removeOwnSocket()
+		cs.drainReaders()
 
 		done := make(chan struct{})
 		go func() {
@@ -1160,6 +1405,9 @@ func (cs *ControlServer) doAutoReconnect(reason string) {
 	currentDelay := autoReconnectInitialDelay
 	consecutiveFailures := 0
 	lastNetworkCheck := time.Time{}
+	// networkChanged: the relay died on the network it was on until a wait
+	// for the network says otherwise (see ControlConfig.ReconnectFn).
+	networkChanged := false
 
 	for {
 		consecutiveFailures++
@@ -1179,6 +1427,7 @@ func (cs *ControlServer) doAutoReconnect(reason string) {
 		if consecutiveFailures%5 == 0 || time.Since(lastNetworkCheck) > 30*time.Second {
 			if !cs.checkNetworkConnectivity() {
 				log.Warn("No network connectivity, waiting...")
+				networkChanged = true
 
 				// Wait for network with periodic checks
 				if !cs.waitForNetwork(stopCh) {
@@ -1204,7 +1453,7 @@ func (cs *ControlServer) doAutoReconnect(reason string) {
 
 		// Try to reconnect using ReconnectFn or ConnectFn
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		success := cs.attemptReconnect(ctx)
+		success := cs.attemptReconnect(ctx, networkChanged)
 		cancel()
 
 		if success {
@@ -1239,7 +1488,7 @@ func (cs *ControlServer) doAutoReconnect(reason string) {
 }
 
 // attemptReconnect tries to reconnect using available methods
-func (cs *ControlServer) attemptReconnect(ctx context.Context) bool {
+func (cs *ControlServer) attemptReconnect(ctx context.Context, networkChanged bool) bool {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
@@ -1260,7 +1509,7 @@ func (cs *ControlServer) attemptReconnect(ctx context.Context) bool {
 
 	// Close existing server connection
 	if cs.serverConn != nil {
-		cs.serverConn.Close()
+		_ = closeNow(cs.serverConn)
 		cs.serverConn = nil
 	}
 
@@ -1274,7 +1523,7 @@ func (cs *ControlServer) attemptReconnect(ctx context.Context) bool {
 	// Prefer ReconnectFn (handles circuit breaker reset)
 	if cs.config.ReconnectFn != nil {
 		var res ReconnectResult
-		res, err = cs.config.ReconnectFn(ctx, cs.assignedIP, cs.mtu)
+		res, err = cs.config.ReconnectFn(ctx, cs.assignedIP, cs.mtu, networkChanged)
 		newConn, serverIP, assignedIP = res.Conn, res.ServerIP, res.AssignedIP
 		serverIP6, assignedIP6 = res.ServerIP6, res.AssignedIP6
 	} else if cs.config.ConnectFn != nil {
@@ -1322,7 +1571,7 @@ func (cs *ControlServer) attemptReconnect(ctx context.Context) bool {
 	cs.relayStopCh = make(chan struct{})
 	cs.relayGeneration++
 	myAutoGen := cs.relayGeneration
-	cs.relay = startTUNRelay(cs.tunDev, cs.serverConn, cs.assignedIP, cs.serverIP, cs.relayStopCh, &RelayCallbacks{
+	cs.relay = cs.startRelay(cs.tunDev, cs.serverConn, cs.assignedIP, cs.serverIP, cs.relayStopCh, &RelayCallbacks{
 		OnError: func(reason string) {
 			cs.mu.Lock()
 			current := cs.relayGeneration
@@ -1342,6 +1591,7 @@ func (cs *ControlServer) attemptReconnect(ctx context.Context) bool {
 		OnKeepalive: func() {
 			cs.sendEvent("keepalive", "")
 		},
+		OnSessionEnd: cs.sessionEnded,
 	})
 
 	log.Info("Auto-reconnect: TUN relay restarted (server IP: %s)", serverIP)
@@ -1350,6 +1600,9 @@ func (cs *ControlServer) attemptReconnect(ctx context.Context) bool {
 
 // checkNetworkConnectivity performs a quick TCP check
 func (cs *ControlServer) checkNetworkConnectivity() bool {
+	if cs.netCheck != nil {
+		return cs.netCheck()
+	}
 	// Shared with the reconnect loop. The probe must not enter the tunnel:
 	// 8.8.8.8 and 1.1.1.1 are routinely part of the installed TUN routes, so
 	// dials to them black-hole while the tunnel is down and read as "no
@@ -1435,7 +1688,7 @@ func (cs *ControlServer) performTUNHandshake(ctx context.Context) (assignedIP, s
 	// cancelled ctx closes the conn to end it. stop() reporting false means
 	// that already happened and the conn is gone.
 	conn := cs.serverConn
-	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	stop := context.AfterFunc(ctx, func() { _ = closeNow(conn) })
 	defer stop()
 
 	// Get MTU from config or use default
@@ -1459,7 +1712,7 @@ func (cs *ControlServer) performTUNHandshake(ctx context.Context) (assignedIP, s
 
 	log.Debug("Sending TUN handshake: mode=0x02, mtu=%d, version=0x%02x", mtu, version)
 	if _, err := cs.serverConn.Write(handshake); err != nil {
-		return nil, nil, fmt.Errorf("handshake write failed: %w", err)
+		return nil, nil, fmt.Errorf("handshake write failed: %w: %w", errHandshakeNotSent, err)
 	}
 
 	// Read the response for the version just sent. readHandshakeResponse reads
@@ -1467,9 +1720,12 @@ func (cs *ControlServer) performTUNHandshake(ctx context.Context) (assignedIP, s
 	// nothing past it, so the relay that follows starts frame-aligned; the conn
 	// it returns replaces cs.serverConn because it may carry the first byte of
 	// the first frame back to the relay.
-	resp, n, next, err := readHandshakeResponse(cs.serverConn, version, time.Now().Add(handshakeReadTimeout))
+	resp, n, next, err := readHandshakeResponse(cs.serverConn, version, time.Time{})
 	if !stop() {
-		return nil, nil, fmt.Errorf("handshake interrupted: %w", context.Cause(ctx))
+		// As on the reconnect: the cancellation carries what the handshake
+		// learned (P3-7 of the round-9 review).
+		return nil, nil, KeepHandshakeMark(
+			fmt.Errorf("handshake interrupted: %w", context.Cause(ctx)), err)
 	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("handshake read failed: %w", err)
@@ -1490,11 +1746,11 @@ func (cs *ControlServer) performTUNHandshake(ctx context.Context) (assignedIP, s
 	if resp[0] != 0x00 {
 		switch resp[0] {
 		case 0x01:
-			return nil, nil, fmt.Errorf("IP pool exhausted")
+			return nil, nil, fmt.Errorf("%w: IP pool exhausted", errHandshakeRefused)
 		case 0x02:
-			return nil, nil, fmt.Errorf("no IP pool configured")
+			return nil, nil, fmt.Errorf("%w: no IP pool configured", errHandshakeRefused)
 		default:
-			return nil, nil, fmt.Errorf("server error: %d", resp[0])
+			return nil, nil, HandshakeRefused(resp[0])
 		}
 	}
 
@@ -1520,4 +1776,26 @@ func (cs *ControlServer) performTUNHandshake(ctx context.Context) (assignedIP, s
 
 	log.Debug("TUN handshake successful: assigned=%s, server=%s", assignedIP, serverIP)
 	return assignedIP, serverIP, nil
+}
+
+// startRelay is startTUNRelay with the session's strategy named in the
+// callbacks, for the relay's stall detector (SessionStrategyFn).
+func (cs *ControlServer) startRelay(tunDev *TUNDevice, serverConn net.Conn, localIP, remoteIP net.IP, stopCh chan struct{}, cb *RelayCallbacks) *tunRelay {
+	cb.Strategy = cs.sessionStrategy()
+	return startTUNRelay(tunDev, serverConn, localIP, remoteIP, stopCh, cb)
+}
+
+// sessionStrategy is SessionStrategyFn's answer, nil when there is none.
+func (cs *ControlServer) sessionStrategy() strategy.Strategy {
+	if cs.config == nil || cs.config.SessionStrategyFn == nil {
+		return nil
+	}
+	return cs.config.SessionStrategyFn()
+}
+
+// sessionEnded hands the end of the relay's session to SessionEndedFn.
+func (cs *ControlServer) sessionEnded(end RelaySessionEnd) {
+	if cs.config != nil && cs.config.SessionEndedFn != nil {
+		cs.config.SessionEndedFn(end)
+	}
 }

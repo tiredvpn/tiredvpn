@@ -382,3 +382,44 @@ func TestProtectDialerDialContextCancelled(t *testing.T) {
 		t.Fatal("expected error dialing with a cancelled context")
 	}
 }
+
+// TestConnectedHookFiresBeforeProtect: the connect is up when the dial
+// returns. A protect round trip that takes its time (here 300 ms) must not
+// delay the hook, or the strategy manager's dial-limit cut could land on a
+// connected socket and count it as a SYN nobody answered.
+func TestConnectedHookFiresBeforeProtect(t *testing.T) {
+	resetProtector(t)
+	app := startFakeApp(t, true, func(a *fakeApp) { a.delay = 300 * time.Millisecond })
+	if err := InitAndroidProtector(app.path); err != nil {
+		t.Fatalf("InitAndroidProtector: %v", err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close()
+		}
+	}()
+
+	var hookAt time.Time
+	ctx := WithDialHooks(context.Background(), nil, func(net.Conn) { hookAt = time.Now() })
+	conn, err := (&ProtectDialer{}).DialContext(ctx, "tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("DialContext: %v", err)
+	}
+	conn.Close()
+	returned := time.Now()
+	if hookAt.IsZero() {
+		t.Fatal("the connected hook never ran")
+	}
+	if wait := returned.Sub(hookAt); wait < 200*time.Millisecond {
+		t.Fatalf("the hook ran %v before the dial returned: it waited for protect", wait)
+	}
+}

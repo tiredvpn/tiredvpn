@@ -202,7 +202,7 @@ func TestControlSwapKeepsSession(t *testing.T) {
 					h.attachExit(exit)
 					var nextExit atomic.Pointer[testExit]
 					h.cs.mu.Lock()
-					h.cs.config.ReconnectFn = func(_ context.Context, _ net.IP, _ int) (ReconnectResult, error) {
+					h.cs.config.ReconnectFn = func(_ context.Context, _ net.IP, _ int, _ bool) (ReconnectResult, error) {
 						e := h.newTestExit()
 						nextExit.Store(e)
 						return ReconnectResult{Conn: e.cli, ServerIP: net.IPv4(10, 9, 0, 1), AssignedIP: net.IPv4(10, 9, 0, 2)}, nil

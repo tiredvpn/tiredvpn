@@ -17,6 +17,10 @@ import (
 // routable, and it must stay in play - the fix excludes only the routeless
 // family, never the working one.
 func TestFamilyReachabilityPreflightExcludesNoRouteFamily(t *testing.T) {
+	// SetEndpoints hands back the process-wide selector for this pool: a
+	// second run (-count=2) got the first one's, with v6 already excluded.
+	endpoint.ResetSharedSelectors()
+	t.Cleanup(endpoint.ResetSharedSelectors)
 	m := NewManager()
 	eps := []endpoint.Endpoint{{Name: "srv", V6: "[2001:db8::1]:443", V4: "203.0.113.1:443"}}
 	if err := m.SetEndpoints(eps, endpoint.PreferV6); err != nil {
@@ -55,6 +59,8 @@ func TestFamilyReachabilityPreflightExcludesNoRouteFamily(t *testing.T) {
 // net.IP verdict (no port) is mapped onto the matching candidate address and
 // re-admitted when the route returns.
 func TestSetEndpointReachableIPMapsByHost(t *testing.T) {
+	endpoint.ResetSharedSelectors()
+	t.Cleanup(endpoint.ResetSharedSelectors)
 	m := NewManager()
 	eps := []endpoint.Endpoint{{Name: "srv", V6: "[2001:db8::1]:443", V4: "203.0.113.1:443"}}
 	if err := m.SetEndpoints(eps, endpoint.PreferV6); err != nil {

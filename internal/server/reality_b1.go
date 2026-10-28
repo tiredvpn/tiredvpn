@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,6 +33,12 @@ var (
 	// the shape the cover was meant to avoid, and nothing in the log says so.
 	realityDonorDialFailTotal atomic.Uint64
 
+	// realityFallbackTagTotal counts ClientHellos the gate let through to the
+	// ordinary TLS path on a valid fallback-transport tag: the TLS fallbacks
+	// (HTTP Polling, WebSocket, Geneva, anti-probe, Stego, Morph) of clients
+	// new enough to send one.
+	realityFallbackTagTotal atomic.Uint64
+
 	// realityReshapeCapableTotal counts authenticated B1 clients that advertised
 	// they can tolerate server-initiated reshaping. It is the number that says
 	// when the field has caught up enough for the server side to be switched on.
@@ -41,12 +49,17 @@ var (
 type realityB1Gate struct {
 	index  *shortIDIndex
 	replay *replayCache
+
+	// tagReplay remembers the fallback-transport tags already let through.
+	// Apart from replay, so the two schemes cannot evict each other's entries.
+	tagReplay *replayCache
 }
 
 func newREALITYB1Gate(maxTimeDiff int) *realityB1Gate {
 	return &realityB1Gate{
-		index:  newShortIDIndex(),
-		replay: newReplayCache(replayTTLFor(maxTimeDiff)),
+		index:     newShortIDIndex(),
+		replay:    newReplayCache(replayTTLFor(maxTimeDiff)),
+		tagReplay: newReplayCache(replayTTLFor(maxTimeDiff)),
 	}
 }
 
@@ -59,13 +72,12 @@ var (
 // per process, and the gate is keyed to that server's static key, so a
 // singleton is the honest shape; tests construct their own instead.
 func gateFor(srvCtx *serverContext) *realityB1Gate {
+	if srvCtx.b1Gate != nil {
+		return srvCtx.b1Gate
+	}
 	b1GateOnce.Do(func() {
 		b1Gate = newREALITYB1Gate(srvCtx.cfg.REALITYMaxTimeDiff)
-		var clients []*ClientConfig
-		if srvCtx.registry != nil {
-			clients = srvCtx.registry.ListClients()
-		}
-		b1Gate.index.Rebuild(clients, srvCtx.cfg.Secret)
+		b1Gate.index.rebuildFrom(srvCtx)
 	})
 	return b1Gate
 }
@@ -77,13 +89,14 @@ func gateFor(srvCtx *serverContext) *realityB1Gate {
 //
 // Return values carry a distinction worth stating plainly:
 //
-//   - false means "this is not a TLS ClientHello I can even parse". The
-//     dispatcher goes on to try the legacy detector and then plain TLS, so
-//     other protocols are not swallowed.
+//   - false means "this is not a TLS ClientHello I can even parse", or "it is
+//     one of our TLS fallback transports" (a valid fallback-transport tag in
+//     session_id), or a legacy client. The dispatcher goes on to try the legacy
+//     detector and then plain TLS, so other protocols are not swallowed.
 //   - true means the connection is spoken for, either because a client
 //     authenticated or because it did not and got the donor site instead.
-//     Everything that is a ClientHello ends here, which is the point: a prober
-//     must not be able to tell our server from the site it is impersonating.
+//     Every other ClientHello ends here, which is the point: a prober must not
+//     be able to tell our server from the site it is impersonating.
 //
 // B1.5 hooks in here. Its adaptive mirroring wants to open the donor
 // connection before the verdict for sources it has not seen, and this is the
@@ -134,6 +147,27 @@ func tryREALITYB1(conn net.Conn, peekBuf []byte, srvCtx *serverContext, logger *
 			logger.Debug("REALITY B1: no match (%s), deferring to the legacy transport", verdict.reason)
 			releaseDonor(donor)
 			return false
+		}
+
+		// Our own TLS fallback transports. They speak plain crypto/tls, so B1
+		// turns them down, and their SNI comes from the endpoint's pool - donor
+		// names by design - so the donor fallback below would hand them to a
+		// real site. A valid tag in session_id says the hello is ours: hand it
+		// back for the ordinary TLS path and its dispatch byte. Ahead of the
+		// cover domain too, which used to take every one of them. After the
+		// legacy check: crypto/tls never sends a padding extension, so a legacy
+		// hello is never a tagged one, and it no longer pays an HMAC per
+		// client for nothing (P3-1 of the round-5 review). Only with
+		// -reality-fallback-tag: off, a tagged hello is a stranger's like any
+		// other, and no HMAC is paid at all.
+		if srvCtx.cfg.REALITYFallbackTag {
+			if entry, ok := gate.fallbackTag(srvCtx, helloRaw, now); ok {
+				releaseDonor(donor)
+				reputation.remember(conn.RemoteAddr(), now)
+				realityFallbackTagTotal.Add(1)
+				logger.Debug("REALITY B1: fallback-transport tag accepted (client: %s), continuing as ordinary TLS", entry.clientID)
+				return false
+			}
 		}
 
 		// Every other rejection lands here, and they must be indistinguishable.
@@ -251,6 +285,27 @@ func (g *realityB1Gate) evaluate(srvCtx *serverContext, helloRaw []byte, now tim
 	return b1Verdict{ok: true, reason: reasonAuthenticated, entry: entry, flags: payload.Flags}, nil
 }
 
+// fallbackTag reports whether the hello's session_id is a fresh
+// fallback-transport tag of a known client.
+//
+// Fresh means made inside the clock-skew window and not seen before. A replay
+// of a captured hello fails here and goes to the donor like any stranger: the
+// tag is recorded only once it has opened, so garbage cannot fill the cache.
+func (g *realityB1Gate) fallbackTag(srvCtx *serverContext, helloRaw []byte, now time.Time) (shortIDEntry, bool) {
+	sid, err := customtls.SessionIDFrom(helloRaw)
+	if err != nil {
+		return shortIDEntry{}, false
+	}
+	entry, at, ok := g.index.MatchFallbackTag(sid)
+	if !ok || !withinSkew(at, now, srvCtx.cfg.REALITYMaxTimeDiff) {
+		return shortIDEntry{}, false
+	}
+	if !g.tagReplay.checkAndRecord(sid, now) {
+		return shortIDEntry{}, false
+	}
+	return entry, true
+}
+
 // refreshIndexIfNeeded rebuilds the short-ID index in the background when it is
 // stale, or when a lookup missed and the index has not been rebuilt recently.
 // A miss is the only signal available that a client was added, and the rate
@@ -258,6 +313,13 @@ func (g *realityB1Gate) evaluate(srvCtx *serverContext, helloRaw []byte, now tim
 func (g *realityB1Gate) refreshIndexIfNeeded(srvCtx *serverContext, verdict b1Verdict) {
 	switch {
 	case verdict.reason == reasonUnknownID:
+		g.index.refreshAsync(srvCtx, shortIDMissRefreshInterval)
+	case g.index.behind(srvCtx):
+		// A client added or changed in the registry: its fallback-transport
+		// tag opens with nothing in the index, and nothing about a tag miss
+		// says so - the miss looks like every stranger's. The periodic
+		// rebuild left a new client's TLS fallbacks at the donor for up to
+		// 30 s (P3-2 of the round-5 review); the registry's generation tells.
 		g.index.refreshAsync(srvCtx, shortIDMissRefreshInterval)
 	case g.index.stale(time.Now()):
 		g.index.refreshAsync(srvCtx, shortIDRefreshInterval)
@@ -362,7 +424,7 @@ func awaitDonor(donor <-chan donorHandoff, peekBuf []byte, srvCtx *serverContext
 		return h.conn, h.dest, h.err
 	}
 
-	dest := donorDestination(peekBuf, srvCtx.cfg.REALITYCoverDomain)
+	dest := donorDestination(peekBuf, srvCtx.cfg)
 	if dest == "" {
 		return nil, "", errNoDonor
 	}
@@ -384,24 +446,28 @@ func releaseDonor(donor <-chan donorHandoff) {
 	}()
 }
 
-// donorDestination applies the destination policy to a ClientHello.
-func donorDestination(peekBuf []byte, coverDomain string) string {
+// donorDestination applies the destination policy to a ClientHello: the SNI
+// if it is a donor we allow, else the cover domain.
+func donorDestination(peekBuf []byte, cfg *Config) string {
 	sni, err := ExtractSNI(peekBuf)
-	if err == nil && sniAllowlisted(sni) {
+	if err == nil && sniAllowlisted(sni, cfg.REALITYSNIs) {
 		return sni
 	}
-	return coverDomain
+	return cfg.REALITYCoverDomain
 }
 
 // sniAllowlisted reports whether a hostname is one of the donors we are willing
-// to open a connection to.
-func sniAllowlisted(sni string) bool {
+// to open a connection to: the built-in list, or one the operator added with
+// -reality-sni. Only those two - the name comes from an unauthenticated
+// ClientHello, and dialling whatever it says would make the exit an open
+// proxy.
+func sniAllowlisted(sni string, extra []string) bool {
 	for _, entry := range evasion.WhitelistedSNIs {
-		if entry.SNI == sni {
+		if strings.EqualFold(entry.SNI, sni) {
 			return true
 		}
 	}
-	return false
+	return slices.Contains(extra, strings.ToLower(sni))
 }
 
 // proxyBothWays copies in both directions until either side finishes, passing
@@ -453,6 +519,11 @@ func writeREALITYAuthMetrics(w io.Writer) {
 	fmt.Fprintf(w, "# HELP reality_reshape_capable_total Authenticated B1 clients that advertised tolerance for server-initiated reshaping\n")
 	fmt.Fprintf(w, "# TYPE reality_reshape_capable_total counter\n")
 	fmt.Fprintf(w, "reality_reshape_capable_total %d\n", realityReshapeCapableTotal.Load())
+	fmt.Fprintf(w, "\n")
+
+	fmt.Fprintf(w, "# HELP reality_fallback_tag_total TLS fallback-transport connections the B1 gate passed to the ordinary TLS path on a valid session_id tag\n")
+	fmt.Fprintf(w, "# TYPE reality_fallback_tag_total counter\n")
+	fmt.Fprintf(w, "reality_fallback_tag_total %d\n", realityFallbackTagTotal.Load())
 	fmt.Fprintf(w, "\n")
 
 	fmt.Fprintf(w, "# HELP reality_donor_dial_fail_total Unauthenticated connections that could not be handed to a donor because the dial failed\n")
