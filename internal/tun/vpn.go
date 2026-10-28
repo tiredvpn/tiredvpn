@@ -1633,34 +1633,73 @@ func closeNow(conn net.Conn) error {
 
 // gracefulCloseLimitNs bounds closeGracefully: 5.5 s, past the 5 s a
 // transport's own Close spends sending its queue (HTTP polling, the ICMP
-// tunnel), so a drain still going on its own is not cut. Atomic so tests
-// can scale it.
+// tunnel), so the drain of a conn with no wrapper is not cut. Atomic so
+// tests can scale it.
 var gracefulCloseLimitNs = func() *atomic.Int64 {
 	var v atomic.Int64
 	v.Store(int64(5500 * time.Millisecond))
 	return &v
 }()
 
+// wrappedCloseAllowanceNs is what closeGracefully adds for a conn behind
+// RTT masking: RTTMaskingConn.Close flushes its burst before the transport
+// under it starts its own 5 s drain, so a limit counted from the outer
+// Close cut a drain that was still going (P3-1 of the round-21 review). 5 s
+// for the flush, 10.5 s in all. Atomic so tests can scale it.
+var wrappedCloseAllowanceNs = func() *atomic.Int64 {
+	var v atomic.Int64
+	v.Store(int64(5 * time.Second))
+	return &v
+}()
+
+// gracefulCloseLimit is closeGracefully's limit for conn: more when a
+// wrapper runs work of its own before the transport's drain.
+func gracefulCloseLimit(conn net.Conn) time.Duration {
+	limit := time.Duration(gracefulCloseLimitNs.Load())
+	for {
+		switch c := conn.(type) {
+		case *replayConn:
+			conn = c.Conn
+		case *strategy.RTTMaskingConn:
+			return limit + time.Duration(wrappedCloseAllowanceNs.Load())
+		default:
+			return limit
+		}
+	}
+}
+
 // closeGracefully closes the old session of a hop, an upgrade or a return:
 // the graceful Close, so what it has queued still goes out, but within
-// gracefulCloseLimitNs. A Close still running then is aborted (closeNow).
-// The transports bound their own drain, but a wrapper could wait before it
+// gracefulCloseLimit. A Close still running then is aborted. The
+// transports bound their own drain, but a wrapper could wait before it
 // even started: RTTMaskingConn's flush waits on a Write blocked on a full
 // polling queue until the poll layer is declared dead, about 20 s. This
 // bounds every graceful close the client makes on a path it cares about,
 // whatever the conn underneath (#2 of the round-20 review).
+//
+// Before the abort the conn's deadline is set to now: a conn with no
+// CloseNow gets a second Close from closeNow, and one that writes its
+// close frame holding a lock with no deadline of its own - Salamander, the
+// QUIC conn - held that second Close on the lock until the write gave up
+// (P3-2 of the round-21 review). A close that reports bytes it could not
+// send is logged at Info: the abort, or the transport's own bound, cost
+// data.
 func closeGracefully(conn net.Conn) {
+	limit := gracefulCloseLimit(conn)
 	done := make(chan struct{})
 	go func() {
-		_ = conn.Close()
+		if err := conn.Close(); err != nil {
+			log.Info("Old session closed: %v", err)
+		}
 		close(done)
 	}()
-	t := time.NewTimer(time.Duration(gracefulCloseLimitNs.Load()))
+	t := time.NewTimer(limit)
 	defer t.Stop()
 	select {
 	case <-done:
 	case <-t.C:
-		log.Debug("Graceful close of the old session still running after %v, aborting it", time.Duration(gracefulCloseLimitNs.Load()))
+		log.Info("Graceful close of the old session still running after %v, aborting it", limit)
+		_ = conn.SetDeadline(time.Now())
 		_ = closeNow(conn)
 	}
 }
