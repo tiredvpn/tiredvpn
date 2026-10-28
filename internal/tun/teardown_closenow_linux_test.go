@@ -418,3 +418,73 @@ func TestAnUpgradeDoesNotWaitForTheOldSessionsDrain(t *testing.T) {
 		t.Fatal("the upgrade did not swap the connection - the test proves nothing")
 	}
 }
+
+func setWrappedCloseAllowance(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := wrappedCloseAllowanceNs.Swap(int64(d))
+	t.Cleanup(func() { wrappedCloseAllowanceNs.Store(old) })
+}
+
+// TestAGracefulCloseBehindRTTMaskingGetsTheFlushOnTop is P3-1 of the
+// round-21 review: behind RTT masking the transport's drain starts only
+// after the wrapper's flush, and a limit counted from the outer Close cut a
+// drain that was still going. The same 450 ms drain is left alone behind
+// the wrapper, where the limit has the flush allowance on top, and aborted
+// without it.
+func TestAGracefulCloseBehindRTTMaskingGetsTheFlushOnTop(t *testing.T) {
+	setGracefulCloseLimit(t, 300*time.Millisecond)
+	setWrappedCloseAllowance(t, 300*time.Millisecond)
+
+	wrapped := newHangingConn(t, 450*time.Millisecond)
+	closeGracefully(&replayConn{Conn: strategy.NewRTTMaskingConn(wrapped, strategy.DefaultRTTMaskingConfig())})
+	if wrapped.closed.Load() != 1 || wrapped.aborted.Load() != 0 {
+		t.Fatalf("behind RTT masking: Close %d, CloseNow %d - a live drain was cut", wrapped.closed.Load(), wrapped.aborted.Load())
+	}
+
+	bare := newHangingConn(t, 450*time.Millisecond)
+	closeGracefully(bare)
+	if bare.aborted.Load() != 1 {
+		t.Fatal("with no wrapper the 450 ms drain was not aborted at the 300 ms limit - the test proves nothing")
+	}
+}
+
+// lockedCloseConn has no CloseNow and writes its close frame holding a
+// lock with no deadline of its own, as Salamander and the QUIC conn do: a
+// second Close waits on the lock until the first one's write gives up -
+// here, until a deadline is set.
+type lockedCloseConn struct {
+	net.Conn
+	mu       sync.Mutex
+	deadline chan struct{}
+	once     sync.Once
+}
+
+func (c *lockedCloseConn) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	select {
+	case <-c.deadline:
+	case <-time.After(20 * time.Second):
+	}
+	return nil
+}
+
+func (c *lockedCloseConn) SetDeadline(time.Time) error {
+	c.once.Do(func() { close(c.deadline) })
+	return nil
+}
+
+// TestAGracefulCloseOfAConnWithNoAbortIsCutByItsDeadline is P3-2 of the
+// round-21 review: with no CloseNow, the watchdog's abort was a second
+// Close, held on the lock of the first.
+func TestAGracefulCloseOfAConnWithNoAbortIsCutByItsDeadline(t *testing.T) {
+	setGracefulCloseLimit(t, 300*time.Millisecond)
+	c := &lockedCloseConn{deadline: make(chan struct{})}
+	done := make(chan struct{})
+	go func() { closeGracefully(c); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the graceful close of a conn with no CloseNow is still running 3 s in, against a 300 ms limit")
+	}
+}
