@@ -34,8 +34,8 @@ Key design goals:
   path, or an unreachable server each get replaced without a restart.
 - **Stealth** - traffic patterns are morphed to resemble legitimate services
   (video streaming, CDN traffic, HTTPS browsing).
-- **Performance** - multiplexed connections via smux, QUIC transport, and
-  adaptive RTT masking minimize overhead.
+- **Performance** - multiplexed connections via smux and an optional QUIC
+  transport cut per-request handshake overhead.
 
 ---
 
@@ -43,7 +43,7 @@ Key design goals:
 
 - **20+ DPI bypass strategies** with automatic selection and mid-session fallback
 - **QUIC and TLS transports** with Salamander padding and SNI fragmentation
-- **REALITY protocol** - impersonates legitimate websites with near-perfect TLS fingerprints
+- **REALITY-style transport** - the handshake carries a real browser's TLS fingerprint (uTLS) toward a donor SNI; the opt-in B1 mode is a genuine TLS 1.3 handshake, the default path is not full TLS past the ClientHello (see [security model](docs/security.md))
 - **HTTP/2 steganography** - hides tunnel data inside real HTTP/2 frames
 - **Traffic morphing** - statistically matches traffic patterns of popular services
 - **Geneva engine** - country-specific packet manipulation rules (Russia, China, Iran, Turkey)
@@ -580,9 +580,9 @@ priority order; `-strategy <id>` pins one.
 
 | ID | Name | Description |
 |----|------|-------------|
-| `reality` | REALITY Protocol | Impersonates legitimate websites with authentic TLS fingerprints (first in the default order) |
+| `reality` | REALITY Protocol | Hides auth inside a uTLS browser-fingerprinted ClientHello toward a donor SNI. Default path is not full TLS past the handshake; B1 (`-reality-server-pubkey`) is a genuine TLS 1.3 handshake (first in the default order) |
 | `quic_salamander` | QUIC Salamander | QUIC over UDP with Salamander padding (opt-in: `-quic`) |
-| `quic` | QUIC Tunnel | QUIC transport with version spoofing, draft-29 to bypass TSPU (opt-in: `-quic`) |
+| `quic` | QUIC Tunnel | QUIC v1 transport with SNI fragmented across CRYPTO frames to bypass SNI-based blocking (opt-in: `-quic -quic-sni-frag`) |
 | `seqovl` | Seqovl (Sequence Overlap) | Prepends a secret-marked decoy TLS record before the REALITY ClientHello to desync stateful DPI reassembly (packet-level overlap on Linux via `-seqovl-packet`) |
 | `http2_stego` | HTTP/2 Steganography | Hides data inside HTTP/2 frames with NaiveProxy-style padding |
 | `websocket_padded` | WebSocket Salamander | WebSocket transport with Salamander obfuscation padding |
