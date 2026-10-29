@@ -457,7 +457,7 @@ tiredvpn client -server host:443 -secret <s> -benchmark-full
 tiredvpn client -server host:443 -secret <s> -benchmark-all
 ```
 
-Benchmark results show per-strategy latency, success rate, and throughput. Use these to choose the right `-strategy` for your network.
+Benchmark results show per-strategy latency, success rate, and throughput. Latency and success rate are the reliable signals for picking a `-strategy`. The throughput figure comes from `-benchmark-full` downloading a fixed 5 MiB file from a public Ubuntu mirror through the tunnel, so it also reflects the server's own path to that mirror and is not raw tunnel capacity.
 
 ### MONITORING
 
