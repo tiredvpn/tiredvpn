@@ -211,10 +211,6 @@ func TestClientServerAuthFlow(t *testing.T) {
 }
 
 func TestREALITYExtensionConstants(t *testing.T) {
-	if REALITYMagic != "REAL" {
-		t.Errorf("REALITYMagic = %q, want %q", REALITYMagic, "REAL")
-	}
-
 	expectedLen := 32 + 32 // pubkey + auth token (no magic, no version)
 	if REALITYExtensionLength != expectedLen {
 		t.Errorf("REALITYExtensionLength = %d, want %d", REALITYExtensionLength, expectedLen)

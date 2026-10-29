@@ -4,7 +4,6 @@ import (
 	"cmp"
 	"context"
 	"crypto/tls"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -3583,10 +3582,6 @@ type DefaultManagerConfig struct {
 	// QUIC SNI fragmentation for GFW bypass
 	QUICSNIFragEnabled bool // Enable SNI fragmentation in QUIC CRYPTO frames
 
-	// Post-Quantum crypto for REALITY
-	PQEnabled         bool   // Enable post-quantum crypto (ML-KEM-768 + ML-DSA-65)
-	PQServerKemPubB64 string // Server's Kyber768 public key in base64
-
 	// Android-specific optimizations
 	AndroidMode bool // Running on Android - use shorter timeouts, fewer retries, TCP-first
 
@@ -3990,14 +3985,6 @@ func registerTLSStrategies(m *Manager, cfg DefaultManagerConfig, hasServer, hasS
 		}
 	}
 	reality.SetRequireDataV2(cfg.REALITYRequireDataV2)
-	if cfg.PQEnabled && cfg.PQServerKemPubB64 != "" {
-		kemPub, err := base64.StdEncoding.DecodeString(cfg.PQServerKemPubB64)
-		if err == nil && len(kemPub) > 0 {
-			if err := reality.SetPostQuantum(kemPub); err != nil {
-				log.Warn("REALITY: PQ init failed, using classical: %v", err)
-			}
-		}
-	}
 	m.Register(reality)
 
 	m.Register(NewWebSocketPaddedStrategy(m, cfg.Secret))

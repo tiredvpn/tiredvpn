@@ -170,10 +170,6 @@ type Config struct {
 	// QUIC SNI fragmentation for GFW bypass
 	QUICSNIFragEnabled bool // Fragment SNI in QUIC CRYPTO frames
 
-	// Post-Quantum crypto
-	PQEnabled         bool   // Enable ML-KEM-768 + ML-DSA-65
-	PQServerKemPubB64 string // Server's Kyber768 public key in base64
-
 	// API/Metrics
 	APIAddr string // API/Metrics HTTP endpoint (e.g., :8080)
 
@@ -387,8 +383,6 @@ func buildManager(cfg *Config, secret string) (*strategy.Manager, error) {
 		ECHConfigList:          echConfigList,
 		ECHPublicName:          cfg.ECHPublicName,
 		QUICSNIFragEnabled:     cfg.QUICSNIFragEnabled,
-		PQEnabled:              cfg.PQEnabled,
-		PQServerKemPubB64:      cfg.PQServerKemPubB64,
 		AndroidMode:            cfg.AndroidMode || cfg.MacOSMode,
 		PortHopping:            portHoppingCfg,
 		Shaper:                 cfg.Shaper,
@@ -505,9 +499,6 @@ func logEnabledFeatures(cfg *Config, mgr *strategy.Manager) {
 	}
 	if cfg.QUICSNIFragEnabled {
 		log.Info("QUIC SNI fragmentation enabled (GFW bypass)")
-	}
-	if cfg.PQEnabled {
-		log.Info("Post-quantum crypto enabled (ML-KEM-768 + ML-DSA-65)")
 	}
 	if cfg.ServerAddrV6 != "" && cfg.PreferIPv6 {
 		log.Info("IPv6 transport enabled (IPv6=%s, IPv4=%s, fallback=%v)",

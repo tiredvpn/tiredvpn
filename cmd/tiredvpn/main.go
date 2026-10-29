@@ -395,10 +395,6 @@ ADVANCED EVASION:
         ECHConfigList in base64 (from server)
   -ech-public-name string
         Outer SNI visible to network when using ECH (default "cloudflare-ech.com")
-  -pq
-        Enable post-quantum crypto (ML-KEM-768 + ML-DSA-65)
-  -pq-server-key string
-        Server's Kyber768 public key in base64
   -rtt-masking
         Enable RTT masking (hides proxy timing signature)
   -rtt-profile string
@@ -762,10 +758,6 @@ func runClient(args []string) {
 
 	// QUIC SNI fragmentation for GFW bypass
 	fs.BoolVar(&cfg.QUICSNIFragEnabled, "quic-sni-frag", false, "Enable QUIC SNI fragmentation for GFW bypass")
-
-	// Post-Quantum crypto flags
-	fs.BoolVar(&cfg.PQEnabled, "pq", false, "Enable post-quantum crypto (ML-KEM-768 + ML-DSA-65)")
-	fs.StringVar(&cfg.PQServerKemPubB64, "pq-server-key", "", "Server's Kyber768 public key in base64")
 
 	pprofAddr := fs.String("pprof", "", "Enable pprof profiling on address (e.g., :6060)")
 

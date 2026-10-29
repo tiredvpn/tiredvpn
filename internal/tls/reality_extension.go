@@ -23,10 +23,6 @@ const (
 	// Padding extension type (RFC 7685) - used to hide REALITY data
 	PaddingExtensionType = 0x0015
 
-	// REALITYMagic is used only by the postquantum V2 path.
-	// V1 format contains no magic markers - just PubKey+AuthToken at a fixed offset.
-	REALITYMagic = "REAL"
-
 	REALITYExtensionLength = 32 + 32 // pubkey + auth token (no magic, no version)
 	MinPaddingSize         = 256     // minimum padding size for REALITY data + random
 
@@ -269,8 +265,8 @@ func ParseServerDataV2(secret []byte, clientPub, serverPub, clientSalt [32]byte,
 }
 
 // NewClientREALITYExtensionDataV2 is NewClientREALITYExtension plus the v2
-// data-layer signal. Unrelated to REALITYExtensionV2, which is the
-// post-quantum extension format in postquantum.go.
+// data-layer signal, carried in the extension's Extra block. This is a
+// data-layer marker, not a transport-crypto change.
 func NewClientREALITYExtensionDataV2(secret []byte, clientPrivKey, clientSalt [32]byte) (*REALITYExtension, error) {
 	ext, err := NewClientREALITYExtension(secret, clientPrivKey)
 	if err != nil {
