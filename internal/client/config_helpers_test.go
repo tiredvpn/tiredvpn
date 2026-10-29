@@ -10,31 +10,46 @@ import (
 	"github.com/tiredvpn/tiredvpn/internal/strategy"
 )
 
-// TestResolveSecret covers the precedence flag > env > insecure default. Every
-// tunnel derives its client ID from this value, so picking the wrong source
-// means the server rejects the client with "client not found".
+// TestResolveSecret covers the precedence flag > env and the fail-closed path
+// when neither is set. Every tunnel derives its client ID from this value, so
+// picking the wrong source means the server rejects the client with "client not
+// found"; falling back to a baked-in constant would mean no authentication at
+// all, so that case must refuse to start.
 func TestResolveSecret(t *testing.T) {
 	t.Run("flag wins over env", func(t *testing.T) {
 		t.Setenv("TIREDVPN_SECRET", "from-env")
-		if got := resolveSecret(&Config{Secret: "from-flag"}); got != "from-flag" {
+		got, err := resolveSecret(&Config{Secret: "from-flag"})
+		if err != nil {
+			t.Fatalf("resolveSecret: unexpected error %v", err)
+		}
+		if got != "from-flag" {
 			t.Fatalf("resolveSecret = %q, want from-flag", got)
 		}
 	})
 
 	t.Run("env used when flag empty", func(t *testing.T) {
 		t.Setenv("TIREDVPN_SECRET", "from-env")
-		if got := resolveSecret(&Config{}); got != "from-env" {
+		got, err := resolveSecret(&Config{})
+		if err != nil {
+			t.Fatalf("resolveSecret: unexpected error %v", err)
+		}
+		if got != "from-env" {
 			t.Fatalf("resolveSecret = %q, want from-env", got)
 		}
 	})
 
-	t.Run("falls back to the insecure default", func(t *testing.T) {
+	t.Run("no secret fails closed", func(t *testing.T) {
 		t.Setenv("TIREDVPN_SECRET", "")
-		// The default is deliberately fixed and logged as INSECURE; changing it
-		// silently would break every deployment that relies on it for a first
-		// connect.
-		if got := resolveSecret(&Config{}); got != "default-secret-change-me" {
-			t.Fatalf("resolveSecret = %q, want the insecure default", got)
+		// No flag, no env, and (in the real call order) reconcileSecrets left
+		// cfg.Secret empty only because no endpoint named one either. The old
+		// code sat on "default-secret-change-me" here; a security tool must
+		// refuse to start rather than authenticate with a public constant.
+		got, err := resolveSecret(&Config{})
+		if err == nil {
+			t.Fatalf("resolveSecret = %q, nil error; want a fail-closed error", got)
+		}
+		if got != "" {
+			t.Fatalf("resolveSecret returned %q alongside the error, want empty", got)
 		}
 	})
 }

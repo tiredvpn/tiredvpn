@@ -24,7 +24,10 @@ func RunWithContext(ctx context.Context, cfg *Config) error {
 	}
 
 	// Try environment variable for secret
-	secret := resolveSecret(cfg)
+	secret, err := resolveSecret(cfg)
+	if err != nil {
+		return err
+	}
 	cfg.Secret = secret
 
 	if cfg.Debug {

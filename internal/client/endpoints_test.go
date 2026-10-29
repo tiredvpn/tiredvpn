@@ -205,10 +205,10 @@ func TestResolveEndpoints_Secrets(t *testing.T) {
 			t.Fatalf("ResolveEndpoints: %v", err)
 		}
 		// The adopted default is never dialled with - every endpoint has its own
-		// - but it must not be empty, or resolveSecret substitutes the insecure
-		// placeholder and warns about a secret the operator did configure.
+		// - but it must not be empty, or resolveSecret would fail closed and
+		// refuse to start over a secret the operator did configure per server.
 		if cfg.Secret == "" {
-			t.Fatal("no default adopted: resolveSecret would fall back to the insecure placeholder")
+			t.Fatal("no default adopted: resolveSecret would fail closed despite per-server secrets")
 		}
 	})
 }

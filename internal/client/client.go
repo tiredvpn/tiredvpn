@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -208,7 +209,10 @@ func Run(cfg *Config) error {
 		return err
 	}
 
-	secret := resolveSecret(cfg)
+	secret, err := resolveSecret(cfg)
+	if err != nil {
+		return err
+	}
 
 	if cfg.Debug {
 		log.SetDebug(true)
@@ -287,17 +291,28 @@ func listStrategies(cfg *Config) error {
 	return nil
 }
 
-// resolveSecret returns the effective default secret: from cfg, env, or the
-// insecure placeholder. It is the key for every endpoint that does not carry one
-// of its own; endpoints that do are authenticated with theirs (see
-// reconcileSecrets and internal/strategy/secret.go).
-func resolveSecret(cfg *Config) string {
+// resolveSecret returns the effective default secret: from cfg or env. It is
+// the key for every endpoint that does not carry one of its own; endpoints that
+// do are authenticated with theirs (see reconcileSecrets and
+// internal/strategy/secret.go).
+//
+// Fail closed: there is no placeholder fallback. By the time this runs,
+// ResolveEndpoints/reconcileSecrets has already adopted a single shared endpoint
+// secret into cfg.Secret when every endpoint carried one, and has errored on a
+// mixed list that has no default. So an empty result here means no endpoint
+// named a secret and no -secret/TIREDVPN_SECRET default was set: every endpoint
+// would authenticate with a baked-in constant, which any client can reproduce -
+// no authentication at all. The old code logged a warning and sat on
+// "default-secret-change-me"; for a security tool that is a hole, so refuse to
+// start instead.
+func resolveSecret(cfg *Config) (string, error) {
 	s := defaultSecret(cfg)
 	if s == "" {
-		log.Warn("No secret provided - using default (INSECURE!)")
-		s = "default-secret-change-me"
+		return "", errors.New("no secret configured: every server would fall back to a baked-in " +
+			"placeholder that provides no authentication. Set -secret or TIREDVPN_SECRET, or give each " +
+			"server its own secret in the config")
 	}
-	return s
+	return s, nil
 }
 
 // applyAdaptiveDefaults fills zero-value adaptive config fields with sensible defaults.
