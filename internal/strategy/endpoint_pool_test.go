@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -54,16 +55,21 @@ func TestConnectWalksAPoolOfThree(t *testing.T) {
 // walking the whole list. The bound is on strategy scans, which is the
 // expensive step.
 func TestConnectBudgetsScansOverADeadPool(t *testing.T) {
-	var addrs []string
-	for range 4 {
-		l := newCountingListener(t)
-		l.stop()
-		addrs = append(addrs, l.addr)
+	// A pool of four endpoints that nothing answers, modelled with an injected
+	// dialer rather than closed loopback ports. The real-port version was flaky
+	// in CI: a port freed by the listener's stop() could be reused and answer
+	// (turning "every endpoint dark" into a live dial), and a refused dial pulled
+	// connectThroughRefusal into its refusal-retry backoff, so the walk's timing
+	// was the kernel's to decide. darkDial fails instantly and identically every
+	// time, which leaves only the thing under test: the budget cap on scans.
+	addrs := make([]string, 4)
+	for i := range addrs {
+		addrs[i] = fmt.Sprintf("192.0.2.%d:995", 10+i) // RFC 5737 TEST-NET-1, never dialled for real
 	}
 
 	clk := newEndpointClock()
-	m := newMultiEndpointManager(t, clk, endpoint.Config{FailureThreshold: 2}, addrs...)
-	strat := &targetStrategy{mgr: m, id: "s1", priority: 1}
+	m := newMultiEndpointManager(t, clk, endpoint.Config{FailureThreshold: 2, Dial: darkDial}, addrs...)
+	strat := &targetStrategy{mgr: m, id: "s1", priority: 1, dial: darkDial}
 	m.Register(strat)
 
 	if _, _, err := m.Connect(context.Background(), ""); err == nil {
