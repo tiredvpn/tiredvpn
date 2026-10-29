@@ -276,13 +276,11 @@ observer sees.
 
 ## Post-quantum cryptography
 
-Read this section before relying on `-pq`.
-
-**`-pq` and `-pq-server-key` do not affect the connection.** They construct
-ML-KEM-768 and ML-DSA-65 key material and store it on the strategy, and nothing
-in the handshake or data path reads it. The observable effects are a log line and
-a different string in the strategy description. Treat these flags as unfinished
-work, not as protection against harvest-now-decrypt-later.
+There used to be `-pq` and `-pq-server-key` flags. They constructed ML-KEM-768
+and ML-DSA-65 key material, stored it on the strategy, and nothing in the
+handshake or data path ever read it. The only observable effects were a log line
+and a different strategy description. They were removed because an inert flag that
+reads like protection is worse than no flag at all.
 
 What *is* real is the TLS key exchange group, and there the choice went the other
 way on purpose. The server's shared TLS listener offers X25519, P-256 and P-384,
@@ -386,8 +384,9 @@ Collected here so they are not spread across the document:
 1. The default REALITY path is not TLS after the ServerHello, and can fall back
    to an unauthenticated ChaCha20 record layer with no forward secrecy unless
    `-reality-require-data-v2` is set on both ends.
-2. `-pq` and `-pq-server-key` are inert. No post-quantum key exchange happens on
-   any path as a result of setting them.
+2. The old inert `-pq` / `-pq-server-key` flags were removed. The only
+   post-quantum key exchange is the per-donor X25519MLKEM768 hybrid in the outer
+   TLS, under the donor names that genuinely offer it.
 3. Post-quantum TLS groups are deliberately disabled on the shared listener, so
    the non-REALITY transports have no record-now-decrypt-later hedge.
 4. Auth tokens on the non-REALITY transports are replayable for about twenty

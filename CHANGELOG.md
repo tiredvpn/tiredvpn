@@ -5,6 +5,17 @@ All notable changes to TiredVPN are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Removed
+
+- **Client: the inert `-pq` / `-pq-server-key` flags.** They built ML-KEM-768
+  and ML-DSA-65 key material and stored it on the REALITY strategy, but the
+  handshake and data path never read it, so the connection was unchanged. The
+  only real post-quantum key exchange is the per-donor X25519MLKEM768 hybrid in
+  the outer TLS, under the donor names that genuinely offer it; it has no client
+  flag and is untouched. See the post-quantum section in docs/security.md.
+
 ## [1.11.9] - 2026-10-28
 
 ### Added

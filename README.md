@@ -58,7 +58,7 @@ Key design goals:
   blocked when the exit cannot carry it so it does not leak around the VPN
 - **Port hopping** with random, sequential, and Fibonacci strategies
 - **Encrypted Client Hello (ECH)** to hide SNI from DPI
-- **Post-quantum key material** (ML-KEM-768 / ML-DSA-65) - experimental; the `-pq` flag is currently inert and does not protect the connection yet (see [security model](docs/security.md))
+- **Post-quantum TLS** (X25519MLKEM768 hybrid) negotiated in the outer TLS, but only under the donor names that genuinely offer it - there is no separate client flag (see [security model](docs/security.md))
 - **Multi-hop routing** through chained servers
 - **TOML configuration** with CLI overrides (`-config`)
 - **Native packages** - `.deb`/`.rpm`, signed apt/yum repositories, one-line
@@ -359,7 +359,6 @@ Generate the B1 key pair with `tiredvpn reality-keygen`.
 | `-seqovl-packet` | `false` | Packet-level TCP sequence overlap for `seqovl` (Linux + CAP_NET_ADMIN) |
 | `-port-hop` | `false` | Enable port hopping |
 | `-ech` | `false` | Enable Encrypted Client Hello |
-| `-pq` | `false` | Experimental post-quantum key material (inert, does not affect the connection yet) |
 | `-rtt-masking` | `false` | Hide proxy timing signature |
 | `-shaper` | | Traffic shaper preset for the morph strategies |
 | `-prefer-ipv6` | `true` | Prefer IPv6 transport |

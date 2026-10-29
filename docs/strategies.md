@@ -98,9 +98,8 @@ authentication in the ClientHello. Two transports live behind one ID:
   static public key, so it is opt-in per deployment.
 
 `-tls-fingerprint` picks the uTLS browser profile (default `firefox`), fixed for
-the process lifetime on purpose. `-pq` plus `-pq-server-key` adds ML-KEM-768 /
-ML-DSA-65 on top of the classical exchange. `-reality-require-data-v2` refuses
-servers still on the v1 data layer instead of silently downgrading.
+the process lifetime on purpose. `-reality-require-data-v2` refuses servers still
+on the v1 data layer instead of silently downgrading.
 
 ### Seqovl (TCP sequence overlap) — `seqovl`
 

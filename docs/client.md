@@ -357,8 +357,6 @@ tiredvpn client \
 | `-ech` | `false` | Enable Encrypted Client Hello (hides SNI) |
 | `-ech-config` | | ECHConfigList in base64 (from server) |
 | `-ech-public-name` | `cloudflare-ech.com` | Outer SNI visible to network when using ECH |
-| `-pq` | `false` | Enable post-quantum crypto (ML-KEM-768 + ML-DSA-65) |
-| `-pq-server-key` | | Server's ML-KEM public key in base64 |
 | `-rtt-masking` | `false` | Enable RTT masking (hides proxy timing signature) |
 | `-rtt-profile` | `moscow-yandex` | RTT profile to emulate (see table below) |
 | `-reality-server-pubkey` | | Server's static REALITY public key, base64. Non-empty selects the B1 transport |
@@ -427,18 +425,6 @@ tiredvpn client \
   -secret <secret> \
   -ech \
   -ech-public-name cloudflare-ech.com
-```
-
-#### Post-quantum cryptography
-
-Enables ML-KEM-768 key encapsulation and ML-DSA-65 signatures for the REALITY handshake:
-
-```bash
-tiredvpn client \
-  -server your-server.com:443 \
-  -secret <secret> \
-  -pq \
-  -pq-server-key <base64-encoded-mlkem-pubkey>
 ```
 
 ### ADAPTIVE STRATEGY
@@ -556,7 +542,7 @@ which is what the bare `-strategy` default does.
 consumes it. It is listed rather than hidden so a config that sets it is not
 mistaken for a config that changes behaviour.
 
-The port-hopping, ECH, post-quantum, benchmarking and monitoring knobs have no
+The port-hopping, ECH, benchmarking and monitoring knobs have no
 TOML keys at all and stay command-line only. So do the TUN knobs, with two
 exceptions: `[tun] ipv6_allow` and `[tun] routes6`, which a pooled unit
 configured entirely from a file would otherwise have no way to set. `-tun-ipv6`
@@ -754,7 +740,6 @@ tiredvpn client \
   -quic \
   -quic-sni-frag \
   -ech \
-  -pq \
   -port-hop \
   -rtt-masking \
   -rtt-profile beijing-baidu \
@@ -784,7 +769,6 @@ tiredvpn client \
   -quic \
   -quic-sni-frag \
   -ech \
-  -pq \
   -port-hop \
   -rtt-masking \
   -rtt-profile moscow-yandex \

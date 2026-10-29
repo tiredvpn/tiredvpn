@@ -80,12 +80,6 @@ type REALITYStrategy struct {
 	// record. One per strategy, so a device with a drifting clock stops failing
 	// the server's time check after its first successful connection.
 	clockOffset customtls.ClockOffset
-
-	// Post-Quantum crypto (optional)
-	pqEnabled      bool
-	pqKeyExchange  *customtls.HybridKeyExchange
-	pqSignature    *customtls.QuantumSignature
-	serverPQKemPub []byte // Server's Kyber768 public key (for encapsulation)
 }
 
 // realityConn owns the full per-request stack: TCP connection → ChaCha20/TLS
@@ -212,59 +206,6 @@ func (r *REALITYStrategy) SetFingerprint(name string) {
 // data layer, instead of silently falling back to v1.
 func (r *REALITYStrategy) SetRequireDataV2(v bool) { r.requireDataV2 = v }
 
-// NewREALITYStrategyPQ creates a REALITY strategy with post-quantum crypto
-// manager is required for IPv6/IPv4 transport layer support
-func NewREALITYStrategyPQ(manager *Manager, secret []byte, serverKemPub []byte) (*REALITYStrategy, error) {
-	r := NewREALITYStrategy(manager, secret)
-
-	// Initialize PQ crypto
-	hybridKex, err := customtls.NewHybridKeyExchange()
-	if err != nil {
-		return nil, fmt.Errorf("reality pq: failed to init hybrid key exchange: %w", err)
-	}
-
-	quantumSig, err := customtls.NewQuantumSignature()
-	if err != nil {
-		return nil, fmt.Errorf("reality pq: failed to init quantum signature: %w", err)
-	}
-
-	r.pqEnabled = true
-	r.pqKeyExchange = hybridKex
-	r.pqSignature = quantumSig
-	r.serverPQKemPub = serverKemPub
-
-	return r, nil
-}
-
-// SetPostQuantum enables post-quantum crypto with server's KEM public key
-func (r *REALITYStrategy) SetPostQuantum(serverKemPub []byte) error {
-	hybridKex, err := customtls.NewHybridKeyExchange()
-	if err != nil {
-		return fmt.Errorf("failed to init hybrid key exchange: %w", err)
-	}
-
-	quantumSig, err := customtls.NewQuantumSignature()
-	if err != nil {
-		return fmt.Errorf("failed to init quantum signature: %w", err)
-	}
-
-	r.pqEnabled = true
-	r.pqKeyExchange = hybridKex
-	r.pqSignature = quantumSig
-	r.serverPQKemPub = serverKemPub
-
-	log.Debug("REALITY: Post-quantum crypto enabled (ML-KEM-768 + ML-DSA-65)")
-	return nil
-}
-
-// GetPostQuantumPublicKeys returns client's PQ public keys for server registration
-func (r *REALITYStrategy) GetPostQuantumPublicKeys() (kemPub, sigPub []byte) {
-	if !r.pqEnabled || r.pqKeyExchange == nil || r.pqSignature == nil {
-		return nil, nil
-	}
-	return r.pqKeyExchange.GetKyber768PublicKey(), r.pqSignature.GetDilithium3PublicKey()
-}
-
 // Name returns human-readable strategy name
 func (r *REALITYStrategy) Name() string {
 	return "REALITY Protocol"
@@ -292,9 +233,6 @@ func (r *REALITYStrategy) SupportsUDP() bool {
 
 // Description returns a human-readable description
 func (r *REALITYStrategy) Description() string {
-	if r.pqEnabled {
-		return "REALITY protocol with ML-KEM-768 + ML-DSA-65 post-quantum crypto (future-proof)"
-	}
 	return "REALITY protocol - impersonates legitimate websites (99.5% success rate)"
 }
 
