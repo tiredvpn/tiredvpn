@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -11,6 +12,22 @@ import (
 
 	"github.com/tiredvpn/tiredvpn/internal/endpoint"
 )
+
+// errDarkEndpoint is what darkDial returns for every address. It is a plain
+// dial failure rather than ECONNREFUSED on purpose: connectThroughRefusal only
+// runs its 250ms/500ms/1s retry backoff on a refused dial, so a dark endpoint
+// that is not "refused" fails the scan at once, with no wall-clock wait for a
+// test to race.
+var errDarkEndpoint = errors.New("test dialer: endpoint dark")
+
+// darkDial is an endpoint.DialFunc (and a targetStrategy dialer) that fails
+// instantly for any address. It models a pool where nothing answers without a
+// real socket, so a budget test does not depend on OS timing: the real-port
+// version was flaky in CI because a port freed by stop() could be reused and
+// answer, and because a refused dial pulled in the refusal-retry backoff.
+func darkDial(_ context.Context, network, _ string) (net.Conn, error) {
+	return nil, &net.OpError{Op: "dial", Net: network, Err: errDarkEndpoint}
+}
 
 // endpointClock is the selector's injected time source, so these tests drive
 // cooldowns and dwell windows without sleeping.
@@ -150,9 +167,22 @@ type targetStrategy struct {
 	id       string
 	priority int
 
+	// dial, when set, replaces the real net.Dialer in Probe and Connect. A pool
+	// test injects a deterministic dialer here; the live-listener tests leave it
+	// nil and dial for real.
+	dial func(ctx context.Context, network, addr string) (net.Conn, error)
+
 	mu       sync.Mutex
 	targets  []string
 	resolved []string
+}
+
+// dialTCP dials through the injected dialer when one is set, otherwise for real.
+func (s *targetStrategy) dialTCP(ctx context.Context, target string) (net.Conn, error) {
+	if s.dial != nil {
+		return s.dial(ctx, "tcp", target)
+	}
+	return (&net.Dialer{Timeout: time.Second}).DialContext(ctx, "tcp", target)
 }
 
 func (s *targetStrategy) Name() string         { return s.id }
@@ -182,7 +212,7 @@ func (s *targetStrategy) seenResolved() []string {
 
 func (s *targetStrategy) Probe(ctx context.Context, target string) error {
 	s.note(ctx, target)
-	conn, err := (&net.Dialer{Timeout: time.Second}).DialContext(ctx, "tcp", target)
+	conn, err := s.dialTCP(ctx, target)
 	if err != nil {
 		return err
 	}
@@ -192,7 +222,7 @@ func (s *targetStrategy) Probe(ctx context.Context, target string) error {
 
 func (s *targetStrategy) Connect(ctx context.Context, target string) (net.Conn, error) {
 	s.note(ctx, target)
-	return (&net.Dialer{Timeout: time.Second}).DialContext(ctx, "tcp", target)
+	return s.dialTCP(ctx, target)
 }
 
 // distinct returns the addresses in the order first seen.
