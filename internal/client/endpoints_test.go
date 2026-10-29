@@ -304,6 +304,65 @@ func TestSelectorConfig_RejectsUnknownPolicy(t *testing.T) {
 	}
 }
 
+// TestSelectorConfig_PolicyReachesSelector is the wiring guard: an explicit
+// selection.policy has to land in endpoint.Config.Selection, not be parsed and
+// dropped. It was dropped before - the field was never set, so the selector got
+// SelectPriority whatever the operator asked for. Break the mapping and this
+// goes red.
+func TestSelectorConfig_PolicyReachesSelector(t *testing.T) {
+	cases := []struct {
+		policy string
+		want   endpoint.SelectionPolicy
+	}{
+		{"latency", endpoint.SelectLatency},
+		{"weighted", endpoint.SelectWeighted},
+	}
+	for _, tc := range cases {
+		t.Run(tc.policy, func(t *testing.T) {
+			cfg := &Config{
+				ServerAddr: "203.0.113.10:443",
+				Selection:  SelectionSpec{Policy: tc.policy},
+			}
+			eps, err := ResolveEndpoints(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := selectorConfig(cfg, eps)
+			if err != nil {
+				t.Fatalf("selectorConfig: %v", err)
+			}
+			if got.Selection != tc.want {
+				t.Fatalf("selection = %s, want %s", got.Selection, tc.want)
+			}
+		})
+	}
+}
+
+// TestSelectorConfig_DefaultStaysPriority guards the opt-in contract: an unset
+// or "priority" policy must leave the selector on SelectPriority (its zero
+// value), so a config that says nothing dials exactly as it did before.
+func TestSelectorConfig_DefaultStaysPriority(t *testing.T) {
+	for _, policy := range []string{"", "priority"} {
+		t.Run("policy="+policy, func(t *testing.T) {
+			cfg := &Config{
+				ServerAddr: "203.0.113.10:443",
+				Selection:  SelectionSpec{Policy: policy},
+			}
+			eps, err := ResolveEndpoints(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := selectorConfig(cfg, eps)
+			if err != nil {
+				t.Fatalf("selectorConfig: %v", err)
+			}
+			if got.Selection != endpoint.SelectPriority {
+				t.Fatalf("selection = %s, want priority", got.Selection)
+			}
+		})
+	}
+}
+
 func TestAllServerAddrs(t *testing.T) {
 	cfg := &Config{Servers: []ServerSpec{
 		{Name: "ams", Addr: "203.0.113.10:443", AddrV6: "[2001:db8::10]:443"},
