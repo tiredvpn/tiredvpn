@@ -210,10 +210,17 @@ func selectorConfig(cfg *Config, eps []endpoint.Endpoint) (endpoint.Config, erro
 	if err != nil {
 		return endpoint.Config{}, err
 	}
+	// validateSelection already rejected any spelling ParseSelectionPolicy
+	// would, so the error here is belt-and-braces: the two must not disagree.
+	policy, err := endpoint.ParseSelectionPolicy(cfg.Selection.Policy)
+	if err != nil {
+		return endpoint.Config{}, err
+	}
 	warnUnappliedSelection(cfg, eps)
 	return endpoint.Config{
 		Endpoints:        eps,
 		Family:           family,
+		Selection:        policy,
 		FailureThreshold: cfg.Selection.FailureThreshold,
 		Cooldown:         cfg.Selection.Cooldown,
 		MaxCooldown:      cfg.Selection.MaxCooldown,
@@ -289,13 +296,11 @@ func resolveFamilyPolicy(cfg *Config) (endpoint.FamilyPolicy, error) {
 // warnUnappliedSelection says out loud which configured knobs the runtime does
 // not act on yet. Accepting a key and ignoring it is how a client ends up
 // dialling in a way its operator did not ask for and cannot see.
+//
+// The policy itself (priority/latency/weighted) is wired now, so it is no
+// longer warned about; health_check=active and recheck_interval remain
+// unimplemented and still are.
 func warnUnappliedSelection(cfg *Config, eps []endpoint.Endpoint) {
-	switch cfg.Selection.Policy {
-	case "", "priority":
-	default:
-		log.Warn("selection.policy=%q is not implemented yet; candidates stay in configuration order",
-			cfg.Selection.Policy)
-	}
 	if cfg.Selection.HealthCheck == "active" {
 		log.Warn("selection.health_check=active is not implemented yet; " +
 			"the client only learns about a server by dialling it")
