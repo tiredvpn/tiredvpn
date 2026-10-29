@@ -190,6 +190,44 @@ can still pose as the server to a morph, WebSocket-padded or HTTP polling
 client, answer with the expected byte or status, and receive whatever that
 client sends into the tunnel. If that is in your threat model, use B1.
 
+### Camouflage-only transports
+
+A transport is **camouflage-only** when it does not authenticate the server to
+the client in a way that survives an active man-in-the-middle: either the server
+sends nothing a MITM could not fake, or its proof is not bound to the session
+and can be replayed. For these, the outer TLS is the only confidentiality layer
+and it is unauthenticated, so an attacker who terminates the connection in the
+path can pose as the exit and read whatever the client tunnels in. They defeat
+blocking; they are not a defence against a targeted interceptor. The client
+logs a one-line warning the first time it rides one, and `-benchmark` flags them
+in its report. Application HTTPS inside the tunnel is a separate layer and is
+unaffected.
+
+The classification lives in one place in the code,
+`internal/strategy/camouflage.go` (`IsCamouflageOnly`), which is what the
+warning and the benchmark read.
+
+| Transport | Server-authenticated? | What proves (or does not prove) the server |
+|---|---|---|
+| `reality`, `seqovl` | yes | HMAC(secret, clientPubKey ‖ "reality-server-ack") in the ServerHello padding, bound to a fresh per-connection key, verified before data |
+| `reality_b1` | yes | real TLS 1.3: HMAC in `VerifyPeerCertificate` plus an exporter binding |
+| `antiprobe` | yes | HMAC over the TLS session exporter |
+| `quic`, `quic_salamander` | yes | server marker keyed to the secret and the client's fresh nonce |
+| `ssh_camouflage` | yes | server auth token over the SSH session id, distinct direction context |
+| `confusion_*`, `state_exhaustion` | yes | server marker keyed to (secret, fresh nonce) plus a ChaCha20-Poly1305 data layer |
+| `icmp_tunnel` | yes | ChaCha20-Poly1305 with per-session keys from the secret; only the secret holder can produce openable packets |
+| `http2_stego` | **no (camouflage-only)** | server ack is HMAC(secret, server-chosen nonce), not bound to the TLS session - replayable by an on-path attacker who captured one ack |
+| `morph_*` | **no (camouflage-only)** | server sends a single 0x00 ack any peer can send |
+| `websocket_padded` | **no (camouflage-only)** | server sends an HTTP 101 only |
+| `geneva_*` | **no (camouflage-only)** | rides WebSocket-padded; server sends an HTTP 101 only |
+| `http_polling` | **no (camouflage-only)** | server replies with a plain OK |
+| `mesh_relay` | **no (camouflage-only)** | relay answers a 1-byte 0x01; no keyed relay-to-client proof |
+| `imap_camouflage` | **no (camouflage-only)** | SASL CRAM-MD5 authenticates client to server only; server returns a plain tagged OK |
+
+`http2_stego` is the near miss: a MITM cannot forge the ack without the secret,
+but because the ack is not tied to the TLS session it can be replayed, so it
+does not survive an active MITM and is classified camouflage-only.
+
 ### QUIC and Salamander
 
 QUIC connections carry their own TLS 1.3 (RFC 9001); that is where the

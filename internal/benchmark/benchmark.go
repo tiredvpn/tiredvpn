@@ -34,6 +34,11 @@ type StrategyResult struct {
 	Duration   time.Duration
 	Error      string
 
+	// CamouflageOnly is true when this transport does not authenticate the
+	// server to the client (see strategy.IsCamouflageOnly). Speed and latency
+	// do not capture this, so the report flags it separately.
+	CamouflageOnly bool
+
 	// Extended test results
 	HTTPCheck     bool          `json:"http_check"`
 	ExitIP        string        `json:"exit_ip"`
@@ -54,11 +59,12 @@ type BenchmarkResult struct {
 
 // JSONStrategyResult is the JSON-serializable form of a single strategy probe result.
 type JSONStrategyResult struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Status    string `json:"status"` // "ok", "blocked", "timeout"
-	LatencyMS *int64 `json:"latency_ms"`
-	Error     string `json:"error,omitempty"`
+	ID             string `json:"id"`
+	Name           string `json:"name"`
+	Status         string `json:"status"` // "ok", "blocked", "timeout"
+	LatencyMS      *int64 `json:"latency_ms"`
+	Error          string `json:"error,omitempty"`
+	CamouflageOnly bool   `json:"camouflage_only,omitzero"` // no server authentication
 }
 
 // JSONSummary aggregates counts across all strategies.
@@ -106,10 +112,11 @@ func ToJSONReport(r *BenchmarkResult, serverAddr, version string) JSONReport {
 	for _, sr := range r.Strategies {
 		status := strategyStatus(sr)
 		jsr := JSONStrategyResult{
-			ID:     sr.ID,
-			Name:   sr.Name,
-			Status: status,
-			Error:  sr.Error,
+			ID:             sr.ID,
+			Name:           sr.Name,
+			Status:         status,
+			Error:          sr.Error,
+			CamouflageOnly: sr.CamouflageOnly,
 		}
 		if sr.Available {
 			ms := sr.Latency.Milliseconds()
@@ -137,8 +144,9 @@ func ToJSONReport(r *BenchmarkResult, serverAddr, version string) JSONReport {
 
 func testStrategy(ctx context.Context, strat strategy.Strategy, serverAddr string, testSpeed bool) StrategyResult {
 	sr := StrategyResult{
-		ID:   strat.ID(),
-		Name: strat.Name(),
+		ID:             strat.ID(),
+		Name:           strat.Name(),
+		CamouflageOnly: strategy.IsCamouflageOnly(strat.ID()),
 	}
 
 	// Test latency with probe
@@ -357,6 +365,22 @@ func FormatResults(r *BenchmarkResult, showSpeed bool) string {
 	}
 
 	sb.WriteString("╚══════════════════════════════════════════════════════════════════════╝\n")
+
+	// Camouflage-only transports have no column in the box above, and ranking by
+	// latency/speed would quietly float them to the top. Name them once, plainly:
+	// they do not authenticate the server, so an active MITM can impersonate the
+	// exit. Blocking evasion, not protection against a targeted interceptor.
+	var camo []string
+	for _, sr := range sorted {
+		if sr.CamouflageOnly {
+			camo = append(camo, sr.Name)
+		}
+	}
+	if len(camo) > 0 {
+		fmt.Fprintf(&sb, "\nCamouflage-only (no server authentication; an active MITM can impersonate the exit): %s\n",
+			strings.Join(camo, ", "))
+		sb.WriteString("These defeat blocking, not a targeted interceptor. For that threat model use REALITY B1 (-reality-b1).\n")
+	}
 
 	return sb.String()
 }
@@ -644,8 +668,9 @@ func RunFullBenchmarkDirect(ctx context.Context, mgr *strategy.Manager, serverAd
 
 func testStrategyDirect(ctx context.Context, strat strategy.Strategy, serverAddr string, originalIP string) StrategyResult {
 	sr := StrategyResult{
-		ID:   strat.ID(),
-		Name: strat.Name(),
+		ID:             strat.ID(),
+		Name:           strat.Name(),
+		CamouflageOnly: strategy.IsCamouflageOnly(strat.ID()),
 	}
 
 	// Test 1: Connect and measure latency

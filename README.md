@@ -561,24 +561,33 @@ best transport. Each strategy targets a different aspect of DPI evasion.
 `tiredvpn client -list` prints the ones registered for your current flags, in
 priority order; `-strategy <id>` pins one.
 
-| ID | Name | Description |
-|----|------|-------------|
-| `reality` | REALITY Protocol | Hides auth inside a uTLS browser-fingerprinted ClientHello toward a donor SNI. Default path is not full TLS past the handshake; B1 (`-reality-server-pubkey`) is a genuine TLS 1.3 handshake (first in the default order) |
-| `quic_salamander` | QUIC Salamander | QUIC over UDP with Salamander padding (opt-in: `-quic`) |
-| `quic` | QUIC Tunnel | QUIC v1 transport with SNI fragmented across CRYPTO frames to bypass SNI-based blocking (opt-in: `-quic -quic-sni-frag`) |
-| `seqovl` | Seqovl (Sequence Overlap) | Prepends a secret-marked decoy TLS record before the REALITY ClientHello to desync stateful DPI reassembly (packet-level overlap on Linux via `-seqovl-packet`) |
-| `http2_stego` | HTTP/2 Steganography | Hides data inside HTTP/2 frames with NaiveProxy-style padding |
-| `websocket_padded` | WebSocket Salamander | WebSocket transport with Salamander obfuscation padding |
-| `http_polling` | HTTP Polling | Short-lived HTTP/1.1 requests (meek-style), evades long-connection detection |
-| `morph_*` | Traffic Morphing | Reshapes traffic to match video streaming profiles (Yandex, VK, Baidu, Aparat) |
-| `confusion_*` | Protocol Confusion | Makes packets appear as DNS/HTTP/SSH/SMTP over TLS, plus a multi-layer variant |
-| `geneva_*` | Geneva Engine | Country-specific packet manipulation. Registered by default: `geneva_russia`, `geneva_china`, `geneva_iran`. Turkey rules exist in the engine but are not registered as a strategy. |
-| `antiprobe` | Anti-Probe | Server masquerades as normal website; reveals tunnel only to authenticated clients |
-| `state_exhaustion` | State Exhaustion | Floods DPI state table with decoys to trigger fail-open mode |
-| `mesh_relay` | Mesh Relay | Routes through relay nodes in regions with lighter filtering (opt-in, needs relay nodes configured) |
-| `icmp_tunnel` | ICMP Tunnel | Backup tunnel over ICMP Echo (opt-in: `-icmp-tunnel`, requires CAP_NET_RAW and a server started with `-enable-icmp`) |
-| `ssh_camouflage` | SSH Camouflage | Tunnel under SSH traffic (priority 28, requires server support) |
-| `imap_camouflage` | IMAP Camouflage | Tunnel under IMAP mail protocol (priority 29, requires server support) |
+The **Server auth** column says whether the transport authenticates the server
+to the client. `no` marks a *camouflage-only* transport: it dials with
+`InsecureSkipVerify` and the server proves nothing an active man-in-the-middle
+could not fake, so a MITM that terminates the connection in the path can pose as
+the exit and read what you tunnel into it. These defeat blocking, not a targeted
+interceptor; for that threat model use REALITY B1 (`-reality-b1`). Application
+HTTPS inside the tunnel is a separate layer and still protects you. See the
+[security model](docs/security.md).
+
+| ID | Name | Server auth | Description |
+|----|------|-------------|-------------|
+| `reality` | REALITY Protocol | yes | Hides auth inside a uTLS browser-fingerprinted ClientHello toward a donor SNI. Default path is not full TLS past the handshake, but the server proves itself with a secret-keyed ack bound to the client's fresh key; B1 (`-reality-server-pubkey`) is a genuine TLS 1.3 handshake (first in the default order) |
+| `quic_salamander` | QUIC Salamander | yes | QUIC over UDP with Salamander padding (opt-in: `-quic`) |
+| `quic` | QUIC Tunnel | yes | QUIC v1 transport with SNI fragmented across CRYPTO frames to bypass SNI-based blocking (opt-in: `-quic -quic-sni-frag`) |
+| `seqovl` | Seqovl (Sequence Overlap) | yes | Prepends a secret-marked decoy TLS record before the REALITY ClientHello to desync stateful DPI reassembly (packet-level overlap on Linux via `-seqovl-packet`); server auth inherited from REALITY |
+| `http2_stego` | HTTP/2 Steganography | no | Hides data inside HTTP/2 frames with NaiveProxy-style padding. Server ack is secret-keyed but not bound to the TLS session, so a captured ack can be replayed - camouflage-only |
+| `websocket_padded` | WebSocket Salamander | no | WebSocket transport with Salamander obfuscation padding. Server replies with an HTTP 101 only - camouflage-only |
+| `http_polling` | HTTP Polling | no | Short-lived HTTP/1.1 requests (meek-style), evades long-connection detection. Server replies with a plain OK - camouflage-only |
+| `morph_*` | Traffic Morphing | no | Reshapes traffic to match video streaming profiles (Yandex, VK, Baidu, Aparat). Server replies with a 1-byte ack - camouflage-only |
+| `confusion_*` | Protocol Confusion | yes | Makes packets appear as DNS/HTTP/SSH/SMTP over TLS, plus a multi-layer variant; server marker keyed to the secret and a fresh nonce |
+| `geneva_*` | Geneva Engine | no | Country-specific packet manipulation over WebSocket-padded. Registered by default: `geneva_russia`, `geneva_china`, `geneva_iran`. Turkey rules exist in the engine but are not registered as a strategy. Camouflage-only |
+| `antiprobe` | Anti-Probe | yes | Server masquerades as normal website; reveals tunnel only to authenticated clients, and answers with an HMAC over the TLS session exporter |
+| `state_exhaustion` | State Exhaustion | yes | Floods DPI state table with decoys to trigger fail-open mode; rides the Confusion transport |
+| `mesh_relay` | Mesh Relay | no | Routes through relay nodes in regions with lighter filtering (opt-in, needs relay nodes configured). The relay does not prove itself to the client - camouflage-only |
+| `icmp_tunnel` | ICMP Tunnel | yes | Backup tunnel over ICMP Echo (opt-in: `-icmp-tunnel`, requires CAP_NET_RAW and a server started with `-enable-icmp`); ChaCha20-Poly1305 with per-session keys from the secret |
+| `ssh_camouflage` | SSH Camouflage | yes | Tunnel under SSH traffic (priority 28, requires server support); server auth token over the SSH session id |
+| `imap_camouflage` | IMAP Camouflage | no | Tunnel under IMAP mail protocol (priority 29, requires server support). SASL CRAM-MD5 authenticates client to server only - camouflage-only |
 
 The strategy engine supports:
 
