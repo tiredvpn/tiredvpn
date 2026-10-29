@@ -80,6 +80,32 @@ To see all available strategy IDs:
 tiredvpn client -list
 ```
 
+#### Camouflage-only transports
+
+Some transports do not authenticate the server to the client. They dial with
+`InsecureSkipVerify` and the server proves nothing an active man-in-the-middle
+could not fake, so a MITM that terminates the connection in the path can pose as
+the exit and read what you tunnel in. These transports are **camouflage-only**:
+
+- `morph_*`, `websocket_padded`, `http_polling`, `geneva_*`, `mesh_relay`,
+  `imap_camouflage`, and `http2_stego` (whose server ack is replayable).
+
+They defeat blocking, not a targeted interceptor. The client logs a one-line
+warning the first time it rides one, whether it was auto-selected, forced with
+`-strategy`, or surfaced by `-benchmark`. The table in `-benchmark` flags them
+too.
+
+Do not pin one of these with `-strategy` when your threat model includes an
+active interceptor between you and the exit (a hostile network that can
+terminate TLS, not just a censor that blocks). For that case use REALITY B1
+(`-reality-b1` / `-reality-server-pubkey`), which authenticates the server with
+a real TLS 1.3 handshake. Everything else - `reality`, `seqovl`, `quic`,
+`quic_salamander`, `antiprobe`, `confusion_*`, `state_exhaustion`,
+`ssh_camouflage`, `icmp_tunnel` - already authenticates the server with a
+secret-keyed proof bound to the session. Application HTTPS inside the tunnel is
+a separate layer and protects you regardless. See
+[the security model](security.md) for the full breakdown.
+
 ### TRANSPORT FAMILY AND SERVER SELECTION
 
 | Flag | Default | Description |

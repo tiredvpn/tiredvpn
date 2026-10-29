@@ -111,6 +111,12 @@ type Manager struct {
 	// In forced mode storms are logged loudly but never trigger a switch.
 	forced bool
 
+	// camouflage-only warning dedup: warn once per transport id that it does
+	// not authenticate the server, not on every reconnect. Its own mutex so it
+	// is safe to call while m.mu is held or not. See warnCamouflageOnly.
+	camoWarnMu sync.Mutex
+	camoWarned map[string]bool
+
 	// Periodic re-probe. There is deliberately no cached target here: the
 	// reprobe must follow whichever candidate is pinned right now, and a copy
 	// written once at start-up cannot. All four consumers call GetServerAddr.
@@ -1156,7 +1162,41 @@ func (m *Manager) ForceStrategy(idPrefix string) error {
 	m.strategies = matched
 	m.forced = true
 	log.Info("Forced %d strategies matching '%s'", len(matched), idPrefix)
+	for _, s := range matched {
+		m.warnCamouflageOnly(s)
+	}
 	return nil
+}
+
+// warnCamouflageOnly emits one warning the first time a camouflage-only
+// transport is chosen to carry the tunnel - on an explicit -strategy, on the
+// scan that settles on it, or when a benchmark surfaces it. It fires once per
+// transport id for the life of the manager, so a reconnect that keeps riding
+// the same transport does not repeat it. A server-authenticated transport is a
+// no-op here.
+func (m *Manager) warnCamouflageOnly(s Strategy) {
+	if s == nil {
+		return
+	}
+	reason, ok := camouflageOnlyReason(s.ID())
+	if !ok {
+		return
+	}
+
+	m.camoWarnMu.Lock()
+	if m.camoWarned == nil {
+		m.camoWarned = make(map[string]bool)
+	}
+	if m.camoWarned[s.ID()] {
+		m.camoWarnMu.Unlock()
+		return
+	}
+	m.camoWarned[s.ID()] = true
+	m.camoWarnMu.Unlock()
+
+	log.Warn("transport %q is camouflage-only: it does not authenticate the server (InsecureSkipVerify); "+
+		"an active MITM can impersonate the exit. Do not send plaintext you would not send over open Wi-Fi - %s",
+		s.ID(), reason)
 }
 
 // IsForced reports whether a strategy was explicitly forced via ForceStrategy.
@@ -1749,6 +1789,7 @@ func (m *Manager) ConnectSession(ctx context.Context, target string) (net.Conn, 
 	// peek-buffer + admission slot) until probeReadDeadline, and under a busy
 	// client the accumulation outpaces reclamation -> server OOM.
 	if stream, strat, ok := m.tryMuxFastPath(); ok {
+		m.warnCamouflageOnly(strat)
 		return stream, strat, endpoint.Candidate{}, false, nil
 	}
 
@@ -1758,6 +1799,9 @@ func (m *Manager) ConnectSession(ctx context.Context, target string) (net.Conn, 
 		return nil, nil, endpoint.Candidate{}, false, err
 	}
 	m.recordConnectResult(true)
+	// The transport that just carried the connection is now the live carrier.
+	// Warn once if it does not authenticate the server (dedup inside).
+	m.warnCamouflageOnly(strategy)
 
 	// Wrap with mux if enabled (BEFORE RTT masking in the chain)
 	// Architecture: [Application] -> [RTT Camouflage] -> [Mux Layer] -> [Transport]
