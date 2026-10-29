@@ -58,7 +58,7 @@ Key design goals:
   blocked when the exit cannot carry it so it does not leak around the VPN
 - **Port hopping** with random, sequential, and Fibonacci strategies
 - **Encrypted Client Hello (ECH)** to hide SNI from DPI
-- **Post-quantum cryptography** (ML-KEM-768 + ML-DSA-65)
+- **Post-quantum key material** (ML-KEM-768 / ML-DSA-65) - experimental; the `-pq` flag is currently inert and does not protect the connection yet (see [security model](docs/security.md))
 - **Multi-hop routing** through chained servers
 - **TOML configuration** with CLI overrides (`-config`)
 - **Native packages** - `.deb`/`.rpm`, signed apt/yum repositories, one-line
@@ -68,23 +68,6 @@ Key design goals:
 - **Docker and Helm** - multi-arch images and a chart on ghcr.io
 - **Client management** with Redis backend and REST API
 - **QR code generation** for mobile client provisioning
-
----
-
-## How TiredVPN Compares
-
-| Feature | TiredVPN | Xray/VLESS | sing-box | Outline |
-|---------|----------|------------|----------|---------|
-| Bypass strategies | 20+ | 3–5 | 5–8 | 1–2 |
-| Adaptive fallback | ✅ Mid-session | ❌ | Partial | ❌ |
-| TSPU research | [Daily reports](https://github.com/tiredvpn/tiredvpn-measurements) | ❌ | ❌ | ❌ |
-| Post-quantum crypto | ✅ ML-KEM-768 | ❌ | ❌ | ❌ |
-| Geneva engine | ✅ | ❌ | ❌ | ❌ |
-| RTT masking | ✅ | ❌ | ❌ | ❌ |
-| ICMP fallback | ✅ | ❌ | ❌ | ❌ |
-| Traffic morphing | ✅ | ❌ | ❌ | ❌ |
-| Android app | ✅ Native | Third-party | Third-party | ✅ |
-| License | AGPL-3.0 | MPL-2.0 | GPL-3.0 | Apache-2.0 |
 
 ---
 
@@ -376,7 +359,7 @@ Generate the B1 key pair with `tiredvpn reality-keygen`.
 | `-seqovl-packet` | `false` | Packet-level TCP sequence overlap for `seqovl` (Linux + CAP_NET_ADMIN) |
 | `-port-hop` | `false` | Enable port hopping |
 | `-ech` | `false` | Enable Encrypted Client Hello |
-| `-pq` | `false` | Enable post-quantum crypto |
+| `-pq` | `false` | Experimental post-quantum key material (inert, does not affect the connection yet) |
 | `-rtt-masking` | `false` | Hide proxy timing signature |
 | `-shaper` | | Traffic shaper preset for the morph strategies |
 | `-prefer-ipv6` | `true` | Prefer IPv6 transport |
