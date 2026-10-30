@@ -106,7 +106,7 @@ func TestRelayBridgeKeepsFirstFrame(t *testing.T) {
 
 	relaySide, clientSide := net.Pipe()
 	t.Cleanup(func() { clientSide.Close() })
-	go relayTUNToUpstream(relaySide, srvCtx, testLogger(t), v3TUNHandshake(), clientIdentity{})
+	go relayTUNToUpstream(relaySide, srvCtx, testLogger(t), v3TUNHandshake(), clientIdentity{}, nil)
 
 	if err := clientSide.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		t.Fatalf("set deadline: %v", err)

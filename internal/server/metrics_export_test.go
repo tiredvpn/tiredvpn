@@ -88,15 +88,11 @@ func TestMetricsServerCounters(t *testing.T) {
 // per-tenant dashboard silently aggregates everybody together.
 func TestMetricsPerClientExport(t *testing.T) {
 	r := NewClientRegistry(nil)
-	var conns, up, down int64
 	r.byID["c1"] = &ClientConfig{
 		ID: "c1", Name: "alice", Secret: "s1", Enabled: true, MaxConns: 4,
 		ExpiresAt: time.Unix(1893456000, 0),
 	}
 	r.bySecret["s1"] = r.byID["c1"]
-	r.totalConns["c1"] = &conns
-	r.bytesUp["c1"] = &up
-	r.bytesDown["c1"] = &down
 
 	m := NewMetrics(r)
 

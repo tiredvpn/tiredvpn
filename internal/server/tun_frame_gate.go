@@ -85,9 +85,17 @@ func (g *tunFrameGate) Frame(p []byte) error {
 	return g.write(p)
 }
 
-// FrameDropped reports a frame refused because the gate was still closed, so a
-// caller can tell a dropped packet from a dead connection.
-func FrameDropped(err error) bool { return errors.Is(err, errTUNGateClosed) }
+// errFrameShed reports a frame a transport discarded because its downlink was
+// full. Like a frame refused before the handshake it is packet loss, not a
+// dead connection, and it was not delivered.
+var errFrameShed = errors.New("tun frame shed: downlink full")
+
+// FrameDropped reports a frame that was not delivered - refused because the
+// gate was still closed, or shed by a full downlink - so a caller can tell a
+// dropped packet from a dead connection.
+func FrameDropped(err error) bool {
+	return errors.Is(err, errTUNGateClosed) || errors.Is(err, errFrameShed)
+}
 
 // droppedBeforeOpen is test-visible accounting of pre-handshake drops.
 func (g *tunFrameGate) droppedBeforeOpen() int {

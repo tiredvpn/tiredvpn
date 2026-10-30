@@ -105,8 +105,8 @@ All carry `client_id` and `client_name`.
 |---|---|---|---|
 | `tiredvpn_client_connections_active` | gauge | — | Active connections per client |
 | `tiredvpn_client_connections_total` | counter | — | Total connections per client |
-| `tiredvpn_client_bytes_sent_total` | counter | — | Bytes sent per client |
-| `tiredvpn_client_bytes_received_total` | counter | — | Bytes received per client |
+| `tiredvpn_client_bytes_sent_total` | counter | — | Bytes sent to each client by this server since start |
+| `tiredvpn_client_bytes_received_total` | counter | — | Bytes received from each client by this server since start |
 | `tiredvpn_client_info` | gauge | `max_conns` | 1 when the client is enabled, 0 when disabled |
 | `tiredvpn_client_expires_timestamp_seconds` | gauge | — | Expiry as a Unix timestamp, 0 = never |
 

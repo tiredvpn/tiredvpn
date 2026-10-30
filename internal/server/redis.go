@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -44,7 +45,7 @@ type ClientStats struct {
 	TotalConns  int64     `json:"total_conns"`
 	BytesUp     int64     `json:"bytes_up"`
 	BytesDown   int64     `json:"bytes_down"`
-	LastSeen    time.Time `json:"last_seen"`
+	LastSeen    time.Time `json:"last_seen,omitzero"` // zero (omitted) = never seen
 }
 
 // DefaultRedisPrefix is the key namespace used when none is configured.
@@ -335,14 +336,104 @@ func (r *RedisStore) ListClients(ctx context.Context) ([]*ClientConfig, error) {
 	return clients, nil
 }
 
-// UpdateStats updates client statistics
-func (r *RedisStore) UpdateStats(ctx context.Context, clientID string, stats *ClientStats) error {
-	data, err := json.Marshal(stats)
-	if err != nil {
-		return fmt.Errorf("marshal stats: %w", err)
-	}
+// statsRecordFormat marks a stats record written by addStatsScript. A record
+// without it was written by 1.11.8 or earlier, whose counters were one shared
+// integer (connections, and on some paths bytes too, all summed together), so
+// none of its numbers mean what their names say.
+const statsRecordFormat = 2
 
-	return r.client.Set(ctx, r.statsKey(clientID), data, 0).Err()
+// StatsDelta is what one server adds to a client's lifetime stats record at a
+// flush: the traffic and connections it saw since its previous flush.
+type StatsDelta struct {
+	ClientID    string
+	Conns       int64
+	BytesUp     int64
+	BytesDown   int64
+	ActiveConns int       // this server's, stored as is (last writer wins)
+	LastSeen    time.Time // zero: this server has not seen the client
+}
+
+// errClientGone reports a delta for a client that no longer exists: the stats
+// key was not written, so a deleted client's record stays deleted.
+var errClientGone = errors.New("client no longer exists")
+
+// addStatsScript adds one delta to a stats record, atomically, so any number
+// of servers can share the record: each adds what it saw, and nothing is
+// overwritten. It writes nothing when the client key is gone. A record
+// without the current format marker, or one that does not parse, starts over
+// from zero.
+//
+// The JSON is built by hand: cjson would print large counters in %.14g and
+// lose their low digits. %.0f is exact below 2^53.
+//
+// KEYS: stats key, client key. ARGV: client id, conns, up, down, active,
+// last-seen unix nanos (0: none), last-seen RFC 3339.
+var addStatsScript = redis.NewScript(`
+if redis.call('EXISTS', KEYS[2]) == 0 then return 0 end
+local s = {}
+local raw = redis.call('GET', KEYS[1])
+if raw then
+  local ok, dec = pcall(cjson.decode, raw)
+  if ok and type(dec) == 'table' and tonumber(dec.format) == ` + fmt.Sprint(statsRecordFormat) + ` then s = dec end
+end
+local function n(v) return tonumber(v) or 0 end
+local conns = n(s.total_conns) + n(ARGV[2])
+local up = n(s.bytes_up) + n(ARGV[3])
+local down = n(s.bytes_down) + n(ARGV[4])
+local seenNs, seen = n(s.last_seen_ns), s.last_seen
+if n(ARGV[6]) > seenNs then seenNs, seen = n(ARGV[6]), ARGV[7] end
+local out = '{"client_id":' .. cjson.encode(ARGV[1]) ..
+  ',"active_conns":' .. string.format('%.0f', n(ARGV[5])) ..
+  ',"total_conns":' .. string.format('%.0f', conns) ..
+  ',"bytes_up":' .. string.format('%.0f', up) ..
+  ',"bytes_down":' .. string.format('%.0f', down)
+if type(seen) == 'string' and seenNs > 0 then
+  out = out .. ',"last_seen":' .. cjson.encode(seen) .. ',"last_seen_ns":' .. string.format('%.0f', seenNs)
+end
+out = out .. ',"format":` + fmt.Sprint(statsRecordFormat) + `}'
+redis.call('SET', KEYS[1], out)
+return 1
+`)
+
+// AddStatsDeltas adds each delta to its client's stats record in one round
+// trip. The result holds one error per delta: nil when it was added,
+// errClientGone when the client no longer exists.
+func (r *RedisStore) AddStatsDeltas(ctx context.Context, deltas []StatsDelta) []error {
+	errs := make([]error, len(deltas))
+	if len(deltas) == 0 {
+		return errs
+	}
+	// Load the script first so the pipeline can run it by hash.
+	if err := addStatsScript.Load(ctx, r.client).Err(); err != nil {
+		for i := range errs {
+			errs[i] = fmt.Errorf("load stats script: %w", err)
+		}
+		return errs
+	}
+	pipe := r.client.Pipeline()
+	cmds := make([]*redis.Cmd, len(deltas))
+	for i, d := range deltas {
+		var seenNs int64
+		var seen string
+		if !d.LastSeen.IsZero() {
+			seenNs = d.LastSeen.UnixNano()
+			seen = d.LastSeen.UTC().Format(time.RFC3339Nano)
+		}
+		cmds[i] = addStatsScript.EvalSha(ctx, pipe,
+			[]string{r.statsKey(d.ClientID), r.clientKey(d.ClientID)},
+			d.ClientID, d.Conns, d.BytesUp, d.BytesDown, d.ActiveConns, seenNs, seen)
+	}
+	_, _ = pipe.Exec(ctx) // per-command errors are read below
+	for i, cmd := range cmds {
+		written, err := cmd.Int()
+		switch {
+		case err != nil:
+			errs[i] = fmt.Errorf("add stats: %w", err)
+		case written == 0:
+			errs[i] = errClientGone
+		}
+	}
+	return errs
 }
 
 // GetStats retrieves client statistics
