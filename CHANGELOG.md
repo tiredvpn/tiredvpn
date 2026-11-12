@@ -7,6 +7,14 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Deps: quic-go 0.64.1 -> 0.65.0, golang.org/x/net -> 0.62.0.**
+  quic-go 0.65.0 fixes QUIC v2 key-update labelling, connection-migration
+  path handling and DATAGRAM starvation of ACKs; the http3 API break
+  (`HTTPStreamer.HTTPStream` now returns `(*Stream, error)`) does not
+  affect this project.
+
 ### Fixed
 
 - **Server: per-client traffic stats count bytes.** `bytes_up` and `bytes_down`
