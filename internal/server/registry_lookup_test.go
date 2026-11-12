@@ -23,10 +23,6 @@ func newPopulatedRegistry(t *testing.T) *ClientRegistry {
 	for _, c := range clients {
 		r.byID[c.ID] = c
 		r.bySecret[c.Secret] = c
-		var conns, up, down int64
-		r.totalConns[c.ID] = &conns
-		r.bytesUp[c.ID] = &up
-		r.bytesDown[c.ID] = &down
 	}
 	return r
 }

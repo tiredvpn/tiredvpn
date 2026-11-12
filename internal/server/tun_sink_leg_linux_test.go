@@ -517,7 +517,7 @@ func dialLegVia(t *testing.T, proxy *stallProxy) (exit *legExit, sink *relayTUNS
 	}
 	relayCtx := &serverContext{cfg: &Config{}, upstreamDialer: NewUpstreamDialer(addr, secret)}
 	down = &atomic.Int64{}
-	sink, _, clientIP, err := dialRelayTUN(relayCtx, testLogger(t), dialTUNHandshake(), "origin", "", nil,
+	sink, _, clientIP, err := dialRelayTUN(relayCtx, testLogger(t), dialTUNHandshake(), "origin", "", nil, nil,
 		func([]byte) error { down.Add(1); return nil })
 	if err != nil {
 		t.Fatalf("dialRelayTUN: %v", err)

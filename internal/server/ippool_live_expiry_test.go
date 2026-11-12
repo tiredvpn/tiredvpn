@@ -38,7 +38,7 @@ func TestADynamicLeaseDoesNotExpireUnderALiveSession(t *testing.T) {
 			// A TUN with a session on a, wired as the exit wires it.
 			st := newTestSharedTUN(t)
 			bindPoolToTUN(p, st)
-			st.RegisterClientGated(a, "global", "203.0.113.7", nil, nil, nil)
+			st.RegisterClientGated(a, "global", "203.0.113.7", nil, nil, nil, nil)
 			time.Sleep(400 * time.Millisecond)
 			// Each place that reclaims a run-out lease, on its own: the
 			// cleanup, the session's own handshake, the free-address scan.

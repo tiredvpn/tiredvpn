@@ -26,7 +26,7 @@ func TestRunIdleWatchedBridge_IdleCloses(t *testing.T) {
 	const idle = 200 * time.Millisecond
 	done := make(chan struct{})
 	go func() {
-		runIdleWatchedBridge(a, b, idle, nil)
+		runIdleWatchedBridge(a, b, idle, nil, nil)
 		close(done)
 	}()
 
@@ -55,7 +55,7 @@ func TestRunIdleWatchedBridge_TrafficKeepsAlive(t *testing.T) {
 	const idle = 300 * time.Millisecond
 	done := make(chan struct{})
 	go func() {
-		runIdleWatchedBridge(a, b, idle, nil)
+		runIdleWatchedBridge(a, b, idle, nil, nil)
 		close(done)
 	}()
 
@@ -102,7 +102,7 @@ func TestRunIdleWatchedBridge_PeerCloseEnds(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		runIdleWatchedBridge(a, b, 10*time.Second, nil)
+		runIdleWatchedBridge(a, b, 10*time.Second, nil, nil)
 		close(done)
 	}()
 

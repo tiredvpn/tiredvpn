@@ -7,6 +7,23 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Server: per-client traffic stats count bytes.** `bytes_up` and `bytes_down`
+  showed the client's connection count: the three counters of a client shared
+  one integer, no TUN transport counted traffic, and REALITY sessions were not
+  attributed to their client at all. Every data path now accounts the client's
+  traffic on exits and relays, with one atomic add per packet and no Redis call
+  on the data path. `/stats`, `/clients/{id}` and `/metrics` report this
+  server's own counts since start. The Redis record holds lifetime totals:
+  servers add their deltas atomically, so several servers can share one Redis,
+  a deleted client's record is not written back, records from 1.11.8 and
+  earlier start over from zero, and the server flushes on shutdown. Proxied
+  streams are counted as they go instead of when they close (spliced kTLS
+  streams every 1 MiB), and dropped downlink packets are not counted. `last_seen` is when the client was last
+  seen and is omitted for a client never seen. See "Traffic statistics" in
+  `docs/admin.md`.
+
 ### Removed
 
 - **Client: the inert `-pq` / `-pq-server-key` flags.** They built ML-KEM-768

@@ -35,6 +35,15 @@ type tunPacketSink interface {
 	Close()
 }
 
+// countPacket accounts one tunnel packet, unless it is an auto-MTU probe
+// frame: those are the transport measuring itself, not the client's traffic,
+// and some transports forward them where others answer them in place.
+func countPacket(add func(int), pkt []byte) {
+	if !tun.IsProbeFrame(pkt) {
+		add(len(pkt))
+	}
+}
+
 // localTUNSink terminates the client on this node's shared TUN device.
 type localTUNSink struct {
 	shared   *SharedTUN
@@ -48,8 +57,11 @@ func newLocalTUNSink(shared *SharedTUN, writer *ClientWriter, clientIP net.IP) *
 }
 
 func (s *localTUNSink) WritePacket(pkt []byte) error {
-	_, err := s.shared.TUNDevice().Write(pkt)
-	return err
+	if _, err := s.shared.TUNDevice().Write(pkt); err != nil {
+		return err
+	}
+	countPacket(s.writer.traffic.addUp, pkt)
+	return nil
 }
 
 func (s *localTUNSink) Done() <-chan struct{} { return s.writer.Done() }
@@ -74,6 +86,10 @@ type relayTUNSink struct {
 	// like the v4 ones, always come from the exit, never from the relay's pool.
 	serverIP6 net.IP
 	clientIP6 net.IP
+
+	// traffic accounts the packets relayed for this client in both directions;
+	// nil when the session has no registry client.
+	traffic *clientTraffic
 
 	writeMu sync.Mutex
 	done    chan struct{}
@@ -140,7 +156,11 @@ func (s *relayTUNSink) WritePacket(pkt []byte) error {
 	defer s.writeMu.Unlock()
 	err := s.writeUp(frame)
 	s.lastUp.Store(monoNow())
-	return err
+	if err != nil {
+		return err
+	}
+	countPacket(s.traffic.addUp, pkt)
+	return nil
 }
 
 // relayWriteTimeoutNs bounds one write up the leg; atomic so tests can scale
@@ -398,9 +418,13 @@ func (s *relayTUNSink) pump(deliver func(pkt []byte) error) {
 			return
 		}
 		if err := deliver(pkt); err != nil {
+			if FrameDropped(err) {
+				continue // not delivered, not counted; the inner TCP retransmits
+			}
 			s.why.CompareAndSwap(nil, new("downstream delivery: "+err.Error()))
 			return
 		}
+		countPacket(s.traffic.addDown, pkt)
 	}
 }
 
@@ -413,9 +437,10 @@ func (s *relayTUNSink) pump(deliver func(pkt []byte) error) {
 // the server/client IPs the exit assigned - the caller answers its client with
 // those, so the address always comes from the exit, never from the relay's pool.
 // When the exit negotiated dual-stack, its IPv6 tunnel addresses ride on the
-// sink (see relayTUNSink.dualAddrs).
+// sink (see relayTUNSink.dualAddrs). traffic accounts the relayed packets to
+// the client; nil counts nothing.
 func dialRelayTUN(srvCtx *serverContext, logger *log.Logger, handshake []byte, origin, clientTag string,
-	client net.Conn, deliver func(pkt []byte) error) (*relayTUNSink, net.IP, net.IP, error) {
+	traffic *clientTraffic, client net.Conn, deliver func(pkt []byte) error) (*relayTUNSink, net.IP, net.IP, error) {
 
 	handshake, forwarded := splitTUNOrigin(handshake)
 	handshake, forwardedTag := splitTUNClientTag(handshake)
@@ -439,7 +464,7 @@ func dialRelayTUN(srvCtx *serverContext, logger *log.Logger, handshake []byte, o
 		return nil, nil, nil, fmt.Errorf("short upstream handshake response: %d bytes", len(resp))
 	}
 
-	sink := &relayTUNSink{up: upConn, logger: logger, done: make(chan struct{}), client: client}
+	sink := &relayTUNSink{up: upConn, logger: logger, traffic: traffic, done: make(chan struct{}), client: client}
 	serverIP := append(net.IP(nil), resp[1:5]...)
 	clientIP := append(net.IP(nil), resp[5:9]...)
 

@@ -178,6 +178,11 @@ type clientIdentity struct {
 	// "global". A client that moved from Geneva to REALITY in the middle of a
 	// session - the strategy upgrade - arrived as somebody else and was handed
 	// another address, so the move could never be committed.
+	//
+	// lease also names the registry client a session's connections and traffic
+	// are accounted to: a per-client identity leases (and so is counted) under
+	// the registry client's ID, while the global secret and an unauthenticated
+	// peer are not perClient and are counted nowhere (see trafficOf).
 	lease string
 }
 

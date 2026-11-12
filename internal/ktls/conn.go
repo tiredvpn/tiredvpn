@@ -127,6 +127,43 @@ func (c *Conn) WriteTo(w io.Writer) (int64, error) {
 	return head + n, err
 }
 
+// WriteToN is WriteTo for at most n bytes, keeping the splice path: the limit
+// wraps the TCP socket itself, which net.TCPConn.ReadFrom still splices from.
+// A caller that wants progress while a long stream is in flight copies in
+// chunks with it; io.CopyN over the *Conn would hide the socket behind an
+// io.LimitedReader and fall back to the userspace loop. It returns fewer
+// than n bytes only at EOF or on an error.
+func (c *Conn) WriteToN(w io.Writer, n int64) (int64, error) {
+	head, err := c.flushPendingN(w, n)
+	if err != nil || head == n {
+		return head, err
+	}
+	if kc, ok := w.(*Conn); ok {
+		w = kc.tcpConn
+	}
+	src := &io.LimitedReader{R: c.tcpConn, N: n - head}
+	var m int64
+	if rf, ok := w.(io.ReaderFrom); ok {
+		m, err = rf.ReadFrom(src)
+	} else {
+		m, err = io.Copy(w, src)
+	}
+	return head + m, err
+}
+
+// flushPendingN writes out up to n bytes of handover leftovers.
+func (c *Conn) flushPendingN(w io.Writer, n int64) (int64, error) {
+	c.rxMu.Lock()
+	defer c.rxMu.Unlock()
+	if len(c.pending) == 0 {
+		return 0, nil
+	}
+	k := min(int64(len(c.pending)), n)
+	m, err := w.Write(c.pending[:k])
+	c.pending = c.pending[m:]
+	return int64(m), err
+}
+
 // flushPending writes out data left over from the handover, if any.
 func (c *Conn) flushPending(w io.Writer) (int64, error) {
 	c.rxMu.Lock()
