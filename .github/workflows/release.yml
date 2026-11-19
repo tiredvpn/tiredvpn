@@ -183,7 +183,7 @@ jobs:
           path: .
 
       - name: Install nfpm
-        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.48.0
 
       # nfpm signs the RPMs with the release GPG key so dnf's per-package
       # gpgcheck passes and directly-downloaded .rpm files verify (issue #53).
