@@ -9,6 +9,10 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Deps: golang.org/x/crypto 0.58.0 -> 0.59.0, golang.org/x/sys -> 0.62.0.**
+  x/crypto 0.59.0 quotes peer-controlled strings in ssh error messages and
+  fails `OpenChannel` when the connection is lost.
+
 - **Deps: quic-go 0.64.1 -> 0.65.0, golang.org/x/net -> 0.62.0.**
   quic-go 0.65.0 fixes QUIC v2 key-update labelling, connection-migration
   path handling and DATAGRAM starvation of ACKs; the http3 API break
