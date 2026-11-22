@@ -15,7 +15,7 @@ require (
 	github.com/vishvananda/netlink v1.3.1
 	github.com/xtaci/smux v2.0.1+incompatible
 	golang.org/x/crypto v0.59.0
-	golang.org/x/net v0.62.0
+	golang.org/x/net v0.63.0
 	golang.org/x/sys v0.50.0
 )
 
